@@ -225,6 +225,7 @@ u16  headerLength
 - **Responses** carry the request's opcode with the RESPONSE flag. Every response header begins `u16 errorCode` (0 = OK); on error: `string errorMessage` + tagged fields carrying typed detail (documented per opcode, e.g. `expectedEndOffset` on `OFFSET_GAP`, `currentFenceEpoch` on `FENCED_EPOCH`).
 - **Payload CRC vs zero-copy:** the writer always sets PAYLOAD_CRC on `APPEND`. A server MAY omit it on `READ`/`FETCH_CHUNK` responses served via sendfile; the reader then relies on record-batch internal CRCs and footer range CRCs. Integrity is therefore end-to-end (content CRCs) with hop-level CRC as an optimization, not a dependency.
 - **Connection lifecycle:** TCP, TLS per deployment policy. First frame MUST be `HELLO`. Pipelining is allowed after handshake, bounded by the negotiated in-flight byte cap. All `APPEND`s for a given chunk MUST use a single connection (ordering); after reconnect, the writer resyncs with `STAT_CHUNK`.
+- **Implementation note (v0 finding):** on virtual-thread runtimes, never hold a monitor (`synchronized`) across blocking I/O or while response handlers may contend for it — blocked virtual threads inside monitors pin their carriers (JDK ≤23), and enough pinned carriers stall every virtual thread in the process. Use `ReentrantLock`, and dispatch response callbacks off the connection reader threads (a handler blocked on a lock must never stall frame dispatch for the very response its lock-holder is waiting on).
 
 **Handshake.** `HELLO` request: `u16 frameVersionMin, u16 frameVersionMax, u8 clientKind (1 broker | 2 storage-node | 3 metadata | 4 tool), u64 featureBits, string clientId`. Response: `u16 chosenFrameVersion, u64 featureBits (intersection), u32 nodeId (0 if n/a), uuid incarnationId, u32 maxFrameBytes, u64 maxInflightBytes, array{u16 opcode, u16 maxApiVersion}`. The per-opcode version map is the negotiation mechanism: a client uses `min(its max, advertised max)` per opcode and never sends an opcode absent from the map.
 
@@ -242,6 +243,13 @@ u16  headerLength
 | 0x0016 | `DELETE_CHUNKS` | varint n, chunkId×n | array{chunkId, u16 code} | — |
 | 0x0017 | `FETCH_CHUNK` | chunkId, u64 offset, u32 maxBytes | u64 fileLength, u8 state | raw chunk-file bytes (header block + data + footer) |
 | 0x0018 | `PING` | — | — | — |
+| 0x0019 | `READ_LEDGER` | chunkId, u64 fromOffset | array{u64 endOffset, u32 payloadCrc, i32 writeEpoch} | — |
+
+`READ_LEDGER` (v0 addition) exposes integrity-ledger entries above an offset: seal recovery (§7.3)
+needs per-append boundaries without parsing the opaque payload. Empty for sealed chunks (the ledger
+is deleted at seal; recovery never needs it then). `SEAL_CHUNK` semantics refined in v0: caller
+footer sections are optional, and the node ALWAYS computes CRC_RANGES + STATS itself — recovery-
+sealed chunks therefore stay byte-identical across replicas with no caller input.
 
 Notes: `FETCH_CHUNK` is distinct from `READ` so it can run in a separate QoS/throttle class (repair must never starve foreground reads) and because it copies the *file* representation (header + footer included) — a repaired sealed replica is byte-identical, so whole-file CRCs are comparable across replicas. The node-local sidecar and ledger (§11.3) are never copied; the puller starts fresh ones.
 
@@ -253,13 +261,24 @@ Notes: `FETCH_CHUNK` is distinct from `READ` so it can run in a separate QoS/thr
 | 0x0102 | `NODE_HEARTBEAT` | u32 nodeId, uuid incarnationId, u64 sessionEpoch, array{u8 mediaClass, u64 usedBytes, u64 freeBytes}, u32 repairQueueDepth | u64 leaseValidUntilMs, array commands |
 | 0x0103 | `INVENTORY_REPORT` | u32 nodeId, u32 shardIndex, u32 shardCount, array{chunkId, u8 state, u64 length, u32 crc} | u16 ack |
 
+v0 additions: `NODE_HEARTBEAT` requests carry tagged field 0 `completedCommands` (array{u64
+commandId, u16 status}) so the repair coordinator learns command completion on the next heartbeat;
+`REPLICATE` params gained `expectedLength`. The v0 client↔metadata APIs ride SCP in the 0x02xx
+range (`CREATE_FILE` 0x0201, `CREATE_CHUNK` 0x0202, `SEAL_CHUNK_META` 0x0203, `LOOKUP_FILE` 0x0204,
+`DELETE_FILES` 0x0205, `SEAL_FILE` 0x0206) — v1 moves broker-facing APIs to Kafka RPC per §10.1;
+the 0x02xx range stays reserved for tools.
+
 Command encoding (in heartbeat responses): `u8 type` + tagged params. v1 types: `REPLICATE{chunkId, sources: array{nodeId, endpoint}, u8 priority, expectedCrc}` (pull via `FETCH_CHUNK`), `DELETE{chunkIds}`, `DRAIN{}` (node enters DRAINING; serve reads/copies, refuse `OPEN_CHUNK`). New command types are additive; a node MUST ignore unknown command types and report them in the next heartbeat (tagged field `unknownCommandTypes`) so operators see version skew instead of silent no-ops.
 
 Node identity: the assigned `nodeId` + `incarnationId` are persisted in an identity file on every data volume; re-registration presents them, which is what makes pod rescheduling onto the same disks identity-preserving (§7.2).
 
 ### 10.5 Error codes (shared, append-only)
 
-`0 OK · 1 UNKNOWN_OPCODE · 2 UNSUPPORTED_VERSION · 3 FENCED_EPOCH · 4 OFFSET_GAP (retriable) · 5 CHUNK_NOT_FOUND · 6 CHUNK_SEALED · 7 CHUNK_ALREADY_EXISTS · 8 OUT_OF_SPACE · 9 CRC_MISMATCH · 10 NOT_REGISTERED · 11 LEASE_EXPIRED · 12 THROTTLED (retriable; tagged retryAfterMs) · 13 CORRUPT_CHUNK · 14 INTERNAL (retriable)`. Codes 0–999 reserved for protocol-level errors; 1000+ for future domain extensions. Codes are never renumbered or reused.
+`0 OK · 1 UNKNOWN_OPCODE · 2 UNSUPPORTED_VERSION · 3 FENCED_EPOCH · 4 OFFSET_GAP (retriable) · 5 CHUNK_NOT_FOUND · 6 CHUNK_SEALED · 7 CHUNK_ALREADY_EXISTS · 8 OUT_OF_SPACE · 9 CRC_MISMATCH · 10 NOT_REGISTERED · 11 LEASE_EXPIRED · 12 THROTTLED (retriable; tagged retryAfterMs) · 13 CORRUPT_CHUNK · 14 INTERNAL (retriable) · 15 NOT_LEADER (retriable; v0) · 16 NO_CAPACITY (retriable; v0) · 17 FILE_NOT_FOUND (v0) · 18 FILE_SEALED (v0)`. Codes 0–999 reserved for protocol-level errors; 1000+ for future domain extensions. Codes are never renumbered or reused.
+
+Error precedence (v0 finding, locked as protocol semantics): **the fence check dominates the state
+check** — a deposed writer appending to a recovery-sealed chunk gets `FENCED_EPOCH` (permanent
+death for the appender), never `CHUNK_SEALED` (which reads as "roll and continue").
 
 ### 10.6 Wire compatibility rules
 
@@ -360,7 +379,7 @@ interface Reader extends AutoCloseable {
 - *Offset model:* offsets are **file-logical**; chunk boundaries are invisible to the caller. The client maps file offset → (chunk, chunk offset) from cached chunk metadata.
 - *Reads:* `read` never returns bytes above the durable offset for open files; sealed files serve any replica, any range.
 
-**Client-internal responsibilities** (so the broker code stays simple): chunk roll at ~1 GB + create-ahead; seal-and-roll on persistent replica failure (§7.2); DO tracking, piggybacking, and idle beacons; replica selection and hedged reads (hedge to a second replica after a p99-based timeout — directly exploits any-replica equivalence); metadata caching with invalidation on `CHUNK_NOT_FOUND`; retry/backoff with idempotency (append retries are safe: `OFFSET_GAP`/duplicate-suffix detection via `STAT_CHUNK` resync).
+**Client-internal responsibilities** (so the broker code stays simple): chunk roll at ~1 GB + create-ahead; seal-and-roll on persistent replica failure (§7.2), where failure detection includes a **per-replica append timeout** — a black-holed connection (silent packet loss) must fail that one replica into the roll path, never stall the whole appender; DO tracking, piggybacking, and idle beacons; replica selection and hedged reads (hedge to a second replica after a p99-based timeout — directly exploits any-replica equivalence); metadata caching with invalidation on `CHUNK_NOT_FOUND`; retry/backoff with idempotency (append retries are safe: `OFFSET_GAP`/duplicate-suffix detection via `STAT_CHUNK` resync).
 
 **Non-goals:** the client never inspects payload bytes; no Kafka types in the API surface; no buffering policy beyond pipelining (batching is the caller's concern — the broker already batches).
 

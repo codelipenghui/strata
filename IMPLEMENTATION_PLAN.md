@@ -33,20 +33,33 @@ tla/            ChunkReplication.tla + TLC config
 scripts/        verify.sh (full pyramid), run helpers
 ```
 
-## Stages (gate: tests green, then commit)
+## Stages (gate: tests green, then commit) — ALL COMPLETE
 
-- [ ] 1. Scaffold Maven multi-module; commit docs + plan + scaffold
-- [ ] 2. strata-common primitives + unit tests
-- [ ] 3. SCP framing + messages + roundtrip/golden tests
-- [ ] 4. Chunk store engine + crash recovery + torn-write tests
-- [ ] 5. Storage node server + single-node integration test
-- [ ] 6. Metadata service on ZK (embedded-ZK tests)
-- [ ] 7. Client library + 3-node end-to-end happy path
-- [ ] 8. Failure paths: fencing, seal-and-roll, seal recovery (§7.3) + fault-injection tests
-- [ ] 9. Repair + reconciliation + retention + tests
-- [ ] 10. Chaos suite (testcontainers; start Docker first)
-- [ ] 11. TLA+ spec + TLC run
-- [ ] 12. verify.sh, design-doc updates (v0 additions), final commit
+- [x] 1. Scaffold Maven multi-module; commit docs + plan + scaffold
+- [x] 2. strata-common primitives + unit tests
+- [x] 3. SCP framing + messages + roundtrip/golden tests
+- [x] 4. Chunk store engine + crash recovery + torn-write tests
+- [x] 5. Storage node server + single-node integration test
+- [x] 6. Metadata service on ZK (embedded-ZK tests)
+- [x] 7. Client library + 3-node end-to-end happy path
+- [x] 8. Failure paths: fencing, seal-and-roll, seal recovery (§7.3) + fault-injection tests
+- [x] 9. Repair + reconciliation + retention + tests
+- [x] 10. Chaos suite (testcontainers: toxiproxy slow-replica/blackhole, ZK pause)
+- [x] 11. TLA+ spec + TLC run (315K states, 4 invariants, negative control verified)
+- [x] 12. verify.sh, design-doc updates (v0 additions), final commit
+
+## Findings locked during implementation (also folded into the tech design doc)
+
+- **Virtual-thread pinning:** never hold `synchronized` across blocking I/O or where response
+  handlers contend; `ReentrantLock` + async callback dispatch off reader threads. (Manifested as a
+  full-JVM stall: callbacks blocked on the appender monitor pinned every carrier thread.)
+- **Per-replica append timeout** is required equipment: a black-holed connection must fail one
+  replica into seal-and-roll, not starve the appender into quorum loss.
+- **Fence check dominates state check** in `append` — a deposed writer must see FENCED_EPOCH
+  (permanent death), never CHUNK_SEALED ("roll and continue").
+- **DO clamping:** a piggybacked DO is clamped to the pre-append end — a DO claim can never cover
+  the bytes of the append carrying it.
+- Error codes 15–18 added (NOT_LEADER, NO_CAPACITY, FILE_NOT_FOUND, FILE_SEALED).
 
 ## Correctness invariants under test (tech design §14)
 
