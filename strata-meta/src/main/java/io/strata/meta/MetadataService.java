@@ -42,9 +42,9 @@ public final class MetadataService implements AutoCloseable {
         this.config = config;
         this.store = new ZkMetadataStore(config.zkConnect());
         this.registry = new NodeRegistry(store, config);
-        this.repair = new RepairCoordinator(store, registry, config);
         UUID serviceId = UUID.randomUUID();
         this.leaderLatch = new LeaderLatch(store.curator(), "/strata/leader", serviceId.toString());
+        this.repair = new RepairCoordinator(store, registry, config, leaderLatch::hasLeadership);
         this.leaderLatch.start();
         this.server = new ScpServer(config.listenPort(), 0,
                 serviceId.getMostSignificantBits(), serviceId.getLeastSignificantBits(), this::handle);

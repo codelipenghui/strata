@@ -20,17 +20,22 @@ import java.util.List;
  */
 final class MiniCluster implements AutoCloseable {
     final TestingServer zk;       // null when an external (containerized) ZK is supplied
-    final MetadataService meta;
+    final List<MetadataService> metas = new ArrayList<>();
+    final MetadataService meta;   // the first instance (initial leader) — legacy accessor
     final List<StorageNode> nodes = new ArrayList<>();
     final Path root;
     private String zkConnect;
 
     MiniCluster(int nodeCount) throws Exception {
-        this(nodeCount, null);
+        this(nodeCount, null, 1);
+    }
+
+    MiniCluster(int nodeCount, String zkConnectOverride) throws Exception {
+        this(nodeCount, zkConnectOverride, 1);
     }
 
     /** zkConnectOverride lets chaos tests supply a containerized ZooKeeper. */
-    MiniCluster(int nodeCount, String zkConnectOverride) throws Exception {
+    MiniCluster(int nodeCount, String zkConnectOverride, int metaCount) throws Exception {
         this.root = Files.createTempDirectory("strata-it");
         if (zkConnectOverride == null) {
             this.zk = new TestingServer(true);
@@ -39,21 +44,37 @@ final class MiniCluster implements AutoCloseable {
             this.zk = null;
             this.zkConnect = zkConnectOverride;
         }
-        this.meta = new MetadataService(MetaConfig.forTests(zkConnect));
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (!meta.isLeader() && System.currentTimeMillis() < deadline) {
-            Thread.sleep(20);
+        for (int i = 0; i < metaCount; i++) {
+            metas.add(new MetadataService(MetaConfig.forTests(zkConnect)));
         }
-        if (!meta.isLeader()) throw new IllegalStateException("metadata service did not become leader");
+        this.meta = metas.get(0);
+        awaitAnyLeader();
         for (int i = 0; i < nodeCount; i++) {
             addNode("host-" + i);
         }
         if (nodeCount > 0) awaitRegistered(nodeCount);
     }
 
+    void awaitAnyLeader() throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 15_000;
+        while (System.currentTimeMillis() < deadline) {
+            if (metas.stream().anyMatch(MetadataService::isLeader)) return;
+            Thread.sleep(20);
+        }
+        throw new IllegalStateException("no metadata service became leader");
+    }
+
+    List<String> metaEndpoints() {
+        return metas.stream().map(MetadataService::endpoint).toList();
+    }
+
+    void killMeta(int index) throws IOException {
+        metas.get(index).close();
+    }
+
     StorageNode addNode(String host) throws IOException {
         Path dir = root.resolve(host);
-        StorageNode node = new StorageNode(NodeConfig.withMetadata(dir, List.of(meta.endpoint()), host));
+        StorageNode node = new StorageNode(NodeConfig.withMetadata(dir, metaEndpoints(), host));
         nodes.add(node);
         return node;
     }
@@ -112,7 +133,12 @@ final class MiniCluster implements AutoCloseable {
             } catch (IOException ignored) {
             }
         }
-        meta.close();
+        for (MetadataService m : metas) {
+            try {
+                m.close();
+            } catch (Exception ignored) {
+            }
+        }
         if (zk != null) {
             zk.close();
         }

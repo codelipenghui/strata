@@ -61,6 +61,25 @@ scripts/        verify.sh (full pyramid), run helpers
   the bytes of the append carrying it.
 - Error codes 15–18 added (NOT_LEADER, NO_CAPACITY, FILE_NOT_FOUND, FILE_SEALED).
 
+## Hardening pass (post-v0)
+
+- [x] **Metadata failover test** (2 instances, leader kill mid-stream). Bugs found and fixed:
+  - standby's NodeRegistry never learned of nodes registered after its boot → re-registration
+    allocated NEW nodeIds; fix: registration falls back to the persistent store for incarnation
+    matching (identity source of truth).
+  - RepairCoordinator ran on standbys → would declare all nodes DEAD (no heartbeats route to a
+    standby); fix: leadership gate + settle period (lease + grace) after acquiring leadership.
+  - MetaClient double-rotated endpoints on connect failure → with 2 endpoints, every retry hit
+    the dead instance; fix: rotation owned solely by call(), which now retries retriable errors
+    with backoff up to a deadline (failover absorbed by ALL metadata operations).
+- [x] **ack-on-fsync end-to-end**: policy verified in every replica's chunk header on disk;
+  write/seal/read + seal recovery under fsync mode; mixed-mode files coexist.
+- [x] **Perf smoke** (`PerfSmokeTest`, tag `perf`; `./scripts/verify.sh --perf`). First numbers
+  (M-series laptop, 3 nodes in-process): replicate-mode write p50 0.3ms / p99 ~6ms @ window 256,
+  ~21 MB/s at 1 KB records; sequential read ~280-400 MB/s; fsync-mode p50 ~184ms @ window 16 —
+  per-append force with serial replica processing ⇒ group commit is required v1 work
+  (tech design §17.11).
+
 ## Correctness invariants under test (tech design §14)
 
 1. Acked data (quorum 2-of-3) survives any single node failure through seal — verified by the recorder/verifier harness in every integration & chaos test.

@@ -37,26 +37,46 @@ final class RepairCoordinator implements AutoCloseable {
     private final MetadataStore store;
     private final NodeRegistry registry;
     private final MetaConfig config;
+    private final java.util.function.BooleanSupplier isLeader;
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicLong commandIds = new AtomicLong(System.currentTimeMillis());
     private final Map<Long, Action> inflight = new ConcurrentHashMap<>();
     private final Set<ChunkId> chunksBeingRepaired = ConcurrentHashMap.newKeySet();
     private volatile Thread scanThread;
 
-    RepairCoordinator(MetadataStore store, NodeRegistry registry, MetaConfig config) {
+    RepairCoordinator(MetadataStore store, NodeRegistry registry, MetaConfig config,
+                      java.util.function.BooleanSupplier isLeader) {
         this.store = store;
         this.registry = registry;
         this.config = config;
+        this.isLeader = isLeader;
     }
 
     void start() {
         scanThread = Thread.ofVirtual().name("meta-repair-scan").start(this::scanLoop);
     }
 
+    private long leaderSince;
+
     private void scanLoop() {
         while (!closed.get()) {
             try {
                 Thread.sleep(config.repairScanIntervalMs());
+                if (!isLeader.getAsBoolean()) {
+                    // a standby must never run failure detection or repair: with no heartbeats
+                    // routed to it, it would declare every node DEAD and persist that to ZK
+                    leaderSince = 0;
+                    continue;
+                }
+                if (leaderSince == 0) {
+                    leaderSince = System.currentTimeMillis();
+                }
+                // settle period after acquiring leadership: nodes registered with the previous
+                // leader need a lease cycle to re-register here, or every chunk looks
+                // under-replicated and the scan issues spurious repairs
+                if (System.currentTimeMillis() - leaderSince < config.leaseMs() + config.deadGraceMs()) {
+                    continue;
+                }
                 registry.expireScan();
                 scanOnce();
             } catch (InterruptedException e) {

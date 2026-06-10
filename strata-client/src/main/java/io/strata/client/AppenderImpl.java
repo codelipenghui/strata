@@ -275,6 +275,8 @@ final class AppenderImpl implements SegmentStore.Appender {
     }
 
     private void openNewChunkLocked() {
+        // failover resilience lives in MetaClient.call (deadline-based retry); a failure here
+        // means the metadata plane stayed unreachable past the deadline
         Messages.CreateChunkResp created;
         lock.unlock();
         try {

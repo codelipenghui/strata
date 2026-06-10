@@ -76,6 +76,17 @@ final class NodeRegistry {
                 break;
             }
         }
+        if (existing == null) {
+            // not in this leader's memory — a node that registered with a PREVIOUS leader after
+            // this instance booted. The persistent store is the identity source of truth:
+            // re-registration across metadata failover must keep the nodeId stable.
+            for (Records.NodeRecord r : store.listNodes()) {
+                if (r.incMsb() == msg.incMsb() && r.incLsb() == msg.incLsb()) {
+                    existing = r;
+                    break;
+                }
+            }
+        }
         int nodeId = existing != null ? existing.nodeId() : store.nextNodeId();
         byte mediaClass = msg.capacities().isEmpty() ? 0 : msg.capacities().get(0).mediaClass();
         long capacity = msg.capacities().isEmpty() ? 0 : msg.capacities().get(0).capacityBytes();

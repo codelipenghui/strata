@@ -3,16 +3,19 @@
 #   ./scripts/verify.sh           unit + integration (no Docker needed; embedded ZK)
 #   ./scripts/verify.sh --chaos   also run the testcontainers chaos suite (needs Docker)
 #   ./scripts/verify.sh --tlc     also model-check tla/ChunkReplication.tla
+#   ./scripts/verify.sh --perf    also run the perf smoke benchmark (prints latency/throughput)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CHAOS=false
 TLC=false
+PERF=false
 for arg in "$@"; do
   case "$arg" in
     --chaos) CHAOS=true ;;
     --tlc) TLC=true ;;
-    --all) CHAOS=true; TLC=true ;;
+    --perf) PERF=true ;;
+    --all) CHAOS=true; TLC=true; PERF=true ;;
   esac
 done
 
@@ -28,6 +31,12 @@ if $CHAOS; then
     echo "==> SKIP chaos: docker daemon not running" >&2
     exit 1
   fi
+fi
+
+if $PERF; then
+  echo "==> perf smoke (write both durability modes + sequential read)"
+  mvn -pl strata-it test -Dtest=PerfSmokeTest "-DexcludedGroups=" 2>&1 \
+    | grep -E "===|write |read |Tests run"
 fi
 
 if $TLC; then

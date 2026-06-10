@@ -33,7 +33,8 @@ final class MetaClient implements AutoCloseable {
                 try {
                     client = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_BROKER, "strata-client");
                 } catch (IOException e) {
-                    endpointIndex++;
+                    // rotation is owned by call(): incrementing here too would double-rotate and,
+                    // with two endpoints, pin every retry onto the same dead instance
                     throw new ScpException(ErrorCode.INTERNAL, "metadata unreachable at " + ep + ": " + e);
                 }
             }
@@ -43,12 +44,25 @@ final class MetaClient implements AutoCloseable {
         }
     }
 
+    /**
+     * Metadata calls are chunk-boundary operations: a leader failover mid-call must be absorbed,
+     * not surfaced. Retries retriable errors (NOT_LEADER while the standby acquires leadership,
+     * connection failures, NO_CAPACITY while nodes re-register) with backoff up to a deadline.
+     */
     private ByteBuffer call(Opcode op, byte[] header) {
-        for (int attempt = 0; attempt < config.metadataEndpoints().size() + 1; attempt++) {
+        long deadline = System.currentTimeMillis() + Math.max(15_000, config.callTimeoutMs());
+        ScpException last = null;
+        while (System.currentTimeMillis() < deadline) {
             try {
                 return conn().call(op, header, null, config.callTimeoutMs());
             } catch (ScpException e) {
-                if (e.code() == ErrorCode.NOT_LEADER || (e.code() == ErrorCode.INTERNAL && e.retriable())) {
+                last = e;
+                boolean rotate = e.code() == ErrorCode.NOT_LEADER
+                        || (e.code() == ErrorCode.INTERNAL && e.retriable());
+                if (!rotate && !e.retriable()) {
+                    throw e;
+                }
+                if (rotate) {
                     lock.lock();
                     try {
                         endpointIndex++;
@@ -57,12 +71,16 @@ final class MetaClient implements AutoCloseable {
                     } finally {
                         lock.unlock();
                     }
-                    continue;
                 }
-                throw e;
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
             }
         }
-        throw new ScpException(ErrorCode.INTERNAL, "no reachable metadata leader");
+        throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no reachable metadata leader");
     }
 
     FileId createFile(SegmentStore.FileSpec spec) {

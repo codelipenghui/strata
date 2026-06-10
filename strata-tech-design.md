@@ -435,6 +435,7 @@ Produce-path latency decomposed by stage (broker processing / storage append / q
 8. **Flow control** — v1 uses static per-connection caps from `HELLO`; whether repair traffic needs dynamic credit-based flow control to protect foreground p99 at scale is unproven either way.
 9. **Compression** — reserved in the frame flags; whether `FETCH_CHUNK` (repair/relocation) benefits enough to justify it, given producers already compress batches.
 10. **ZK backend retirement** — the v0 backend's cutoff point: which milestone flips the conformance gates, and confirmation that no v0 deployment needs its metadata to survive (current answer: none — no migration tooling will be built).
+11. **Group commit for ack-on-fsync** — v0 forces per append and replicas process a connection serially, so pipelined fsync-mode ack latency degrades to ~window × force-cost (measured: ~11 ms/forced append on a laptop SSD → ~184 ms p50 at window 16). v1 needs batched force: coalesce appends already in the chunk, force once, ack the batch — the standard group-commit design.
 
 ---
 
