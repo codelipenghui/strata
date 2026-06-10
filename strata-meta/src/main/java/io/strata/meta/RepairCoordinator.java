@@ -41,6 +41,7 @@ final class RepairCoordinator implements AutoCloseable {
     private final AtomicLong commandIds = new AtomicLong(System.currentTimeMillis());
     private final Map<Long, Action> inflight = new ConcurrentHashMap<>();
     private final Set<ChunkId> chunksBeingRepaired = ConcurrentHashMap.newKeySet();
+    private volatile Thread scanThread;
 
     RepairCoordinator(MetadataStore store, NodeRegistry registry, MetaConfig config) {
         this.store = store;
@@ -49,7 +50,7 @@ final class RepairCoordinator implements AutoCloseable {
     }
 
     void start() {
-        Thread.ofVirtual().name("meta-repair-scan").start(this::scanLoop);
+        scanThread = Thread.ofVirtual().name("meta-repair-scan").start(this::scanLoop);
     }
 
     private void scanLoop() {
@@ -61,7 +62,9 @@ final class RepairCoordinator implements AutoCloseable {
             } catch (InterruptedException e) {
                 return;
             } catch (Exception e) {
-                log.warn("repair scan failed", e);
+                if (!closed.get()) {
+                    log.warn("repair scan failed", e);
+                }
             }
         }
     }
@@ -297,5 +300,14 @@ final class RepairCoordinator implements AutoCloseable {
     @Override
     public void close() {
         closed.set(true);
+        Thread t = scanThread;
+        if (t != null) {
+            t.interrupt();
+            try {
+                t.join(2_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 }
