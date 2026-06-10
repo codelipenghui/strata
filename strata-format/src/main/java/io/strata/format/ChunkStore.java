@@ -126,8 +126,10 @@ public final class ChunkStore implements AutoCloseable {
                                ByteBuffer payload) throws IOException {
         Handle h = lookup(id);
         synchronized (h) {
-            if (h.state != ChunkState.OPEN) throw new ScpException(ErrorCode.CHUNK_SEALED, id.toString());
+            // fence check dominates the state check: a deposed writer must learn FENCED_EPOCH
+            // (permanent death), never CHUNK_SEALED (which reads as "roll and continue")
             checkEpoch(h, epoch);
+            if (h.state != ChunkState.OPEN) throw new ScpException(ErrorCode.CHUNK_SEALED, id.toString());
             h.writeEpoch = Math.max(h.writeEpoch, epoch);
             if (baseOffset != h.end) {
                 throw new ScpException(ErrorCode.OFFSET_GAP, "expected " + h.end + " got " + baseOffset, h.end);

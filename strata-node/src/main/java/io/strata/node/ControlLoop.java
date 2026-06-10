@@ -80,7 +80,19 @@ final class ControlLoop implements AutoCloseable {
         }
     }
 
-    private synchronized void ensureRegistered() throws IOException {
+    private final java.util.concurrent.locks.ReentrantLock connLock =
+            new java.util.concurrent.locks.ReentrantLock();
+
+    private void ensureRegistered() throws IOException {
+        connLock.lock();
+        try {
+            ensureRegisteredLocked();
+        } finally {
+            connLock.unlock();
+        }
+    }
+
+    private void ensureRegisteredLocked() throws IOException {
         if (meta == null || meta.isClosed()) {
             disconnect();
             String ep = config.metadataEndpoints().get(endpointIndex % config.metadataEndpoints().size());

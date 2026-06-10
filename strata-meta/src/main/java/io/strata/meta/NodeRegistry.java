@@ -54,7 +54,20 @@ final class NodeRegistry {
         }
     }
 
-    synchronized Messages.RegisterResp register(Messages.RegisterNode msg) throws Exception {
+    // ReentrantLock, not synchronized: registration does ZK I/O and runs on server virtual threads
+    private final java.util.concurrent.locks.ReentrantLock registerLock =
+            new java.util.concurrent.locks.ReentrantLock();
+
+    Messages.RegisterResp register(Messages.RegisterNode msg) throws Exception {
+        registerLock.lock();
+        try {
+            return registerLocked(msg);
+        } finally {
+            registerLock.unlock();
+        }
+    }
+
+    private Messages.RegisterResp registerLocked(Messages.RegisterNode msg) throws Exception {
         // identity = incarnation persisted on the node's volumes; same incarnation -> same nodeId
         Records.NodeRecord existing = null;
         for (LiveNode n : live.values()) {

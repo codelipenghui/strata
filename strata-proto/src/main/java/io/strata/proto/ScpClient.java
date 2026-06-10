@@ -33,7 +33,9 @@ public final class ScpClient implements AutoCloseable {
     private final Socket socket;
     private final DataInputStream in;
     private final DataOutputStream out;
-    private final Object writeLock = new Object();
+    // ReentrantLock, not synchronized: blocking socket writes under a monitor pin virtual threads
+    private final java.util.concurrent.locks.ReentrantLock writeLock =
+            new java.util.concurrent.locks.ReentrantLock();
     private final AtomicLong correlation = new AtomicLong(1);
     private final Map<Long, CompletableFuture<Frame>> pending = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
@@ -98,8 +100,11 @@ public final class ScpClient implements AutoCloseable {
         CompletableFuture<Frame> fut = new CompletableFuture<>();
         pending.put(id, fut);
         try {
-            synchronized (writeLock) {
+            writeLock.lock();
+            try {
                 FrameIO.write(out, Frame.request(op, header, payload, id));
+            } finally {
+                writeLock.unlock();
             }
         } catch (IOException e) {
             pending.remove(id);
