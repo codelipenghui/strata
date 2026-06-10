@@ -54,6 +54,9 @@ public final class StorageNode implements AutoCloseable {
     }
 
     public String endpoint() {
+        if (config.advertisedEndpointOverride() != null) {
+            return config.advertisedEndpointOverride();
+        }
         return config.advertisedHost() + ":" + port();
     }
 

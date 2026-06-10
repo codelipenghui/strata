@@ -117,7 +117,10 @@ final class AppenderImpl implements SegmentStore.Appender {
                     onReplicaFailureLocked(s, replicaIndex, e);
                     continue;
                 }
-                f.whenCompleteAsync((frame, err) -> onReplicaResponse(s, replicaIndex, frame, err), CALLBACKS);
+                // per-replica timeout: a black-holed connection must fail THIS replica (seal-and-
+                // roll path), not stall the whole appender into quorum loss
+                f.orTimeout(config.callTimeoutMs(), java.util.concurrent.TimeUnit.MILLISECONDS)
+                        .whenCompleteAsync((frame, err) -> onReplicaResponse(s, replicaIndex, frame, err), CALLBACKS);
             }
             return callerFuture;
         } finally {

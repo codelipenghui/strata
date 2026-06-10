@@ -19,15 +19,27 @@ import java.util.List;
  * deterministic fault injection by killing components.
  */
 final class MiniCluster implements AutoCloseable {
-    final TestingServer zk;
+    final TestingServer zk;       // null when an external (containerized) ZK is supplied
     final MetadataService meta;
     final List<StorageNode> nodes = new ArrayList<>();
     final Path root;
+    private String zkConnect;
 
     MiniCluster(int nodeCount) throws Exception {
+        this(nodeCount, null);
+    }
+
+    /** zkConnectOverride lets chaos tests supply a containerized ZooKeeper. */
+    MiniCluster(int nodeCount, String zkConnectOverride) throws Exception {
         this.root = Files.createTempDirectory("strata-it");
-        this.zk = new TestingServer(true);
-        this.meta = new MetadataService(MetaConfig.forTests(zk.getConnectString()));
+        if (zkConnectOverride == null) {
+            this.zk = new TestingServer(true);
+            this.zkConnect = zk.getConnectString();
+        } else {
+            this.zk = null;
+            this.zkConnect = zkConnectOverride;
+        }
+        this.meta = new MetadataService(MetaConfig.forTests(zkConnect));
         long deadline = System.currentTimeMillis() + 10_000;
         while (!meta.isLeader() && System.currentTimeMillis() < deadline) {
             Thread.sleep(20);
@@ -36,7 +48,7 @@ final class MiniCluster implements AutoCloseable {
         for (int i = 0; i < nodeCount; i++) {
             addNode("host-" + i);
         }
-        awaitRegistered(nodeCount);
+        if (nodeCount > 0) awaitRegistered(nodeCount);
     }
 
     StorageNode addNode(String host) throws IOException {
@@ -44,6 +56,16 @@ final class MiniCluster implements AutoCloseable {
         StorageNode node = new StorageNode(NodeConfig.withMetadata(dir, List.of(meta.endpoint()), host));
         nodes.add(node);
         return node;
+    }
+
+    StorageNode addNode(NodeConfig config) throws IOException {
+        StorageNode node = new StorageNode(config);
+        nodes.add(node);
+        return node;
+    }
+
+    Path nodeDir(String host) {
+        return root.resolve(host);
     }
 
     /** Restarts a node on the same data dir (same volume-bound identity). */
@@ -68,7 +90,7 @@ final class MiniCluster implements AutoCloseable {
     }
 
     void awaitRegistered(int count) throws Exception {
-        try (ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
+        try (ZkMetadataStore store = new ZkMetadataStore(zkConnect)) {
             long deadline = System.currentTimeMillis() + 15_000;
             while (System.currentTimeMillis() < deadline) {
                 if (store.listNodes().size() >= count) return;
@@ -91,6 +113,8 @@ final class MiniCluster implements AutoCloseable {
             }
         }
         meta.close();
-        zk.close();
+        if (zk != null) {
+            zk.close();
+        }
     }
 }
