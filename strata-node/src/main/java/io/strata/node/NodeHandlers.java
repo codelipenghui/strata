@@ -25,6 +25,20 @@ final class NodeHandlers implements ScpServer.Handler {
     }
 
     @Override
+    public java.util.concurrent.CompletableFuture<Frame> handleAsync(Frame req) throws Exception {
+        if (req.opcode() == Opcode.APPEND.code) {
+            // validation + write run synchronously here (per-chunk ordering preserved); the ack
+            // defers until durability per the chunk's policy — for ack-on-fsync that means a
+            // covering group-commit force, while this connection keeps processing frames
+            var m = Messages.Append.decode(req.headerSlice());
+            return store.appendAsync(m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
+                            req.payloadSlice())
+                    .thenApply(r -> ScpServer.ok(req, new Messages.AppendResp(r.endOffset()).encode(), null));
+        }
+        return java.util.concurrent.CompletableFuture.completedFuture(handle(req));
+    }
+
+    @Override
     public Frame handle(Frame req) throws Exception {
         Opcode op = Opcode.fromCode(req.opcode());
         if (op == null) throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "0x" + Integer.toHexString(req.opcode()));
@@ -41,11 +55,7 @@ final class NodeHandlers implements ScpServer.Handler {
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
 
-            case APPEND -> {
-                var m = Messages.Append.decode(h);
-                var r = store.append(m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(), req.payloadSlice());
-                yield ScpServer.ok(req, new Messages.AppendResp(r.endOffset()).encode(), null);
-            }
+            // APPEND is served by handleAsync (deferred ack for group commit)
 
             case READ -> {
                 var m = Messages.Read.decode(h);

@@ -31,11 +31,10 @@ class PerfSmokeTest {
     private static final int RECORDS = Integer.getInteger("perf.records", 8_000);
     private static final int RECORD_SIZE = Integer.getInteger("perf.recordSize", 1_024);
     private static final int WINDOW = Integer.getInteger("perf.window", 256);
-    // v0 forces per append (no group commit yet) and replicas process serially, so fsync-mode
-    // ack latency under pipelining is ~window * force-cost: measure at a shallow window. The
-    // deep-window number is a known queueing artifact until group commit lands (plan findings).
-    private static final int FSYNC_WINDOW = Integer.getInteger("perf.fsyncWindow", 16);
-    private static final int FSYNC_RECORDS = Integer.getInteger("perf.fsyncRecords", 1_000);
+    // group commit (§5.3): replicas coalesce forces, so fsync mode sustains the same deep
+    // pipeline as replicate mode — ack latency ~1-2 force times regardless of window depth
+    private static final int FSYNC_WINDOW = Integer.getInteger("perf.fsyncWindow", WINDOW);
+    private static final int FSYNC_RECORDS = Integer.getInteger("perf.fsyncRecords", 4_000);
     private static final int WARMUP = 1_000;
     private static final int READ_SIZE = 64 * 1024;
 

@@ -123,6 +123,8 @@ Why this exists: build order. The segment store, SCP, on-disk formats, seal reco
 
 Per-topic: `ack-on-replicate` (default; durability = 2 independent nodes, flushes async — Kafka's own stance) or `ack-on-fsync` (replicas fsync data + ledger before acking; belongs on NVMe media class). The policy is carried in `OPEN_CHUNK` and stored per chunk so replicas don't consult config. Benchmarks publish both modes.
 
+**Group commit (fsync mode).** Replicas never force per append: the write lands in the page cache and the ack defers until a per-chunk flusher's force covers it — one force amortizes across every append since the previous one, preceded by a short accumulation window (in-flight fsyncs throttle concurrent writes at the OS level; a clean gap lets a real batch land). Ack latency is ~accumulation + 1–2 force times regardless of pipeline depth. This requires deferred append acks at the server (§10.2 ordering note): validation and writes stay synchronous and in-order on the connection; only the response completes later, which is protocol-legal (correlation ids).
+
 ### 5.4 Fencing
 
 Kafka's leader epoch is the only fencing token in the system. New leader (epoch E+1) fences before writing: `FENCE(chunkId, E+1)` to all reachable replicas; replicas persist the fence epoch (§11.3 sidecar) and reject lower-epoch appends permanently. A deposed leader's in-flight appends fail at the replicas; it cannot ack anything new. There is no window in which two writers can both achieve quorum: 2-of-3 ack sets for two epochs must intersect, and the intersecting replica is fenced.
@@ -435,7 +437,7 @@ Produce-path latency decomposed by stage (broker processing / storage append / q
 8. **Flow control** — v1 uses static per-connection caps from `HELLO`; whether repair traffic needs dynamic credit-based flow control to protect foreground p99 at scale is unproven either way.
 9. **Compression** — reserved in the frame flags; whether `FETCH_CHUNK` (repair/relocation) benefits enough to justify it, given producers already compress batches.
 10. **ZK backend retirement** — the v0 backend's cutoff point: which milestone flips the conformance gates, and confirmation that no v0 deployment needs its metadata to survive (current answer: none — no migration tooling will be built).
-11. **Group commit for ack-on-fsync** — v0 forces per append and replicas process a connection serially, so pipelined fsync-mode ack latency degrades to ~window × force-cost (measured: ~11 ms/forced append on a laptop SSD → ~184 ms p50 at window 16). v1 needs batched force: coalesce appends already in the chunk, force once, ack the batch — the standard group-commit design.
+11. **Group commit for ack-on-fsync** — RESOLVED in v0 (§5.3): per-chunk coalesced forces with a 5 ms accumulation window and deferred append acks. Measured at window 256 on a shared-SSD laptop: p50 2,941 ms → 75 ms (39×), throughput 0.1 → 3.2 MB/s (32×). Remaining tunable: the accumulation window should become a config and be re-calibrated on production hardware (per-node devices interfere less than a shared laptop SSD).
 
 ---
 

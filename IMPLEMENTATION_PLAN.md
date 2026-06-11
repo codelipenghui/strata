@@ -79,6 +79,16 @@ scripts/        verify.sh (full pyramid), run helpers
   ~21 MB/s at 1 KB records; sequential read ~280-400 MB/s; fsync-mode p50 ~184ms @ window 16 —
   per-append force with serial replica processing ⇒ group commit is required v1 work
   (tech design §17.11).
+- [x] **Group commit for ack-on-fsync** (tech design §5.3, §17.11 resolved). Per-chunk flusher
+  coalesces forces; append acks defer at the server (handleAsync — connection keeps processing
+  while waiters await a covering force; out-of-order responses are protocol-legal). Two findings:
+  - in-flight fsyncs throttle concurrent data/ledger writes at the OS level — without an
+    accumulation gap, coalescing degraded to ~3 appends/force; a 5ms clean window before each
+    force restored real batches (0ms→3, 1ms→6, 3ms→16, 5ms→44 appends/force on shared-SSD laptop).
+  - regression guards: GroupCommitTest (engine), FsyncPipelineWireTest (wire),
+    FsyncAppenderPipelineTest (full stack) — all assert forces << appends.
+  Result @ window 256: fsync p50 2,941ms → 75ms (39×), throughput 0.1 → 3.2 MB/s (32×);
+  replicate mode and read path unchanged.
 
 ## Correctness invariants under test (tech design §14)
 

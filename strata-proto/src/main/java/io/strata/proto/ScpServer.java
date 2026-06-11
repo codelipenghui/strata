@@ -24,9 +24,20 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class ScpServer implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ScpServer.class);
 
-    /** Handles one request frame; returns the response frame. Throw ScpException for protocol errors. */
+    /**
+     * Handles one request frame; returns the response frame. Throw ScpException for protocol errors.
+     *
+     * handleAsync is the dispatch entry point: its synchronous portion runs on the connection
+     * thread IN ORDER (validation/writes keep per-chunk contiguity semantics), but the response
+     * may complete later (e.g. group commit) — the connection keeps processing subsequent frames
+     * meanwhile. Out-of-order responses are protocol-legal: clients correlate by id.
+     */
     public interface Handler {
         Frame handle(Frame request) throws Exception;
+
+        default java.util.concurrent.CompletableFuture<Frame> handleAsync(Frame request) throws Exception {
+            return java.util.concurrent.CompletableFuture.completedFuture(handle(request));
+        }
     }
 
     private final ServerSocket serverSocket;
@@ -65,6 +76,9 @@ public final class ScpServer implements AutoCloseable {
     }
 
     private void serve(Socket s) {
+        // ReentrantLock (not synchronized): deferred completions write responses from virtual
+        // threads; blocking socket writes must not pin carriers
+        java.util.concurrent.locks.ReentrantLock writeLock = new java.util.concurrent.locks.ReentrantLock();
         try (s) {
             DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream(), 1 << 16));
             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream(), 1 << 16));
@@ -72,32 +86,63 @@ public final class ScpServer implements AutoCloseable {
             Frame hello = FrameIO.read(in);
             if (hello == null) return;
             if (hello.opcode() != Opcode.HELLO.code) {
-                FrameIO.write(out, Frame.response(hello,
+                writeResponse(s, out, writeLock, Frame.response(hello,
                         Resp.error(ErrorCode.UNKNOWN_OPCODE, "first frame must be HELLO", 0), null));
                 return;
             }
             Messages.Hello.decode(hello.headerSlice()); // validates frame-version overlap
-            FrameIO.write(out, Frame.response(hello,
+            writeResponse(s, out, writeLock, Frame.response(hello,
                     new Messages.HelloResp(0, nodeId, incMsb, incLsb, FrameIO.MAX_FRAME_BYTES, 1L << 30).encode(), null));
 
             while (!closed.get()) {
                 Frame req = FrameIO.read(in);
                 if (req == null) return;
-                Frame resp;
+                java.util.concurrent.CompletableFuture<Frame> respF;
                 try {
-                    resp = handler.handle(req);
+                    respF = handler.handleAsync(req);
                 } catch (ScpException e) {
-                    resp = Frame.response(req, Resp.error(e.code(), e.getMessage(), e.detail()), null);
+                    respF = java.util.concurrent.CompletableFuture.completedFuture(
+                            Frame.response(req, Resp.error(e.code(), e.getMessage(), e.detail()), null));
                 } catch (Exception e) {
                     log.warn("handler error for opcode 0x{}", Integer.toHexString(req.opcode()), e);
-                    resp = Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(e), 0), null);
+                    respF = java.util.concurrent.CompletableFuture.completedFuture(
+                            Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(e), 0), null));
                 }
-                FrameIO.write(out, resp);
+                if (respF.isDone() && !respF.isCompletedExceptionally()) {
+                    writeResponse(s, out, writeLock, respF.join()); // fast path, no extra hop
+                } else {
+                    respF.whenComplete((resp, err) -> {
+                        Frame frame = resp;
+                        if (err != null) {
+                            Throwable cause = err instanceof java.util.concurrent.CompletionException
+                                    ? err.getCause() : err;
+                            frame = cause instanceof ScpException se
+                                    ? Frame.response(req, Resp.error(se.code(), se.getMessage(), se.detail()), null)
+                                    : Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(cause), 0), null);
+                        }
+                        writeResponse(s, out, writeLock, frame);
+                    });
+                }
             }
         } catch (IOException e) {
             // connection dropped — normal in failure tests
         } finally {
             connections.remove(s);
+        }
+    }
+
+    private void writeResponse(Socket s, DataOutputStream out,
+                               java.util.concurrent.locks.ReentrantLock writeLock, Frame frame) {
+        writeLock.lock();
+        try {
+            FrameIO.write(out, frame);
+        } catch (IOException e) {
+            try {
+                s.close(); // unblocks the reader loop; connection teardown is the recovery path
+            } catch (IOException ignored) {
+            }
+        } finally {
+            writeLock.unlock();
         }
     }
 

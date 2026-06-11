@@ -41,11 +41,18 @@ public final class ChunkStore implements AutoCloseable {
 
     private final Path dir;
     private final Map<ChunkId, Handle> chunks = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicLong forceCount =
+            new java.util.concurrent.atomic.AtomicLong();
 
     public ChunkStore(Path dir) throws IOException {
         this.dir = dir;
         Files.createDirectories(dir);
         recoverAll();
+    }
+
+    /** Number of group-commit force() calls — observability + coalescing tests. */
+    public long fsyncForceCount() {
+        return forceCount.get();
     }
 
     /* ---------------- per-chunk state ---------------- */
@@ -58,6 +65,7 @@ public final class ChunkStore implements AutoCloseable {
         final Path ledgerPath;
         FileChannel data;
         IntegrityLedger ledger; // null once sealed
+        GroupCommitter committer; // non-null only for OPEN ack-on-fsync chunks
         ChunkState state;
         long end;               // logical data length
         int writeEpoch;
@@ -80,6 +88,23 @@ public final class ChunkStore implements AutoCloseable {
             try (FileChannel ch = FileChannel.open(metaPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
                 ch.write(ByteBuffer.wrap(bytes), 0);
                 ch.force(true);
+            }
+        }
+
+        void startCommitterIfFsync(java.util.concurrent.atomic.AtomicLong counter) {
+            if (header.ackPolicy() == ACK_ON_FSYNC) {
+                committer = new GroupCommitter(id.toString(), () -> {
+                    // both must be durable before acking; either alone is safe for recovery
+                    data.force(false);
+                    ledger.force();
+                }, counter);
+            }
+        }
+
+        void stopCommitter() {
+            if (committer != null) {
+                committer.close(); // drains with a final force
+                committer = null;
             }
         }
     }
@@ -117,14 +142,22 @@ public final class ChunkStore implements AutoCloseable {
         h.fenceEpoch = -1;
         h.lastKnownDO = 0;
         h.persistSidecar();
+        h.startCommitterIfFsync(forceCount);
         chunks.put(id, h);
     }
 
     public record AppendResult(long endOffset) {}
 
-    public AppendResult append(ChunkId id, int epoch, long baseOffset, long durableOffset,
-                               ByteBuffer payload) throws IOException {
+    /**
+     * Validates and writes synchronously (per-chunk ordering and contiguity preserved); the
+     * returned future completes when the append is durable per the chunk's ack policy —
+     * immediately for ack-on-replicate, after a covering group-commit force for ack-on-fsync.
+     */
+    public java.util.concurrent.CompletableFuture<AppendResult> appendAsync(
+            ChunkId id, int epoch, long baseOffset, long durableOffset, ByteBuffer payload) throws IOException {
         Handle h = lookup(id);
+        long newEnd;
+        GroupCommitter committer;
         synchronized (h) {
             // fence check dominates the state check: a deposed writer must learn FENCED_EPOCH
             // (permanent death), never CHUNK_SEALED (which reads as "roll and continue")
@@ -137,18 +170,30 @@ public final class ChunkStore implements AutoCloseable {
             h.lastKnownDO = Math.max(h.lastKnownDO, Math.min(durableOffset, h.end));
             int len = payload.remaining();
             if (len == 0) {
-                return new AppendResult(h.end); // DO beacon
+                return java.util.concurrent.CompletableFuture.completedFuture(new AppendResult(h.end)); // DO beacon
             }
             int payloadCrc = Crc.of(payload.duplicate());
             h.data.write(payload.duplicate(), DATA_START + baseOffset);
-            long newEnd = baseOffset + len;
+            newEnd = baseOffset + len;
             h.ledger.append(new ChunkFormats.LedgerEntry(newEnd, payloadCrc, epoch));
-            if (h.header.ackPolicy() == ACK_ON_FSYNC) {
-                h.data.force(false);
-                h.ledger.force();
-            }
             h.end = newEnd;
-            return new AppendResult(newEnd);
+            committer = h.committer;
+        }
+        if (committer == null) {
+            return java.util.concurrent.CompletableFuture.completedFuture(new AppendResult(newEnd));
+        }
+        long end = newEnd;
+        return committer.awaitFlush(end).thenApply(v -> new AppendResult(end));
+    }
+
+    /** Synchronous convenience (tests, simple callers); production append path uses appendAsync. */
+    public AppendResult append(ChunkId id, int epoch, long baseOffset, long durableOffset,
+                               ByteBuffer payload) throws IOException {
+        try {
+            return appendAsync(id, epoch, baseOffset, durableOffset, payload).join();
+        } catch (java.util.concurrent.CompletionException e) {
+            if (e.getCause() instanceof ScpException se) throw se;
+            throw new ScpException(ErrorCode.INTERNAL, String.valueOf(e.getCause()));
         }
     }
 
@@ -209,6 +254,9 @@ public final class ChunkStore implements AutoCloseable {
             if (dataLength > h.end) {
                 throw new ScpException(ErrorCode.INTERNAL, "seal beyond end: " + dataLength + " > " + h.end);
             }
+            // stop the group committer BEFORE truncating: its flusher must not race the truncate,
+            // and its final force drains any remaining waiters
+            h.stopCommitter();
             if (dataLength < h.end) {
                 h.data.truncate(DATA_START + dataLength);
                 h.ledger.truncateTo(dataLength);
@@ -359,6 +407,7 @@ public final class ChunkStore implements AutoCloseable {
         if (h == null) return ErrorCode.CHUNK_NOT_FOUND;
         synchronized (h) {
             try {
+                h.stopCommitter();
                 if (h.data != null) h.data.close();
                 if (h.ledger != null) h.ledger.close();
                 Files.deleteIfExists(h.dataPath);
@@ -468,6 +517,7 @@ public final class ChunkStore implements AutoCloseable {
             h.state = ChunkState.OPEN;
             h.end = verifiedEnd;
             h.lastKnownDO = Math.min(h.lastKnownDO, verifiedEnd);
+            h.startCommitterIfFsync(forceCount);
         }
         chunks.put(id, h);
         log.info("recovered chunk {} state={} end={}", id, h.state, h.end);
@@ -487,6 +537,7 @@ public final class ChunkStore implements AutoCloseable {
         for (Handle h : chunks.values()) {
             synchronized (h) {
                 try {
+                    h.stopCommitter();
                     h.persistSidecar(); // persist advisory DO/epochs on clean shutdown
                     if (h.ledger != null) h.ledger.close();
                     if (h.data != null) h.data.close();
