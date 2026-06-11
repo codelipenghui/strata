@@ -178,7 +178,14 @@ final class RepairCoordinator implements AutoCloseable {
                 if (host != null) usedHosts.add(host);
             }
         }
-        if (deadNode < 0 || sources.isEmpty()) return;
+        if (sources.isEmpty()) return;
+        if (deadNode < 0 && chunk.replicas().size() >= REPLICATION_FACTOR) {
+            return; // fully replicated on live nodes — nothing to do
+        }
+        // deadNode >= 0: swap the dead member out. deadNode < 0 with a short replica list:
+        // ADD a member — happens after a corrupt/missing replica was dropped from the
+        // descriptor (inventory reconciliation); without add-mode the chunk would be stranded
+        // under-replicated with no dead node to replace.
 
         List<NodeRegistry.LiveNode> targets;
         try {
@@ -198,11 +205,9 @@ final class RepairCoordinator implements AutoCloseable {
     }
 
     private void driveDeletion(Records.FileRecord file, int version) throws Exception {
-        boolean allConfirmed = true;
         for (Records.ChunkRecord chunk : file.chunks()) {
             ChunkId chunkId = file.chunkId(chunk.index());
             for (int nodeId : chunk.replicas()) {
-                allConfirmed = false;
                 if (registry.isDead(nodeId)) {
                     // a dead node's data is unreachable; its files vanish with the volume —
                     // drop the replica reference so deletion can converge
@@ -220,7 +225,10 @@ final class RepairCoordinator implements AutoCloseable {
                 }
             }
         }
-        if (file.chunks().isEmpty() || allConfirmed && file.chunks().stream().allMatch(c -> c.replicas().isEmpty())) {
+        // chunked files converge via applyDeleteConfirmed (which drops the record once the last
+        // replica confirms); only a chunkless file is deleted here, where `version` is still
+        // valid because no mutation happened in this pass
+        if (file.chunks().isEmpty()) {
             store.deleteFile(file.fileId(), version);
             log.info("file {} fully deleted", file.fileId());
         }
@@ -250,6 +258,14 @@ final class RepairCoordinator implements AutoCloseable {
     }
 
     private void applyReplicaSwap(ReplicateAction r) throws Exception {
+        if (registry.isDead(r.targetNode())) {
+            // target completed the copy but died before the swap landed: writing a dead node
+            // into the descriptor would hand readers a bad replica — skip; the next scan
+            // re-repairs (and the dead target's copy becomes an orphan)
+            log.warn("repair target {} for {} died before descriptor swap — next scan retries",
+                    r.targetNode(), r.chunkId());
+            return;
+        }
         for (int attempt = 0; attempt < 5; attempt++) {
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(r.fileId());
             if (opt.isEmpty()) return;
@@ -258,8 +274,17 @@ final class RepairCoordinator implements AutoCloseable {
             boolean changed = false;
             for (int i = 0; i < chunks.size(); i++) {
                 Records.ChunkRecord c = chunks.get(i);
-                if (file.chunkId(c.index()).equals(r.chunkId()) && c.replicas().contains(r.deadNode())) {
+                if (!file.chunkId(c.index()).equals(r.chunkId()) || c.replicas().contains(r.targetNode())) {
+                    continue;
+                }
+                if (r.deadNode() >= 0 && c.replicas().contains(r.deadNode())) {
                     chunks.set(i, c.withReplicaSwapped(r.deadNode(), r.targetNode()));
+                    changed = true;
+                } else if (r.deadNode() < 0 && c.replicas().size() < REPLICATION_FACTOR) {
+                    List<Integer> grown = new ArrayList<>(c.replicas());
+                    grown.add(r.targetNode());
+                    chunks.set(i, new Records.ChunkRecord(c.index(), c.state(), c.length(), c.crc(),
+                            c.writeEpoch(), grown));
                     changed = true;
                 }
             }
@@ -361,6 +386,11 @@ final class RepairCoordinator implements AutoCloseable {
                                         + "dropping replica for re-repair", report.nodeId(), chunkId,
                                 entry.length(), c.length(), entry.crc(), c.crc());
                         applyDeleteConfirmed(fileId, chunkId, report.nodeId());
+                        // schedule physical deletion NOW: placement may legitimately re-pick this
+                        // node as the add-repair target, and the corrupt bytes must be gone first
+                        // (FIFO command delivery guarantees delete-before-replicate)
+                        registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
+                                commandIds.incrementAndGet(), List.of(chunkId)));
                     }
                     // entry.state() == OPEN while descriptor is SEALED: seal straggler (§9.2
                     // convergent state) — its prefix is valid; FETCH from it fails harmlessly

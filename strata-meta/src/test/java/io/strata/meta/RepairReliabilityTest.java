@@ -133,6 +133,48 @@ class RepairReliabilityTest {
         for (var r : replicas) {
             assertTrue(r.nodeId() != replicaNode, "the corrupt node must be the one dropped");
         }
+
+        // CRITICAL follow-through: the chunk is now at RF=2 with NO dead node in its replica
+        // list — repair must be able to ADD a replica (not just swap a dead one), otherwise the
+        // chunk is stranded under-replicated forever
+        long deadline = System.currentTimeMillis() + 15_000;
+        while (System.currentTimeMillis() < deadline) {
+            for (FakeNode n : nodes) n.heartbeat();
+            try {
+                service.reconcileNow();
+            } catch (Exception ignored) {
+            }
+            if (lookup(file.fileId()).chunks().get(0).replicas().size() == 3) break;
+            try {
+                Thread.sleep(150);
+            } catch (InterruptedException ignored) {
+            }
+        }
+        var restored = lookup(file.fileId()).chunks().get(0).replicas();
+        assertEquals(3, restored.size(), "repair must restore RF=3 after a corrupt-replica drop");
+
+        // the corrupt node MAY be re-picked as the add-target — but only after its corrupt copy
+        // was scheduled for physical deletion FIRST (FIFO command delivery: delete precedes the
+        // re-replicate, so the node re-pulls a clean copy instead of trusting stale bytes)
+        boolean corruptNodeReturned = restored.stream().anyMatch(r -> r.nodeId() == replicaNode);
+        if (corruptNodeReturned) {
+            FakeNode corrupt = nodes.stream().filter(n -> n.nodeId == replicaNode).findFirst().orElseThrow();
+            int deleteIdx = -1, replicateIdx = -1;
+            for (int i = 0; i < corrupt.received.size(); i++) {
+                var c = corrupt.received.get(i);
+                if (c instanceof Messages.DeleteCmd d && d.chunkIds().contains(chunk.chunkId())
+                        && deleteIdx < 0) {
+                    deleteIdx = i;
+                }
+                if (c instanceof Messages.ReplicateCmd r && r.chunkId().equals(chunk.chunkId())
+                        && replicateIdx < 0) {
+                    replicateIdx = i;
+                }
+            }
+            assertTrue(deleteIdx >= 0, "corrupt node must receive a DELETE for its bad copy");
+            assertTrue(replicateIdx < 0 || deleteIdx < replicateIdx,
+                    "DELETE must precede any re-REPLICATE to the corrupt node");
+        }
     }
 
     @Test

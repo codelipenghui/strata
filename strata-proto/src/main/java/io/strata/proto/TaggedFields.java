@@ -37,13 +37,19 @@ public final class TaggedFields {
     }
 
     public static TaggedFields readFrom(ByteBuffer buf) {
-        int n = (int) Varint.readUnsigned(buf);
+        long n = Varint.readUnsigned(buf);
         if (n == 0) return EMPTY;
+        if (n < 0 || n > 1024) {
+            throw new IllegalArgumentException("bad tagged-field count: " + n);
+        }
         TreeMap<Integer, byte[]> m = new TreeMap<>();
         for (int i = 0; i < n; i++) {
             int tag = (int) Varint.readUnsigned(buf);
-            int size = (int) Varint.readUnsigned(buf);
-            byte[] b = new byte[size];
+            long size = Varint.readUnsigned(buf);
+            if (size < 0 || size > buf.remaining()) {
+                throw new IllegalArgumentException("bad tagged-field size: " + size);
+            }
+            byte[] b = new byte[(int) size];
             buf.get(b);
             m.put(tag, b);
         }

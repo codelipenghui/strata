@@ -110,6 +110,12 @@ public final class ScpClient implements AutoCloseable {
             pending.remove(id);
             failAll(e);
             fut.completeExceptionally(e);
+            return fut;
+        }
+        // failAll() may have swept the map BETWEEN the closed-check above and our put — in that
+        // window nobody will ever complete this future; fail it ourselves rather than orphan it
+        if (closed.get() && pending.remove(id) != null) {
+            fut.completeExceptionally(new IOException("connection closed"));
         }
         return fut;
     }
@@ -143,7 +149,9 @@ public final class ScpClient implements AutoCloseable {
 
     @Override
     public void close() {
-        closed.set(true);
+        // fail pending futures synchronously: a caller observing isClosed()==true must be able
+        // to assume no future from this connection is still silently pending
+        failAll(new IOException("connection closed"));
         try {
             socket.close();
         } catch (IOException ignored) {

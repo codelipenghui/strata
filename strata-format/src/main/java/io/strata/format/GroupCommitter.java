@@ -97,6 +97,8 @@ final class GroupCommitter implements AutoCloseable {
                     try {
                         work.await();
                     } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        failRemainingLocked("flusher interrupted");
                         return;
                     }
                 }
@@ -157,12 +159,34 @@ final class GroupCommitter implements AutoCloseable {
         }
     }
 
-    /** Final force, drain remaining waiters, stop the flusher. Idempotent. */
+    /** Fails every queued waiter; caller must hold {@code lock}. Future waiters fail too. */
+    private void failRemainingLocked(String reason) {
+        poisoned = true;
+        List<Waiter> drained = new ArrayList<>(waiters);
+        waiters.clear();
+        // completing under the lock is acceptable here: this is a terminal path
+        for (Waiter w : drained) {
+            w.future().completeExceptionally(new ScpException(ErrorCode.INTERNAL, reason));
+        }
+    }
+
+    /**
+     * Final force, drain remaining waiters, stop the flusher. Idempotent.
+     *
+     * @return false if the flusher could not be confirmed terminated — the caller must NOT
+     * mutate the underlying files (truncate/close/delete) while a force may still be in flight.
+     */
     @Override
     public void close() {
+        if (!closeAndConfirm()) {
+            throw new IllegalStateException("group-commit flusher did not terminate");
+        }
+    }
+
+    boolean closeAndConfirm() {
         lock.lock();
         try {
-            if (closed) return;
+            if (closed && !flusher.isAlive()) return true;
             closed = true;
             work.signal();
         } finally {
@@ -173,5 +197,16 @@ final class GroupCommitter implements AutoCloseable {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+        if (flusher.isAlive()) {
+            // a force stuck past 10s: interrupt and give it a moment — if it STILL lives, the
+            // caller must treat the chunk as failed rather than race file mutations with it
+            flusher.interrupt();
+            try {
+                flusher.join(2_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        return !flusher.isAlive();
     }
 }

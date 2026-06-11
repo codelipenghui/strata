@@ -79,6 +79,11 @@ public final class FrameIO {
         int payloadLen = buf.getInt();
         int payloadCrc = buf.getInt();
         int headerLen = buf.getShort() & 0xFFFF;
+        if (payloadLen < 0) {
+            // a negative payload length can satisfy the equality check below (26+1+(-1)=26) and
+            // would blow up later as an unchecked IndexOutOfBounds — reject it as protocol error
+            throw new IOException("negative payload length " + payloadLen);
+        }
         if (Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen != frameLen) {
             throw new IOException("frame length mismatch: " + frameLen + " vs header=" + headerLen + " payload=" + payloadLen);
         }

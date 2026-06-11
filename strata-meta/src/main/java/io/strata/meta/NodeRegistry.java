@@ -26,6 +26,7 @@ final class NodeRegistry {
 
     static final class LiveNode {
         volatile Records.NodeRecord record;
+        volatile int recordVersion; // znode version for CAS writes
         volatile long sessionEpoch;
         volatile long leaseUntil;
         volatile long freeBytes;
@@ -45,12 +46,13 @@ final class NodeRegistry {
         this.store = store;
         this.config = config;
         // warm the in-memory view from persisted registrations (their leases start expired)
-        for (Records.NodeRecord r : store.listNodes()) {
+        for (MetadataStore.Versioned<Records.NodeRecord> v : store.listNodes()) {
             LiveNode n = new LiveNode();
-            n.record = r;
+            n.record = v.value();
+            n.recordVersion = v.version();
             n.sessionEpoch = -1;
             n.leaseUntil = 0;
-            live.put(r.nodeId(), n);
+            live.put(v.value().nodeId(), n);
         }
     }
 
@@ -69,34 +71,53 @@ final class NodeRegistry {
 
     private Messages.RegisterResp registerLocked(Messages.RegisterNode msg) throws Exception {
         // identity = incarnation persisted on the node's volumes; same incarnation -> same nodeId
-        Records.NodeRecord existing = null;
+        Integer nodeIdFound = null;
+        int existingVersion = -1;
         for (LiveNode n : live.values()) {
             if (n.record.incMsb() == msg.incMsb() && n.record.incLsb() == msg.incLsb()) {
-                existing = n.record;
+                nodeIdFound = n.record.nodeId();
+                existingVersion = n.recordVersion;
                 break;
             }
         }
-        if (existing == null) {
+        if (nodeIdFound == null) {
             // not in this leader's memory — a node that registered with a PREVIOUS leader after
             // this instance booted. The persistent store is the identity source of truth:
             // re-registration across metadata failover must keep the nodeId stable.
-            for (Records.NodeRecord r : store.listNodes()) {
-                if (r.incMsb() == msg.incMsb() && r.incLsb() == msg.incLsb()) {
-                    existing = r;
+            for (MetadataStore.Versioned<Records.NodeRecord> v : store.listNodes()) {
+                if (v.value().incMsb() == msg.incMsb() && v.value().incLsb() == msg.incLsb()) {
+                    nodeIdFound = v.value().nodeId();
+                    existingVersion = v.version();
                     break;
                 }
             }
         }
-        int nodeId = existing != null ? existing.nodeId() : store.nextNodeId();
+        int nodeId = nodeIdFound != null ? nodeIdFound : store.nextNodeId();
         byte mediaClass = msg.capacities().isEmpty() ? 0 : msg.capacities().get(0).mediaClass();
         long capacity = msg.capacities().isEmpty() ? 0 : msg.capacities().get(0).capacityBytes();
         Records.NodeRecord record = new Records.NodeRecord(nodeId, msg.incMsb(), msg.incLsb(),
                 msg.endpoints(), msg.zone(), msg.rack(), msg.host(), mediaClass, capacity,
                 Records.NodeState.REGISTERED);
-        store.putNode(record);
+
+        // CAS write; on conflict re-read once and retry — persistent conflict means another
+        // leader is mutating this record, so the node should re-register with the real leader
+        int version = existingVersion;
+        boolean written = false;
+        for (int attempt = 0; attempt < 3 && !written; attempt++) {
+            written = store.putNode(record, version);
+            if (!written) {
+                var current = store.getNode(nodeId);
+                version = current.map(MetadataStore.Versioned::version).orElse(-1);
+            }
+        }
+        if (!written) {
+            throw new ScpException(ErrorCode.NOT_LEADER, "node record contention — retry registration");
+        }
+        int committedVersion = store.getNode(nodeId).map(MetadataStore.Versioned::version).orElse(version + 1);
 
         LiveNode n = live.computeIfAbsent(nodeId, k -> new LiveNode());
         n.record = record;
+        n.recordVersion = committedVersion;
         n.sessionEpoch = sessionCounter.incrementAndGet();
         n.leaseUntil = System.currentTimeMillis() + config.leaseMs();
         n.freeBytes = capacity;
@@ -162,11 +183,22 @@ final class NodeRegistry {
     private void markState(LiveNode n, Records.NodeState state) {
         Records.NodeRecord updated = n.record.withState(state);
         try {
-            store.putNode(updated);
+            if (store.putNode(updated, n.recordVersion)) {
+                n.recordVersion = n.recordVersion + 1;
+                n.record = updated;
+            } else {
+                // CAS lost: another leader owns this record now (e.g. we are deposed and it just
+                // re-registered the node) — adopt the store's view instead of overwriting it
+                store.getNode(n.record.nodeId()).ifPresent(v -> {
+                    n.record = v.value();
+                    n.recordVersion = v.version();
+                });
+                log.warn("node {} state transition to {} lost CAS — adopted store state {}",
+                        updated.nodeId(), state, n.record.state());
+            }
         } catch (Exception e) {
             log.warn("persisting node {} state {} failed", n.record.nodeId(), state, e);
         }
-        n.record = updated;
     }
 
     List<LiveNode> aliveNodes() {

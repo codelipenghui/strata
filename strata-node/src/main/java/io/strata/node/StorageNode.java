@@ -88,6 +88,7 @@ public final class StorageNode implements AutoCloseable {
     void nodeIdAssigned(int id) throws IOException {
         if (this.nodeId != id) {
             this.nodeId = id;
+            server.setNodeId(id); // HELLO responses must announce the real id, not -1
             persistIdentity(config.dataDir(), new Identity(id, incarnation));
         }
     }

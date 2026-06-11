@@ -145,6 +145,25 @@ class CrashRecoveryTest {
     }
 
     @Test
+    void corruptFooterIsDetectedAtRecoveryAndChunkQuarantined() throws Exception {
+        ChunkStore store = new ChunkStore(dir);
+        open(store);
+        store.append(id, 1, 0, 0, ByteBuffer.wrap("sealed-data".getBytes()));
+        store.seal(id, 1, 11, null);
+        // bit-rot inside the footer section area (between data end and the 64B trailer)
+        long fileSize = Files.size(dataPath());
+        try (FileChannel ch = FileChannel.open(dataPath(), StandardOpenOption.WRITE)) {
+            ch.write(ByteBuffer.wrap(new byte[]{0x7F}), ChunkFormats.DATA_START + 11 + 4);
+        }
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            // a sealed chunk whose footer fails its CRC must be quarantined, not served
+            assertEquals(0, recovered.inventory().size(),
+                    "corrupt-footer chunk must not be recovered as healthy");
+        }
+        assertEquals(fileSize, Files.size(dataPath()), "quarantine must not destroy evidence");
+    }
+
+    @Test
     void chunkWithoutSidecarIsRemovedAsUnacked() throws Exception {
         ChunkStore store = new ChunkStore(dir);
         open(store);

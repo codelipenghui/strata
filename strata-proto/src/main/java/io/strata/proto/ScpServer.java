@@ -42,7 +42,7 @@ public final class ScpServer implements AutoCloseable {
 
     private final ServerSocket serverSocket;
     private final Handler handler;
-    private final int nodeId;
+    private volatile int nodeId; // updatable: a fresh storage node learns its id at registration
     private final long incMsb;
     private final long incLsb;
     private final AtomicBoolean closed = new AtomicBoolean(false);
@@ -59,6 +59,11 @@ public final class ScpServer implements AutoCloseable {
 
     public int port() {
         return serverSocket.getLocalPort();
+    }
+
+    /** Updates the node id announced in HELLO responses (assigned at first registration). */
+    public void setNodeId(int nodeId) {
+        this.nodeId = nodeId;
     }
 
     private void acceptLoop() {
@@ -90,7 +95,15 @@ public final class ScpServer implements AutoCloseable {
                         Resp.error(ErrorCode.UNKNOWN_OPCODE, "first frame must be HELLO", 0), null));
                 return;
             }
-            Messages.Hello.decode(hello.headerSlice()); // validates frame-version overlap
+            try {
+                Messages.Hello.decode(hello.headerSlice()); // validates frame-version overlap
+            } catch (RuntimeException e) {
+                // incompatible version range or malformed HELLO header: answer with a typed
+                // error instead of silently dropping the connection
+                writeResponse(s, out, writeLock, Frame.response(hello,
+                        Resp.error(ErrorCode.UNSUPPORTED_VERSION, String.valueOf(e.getMessage()), 0), null));
+                return;
+            }
             writeResponse(s, out, writeLock, Frame.response(hello,
                     new Messages.HelloResp(0, nodeId, incMsb, incLsb, FrameIO.MAX_FRAME_BYTES, 1L << 30).encode(), null));
 

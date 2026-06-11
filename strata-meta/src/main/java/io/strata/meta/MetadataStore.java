@@ -34,11 +34,17 @@ public interface MetadataStore extends AutoCloseable {
 
     int nextNodeId() throws Exception;
 
-    void putNode(Records.NodeRecord record) throws Exception;
+    /**
+     * CAS write of a node record: expectedVersion -1 creates (fails if present), otherwise
+     * updates only if the stored version matches. A deposed leader's stale write must lose —
+     * unconditional node writes allowed a dead leader's expire-scan to overwrite the new
+     * leader's REGISTERED state with DEAD.
+     */
+    boolean putNode(Records.NodeRecord record, int expectedVersion) throws Exception;
 
-    Optional<Records.NodeRecord> getNode(int nodeId) throws Exception;
+    Optional<Versioned<Records.NodeRecord>> getNode(int nodeId) throws Exception;
 
-    List<Records.NodeRecord> listNodes() throws Exception;
+    List<Versioned<Records.NodeRecord>> listNodes() throws Exception;
 
     @Override
     void close();

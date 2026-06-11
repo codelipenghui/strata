@@ -104,6 +104,41 @@ scripts/        verify.sh (full pyramid), run helpers
     replicas are dropped from the descriptor (re-repaired; their copy becomes an orphan and is
     deleted by the existing orphan path).
 
+## Full-repo review pass (4 parallel reviewers + adjudication; all fixes verified by tests)
+
+Real bugs fixed (TDD where deterministically testable):
+- **Repair could only SWAP dead replicas, never ADD** — a corrupt-replica drop left chunks
+  stranded at RF=2 forever. Add-mode repair (deadNode=-1 sentinel); corrupt copies are now also
+  physically deleted FIRST (FIFO before any re-replicate to the same node), and node-side
+  replicate validates an existing local copy against expected len/crc instead of trusting it.
+  (`RepairReliabilityTest` extended.)
+- **Recovery could not catch up a replica behind the durable offset** — its re-replication
+  APPEND at base=p hit OFFSET_GAP, was swallowed, and recovery "succeeded" leaving a short OPEN
+  replica in the descriptor. Recovery now has a catch-up phase (also used for the found-sealed
+  path), per-replica end tracking, and evicts-with-quorum-check any replica that cannot reach
+  the seal point; finishSeal only includes caught-up replicas. (`RecoveryCatchUpTest`.)
+- **Node-record writes were unconditional** — a deposed leader's expire scan could overwrite the
+  new leader's REGISTERED with DEAD. putNode is now CAS by znode version; the registry tracks
+  versions; a lost CAS adopts the store state. (`ZkMetadataStoreCasTest`.)
+- **Sealed-chunk recovery never verified the footer CRC** — rotted footer metadata was served as
+  healthy. Footer (KBs) now CRC-verified at recovery; mismatch quarantines the chunk, preserving
+  evidence. Full data-region verification stays deferred to scrub. (`CrashRecoveryTest`.)
+- **Protocol input validation**: negative payload length passed the frame length-equality check
+  (26+1-1=26) and killed connections with unchecked exceptions; adversarial list counts hit
+  ArrayList "Illegal Capacity"; incompatible HELLO got a silent close instead of
+  UNSUPPORTED_VERSION; tagged-field count/size unbounded. All now typed protocol errors.
+  (`AdversarialInputTest`.)
+- ScpClient: orphaned-future race (send vs failAll between closed-check and registration) and
+  close() not failing pending futures; appender sealChunkMeta failure now dies cleanly instead
+  of leaking a half-sealed session; applyReplicaSwap skips a target that died before the swap;
+  driveDeletion dead `allConfirmed` logic removed; GroupCommitter interrupt drains waiters and
+  close() confirms flusher termination (stuck flusher fails the operation rather than racing
+  file mutations); importSealed range-checks trailer dataLength; OPEN-chunk-without-ledger now
+  logged loudly; HELLO announces the registered nodeId (was -1 until restart).
+
+Adjudicated NOT bugs: duplicate command completions (deduped by inflight.remove), node
+re-registration on a live connection (stateless RPC), one reviewer self-retraction.
+
 ## Correctness invariants under test (tech design §14)
 
 1. Acked data (quorum 2-of-3) survives any single node failure through seal — verified by the recorder/verifier harness in every integration & chaos test.

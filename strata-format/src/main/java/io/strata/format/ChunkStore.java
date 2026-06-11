@@ -101,9 +101,14 @@ public final class ChunkStore implements AutoCloseable {
             }
         }
 
-        void stopCommitter() {
+        void stopCommitter() throws IOException {
             if (committer != null) {
-                committer.close(); // drains with a final force
+                // drains with a final force; a flusher stuck in a hung force means we must NOT
+                // proceed to truncate/close/delete these files — fail the operation instead
+                if (!committer.closeAndConfirm()) {
+                    throw new IOException("group-commit flusher stuck for " + id
+                            + " — refusing to mutate chunk files");
+                }
                 committer = null;
             }
         }
@@ -366,6 +371,9 @@ public final class ChunkStore implements AutoCloseable {
         if (fileBytes.length < HEADER_SIZE + TRAILER_SIZE) {
             throw new ScpException(ErrorCode.CORRUPT_CHUNK, "file too short");
         }
+        // fileBytes is int-indexed, so anything that fit arrived < 2 GB — but the trailer's
+        // claimed dataLength must still be range-checked before the (int) narrowing below
+        long maxData = fileBytes.length - HEADER_SIZE - TRAILER_SIZE;
         byte[] headerBytes = new byte[HEADER_SIZE];
         System.arraycopy(fileBytes, 0, headerBytes, 0, HEADER_SIZE);
         ChunkFormats.Header header = ChunkFormats.Header.decode(headerBytes);
@@ -377,6 +385,9 @@ public final class ChunkStore implements AutoCloseable {
         ChunkFormats.Trailer trailer = ChunkFormats.Trailer.decode(trailerBytes);
         if (expectedLength >= 0 && trailer.dataLength() != expectedLength) {
             throw new ScpException(ErrorCode.CORRUPT_CHUNK, "length mismatch: " + trailer.dataLength());
+        }
+        if (trailer.dataLength() < 0 || trailer.dataLength() > maxData) {
+            throw new ScpException(ErrorCode.CORRUPT_CHUNK, "bad dataLength " + trailer.dataLength());
         }
         int dataCrc = Crc.of(fileBytes, HEADER_SIZE, (int) trailer.dataLength());
         if (dataCrc != trailer.dataCrc() || (expectedCrc != 0 && dataCrc != expectedCrc)) {
@@ -492,6 +503,18 @@ public final class ChunkStore implements AutoCloseable {
             byte[] trailerBytes = new byte[TRAILER_SIZE];
             readFully(h.data, ByteBuffer.wrap(trailerBytes), fileLen - TRAILER_SIZE);
             ChunkFormats.Trailer trailer = ChunkFormats.Trailer.decode(trailerBytes);
+            // verify the footer sections against the trailer's CRC (cheap — KBs): a sealed chunk
+            // with rotted footer metadata must be quarantined, not served as healthy (full
+            // data-region verification is deferred to scrub; readers have CRC_RANGES + batch CRCs)
+            long footerLen = fileLen - TRAILER_SIZE - trailer.footerStart();
+            if (footerLen < 0 || trailer.footerStart() != DATA_START + trailer.dataLength()) {
+                throw new CorruptChunkException("trailer geometry invalid for " + id);
+            }
+            byte[] footerBytes = new byte[(int) footerLen];
+            readFully(h.data, ByteBuffer.wrap(footerBytes), trailer.footerStart());
+            if (Crc.of(footerBytes) != trailer.footerCrc()) {
+                throw new CorruptChunkException("footer crc mismatch for sealed chunk " + id);
+            }
             h.state = ChunkState.SEALED;
             h.end = trailer.dataLength();
             h.sealedLength = trailer.dataLength();
@@ -499,6 +522,13 @@ public final class ChunkStore implements AutoCloseable {
             Files.deleteIfExists(h.ledgerPath); // seal crashed before ledger delete
         } else {
             // OPEN: replay ledger, verify tail data CRCs, truncate to the last verified boundary
+            if (!Files.exists(h.ledgerPath) && h.data.size() > HEADER_SIZE) {
+                // the ledger should only ever be absent for SEALED chunks; an open chunk with
+                // data but no ledger means external damage — its bytes are unverifiable and the
+                // truncate below discards them, so say it loudly
+                log.warn("chunk {} is OPEN with {} data bytes but NO integrity ledger — "
+                        + "unverifiable data will be discarded", id, h.data.size() - HEADER_SIZE);
+            }
             h.ledger = IntegrityLedger.open(h.ledgerPath);
             long verifiedEnd = 0;
             byte[] buf = null;

@@ -18,6 +18,22 @@ import java.util.Map;
 public final class Messages {
     private Messages() {}
 
+    /** Sanity bound for any list count on the wire — far above legitimate use. */
+    static final int MAX_COUNT = 1_000_000;
+
+    /**
+     * Reads a list count and validates it: an adversarial varint (e.g. 0xFFFFFFFF) narrows to a
+     * negative int and would otherwise surface as ArrayList's "Illegal Capacity" — an unchecked
+     * exception that kills the connection thread instead of producing a typed protocol error.
+     */
+    static int count(ByteBuffer b) {
+        long n = Varint.readUnsigned(b);
+        if (n < 0 || n > MAX_COUNT) {
+            throw new IllegalArgumentException("bad list count on wire: " + n);
+        }
+        return (int) n;
+    }
+
     /* ---------- shared sub-structs ---------- */
 
     public record Replica(int nodeId, String endpoint) {
@@ -36,7 +52,7 @@ public final class Messages {
     }
 
     static List<Replica> readReplicas(ByteBuffer b) {
-        int n = (int) Varint.readUnsigned(b);
+        int n = count(b);
         List<Replica> rs = new ArrayList<>(n);
         for (int i = 0; i < n; i++) rs.add(Replica.read(b));
         return rs;
@@ -88,7 +104,7 @@ public final class Messages {
             long msb = b.getLong(), lsb = b.getLong();
             int maxFrame = b.getInt();
             long maxInflight = b.getLong();
-            int n = (int) Varint.readUnsigned(b);
+            int n = count(b);
             for (int i = 0; i < n; i++) { b.getShort(); b.getShort(); }
             TaggedFields.readFrom(b);
             return new HelloResp(features, nodeId, msb, lsb, maxFrame, maxInflight);
@@ -272,7 +288,7 @@ public final class Messages {
         }
 
         public static DeleteChunks decode(ByteBuffer b) {
-            int n = (int) Varint.readUnsigned(b);
+            int n = count(b);
             List<ChunkId> ids = new ArrayList<>(n);
             for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
             TaggedFields.readFrom(b);
@@ -293,7 +309,7 @@ public final class Messages {
         }
 
         public static DeleteChunksResp decode(ByteBuffer b) {
-            int n = (int) Varint.readUnsigned(b);
+            int n = count(b);
             List<ChunkId> ids = new ArrayList<>(n);
             List<Short> codes = new ArrayList<>(n);
             for (int i = 0; i < n; i++) {
@@ -362,7 +378,7 @@ public final class Messages {
         }
 
         public static ReadLedgerResp decode(ByteBuffer b) {
-            int n = (int) Varint.readUnsigned(b);
+            int n = count(b);
             List<LedgerEntry> es = new ArrayList<>(n);
             for (int i = 0; i < n; i++) es.add(new LedgerEntry(b.getLong(), b.getInt(), b.getInt()));
             TaggedFields.readFrom(b);
@@ -391,11 +407,11 @@ public final class Messages {
 
         public static RegisterNode decode(ByteBuffer b) {
             long msb = b.getLong(), lsb = b.getLong();
-            int ne = (int) Varint.readUnsigned(b);
+            int ne = count(b);
             List<String> eps = new ArrayList<>(ne);
             for (int i = 0; i < ne; i++) eps.add(Varint.readString(b));
             String zone = Varint.readString(b), rack = Varint.readString(b), host = Varint.readString(b);
-            int nc = (int) Varint.readUnsigned(b);
+            int nc = count(b);
             List<MediaCapacity> caps = new ArrayList<>(nc);
             for (int i = 0; i < nc; i++) caps.add(new MediaCapacity(b.get(), b.getLong()));
             int fmt = b.getInt();
@@ -450,7 +466,7 @@ public final class Messages {
             int nodeId = b.getInt();
             long msb = b.getLong(), lsb = b.getLong();
             long session = b.getLong();
-            int nu = (int) Varint.readUnsigned(b);
+            int nu = count(b);
             List<MediaUsage> us = new ArrayList<>(nu);
             for (int i = 0; i < nu; i++) us.add(new MediaUsage(b.get(), b.getLong(), b.getLong()));
             int depth = b.getInt();
@@ -491,7 +507,7 @@ public final class Messages {
             return switch (type) {
                 case 1 -> new ReplicateCmd(id, ChunkId.readFrom(b), readReplicas(b), b.get(), b.getInt(), b.getLong());
                 case 2 -> {
-                    int n = (int) Varint.readUnsigned(b);
+                    int n = count(b);
                     List<ChunkId> ids = new ArrayList<>(n);
                     for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
                     yield new DeleteCmd(id, ids);
@@ -522,7 +538,7 @@ public final class Messages {
 
         public static HeartbeatResp decode(ByteBuffer b) {
             long lease = b.getLong();
-            int n = (int) Varint.readUnsigned(b);
+            int n = count(b);
             List<Command> cs = new ArrayList<>(n);
             for (int i = 0; i < n; i++) cs.add(Command.read(b));
             TaggedFields.readFrom(b);
@@ -546,7 +562,7 @@ public final class Messages {
 
         public static InventoryReport decode(ByteBuffer b) {
             int nodeId = b.getInt(), shard = b.getInt(), count = b.getInt();
-            int n = (int) Varint.readUnsigned(b);
+            int n = count(b);
             List<InventoryEntry> es = new ArrayList<>(n);
             for (int i = 0; i < n; i++) {
                 es.add(new InventoryEntry(ChunkId.readFrom(b), ChunkState.fromValue(b.get()), b.getLong(), b.getInt()));
@@ -672,7 +688,7 @@ public final class Messages {
 
         public static LookupFileResp decode(ByteBuffer b) {
             byte kind = b.get(), ack = b.get(), state = b.get();
-            int n = (int) Varint.readUnsigned(b);
+            int n = count(b);
             List<ChunkInfo> cs = new ArrayList<>(n);
             for (int i = 0; i < n; i++) cs.add(ChunkInfo.read(b));
             TaggedFields.readFrom(b);
@@ -690,7 +706,7 @@ public final class Messages {
         }
 
         public static DeleteFiles decode(ByteBuffer b) {
-            int n = (int) Varint.readUnsigned(b);
+            int n = count(b);
             List<FileId> ids = new ArrayList<>(n);
             for (int i = 0; i < n; i++) ids.add(FileId.readFrom(b));
             TaggedFields.readFrom(b);
@@ -711,7 +727,7 @@ public final class Messages {
         }
 
         public static DeleteFilesResp decode(ByteBuffer b) {
-            int n = (int) Varint.readUnsigned(b);
+            int n = count(b);
             List<FileId> ids = new ArrayList<>(n);
             List<Short> codes = new ArrayList<>(n);
             for (int i = 0; i < n; i++) {

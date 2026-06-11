@@ -266,11 +266,20 @@ final class AppenderImpl implements SegmentStore.Appender {
         long fl = finalLength;
         int fcrc = crc;
         ChunkId id = s.chunkId;
+        ScpException metaFailure = null;
         lock.unlock();
         try {
             meta.sealChunkMeta(id, epoch, fl, fcrc);
+        } catch (ScpException e) {
+            metaFailure = e; // handled under the lock below
         } finally {
             lock.lock();
+        }
+        if (metaFailure != null) {
+            // replicas are sealed but metadata isn't: the session is unusable — die cleanly with
+            // the real cause instead of leaking a half-sealed session into the next append
+            // (recoverAndSeal commits the metadata idempotently later)
+            dieLocked(metaFailure);
         }
     }
 

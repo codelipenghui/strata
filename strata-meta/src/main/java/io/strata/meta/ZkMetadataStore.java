@@ -106,27 +106,34 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     @Override
-    public void putNode(Records.NodeRecord record) throws Exception {
+    public boolean putNode(Records.NodeRecord record, int expectedVersion) throws Exception {
         String path = NODES + "/" + record.nodeId();
-        if (curator.checkExists().forPath(path) == null) {
-            curator.create().forPath(path, record.encode());
-        } else {
-            curator.setData().forPath(path, record.encode());
+        try {
+            if (expectedVersion < 0) {
+                curator.create().forPath(path, record.encode());
+            } else {
+                curator.setData().withVersion(expectedVersion).forPath(path, record.encode());
+            }
+            return true;
+        } catch (KeeperException.NodeExistsException | KeeperException.BadVersionException e) {
+            return false;
         }
     }
 
     @Override
-    public Optional<Records.NodeRecord> getNode(int nodeId) throws Exception {
+    public Optional<Versioned<Records.NodeRecord>> getNode(int nodeId) throws Exception {
         try {
-            return Optional.of(Records.NodeRecord.decode(curator.getData().forPath(NODES + "/" + nodeId)));
+            Stat stat = new Stat();
+            byte[] data = curator.getData().storingStatIn(stat).forPath(NODES + "/" + nodeId);
+            return Optional.of(new Versioned<>(Records.NodeRecord.decode(data), stat.getVersion()));
         } catch (KeeperException.NoNodeException e) {
             return Optional.empty();
         }
     }
 
     @Override
-    public List<Records.NodeRecord> listNodes() throws Exception {
-        List<Records.NodeRecord> out = new ArrayList<>();
+    public List<Versioned<Records.NodeRecord>> listNodes() throws Exception {
+        List<Versioned<Records.NodeRecord>> out = new ArrayList<>();
         for (String child : curator.getChildren().forPath(NODES)) {
             getNode(Integer.parseInt(child)).ifPresent(out::add);
         }

@@ -172,7 +172,17 @@ final class ControlLoop implements AutoCloseable {
 
     private void replicate(Messages.ReplicateCmd cmd) throws IOException {
         if (store.contains(cmd.chunkId())) {
-            return; // command replay — already have it
+            // command replay — but only a VALID copy counts: a local chunk whose seal state or
+            // crc/length mismatch the descriptor is corrupt and must be replaced, not trusted
+            var stat = store.stat(cmd.chunkId());
+            if (stat.state() == io.strata.common.ChunkState.SEALED
+                    && stat.sealedLength() == cmd.expectedLength()
+                    && (cmd.expectedCrc() == 0 || stat.dataCrc() == cmd.expectedCrc())) {
+                return;
+            }
+            log.warn("local copy of {} mismatches descriptor (state={} len={} crc={}) — re-pulling",
+                    cmd.chunkId(), stat.state(), stat.sealedLength(), stat.dataCrc());
+            store.delete(cmd.chunkId());
         }
         ScpException last = null;
         for (Messages.Replica source : cmd.sources()) {
