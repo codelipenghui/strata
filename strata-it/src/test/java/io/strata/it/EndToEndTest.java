@@ -37,8 +37,8 @@ class EndToEndTest {
 
     @AfterAll
     void teardown() throws Exception {
-        client.close();
-        cluster.close();
+        if (client != null) client.close();
+        if (cluster != null) cluster.close();
     }
 
     @Test

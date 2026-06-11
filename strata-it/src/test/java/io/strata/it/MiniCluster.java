@@ -19,9 +19,9 @@ import java.util.List;
  * deterministic fault injection by killing components.
  */
 final class MiniCluster implements AutoCloseable {
-    final TestingServer zk;       // null when an external (containerized) ZK is supplied
+    TestingServer zk;             // null when an external (containerized) ZK is supplied
     final List<MetadataService> metas = new ArrayList<>();
-    final MetadataService meta;   // the first instance (initial leader) — legacy accessor
+    MetadataService meta;         // the first instance (initial leader) — legacy accessor
     final List<StorageNode> nodes = new ArrayList<>();
     final Path root;
     private String zkConnect;
@@ -37,22 +37,32 @@ final class MiniCluster implements AutoCloseable {
     /** zkConnectOverride lets chaos tests supply a containerized ZooKeeper. */
     MiniCluster(int nodeCount, String zkConnectOverride, int metaCount) throws Exception {
         this.root = Files.createTempDirectory("strata-it");
-        if (zkConnectOverride == null) {
-            this.zk = new TestingServer(true);
-            this.zkConnect = zk.getConnectString();
-        } else {
-            this.zk = null;
-            this.zkConnect = zkConnectOverride;
+        try {
+            if (zkConnectOverride == null) {
+                this.zk = new TestingServer(true);
+                this.zkConnect = zk.getConnectString();
+            } else {
+                this.zkConnect = zkConnectOverride;
+            }
+            for (int i = 0; i < metaCount; i++) {
+                metas.add(new MetadataService(MetaConfig.forTests(zkConnect)));
+            }
+            this.meta = metas.get(0);
+            awaitAnyLeader();
+            for (int i = 0; i < nodeCount; i++) {
+                addNode("host-" + i);
+            }
+            if (nodeCount > 0) awaitRegistered(nodeCount);
+        } catch (Exception e) {
+            // constructor failure must not leak half a cluster (a flake here previously left
+            // nodes/meta/zk running AND made teardown NPE on the unassigned field)
+            try {
+                close();
+            } catch (Exception suppressed) {
+                e.addSuppressed(suppressed);
+            }
+            throw e;
         }
-        for (int i = 0; i < metaCount; i++) {
-            metas.add(new MetadataService(MetaConfig.forTests(zkConnect)));
-        }
-        this.meta = metas.get(0);
-        awaitAnyLeader();
-        for (int i = 0; i < nodeCount; i++) {
-            addNode("host-" + i);
-        }
-        if (nodeCount > 0) awaitRegistered(nodeCount);
     }
 
     void awaitAnyLeader() throws InterruptedException {

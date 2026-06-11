@@ -129,6 +129,11 @@ public final class MetadataService implements AutoCloseable {
                 // or buggy client must not freeze a file mid-write (validated under CAS, so it
                 // is race-free against concurrent chunk creates)
                 mutateFile(m.fileId(), file -> {
+                    if (file.state() == Records.FileState.DELETING) {
+                        // sealing must never resurrect a DELETING file: deletion would stop
+                        // half-way, leaving a "live" file with missing chunks
+                        throw new ScpException(ErrorCode.PRECONDITION_FAILED, "file is DELETING");
+                    }
                     long total = 0;
                     for (Records.ChunkRecord c : file.chunks()) {
                         if (c.state() != ChunkState.SEALED) {
@@ -181,10 +186,20 @@ public final class MetadataService implements AutoCloseable {
             if (file.state() != Records.FileState.OPEN) {
                 throw new ScpException(ErrorCode.FILE_SEALED, "file state " + file.state());
             }
-            // stale-leader guard: a new epoch may already own this file
+            // stale-leader guard: a new epoch may already own this file (fence precedence)
             int maxEpoch = file.chunks().stream().mapToInt(Records.ChunkRecord::writeEpoch).max().orElse(-1);
             if (m.writeEpoch() < maxEpoch) {
                 throw new ScpException(ErrorCode.FENCED_EPOCH, "file epoch " + maxEpoch, maxEpoch);
+            }
+            // no legitimate flow creates a chunk while the tail is OPEN (appenders seal before
+            // rolling, recovery seals before new appenders open) — racing same-epoch writers
+            // would otherwise both claim the same file offsets in different chunks
+            if (!file.chunks().isEmpty()) {
+                Records.ChunkRecord tail = file.chunks().get(file.chunks().size() - 1);
+                if (tail.state() == ChunkState.OPEN) {
+                    throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                            "tail chunk " + tail.index() + " is OPEN — seal or recover it first");
+                }
             }
             byte mediaClass = m.mediaClassHint() != (byte) 0xFF ? m.mediaClassHint() : file.mediaClass();
             List<NodeRegistry.LiveNode> nodes = Placement.choose(registry, 3, mediaClass,
@@ -215,6 +230,10 @@ public final class MetadataService implements AutoCloseable {
             var opt = store.getFile(m.chunkId().fileId());
             if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, m.chunkId().toString());
             Records.FileRecord file = opt.get().value();
+            if (file.state() == Records.FileState.DELETING) {
+                // an in-flight appender must not mutate a file that deletion is dismantling
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED, "file is DELETING");
+            }
             List<Records.ChunkRecord> chunks = new ArrayList<>(file.chunks());
             boolean found = false;
             for (int i = 0; i < chunks.size(); i++) {

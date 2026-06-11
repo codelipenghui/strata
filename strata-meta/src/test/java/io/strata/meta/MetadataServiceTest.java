@@ -117,17 +117,18 @@ class MetadataServiceTest {
         }
         assertEquals(3, ids.size());
 
-        // lower-epoch create rejected after epoch-2 chunk exists (stale leader guard)
+        // seal chunk 0, then a higher-epoch writer takes over with chunk 1
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunkResp.chunkId(), 1, 4096, 0xAB, List.of()).encode(), null, 5000);
         var chunk2 = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(fileId, 2, (byte) 0xFF).encode(), null, 5000));
         assertEquals(1, chunk2.chunkId().index());
+
+        // lower-epoch create rejected (stale leader guard; fence precedence over tail-open)
         ScpException stale = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(fileId, 1, (byte) 0xFF).encode(), null, 5000));
         assertEquals(ErrorCode.FENCED_EPOCH, stale.code());
 
-        // seal chunk 0 and look it up
-        client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunkResp.chunkId(), 1, 4096, 0xAB, List.of()).encode(), null, 5000);
         var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
                 new Messages.LookupFile(fileId).encode(), null, 5000));
         assertEquals(2, lookup.chunks().size());
@@ -208,6 +209,58 @@ class MetadataServiceTest {
                             List.of(new Messages.MediaCapacity(mediaClass, 1L << 40)), 1, 0).encode(),
                     null, 5000);
         }
+    }
+
+    @Test
+    void createChunkRejectedWhileTailChunkIsOpen() {
+        registerTrio((byte) 11, "tailHost");
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 11, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 11).encode(), null, 5000));
+
+        // no legitimate flow creates a chunk while the tail is OPEN (appenders seal before
+        // rolling; recovery seals before a new appender opens) — two same-epoch appenders racing
+        // would otherwise both claim file offset 0 in different chunks
+        ScpException e = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 11).encode(), null, 5000));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, e.code());
+        ScpException e2 = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 2, (byte) 11).encode(), null, 5000));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, e2.code());
+
+        // sealing the tail re-enables creation
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 10, 0xA, List.of()).encode(), null, 5000);
+        var next = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 11).encode(), null, 5000));
+        assertEquals(1, next.chunkId().index());
+    }
+
+    @Test
+    void deletingFileCannotBeSealedOrResurrected() {
+        registerTrio((byte) 12, "delHost");
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 12, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 12).encode(), null, 5000));
+
+        client.call(Opcode.DELETE_FILES, new Messages.DeleteFiles(List.of(file.fileId())).encode(), null, 5000);
+
+        // an in-flight appender's seal must not mutate a DELETING file...
+        ScpException sealChunk = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 10, 0xA, List.of()).encode(), null, 5000));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, sealChunk.code());
+
+        // ...and SEAL_FILE must never resurrect it to SEALED (deletion would half-stop, leaving
+        // a live file with missing chunks)
+        ScpException sealFile = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_FILE,
+                new Messages.SealFile(file.fileId(), 0).encode(), null, 5000));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, sealFile.code());
+
+        var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
+                new Messages.LookupFile(file.fileId()).encode(), null, 5000));
+        assertEquals(2, lookup.fileState(), "file must remain DELETING");
     }
 
     @Test

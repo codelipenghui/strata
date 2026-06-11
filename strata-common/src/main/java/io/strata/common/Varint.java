@@ -42,10 +42,7 @@ public final class Varint {
     }
 
     public static String readString(ByteBuffer buf) {
-        int len = (int) readUnsigned(buf);
-        byte[] bytes = new byte[len];
-        buf.get(bytes);
-        return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+        return new String(readBytes(buf), java.nio.charset.StandardCharsets.UTF_8);
     }
 
     public static void writeBytes(ByteBuffer buf, byte[] b) {
@@ -54,8 +51,15 @@ public final class Varint {
     }
 
     public static byte[] readBytes(ByteBuffer buf) {
-        int len = (int) readUnsigned(buf);
-        byte[] b = new byte[len];
+        long len = readUnsigned(buf);
+        // validate BEFORE allocating: a small frame advertising a huge (or negative-after-
+        // narrowing) length must be a typed protocol rejection, not heap pressure or an
+        // unchecked NegativeArraySizeException
+        if (len < 0 || len > buf.remaining()) {
+            throw new IllegalArgumentException(
+                    "bad length on wire: " + len + " (remaining " + buf.remaining() + ")");
+        }
+        byte[] b = new byte[(int) len];
         buf.get(b);
         return b;
     }

@@ -234,10 +234,16 @@ final class ControlLoop implements AutoCloseable {
     }
 
     private void inventoryLoop() {
+        int cycle = 0;
         while (!closed.get()) {
             sleepQuiet(config.inventoryIntervalMs());
             if (closed.get()) return;
             try {
+                // periodic scrub (every 10th cycle): recompute sealed data CRCs so rot shows up
+                // in the NEXT report's crc and the coordinator drops + re-repairs the replica
+                if (++cycle % 10 == 0) {
+                    store.scrubOnce();
+                }
                 ScpClient m = meta;
                 if (m == null || m.isClosed() || sessionEpoch < 0) continue;
                 List<Messages.InventoryEntry> entries = new ArrayList<>();

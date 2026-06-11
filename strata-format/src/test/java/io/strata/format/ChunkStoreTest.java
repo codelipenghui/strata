@@ -16,6 +16,7 @@ import java.nio.file.Path;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ChunkStoreTest {
 
@@ -209,6 +210,52 @@ class ChunkStoreTest {
             assertEquals(7, store.stat(id).localEndOffset());
             assertEquals(8, store.append(id, 1, 7, 7, bytes("!")).endOffset());
             assertEquals(8, store.seal(id, 1, 8, null).finalLength());
+        }
+    }
+
+    @Test
+    void readAndFetchSizesAreClampedServerSide() throws Exception {
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            byte[] big = new byte[9 << 20]; // 9 MB > the 8 MB per-request cap
+            store.append(id, 1, 0, 0, ByteBuffer.wrap(big));
+            store.seal(id, 1, big.length, null);
+
+            // a request asking for "everything" must be clamped, not answered with one
+            // chunk-sized allocation (callers loop; the frame layer caps at 64 MB anyway)
+            var r = store.read(id, 0, Integer.MAX_VALUE);
+            assertEquals(ChunkStore.MAX_REQUEST_BYTES, r.bytes().length);
+            var f = store.fetch(id, 0, Integer.MAX_VALUE);
+            assertEquals(ChunkStore.MAX_REQUEST_BYTES, f.bytes().length);
+        }
+    }
+
+    @Test
+    void scrubDetectsDataRotAndExposesItThroughInventory() throws Exception {
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            store.append(id, 1, 0, 0, bytes("pristine-data!"));
+            var sealed = store.seal(id, 1, 14, null);
+
+            // inventory reports the seal-time CRC — descriptor and node agree
+            assertEquals(sealed.dataCrc(), store.inventory().get(0).crc());
+
+            // bit-rot in the data region: the STORED crc still matches the descriptor, so only
+            // recomputation can catch it
+            String base = ChunkFormats.baseName(id);
+            try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(
+                    dir.resolve(base + ".chunk"), java.nio.file.StandardOpenOption.WRITE)) {
+                ch.write(ByteBuffer.wrap(new byte[]{0x7F}), ChunkFormats.DATA_START + 3);
+            }
+            assertEquals(sealed.dataCrc(), store.inventory().get(0).crc(),
+                    "before scrub the rot is invisible");
+
+            int corrupt = store.scrubOnce();
+            assertEquals(1, corrupt, "scrub must detect the rotted chunk");
+            // inventory now exposes the RECOMPUTED crc — the coordinator's existing
+            // corrupt-mismatch path drops this replica and re-repairs from good copies
+            assertTrue(store.inventory().get(0).crc() != sealed.dataCrc(),
+                    "inventory must reflect the actual bytes after scrub");
         }
     }
 

@@ -160,6 +160,27 @@ re-registration on a live connection (stateless RPC), one reviewer self-retracti
 - **P3 ControlLoop.close() interrupts and joins its virtual threads** (executeCommands no
   longer lingers in commandQueue.take()).
 
+## Third external review (6 findings, all verified, fixed with TDD)
+
+- **P1 CREATE_CHUNK rejected while the tail chunk is OPEN** — no legitimate flow creates over an
+  open tail (appenders seal before rolling, recovery seals before new appenders open); racing
+  same-epoch appenders could otherwise both claim file offset 0 in different chunks. Fence check
+  keeps precedence. Same-epoch dual writers after a seal remain a caller-contract violation that
+  v1 controller-issued unique epochs eliminate. (`MetadataServiceTest`.)
+- **P1 DELETING files are immutable to writers** — seal-chunk and SEAL_FILE now reject DELETING
+  (SEAL_FILE previously RESURRECTED a half-deleted file to SEALED, stopping deletion with chunks
+  missing). (`MetadataServiceTest`.)
+- **P2 read/fetch clamped server-side** at 8 MB per request (allocation was data-bounded, not
+  attacker-controlled, but a >64 MB response would die at the frame layer anyway; callers loop).
+- **P2 varint length validation before allocation** — a small frame advertising a huge/negative
+  string/bytes length is a typed rejection, not heap pressure or NegativeArraySizeException.
+- **P2 scrub** — nodes recompute sealed data CRCs (every 10th inventory cycle, and
+  `ChunkStore.scrubOnce()` on demand); rot updates the reported CRC so the coordinator's
+  existing corrupt-replica path drops and re-repairs the copy. Same-length silent corruption is
+  now detected end-to-end without read-path cost. (`ChunkStoreTest`.)
+- **P3 test-infra**: MiniCluster constructor cleans up on failure; all teardowns null-guarded
+  (a setup flake previously leaked the half-built cluster and NPE'd teardown).
+
 ## Correctness invariants under test (tech design §14)
 
 1. Acked data (quorum 2-of-3) survives any single node failure through seal — verified by the recorder/verifier harness in every integration & chaos test.

@@ -38,6 +38,8 @@ public final class ChunkStore implements AutoCloseable {
 
     public static final byte ACK_ON_REPLICATE = 0;
     public static final byte ACK_ON_FSYNC = 1;
+    /** Per-request read/fetch cap: callers loop; the frame layer tops out at 64 MB anyway. */
+    public static final int MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 
     private final Path dir;
     private final Map<ChunkId, Handle> chunks = new ConcurrentHashMap<>();
@@ -217,7 +219,7 @@ public final class ChunkStore implements AutoCloseable {
         synchronized (h) {
             long end = h.state == ChunkState.SEALED ? h.sealedLength : h.end;
             if (offset >= end) return new ReadResult(new byte[0], end, h.lastKnownDO);
-            int n = (int) Math.min(maxBytes, end - offset);
+            int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), end - offset);
             byte[] out = new byte[n];
             readFully(h.data, ByteBuffer.wrap(out), DATA_START + offset);
             return new ReadResult(out, end, h.lastKnownDO);
@@ -371,7 +373,7 @@ public final class ChunkStore implements AutoCloseable {
             }
             long fileLen = h.data.size();
             if (offset >= fileLen) return new FetchResult(fileLen, h.state, new byte[0]);
-            int n = (int) Math.min(maxBytes, fileLen - offset);
+            int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), fileLen - offset);
             byte[] out = new byte[n];
             readFully(h.data, ByteBuffer.wrap(out), offset);
             return new FetchResult(fileLen, h.state, out);
@@ -470,6 +472,30 @@ public final class ChunkStore implements AutoCloseable {
 
     public boolean contains(ChunkId id) {
         return chunks.containsKey(id);
+    }
+
+    /**
+     * Re-verifies sealed chunks' data regions against their trailer CRC (tech design §16
+     * crash-safety / the read-path's deferred verification). On rot, the handle's dataCrc is
+     * updated to the RECOMPUTED value so the next inventory report mismatches the descriptor —
+     * the coordinator's existing corrupt-replica path then drops and re-repairs this copy.
+     * Returns the number of corrupt chunks found.
+     */
+    public int scrubOnce() throws IOException {
+        int corrupt = 0;
+        for (Handle h : chunks.values()) {
+            synchronized (h) {
+                if (h.state != ChunkState.SEALED) continue;
+                int actual = scanDataCrcs(h, h.sealedLength).dataCrc();
+                if (actual != h.dataCrc) {
+                    log.error("scrub: sealed chunk {} data rot — stored crc {} actual {}; "
+                            + "exposing via inventory for re-repair", h.id, h.dataCrc, actual);
+                    h.dataCrc = actual;
+                    corrupt++;
+                }
+            }
+        }
+        return corrupt;
     }
 
     /* ---------------- startup recovery (tech design §11.3) ---------------- */
