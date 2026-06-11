@@ -89,6 +89,20 @@ scripts/        verify.sh (full pyramid), run helpers
     FsyncAppenderPipelineTest (full stack) — all assert forces << appends.
   Result @ window 256: fsync p50 2,941ms → 75ms (39×), throughput 0.1 → 3.2 MB/s (32×);
   replicate mode and read path unchanged.
+- [x] **Review fixes (5 findings, all verified real, fixed with TDD)**:
+  - P1 recovery seal divergence: Recovery.finishSeal now requires all successful seal responses
+    to agree on length+crc (the appender's check) — never commits metadata over divergent bytes
+    (`RecoveryDivergenceTest` constructs same-length-different-bytes replicas).
+  - P1 stuck repair: in-flight commands are swept when the executing node is DEAD or the command
+    aged past `repairCommandTimeoutMs` (new MetaConfig field) — the chunksBeingRepaired marker is
+    released and the next scan re-issues (`RepairReliabilityTest`).
+  - P2 SEAL_FILE validation: refuses unless every chunk is SEALED and lengths sum to the
+    requested total (new error code 19 PRECONDITION_FAILED); also closes the no-epoch zombie
+    file-seal hole, since a live appender implies an open chunk.
+  - P2 seal idempotence: requires length AND crc match; same-length-different-crc is refused.
+  - P2 inventory reconciliation: sealed entries must match descriptor length+crc; corrupt
+    replicas are dropped from the descriptor (re-repaired; their copy becomes an orphan and is
+    deleted by the existing orphan path).
 
 ## Correctness invariants under test (tech design §14)
 

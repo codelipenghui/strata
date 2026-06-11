@@ -198,6 +198,66 @@ class MetadataServiceTest {
         assertEquals(ErrorCode.LEASE_EXPIRED, e.code());
     }
 
+    /** Registers three fake nodes on distinct hosts with the given media class. */
+    private void registerTrio(byte mediaClass, String hostPrefix) {
+        for (String host : List.of(hostPrefix + "A", hostPrefix + "B", hostPrefix + "C")) {
+            UUID inc = UUID.randomUUID();
+            client.call(Opcode.REGISTER_NODE,
+                    new Messages.RegisterNode(inc.getMostSignificantBits(), inc.getLeastSignificantBits(),
+                            List.of(host + ":9000"), "z1", "r1", host,
+                            List.of(new Messages.MediaCapacity(mediaClass, 1L << 40)), 1, 0).encode(),
+                    null, 5000);
+        }
+    }
+
+    @Test
+    void chunkSealIdempotenceRequiresMatchingCrc() {
+        registerTrio((byte) 5, "crcHost");
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 5, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 5).encode(), null, 5000));
+
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xA).encode(), null, 5000);
+        // true idempotent retry: same length AND same crc -> OK
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xA).encode(), null, 5000);
+        // same length, DIFFERENT crc: byte divergence — the metadata layer must refuse
+        ScpException e = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xB).encode(), null, 5000));
+        assertEquals(ErrorCode.CHUNK_SEALED, e.code());
+    }
+
+    @Test
+    void sealFileValidatesChunkStatesAndTotalLength() {
+        registerTrio((byte) 6, "sfHost");
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 6, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 6).encode(), null, 5000));
+
+        // open chunk present -> sealing the file must be refused
+        ScpException open = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_FILE,
+                new Messages.SealFile(file.fileId(), 0).encode(), null, 5000));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, open.code());
+
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC).encode(), null, 5000);
+
+        // wrong total length -> refused
+        ScpException wrongLen = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_FILE,
+                new Messages.SealFile(file.fileId(), 999).encode(), null, 5000));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, wrongLen.code());
+
+        // correct total -> OK, and idempotent
+        client.call(Opcode.SEAL_FILE, new Messages.SealFile(file.fileId(), 100).encode(), null, 5000);
+        client.call(Opcode.SEAL_FILE, new Messages.SealFile(file.fileId(), 100).encode(), null, 5000);
+        var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
+                new Messages.LookupFile(file.fileId()).encode(), null, 5000));
+        assertEquals(1, lookup.fileState());
+    }
+
     @Test
     void placementRequiresThreeAliveNodesOnDistinctHosts() throws Exception {
         // fresh service state: nodes from other tests may be alive; use a distinct media class

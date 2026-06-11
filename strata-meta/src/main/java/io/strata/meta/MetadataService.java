@@ -125,9 +125,26 @@ public final class MetadataService implements AutoCloseable {
 
             case SEAL_FILE -> {
                 var m = Messages.SealFile.decode(h);
-                mutateFile(m.fileId(), file -> new Records.FileRecord(file.fileId(), file.fileKind(),
-                        file.mediaClass(), file.ackPolicy(), file.ownerTag(), Records.FileState.SEALED,
-                        file.createdAtMs(), file.chunks()));
+                // a file seals only when every chunk is sealed and the lengths add up — a stale
+                // or buggy client must not freeze a file mid-write (validated under CAS, so it
+                // is race-free against concurrent chunk creates)
+                mutateFile(m.fileId(), file -> {
+                    long total = 0;
+                    for (Records.ChunkRecord c : file.chunks()) {
+                        if (c.state() != ChunkState.SEALED) {
+                            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                                    "chunk " + c.index() + " is " + c.state());
+                        }
+                        total += c.length();
+                    }
+                    if (total != m.totalLength()) {
+                        throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                                "total length " + total + " != requested " + m.totalLength(), total);
+                    }
+                    return new Records.FileRecord(file.fileId(), file.fileKind(),
+                            file.mediaClass(), file.ackPolicy(), file.ownerTag(), Records.FileState.SEALED,
+                            file.createdAtMs(), file.chunks());
+                });
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
 
@@ -205,8 +222,10 @@ public final class MetadataService implements AutoCloseable {
                 if (c.index() == m.chunkId().index()) {
                     found = true;
                     if (c.state() == ChunkState.SEALED) {
-                        if (c.length() == m.length()) return; // idempotent
-                        throw new ScpException(ErrorCode.CHUNK_SEALED, "sealed at " + c.length(), c.length());
+                        if (c.length() == m.length() && c.crc() == m.crc()) return; // idempotent retry
+                        // same length but different crc is byte divergence — never swallow it
+                        throw new ScpException(ErrorCode.CHUNK_SEALED,
+                                "sealed at " + c.length() + " crc " + c.crc(), c.length());
                     }
                     if (m.writeEpoch() < c.writeEpoch()) {
                         throw new ScpException(ErrorCode.FENCED_EPOCH, "chunk epoch " + c.writeEpoch(),

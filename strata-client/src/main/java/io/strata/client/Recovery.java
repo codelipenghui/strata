@@ -156,24 +156,34 @@ final class Recovery {
 
     private long finishSeal(ChunkId chunkId, int epoch,
                             long dataLength, List<Messages.Replica> replicas) {
-        // seal every reachable replica; require quorum
+        // seal every reachable replica; require quorum AND agreement — committing metadata over
+        // replicas that sealed the same length with different bytes would violate invariant
+        // §14.6 (the appender's seal path performs the same check)
         int ok = 0;
         long finalLength = -1;
         int crc = 0;
         ScpException last = null;
         for (Messages.Replica r : replicas) {
+            Messages.SealResp resp;
             try {
                 ByteBuffer h = pool.get(r.endpoint()).call(Opcode.SEAL_CHUNK,
                         new Messages.SealChunk(chunkId, epoch, dataLength).encode(), null,
                         config.callTimeoutMs());
-                var resp = Messages.SealResp.decode(h);
-                finalLength = resp.finalLength();
-                crc = resp.chunkCrc();
-                ok++;
+                resp = Messages.SealResp.decode(h);
             } catch (ScpException e) {
                 last = e;
                 log.warn("recovery seal {} on {} failed: {}", chunkId, r.endpoint(), e.getMessage());
+                continue;
             }
+            if (ok > 0 && (resp.finalLength() != finalLength || resp.chunkCrc() != crc)) {
+                throw new ScpException(ErrorCode.INTERNAL,
+                        "replica seal divergence on " + chunkId + " during recovery: " + r.endpoint()
+                                + " returned len=" + resp.finalLength() + " crc=" + resp.chunkCrc()
+                                + " vs len=" + finalLength + " crc=" + crc);
+            }
+            finalLength = resp.finalLength();
+            crc = resp.chunkCrc();
+            ok++;
         }
         if (ok < 2) {
             throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "recovery seal quorum lost");

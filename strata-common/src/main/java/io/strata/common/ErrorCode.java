@@ -21,7 +21,8 @@ public enum ErrorCode {
     NOT_LEADER(15, true),
     NO_CAPACITY(16, true),
     FILE_NOT_FOUND(17, false),
-    FILE_SEALED(18, false);
+    FILE_SEALED(18, false),
+    PRECONDITION_FAILED(19, false);
 
     public final short code;
     public final boolean retriable;

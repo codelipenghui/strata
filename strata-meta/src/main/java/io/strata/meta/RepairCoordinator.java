@@ -27,12 +27,27 @@ final class RepairCoordinator implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(RepairCoordinator.class);
     private static final int REPLICATION_FACTOR = 3;
 
-    private sealed interface Action permits ReplicateAction, DeleteAction {}
+    private sealed interface Action permits ReplicateAction, DeleteAction {
+        int executingNode();
 
-    private record ReplicateAction(FileId fileId, ChunkId chunkId, int deadNode, int targetNode)
-            implements Action {}
+        long issuedAtMs();
+    }
 
-    private record DeleteAction(FileId fileId, ChunkId chunkId, int nodeId) implements Action {}
+    private record ReplicateAction(FileId fileId, ChunkId chunkId, int deadNode, int targetNode,
+                                   long issuedAtMs) implements Action {
+        @Override
+        public int executingNode() {
+            return targetNode;
+        }
+    }
+
+    private record DeleteAction(FileId fileId, ChunkId chunkId, int nodeId, long issuedAtMs)
+            implements Action {
+        @Override
+        public int executingNode() {
+            return nodeId;
+        }
+    }
 
     private final MetadataStore store;
     private final NodeRegistry registry;
@@ -91,6 +106,7 @@ final class RepairCoordinator implements AutoCloseable {
 
     /** One reconciliation pass over all files. Idempotent; safe to run concurrently with serving. */
     void scanOnce() throws Exception {
+        sweepStuckCommands();
         record Repair(FileId fileId, Records.FileRecord file, Records.ChunkRecord chunk, int liveReplicas) {}
         List<Repair> repairs = new ArrayList<>();
 
@@ -126,6 +142,27 @@ final class RepairCoordinator implements AutoCloseable {
         }
     }
 
+    /**
+     * Releases in-flight commands whose executing node died or which aged past the command
+     * timeout without a completion — otherwise the chunksBeingRepaired marker would suppress an
+     * under-replicated chunk forever (until a service restart). The next scan re-issues.
+     */
+    private void sweepStuckCommands() {
+        long now = System.currentTimeMillis();
+        for (Map.Entry<Long, Action> e : inflight.entrySet()) {
+            Action a = e.getValue();
+            boolean dead = registry.isDead(a.executingNode());
+            boolean expired = now - a.issuedAtMs() > config.repairCommandTimeoutMs();
+            if (!dead && !expired) continue;
+            if (inflight.remove(e.getKey()) == null) continue; // completion raced us — it won
+            if (a instanceof ReplicateAction r) {
+                chunksBeingRepaired.remove(r.chunkId());
+                log.warn("repair cmd {} for {} abandoned (target {} {}) — will re-issue",
+                        e.getKey(), r.chunkId(), r.targetNode(), dead ? "dead" : "timed out");
+            }
+        }
+    }
+
     private void issueReplicate(FileId fileId, Records.FileRecord file, Records.ChunkRecord chunk) {
         ChunkId chunkId = file.chunkId(chunk.index());
         int deadNode = -1;
@@ -152,7 +189,8 @@ final class RepairCoordinator implements AutoCloseable {
         }
         NodeRegistry.LiveNode target = targets.get(0);
         long cmdId = commandIds.incrementAndGet();
-        inflight.put(cmdId, new ReplicateAction(fileId, chunkId, deadNode, target.record.nodeId()));
+        inflight.put(cmdId, new ReplicateAction(fileId, chunkId, deadNode, target.record.nodeId(),
+                System.currentTimeMillis()));
         chunksBeingRepaired.add(chunkId);
         registry.enqueue(target.record.nodeId(),
                 new Messages.ReplicateCmd(cmdId, chunkId, sources, (byte) 1, chunk.crc(), chunk.length()));
@@ -176,7 +214,8 @@ final class RepairCoordinator implements AutoCloseable {
                                 && d.chunkId().equals(chunkId) && d.nodeId() == nodeId);
                 if (!alreadyInflight) {
                     long cmdId = commandIds.incrementAndGet();
-                    inflight.put(cmdId, new DeleteAction(file.fileId(), chunkId, nodeId));
+                    inflight.put(cmdId, new DeleteAction(file.fileId(), chunkId, nodeId,
+                            System.currentTimeMillis()));
                     registry.enqueue(nodeId, new Messages.DeleteCmd(cmdId, List.of(chunkId)));
                 }
             }
@@ -273,9 +312,9 @@ final class RepairCoordinator implements AutoCloseable {
      */
     void onInventory(Messages.InventoryReport report) {
         try {
-            Set<ChunkId> reported = new HashSet<>();
+            Map<ChunkId, Messages.InventoryEntry> reported = new java.util.HashMap<>();
             for (Messages.InventoryEntry e : report.entries()) {
-                reported.add(e.chunkId());
+                reported.put(e.chunkId(), e);
             }
             // orphan detection
             List<ChunkId> orphans = new ArrayList<>();
@@ -298,18 +337,33 @@ final class RepairCoordinator implements AutoCloseable {
                 registry.enqueue(report.nodeId(), new Messages.DeleteCmd(cmdId, orphans));
                 log.info("node {}: {} orphan chunk(s) scheduled for deletion", report.nodeId(), orphans.size());
             }
-            // missing detection (sealed chunks this node should hold but didn't report)
+            // missing or corrupt detection: a sealed chunk this node should hold must be reported
+            // with the descriptor's exact length and crc — right id with wrong bytes is corruption
+            // and the replica must stop being a read/repair source (the under-replication scan
+            // then re-repairs, and the dropped node's copy becomes an orphan to delete)
             for (FileId fileId : store.listFiles()) {
                 Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
                 if (opt.isEmpty() || opt.get().value().state() == Records.FileState.DELETING) continue;
                 Records.FileRecord file = opt.get().value();
                 for (Records.ChunkRecord c : file.chunks()) {
-                    if (c.state() == ChunkState.SEALED && c.replicas().contains(report.nodeId())
-                            && !reported.contains(file.chunkId(c.index()))) {
-                        log.warn("node {} lost sealed chunk {} — dropping replica for re-repair",
-                                report.nodeId(), file.chunkId(c.index()));
-                        applyDeleteConfirmed(fileId, file.chunkId(c.index()), report.nodeId());
+                    if (c.state() != ChunkState.SEALED || !c.replicas().contains(report.nodeId())) {
+                        continue;
                     }
+                    ChunkId chunkId = file.chunkId(c.index());
+                    Messages.InventoryEntry entry = reported.get(chunkId);
+                    if (entry == null) {
+                        log.warn("node {} lost sealed chunk {} — dropping replica for re-repair",
+                                report.nodeId(), chunkId);
+                        applyDeleteConfirmed(fileId, chunkId, report.nodeId());
+                    } else if (entry.state() == ChunkState.SEALED
+                            && (entry.length() != c.length() || entry.crc() != c.crc())) {
+                        log.warn("node {} holds corrupt sealed chunk {} (len {}/{} crc {}/{}) — "
+                                        + "dropping replica for re-repair", report.nodeId(), chunkId,
+                                entry.length(), c.length(), entry.crc(), c.crc());
+                        applyDeleteConfirmed(fileId, chunkId, report.nodeId());
+                    }
+                    // entry.state() == OPEN while descriptor is SEALED: seal straggler (§9.2
+                    // convergent state) — its prefix is valid; FETCH from it fails harmlessly
                 }
             }
         } catch (Exception e) {

@@ -7,13 +7,14 @@ public record MetaConfig(
         int heartbeatIntervalMs,   // told to nodes at registration
         int leaseMs,               // lease granted per heartbeat
         int deadGraceMs,           // lease expiry -> SUSPECT; expiry + grace -> DEAD (repair starts)
-        int repairScanIntervalMs
+        int repairScanIntervalMs,
+        int repairCommandTimeoutMs // in-flight command without completion past this -> re-issue
 ) {
     public static MetaConfig forTests(String zkConnect) {
-        return new MetaConfig(zkConnect, 0, 200, 1_000, 1_500, 300);
+        return new MetaConfig(zkConnect, 0, 200, 1_000, 1_500, 300, 3_000);
     }
 
     public static MetaConfig production(String zkConnect, int port) {
-        return new MetaConfig(zkConnect, port, 1_000, 10_000, 300_000, 30_000);
+        return new MetaConfig(zkConnect, port, 1_000, 10_000, 300_000, 30_000, 600_000);
     }
 }

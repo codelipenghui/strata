@@ -276,7 +276,7 @@ Node identity: the assigned `nodeId` + `incarnationId` are persisted in an ident
 
 ### 10.5 Error codes (shared, append-only)
 
-`0 OK · 1 UNKNOWN_OPCODE · 2 UNSUPPORTED_VERSION · 3 FENCED_EPOCH · 4 OFFSET_GAP (retriable) · 5 CHUNK_NOT_FOUND · 6 CHUNK_SEALED · 7 CHUNK_ALREADY_EXISTS · 8 OUT_OF_SPACE · 9 CRC_MISMATCH · 10 NOT_REGISTERED · 11 LEASE_EXPIRED · 12 THROTTLED (retriable; tagged retryAfterMs) · 13 CORRUPT_CHUNK · 14 INTERNAL (retriable) · 15 NOT_LEADER (retriable; v0) · 16 NO_CAPACITY (retriable; v0) · 17 FILE_NOT_FOUND (v0) · 18 FILE_SEALED (v0)`. Codes 0–999 reserved for protocol-level errors; 1000+ for future domain extensions. Codes are never renumbered or reused.
+`0 OK · 1 UNKNOWN_OPCODE · 2 UNSUPPORTED_VERSION · 3 FENCED_EPOCH · 4 OFFSET_GAP (retriable) · 5 CHUNK_NOT_FOUND · 6 CHUNK_SEALED · 7 CHUNK_ALREADY_EXISTS · 8 OUT_OF_SPACE · 9 CRC_MISMATCH · 10 NOT_REGISTERED · 11 LEASE_EXPIRED · 12 THROTTLED (retriable; tagged retryAfterMs) · 13 CORRUPT_CHUNK · 14 INTERNAL (retriable) · 15 NOT_LEADER (retriable; v0) · 16 NO_CAPACITY (retriable; v0) · 17 FILE_NOT_FOUND (v0) · 18 FILE_SEALED (v0) · 19 PRECONDITION_FAILED (v0)`. Codes 0–999 reserved for protocol-level errors; 1000+ for future domain extensions. Codes are never renumbered or reused.
 
 Error precedence (v0 finding, locked as protocol semantics): **the fence check dominates the state
 check** — a deposed writer appending to a recovery-sealed chunk gets `FENCED_EPOCH` (permanent
