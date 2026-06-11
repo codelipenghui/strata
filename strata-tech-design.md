@@ -351,15 +351,21 @@ File-level header `{u32 magic "SCKP", u16 version}` then append-only entries `{u
 The client library the broker embeds (JVM, since the broker is Kafka-derived); the API is deliberately **Kafka-free** — files, bytes, offsets, epochs — preserving the tenant-agnostic discipline (product doc §5). Semantics below are normative for any future implementation.
 
 ```java
-interface StrataClient {
+interface StrataClient extends AutoCloseable {
   static StrataClient connect(ClientConfig config);
-  CompletableFuture<FileHandle> create(FileSpec spec);
+  StrataFile create(FileSpec spec);
       // spec: fileKind, mediaClass, ackPolicy, owner tag (opaque to storage)
-  CompletableFuture<Appender>   openForAppend(FileId id, int writeEpoch);
-  CompletableFuture<Reader>     openForRead(FileId id);
-  CompletableFuture<SealInfo>   recoverAndSeal(FileId id, int newEpoch);
-      // fence all chunks → seal-recover the open tail (§7.3) → returns sealed length
-  CompletableFuture<Void>       delete(List<FileId> ids);
+  StrataFile open(FileId id);
+  void delete(FileId id);
+  void delete(List<FileId> ids);
+}
+
+interface StrataFile {
+  FileId id();
+  Appender openForAppend(int writeEpoch);
+  Reader openForRead();
+  SealInfo recoverAndSeal(int newEpoch);
+      // fence all chunks -> seal-recover the open tail (§7.3) -> returns sealed length
 }
 
 interface Appender extends AutoCloseable {

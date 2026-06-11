@@ -17,7 +17,7 @@ import java.util.List;
  * Reader (tech design §6): sealed chunks from any replica; open-chunk reads are clamped to the
  * replica-known durable offset, so a reader never sees un-quorum-acked bytes (invariant §14.3).
  */
-final class ReaderImpl implements StrataClient.Reader {
+final class ReaderImpl implements StrataFile.Reader {
     private final MetaClient meta;
     private final NodePool pool;
     private final ClientConfig config;
@@ -39,7 +39,7 @@ final class ReaderImpl implements StrataClient.Reader {
     }
 
     @Override
-    public StrataClient.ReadResult read(long fileOffset, int maxBytes) {
+    public StrataFile.ReadResult read(long fileOffset, int maxBytes) {
         if (fileOffset < 0) {
             throw new ScpException(ErrorCode.INTERNAL, "negative read offset " + fileOffset);
         }
@@ -67,18 +67,18 @@ final class ReaderImpl implements StrataClient.Reader {
                     byte[] data = readFromReplicas(chunk, chunkOffset, want, false);
                     boolean eof = f.fileState() == 1 /* SEALED */ && last
                             && fileOffset + data.length == chunkEnd;
-                    return new StrataClient.ReadResult(data, eof);
+                    return new StrataFile.ReadResult(data, eof);
                 }
                 base = chunkEnd;
             } else {
                 // open chunk: serve [fileOffset-base, durableOffset)
                 long chunkOffset = fileOffset - base;
                 byte[] data = readFromReplicas(chunk, chunkOffset, maxBytes, true);
-                return new StrataClient.ReadResult(data, false);
+                return new StrataFile.ReadResult(data, false);
             }
         }
         boolean eof = f.fileState() == 1;
-        return new StrataClient.ReadResult(new byte[0], eof);
+        return new StrataFile.ReadResult(new byte[0], eof);
     }
 
     private byte[] readFromReplicas(Messages.ChunkInfo chunk, long offset, int maxBytes, boolean open) {

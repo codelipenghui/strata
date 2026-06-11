@@ -442,7 +442,7 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(open))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
-                StrataClient.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(5, sealedInfo.sealedLength());
                 assertEquals(5L, sealedFileLength.get());
@@ -466,7 +466,7 @@ class RecoveryTest {
                              new Messages.Replica(3, endpoint(validB))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
-                StrataClient.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(4, sealedInfo.sealedLength());
                 assertEquals(4L, sealedFileLength.get());
@@ -527,7 +527,7 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(lagging))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
-                StrataClient.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(4, sealedInfo.sealedLength());
                 assertEquals(4L, sealedFileLength.get());
@@ -560,7 +560,7 @@ class RecoveryTest {
                              new Messages.Replica(3, endpoint(invalidLong))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
-                StrataClient.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(4, sealedInfo.sealedLength());
                 assertEquals(4L, sealedFileLength.get());
@@ -607,7 +607,7 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(malformedLedger))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
-                StrataClient.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(0, sealedInfo.sealedLength());
                 assertEquals(0L, sealedFileLength.get());
@@ -766,7 +766,7 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(s2))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
-                StrataClient.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(0, sealedInfo.sealedLength());
                 assertEquals(0L, sealedFileLength.get());
@@ -791,7 +791,7 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(s2))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
-                StrataClient.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(0, sealedInfo.sealedLength());
                 assertEquals(0L, sealedFileLength.get());
@@ -862,7 +862,7 @@ class RecoveryTest {
                              new Messages.Replica(3, endpoint(divergent))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
-                StrataClient.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(0, sealedInfo.sealedLength());
                 assertEquals(0L, sealedFileLength.get());
@@ -888,7 +888,7 @@ class RecoveryTest {
                              new Messages.Replica(3, endpoint(full))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
-                StrataClient.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(4, sealedInfo.sealedLength());
                 assertEquals(4L, sealedFileLength.get());

@@ -64,7 +64,7 @@ class RecoveryCatchUpTest {
                 }
             }
 
-            var sealed = client.recoverAndSeal(fileId, 2);
+            var sealed = client.open(fileId).recoverAndSeal(2);
             assertEquals(12, sealed.sealedLength(), "all quorum-durable bytes must be preserved");
 
             // EVERY replica in the descriptor must now serve the full sealed chunk byte-identically
@@ -136,7 +136,7 @@ class RecoveryCatchUpTest {
                 }
             }
 
-            var sealed = client.recoverAndSeal(fileId, 2);
+            var sealed = client.open(fileId).recoverAndSeal(2);
             assertEquals(8, sealed.sealedLength(),
                     "a short sealed replica must not truncate quorum-durable bytes");
 
@@ -149,7 +149,7 @@ class RecoveryCatchUpTest {
                     "the short sealed copy must be excluded from the descriptor");
             assertTrue(lookup.chunks().get(0).replicas().stream().noneMatch(r -> r.nodeId() == shortReplica));
 
-            try (var reader = client.openForRead(fileId)) {
+            try (var reader = client.open(fileId).openForRead()) {
                 assertEquals("AAAABBBB", new String(reader.read(0, 16).data(), StandardCharsets.UTF_8));
             }
         }
@@ -192,7 +192,7 @@ class RecoveryCatchUpTest {
                 }
             }
 
-            var sealed = client.recoverAndSeal(fileId, 2);
+            var sealed = client.open(fileId).recoverAndSeal(2);
             assertEquals(12, sealed.sealedLength(),
                     "recovery must preserve the full valid batch, not stop at a shorter partial boundary");
 

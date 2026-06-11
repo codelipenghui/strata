@@ -33,7 +33,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * monitor pin their carrier (JDK 21), and replica callbacks ARE virtual threads; pinned carriers
  * can starve every other virtual thread in the process (observed as a full-JVM stall).
  */
-final class AppenderImpl implements StrataClient.Appender {
+final class AppenderImpl implements StrataFile.Appender {
     private static final Logger log = LoggerFactory.getLogger(AppenderImpl.class);
     private static final int REPLICA_SLOTS = 3;
     private static final int OPEN_QUORUM = 2;
@@ -81,7 +81,7 @@ final class AppenderImpl implements StrataClient.Appender {
         }
     }
 
-    private record Pending(long chunkEnd, CompletableFuture<StrataClient.AppendAck> future) {}
+    private record Pending(long chunkEnd, CompletableFuture<StrataFile.AppendAck> future) {}
 
     private record SealKey(long finalLength, int crc) {}
 
@@ -106,7 +106,7 @@ final class AppenderImpl implements StrataClient.Appender {
     }
 
     @Override
-    public CompletableFuture<StrataClient.AppendAck> append(ByteBuffer data) {
+    public CompletableFuture<StrataFile.AppendAck> append(ByteBuffer data) {
         lock.lock();
         try {
             awaitNotRolling();
@@ -114,13 +114,13 @@ final class AppenderImpl implements StrataClient.Appender {
             int len = data.remaining();
             if (len == 0) {
                 if (session == null) {
-                    return CompletableFuture.completedFuture(new StrataClient.AppendAck(fileBase, fileBase));
+                    return CompletableFuture.completedFuture(new StrataFile.AppendAck(fileBase, fileBase));
                 }
                 if (session.end <= session.durable) {
                     return CompletableFuture.completedFuture(
-                            new StrataClient.AppendAck(fileOffset(session.end), fileOffset(session.durable)));
+                            new StrataFile.AppendAck(fileOffset(session.end), fileOffset(session.durable)));
                 }
-                CompletableFuture<StrataClient.AppendAck> callerFuture = new CompletableFuture<>();
+                CompletableFuture<StrataFile.AppendAck> callerFuture = new CompletableFuture<>();
                 session.pending.addLast(new Pending(session.end, callerFuture));
                 return callerFuture;
             }
@@ -132,7 +132,7 @@ final class AppenderImpl implements StrataClient.Appender {
             long base = s.end;
             long newEnd = checkedAdd(base, len, "chunk offset");
             s.end = newEnd;
-            CompletableFuture<StrataClient.AppendAck> callerFuture = new CompletableFuture<>();
+            CompletableFuture<StrataFile.AppendAck> callerFuture = new CompletableFuture<>();
             s.pending.addLast(new Pending(newEnd, callerFuture));
 
             byte[] header = new Messages.Append(s.chunkId, epoch, base, s.durable).encode();
@@ -257,9 +257,9 @@ final class AppenderImpl implements StrataClient.Appender {
             s.durable = second;
             while (!s.pending.isEmpty() && s.pending.peekFirst().chunkEnd() <= s.durable) {
                 Pending p = s.pending.peekFirst();
-                StrataClient.AppendAck ack;
+                StrataFile.AppendAck ack;
                 try {
-                    ack = new StrataClient.AppendAck(fileOffset(p.chunkEnd()), fileOffset(s.durable));
+                    ack = new StrataFile.AppendAck(fileOffset(p.chunkEnd()), fileOffset(s.durable));
                 } catch (ScpException e) {
                     dieLocked(e);
                     return;
@@ -562,7 +562,7 @@ final class AppenderImpl implements StrataClient.Appender {
     }
 
     @Override
-    public StrataClient.SealInfo seal() {
+    public StrataFile.SealInfo seal() {
         lock.lock();
         try {
             awaitNotRolling();
@@ -601,7 +601,7 @@ final class AppenderImpl implements StrataClient.Appender {
                 }
                 dead = true;
                 deathCause = new ScpException(ErrorCode.FILE_SEALED, "appender sealed the file");
-                return new StrataClient.SealInfo(total);
+                return new StrataFile.SealInfo(total);
             } finally {
                 rolling = false;
                 progress.signalAll();

@@ -31,7 +31,7 @@ class RecoveryDivergenceTest {
                     List.of("AAAA".getBytes(), "AAAA".getBytes(), "BBBB".getBytes()));
 
             String[] hp = cluster.metaEndpoint().split(":");
-            var sealed = client.recoverAndSeal(setup.fileId(), 2);
+            var sealed = client.open(setup.fileId()).recoverAndSeal(2);
             assertEquals(4, sealed.sealedLength());
 
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
@@ -42,7 +42,7 @@ class RecoveryDivergenceTest {
                         "metadata must retain only the agreeing seal quorum");
             }
 
-            try (var reader = client.openForRead(setup.fileId())) {
+            try (var reader = client.open(setup.fileId()).openForRead()) {
                 assertArrayEquals("AAAA".getBytes(), reader.read(0, 4).data());
             }
         }
@@ -55,7 +55,7 @@ class RecoveryDivergenceTest {
             var setup = createOpenChunkWithReplicaPayloads(cluster, "split",
                     List.of("AAAA".getBytes(), "BBBB".getBytes(), "CCCC".getBytes()));
 
-            ScpException e = assertThrows(ScpException.class, () -> client.recoverAndSeal(setup.fileId(), 2));
+            ScpException e = assertThrows(ScpException.class, () -> client.open(setup.fileId()).recoverAndSeal(2));
             assertEquals(ErrorCode.INTERNAL, e.code());
             assertTrue(e.getMessage().contains("divergence"),
                     "expected a divergence failure, got: " + e.getMessage());

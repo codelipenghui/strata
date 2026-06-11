@@ -5,6 +5,7 @@ import eu.rekawek.toxiproxy.ToxiproxyClient;
 import eu.rekawek.toxiproxy.model.ToxicDirection;
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
+import io.strata.client.StrataFile;
 import io.strata.client.StrataClient;
 import io.strata.common.FileId;
 import io.strata.node.NodeConfig;
@@ -58,10 +59,10 @@ class ChaosTest {
 
                 try (StrataClient client = StrataClient.connect(
                         ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(1 << 20))) {
-                    FileId fileId = client.create(StrataClient.FileSpec.log("slow-replica"));
+                    FileId fileId = client.create(StrataClient.FileSpec.log("slow-replica")).id();
                     Workload workload = new Workload();
 
-                    try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
+                    try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
                         workload.appendAcked(appender, 0, 20); // warm-up: chunk spans all 3 nodes
 
                         // stall the proxied replica's responses by 3s
@@ -107,10 +108,10 @@ class ChaosTest {
                 // short per-replica timeout so the blackhole is detected quickly
                 ClientConfig cfg = new ClientConfig(List.of(cluster.metaEndpoint()), 1 << 14, 2_000);
                 try (StrataClient client = StrataClient.connect(cfg)) {
-                    FileId fileId = client.create(StrataClient.FileSpec.log("blackhole"));
+                    FileId fileId = client.create(StrataClient.FileSpec.log("blackhole")).id();
                     Workload workload = new Workload();
 
-                    try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
+                    try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
                         workload.appendAcked(appender, 0, 100);
 
                         // drop all responses from the proxied replica, forever
@@ -139,10 +140,10 @@ class ChaosTest {
                  StrataClient client = StrataClient.connect(
                          ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(1 << 24))) {
 
-                FileId fileId = client.create(StrataClient.FileSpec.log("zk-outage"));
+                FileId fileId = client.create(StrataClient.FileSpec.log("zk-outage")).id();
                 Workload workload = new Workload();
 
-                try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
+                try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
                     workload.appendAcked(appender, 0, 50);
 
                     // freeze ZooKeeper (SIGSTOP semantics)

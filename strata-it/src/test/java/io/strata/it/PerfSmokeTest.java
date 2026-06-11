@@ -2,6 +2,7 @@ package io.strata.it;
 
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
+import io.strata.client.StrataFile;
 import io.strata.client.StrataClient;
 import io.strata.common.FileId;
 import org.junit.jupiter.api.Tag;
@@ -77,11 +78,11 @@ class PerfSmokeTest {
 
     private WriteRun runWrite(StrataClient client, StrataClient.FileSpec spec,
                               int records, int window) throws Exception {
-        FileId fileId = client.create(spec);
+        FileId fileId = client.create(spec).id();
         byte[] payload = new byte[RECORD_SIZE];
         java.util.concurrent.ThreadLocalRandom.current().nextBytes(payload);
 
-        try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
+        try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
             // warmup (not measured)
             await(appendWindowed(appender, payload, Math.min(WARMUP, records), null, window));
 
@@ -97,7 +98,7 @@ class PerfSmokeTest {
     }
 
     /** Pipelined appends with a bounded in-flight window; per-append ack latency captured. */
-    private CompletableFuture<?>[] appendWindowed(StrataClient.Appender appender, byte[] payload,
+    private CompletableFuture<?>[] appendWindowed(StrataFile.Appender appender, byte[] payload,
                                                   int count, long[] latenciesOut,
                                                   int windowSize) throws InterruptedException {
         Semaphore window = new Semaphore(windowSize);
@@ -120,7 +121,7 @@ class PerfSmokeTest {
     }
 
     private ReadResult runRead(StrataClient client, FileId fileId) {
-        try (StrataClient.Reader reader = client.openForRead(fileId)) {
+        try (StrataFile.Reader reader = client.open(fileId).openForRead()) {
             long[] latencies = new long[4096];
             int reads = 0;
             long bytes = 0;
@@ -128,7 +129,7 @@ class PerfSmokeTest {
             long offset = 0;
             while (true) {
                 long t0 = System.nanoTime();
-                StrataClient.ReadResult r = reader.read(offset, READ_SIZE);
+                StrataFile.ReadResult r = reader.read(offset, READ_SIZE);
                 if (r.data().length == 0) break;
                 if (reads < latencies.length) latencies[reads] = System.nanoTime() - t0;
                 reads++;

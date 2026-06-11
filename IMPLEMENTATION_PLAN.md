@@ -27,7 +27,7 @@ strata-proto    SCP frame codec, tagged fields, opcodes, message structs, ScpCli
 strata-format   chunk file header/footer/trailer, sidecar .meta, integrity ledger .j, ChunkStore engine + crash recovery
 strata-node     storage node: SCP handlers → ChunkStore; register/heartbeat/inventory loop; REPLICATE executor (pull)
 strata-meta     MetadataStore SPI, ZkMetadataStore, MetadataService (SCP listener, placement, leases, repair, retention)
-strata-client   StrataClient/Appender/Reader per design §12 (quorum ack, DO, roll, create-ahead, recoverAndSeal)
+strata-client   StrataClient/StrataFile/Appender/Reader per design §12 (quorum ack, DO, roll, create-ahead, recoverAndSeal)
 strata-it       integration tests: in-process cluster + embedded ZK (primary correctness layer); chaos via testcontainers
 tla/            ChunkReplication.tla + TLC config
 scripts/        verify.sh (full pyramid), run helpers

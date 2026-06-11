@@ -4,12 +4,10 @@ import io.strata.common.FileId;
 
 import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.CompletableFuture;
 
 /**
- * Strata client API for append-only logical files: files, bytes, offsets, epochs.
- * v0 deviation from the design signatures: file-lifecycle calls are synchronous
- * because they are chunk-boundary operations off the hot path; append is fully pipelined/async.
+ * Strata client API for managing append-only logical files.
+ * File-scoped read, append, and recovery operations live on StrataFile handles.
  */
 public interface StrataClient extends AutoCloseable {
 
@@ -32,51 +30,20 @@ public interface StrataClient extends AutoCloseable {
         }
     }
 
-    record AppendAck(long endOffset, long durableOffset) {}
+    StrataFile create(FileSpec spec);
 
-    record SealInfo(long sealedLength) {}
+    StrataFile open(FileId fileId);
 
-    record ReadResult(byte[] data, boolean endOfFile) {}
+    default void delete(FileId fileId) {
+        delete(List.of(Objects.requireNonNull(fileId, "fileId")));
+    }
 
-    FileId create(FileSpec spec);
-
-    /** Single writer per epoch; a higher epoch anywhere kills this appender permanently. */
-    Appender openForAppend(FileId fileId, int writeEpoch);
-
-    Reader openForRead(FileId fileId);
-
-    /** Fences the file at newEpoch, seal-recovers the open tail (§7.3), returns the sealed length. */
-    SealInfo recoverAndSeal(FileId fileId, int newEpoch);
+    default void delete(StrataFile file) {
+        delete(Objects.requireNonNull(file, "file").id());
+    }
 
     void delete(List<FileId> fileIds);
 
     @Override
     void close();
-
-    interface Appender extends AutoCloseable {
-        /** Pipelined; completes on quorum (2/3) ack. Offsets are file-logical. */
-        CompletableFuture<AppendAck> append(java.nio.ByteBuffer data);
-
-        long durableOffset();
-
-        /** Seals the open chunk at the durable offset and the file at its total length. */
-        SealInfo seal();
-
-        @Override
-        void close();
-    }
-
-    interface Reader extends AutoCloseable {
-        /**
-         * Reads up to maxBytes from fileOffset (may return fewer — at most to a chunk boundary,
-         * and never beyond the durable offset of an open chunk).
-         */
-        ReadResult read(long fileOffset, int maxBytes);
-
-        /** Re-fetches file metadata (new chunks, seals) for tail-following reads. */
-        void refresh();
-
-        @Override
-        void close();
-    }
 }

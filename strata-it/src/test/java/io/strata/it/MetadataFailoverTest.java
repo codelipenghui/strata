@@ -2,6 +2,7 @@ package io.strata.it;
 
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
+import io.strata.client.StrataFile;
 import io.strata.client.StrataClient;
 import io.strata.common.FileId;
 import org.junit.jupiter.api.Test;
@@ -27,13 +28,13 @@ class MetadataFailoverTest {
         try (MiniCluster cluster = new MiniCluster(3, null, 2)) {
             ClientConfig cfg = new ClientConfig(cluster.metaEndpoints(), 1024, 5_000);
             try (StrataClient client = StrataClient.connect(cfg)) {
-                FileId fileId = client.create(StrataClient.FileSpec.log("failover"));
+                FileId fileId = client.create(StrataClient.FileSpec.log("failover")).id();
                 Workload workload = new Workload();
 
                 List<Integer> nodeIdsBefore = new ArrayList<>();
                 for (var n : cluster.nodes) nodeIdsBefore.add(n.nodeId());
 
-                try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
+                try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
                     workload.appendAcked(appender, 0, 300);
 
                     // kill the current leader

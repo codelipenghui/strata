@@ -2,6 +2,7 @@ package io.strata.it;
 
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
+import io.strata.client.StrataFile;
 import io.strata.client.StrataClient;
 import io.strata.common.FileId;
 import io.strata.format.ChunkFormats;
@@ -48,9 +49,9 @@ class FsyncEndToEndTest {
 
     @Test
     void fsyncPolicyReachesEveryReplicaHeaderAndDataSurvives() throws Exception {
-        FileId fileId = client.create(FSYNC_SPEC);
+        FileId fileId = client.create(FSYNC_SPEC).id();
         Workload workload = new Workload();
-        try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
+        try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
             workload.appendAcked(appender, 0, 500); // several rolls under fsync
             appender.seal();
         }
@@ -71,12 +72,12 @@ class FsyncEndToEndTest {
 
     @Test
     void sealRecoveryWorksUnderFsyncMode() throws Exception {
-        FileId fileId = client.create(FSYNC_SPEC);
+        FileId fileId = client.create(FSYNC_SPEC).id();
         Workload workload = new Workload();
-        StrataClient.Appender zombie = client.openForAppend(fileId, 1);
+        StrataFile.Appender zombie = client.open(fileId).openForAppend(1);
         workload.appendAcked(zombie, 0, 120);
 
-        var sealed = client.recoverAndSeal(fileId, 2);
+        var sealed = client.open(fileId).recoverAndSeal(2);
         assertTrue(sealed.sealedLength() >= workload.ackedBytes());
         zombie.close();
         workload.verifyAckedPrefix(client, fileId);
@@ -84,11 +85,11 @@ class FsyncEndToEndTest {
 
     @Test
     void fsyncAndReplicateFilesCoexist() throws Exception {
-        FileId fsyncFile = client.create(FSYNC_SPEC);
-        FileId fastFile = client.create(StrataClient.FileSpec.log("fast-topic"));
+        FileId fsyncFile = client.create(FSYNC_SPEC).id();
+        FileId fastFile = client.create(StrataClient.FileSpec.log("fast-topic")).id();
         Workload w1 = new Workload(), w2 = new Workload();
-        try (StrataClient.Appender a1 = client.openForAppend(fsyncFile, 1);
-             StrataClient.Appender a2 = client.openForAppend(fastFile, 1)) {
+        try (StrataFile.Appender a1 = client.open(fsyncFile).openForAppend(1);
+             StrataFile.Appender a2 = client.open(fastFile).openForAppend(1)) {
             w1.appendAcked(a1, 0, 100);
             w2.appendAcked(a2, 0, 100);
             a1.seal();
