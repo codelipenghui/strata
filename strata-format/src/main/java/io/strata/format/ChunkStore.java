@@ -120,6 +120,12 @@ public final class ChunkStore implements AutoCloseable {
         return h;
     }
 
+    private static void requireNonNegative(long value, String what) {
+        if (value < 0) {
+            throw new ScpException(ErrorCode.INTERNAL, "negative " + what + ": " + value);
+        }
+    }
+
     private static void checkEpoch(Handle h, int epoch) {
         int floor = Math.max(h.fenceEpoch, h.writeEpoch);
         if (epoch < floor) {
@@ -205,6 +211,8 @@ public final class ChunkStore implements AutoCloseable {
     public record ReadResult(byte[] bytes, long localEndOffset, long lastKnownDO) {}
 
     public ReadResult read(ChunkId id, long offset, int maxBytes) throws IOException {
+        requireNonNegative(offset, "read offset");
+        requireNonNegative(maxBytes, "read maxBytes");
         Handle h = lookup(id);
         synchronized (h) {
             long end = h.state == ChunkState.SEALED ? h.sealedLength : h.end;
@@ -249,6 +257,9 @@ public final class ChunkStore implements AutoCloseable {
      * callerSections, if non-empty, is a pre-encoded section list: u32 count + section bytes.
      */
     public SealResult seal(ChunkId id, int epoch, long dataLength, ByteBuffer callerSections) throws IOException {
+        // a negative length would pass the > end check and truncate(DATA_START + negative)
+        // destroys the chunk HEADER before anything throws — reject at the boundary
+        requireNonNegative(dataLength, "seal dataLength");
         Handle h = lookup(id);
         synchronized (h) {
             if (h.state == ChunkState.SEALED) {
@@ -351,6 +362,8 @@ public final class ChunkStore implements AutoCloseable {
 
     /** Raw file bytes (header + data + footer) — repair/relocation transfer. Sealed chunks only. */
     public FetchResult fetch(ChunkId id, long offset, int maxBytes) throws IOException {
+        requireNonNegative(offset, "fetch offset");
+        requireNonNegative(maxBytes, "fetch maxBytes");
         Handle h = lookup(id);
         synchronized (h) {
             if (h.state != ChunkState.SEALED) {

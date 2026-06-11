@@ -634,17 +634,32 @@ public final class Messages {
         }
     }
 
-    public record SealChunkMeta(ChunkId chunkId, int writeEpoch, long length, int crc) {
+    /**
+     * sealedReplicas: node ids that confirmed the seal — the descriptor keeps only these (a
+     * replica skipped during seal would otherwise stay listed and serve short/stale reads).
+     * Empty = keep all (compat). v0 fixed-field addition (pre-release; single apiVersion).
+     */
+    public record SealChunkMeta(ChunkId chunkId, int writeEpoch, long length, int crc,
+                                List<Integer> sealedReplicas) {
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(writeEpoch).u64(length).u32(crc).noTags();
+            w.chunkId(chunkId).i32(writeEpoch).u64(length).u32(crc);
+            w.varint(sealedReplicas.size());
+            for (int id : sealedReplicas) w.u32(id);
+            w.noTags();
             return w.toBytes();
         }
 
         public static SealChunkMeta decode(ByteBuffer b) {
-            SealChunkMeta m = new SealChunkMeta(ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getInt());
+            ChunkId id = ChunkId.readFrom(b);
+            int epoch = b.getInt();
+            long length = b.getLong();
+            int crc = b.getInt();
+            int n = count(b);
+            List<Integer> sealed = new ArrayList<>(n);
+            for (int i = 0; i < n; i++) sealed.add(b.getInt());
             TaggedFields.readFrom(b);
-            return m;
+            return new SealChunkMeta(id, epoch, length, crc, sealed);
         }
     }
 

@@ -47,10 +47,12 @@ final class ControlLoop implements AutoCloseable {
         this.store = store;
     }
 
+    private final java.util.List<Thread> threads = new java.util.ArrayList<>(3);
+
     void start() {
-        Thread.ofVirtual().name("node-control-" + node.incarnation()).start(this::run);
-        Thread.ofVirtual().name("node-cmd-exec-" + node.incarnation()).start(this::executeCommands);
-        Thread.ofVirtual().name("node-inventory-" + node.incarnation()).start(this::inventoryLoop);
+        threads.add(Thread.ofVirtual().name("node-control-" + node.incarnation()).start(this::run));
+        threads.add(Thread.ofVirtual().name("node-cmd-exec-" + node.incarnation()).start(this::executeCommands));
+        threads.add(Thread.ofVirtual().name("node-inventory-" + node.incarnation()).start(this::inventoryLoop));
     }
 
     private void run() {
@@ -274,5 +276,17 @@ final class ControlLoop implements AutoCloseable {
     public void close() {
         closed.set(true);
         disconnect();
+        // executeCommands blocks in commandQueue.take() and the loops in sleep — interrupt so
+        // the virtual threads exit promptly instead of lingering per closed node
+        for (Thread t : threads) {
+            t.interrupt();
+        }
+        for (Thread t : threads) {
+            try {
+                t.join(2_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 }

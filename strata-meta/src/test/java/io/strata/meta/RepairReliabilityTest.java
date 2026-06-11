@@ -113,7 +113,7 @@ class RepairReliabilityTest {
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC0FFEE).encode(), null, 5000);
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC0FFEE, List.of()).encode(), null, 5000);
 
         int replicaNode = chunk.replicas().get(0).nodeId();
 
@@ -178,6 +178,108 @@ class RepairReliabilityTest {
     }
 
     @Test
+    void losingAllReplicasOfALiveFileKeepsTheChunkRecordAsHardFailure() {
+        List<FakeNode> nodes = new ArrayList<>();
+        for (String h : List.of("lossA", "lossB", "lossC")) {
+            FakeNode n = new FakeNode(h);
+            n.register();
+            nodes.add(n);
+        }
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC, List.of()).encode(), null, 5000);
+
+        // catastrophic: every replica reports a corrupt copy — all three get dropped
+        for (var replica : chunk.replicas()) {
+            client.call(Opcode.INVENTORY_REPORT, new Messages.InventoryReport(replica.nodeId(), 0, 1,
+                    List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD)))
+                    .encode(), null, 5000);
+        }
+
+        // the chunk record must SURVIVE with zero replicas: erasing it would silently shorten a
+        // live file (readers' offset accounting shifts) — data loss must be a hard read failure
+        var lookup = lookup(file.fileId());
+        assertEquals(1, lookup.chunks().size(),
+                "chunk record of a live file must never be erased by reconciliation");
+        assertEquals(0, lookup.chunks().get(0).replicas().size(),
+                "all replicas lost -> empty replica list, hard failure for readers");
+    }
+
+    @Test
+    void sealCommitsOnlyTheActuallySealedReplicasAndRepairRestoresRf() throws Exception {
+        List<FakeNode> nodes = new ArrayList<>();
+        for (String h : List.of("subA", "subB", "subC", "subD")) {
+            FakeNode n = new FakeNode(h);
+            n.register();
+            nodes.add(n);
+        }
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
+
+        // the writer sealed on a quorum of 2 — the third replica failed mid-chunk and holds a
+        // short OPEN copy; committing it into the SEALED descriptor would let it serve reads
+        List<Integer> sealedSubset = List.of(chunk.replicas().get(0).nodeId(),
+                chunk.replicas().get(1).nodeId());
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC, sealedSubset).encode(), null, 5000);
+
+        var sealedLookup = lookup(file.fileId()).chunks().get(0);
+        assertEquals(2, sealedLookup.replicas().size(),
+                "descriptor must contain only replicas that actually sealed");
+        for (var r : sealedLookup.replicas()) {
+            assertTrue(sealedSubset.contains(r.nodeId()));
+        }
+
+        // and the under-replication scan must then restore RF=3 via add-mode repair
+        long deadline = System.currentTimeMillis() + 15_000;
+        while (System.currentTimeMillis() < deadline) {
+            for (FakeNode n : nodes) n.heartbeat();
+            try {
+                service.reconcileNow();
+            } catch (Exception ignored) {
+            }
+            if (lookup(file.fileId()).chunks().get(0).replicas().size() == 3) break;
+            Thread.sleep(150);
+        }
+        assertEquals(3, lookup(file.fileId()).chunks().get(0).replicas().size(),
+                "add-mode repair must restore RF after a subset seal");
+    }
+
+    @Test
+    void openReplicaOfSealedChunkIsDroppedOnInventory() {
+        List<FakeNode> nodes = new ArrayList<>();
+        for (String h : List.of("strA", "strB", "strC", "strD")) {
+            FakeNode n = new FakeNode(h);
+            n.register();
+            nodes.add(n);
+        }
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC, List.of()).encode(), null, 5000);
+
+        // a replica still OPEN under a SEALED descriptor never converges by itself: nothing
+        // re-seals it, FETCH from it fails, and reads to it return short — it must be dropped
+        int straggler = chunk.replicas().get(0).nodeId();
+        client.call(Opcode.INVENTORY_REPORT, new Messages.InventoryReport(straggler, 0, 1,
+                List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.OPEN, 40, 0)))
+                .encode(), null, 5000);
+
+        var replicas = lookup(file.fileId()).chunks().get(0).replicas();
+        assertEquals(2, replicas.size(), "OPEN straggler under a SEALED descriptor must be dropped");
+        for (var r : replicas) {
+            assertTrue(r.nodeId() != straggler);
+        }
+    }
+
+    @Test
     void repairIsReissuedWhenTargetDiesBeforeCompleting() throws Exception {
         List<FakeNode> nodes = new ArrayList<>();
         for (String h : List.of("rrA", "rrB", "rrC", "rrD", "rrE")) {
@@ -190,7 +292,7 @@ class RepairReliabilityTest {
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xD).encode(), null, 5000);
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xD, List.of()).encode(), null, 5000);
 
         Set<Integer> replicaIds = new HashSet<>();
         for (var r : chunk.replicas()) replicaIds.add(r.nodeId());

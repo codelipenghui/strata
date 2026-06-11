@@ -139,6 +139,27 @@ Real bugs fixed (TDD where deterministically testable):
 Adjudicated NOT bugs: duplicate command completions (deduped by inflight.remove), node
 re-registration on a live connection (stateless RPC), one reviewer self-retraction.
 
+## Second external review (5 findings, all verified real, fixed with TDD)
+
+- **P1 seal commits only confirmed replicas**: SEAL_CHUNK_META gained a sealedReplicas list;
+  the descriptor keeps the intersection (a client-failed-but-alive replica left listed would
+  serve short reads forever — alive, so repair never fires). Add-mode repair restores RF after
+  a subset seal. Inventory now also drops OPEN stragglers under SEALED descriptors (they never
+  converge by themselves), and the reader rejects sealed-read responses shorter than the
+  descriptor length (defense in depth). (`RepairReliabilityTest` x2 new tests.)
+- **P1 live files never lose chunk records**: applyDeleteConfirmed keeps an empty-replica chunk
+  record unless the file is DELETING — erasing it would silently shorten the file and shift
+  reader offset accounting; total loss now surfaces as a hard read failure + ERROR log.
+- **P2 negative wire values guarded at the engine boundary**: read/seal/fetch reject negative
+  offsets/lengths — a negative seal length previously passed range checks and
+  truncate(DATA_START-5) would destroy the chunk HEADER before throwing. (`ChunkStoreTest`.)
+- **P2 correlation-entry leak**: every ScpClient future now removes its pending entry on ANY
+  completion path (response, failure, caller timeout, orTimeout/cancel); callFrame completes
+  the future exceptionally on timeout. (`ClientServerTest`.) Note: reusing the connection after
+  a timeout is correct — correlation ids make late responses harmless.
+- **P3 ControlLoop.close() interrupts and joins its virtual threads** (executeCommands no
+  longer lingers in commandQueue.take()).
+
 ## Correctness invariants under test (tech design §14)
 
 1. Acked data (quorum 2-of-3) survives any single node failure through seal — verified by the recorder/verifier harness in every integration & chaos test.

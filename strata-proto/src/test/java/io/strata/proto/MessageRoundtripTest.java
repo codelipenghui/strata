@@ -120,7 +120,7 @@ class MessageRoundtripTest {
                 List.of(new Messages.Replica(1, "a:1"), new Messages.Replica(2, "b:2"), new Messages.Replica(3, "c:3")));
         assertEquals(ccr, decodeResp(ccr.encode(), Messages.CreateChunkResp::decode));
 
-        var scm = new Messages.SealChunkMeta(c, 5, 4096, 0xDD);
+        var scm = new Messages.SealChunkMeta(c, 5, 4096, 0xDD, List.of(1, 2));
         assertEquals(scm, Messages.SealChunkMeta.decode(buf(scm.encode())));
 
         var lf = new Messages.LookupFile(f);

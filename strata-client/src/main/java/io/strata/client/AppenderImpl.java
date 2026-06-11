@@ -229,6 +229,7 @@ final class AppenderImpl implements SegmentStore.Appender {
         long finalLength = -1;
         int crc = 0;
         ScpException lastErr = null;
+        List<Integer> sealedReplicas = new java.util.ArrayList<>(3);
         for (int i = 0; i < s.replicas.size(); i++) {
             if (s.failed[i]) continue;
             String endpoint = s.replicas.get(i).endpoint();
@@ -257,6 +258,7 @@ final class AppenderImpl implements SegmentStore.Appender {
             }
             finalLength = resp.finalLength();
             crc = resp.chunkCrc();
+            sealedReplicas.add(s.replicas.get(i).nodeId());
             okCount++;
         }
         if (okCount < OPEN_QUORUM) {
@@ -269,7 +271,10 @@ final class AppenderImpl implements SegmentStore.Appender {
         ScpException metaFailure = null;
         lock.unlock();
         try {
-            meta.sealChunkMeta(id, epoch, fl, fcrc);
+            // commit only the replicas that ACTUALLY sealed: a failed/skipped replica left in a
+            // SEALED descriptor would serve short reads forever (alive, so repair never fires);
+            // the under-replication scan add-repairs the descriptor back to RF afterwards
+            meta.sealChunkMeta(id, epoch, fl, fcrc, sealedReplicas);
         } catch (ScpException e) {
             metaFailure = e; // handled under the lock below
         } finally {

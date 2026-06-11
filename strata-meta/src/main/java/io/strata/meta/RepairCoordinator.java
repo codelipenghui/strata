@@ -310,10 +310,17 @@ final class RepairCoordinator implements AutoCloseable {
                 if (file.chunkId(c.index()).equals(chunkId)) {
                     List<Integer> replicas = new ArrayList<>(c.replicas());
                     replicas.remove(Integer.valueOf(nodeId));
-                    if (!replicas.isEmpty()) {
+                    if (!replicas.isEmpty() || file.state() != Records.FileState.DELETING) {
+                        // a LIVE file keeps the chunk record even with zero replicas: erasing it
+                        // would silently shorten the file (readers' offset accounting shifts) —
+                        // total loss must surface as a hard read failure, not missing data
+                        if (replicas.isEmpty()) {
+                            log.error("chunk {} of live file {} has lost ALL replicas — readers "
+                                    + "will hard-fail until operator intervention", chunkId, fileId);
+                        }
                         chunks.add(new Records.ChunkRecord(c.index(), c.state(), c.length(), c.crc(),
                                 c.writeEpoch(), replicas));
-                    } // empty -> chunk record dropped
+                    } // empty AND deleting -> chunk record dropped
                 } else {
                     chunks.add(c);
                 }
@@ -391,9 +398,16 @@ final class RepairCoordinator implements AutoCloseable {
                         // (FIFO command delivery guarantees delete-before-replicate)
                         registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
                                 commandIds.incrementAndGet(), List.of(chunkId)));
+                    } else if (entry.state() == ChunkState.OPEN) {
+                        // an OPEN replica under a SEALED descriptor never converges by itself:
+                        // nothing re-seals it, FETCH from it fails, and reads to it return short
+                        // — drop it like a corrupt copy and let add-repair restore RF
+                        log.warn("node {} holds OPEN straggler of sealed chunk {} — dropping "
+                                + "replica for re-repair", report.nodeId(), chunkId);
+                        applyDeleteConfirmed(fileId, chunkId, report.nodeId());
+                        registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
+                                commandIds.incrementAndGet(), List.of(chunkId)));
                     }
-                    // entry.state() == OPEN while descriptor is SEALED: seal straggler (§9.2
-                    // convergent state) — its prefix is valid; FETCH from it fails harmlessly
                 }
             }
         } catch (Exception e) {

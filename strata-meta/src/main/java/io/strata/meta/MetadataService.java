@@ -231,7 +231,21 @@ public final class MetadataService implements AutoCloseable {
                         throw new ScpException(ErrorCode.FENCED_EPOCH, "chunk epoch " + c.writeEpoch(),
                                 c.writeEpoch());
                     }
-                    chunks.set(i, c.sealed(m.length(), m.crc(), m.writeEpoch()));
+                    Records.ChunkRecord sealed = c.sealed(m.length(), m.crc(), m.writeEpoch());
+                    if (!m.sealedReplicas().isEmpty()) {
+                        // keep only replicas that actually sealed: a skipped/failed replica left
+                        // in a SEALED descriptor stays alive, never repairs, and serves short
+                        // reads; the under-replication scan add-repairs RF afterwards
+                        List<Integer> confirmed = new ArrayList<>(c.replicas());
+                        confirmed.retainAll(m.sealedReplicas());
+                        if (confirmed.isEmpty()) {
+                            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                                    "sealed-replica set disjoint from descriptor replicas");
+                        }
+                        sealed = new Records.ChunkRecord(sealed.index(), sealed.state(), sealed.length(),
+                                sealed.crc(), sealed.writeEpoch(), confirmed);
+                    }
+                    chunks.set(i, sealed);
                 }
             }
             if (!found) throw new ScpException(ErrorCode.CHUNK_NOT_FOUND, m.chunkId().toString());

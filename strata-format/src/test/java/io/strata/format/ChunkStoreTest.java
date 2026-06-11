@@ -191,6 +191,28 @@ class ChunkStoreTest {
     }
 
     @Test
+    void negativeWireValuesAreRejectedWithoutDamage() throws Exception {
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            store.append(id, 1, 0, 0, bytes("payload"));
+
+            // a negative seal length passes naive range checks (-5 is not > end) and
+            // truncate(DATA_START - 5) would DESTROY the header before anything throws
+            assertEquals(ErrorCode.INTERNAL,
+                    assertThrows(ScpException.class, () -> store.seal(id, 1, -5, null)).code());
+            // negative read/append/fetch offsets likewise must be typed rejections
+            assertThrows(ScpException.class, () -> store.read(id, -1, 10));
+            assertThrows(ScpException.class, () -> store.read(id, 0, -10));
+            assertThrows(ScpException.class, () -> store.append(id, 1, -3, 0, bytes("x")));
+
+            // and the chunk must be UNDAMAGED: header intact, still appendable, still sealable
+            assertEquals(7, store.stat(id).localEndOffset());
+            assertEquals(8, store.append(id, 1, 7, 7, bytes("!")).endOffset());
+            assertEquals(8, store.seal(id, 1, 8, null).finalLength());
+        }
+    }
+
+    @Test
     void deleteRemovesEverything() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);

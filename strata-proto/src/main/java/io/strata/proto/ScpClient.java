@@ -99,6 +99,10 @@ public final class ScpClient implements AutoCloseable {
         long id = correlation.getAndIncrement();
         CompletableFuture<Frame> fut = new CompletableFuture<>();
         pending.put(id, fut);
+        // whatever completes this future — response, connection failure, caller-side timeout or
+        // orTimeout/cancel — the correlation entry must go with it, or long-lived pipelined
+        // connections leak one entry per unanswered request
+        fut.whenComplete((r, e) -> pending.remove(id, fut));
         try {
             writeLock.lock();
             try {
@@ -130,21 +134,32 @@ public final class ScpClient implements AutoCloseable {
 
     /** Synchronous call returning the whole frame (for payload-carrying responses); error NOT yet checked. */
     public Frame callFrame(Opcode op, byte[] header, ByteBuffer payload, long timeoutMs) {
+        CompletableFuture<Frame> fut = send(op, header, payload);
         try {
-            return send(op, header, payload).get(timeoutMs, TimeUnit.MILLISECONDS);
+            return fut.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (ExecutionException e) {
             if (e.getCause() instanceof ScpException se) throw se;
             throw new ScpException(ErrorCode.INTERNAL, String.valueOf(e.getCause()));
         } catch (TimeoutException e) {
-            throw new ScpException(ErrorCode.INTERNAL, "timeout after " + timeoutMs + "ms for " + op);
+            ScpException timeout = new ScpException(ErrorCode.INTERNAL,
+                    "timeout after " + timeoutMs + "ms for " + op);
+            fut.completeExceptionally(timeout); // releases the correlation entry (cleanup hook)
+            throw timeout;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new ScpException(ErrorCode.INTERNAL, "interrupted");
+            ScpException interrupted = new ScpException(ErrorCode.INTERNAL, "interrupted");
+            fut.completeExceptionally(interrupted);
+            throw interrupted;
         }
     }
 
     public boolean isClosed() {
         return closed.get();
+    }
+
+    /** Outstanding correlation entries — observability and leak tests. */
+    public int pendingCount() {
+        return pending.size();
     }
 
     @Override

@@ -57,4 +57,23 @@ class ClientServerTest {
         w.noTags();
         return w.toBytes();
     }
+
+    @Test
+    void timedOutCallCleansUpItsPendingCorrelation() throws Exception {
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        ScpServer.Handler hang = req -> {
+            release.await(); // never answers until released
+            return ScpServer.ok(req, Messages.okHeader(), null);
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, hang);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
+            assertThrows(ScpException.class,
+                    () -> client.callFrame(Opcode.PING, emptyHeader(), null, 200));
+            // the correlation entry must not leak after the timeout — on a long-lived connection
+            // (appends pipeline for hours) leaked entries accumulate unboundedly
+            assertEquals(0, client.pendingCount(),
+                    "timed-out request left its correlation entry behind");
+            release.countDown();
+        }
+    }
 }

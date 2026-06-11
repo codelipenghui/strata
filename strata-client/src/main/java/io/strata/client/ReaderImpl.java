@@ -79,6 +79,14 @@ final class ReaderImpl implements SegmentStore.Reader {
                 ByteBuffer h = frame.headerSlice();
                 Resp.check(h);
                 var resp = Messages.ReadResp.decode(h);
+                if (!open && resp.localEndOffset() < chunk.length()) {
+                    // a sealed chunk must be served whole: a replica shorter than the descriptor
+                    // (seal straggler not yet reconciled away) would return truncated data
+                    last = new ScpException(io.strata.common.ErrorCode.CORRUPT_CHUNK,
+                            "replica " + r.nodeId() + " short for sealed chunk " + chunk.chunkId()
+                                    + ": " + resp.localEndOffset() + " < " + chunk.length());
+                    continue;
+                }
                 byte[] data = new byte[frame.payloadLength()];
                 frame.payloadSlice().get(data);
                 if (open) {

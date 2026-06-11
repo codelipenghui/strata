@@ -127,7 +127,7 @@ class MetadataServiceTest {
 
         // seal chunk 0 and look it up
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunkResp.chunkId(), 1, 4096, 0xAB).encode(), null, 5000);
+                new Messages.SealChunkMeta(chunkResp.chunkId(), 1, 4096, 0xAB, List.of()).encode(), null, 5000);
         var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
                 new Messages.LookupFile(fileId).encode(), null, 5000));
         assertEquals(2, lookup.chunks().size());
@@ -137,9 +137,9 @@ class MetadataServiceTest {
 
         // idempotent seal ok; conflicting seal rejected
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunkResp.chunkId(), 1, 4096, 0xAB).encode(), null, 5000);
+                new Messages.SealChunkMeta(chunkResp.chunkId(), 1, 4096, 0xAB, List.of()).encode(), null, 5000);
         ScpException conflict = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunkResp.chunkId(), 1, 5000, 0xAB).encode(), null, 5000));
+                new Messages.SealChunkMeta(chunkResp.chunkId(), 1, 5000, 0xAB, List.of()).encode(), null, 5000));
         assertEquals(ErrorCode.CHUNK_SEALED, conflict.code());
 
         // delete the file: DELETING -> DELETE commands ride heartbeats -> confirmations -> gone
@@ -219,13 +219,13 @@ class MetadataServiceTest {
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 5).encode(), null, 5000));
 
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xA).encode(), null, 5000);
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xA, List.of()).encode(), null, 5000);
         // true idempotent retry: same length AND same crc -> OK
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xA).encode(), null, 5000);
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xA, List.of()).encode(), null, 5000);
         // same length, DIFFERENT crc: byte divergence — the metadata layer must refuse
         ScpException e = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xB).encode(), null, 5000));
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xB, List.of()).encode(), null, 5000));
         assertEquals(ErrorCode.CHUNK_SEALED, e.code());
     }
 
@@ -243,7 +243,7 @@ class MetadataServiceTest {
         assertEquals(ErrorCode.PRECONDITION_FAILED, open.code());
 
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC).encode(), null, 5000);
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC, List.of()).encode(), null, 5000);
 
         // wrong total length -> refused
         ScpException wrongLen = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_FILE,

@@ -234,6 +234,7 @@ final class Recovery {
         long finalLength = -1;
         int crc = 0;
         ScpException last = null;
+        List<Integer> sealedReplicas = new ArrayList<>(replicas.size());
         for (ReplicaState rs : replicas) {
             Messages.SealResp resp;
             try {
@@ -254,12 +255,13 @@ final class Recovery {
             }
             finalLength = resp.finalLength();
             crc = resp.chunkCrc();
+            sealedReplicas.add(rs.replica.nodeId());
             ok++;
         }
         if (ok < 2) {
             throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "recovery seal quorum lost");
         }
-        meta.sealChunkMeta(chunkId, epoch, finalLength, crc);
+        meta.sealChunkMeta(chunkId, epoch, finalLength, crc, sealedReplicas);
         return finalLength;
     }
 }

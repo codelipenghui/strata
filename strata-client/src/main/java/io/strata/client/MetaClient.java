@@ -94,8 +94,10 @@ final class MetaClient implements AutoCloseable {
         return Messages.CreateChunkResp.decode(resp);
     }
 
-    void sealChunkMeta(io.strata.common.ChunkId chunkId, int writeEpoch, long length, int crc) {
-        call(Opcode.SEAL_CHUNK_META, new Messages.SealChunkMeta(chunkId, writeEpoch, length, crc).encode());
+    void sealChunkMeta(io.strata.common.ChunkId chunkId, int writeEpoch, long length, int crc,
+                       java.util.List<Integer> sealedReplicas) {
+        call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunkId, writeEpoch, length, crc, sealedReplicas).encode());
     }
 
     Messages.LookupFileResp lookupFile(FileId fileId) {
