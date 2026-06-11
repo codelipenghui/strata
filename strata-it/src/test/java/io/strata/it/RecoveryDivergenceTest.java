@@ -26,7 +26,7 @@ class RecoveryDivergenceTest {
     @Test
     void recoveryCommitsAgreeingSealQuorumAndDropsOutlier() throws Exception {
         try (MiniCluster cluster = new MiniCluster(3);
-             StrataClient client = new StrataClient(ClientConfig.of(cluster.metaEndpoint()))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()))) {
             var setup = createOpenChunkWithReplicaPayloads(cluster, "majority",
                     List.of("AAAA".getBytes(), "AAAA".getBytes(), "BBBB".getBytes()));
 
@@ -51,7 +51,7 @@ class RecoveryDivergenceTest {
     @Test
     void recoveryRefusesToSealDivergenceWithoutQuorum() throws Exception {
         try (MiniCluster cluster = new MiniCluster(3);
-             StrataClient client = new StrataClient(ClientConfig.of(cluster.metaEndpoint()))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()))) {
             var setup = createOpenChunkWithReplicaPayloads(cluster, "split",
                     List.of("AAAA".getBytes(), "BBBB".getBytes(), "CCCC".getBytes()));
 

@@ -346,12 +346,13 @@ File-level header `{u32 magic "SCKP", u16 version}` then append-only entries `{u
 4. Sealed chunks are immutable forever: format converters never rewrite in place — a format migration, if ever needed, is an explicit relocation (copy-as-new + descriptor swap), the same mechanism as repair.
 5. Within a major version, read support for every prior format version is mandatory.
 
-## 12. Segment-store client API
+## 12. Strata client API
 
 The client library the broker embeds (JVM, since the broker is Kafka-derived); the API is deliberately **Kafka-free** — files, bytes, offsets, epochs — preserving the tenant-agnostic discipline (product doc §5). Semantics below are normative for any future implementation.
 
 ```java
-interface SegmentStore {
+interface StrataClient {
+  static StrataClient connect(ClientConfig config);
   CompletableFuture<FileHandle> create(FileSpec spec);
       // spec: fileKind, mediaClass, ackPolicy, owner tag (opaque to storage)
   CompletableFuture<Appender>   openForAppend(FileId id, int writeEpoch);

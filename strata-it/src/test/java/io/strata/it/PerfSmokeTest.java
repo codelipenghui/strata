@@ -1,7 +1,7 @@
 package io.strata.it;
 
 import io.strata.client.ClientConfig;
-import io.strata.client.SegmentStore;
+import io.strata.client.StrataClient;
 import io.strata.client.StrataClient;
 import io.strata.common.FileId;
 import org.junit.jupiter.api.Tag;
@@ -46,17 +46,17 @@ class PerfSmokeTest {
     void writeAndReadSmoke() throws Exception {
         try (MiniCluster cluster = new MiniCluster(3)) {
             ClientConfig cfg = ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(64L << 20);
-            try (StrataClient client = new StrataClient(cfg)) {
+            try (StrataClient client = StrataClient.connect(cfg)) {
 
                 System.out.printf(Locale.ROOT,
                         "%n=== Strata v0 perf smoke: %d records x %d B, window %d, 3 nodes in-process ===%n",
                         RECORDS, RECORD_SIZE, WINDOW);
 
                 var replicate = runWrite(client,
-                        new SegmentStore.FileSpec((byte) 0, (byte) 0, (byte) 0, "perf-rep"), RECORDS, WINDOW);
+                        new StrataClient.FileSpec((byte) 0, (byte) 0, (byte) 0, "perf-rep"), RECORDS, WINDOW);
                 printWrite("write ack-on-replicate (window " + WINDOW + ") ", replicate.result());
                 var fsync = runWrite(client,
-                        new SegmentStore.FileSpec((byte) 0, (byte) 0, (byte) 1, "perf-fsync"), FSYNC_RECORDS, FSYNC_WINDOW);
+                        new StrataClient.FileSpec((byte) 0, (byte) 0, (byte) 1, "perf-fsync"), FSYNC_RECORDS, FSYNC_WINDOW);
                 printWrite("write ack-on-fsync     (window " + FSYNC_WINDOW + ")  ", fsync.result());
 
                 ReadResult read = runRead(client, replicate.fileId());
@@ -75,13 +75,13 @@ class PerfSmokeTest {
 
     private record WriteRun(FileId fileId, WriteResult result) {}
 
-    private WriteRun runWrite(StrataClient client, SegmentStore.FileSpec spec,
+    private WriteRun runWrite(StrataClient client, StrataClient.FileSpec spec,
                               int records, int window) throws Exception {
         FileId fileId = client.create(spec);
         byte[] payload = new byte[RECORD_SIZE];
         java.util.concurrent.ThreadLocalRandom.current().nextBytes(payload);
 
-        try (SegmentStore.Appender appender = client.openForAppend(fileId, 1)) {
+        try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
             // warmup (not measured)
             await(appendWindowed(appender, payload, Math.min(WARMUP, records), null, window));
 
@@ -97,7 +97,7 @@ class PerfSmokeTest {
     }
 
     /** Pipelined appends with a bounded in-flight window; per-append ack latency captured. */
-    private CompletableFuture<?>[] appendWindowed(SegmentStore.Appender appender, byte[] payload,
+    private CompletableFuture<?>[] appendWindowed(StrataClient.Appender appender, byte[] payload,
                                                   int count, long[] latenciesOut,
                                                   int windowSize) throws InterruptedException {
         Semaphore window = new Semaphore(windowSize);
@@ -120,7 +120,7 @@ class PerfSmokeTest {
     }
 
     private ReadResult runRead(StrataClient client, FileId fileId) {
-        try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+        try (StrataClient.Reader reader = client.openForRead(fileId)) {
             long[] latencies = new long[4096];
             int reads = 0;
             long bytes = 0;
@@ -128,7 +128,7 @@ class PerfSmokeTest {
             long offset = 0;
             while (true) {
                 long t0 = System.nanoTime();
-                SegmentStore.ReadResult r = reader.read(offset, READ_SIZE);
+                StrataClient.ReadResult r = reader.read(offset, READ_SIZE);
                 if (r.data().length == 0) break;
                 if (reads < latencies.length) latencies[reads] = System.nanoTime() - t0;
                 reads++;

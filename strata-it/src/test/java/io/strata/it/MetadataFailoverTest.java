@@ -1,7 +1,7 @@
 package io.strata.it;
 
 import io.strata.client.ClientConfig;
-import io.strata.client.SegmentStore;
+import io.strata.client.StrataClient;
 import io.strata.client.StrataClient;
 import io.strata.common.FileId;
 import org.junit.jupiter.api.Test;
@@ -26,14 +26,14 @@ class MetadataFailoverTest {
     void leaderKillMidStreamIsAbsorbed() throws Exception {
         try (MiniCluster cluster = new MiniCluster(3, null, 2)) {
             ClientConfig cfg = new ClientConfig(cluster.metaEndpoints(), 1024, 5_000);
-            try (StrataClient client = new StrataClient(cfg)) {
-                FileId fileId = client.create(SegmentStore.FileSpec.log("failover"));
+            try (StrataClient client = StrataClient.connect(cfg)) {
+                FileId fileId = client.create(StrataClient.FileSpec.log("failover"));
                 Workload workload = new Workload();
 
                 List<Integer> nodeIdsBefore = new ArrayList<>();
                 for (var n : cluster.nodes) nodeIdsBefore.add(n.nodeId());
 
-                try (SegmentStore.Appender appender = client.openForAppend(fileId, 1)) {
+                try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
                     workload.appendAcked(appender, 0, 300);
 
                     // kill the current leader

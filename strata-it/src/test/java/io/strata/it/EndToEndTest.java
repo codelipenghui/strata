@@ -1,7 +1,7 @@
 package io.strata.it;
 
 import io.strata.client.ClientConfig;
-import io.strata.client.SegmentStore;
+import io.strata.client.StrataClient;
 import io.strata.client.StrataClient;
 import io.strata.common.FileId;
 import io.strata.proto.Messages;
@@ -33,7 +33,7 @@ class EndToEndTest {
     void setup() throws Exception {
         cluster = new MiniCluster(3);
         // small chunks force several rolls in one test
-        client = new StrataClient(ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(4096));
+        client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(4096));
     }
 
     @AfterAll
@@ -44,10 +44,10 @@ class EndToEndTest {
 
     @Test
     void writeRollSealReadBack() throws Exception {
-        FileId fileId = client.create(SegmentStore.FileSpec.log("topicA-0"));
+        FileId fileId = client.create(StrataClient.FileSpec.log("topicA-0"));
         Workload workload = new Workload();
 
-        try (SegmentStore.Appender appender = client.openForAppend(fileId, 1)) {
+        try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
             workload.appendAcked(appender, 0, 1500); // ~24 KB -> several 4 KB chunk rolls
             assertEquals(workload.ackedBytes(), appender.durableOffset());
             var sealed = appender.seal();
@@ -91,12 +91,12 @@ class EndToEndTest {
 
     @Test
     void tailReadNeverExceedsDurableOffset() throws Exception {
-        FileId fileId = client.create(SegmentStore.FileSpec.log("topicB-0"));
+        FileId fileId = client.create(StrataClient.FileSpec.log("topicB-0"));
         Workload workload = new Workload();
-        try (SegmentStore.Appender appender = client.openForAppend(fileId, 1)) {
+        try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
             workload.appendAcked(appender, 0, 50);
 
-            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+            try (StrataClient.Reader reader = client.openForRead(fileId)) {
                 var r = reader.read(0, 1 << 20);
                 // open-chunk read is clamped to the replica-known DO (may lag by one append round)
                 assertTrue(r.data().length <= workload.ackedBytes(),
@@ -112,9 +112,9 @@ class EndToEndTest {
 
     @Test
     void emptyAppendCompletesWithoutCreatingAChunk() throws Exception {
-        FileId fileId = client.create(SegmentStore.FileSpec.log("empty-append"));
+        FileId fileId = client.create(StrataClient.FileSpec.log("empty-append"));
 
-        try (SegmentStore.Appender appender = client.openForAppend(fileId, 1)) {
+        try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
             var ack = appender.append(ByteBuffer.allocate(0)).get(1, TimeUnit.SECONDS);
             assertEquals(0, ack.endOffset());
             assertEquals(0, ack.durableOffset());

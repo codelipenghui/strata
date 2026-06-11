@@ -127,7 +127,7 @@ final class MetaClient implements AutoCloseable {
         }
     }
 
-    FileId createFile(SegmentStore.FileSpec spec) {
+    FileId createFile(StrataClient.FileSpec spec) {
         var resp = call(Opcode.CREATE_FILE, new Messages.CreateFile(spec.fileKind(), spec.mediaClass(),
                 spec.ackPolicy(), spec.ownerTag()).encode());
         return decode(Opcode.CREATE_FILE, resp, Messages.CreateFileResp::decode).fileId();

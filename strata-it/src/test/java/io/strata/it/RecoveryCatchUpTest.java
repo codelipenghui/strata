@@ -30,7 +30,7 @@ class RecoveryCatchUpTest {
     @Test
     void laggingReplicaIsCaughtUpBeforeSeal() throws Exception {
         try (MiniCluster cluster = new MiniCluster(3);
-             StrataClient client = new StrataClient(ClientConfig.of(cluster.metaEndpoint()))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()))) {
 
             String[] hp = cluster.metaEndpoint().split(":");
             FileId fileId;
@@ -98,7 +98,7 @@ class RecoveryCatchUpTest {
     @Test
     void sealedReplicaShorterThanDurableFloorIsEvicted() throws Exception {
         try (MiniCluster cluster = new MiniCluster(3);
-             StrataClient client = new StrataClient(ClientConfig.of(cluster.metaEndpoint()))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()))) {
 
             String[] hp = cluster.metaEndpoint().split(":");
             FileId fileId;
@@ -158,7 +158,7 @@ class RecoveryCatchUpTest {
     @Test
     void recoveryPrefersFullValidBatchOverShorterPartialBoundary() throws Exception {
         try (MiniCluster cluster = new MiniCluster(3);
-             StrataClient client = new StrataClient(ClientConfig.of(cluster.metaEndpoint()))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()))) {
 
             String[] hp = cluster.metaEndpoint().split(":");
             FileId fileId;

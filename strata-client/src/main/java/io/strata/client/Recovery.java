@@ -63,7 +63,7 @@ final class Recovery {
         }
     }
 
-    SegmentStore.SealInfo recoverAndSeal(io.strata.common.FileId fileId, int newEpoch) {
+    StrataClient.SealInfo recoverAndSeal(io.strata.common.FileId fileId, int newEpoch) {
         Messages.LookupFileResp file = meta.lookupFile(fileId);
         if (file.fileState() == FILE_DELETING) {
             throw new ScpException(ErrorCode.PRECONDITION_FAILED, "file is DELETING");
@@ -80,7 +80,7 @@ final class Recovery {
             }
         }
         meta.sealFile(fileId, total);
-        return new SegmentStore.SealInfo(total);
+        return new StrataClient.SealInfo(total);
     }
 
     private static long addFileLength(long total, long delta) {

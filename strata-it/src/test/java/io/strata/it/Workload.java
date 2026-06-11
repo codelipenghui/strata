@@ -1,6 +1,6 @@
 package io.strata.it;
 
-import io.strata.client.SegmentStore;
+import io.strata.client.StrataClient;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -22,9 +22,9 @@ final class Workload {
     }
 
     /** Appends n records, waiting for each ack (call from a virtual thread for pipelining tests). */
-    long appendAcked(SegmentStore.Appender appender, int from, int n) {
+    long appendAcked(StrataClient.Appender appender, int from, int n) {
         long lastEnd = -1;
-        List<CompletableFuture<SegmentStore.AppendAck>> futures = new ArrayList<>(n);
+        List<CompletableFuture<StrataClient.AppendAck>> futures = new ArrayList<>(n);
         List<byte[]> payloads = new ArrayList<>(n);
         for (int i = from; i < from + n; i++) {
             byte[] p = payload(i);
@@ -32,7 +32,7 @@ final class Workload {
             futures.add(appender.append(ByteBuffer.wrap(p)));
         }
         for (int i = 0; i < n; i++) {
-            SegmentStore.AppendAck ack = futures.get(i).join();
+            StrataClient.AppendAck ack = futures.get(i).join();
             recordAcked(payloads.get(i));
             lastEnd = ack.endOffset();
         }
@@ -53,7 +53,7 @@ final class Workload {
     }
 
     /** Asserts the file's prefix equals every acked byte, in order. */
-    synchronized void verifyAckedPrefix(SegmentStore store, io.strata.common.FileId fileId) {
+    synchronized void verifyAckedPrefix(StrataClient store, io.strata.common.FileId fileId) {
         byte[] expectedBytes = expected.toString().getBytes(StandardCharsets.UTF_8);
         byte[] actual = readAll(store, fileId, expectedBytes.length);
         if (actual.length < expectedBytes.length) {
@@ -67,13 +67,13 @@ final class Workload {
         }
     }
 
-    static byte[] readAll(SegmentStore store, io.strata.common.FileId fileId, int atLeast) {
-        try (SegmentStore.Reader reader = store.openForRead(fileId)) {
+    static byte[] readAll(StrataClient store, io.strata.common.FileId fileId, int atLeast) {
+        try (StrataClient.Reader reader = store.openForRead(fileId)) {
             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
             long offset = 0;
             int idleRounds = 0;
             while (idleRounds < 3) {
-                SegmentStore.ReadResult r = reader.read(offset, 1 << 20);
+                StrataClient.ReadResult r = reader.read(offset, 1 << 20);
                 if (r.data().length > 0) {
                     out.write(r.data(), 0, r.data().length);
                     offset += r.data().length;

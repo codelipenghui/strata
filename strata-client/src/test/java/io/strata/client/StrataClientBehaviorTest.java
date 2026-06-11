@@ -23,9 +23,9 @@ class StrataClientBehaviorTest {
 
     @Test
     void fileSpecRejectsInvalidClientValues() {
-        assertThrows(IllegalArgumentException.class, () -> SegmentStore.FileSpec.log(null));
+        assertThrows(IllegalArgumentException.class, () -> StrataClient.FileSpec.log(null));
         assertThrows(IllegalArgumentException.class,
-                () -> new SegmentStore.FileSpec((byte) 0, (byte) 0, (byte) 2, "owner"));
+                () -> new StrataClient.FileSpec((byte) 0, (byte) 0, (byte) 2, "owner"));
     }
 
     @Test
@@ -46,8 +46,8 @@ class StrataClientBehaviorTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
-            assertEquals(created, client.create(SegmentStore.FileSpec.log("owner")));
+             StrataClient client = StrataClient.connect(ClientConfig.of(endpoint(meta)))) {
+            assertEquals(created, client.create(StrataClient.FileSpec.log("owner")));
 
             ScpException e = assertThrows(ScpException.class,
                     () -> client.delete(List.of(created, denied)));
@@ -64,9 +64,9 @@ class StrataClientBehaviorTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(endpoint(meta)))) {
             ScpException e = assertThrows(ScpException.class,
-                    () -> client.create(SegmentStore.FileSpec.log("owner")));
+                    () -> client.create(StrataClient.FileSpec.log("owner")));
             assertEquals(ErrorCode.INTERNAL, e.code());
         }
     }
@@ -85,7 +85,7 @@ class StrataClientBehaviorTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(endpoint(meta)))) {
             ScpException e = assertThrows(ScpException.class,
                     () -> client.delete(List.of(first, second)));
             assertEquals(ErrorCode.INTERNAL, e.code());
@@ -106,7 +106,7 @@ class StrataClientBehaviorTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(endpoint(meta)))) {
             ScpException e = assertThrows(ScpException.class,
                     () -> client.delete(List.of(first, second)));
             assertEquals(ErrorCode.INTERNAL, e.code());
@@ -119,7 +119,7 @@ class StrataClientBehaviorTest {
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
         try (ScpServer meta = metadataServer(lookup);
-             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(endpoint(meta)))) {
             lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1, List.of()));
             assertEquals(ErrorCode.FILE_SEALED,
                     assertThrows(ScpException.class, () -> client.openForAppend(fileId, 1)).code());
@@ -162,12 +162,12 @@ class StrataClientBehaviorTest {
                     ByteBuffer.wrap(new byte[] {4, 5, 6, 7}));
         });
              ScpServer meta = metadataServer(lookup);
-             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(endpoint(meta)))) {
             lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
                     List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
                             new Messages.Replica(1, endpoint(storage))))));
-            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
-                SegmentStore.ReadResult result = reader.read(0, 10);
+            try (StrataClient.Reader reader = client.openForRead(fileId)) {
+                StrataClient.ReadResult result = reader.read(0, 10);
                 assertArrayEquals(new byte[] {1, 2, 3}, result.data());
                 assertEquals(true, result.endOfFile());
             }
@@ -175,8 +175,8 @@ class StrataClientBehaviorTest {
             lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0,
                     List.of(chunk(chunkId, ChunkState.OPEN, 0, 0, 1,
                             new Messages.Replica(1, endpoint(storage))))));
-            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
-                SegmentStore.ReadResult result = reader.read(0, 4);
+            try (StrataClient.Reader reader = client.openForRead(fileId)) {
+                StrataClient.ReadResult result = reader.read(0, 4);
                 assertArrayEquals(new byte[] {4, 5}, result.data());
                 assertEquals(false, result.endOfFile());
             }
@@ -184,7 +184,7 @@ class StrataClientBehaviorTest {
             lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
                     List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
                             new Messages.Replica(2, "")))));
-            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+            try (StrataClient.Reader reader = client.openForRead(fileId)) {
                 assertEquals(ErrorCode.INTERNAL,
                         assertThrows(ScpException.class, () -> reader.read(0, 10)).code());
             }
@@ -197,11 +197,11 @@ class StrataClientBehaviorTest {
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
         try (ScpServer meta = metadataServer(lookup);
-             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(endpoint(meta)))) {
             lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
                     List.of(chunk(chunkId, ChunkState.SEALED, -1, 0, 1,
                             new Messages.Replica(1, "")))));
-            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+            try (StrataClient.Reader reader = client.openForRead(fileId)) {
                 assertEquals(ErrorCode.CORRUPT_CHUNK,
                         assertThrows(ScpException.class, () -> reader.read(0, 10)).code());
             }
@@ -219,11 +219,11 @@ class StrataClientBehaviorTest {
             return ScpServer.ok(req, new Messages.ReadResp(3, 3).encode(), ByteBuffer.allocate(0));
         });
              ScpServer meta = metadataServer(lookup);
-             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(endpoint(meta)))) {
             lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
                     List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
                             new Messages.Replica(1, endpoint(storage))))));
-            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+            try (StrataClient.Reader reader = client.openForRead(fileId)) {
                 assertEquals(ErrorCode.INTERNAL,
                         assertThrows(ScpException.class, () -> reader.read(-1, 10)).code());
                 assertEquals(ErrorCode.INTERNAL,
@@ -248,11 +248,11 @@ class StrataClientBehaviorTest {
                      ScpServer.ok(req, new Messages.ReadResp(3, 3).encode(),
                              ByteBuffer.wrap(new byte[] {1, 2})));
              ScpServer meta = metadataServer(lookup);
-             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(endpoint(meta)))) {
             lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
                     List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
                             new Messages.Replica(1, endpoint(overlong))))));
-            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+            try (StrataClient.Reader reader = client.openForRead(fileId)) {
                 assertEquals(ErrorCode.CORRUPT_CHUNK,
                         assertThrows(ScpException.class, () -> reader.read(0, 3)).code());
             }
@@ -260,7 +260,7 @@ class StrataClientBehaviorTest {
             lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
                     List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
                             new Messages.Replica(3, endpoint(shortSealed))))));
-            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+            try (StrataClient.Reader reader = client.openForRead(fileId)) {
                 assertEquals(ErrorCode.CORRUPT_CHUNK,
                         assertThrows(ScpException.class, () -> reader.read(0, 3)).code());
             }
@@ -268,7 +268,7 @@ class StrataClientBehaviorTest {
             lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0,
                     List.of(chunk(chunkId, ChunkState.OPEN, 0, 0, 1,
                             new Messages.Replica(2, endpoint(badOffsets))))));
-            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+            try (StrataClient.Reader reader = client.openForRead(fileId)) {
                 assertEquals(ErrorCode.CORRUPT_CHUNK,
                         assertThrows(ScpException.class, () -> reader.read(0, 3)).code());
             }

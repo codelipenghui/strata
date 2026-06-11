@@ -1,7 +1,7 @@
 package io.strata.it;
 
 import io.strata.client.ClientConfig;
-import io.strata.client.SegmentStore;
+import io.strata.client.StrataClient;
 import io.strata.client.StrataClient;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
@@ -22,14 +22,14 @@ class OpenQuorumFailureTest {
     @Test
     void failedInitialOpenAbortsMetadataTail() throws Exception {
         try (MiniCluster cluster = new MiniCluster(3);
-             StrataClient client = new StrataClient(new ClientConfig(
+             StrataClient client = StrataClient.connect(new ClientConfig(
                      List.of(cluster.metaEndpoint()), 4096, 500))) {
-            FileId fileId = client.create(SegmentStore.FileSpec.log("open-abort"));
+            FileId fileId = client.create(StrataClient.FileSpec.log("open-abort"));
 
             cluster.killNode(1);
             cluster.killNode(2);
 
-            try (SegmentStore.Appender appender = client.openForAppend(fileId, 1)) {
+            try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[]{1})));
                 assertEquals(ErrorCode.INTERNAL, e.code());

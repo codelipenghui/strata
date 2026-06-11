@@ -1,7 +1,7 @@
 package io.strata.it;
 
 import io.strata.client.ClientConfig;
-import io.strata.client.SegmentStore;
+import io.strata.client.StrataClient;
 import io.strata.client.StrataClient;
 import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
@@ -37,7 +37,7 @@ class RepairAndRetentionTest {
     @BeforeEach
     void setup() throws Exception {
         cluster = new MiniCluster(4);
-        client = new StrataClient(ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(4096));
+        client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(4096));
     }
 
     @AfterEach
@@ -48,9 +48,9 @@ class RepairAndRetentionTest {
 
     @Test
     void nodeDeathRepairsAllChunksBackToRf3() throws Exception {
-        FileId fileId = client.create(SegmentStore.FileSpec.log("repair-me"));
+        FileId fileId = client.create(StrataClient.FileSpec.log("repair-me"));
         Workload workload = new Workload();
-        try (SegmentStore.Appender appender = client.openForAppend(fileId, 1)) {
+        try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
             workload.appendAcked(appender, 0, 1200); // several chunks across 4 nodes
             appender.seal();
         }
@@ -121,9 +121,9 @@ class RepairAndRetentionTest {
 
     @Test
     void fileDeletionConvergesOnNodes() throws Exception {
-        FileId fileId = client.create(SegmentStore.FileSpec.log("delete-me"));
+        FileId fileId = client.create(StrataClient.FileSpec.log("delete-me"));
         Workload workload = new Workload();
-        try (SegmentStore.Appender appender = client.openForAppend(fileId, 1)) {
+        try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
             workload.appendAcked(appender, 0, 600);
             appender.seal();
         }

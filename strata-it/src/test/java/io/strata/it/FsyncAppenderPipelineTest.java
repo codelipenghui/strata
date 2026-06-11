@@ -1,7 +1,7 @@
 package io.strata.it;
 
 import io.strata.client.ClientConfig;
-import io.strata.client.SegmentStore;
+import io.strata.client.StrataClient;
 import io.strata.client.StrataClient;
 import io.strata.common.FileId;
 import org.junit.jupiter.api.Test;
@@ -21,15 +21,15 @@ class FsyncAppenderPipelineTest {
     void appenderPipelineCoalescesForcesOnAllReplicas() throws Exception {
         int appends = 400;
         try (MiniCluster cluster = new MiniCluster(3);
-             StrataClient client = new StrataClient(
+             StrataClient client = StrataClient.connect(
                      ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(64L << 20))) {
 
-            FileId fileId = client.create(new SegmentStore.FileSpec((byte) 0, (byte) 0, (byte) 1, "diag"));
+            FileId fileId = client.create(new StrataClient.FileSpec((byte) 0, (byte) 0, (byte) 1, "diag"));
             byte[] payload = new byte[512];
 
-            try (SegmentStore.Appender appender = client.openForAppend(fileId, 1)) {
+            try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
                 long start = System.nanoTime();
-                List<CompletableFuture<SegmentStore.AppendAck>> futures = new ArrayList<>(appends);
+                List<CompletableFuture<StrataClient.AppendAck>> futures = new ArrayList<>(appends);
                 for (int i = 0; i < appends; i++) {
                     futures.add(appender.append(ByteBuffer.wrap(payload)));
                 }

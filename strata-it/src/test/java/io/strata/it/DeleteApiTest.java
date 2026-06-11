@@ -15,7 +15,7 @@ class DeleteApiTest {
     @Test
     void deleteSurfacesPerFileFailures() throws Exception {
         try (MiniCluster cluster = new MiniCluster(3);
-             StrataClient client = new StrataClient(ClientConfig.of(cluster.metaEndpoint()))) {
+             StrataClient client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()))) {
             ScpException e = assertThrows(ScpException.class,
                     () -> client.delete(java.util.List.of(FileId.random())));
             assertEquals(ErrorCode.FILE_NOT_FOUND, e.code());

@@ -1,7 +1,7 @@
 package io.strata.it;
 
 import io.strata.client.ClientConfig;
-import io.strata.client.SegmentStore;
+import io.strata.client.StrataClient;
 import io.strata.client.StrataClient;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
@@ -35,7 +35,7 @@ class FailureRecoveryTest {
     @BeforeEach
     void setup() throws Exception {
         cluster = new MiniCluster(4); // one spare so rolls/repair can re-place
-        client = new StrataClient(ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(1 << 16));
+        client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(1 << 16));
     }
 
     @AfterEach
@@ -46,10 +46,10 @@ class FailureRecoveryTest {
 
     @Test
     void replicaDeathDuringWritesTriggersSealAndRollWithoutAckedLoss() throws Exception {
-        FileId fileId = client.create(SegmentStore.FileSpec.log("kill-replica"));
+        FileId fileId = client.create(StrataClient.FileSpec.log("kill-replica"));
         Workload workload = new Workload();
 
-        try (SegmentStore.Appender appender = client.openForAppend(fileId, 1)) {
+        try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
             workload.appendAcked(appender, 0, 200);
 
             // find a storage node hosting the current open chunk and kill it
@@ -74,11 +74,11 @@ class FailureRecoveryTest {
 
     @Test
     void writerDeathThenSealRecoveryPreservesAckedPrefixAndFencesZombie() throws Exception {
-        FileId fileId = client.create(SegmentStore.FileSpec.log("kill-writer"));
+        FileId fileId = client.create(StrataClient.FileSpec.log("kill-writer"));
         Workload workload = new Workload();
 
         // the "old leader" writes and is then abandoned without sealing (broker died)
-        SegmentStore.Appender zombie = client.openForAppend(fileId, 1);
+        StrataClient.Appender zombie = client.openForAppend(fileId, 1);
         workload.appendAcked(zombie, 0, 137);
 
         // the "new leader" recovers with epoch 2
@@ -108,10 +108,10 @@ class FailureRecoveryTest {
 
     @Test
     void recoveryWithOneReplicaDownStillPreservesAckedData() throws Exception {
-        FileId fileId = client.create(SegmentStore.FileSpec.log("recover-degraded"));
+        FileId fileId = client.create(StrataClient.FileSpec.log("recover-degraded"));
         Workload workload = new Workload();
 
-        SegmentStore.Appender zombie = client.openForAppend(fileId, 1);
+        StrataClient.Appender zombie = client.openForAppend(fileId, 1);
         workload.appendAcked(zombie, 0, 80);
 
         // kill one replica of the open chunk, then recover with only 2 reachable
@@ -131,8 +131,8 @@ class FailureRecoveryTest {
 
     @Test
     void staleRecoveryEpochFailsWhenAnyReplicaIsAlreadyFencedHigher() throws Exception {
-        FileId fileId = client.create(SegmentStore.FileSpec.log("recover-stale-epoch"));
-        SegmentStore.Appender zombie = client.openForAppend(fileId, 1);
+        FileId fileId = client.create(StrataClient.FileSpec.log("recover-stale-epoch"));
+        StrataClient.Appender zombie = client.openForAppend(fileId, 1);
         new Workload().appendAcked(zombie, 0, 10);
 
         var lookup = lookupFile(fileId);
@@ -158,9 +158,9 @@ class FailureRecoveryTest {
 
     @Test
     void nodeRestartKeepsIdentityAndData() throws Exception {
-        FileId fileId = client.create(SegmentStore.FileSpec.log("restart"));
+        FileId fileId = client.create(StrataClient.FileSpec.log("restart"));
         Workload workload = new Workload();
-        try (SegmentStore.Appender appender = client.openForAppend(fileId, 1)) {
+        try (StrataClient.Appender appender = client.openForAppend(fileId, 1)) {
             workload.appendAcked(appender, 0, 100);
             appender.seal();
         }

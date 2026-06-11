@@ -76,7 +76,7 @@ class ReaderImplTest {
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
 
-                SegmentStore.ReadResult result = reader.read(0, 3);
+                StrataClient.ReadResult result = reader.read(0, 3);
                 assertArrayEquals(new byte[] {1, 2, 3}, result.data());
                 assertFalse(result.endOfFile());
             }
@@ -143,7 +143,7 @@ class ReaderImplTest {
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
 
-                SegmentStore.ReadResult result = reader.read(0, 4);
+                StrataClient.ReadResult result = reader.read(0, 4);
                 assertArrayEquals(new byte[] {1, 2, 3, 4}, result.data());
                 assertFalse(result.endOfFile());
             }
