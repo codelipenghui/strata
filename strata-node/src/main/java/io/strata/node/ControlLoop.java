@@ -3,6 +3,7 @@ package io.strata.node;
 import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
+import io.strata.format.ChunkFormats;
 import io.strata.format.ChunkStore;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -28,6 +29,7 @@ final class ControlLoop implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ControlLoop.class);
     private static final int CALL_TIMEOUT_MS = 10_000;
     private static final int FETCH_CHUNK_BYTES = 4 * 1024 * 1024;
+    private static final long MAX_REPAIR_FOOTER_BYTES = 64L * 1024 * 1024;
 
     private final StorageNode node;
     private final NodeConfig config;
@@ -98,8 +100,8 @@ final class ControlLoop implements AutoCloseable {
         if (meta == null || meta.isClosed()) {
             disconnect();
             String ep = config.metadataEndpoints().get(endpointIndex % config.metadataEndpoints().size());
-            String[] hp = ep.split(":");
-            meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_STORAGE_NODE,
+            HostPort hp = parseEndpoint(ep);
+            meta = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_STORAGE_NODE,
                     "node-" + node.incarnation());
             sessionEpoch = -1;
         }
@@ -157,7 +159,12 @@ final class ControlLoop implements AutoCloseable {
                 switch (cmd) {
                     case Messages.ReplicateCmd r -> replicate(r);
                     case Messages.DeleteCmd d -> {
-                        for (var id : d.chunkIds()) store.delete(id); // CHUNK_NOT_FOUND is idempotent-ok
+                        for (var id : d.chunkIds()) {
+                            ErrorCode result = store.delete(id);
+                            if (result != ErrorCode.OK && result != ErrorCode.CHUNK_NOT_FOUND) {
+                                throw new ScpException(result, "delete " + id + " failed");
+                            }
+                        }
                     }
                     case Messages.DrainCmd dr -> node.setDraining(true);
                 }
@@ -179,23 +186,28 @@ final class ControlLoop implements AutoCloseable {
             var stat = store.stat(cmd.chunkId());
             if (stat.state() == io.strata.common.ChunkState.SEALED
                     && stat.sealedLength() == cmd.expectedLength()
-                    && (cmd.expectedCrc() == 0 || stat.dataCrc() == cmd.expectedCrc())) {
+                    && stat.dataCrc() == cmd.expectedCrc()) {
                 return;
             }
             log.warn("local copy of {} mismatches descriptor (state={} len={} crc={}) — re-pulling",
                     cmd.chunkId(), stat.state(), stat.sealedLength(), stat.dataCrc());
-            store.delete(cmd.chunkId());
+            ErrorCode deleteResult = store.delete(cmd.chunkId());
+            if (deleteResult != ErrorCode.OK && deleteResult != ErrorCode.CHUNK_NOT_FOUND) {
+                throw new ScpException(deleteResult, "delete stale local copy of " + cmd.chunkId() + " failed");
+            }
         }
         ScpException last = null;
         for (Messages.Replica source : cmd.sources()) {
             if (source.nodeId() == node.nodeId()) continue;
-            String[] hp = source.endpoint().split(":");
-            try (ScpClient src = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_STORAGE_NODE,
-                    "repair-" + node.nodeId())) {
-                byte[] file = fetchWholeFile(src, cmd);
-                store.importSealed(cmd.chunkId(), file, cmd.expectedLength(), cmd.expectedCrc());
-                log.info("replicated {} from node {} ({} bytes)", cmd.chunkId(), source.nodeId(), file.length);
-                return;
+            try {
+                HostPort hp = parseEndpoint(source.endpoint());
+                try (ScpClient src = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_STORAGE_NODE,
+                        "repair-" + node.nodeId())) {
+                    byte[] file = fetchWholeFile(src, cmd);
+                    store.importSealed(cmd.chunkId(), file, cmd.expectedLength(), cmd.expectedCrc());
+                    log.info("replicated {} from node {} ({} bytes)", cmd.chunkId(), source.nodeId(), file.length);
+                    return;
+                }
             } catch (ScpException e) {
                 last = e;
                 log.warn("replicate {} from {} failed: {}", cmd.chunkId(), source.endpoint(), e.getMessage());
@@ -207,21 +219,74 @@ final class ControlLoop implements AutoCloseable {
         throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no usable source");
     }
 
-    private byte[] fetchWholeFile(ScpClient src, Messages.ReplicateCmd cmd) throws IOException {
+    private record HostPort(String host, int port) {}
+
+    private static HostPort parseEndpoint(String endpoint) {
+        int colon = endpoint == null ? -1 : endpoint.lastIndexOf(':');
+        if (colon <= 0 || colon == endpoint.length() - 1) {
+            throw new ScpException(ErrorCode.INTERNAL, "invalid endpoint: " + endpoint);
+        }
+        String host = endpoint.substring(0, colon);
+        if (host.startsWith("[") != host.endsWith("]")) {
+            throw new ScpException(ErrorCode.INTERNAL, "invalid endpoint brackets: " + endpoint);
+        }
+        if (host.startsWith("[") && host.endsWith("]")) {
+            host = host.substring(1, host.length() - 1);
+        }
+        int port;
+        try {
+            port = Integer.parseInt(endpoint.substring(colon + 1));
+        } catch (NumberFormatException e) {
+            throw new ScpException(ErrorCode.INTERNAL, "invalid endpoint port: " + endpoint);
+        }
+        if (host.isBlank() || !host.equals(host.trim()) || port <= 0 || port > 65_535) {
+            throw new ScpException(ErrorCode.INTERNAL, "invalid endpoint: " + endpoint);
+        }
+        return new HostPort(host, port);
+    }
+
+    byte[] fetchWholeFile(ScpClient src, Messages.ReplicateCmd cmd) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         long offset = 0;
-        long fileLength = Long.MAX_VALUE;
-        while (offset < fileLength) {
+        long fileLength = -1;
+        long maxFileLength = maxRepairFileLength(cmd.expectedLength());
+        while (fileLength < 0 || offset < fileLength) {
             var fetch = new Messages.FetchChunk(cmd.chunkId(), offset, FETCH_CHUNK_BYTES);
             var frame = src.callFrame(Opcode.FETCH_CHUNK, fetch.encode(), null, CALL_TIMEOUT_MS);
-            ByteBuffer hb = frame.headerSlice();
-            io.strata.proto.Resp.check(hb);
-            var resp = Messages.FetchResp.decode(hb);
+            Messages.FetchResp resp;
+            try {
+                ByteBuffer hb = frame.headerSlice();
+                io.strata.proto.Resp.check(hb);
+                resp = Messages.FetchResp.decode(hb);
+            } catch (ScpException e) {
+                throw e;
+            } catch (RuntimeException e) {
+                throw new ScpException(ErrorCode.CORRUPT_CHUNK,
+                        "malformed fetch response from repair source: " + e);
+            }
             if (resp.state() != ChunkState.SEALED) {
                 throw new ScpException(ErrorCode.INTERNAL, "source chunk not sealed");
             }
-            fileLength = resp.fileLength();
+            long reportedLength = resp.fileLength();
+            if (reportedLength < ChunkFormats.HEADER_SIZE + ChunkFormats.TRAILER_SIZE
+                    || reportedLength > maxFileLength) {
+                throw new ScpException(ErrorCode.CORRUPT_CHUNK,
+                        "source file length out of bounds: " + reportedLength);
+            }
+            if (fileLength < 0) {
+                fileLength = reportedLength;
+            } else if (reportedLength != fileLength) {
+                throw new ScpException(ErrorCode.CORRUPT_CHUNK,
+                        "source file length changed: " + fileLength + " -> " + reportedLength);
+            }
             int n = frame.payloadLength();
+            if (n > FETCH_CHUNK_BYTES) {
+                throw new ScpException(ErrorCode.CORRUPT_CHUNK,
+                        "source sent " + n + " bytes for fetch limit " + FETCH_CHUNK_BYTES);
+            }
+            if (n > fileLength - offset) {
+                throw new ScpException(ErrorCode.CORRUPT_CHUNK, "source sent bytes past EOF");
+            }
             if (n == 0 && offset < fileLength) {
                 throw new ScpException(ErrorCode.INTERNAL, "short fetch at " + offset);
             }
@@ -231,6 +296,25 @@ final class ControlLoop implements AutoCloseable {
             offset += n;
         }
         return out.toByteArray();
+    }
+
+    private static long maxRepairFileLength(long expectedLength) {
+        if (expectedLength < 0) {
+            throw new ScpException(ErrorCode.CORRUPT_CHUNK, "negative expected repair length");
+        }
+        long max;
+        try {
+            max = Math.addExact(ChunkFormats.HEADER_SIZE, expectedLength);
+            max = Math.addExact(max, ChunkFormats.TRAILER_SIZE);
+            max = Math.addExact(max, MAX_REPAIR_FOOTER_BYTES);
+        } catch (ArithmeticException e) {
+            throw new ScpException(ErrorCode.CORRUPT_CHUNK, "repair length overflow");
+        }
+        if (max > Integer.MAX_VALUE) {
+            throw new ScpException(ErrorCode.INTERNAL,
+                    "repair file too large for in-memory import: " + expectedLength);
+        }
+        return max;
     }
 
     private void inventoryLoop() {

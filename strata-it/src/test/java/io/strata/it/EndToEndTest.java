@@ -16,6 +16,7 @@ import org.junit.jupiter.api.TestInstance;
 import java.nio.ByteBuffer;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -107,6 +108,23 @@ class EndToEndTest {
             appender.seal();
         }
         workload.verifyAckedPrefix(client, fileId);
+    }
+
+    @Test
+    void emptyAppendCompletesWithoutCreatingAChunk() throws Exception {
+        FileId fileId = client.create(SegmentStore.FileSpec.log("empty-append"));
+
+        try (SegmentStore.Appender appender = client.openForAppend(fileId, 1)) {
+            var ack = appender.append(ByteBuffer.allocate(0)).get(1, TimeUnit.SECONDS);
+            assertEquals(0, ack.endOffset());
+            assertEquals(0, ack.durableOffset());
+            assertEquals(0, appender.durableOffset());
+            assertEquals(0, appender.seal().sealedLength());
+        }
+
+        var lookup = lookup(fileId);
+        assertEquals(1, lookup.fileState(), "empty sealed file should be SEALED");
+        assertEquals(0, lookup.chunks().size(), "empty append must not create an empty chunk");
     }
 
     private Messages.LookupFileResp lookup(FileId fileId) throws Exception {

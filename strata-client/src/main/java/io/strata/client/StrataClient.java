@@ -39,7 +39,14 @@ public final class StrataClient implements SegmentStore {
             if (c.writeEpoch() > writeEpoch) {
                 throw new ScpException(ErrorCode.FENCED_EPOCH, "file epoch " + c.writeEpoch(), c.writeEpoch());
             }
-            length += c.length();
+            if (c.length() < 0) {
+                throw new ScpException(ErrorCode.CORRUPT_CHUNK, "negative chunk length " + c.length());
+            }
+            try {
+                length = Math.addExact(length, c.length());
+            } catch (ArithmeticException e) {
+                throw new ScpException(ErrorCode.CORRUPT_CHUNK, "file length overflow");
+            }
         }
         return new AppenderImpl(meta, pool, config, fileId, writeEpoch, file.fileKind(),
                 file.ackPolicy(), length);
@@ -57,7 +64,17 @@ public final class StrataClient implements SegmentStore {
 
     @Override
     public void delete(List<FileId> fileIds) {
-        meta.deleteFiles(fileIds);
+        Messages.DeleteFilesResp resp = meta.deleteFiles(fileIds);
+        if (!resp.fileIds().equals(fileIds) || resp.codes().size() != fileIds.size()) {
+            throw new ScpException(ErrorCode.INTERNAL, "metadata delete response did not match request");
+        }
+        for (int i = 0; i < resp.fileIds().size(); i++) {
+            short code = resp.codes().get(i);
+            if (code != ErrorCode.OK.code) {
+                throw new ScpException(ErrorCode.fromCode(code),
+                        "delete " + resp.fileIds().get(i) + " failed with " + code);
+            }
+        }
     }
 
     @Override

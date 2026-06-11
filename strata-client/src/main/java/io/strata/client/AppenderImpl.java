@@ -7,12 +7,17 @@ import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.Resp;
+import io.strata.proto.ScpClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
@@ -30,6 +35,7 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 final class AppenderImpl implements SegmentStore.Appender {
     private static final Logger log = LoggerFactory.getLogger(AppenderImpl.class);
+    private static final int REPLICA_SLOTS = 3;
     private static final int OPEN_QUORUM = 2;
     /** Replica responses are dispatched off the connection reader threads. */
     private static final java.util.concurrent.Executor CALLBACKS =
@@ -77,6 +83,16 @@ final class AppenderImpl implements SegmentStore.Appender {
 
     private record Pending(long chunkEnd, CompletableFuture<SegmentStore.AppendAck> future) {}
 
+    private record SealKey(long finalLength, int crc) {}
+
+    private static long checkedAdd(long left, long right, String what) {
+        try {
+            return Math.addExact(left, right);
+        } catch (ArithmeticException e) {
+            throw new ScpException(ErrorCode.CORRUPT_CHUNK, what + " overflow");
+        }
+    }
+
     AppenderImpl(MetaClient meta, NodePool pool, ClientConfig config, io.strata.common.FileId fileId,
                  int epoch, byte fileKind, byte ackPolicy, long existingFileLength) {
         this.meta = meta;
@@ -95,32 +111,46 @@ final class AppenderImpl implements SegmentStore.Appender {
         try {
             awaitNotRolling();
             throwIfDead();
+            int len = data.remaining();
+            if (len == 0) {
+                if (session == null) {
+                    return CompletableFuture.completedFuture(new SegmentStore.AppendAck(fileBase, fileBase));
+                }
+                if (session.end <= session.durable) {
+                    return CompletableFuture.completedFuture(
+                            new SegmentStore.AppendAck(fileOffset(session.end), fileOffset(session.durable)));
+                }
+                CompletableFuture<SegmentStore.AppendAck> callerFuture = new CompletableFuture<>();
+                session.pending.addLast(new Pending(session.end, callerFuture));
+                return callerFuture;
+            }
             if (session == null || session.needRoll || session.end >= config.chunkRollBytes()) {
                 roll();
                 throwIfDead();
             }
             ChunkSession s = session;
             long base = s.end;
-            int len = data.remaining();
-            s.end = base + len;
+            long newEnd = checkedAdd(base, len, "chunk offset");
+            s.end = newEnd;
             CompletableFuture<SegmentStore.AppendAck> callerFuture = new CompletableFuture<>();
-            s.pending.addLast(new Pending(s.end, callerFuture));
+            s.pending.addLast(new Pending(newEnd, callerFuture));
 
             byte[] header = new Messages.Append(s.chunkId, epoch, base, s.durable).encode();
             for (int i = 0; i < s.replicas.size(); i++) {
+                if (dead) break;
                 if (s.failed[i]) continue;
                 final int replicaIndex = i;
                 CompletableFuture<Frame> f;
                 try {
-                    f = pool.get(s.replicas.get(i).endpoint()).send(Opcode.APPEND, header, data.duplicate());
+                    ScpClient client = pool.get(s.replicas.get(i).endpoint());
+                    f = client.sendWithTimeout(Opcode.APPEND, header, data.duplicate(), config.callTimeoutMs());
                 } catch (ScpException e) {
                     onReplicaFailureLocked(s, replicaIndex, e);
                     continue;
                 }
                 // per-replica timeout: a black-holed connection must fail THIS replica (seal-and-
                 // roll path), not stall the whole appender into quorum loss
-                f.orTimeout(config.callTimeoutMs(), java.util.concurrent.TimeUnit.MILLISECONDS)
-                        .whenCompleteAsync((frame, err) -> onReplicaResponse(s, replicaIndex, frame, err), CALLBACKS);
+                f.whenCompleteAsync((frame, err) -> onReplicaResponse(s, replicaIndex, newEnd, frame, err), CALLBACKS);
             }
             return callerFuture;
         } finally {
@@ -128,17 +158,34 @@ final class AppenderImpl implements SegmentStore.Appender {
         }
     }
 
-    private void onReplicaResponse(ChunkSession s, int replicaIndex, Frame frame, Throwable err) {
+    private void onReplicaResponse(ChunkSession s, int replicaIndex, long expectedEnd, Frame frame, Throwable err) {
         lock.lock();
         try {
+            if (s != session) {
+                handleStaleReplicaResponseLocked(frame, err);
+                return;
+            }
             if (err != null) {
-                onReplicaFailureLocked(s, replicaIndex, new ScpException(ErrorCode.INTERNAL, String.valueOf(err)));
+                ScpException e = asScpException(err);
+                if (e != null && e.code() == ErrorCode.FENCED_EPOCH) {
+                    dieLocked(e);
+                } else {
+                    onReplicaFailureLocked(s, replicaIndex, e != null ? e
+                            : new ScpException(ErrorCode.INTERNAL, String.valueOf(err)));
+                }
                 return;
             }
             try {
+                if (frame == null) {
+                    throw new ScpException(ErrorCode.INTERNAL, "null append response");
+                }
                 ByteBuffer h = frame.headerSlice();
                 Resp.check(h);
                 long end = Messages.AppendResp.decode(h).endOffset();
+                if (end != expectedEnd) {
+                    throw new ScpException(ErrorCode.CORRUPT_CHUNK,
+                            "replica append end " + end + " != expected " + expectedEnd);
+                }
                 s.acked[replicaIndex] = Math.max(s.acked[replicaIndex], end);
                 advanceDurableLocked(s);
             } catch (ScpException e) {
@@ -147,10 +194,40 @@ final class AppenderImpl implements SegmentStore.Appender {
                 } else {
                     onReplicaFailureLocked(s, replicaIndex, e);
                 }
+            } catch (RuntimeException e) {
+                onReplicaFailureLocked(s, replicaIndex,
+                        new ScpException(ErrorCode.INTERNAL, "malformed append response: " + e));
             }
         } finally {
             lock.unlock();
         }
+    }
+
+    private void handleStaleReplicaResponseLocked(Frame frame, Throwable err) {
+        if (dead) return;
+        ScpException error = asScpException(err);
+        if (error != null && error.code() == ErrorCode.FENCED_EPOCH) {
+            dieLocked(error);
+            return;
+        }
+        if (frame == null) return;
+        try {
+            Resp.check(frame.headerSlice());
+        } catch (ScpException e) {
+            if (e.code() == ErrorCode.FENCED_EPOCH) {
+                dieLocked(e);
+            }
+        } catch (RuntimeException ignored) {
+            // Stale malformed responses are already detached from caller state.
+        }
+    }
+
+    private static ScpException asScpException(Throwable err) {
+        Throwable t = err;
+        while (t instanceof java.util.concurrent.CompletionException && t.getCause() != null) {
+            t = t.getCause();
+        }
+        return t instanceof ScpException e ? e : null;
     }
 
     private void onReplicaFailureLocked(ChunkSession s, int replicaIndex, ScpException cause) {
@@ -179,8 +256,16 @@ final class AppenderImpl implements SegmentStore.Appender {
         if (second > s.durable) {
             s.durable = second;
             while (!s.pending.isEmpty() && s.pending.peekFirst().chunkEnd() <= s.durable) {
-                Pending p = s.pending.pollFirst();
-                p.future().complete(new SegmentStore.AppendAck(fileBase + p.chunkEnd(), fileBase + s.durable));
+                Pending p = s.pending.peekFirst();
+                SegmentStore.AppendAck ack;
+                try {
+                    ack = new SegmentStore.AppendAck(fileOffset(p.chunkEnd()), fileOffset(s.durable));
+                } catch (ScpException e) {
+                    dieLocked(e);
+                    return;
+                }
+                s.pending.pollFirst();
+                p.future().complete(ack);
             }
             progress.signalAll();
         }
@@ -196,7 +281,12 @@ final class AppenderImpl implements SegmentStore.Appender {
                 long sealAt = session.end; // pipeline drained => durable == end
                 sealChunkLocked(session, sealAt);
                 if (dead) return;
-                fileBase += sealAt;
+                try {
+                    fileBase = fileOffset(sealAt);
+                } catch (ScpException e) {
+                    dieLocked(e);
+                    return;
+                }
                 session = null;
             }
             openNewChunkLocked();
@@ -225,11 +315,8 @@ final class AppenderImpl implements SegmentStore.Appender {
     /** Network calls are made WITHOUT the lock held — blocked callbacks must never wait on us. */
     private void sealChunkLocked(ChunkSession s, long dataLength) {
         byte[] header = new Messages.SealChunk(s.chunkId, epoch, dataLength).encode();
-        int okCount = 0;
-        long finalLength = -1;
-        int crc = 0;
         ScpException lastErr = null;
-        List<Integer> sealedReplicas = new java.util.ArrayList<>(3);
+        Map<SealKey, List<Integer>> votes = new LinkedHashMap<>();
         for (int i = 0; i < s.replicas.size(); i++) {
             if (s.failed[i]) continue;
             String endpoint = s.replicas.get(i).endpoint();
@@ -251,22 +338,42 @@ final class AppenderImpl implements SegmentStore.Appender {
                 }
                 continue;
             }
-            var resp = Messages.SealResp.decode(h);
-            if (finalLength >= 0 && (resp.finalLength() != finalLength || resp.chunkCrc() != crc)) {
-                dieLocked(new ScpException(ErrorCode.INTERNAL, "replica seal divergence on " + s.chunkId));
-                return;
+            Messages.SealResp resp;
+            try {
+                resp = Messages.SealResp.decode(h);
+            } catch (RuntimeException e) {
+                lastErr = new ScpException(ErrorCode.INTERNAL, "malformed seal response: " + e);
+                log.warn("seal {} on replica {} returned malformed response: {}",
+                        s.chunkId, endpoint, e.toString());
+                continue;
             }
-            finalLength = resp.finalLength();
-            crc = resp.chunkCrc();
-            sealedReplicas.add(s.replicas.get(i).nodeId());
-            okCount++;
+            if (resp.finalLength() != dataLength) {
+                lastErr = new ScpException(ErrorCode.CORRUPT_CHUNK,
+                        "replica sealed at " + resp.finalLength() + " != requested " + dataLength);
+                log.warn("seal {} on replica {} returned bad final length: {}",
+                        s.chunkId, endpoint, lastErr.getMessage());
+                continue;
+            }
+            SealKey key = new SealKey(resp.finalLength(), resp.chunkCrc());
+            votes.computeIfAbsent(key, ignored -> new ArrayList<>()).add(s.replicas.get(i).nodeId());
         }
+        int okCount = votes.values().stream().mapToInt(List::size).sum();
         if (okCount < OPEN_QUORUM) {
             dieLocked(lastErr != null ? lastErr : new ScpException(ErrorCode.INTERNAL, "seal quorum lost"));
             return;
         }
-        long fl = finalLength;
-        int fcrc = crc;
+        Map.Entry<SealKey, List<Integer>> quorum = bestSealQuorum(votes);
+        if (quorum == null) {
+            dieLocked(new ScpException(ErrorCode.INTERNAL, "replica seal divergence on " + s.chunkId));
+            return;
+        }
+        if (votes.size() > 1) {
+            log.warn("replica seal divergence on {} — committing agreeing quorum {} of {} successful seals",
+                    s.chunkId, quorum.getValue().size(), okCount);
+        }
+        long fl = quorum.getKey().finalLength();
+        int fcrc = quorum.getKey().crc();
+        List<Integer> sealedReplicas = List.copyOf(quorum.getValue());
         ChunkId id = s.chunkId;
         ScpException metaFailure = null;
         lock.unlock();
@@ -288,13 +395,26 @@ final class AppenderImpl implements SegmentStore.Appender {
         }
     }
 
+    private static Map.Entry<SealKey, List<Integer>> bestSealQuorum(Map<SealKey, List<Integer>> votes) {
+        Map.Entry<SealKey, List<Integer>> best = null;
+        for (Map.Entry<SealKey, List<Integer>> entry : votes.entrySet()) {
+            if (entry.getValue().size() < OPEN_QUORUM) continue;
+            if (best == null || entry.getValue().size() > best.getValue().size()) {
+                best = entry;
+            }
+        }
+        return best;
+    }
+
     private void openNewChunkLocked() {
         // failover resilience lives in MetaClient.call (deadline-based retry); a failure here
         // means the metadata plane stayed unreachable past the deadline
         Messages.CreateChunkResp created;
+        UUID createOp = UUID.randomUUID();
         lock.unlock();
         try {
-            created = meta.createChunk(fileId, epoch);
+            created = meta.createChunk(fileId, epoch,
+                    createOp.getMostSignificantBits(), createOp.getLeastSignificantBits());
         } catch (ScpException e) {
             lock.lock();
             dieLocked(e);
@@ -302,10 +422,21 @@ final class AppenderImpl implements SegmentStore.Appender {
         } finally {
             if (!lock.isHeldByCurrentThread()) lock.lock();
         }
+        if (dead) {
+            abortCreatedChunkLocked(created.chunkId(), createOp, List.of());
+            return;
+        }
+        if (!validCreatedChunk(created)) {
+            abortCreatedChunkLocked(created.chunkId(), createOp, List.of());
+            dieLocked(new ScpException(ErrorCode.INTERNAL,
+                    "metadata returned invalid created chunk for " + created.chunkId()));
+            return;
+        }
         ChunkSession s = new ChunkSession(created.chunkId(), created.replicas());
         byte[] header = new Messages.OpenChunk(created.chunkId(), epoch, ackPolicy, (byte) 0, fileKind,
                 config.chunkRollBytes(), System.currentTimeMillis()).encode();
         int ok = 0;
+        List<Messages.Replica> opened = new ArrayList<>(s.replicas.size());
         for (int i = 0; i < s.replicas.size(); i++) {
             String endpoint = s.replicas.get(i).endpoint();
             lock.unlock();
@@ -320,15 +451,71 @@ final class AppenderImpl implements SegmentStore.Appender {
             if (err != null) {
                 s.failed[i] = true;
                 log.warn("open {} on replica {} failed: {}", s.chunkId, endpoint, err.getMessage());
+                if (err.code() == ErrorCode.FENCED_EPOCH) {
+                    dieLocked(err);
+                }
             } else {
+                opened.add(s.replicas.get(i));
                 ok++;
+            }
+            if (dead) {
+                abortCreatedChunkLocked(s.chunkId, createOp, opened);
+                return;
             }
         }
         if (ok < OPEN_QUORUM) {
+            abortCreatedChunkLocked(s.chunkId, createOp, opened);
             dieLocked(new ScpException(ErrorCode.INTERNAL, "cannot open chunk on a quorum"));
             return;
         }
         session = s;
+    }
+
+    private boolean validCreatedChunk(Messages.CreateChunkResp created) {
+        return created.writeEpoch() == epoch
+                && created.chunkId().fileId().equals(fileId)
+                && validReplicaSet(created.replicas());
+    }
+
+    private static boolean validReplicaSet(List<Messages.Replica> replicas) {
+        if (replicas.size() != REPLICA_SLOTS) return false;
+        java.util.HashSet<Integer> nodeIds = new java.util.HashSet<>();
+        java.util.HashSet<String> endpoints = new java.util.HashSet<>();
+        for (Messages.Replica r : replicas) {
+            if (r.nodeId() <= 0) return false;
+            if (r.endpoint() == null || r.endpoint().isBlank()) return false;
+            if (!nodeIds.add(r.nodeId())) return false;
+            if (!endpoints.add(r.endpoint())) return false;
+        }
+        return true;
+    }
+
+    private void abortCreatedChunkLocked(ChunkId chunkId, UUID createOp, List<Messages.Replica> opened) {
+        ScpException abortErr = null;
+        lock.unlock();
+        try {
+            meta.abortChunkMeta(chunkId, epoch, createOp.getMostSignificantBits(), createOp.getLeastSignificantBits());
+        } catch (ScpException e) {
+            abortErr = e;
+        } finally {
+            lock.lock();
+        }
+        if (abortErr != null) {
+            dieLocked(abortErr);
+            return;
+        }
+        byte[] deleteHeader = new Messages.DeleteChunks(List.of(chunkId)).encode();
+        for (Messages.Replica r : opened) {
+            lock.unlock();
+            try {
+                pool.get(r.endpoint()).call(Opcode.DELETE_CHUNKS, deleteHeader, null, config.callTimeoutMs());
+            } catch (ScpException e) {
+                log.warn("cleanup delete of aborted {} on {} failed: {}",
+                        chunkId, r.endpoint(), e.getMessage());
+            } finally {
+                lock.lock();
+            }
+        }
     }
 
     private void awaitNotRolling() {
@@ -360,11 +547,15 @@ final class AppenderImpl implements SegmentStore.Appender {
                 : new ScpException(ErrorCode.INTERNAL, "appender closed");
     }
 
+    private long fileOffset(long chunkOffset) {
+        return checkedAdd(fileBase, chunkOffset, "file offset");
+    }
+
     @Override
     public long durableOffset() {
         lock.lock();
         try {
-            return session == null ? fileBase : fileBase + session.durable;
+            return session == null ? fileBase : fileOffset(session.durable);
         } finally {
             lock.unlock();
         }
@@ -385,16 +576,28 @@ final class AppenderImpl implements SegmentStore.Appender {
                     long sealAt = session.end;
                     sealChunkLocked(session, sealAt);
                     throwIfDead();
-                    total = fileBase + sealAt;
+                    try {
+                        total = fileOffset(sealAt);
+                    } catch (ScpException e) {
+                        dieLocked(e);
+                        throw e;
+                    }
                     fileBase = total;
                     session = null;
                 }
                 long t = total;
+                ScpException sealFileFailure = null;
                 lock.unlock();
                 try {
                     meta.sealFile(fileId, t);
+                } catch (ScpException e) {
+                    sealFileFailure = e;
                 } finally {
                     lock.lock();
+                }
+                if (sealFileFailure != null) {
+                    dieLocked(sealFileFailure);
+                    throw sealFileFailure;
                 }
                 dead = true;
                 deathCause = new ScpException(ErrorCode.FILE_SEALED, "appender sealed the file");

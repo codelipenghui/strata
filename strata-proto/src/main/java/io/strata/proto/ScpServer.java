@@ -84,14 +84,15 @@ public final class ScpServer implements AutoCloseable {
         // ReentrantLock (not synchronized): deferred completions write responses from virtual
         // threads; blocking socket writes must not pin carriers
         java.util.concurrent.locks.ReentrantLock writeLock = new java.util.concurrent.locks.ReentrantLock();
-        try (s) {
+        AtomicBoolean connectionOpen = new AtomicBoolean(true);
+        try {
             DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream(), 1 << 16));
             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream(), 1 << 16));
 
             Frame hello = FrameIO.read(in);
             if (hello == null) return;
             if (hello.opcode() != Opcode.HELLO.code) {
-                writeResponse(s, out, writeLock, Frame.response(hello,
+                writeResponse(s, out, writeLock, connectionOpen, Frame.response(hello,
                         Resp.error(ErrorCode.UNKNOWN_OPCODE, "first frame must be HELLO", 0), null));
                 return;
             }
@@ -100,11 +101,11 @@ public final class ScpServer implements AutoCloseable {
             } catch (RuntimeException e) {
                 // incompatible version range or malformed HELLO header: answer with a typed
                 // error instead of silently dropping the connection
-                writeResponse(s, out, writeLock, Frame.response(hello,
+                writeResponse(s, out, writeLock, connectionOpen, Frame.response(hello,
                         Resp.error(ErrorCode.UNSUPPORTED_VERSION, String.valueOf(e.getMessage()), 0), null));
                 return;
             }
-            writeResponse(s, out, writeLock, Frame.response(hello,
+            writeResponse(s, out, writeLock, connectionOpen, Frame.response(hello,
                     new Messages.HelloResp(0, nodeId, incMsb, incLsb, FrameIO.MAX_FRAME_BYTES, 1L << 30).encode(), null));
 
             while (!closed.get()) {
@@ -113,6 +114,10 @@ public final class ScpServer implements AutoCloseable {
                 java.util.concurrent.CompletableFuture<Frame> respF;
                 try {
                     respF = handler.handleAsync(req);
+                    if (respF == null) {
+                        respF = java.util.concurrent.CompletableFuture.completedFuture(
+                                internalError(req, "handler returned null future"));
+                    }
                 } catch (ScpException e) {
                     respF = java.util.concurrent.CompletableFuture.completedFuture(
                             Frame.response(req, Resp.error(e.code(), e.getMessage(), e.detail()), null));
@@ -122,7 +127,8 @@ public final class ScpServer implements AutoCloseable {
                             Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(e), 0), null));
                 }
                 if (respF.isDone() && !respF.isCompletedExceptionally()) {
-                    writeResponse(s, out, writeLock, respF.join()); // fast path, no extra hop
+                    writeResponse(s, out, writeLock, connectionOpen,
+                            requireResponse(req, respF.join())); // fast path, no extra hop
                 } else {
                     respF.whenComplete((resp, err) -> {
                         Frame frame = resp;
@@ -133,21 +139,42 @@ public final class ScpServer implements AutoCloseable {
                                     ? Frame.response(req, Resp.error(se.code(), se.getMessage(), se.detail()), null)
                                     : Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(cause), 0), null);
                         }
-                        writeResponse(s, out, writeLock, frame);
+                        frame = requireResponse(req, frame);
+                        writeResponse(s, out, writeLock, connectionOpen, frame);
                     });
                 }
             }
         } catch (IOException e) {
             // connection dropped — normal in failure tests
         } finally {
+            connectionOpen.set(false);
             connections.remove(s);
+            try {
+                s.close();
+            } catch (IOException ignored) {
+            }
         }
     }
 
+    private static Frame requireResponse(Frame req, Frame frame) {
+        return frame != null ? frame : internalError(req, "handler returned null response");
+    }
+
+    private static Frame internalError(Frame req, String message) {
+        return Frame.response(req, Resp.error(ErrorCode.INTERNAL, message, 0), null);
+    }
+
     private void writeResponse(Socket s, DataOutputStream out,
-                               java.util.concurrent.locks.ReentrantLock writeLock, Frame frame) {
+                               java.util.concurrent.locks.ReentrantLock writeLock,
+                               AtomicBoolean connectionOpen, Frame frame) {
+        if (closed.get() || !connectionOpen.get() || s.isClosed()) {
+            return;
+        }
         writeLock.lock();
         try {
+            if (closed.get() || !connectionOpen.get() || s.isClosed()) {
+                return;
+            }
             FrameIO.write(out, frame);
         } catch (IOException e) {
             try {

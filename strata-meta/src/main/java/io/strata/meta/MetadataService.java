@@ -10,15 +10,14 @@ import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpServer;
 import org.apache.curator.framework.recipes.leader.LeaderLatch;
+import org.apache.zookeeper.KeeperException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
@@ -32,7 +31,7 @@ public final class MetadataService implements AutoCloseable {
     private static final int CAS_RETRIES = 5;
 
     private final MetaConfig config;
-    private final ZkMetadataStore store;
+    private final MetadataStore store;
     private final NodeRegistry registry;
     private final RepairCoordinator repair;
     private final ScpServer server;
@@ -40,16 +39,85 @@ public final class MetadataService implements AutoCloseable {
 
     public MetadataService(MetaConfig config) throws Exception {
         this.config = config;
-        this.store = new ZkMetadataStore(config.zkConnect());
-        this.registry = new NodeRegistry(store, config);
-        UUID serviceId = UUID.randomUUID();
-        this.leaderLatch = new LeaderLatch(store.curator(), "/strata/leader", serviceId.toString());
-        this.repair = new RepairCoordinator(store, registry, config, leaderLatch::hasLeadership);
-        this.leaderLatch.start();
-        this.server = new ScpServer(config.listenPort(), 0,
-                serviceId.getMostSignificantBits(), serviceId.getLeastSignificantBits(), this::handle);
-        this.repair.start();
+        ZkMetadataStore openedStore = null;
+        LeaderLatch openedLatch = null;
+        RepairCoordinator openedRepair = null;
+        ScpServer openedServer = null;
+        try {
+            openedStore = new ZkMetadataStore(config.zkConnect());
+            NodeRegistry openedRegistry = new NodeRegistry(openedStore, config);
+            UUID serviceId = UUID.randomUUID();
+            openedLatch = new LeaderLatch(openedStore.curator(), "/strata/leader", serviceId.toString());
+            openedRepair = new RepairCoordinator(openedStore, openedRegistry, config, openedLatch::hasLeadership);
+
+            this.store = openedStore;
+            this.registry = openedRegistry;
+            this.leaderLatch = openedLatch;
+            this.repair = openedRepair;
+
+            openedServer = new ScpServer(config.listenPort(), 0,
+                    serviceId.getMostSignificantBits(), serviceId.getLeastSignificantBits(), this::handle);
+            this.server = openedServer;
+            openedLatch.start();
+            openedRepair.start();
+        } catch (Exception e) {
+            cleanupFailedStart(openedRepair, openedServer, openedLatch, openedStore, e);
+            throw e;
+        }
         log.info("metadata service started on port {} (zk {})", server.port(), config.zkConnect());
+    }
+
+    private static void cleanupFailedStart(RepairCoordinator repair, ScpServer server,
+                                           LeaderLatch leaderLatch, MetadataStore store, Throwable failure) {
+        if (repair != null) {
+            try {
+                repair.close();
+            } catch (RuntimeException e) {
+                failure.addSuppressed(e);
+            }
+        }
+        if (server != null) {
+            try {
+                server.close();
+            } catch (RuntimeException e) {
+                failure.addSuppressed(e);
+            }
+        }
+        if (leaderLatch != null) {
+            try {
+                leaderLatch.close();
+            } catch (IOException | RuntimeException e) {
+                failure.addSuppressed(e);
+            }
+        }
+        if (store != null) {
+            try {
+                store.close();
+            } catch (RuntimeException e) {
+                failure.addSuppressed(e);
+            }
+        }
+    }
+
+    private static Throwable suppress(Throwable failure, Throwable next) {
+        if (failure == null) {
+            return next;
+        }
+        failure.addSuppressed(next);
+        return failure;
+    }
+
+    private static void throwCloseFailure(Throwable failure) throws IOException {
+        if (failure == null) {
+            return;
+        }
+        if (failure instanceof IOException e) {
+            throw e;
+        }
+        if (failure instanceof RuntimeException e) {
+            throw e;
+        }
+        throw new IOException(failure);
     }
 
     public int port() {
@@ -106,9 +174,7 @@ public final class MetadataService implements AutoCloseable {
 
             case CREATE_FILE -> {
                 var m = Messages.CreateFile.decode(h);
-                FileId id = FileId.random();
-                store.createFile(new Records.FileRecord(id, m.fileKind(), m.mediaClass(), m.ackPolicy(),
-                        m.ownerTag(), Records.FileState.OPEN, System.currentTimeMillis(), List.of()));
+                FileId id = createFile(m);
                 yield ScpServer.ok(req, new Messages.CreateFileResp(id).encode(), null);
             }
 
@@ -120,6 +186,12 @@ public final class MetadataService implements AutoCloseable {
             case SEAL_CHUNK_META -> {
                 var m = Messages.SealChunkMeta.decode(h);
                 sealChunk(m);
+                yield ScpServer.ok(req, Messages.okHeader(), null);
+            }
+
+            case ABORT_CHUNK_META -> {
+                var m = Messages.AbortChunkMeta.decode(h);
+                abortChunk(m);
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
 
@@ -140,15 +212,22 @@ public final class MetadataService implements AutoCloseable {
                             throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                                     "chunk " + c.index() + " is " + c.state());
                         }
-                        total += c.length();
+                        if (c.length() < 0) {
+                            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                                    "negative sealed length on chunk " + c.index());
+                        }
+                        try {
+                            total = Math.addExact(total, c.length());
+                        } catch (ArithmeticException e) {
+                            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                                    "sealed chunk lengths overflow");
+                        }
                     }
                     if (total != m.totalLength()) {
                         throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                                 "total length " + total + " != requested " + m.totalLength(), total);
                     }
-                    return new Records.FileRecord(file.fileId(), file.fileKind(),
-                            file.mediaClass(), file.ackPolicy(), file.ownerTag(), Records.FileState.SEALED,
-                            file.createdAtMs(), file.chunks());
+                    return file.withState(Records.FileState.SEALED);
                 });
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
@@ -163,9 +242,7 @@ public final class MetadataService implements AutoCloseable {
                 List<Short> codes = new ArrayList<>();
                 for (FileId id : m.fileIds()) {
                     try {
-                        mutateFile(id, file -> new Records.FileRecord(file.fileId(), file.fileKind(),
-                                file.mediaClass(), file.ackPolicy(), file.ownerTag(),
-                                Records.FileState.DELETING, file.createdAtMs(), file.chunks()));
+                        mutateFile(id, file -> file.withState(Records.FileState.DELETING));
                         codes.add(ErrorCode.OK.code);
                     } catch (ScpException e) {
                         codes.add(e.code().code);
@@ -176,6 +253,26 @@ public final class MetadataService implements AutoCloseable {
 
             default -> throw new ScpException(ErrorCode.UNKNOWN_OPCODE, op + " not served by metadata plane");
         };
+    }
+
+    private FileId createFile(Messages.CreateFile m) throws Exception {
+        if (m.ackPolicy() != 0 && m.ackPolicy() != 1) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                    "unsupported ack policy " + (m.ackPolicy() & 0xFF));
+        }
+        try {
+            store.createFile(new Records.FileRecord(m.fileId(), m.fileKind(), m.mediaClass(), m.ackPolicy(),
+                    m.ownerTag(), Records.FileState.OPEN, System.currentTimeMillis(), List.of(),
+                    m.opIdMsb(), m.opIdLsb()));
+            return m.fileId();
+        } catch (KeeperException.NodeExistsException e) {
+            var existing = store.getFile(m.fileId());
+            if (existing.isPresent() && existing.get().value().createdBy(m.opIdMsb(), m.opIdLsb())) {
+                return m.fileId();
+            }
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                    "file id already exists for a different create request: " + m.fileId());
+        }
     }
 
     private Messages.CreateChunkResp createChunk(Messages.CreateChunk m) throws Exception {
@@ -197,6 +294,10 @@ public final class MetadataService implements AutoCloseable {
             if (!file.chunks().isEmpty()) {
                 Records.ChunkRecord tail = file.chunks().get(file.chunks().size() - 1);
                 if (tail.state() == ChunkState.OPEN) {
+                    if (tail.createdBy(m.opIdMsb(), m.opIdLsb())) {
+                        return new Messages.CreateChunkResp(new ChunkId(m.fileId(), tail.index()),
+                                tail.writeEpoch(), replicasFor(tail.replicas()));
+                    }
                     throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                             "tail chunk " + tail.index() + " is OPEN — seal or recover it first");
                 }
@@ -213,10 +314,9 @@ public final class MetadataService implements AutoCloseable {
             int index = file.chunks().isEmpty() ? 0
                     : file.chunks().get(file.chunks().size() - 1).index() + 1;
             List<Records.ChunkRecord> chunks = new ArrayList<>(file.chunks());
-            chunks.add(new Records.ChunkRecord(index, ChunkState.OPEN, 0, 0, m.writeEpoch(), replicaIds));
-            Records.FileRecord updated = new Records.FileRecord(file.fileId(), file.fileKind(),
-                    file.mediaClass(), file.ackPolicy(), file.ownerTag(), file.state(),
-                    file.createdAtMs(), chunks);
+            chunks.add(new Records.ChunkRecord(index, ChunkState.OPEN, 0, 0, m.writeEpoch(), replicaIds,
+                    m.opIdMsb(), m.opIdLsb()));
+            Records.FileRecord updated = file.withChunks(chunks);
             // commit-before-write: the descriptor exists before the client opens chunks anywhere
             if (store.updateFile(updated, opt.get().version())) {
                 return new Messages.CreateChunkResp(new ChunkId(m.fileId(), index), m.writeEpoch(), replicas);
@@ -225,7 +325,18 @@ public final class MetadataService implements AutoCloseable {
         throw new ScpException(ErrorCode.INTERNAL, "createChunk CAS exhausted");
     }
 
+    private List<Messages.Replica> replicasFor(List<Integer> replicaIds) {
+        List<Messages.Replica> replicas = new ArrayList<>(replicaIds.size());
+        for (int nodeId : replicaIds) {
+            replicas.add(registry.replicaOf(nodeId));
+        }
+        return replicas;
+    }
+
     private void sealChunk(Messages.SealChunkMeta m) throws Exception {
+        if (m.length() < 0) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED, "negative sealed length " + m.length());
+        }
         for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
             var opt = store.getFile(m.chunkId().fileId());
             if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, m.chunkId().toString());
@@ -240,15 +351,15 @@ public final class MetadataService implements AutoCloseable {
                 Records.ChunkRecord c = chunks.get(i);
                 if (c.index() == m.chunkId().index()) {
                     found = true;
+                    if (m.writeEpoch() < c.writeEpoch()) {
+                        throw new ScpException(ErrorCode.FENCED_EPOCH, "chunk epoch " + c.writeEpoch(),
+                                c.writeEpoch());
+                    }
                     if (c.state() == ChunkState.SEALED) {
                         if (c.length() == m.length() && c.crc() == m.crc()) return; // idempotent retry
                         // same length but different crc is byte divergence — never swallow it
                         throw new ScpException(ErrorCode.CHUNK_SEALED,
                                 "sealed at " + c.length() + " crc " + c.crc(), c.length());
-                    }
-                    if (m.writeEpoch() < c.writeEpoch()) {
-                        throw new ScpException(ErrorCode.FENCED_EPOCH, "chunk epoch " + c.writeEpoch(),
-                                c.writeEpoch());
                     }
                     Records.ChunkRecord sealed = c.sealed(m.length(), m.crc(), m.writeEpoch());
                     if (!m.sealedReplicas().isEmpty()) {
@@ -261,19 +372,48 @@ public final class MetadataService implements AutoCloseable {
                             throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                                     "sealed-replica set disjoint from descriptor replicas");
                         }
-                        sealed = new Records.ChunkRecord(sealed.index(), sealed.state(), sealed.length(),
-                                sealed.crc(), sealed.writeEpoch(), confirmed);
+                        if (confirmed.size() < 2) {
+                            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                                    "sealed-replica set is below quorum");
+                        }
+                        sealed = sealed.withReplicas(confirmed);
                     }
                     chunks.set(i, sealed);
                 }
             }
             if (!found) throw new ScpException(ErrorCode.CHUNK_NOT_FOUND, m.chunkId().toString());
-            Records.FileRecord updated = new Records.FileRecord(file.fileId(), file.fileKind(),
-                    file.mediaClass(), file.ackPolicy(), file.ownerTag(), file.state(),
-                    file.createdAtMs(), chunks);
+            Records.FileRecord updated = file.withChunks(chunks);
             if (store.updateFile(updated, opt.get().version())) return;
         }
         throw new ScpException(ErrorCode.INTERNAL, "sealChunk CAS exhausted");
+    }
+
+    private void abortChunk(Messages.AbortChunkMeta m) throws Exception {
+        for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
+            var opt = store.getFile(m.chunkId().fileId());
+            if (opt.isEmpty()) return; // idempotent after deletion
+            Records.FileRecord file = opt.get().value();
+            if (file.chunks().isEmpty()) return; // already aborted
+            List<Records.ChunkRecord> chunks = new ArrayList<>(file.chunks());
+            Records.ChunkRecord tail = chunks.get(chunks.size() - 1);
+            if (tail.index() != m.chunkId().index()) {
+                boolean stillExists = chunks.stream().anyMatch(c -> c.index() == m.chunkId().index());
+                if (!stillExists) return; // already aborted
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "can only abort the current tail chunk " + m.chunkId());
+            }
+            if (tail.state() != ChunkState.OPEN) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "cannot abort " + tail.state() + " chunk " + m.chunkId());
+            }
+            if (tail.writeEpoch() != m.writeEpoch() || !tail.createdBy(m.opIdMsb(), m.opIdLsb())) {
+                throw new ScpException(ErrorCode.FENCED_EPOCH,
+                        "chunk owned by another create request or epoch", tail.writeEpoch());
+            }
+            chunks.remove(chunks.size() - 1);
+            if (store.updateFile(file.withChunks(chunks), opt.get().version())) return;
+        }
+        throw new ScpException(ErrorCode.INTERNAL, "abortChunk CAS exhausted");
     }
 
     private Messages.LookupFileResp lookup(FileId fileId) throws Exception {
@@ -303,12 +443,27 @@ public final class MetadataService implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
-        repair.close();
-        server.close();
+        Throwable failure = null;
+        try {
+            repair.close();
+        } catch (RuntimeException e) {
+            failure = suppress(failure, e);
+        }
+        try {
+            server.close();
+        } catch (RuntimeException e) {
+            failure = suppress(failure, e);
+        }
         try {
             leaderLatch.close();
-        } catch (IOException ignored) {
+        } catch (IOException | RuntimeException e) {
+            failure = suppress(failure, e);
         }
-        store.close();
+        try {
+            store.close();
+        } catch (RuntimeException e) {
+            failure = suppress(failure, e);
+        }
+        throwCloseFailure(failure);
     }
 }

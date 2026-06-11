@@ -1,5 +1,9 @@
 package io.strata.meta;
 
+import io.strata.common.FileId;
+import org.apache.curator.framework.CuratorFramework;
+import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
 
@@ -40,6 +44,52 @@ class ZkMetadataStoreCasTest {
                 assertEquals(Records.NodeState.REGISTERED,
                         leaderA.getNode(7).orElseThrow().value().state(),
                         "the new leader's state must survive");
+            }
+        }
+    }
+
+    @Test
+    void staleFileDeleteLosesCas() throws Exception {
+        try (TestingServer zk = new TestingServer(true)) {
+            try (ZkMetadataStore leaderA = new ZkMetadataStore(zk.getConnectString());
+                 ZkMetadataStore leaderB = new ZkMetadataStore(zk.getConnectString())) {
+                FileId fileId = FileId.random();
+                Records.FileRecord file = new Records.FileRecord(fileId, (byte) 0, (byte) 0, (byte) 0,
+                        "owner", Records.FileState.OPEN, System.currentTimeMillis(), List.of());
+                leaderA.createFile(file);
+                int v0 = leaderA.getFile(fileId).orElseThrow().version();
+
+                assertTrue(leaderB.updateFile(file.withState(Records.FileState.SEALED), v0));
+
+                assertFalse(leaderA.deleteFile(fileId, v0), "stale-version delete must be rejected");
+                assertEquals(Records.FileState.SEALED,
+                        leaderA.getFile(fileId).orElseThrow().value().state(),
+                        "the newer file version must survive");
+
+                int currentVersion = leaderA.getFile(fileId).orElseThrow().version();
+                assertTrue(leaderA.deleteFile(fileId, currentVersion));
+            }
+        }
+    }
+
+    @Test
+    void externalCuratorConstructorInitializesNamespaceWithoutTakingOwnership() throws Exception {
+        try (TestingServer zk = new TestingServer(true)) {
+            CuratorFramework curator = CuratorFrameworkFactory.newClient(zk.getConnectString(),
+                    new ExponentialBackoffRetry(100, 3));
+            curator.start();
+            try {
+                try (ZkMetadataStore store = new ZkMetadataStore(curator)) {
+                    assertEquals(1, store.nextNodeId());
+                }
+
+                assertTrue(curator.getZookeeperClient().isConnected(), "store.close must not close external curator");
+                try (ZkMetadataStore second = new ZkMetadataStore(curator)) {
+                    assertEquals(List.of(), second.listFiles());
+                    assertEquals(2, second.nextNodeId());
+                }
+            } finally {
+                curator.close();
             }
         }
     }

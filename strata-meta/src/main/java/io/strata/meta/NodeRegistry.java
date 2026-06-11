@@ -13,7 +13,7 @@ import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 
 /**
  * Liveness and command delivery (tech design §7.2 detection, §10.4 command flow).
@@ -70,6 +70,7 @@ final class NodeRegistry {
     }
 
     private Messages.RegisterResp registerLocked(Messages.RegisterNode msg) throws Exception {
+        validateRegistration(msg);
         // identity = incarnation persisted on the node's volumes; same incarnation -> same nodeId
         Integer nodeIdFound = null;
         int existingVersion = -1;
@@ -125,8 +126,53 @@ final class NodeRegistry {
         return new Messages.RegisterResp(nodeId, n.sessionEpoch, config.heartbeatIntervalMs(), config.leaseMs());
     }
 
+    private static void validateRegistration(Messages.RegisterNode msg) {
+        if (msg.endpoints().isEmpty() || msg.endpoints().stream().anyMatch(e -> e == null || e.isBlank())) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED, "node registration requires an endpoint");
+        }
+        for (String endpoint : msg.endpoints()) {
+            validateEndpoint(endpoint);
+        }
+        if (msg.zone() == null || msg.zone().isBlank()
+                || msg.rack() == null || msg.rack().isBlank()
+                || msg.host() == null || msg.host().isBlank()) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED, "node registration requires zone, rack, and host");
+        }
+        if (msg.capacities().isEmpty()) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED, "node registration requires capacity");
+        }
+        if (msg.capacities().get(0).capacityBytes() <= 0) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                    "node capacity must be positive: " + msg.capacities().get(0).capacityBytes());
+        }
+    }
+
+    private static void validateEndpoint(String endpoint) {
+        int colon = endpoint.lastIndexOf(':');
+        if (colon <= 0 || colon == endpoint.length() - 1) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED, "node endpoint must be host:port: " + endpoint);
+        }
+        String host = endpoint.substring(0, colon);
+        if (host.startsWith("[") != host.endsWith("]")) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                    "node endpoint has unbalanced brackets: " + endpoint);
+        }
+        if (host.startsWith("[") && host.endsWith("]")) {
+            host = host.substring(1, host.length() - 1);
+        }
+        int port;
+        try {
+            port = Integer.parseInt(endpoint.substring(colon + 1));
+        } catch (NumberFormatException e) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED, "node endpoint port must be numeric: " + endpoint);
+        }
+        if (host.isBlank() || !host.equals(host.trim()) || port <= 0 || port > 65_535) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED, "invalid node endpoint: " + endpoint);
+        }
+    }
+
     Messages.HeartbeatResp heartbeat(Messages.NodeHeartbeat msg,
-                                     Consumer<Messages.CompletedCommand> onCompleted) {
+                                     BiConsumer<Integer, Messages.CompletedCommand> onCompleted) {
         LiveNode n = live.get(msg.nodeId());
         if (n == null || n.record.incMsb() != msg.incMsb() || n.record.incLsb() != msg.incLsb()) {
             throw new ScpException(ErrorCode.NOT_REGISTERED, "node " + msg.nodeId());
@@ -135,17 +181,31 @@ final class NodeRegistry {
             throw new ScpException(ErrorCode.LEASE_EXPIRED, "stale session " + msg.sessionEpoch());
         }
         long now = System.currentTimeMillis();
-        n.leaseUntil = now + config.leaseMs();
+        long newLeaseUntil = now + config.leaseMs();
         if (!msg.usages().isEmpty()) {
-            n.freeBytes = msg.usages().get(0).freeBytes();
+            Messages.MediaUsage usage = msg.usages().get(0);
+            if (usage.mediaClass() != n.record.mediaClass()) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "heartbeat media class " + usage.mediaClass() + " != registered " + n.record.mediaClass());
+            }
+            if (usage.usedBytes() < 0 || usage.freeBytes() < 0) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "negative media usage from node " + msg.nodeId());
+            }
+            n.freeBytes = usage.freeBytes();
         }
         if (n.record.state() == Records.NodeState.DEAD) {
             // it came back within the same incarnation — resurrect (repair may already be
             // running; descriptor CAS keeps both sides idempotent)
-            markState(n, Records.NodeState.REGISTERED);
+            if (!markState(n, Records.NodeState.REGISTERED)
+                    && n.record.state() != Records.NodeState.REGISTERED) {
+                throw new ScpException(ErrorCode.LEASE_EXPIRED,
+                        "node " + msg.nodeId() + " state is " + n.record.state());
+            }
         }
+        n.leaseUntil = newLeaseUntil;
         for (Messages.CompletedCommand c : msg.completedCommands()) {
-            onCompleted.accept(c);
+            onCompleted.accept(msg.nodeId(), c);
         }
         List<Messages.Command> out = new ArrayList<>();
         for (int i = 0; i < MAX_COMMANDS_PER_HEARTBEAT; i++) {
@@ -153,7 +213,7 @@ final class NodeRegistry {
             if (c == null) break;
             out.add(c);
         }
-        return new Messages.HeartbeatResp(n.leaseUntil, out);
+        return new Messages.HeartbeatResp(newLeaseUntil, out);
     }
 
     void enqueue(int nodeId, Messages.Command cmd) {
@@ -170,22 +230,24 @@ final class NodeRegistry {
         for (LiveNode n : live.values()) {
             if (n.record.state() == Records.NodeState.REGISTERED
                     && n.leaseUntil + config.deadGraceMs() < now) {
-                markState(n, Records.NodeState.DEAD);
-                n.pending.clear();
-                newlyDead.add(n.record.nodeId());
-                log.warn("node {} declared DEAD (lease expired {}ms ago)",
-                        n.record.nodeId(), now - n.leaseUntil);
+                if (markState(n, Records.NodeState.DEAD)) {
+                    n.pending.clear();
+                    newlyDead.add(n.record.nodeId());
+                    log.warn("node {} declared DEAD (lease expired {}ms ago)",
+                            n.record.nodeId(), now - n.leaseUntil);
+                }
             }
         }
         return newlyDead;
     }
 
-    private void markState(LiveNode n, Records.NodeState state) {
+    private boolean markState(LiveNode n, Records.NodeState state) {
         Records.NodeRecord updated = n.record.withState(state);
         try {
             if (store.putNode(updated, n.recordVersion)) {
                 n.recordVersion = n.recordVersion + 1;
                 n.record = updated;
+                return true;
             } else {
                 // CAS lost: another leader owns this record now (e.g. we are deposed and it just
                 // re-registered the node) — adopt the store's view instead of overwriting it
@@ -195,9 +257,11 @@ final class NodeRegistry {
                 });
                 log.warn("node {} state transition to {} lost CAS — adopted store state {}",
                         updated.nodeId(), state, n.record.state());
+                return false;
             }
         } catch (Exception e) {
             log.warn("persisting node {} state {} failed", n.record.nodeId(), state, e);
+            return false;
         }
     }
 
@@ -213,6 +277,11 @@ final class NodeRegistry {
     boolean isDead(int nodeId) {
         LiveNode n = live.get(nodeId);
         return n == null || n.record.state() == Records.NodeState.DEAD;
+    }
+
+    boolean isAlive(int nodeId) {
+        LiveNode n = live.get(nodeId);
+        return n != null && n.alive(System.currentTimeMillis());
     }
 
     String endpointOf(int nodeId) {

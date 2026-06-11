@@ -68,7 +68,8 @@ public final class ChunkFormats {
             if (b.getInt() != MAGIC_CHUNK) throw new CorruptChunkException("bad chunk magic");
             short version = b.getShort();
             if (version != FORMAT_VERSION) throw new CorruptChunkException("unsupported chunk format " + version);
-            b.getShort(); // headerSize
+            short headerSize = b.getShort();
+            if (headerSize != HEADER_SIZE) throw new CorruptChunkException("bad header size field " + headerSize);
             ChunkId id = ChunkId.readFrom(b);
             byte kind = b.get(), media = b.get(), ack = b.get();
             int epoch = b.getInt();

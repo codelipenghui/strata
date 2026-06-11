@@ -26,7 +26,8 @@ public interface MetadataStore extends AutoCloseable {
     /** CAS update; returns false on version conflict. */
     boolean updateFile(Records.FileRecord record, int expectedVersion) throws Exception;
 
-    void deleteFile(FileId id, int expectedVersion) throws Exception;
+    /** CAS delete; returns false on version conflict. */
+    boolean deleteFile(FileId id, int expectedVersion) throws Exception;
 
     List<FileId> listFiles() throws Exception;
 

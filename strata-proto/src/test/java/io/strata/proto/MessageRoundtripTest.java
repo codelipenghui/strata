@@ -7,8 +7,10 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class MessageRoundtripTest {
 
@@ -106,6 +108,20 @@ class MessageRoundtripTest {
     }
 
     @Test
+    void nodeHeartbeatRejectsTrailingBytesInCompletedCommandTag() {
+        BufWriter completed = new BufWriter();
+        completed.varint(1).u64(7).u16(0).u8(99);
+
+        BufWriter heartbeat = new BufWriter();
+        heartbeat.u32(42).u64(1).u64(2).u64(9).varint(0).u32(0);
+        TaggedFields.of(Map.of(Messages.NodeHeartbeat.TAG_COMPLETED_COMMANDS, completed.toBytes()))
+                .writeTo(heartbeat);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> Messages.NodeHeartbeat.decode(buf(heartbeat.toBytes())));
+    }
+
+    @Test
     void clientMetaRoundtrips() {
         var cf = new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "topicA-0");
         assertEquals(cf, Messages.CreateFile.decode(buf(cf.encode())));
@@ -122,6 +138,9 @@ class MessageRoundtripTest {
 
         var scm = new Messages.SealChunkMeta(c, 5, 4096, 0xDD, List.of(1, 2));
         assertEquals(scm, Messages.SealChunkMeta.decode(buf(scm.encode())));
+
+        var abort = new Messages.AbortChunkMeta(c, 5, 1, 2);
+        assertEquals(abort, Messages.AbortChunkMeta.decode(buf(abort.encode())));
 
         var lf = new Messages.LookupFile(f);
         assertEquals(lf, Messages.LookupFile.decode(buf(lf.encode())));

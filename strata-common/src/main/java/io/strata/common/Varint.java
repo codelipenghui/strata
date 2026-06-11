@@ -20,6 +20,9 @@ public final class Varint {
         while (true) {
             if (shift > 63) throw new IllegalArgumentException("varint too long");
             byte b = buf.get();
+            if (shift == 63 && (b & 0xFE) != 0) {
+                throw new IllegalArgumentException("varint too long");
+            }
             value |= (long) (b & 0x7F) << shift;
             if ((b & 0x80) == 0) return value;
             shift += 7;

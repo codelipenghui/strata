@@ -1,6 +1,5 @@
 package io.strata.node;
 
-import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
 import io.strata.format.ChunkFormats;
@@ -95,8 +94,8 @@ final class NodeHandlers implements ScpServer.Handler {
             case FETCH_CHUNK -> {
                 var m = Messages.FetchChunk.decode(h);
                 var r = store.fetch(m.chunkId(), m.offset(), m.maxBytes());
-                yield ScpServer.ok(req, new Messages.FetchResp(r.fileLength(),
-                        r.state() == null ? ChunkState.SEALED : r.state()).encode(), ByteBuffer.wrap(r.bytes()));
+                yield ScpServer.ok(req, new Messages.FetchResp(r.fileLength(), r.state()).encode(),
+                        ByteBuffer.wrap(r.bytes()));
             }
 
             case READ_LEDGER -> {

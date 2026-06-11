@@ -6,6 +6,15 @@ import java.nio.ByteBuffer;
 public record ChunkId(FileId fileId, int index) implements Comparable<ChunkId> {
     public static final int WIRE_SIZE = 20;
 
+    public ChunkId {
+        if (fileId == null) {
+            throw new IllegalArgumentException("fileId must not be null");
+        }
+        if (index < 0) {
+            throw new IllegalArgumentException("chunk index must be non-negative: " + index);
+        }
+    }
+
     public void writeTo(ByteBuffer buf) {
         fileId.writeTo(buf);
         buf.putInt(index);

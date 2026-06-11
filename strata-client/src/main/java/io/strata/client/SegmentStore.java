@@ -13,6 +13,15 @@ import java.util.concurrent.CompletableFuture;
 public interface SegmentStore extends AutoCloseable {
 
     record FileSpec(byte fileKind, byte mediaClass, byte ackPolicy, String ownerTag) {
+        public FileSpec {
+            if (ackPolicy != 0 && ackPolicy != 1) {
+                throw new IllegalArgumentException("unsupported ack policy " + (ackPolicy & 0xFF));
+            }
+            if (ownerTag == null) {
+                throw new IllegalArgumentException("ownerTag must not be null");
+            }
+        }
+
         public static FileSpec log(String ownerTag) {
             return new FileSpec((byte) 0, (byte) 0, (byte) 0, ownerTag);
         }

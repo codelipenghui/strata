@@ -9,6 +9,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * SCP message structs (tech design §10.3/§10.4 + v0 additions). Every header ends with a
@@ -279,6 +280,10 @@ public final class Messages {
     }
 
     public record DeleteChunks(List<ChunkId> chunkIds) {
+        public DeleteChunks {
+            chunkIds = List.copyOf(chunkIds);
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.varint(chunkIds.size());
@@ -297,6 +302,14 @@ public final class Messages {
     }
 
     public record DeleteChunksResp(List<ChunkId> chunkIds, List<Short> codes) {
+        public DeleteChunksResp {
+            chunkIds = List.copyOf(chunkIds);
+            codes = List.copyOf(codes);
+            if (chunkIds.size() != codes.size()) {
+                throw new IllegalArgumentException("chunkIds/codes size mismatch");
+            }
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             Resp.writeOk(w);
@@ -368,6 +381,10 @@ public final class Messages {
     public record LedgerEntry(long endOffset, int payloadCrc, int writeEpoch) {}
 
     public record ReadLedgerResp(List<LedgerEntry> entries) {
+        public ReadLedgerResp {
+            entries = List.copyOf(entries);
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             Resp.writeOk(w);
@@ -393,6 +410,11 @@ public final class Messages {
     public record RegisterNode(long incMsb, long incLsb, List<String> endpoints,
                                String zone, String rack, String host,
                                List<MediaCapacity> capacities, int onDiskFormatMax, long featureBits) {
+        public RegisterNode {
+            endpoints = List.copyOf(endpoints);
+            capacities = List.copyOf(capacities);
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.u64(incMsb).u64(incLsb);
@@ -445,6 +467,11 @@ public final class Messages {
                                 List<CompletedCommand> completedCommands) {
         public static final int TAG_COMPLETED_COMMANDS = 0;
 
+        public NodeHeartbeat {
+            usages = List.copyOf(usages);
+            completedCommands = List.copyOf(completedCommands);
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.u32(nodeId).u64(incMsb).u64(incLsb).u64(sessionEpoch);
@@ -475,8 +502,11 @@ public final class Messages {
             byte[] cc = tags.get(TAG_COMPLETED_COMMANDS);
             if (cc != null) {
                 ByteBuffer cb = ByteBuffer.wrap(cc);
-                int n = (int) Varint.readUnsigned(cb);
+                int n = count(cb);
                 for (int i = 0; i < n; i++) done.add(new CompletedCommand(cb.getLong(), cb.getShort()));
+                if (cb.hasRemaining()) {
+                    throw new IllegalArgumentException("trailing bytes in completed-command tag");
+                }
             }
             return new NodeHeartbeat(nodeId, msb, lsb, session, us, depth, done);
         }
@@ -519,13 +549,25 @@ public final class Messages {
     }
 
     public record ReplicateCmd(long commandId, ChunkId chunkId, List<Replica> sources,
-                               byte priority, int expectedCrc, long expectedLength) implements Command {}
+                               byte priority, int expectedCrc, long expectedLength) implements Command {
+        public ReplicateCmd {
+            sources = List.copyOf(sources);
+        }
+    }
 
-    public record DeleteCmd(long commandId, List<ChunkId> chunkIds) implements Command {}
+    public record DeleteCmd(long commandId, List<ChunkId> chunkIds) implements Command {
+        public DeleteCmd {
+            chunkIds = List.copyOf(chunkIds);
+        }
+    }
 
     public record DrainCmd(long commandId) implements Command {}
 
     public record HeartbeatResp(long leaseValidUntilMs, List<Command> commands) {
+        public HeartbeatResp {
+            commands = List.copyOf(commands);
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             Resp.writeOk(w);
@@ -549,6 +591,10 @@ public final class Messages {
     public record InventoryEntry(ChunkId chunkId, ChunkState state, long length, int crc) {}
 
     public record InventoryReport(int nodeId, int shardIndex, int shardCount, List<InventoryEntry> entries) {
+        public InventoryReport {
+            entries = List.copyOf(entries);
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.u32(nodeId).u32(shardIndex).u32(shardCount);
@@ -574,15 +620,28 @@ public final class Messages {
 
     /* ---------- v0 client <-> metadata ---------- */
 
-    public record CreateFile(byte fileKind, byte mediaClass, byte ackPolicy, String ownerTag) {
+    public record CreateFile(byte fileKind, byte mediaClass, byte ackPolicy, String ownerTag,
+                             FileId fileId, long opIdMsb, long opIdLsb) {
+        public CreateFile(byte fileKind, byte mediaClass, byte ackPolicy, String ownerTag) {
+            this(fileKind, mediaClass, ackPolicy, ownerTag, FileId.random(), UUID.randomUUID());
+        }
+
+        private CreateFile(byte fileKind, byte mediaClass, byte ackPolicy, String ownerTag,
+                           FileId fileId, UUID opId) {
+            this(fileKind, mediaClass, ackPolicy, ownerTag, fileId,
+                    opId.getMostSignificantBits(), opId.getLeastSignificantBits());
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.u8(fileKind).u8(mediaClass).u8(ackPolicy).string(ownerTag).noTags();
+            w.u8(fileKind).u8(mediaClass).u8(ackPolicy).string(ownerTag)
+                    .fileId(fileId).u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
         public static CreateFile decode(ByteBuffer b) {
-            CreateFile m = new CreateFile(b.get(), b.get(), b.get(), Varint.readString(b));
+            CreateFile m = new CreateFile(b.get(), b.get(), b.get(), Varint.readString(b),
+                    FileId.readFrom(b), b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }
@@ -603,21 +662,36 @@ public final class Messages {
         }
     }
 
-    public record CreateChunk(FileId fileId, int writeEpoch, byte mediaClassHint) {
+    public record CreateChunk(FileId fileId, int writeEpoch, byte mediaClassHint,
+                              long opIdMsb, long opIdLsb) {
+        public CreateChunk(FileId fileId, int writeEpoch, byte mediaClassHint) {
+            this(fileId, writeEpoch, mediaClassHint, UUID.randomUUID());
+        }
+
+        private CreateChunk(FileId fileId, int writeEpoch, byte mediaClassHint, UUID opId) {
+            this(fileId, writeEpoch, mediaClassHint,
+                    opId.getMostSignificantBits(), opId.getLeastSignificantBits());
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.fileId(fileId).i32(writeEpoch).u8(mediaClassHint).noTags();
+            w.fileId(fileId).i32(writeEpoch).u8(mediaClassHint).u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
         public static CreateChunk decode(ByteBuffer b) {
-            CreateChunk m = new CreateChunk(FileId.readFrom(b), b.getInt(), b.get());
+            CreateChunk m = new CreateChunk(FileId.readFrom(b), b.getInt(), b.get(),
+                    b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }
     }
 
     public record CreateChunkResp(ChunkId chunkId, int writeEpoch, List<Replica> replicas) {
+        public CreateChunkResp {
+            replicas = List.copyOf(replicas);
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             Resp.writeOk(w);
@@ -641,6 +715,10 @@ public final class Messages {
      */
     public record SealChunkMeta(ChunkId chunkId, int writeEpoch, long length, int crc,
                                 List<Integer> sealedReplicas) {
+        public SealChunkMeta {
+            sealedReplicas = List.copyOf(sealedReplicas);
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.chunkId(chunkId).i32(writeEpoch).u64(length).u32(crc);
@@ -663,6 +741,20 @@ public final class Messages {
         }
     }
 
+    public record AbortChunkMeta(ChunkId chunkId, int writeEpoch, long opIdMsb, long opIdLsb) {
+        public byte[] encode() {
+            BufWriter w = new BufWriter();
+            w.chunkId(chunkId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb).noTags();
+            return w.toBytes();
+        }
+
+        public static AbortChunkMeta decode(ByteBuffer b) {
+            AbortChunkMeta m = new AbortChunkMeta(ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong());
+            TaggedFields.readFrom(b);
+            return m;
+        }
+    }
+
     public record LookupFile(FileId fileId) {
         public byte[] encode() {
             BufWriter w = new BufWriter();
@@ -679,6 +771,10 @@ public final class Messages {
 
     public record ChunkInfo(ChunkId chunkId, ChunkState state, long length, int crc,
                             int writeEpoch, List<Replica> replicas) {
+        public ChunkInfo {
+            replicas = List.copyOf(replicas);
+        }
+
         static void write(BufWriter w, ChunkInfo c) {
             w.chunkId(c.chunkId()).u8(c.state().value).u64(c.length()).u32(c.crc()).i32(c.writeEpoch());
             writeReplicas(w, c.replicas());
@@ -691,6 +787,10 @@ public final class Messages {
     }
 
     public record LookupFileResp(byte fileKind, byte ackPolicy, byte fileState, List<ChunkInfo> chunks) {
+        public LookupFileResp {
+            chunks = List.copyOf(chunks);
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             Resp.writeOk(w);
@@ -712,6 +812,10 @@ public final class Messages {
     }
 
     public record DeleteFiles(List<FileId> fileIds) {
+        public DeleteFiles {
+            fileIds = List.copyOf(fileIds);
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.varint(fileIds.size());
@@ -730,6 +834,14 @@ public final class Messages {
     }
 
     public record DeleteFilesResp(List<FileId> fileIds, List<Short> codes) {
+        public DeleteFilesResp {
+            fileIds = List.copyOf(fileIds);
+            codes = List.copyOf(codes);
+            if (fileIds.size() != codes.size()) {
+                throw new IllegalArgumentException("fileIds/codes size mismatch");
+            }
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             Resp.writeOk(w);

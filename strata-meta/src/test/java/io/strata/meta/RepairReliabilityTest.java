@@ -2,7 +2,9 @@ package io.strata.meta;
 
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
+import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.ScpException;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -74,25 +76,77 @@ class RepairReliabilityTest {
             return received.stream().anyMatch(c -> c instanceof Messages.ReplicateCmd r
                     && r.chunkId().equals(chunkId));
         }
+
+        void completePendingCommandWith(long commandId, short status) {
+            toReport.removeIf(c -> c.commandId() == commandId);
+            toReport.add(new Messages.CompletedCommand(commandId, status));
+        }
     }
 
     @BeforeEach
     void setup() throws Exception {
-        zk = new TestingServer(true);
-        service = new MetadataService(MetaConfig.forTests(zk.getConnectString()));
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (!service.isLeader() && System.currentTimeMillis() < deadline) {
-            Thread.sleep(20);
+        Exception failure = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                zk = new TestingServer(true);
+                service = new MetadataService(MetaConfig.forTests(zk.getConnectString()));
+                long deadline = System.currentTimeMillis() + 10_000;
+                while (!service.isLeader() && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(20);
+                }
+                assertTrue(service.isLeader());
+                client = connectClient();
+                return;
+            } catch (Exception e) {
+                failure = e;
+                teardown();
+                Thread.sleep(100);
+            }
         }
-        assertTrue(service.isLeader());
-        client = new ScpClient("127.0.0.1", service.port(), ScpClient.KIND_TOOL, "test");
+        throw failure;
     }
 
     @AfterEach
     void teardown() throws Exception {
-        client.close();
-        service.close();
-        zk.close();
+        Exception failure = null;
+        failure = closeIfPresent(client, failure);
+        client = null;
+        failure = closeIfPresent(service, failure);
+        service = null;
+        failure = closeIfPresent(zk, failure);
+        zk = null;
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    private ScpClient connectClient() throws Exception {
+        Exception failure = null;
+        for (int attempt = 0; attempt < 20; attempt++) {
+            try {
+                return new ScpClient("127.0.0.1", service.port(), ScpClient.KIND_TOOL, "test");
+            } catch (Exception e) {
+                failure = e;
+                Thread.sleep(50);
+            }
+        }
+        throw failure;
+    }
+
+    private static Exception closeIfPresent(AutoCloseable closeable, Exception previous) {
+        if (closeable == null) {
+            return previous;
+        }
+        try {
+            closeable.close();
+            return previous;
+        } catch (Exception e) {
+            if (previous != null) {
+                previous.addSuppressed(e);
+                return previous;
+            }
+            return e;
+        }
     }
 
     private Messages.LookupFileResp lookup(FileId fileId) {
@@ -106,6 +160,7 @@ class RepairReliabilityTest {
         for (String h : List.of("invA", "invB", "invC", "invD")) {
             FakeNode n = new FakeNode(h);
             n.register();
+            n.heartbeat();
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
@@ -183,6 +238,7 @@ class RepairReliabilityTest {
         for (String h : List.of("lossA", "lossB", "lossC")) {
             FakeNode n = new FakeNode(h);
             n.register();
+            n.heartbeat();
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
@@ -209,11 +265,51 @@ class RepairReliabilityTest {
     }
 
     @Test
+    void deletingAFileWhoseChunkAlreadyLostAllReplicasConverges() throws Exception {
+        List<FakeNode> nodes = new ArrayList<>();
+        for (String h : List.of("deleteLossA", "deleteLossB", "deleteLossC")) {
+            FakeNode n = new FakeNode(h);
+            n.register();
+            n.heartbeat();
+            nodes.add(n);
+        }
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC, List.of()).encode(), null, 5000);
+
+        for (var replica : chunk.replicas()) {
+            client.call(Opcode.INVENTORY_REPORT, new Messages.InventoryReport(replica.nodeId(), 0, 1,
+                    List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD)))
+                    .encode(), null, 5000);
+        }
+        assertEquals(0, lookup(file.fileId()).chunks().get(0).replicas().size());
+
+        var delResp = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
+                new Messages.DeleteFiles(List.of(file.fileId())).encode(), null, 5000));
+        assertEquals((short) 0, delResp.codes().get(0).shortValue());
+
+        for (int round = 0; round < 5; round++) {
+            service.reconcileNow();
+            try {
+                lookup(file.fileId());
+            } catch (ScpException e) {
+                assertEquals(ErrorCode.FILE_NOT_FOUND, e.code());
+                return;
+            }
+        }
+        throw new AssertionError("zero-replica deleted file did not converge to FILE_NOT_FOUND");
+    }
+
+    @Test
     void sealCommitsOnlyTheActuallySealedReplicasAndRepairRestoresRf() throws Exception {
         List<FakeNode> nodes = new ArrayList<>();
         for (String h : List.of("subA", "subB", "subC", "subD")) {
             FakeNode n = new FakeNode(h);
             n.register();
+            n.heartbeat();
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
@@ -256,6 +352,7 @@ class RepairReliabilityTest {
         for (String h : List.of("strA", "strB", "strC", "strD")) {
             FakeNode n = new FakeNode(h);
             n.register();
+            n.heartbeat();
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
@@ -285,6 +382,7 @@ class RepairReliabilityTest {
         for (String h : List.of("rrA", "rrB", "rrC", "rrD", "rrE")) {
             FakeNode n = new FakeNode(h);
             n.register();
+            n.heartbeat();
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
@@ -319,6 +417,274 @@ class RepairReliabilityTest {
                 "repair stuck: marker never released after target death");
     }
 
+    @Test
+    void repairCompletionFromWrongNodeDoesNotMutateDescriptor() throws Exception {
+        List<FakeNode> nodes = new ArrayList<>();
+        for (String h : List.of("authA", "authB", "authC", "authD")) {
+            FakeNode n = new FakeNode(h);
+            n.register();
+            n.heartbeat();
+            nodes.add(n);
+        }
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC0DE, List.of()).encode(), null, 5000);
+
+        int droppedNode = chunk.replicas().get(0).nodeId();
+        client.call(Opcode.INVENTORY_REPORT, new Messages.InventoryReport(droppedNode, 0, 1,
+                List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD)))
+                .encode(), null, 5000);
+        assertEquals(2, lookup(file.fileId()).chunks().get(0).replicas().size());
+
+        pumpUntilReplicateDelivered(nodes, null, 8_000);
+        FakeNode target = nodes.stream()
+                .filter(n -> n.receivedReplicateFor(chunk.chunkId()))
+                .findFirst()
+                .orElseThrow();
+        Messages.ReplicateCmd command = target.received.stream()
+                .filter(c -> c instanceof Messages.ReplicateCmd r && r.chunkId().equals(chunk.chunkId()))
+                .map(Messages.ReplicateCmd.class::cast)
+                .findFirst()
+                .orElseThrow();
+
+        FakeNode wrongNode = nodes.stream()
+                .filter(n -> n.nodeId != target.nodeId)
+                .findFirst()
+                .orElseThrow();
+        client.call(Opcode.NODE_HEARTBEAT,
+                new Messages.NodeHeartbeat(wrongNode.nodeId, wrongNode.inc.getMostSignificantBits(),
+                        wrongNode.inc.getLeastSignificantBits(), wrongNode.session,
+                        List.of(new Messages.MediaUsage((byte) 0, 0, 1L << 40)), 0,
+                        List.of(new Messages.CompletedCommand(command.commandId(), ErrorCode.OK.code))).encode(),
+                null, 5000);
+
+        var afterWrongCompletion = lookup(file.fileId()).chunks().get(0).replicas();
+        assertEquals(2, afterWrongCompletion.size(), "wrong-node completion must not commit repair");
+        assertTrue(afterWrongCompletion.stream().noneMatch(r -> r.nodeId() == target.nodeId));
+
+        target.heartbeat();
+        var afterAssignedCompletion = lookup(file.fileId()).chunks().get(0).replicas();
+        assertEquals(3, afterAssignedCompletion.size(), "assigned target completion should commit repair");
+        assertTrue(afterAssignedCompletion.stream().anyMatch(r -> r.nodeId() == target.nodeId));
+    }
+
+    @Test
+    void staleInventoryReportCannotDropHealthyReplica() throws Exception {
+        List<FakeNode> nodes = new ArrayList<>();
+        for (String h : List.of("staleInvA", "staleInvB", "staleInvC")) {
+            FakeNode n = new FakeNode(h);
+            n.register();
+            n.heartbeat();
+            nodes.add(n);
+        }
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC0DE, List.of()).encode(), null, 5000);
+
+        int replicaNode = chunk.replicas().get(0).nodeId();
+        FakeNode stale = nodes.stream().filter(n -> n.nodeId == replicaNode).findFirst().orElseThrow();
+        stale.alive = false;
+        long deadline = System.currentTimeMillis() + 1_500;
+        while (System.currentTimeMillis() < deadline) {
+            for (FakeNode n : nodes) n.heartbeat();
+            Thread.sleep(200);
+        }
+
+        client.call(Opcode.INVENTORY_REPORT, new Messages.InventoryReport(replicaNode, 0, 1, List.of())
+                .encode(), null, 5000);
+
+        var replicas = lookup(file.fileId()).chunks().get(0).replicas();
+        assertEquals(3, replicas.size(), "non-live inventory must not mutate descriptors");
+        assertTrue(replicas.stream().anyMatch(r -> r.nodeId() == replicaNode));
+    }
+
+    @Test
+    void orphanInventoryEntryIsScheduledForDeletion() {
+        FakeNode node = new FakeNode("orphanInvA");
+        node.register();
+        node.heartbeat();
+        ChunkId orphan = new ChunkId(FileId.random(), 0);
+
+        client.call(Opcode.INVENTORY_REPORT, new Messages.InventoryReport(node.nodeId, 0, 1,
+                List.of(new Messages.InventoryEntry(orphan, ChunkState.SEALED, 100, 0x1234)))
+                .encode(), null, 5000);
+
+        node.heartbeat();
+
+        long deletes = node.received.stream()
+                .filter(c -> c instanceof Messages.DeleteCmd d && d.chunkIds().contains(orphan))
+                .count();
+        assertEquals(1, deletes, "orphan inventory entries must be deleted from the reporting node");
+    }
+
+    @Test
+    void missingSealedReplicaIsDroppedAndRepairRestoresRf() throws Exception {
+        List<FakeNode> nodes = new ArrayList<>();
+        for (String h : List.of("missInvA", "missInvB", "missInvC", "missInvD")) {
+            FakeNode n = new FakeNode(h);
+            n.register();
+            n.heartbeat();
+            nodes.add(n);
+        }
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC0DE, List.of()).encode(), null, 5000);
+
+        int missingNode = chunk.replicas().get(0).nodeId();
+        client.call(Opcode.INVENTORY_REPORT, new Messages.InventoryReport(missingNode, 0, 1, List.of())
+                .encode(), null, 5000);
+
+        var afterDrop = lookup(file.fileId()).chunks().get(0).replicas();
+        assertEquals(2, afterDrop.size(), "missing sealed replica must be dropped from the descriptor");
+        assertTrue(afterDrop.stream().noneMatch(r -> r.nodeId() == missingNode));
+
+        long deadline = System.currentTimeMillis() + 15_000;
+        while (System.currentTimeMillis() < deadline) {
+            for (FakeNode n : nodes) n.heartbeat();
+            service.reconcileNow();
+            if (lookup(file.fileId()).chunks().get(0).replicas().size() == 3) {
+                return;
+            }
+            Thread.sleep(150);
+        }
+        throw new AssertionError("repair did not restore RF after a missing-replica inventory report");
+    }
+
+    @Test
+    void deleteScanDoesNotDuplicateInflightDeletes() throws Exception {
+        List<FakeNode> nodes = new ArrayList<>();
+        for (String h : List.of("dupDelA", "dupDelB", "dupDelC")) {
+            FakeNode n = new FakeNode(h);
+            n.register();
+            n.heartbeat();
+            nodes.add(n);
+        }
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xD1E7, List.of()).encode(), null, 5000);
+
+        var delResp = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
+                new Messages.DeleteFiles(List.of(file.fileId())).encode(), null, 5000));
+        assertEquals((short) 0, delResp.codes().get(0).shortValue());
+
+        service.reconcileNow();
+        service.reconcileNow();
+        for (FakeNode n : nodes) n.heartbeat();
+
+        for (var replica : chunk.replicas()) {
+            FakeNode holder = nodes.stream().filter(n -> n.nodeId == replica.nodeId()).findFirst().orElseThrow();
+            long deletes = holder.received.stream()
+                    .filter(c -> c instanceof Messages.DeleteCmd d && d.chunkIds().contains(chunk.chunkId()))
+                    .count();
+            assertEquals(1, deletes, "in-flight delete must suppress duplicate commands per replica");
+        }
+    }
+
+    @Test
+    void deletingFileWithDeadReplicaDropsReferenceAndConverges() throws Exception {
+        List<FakeNode> nodes = new ArrayList<>();
+        for (String h : List.of("deadDelA", "deadDelB", "deadDelC")) {
+            FakeNode n = new FakeNode(h);
+            n.register();
+            n.heartbeat();
+            nodes.add(n);
+        }
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xD1E7, List.of()).encode(), null, 5000);
+
+        FakeNode deadReplica = nodes.stream()
+                .filter(n -> n.nodeId == chunk.replicas().get(0).nodeId())
+                .findFirst()
+                .orElseThrow();
+        deadReplica.alive = false;
+
+        var delResp = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
+                new Messages.DeleteFiles(List.of(file.fileId())).encode(), null, 5000));
+        assertEquals((short) 0, delResp.codes().get(0).shortValue());
+
+        long deadline = System.currentTimeMillis() + 8_000;
+        while (System.currentTimeMillis() < deadline) {
+            for (FakeNode n : nodes) n.heartbeat();
+            service.reconcileNow();
+            for (FakeNode n : nodes) n.heartbeat();
+            try {
+                lookup(file.fileId());
+            } catch (ScpException e) {
+                assertEquals(ErrorCode.FILE_NOT_FOUND, e.code());
+                return;
+            }
+            Thread.sleep(200);
+        }
+        throw new AssertionError("deleting file with a dead replica did not converge to FILE_NOT_FOUND");
+    }
+
+    @Test
+    void failedReplicateCompletionIsForgottenAndRetried() throws Exception {
+        List<FakeNode> nodes = new ArrayList<>();
+        for (String h : List.of("repFailA", "repFailB", "repFailC", "repFailD", "repFailE")) {
+            FakeNode n = new FakeNode(h);
+            n.register();
+            n.heartbeat();
+            nodes.add(n);
+        }
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xA11, List.of()).encode(), null, 5000);
+
+        int droppedNode = chunk.replicas().get(0).nodeId();
+        client.call(Opcode.INVENTORY_REPORT, new Messages.InventoryReport(droppedNode, 0, 1,
+                List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD)))
+                .encode(), null, 5000);
+        assertEquals(2, lookup(file.fileId()).chunks().get(0).replicas().size());
+
+        pumpUntilReplicateDelivered(nodes, null, 8_000);
+        FakeNode firstTarget = nodes.stream()
+                .filter(n -> n.receivedReplicateFor(chunk.chunkId()))
+                .findFirst()
+                .orElseThrow();
+        Messages.ReplicateCmd firstCommand = firstTarget.received.stream()
+                .filter(c -> c instanceof Messages.ReplicateCmd r && r.chunkId().equals(chunk.chunkId()))
+                .map(Messages.ReplicateCmd.class::cast)
+                .findFirst()
+                .orElseThrow();
+        int replicateCommandsBeforeFailure = countReplicateCommands(nodes, chunk.chunkId());
+
+        firstTarget.completePendingCommandWith(firstCommand.commandId(), ErrorCode.INTERNAL.code);
+        firstTarget.heartbeat();
+        assertEquals(2, lookup(file.fileId()).chunks().get(0).replicas().size(),
+                "failed replicate completion must not commit the descriptor swap");
+
+        long deadline = System.currentTimeMillis() + 8_000;
+        while (System.currentTimeMillis() < deadline) {
+            for (FakeNode n : nodes) n.heartbeat();
+            service.reconcileNow();
+            if (countReplicateCommands(nodes, chunk.chunkId()) > replicateCommandsBeforeFailure) {
+                return;
+            }
+            Thread.sleep(150);
+        }
+        throw new AssertionError("failed replicate command was not retried");
+    }
+
     /** Heartbeats alive nodes + reconciles until `until` has a REPLICATE (or just runs the window). */
     private void pumpUntilReplicateDelivered(List<FakeNode> nodes, FakeNode until, long windowMs)
             throws Exception {
@@ -335,5 +701,17 @@ class RepairReliabilityTest {
             }
             Thread.sleep(200);
         }
+    }
+
+    private int countReplicateCommands(List<FakeNode> nodes, ChunkId chunkId) {
+        int count = 0;
+        for (FakeNode node : nodes) {
+            for (Messages.Command command : node.received) {
+                if (command instanceof Messages.ReplicateCmd r && r.chunkId().equals(chunkId)) {
+                    count++;
+                }
+            }
+        }
+        return count;
     }
 }

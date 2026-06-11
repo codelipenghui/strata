@@ -1,0 +1,297 @@
+package io.strata.client;
+
+import io.strata.common.ChunkId;
+import io.strata.common.ChunkState;
+import io.strata.common.ErrorCode;
+import io.strata.common.FileId;
+import io.strata.common.ScpException;
+import io.strata.proto.Messages;
+import io.strata.proto.Opcode;
+import io.strata.proto.ScpServer;
+import org.junit.jupiter.api.Test;
+
+import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+class StrataClientBehaviorTest {
+
+    @Test
+    void fileSpecRejectsInvalidClientValues() {
+        assertThrows(IllegalArgumentException.class, () -> SegmentStore.FileSpec.log(null));
+        assertThrows(IllegalArgumentException.class,
+                () -> new SegmentStore.FileSpec((byte) 0, (byte) 0, (byte) 2, "owner"));
+    }
+
+    @Test
+    void createAndDeletePropagateMetadataResponses() throws Exception {
+        FileId created = FileId.random();
+        FileId denied = FileId.random();
+        try (ScpServer meta = new ScpServer(0, 0, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.CREATE_FILE) {
+                return ScpServer.ok(req, new Messages.CreateFileResp(created).encode(), null);
+            }
+            if (op == Opcode.DELETE_FILES) {
+                var msg = Messages.DeleteFiles.decode(req.headerSlice());
+                return ScpServer.ok(req,
+                        new Messages.DeleteFilesResp(msg.fileIds(),
+                                List.of(ErrorCode.OK.code, ErrorCode.FILE_NOT_FOUND.code)).encode(),
+                        null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+            assertEquals(created, client.create(SegmentStore.FileSpec.log("owner")));
+
+            ScpException e = assertThrows(ScpException.class,
+                    () -> client.delete(List.of(created, denied)));
+            assertEquals(ErrorCode.FILE_NOT_FOUND, e.code());
+        }
+    }
+
+    @Test
+    void malformedMetadataSuccessBodyBecomesTypedClientError() throws Exception {
+        try (ScpServer meta = new ScpServer(0, 0, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.CREATE_FILE) {
+                return ScpServer.ok(req, Messages.okHeader(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+            ScpException e = assertThrows(ScpException.class,
+                    () -> client.create(SegmentStore.FileSpec.log("owner")));
+            assertEquals(ErrorCode.INTERNAL, e.code());
+        }
+    }
+
+    @Test
+    void deleteRejectsMetadataResponsesThatDoNotMatchTheRequest() throws Exception {
+        FileId first = FileId.random();
+        FileId second = FileId.random();
+        try (ScpServer meta = new ScpServer(0, 0, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.DELETE_FILES) {
+                Messages.DeleteFiles.decode(req.headerSlice());
+                return ScpServer.ok(req,
+                        new Messages.DeleteFilesResp(List.of(first), List.of(ErrorCode.OK.code)).encode(),
+                        null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+            ScpException e = assertThrows(ScpException.class,
+                    () -> client.delete(List.of(first, second)));
+            assertEquals(ErrorCode.INTERNAL, e.code());
+        }
+    }
+
+    @Test
+    void deleteRejectsCodeCountMismatches() throws Exception {
+        FileId first = FileId.random();
+        FileId second = FileId.random();
+        try (ScpServer meta = new ScpServer(0, 0, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.DELETE_FILES) {
+                Messages.DeleteFiles.decode(req.headerSlice());
+                return ScpServer.ok(req,
+                        new Messages.DeleteFilesResp(List.of(first, second), List.of(ErrorCode.OK.code)).encode(),
+                        null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+            ScpException e = assertThrows(ScpException.class,
+                    () -> client.delete(List.of(first, second)));
+            assertEquals(ErrorCode.INTERNAL, e.code());
+        }
+    }
+
+    @Test
+    void openForAppendRejectsCorruptOrIncompatibleDescriptors() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
+        try (ScpServer meta = metadataServer(lookup);
+             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+            lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1, List.of()));
+            assertEquals(ErrorCode.FILE_SEALED,
+                    assertThrows(ScpException.class, () -> client.openForAppend(fileId, 1)).code());
+
+            lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0,
+                    List.of(chunk(chunkId, ChunkState.OPEN, 0, 0, 1))));
+            assertEquals(ErrorCode.INTERNAL,
+                    assertThrows(ScpException.class, () -> client.openForAppend(fileId, 1)).code());
+
+            lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0,
+                    List.of(chunk(chunkId, ChunkState.SEALED, 5, 0, 3))));
+            assertEquals(ErrorCode.FENCED_EPOCH,
+                    assertThrows(ScpException.class, () -> client.openForAppend(fileId, 2)).code());
+
+            lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0,
+                    List.of(chunk(chunkId, ChunkState.SEALED, -1, 0, 1))));
+            assertEquals(ErrorCode.CORRUPT_CHUNK,
+                    assertThrows(ScpException.class, () -> client.openForAppend(fileId, 1)).code());
+
+            lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0,
+                    List.of(chunk(new ChunkId(fileId, 0), ChunkState.SEALED, Long.MAX_VALUE, 0, 1),
+                            chunk(new ChunkId(fileId, 1), ChunkState.SEALED, 1, 0, 1))));
+            assertEquals(ErrorCode.CORRUPT_CHUNK,
+                    assertThrows(ScpException.class, () -> client.openForAppend(fileId, 1)).code());
+        }
+    }
+
+    @Test
+    void readerHandlesSealedOpenAndUnreadableReplicaCases() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
+        try (ScpServer storage = new ScpServer(0, 1, 0, 0, req -> {
+            var read = Messages.Read.decode(req.headerSlice());
+            if (read.offset() == 0 && read.maxBytes() == 3) {
+                return ScpServer.ok(req, new Messages.ReadResp(3, 3).encode(),
+                        ByteBuffer.wrap(new byte[] {1, 2, 3}));
+            }
+            return ScpServer.ok(req, new Messages.ReadResp(10, 2).encode(),
+                    ByteBuffer.wrap(new byte[] {4, 5, 6, 7}));
+        });
+             ScpServer meta = metadataServer(lookup);
+             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+            lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
+                    List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
+                            new Messages.Replica(1, endpoint(storage))))));
+            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+                SegmentStore.ReadResult result = reader.read(0, 10);
+                assertArrayEquals(new byte[] {1, 2, 3}, result.data());
+                assertEquals(true, result.endOfFile());
+            }
+
+            lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0,
+                    List.of(chunk(chunkId, ChunkState.OPEN, 0, 0, 1,
+                            new Messages.Replica(1, endpoint(storage))))));
+            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+                SegmentStore.ReadResult result = reader.read(0, 4);
+                assertArrayEquals(new byte[] {4, 5}, result.data());
+                assertEquals(false, result.endOfFile());
+            }
+
+            lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
+                    List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
+                            new Messages.Replica(2, "")))));
+            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+                assertEquals(ErrorCode.INTERNAL,
+                        assertThrows(ScpException.class, () -> reader.read(0, 10)).code());
+            }
+        }
+    }
+
+    @Test
+    void readerRejectsCorruptDescriptorLengths() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
+        try (ScpServer meta = metadataServer(lookup);
+             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+            lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
+                    List.of(chunk(chunkId, ChunkState.SEALED, -1, 0, 1,
+                            new Messages.Replica(1, "")))));
+            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+                assertEquals(ErrorCode.CORRUPT_CHUNK,
+                        assertThrows(ScpException.class, () -> reader.read(0, 10)).code());
+            }
+        }
+    }
+
+    @Test
+    void readerRejectsNegativeArgumentsBeforeCallingStorage() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
+        AtomicInteger reads = new AtomicInteger();
+        try (ScpServer storage = new ScpServer(0, 1, 0, 0, req -> {
+            reads.incrementAndGet();
+            return ScpServer.ok(req, new Messages.ReadResp(3, 3).encode(), ByteBuffer.allocate(0));
+        });
+             ScpServer meta = metadataServer(lookup);
+             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+            lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
+                    List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
+                            new Messages.Replica(1, endpoint(storage))))));
+            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+                assertEquals(ErrorCode.INTERNAL,
+                        assertThrows(ScpException.class, () -> reader.read(-1, 10)).code());
+                assertEquals(ErrorCode.INTERNAL,
+                        assertThrows(ScpException.class, () -> reader.read(0, -1)).code());
+                assertEquals(0, reads.get());
+            }
+        }
+    }
+
+    @Test
+    void readerRejectsMalformedReplicaReadResponses() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
+        try (ScpServer overlong = new ScpServer(0, 1, 0, 0, req ->
+                ScpServer.ok(req, new Messages.ReadResp(3, 3).encode(),
+                        ByteBuffer.wrap(new byte[] {1, 2, 3, 4})));
+             ScpServer badOffsets = new ScpServer(0, 2, 0, 0, req ->
+                     ScpServer.ok(req, new Messages.ReadResp(2, 3).encode(),
+                             ByteBuffer.wrap(new byte[] {1})));
+             ScpServer shortSealed = new ScpServer(0, 3, 0, 0, req ->
+                     ScpServer.ok(req, new Messages.ReadResp(3, 3).encode(),
+                             ByteBuffer.wrap(new byte[] {1, 2})));
+             ScpServer meta = metadataServer(lookup);
+             StrataClient client = new StrataClient(ClientConfig.of(endpoint(meta)))) {
+            lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
+                    List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
+                            new Messages.Replica(1, endpoint(overlong))))));
+            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+                assertEquals(ErrorCode.CORRUPT_CHUNK,
+                        assertThrows(ScpException.class, () -> reader.read(0, 3)).code());
+            }
+
+            lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
+                    List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
+                            new Messages.Replica(3, endpoint(shortSealed))))));
+            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+                assertEquals(ErrorCode.CORRUPT_CHUNK,
+                        assertThrows(ScpException.class, () -> reader.read(0, 3)).code());
+            }
+
+            lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0,
+                    List.of(chunk(chunkId, ChunkState.OPEN, 0, 0, 1,
+                            new Messages.Replica(2, endpoint(badOffsets))))));
+            try (SegmentStore.Reader reader = client.openForRead(fileId)) {
+                assertEquals(ErrorCode.CORRUPT_CHUNK,
+                        assertThrows(ScpException.class, () -> reader.read(0, 3)).code());
+            }
+        }
+    }
+
+    private static ScpServer metadataServer(AtomicReference<Messages.LookupFileResp> lookup) throws Exception {
+        return new ScpServer(0, 0, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.LOOKUP_FILE) {
+                Messages.LookupFile.decode(req.headerSlice());
+                return ScpServer.ok(req, lookup.get().encode(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+    }
+
+    private static Messages.ChunkInfo chunk(ChunkId id, ChunkState state, long length, int crc,
+                                            int epoch, Messages.Replica... replicas) {
+        return new Messages.ChunkInfo(id, state, length, crc, epoch, List.of(replicas));
+    }
+
+    private static String endpoint(ScpServer server) {
+        return "127.0.0.1:" + server.port();
+    }
+}

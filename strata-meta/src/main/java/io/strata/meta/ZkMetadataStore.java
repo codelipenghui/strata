@@ -11,6 +11,7 @@ import org.apache.zookeeper.data.Stat;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 
 /**
  * ZooKeeper backend (tech design §4.4, v0 only — development/prototype; retired at v1 GA).
@@ -26,26 +27,54 @@ public final class ZkMetadataStore implements MetadataStore {
     private final boolean ownsCurator;
 
     public ZkMetadataStore(String zkConnect) {
-        this.curator = CuratorFrameworkFactory.newClient(zkConnect, new ExponentialBackoffRetry(100, 5));
-        this.curator.start();
-        this.ownsCurator = true;
-        init();
+        this(CuratorFrameworkFactory.newClient(zkConnect, new ExponentialBackoffRetry(100, 5)), true);
     }
 
     public ZkMetadataStore(CuratorFramework curator) {
+        this(curator, false);
+    }
+
+    private ZkMetadataStore(CuratorFramework curator, boolean ownsCurator) {
         this.curator = curator;
-        this.ownsCurator = false;
-        init();
+        this.ownsCurator = ownsCurator;
+        boolean initialized = false;
+        try {
+            if (ownsCurator) {
+                this.curator.start();
+            }
+            awaitConnected();
+            init();
+            initialized = true;
+        } finally {
+            if (ownsCurator && !initialized) {
+                this.curator.close();
+            }
+        }
+    }
+
+    private void awaitConnected() {
+        try {
+            if (!curator.blockUntilConnected(10, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("zk connection timed out");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while connecting to zk", e);
+        }
     }
 
     private void init() {
         try {
             for (String path : new String[]{FILES, NODES, IDS}) {
-                if (curator.checkExists().forPath(path) == null) {
-                    curator.create().creatingParentsIfNeeded().forPath(path);
+                try {
+                    if (curator.checkExists().forPath(path) == null) {
+                        curator.create().creatingParentsIfNeeded().forPath(path);
+                    }
+                } catch (KeeperException.NodeExistsException ignored) {
+                    // Another metadata service won the create race for this root; continue
+                    // initializing the rest of the namespace.
                 }
             }
-        } catch (KeeperException.NodeExistsException ignored) {
         } catch (Exception e) {
             throw new IllegalStateException("zk init failed", e);
         }
@@ -82,10 +111,14 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     @Override
-    public void deleteFile(FileId id, int expectedVersion) throws Exception {
+    public boolean deleteFile(FileId id, int expectedVersion) throws Exception {
         try {
             curator.delete().withVersion(expectedVersion).forPath(FILES + "/" + id);
+            return true;
+        } catch (KeeperException.BadVersionException e) {
+            return false;
         } catch (KeeperException.NoNodeException ignored) {
+            return true;
         }
     }
 

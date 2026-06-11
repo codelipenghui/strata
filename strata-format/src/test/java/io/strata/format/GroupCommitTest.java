@@ -1,19 +1,28 @@
 package io.strata.format;
 
+import io.strata.common.ErrorCode;
 import io.strata.common.ChunkId;
 import io.strata.common.FileId;
+import io.strata.common.ScpException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -115,5 +124,118 @@ class GroupCommitTest {
             }
             assertEquals(0, store.fsyncForceCount(), "replicate mode must never group-commit");
         }
+    }
+
+    @Test
+    void fsyncFailurePoisonsCurrentAndFutureWaiters() {
+        AtomicLong forces = new AtomicLong();
+        GroupCommitter committer = new GroupCommitter("fail", () -> {
+            throw new IOException("disk unavailable");
+        }, forces);
+
+        CompletionException first = assertThrows(CompletionException.class,
+                () -> committer.awaitFlush(1).join());
+        assertTrue(first.getCause() instanceof ScpException se && se.code() == ErrorCode.INTERNAL,
+                "expected INTERNAL ScpException, got " + first.getCause());
+        assertEquals(0, forces.get(), "failed force must not be counted as durable");
+
+        CompletionException second = assertThrows(CompletionException.class,
+                () -> committer.awaitFlush(2).join());
+        assertTrue(second.getCause() instanceof ScpException se && se.code() == ErrorCode.INTERNAL,
+                "expected poisoned committer failure, got " + second.getCause());
+
+        assertTrue(committer.closeAndConfirm());
+        assertTrue(committer.isPoisoned());
+    }
+
+    @Test
+    void awaitAfterCloseFailsUnlessAlreadyFlushed() {
+        AtomicLong forces = new AtomicLong();
+        GroupCommitter committer = new GroupCommitter("closed", forces::incrementAndGet, forces);
+        assertTrue(committer.closeAndConfirm());
+
+        assertEquals(null, committer.awaitFlush(0).join());
+        CompletionException e = assertThrows(CompletionException.class, () -> committer.awaitFlush(1).join());
+        assertTrue(e.getCause() instanceof ScpException se && se.code() == ErrorCode.CHUNK_SEALED,
+                "expected CHUNK_SEALED after close, got " + e.getCause());
+
+        committer.close();
+    }
+
+    @Test
+    void terminalFailureCompletesQueuedWaitersAndPoisonsFutureWaiters() throws Exception {
+        AtomicLong forces = new AtomicLong();
+        CountDownLatch forceStarted = new CountDownLatch(1);
+        CountDownLatch releaseForce = new CountDownLatch(1);
+        GroupCommitter committer = new GroupCommitter("terminal", () -> {
+            forceStarted.countDown();
+            try {
+                if (!releaseForce.await(1, TimeUnit.SECONDS)) {
+                    throw new IOException("test did not release force");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted", e);
+            }
+        }, forces);
+
+        CompletableFuture<Void> waiter = committer.awaitFlush(1);
+        assertTrue(forceStarted.await(1, TimeUnit.SECONDS));
+
+        Method failRemaining = GroupCommitter.class.getDeclaredMethod("failRemainingLocked", String.class);
+        failRemaining.setAccessible(true);
+        failRemaining.invoke(committer, "terminal failure");
+
+        CompletionException first = assertThrows(CompletionException.class, waiter::join);
+        assertTrue(first.getCause() instanceof ScpException se && se.code() == ErrorCode.INTERNAL,
+                "expected terminal failure, got " + first.getCause());
+
+        CompletionException second = assertThrows(CompletionException.class,
+                () -> committer.awaitFlush(2).join());
+        assertTrue(second.getCause() instanceof ScpException se && se.code() == ErrorCode.INTERNAL,
+                "expected poisoned committer failure, got " + second.getCause());
+
+        releaseForce.countDown();
+        assertTrue(committer.closeAndConfirm());
+        assertTrue(committer.isPoisoned());
+    }
+
+    @Test
+    void flusherInterruptPoisonsFutureWaiters() throws Exception {
+        AtomicLong forces = new AtomicLong();
+        GroupCommitter committer = new GroupCommitter("interrupt", forces::incrementAndGet, forces);
+        Thread flusher = flusherThread(committer);
+
+        flusher.interrupt();
+        flusher.join(1_000);
+
+        assertTrue(!flusher.isAlive(), "flusher did not stop after interrupt");
+        CompletionException e = assertThrows(CompletionException.class,
+                () -> committer.awaitFlush(1).join());
+        assertTrue(e.getCause() instanceof ScpException se && se.code() == ErrorCode.INTERNAL,
+                "expected poisoned committer failure, got " + e.getCause());
+        assertTrue(committer.closeAndConfirm());
+        assertTrue(committer.isPoisoned());
+    }
+
+    @Test
+    void closeAndConfirmPreservesCallerInterrupt() throws Exception {
+        AtomicLong forces = new AtomicLong();
+        GroupCommitter committer = new GroupCommitter("caller-interrupted", forces::incrementAndGet, forces);
+
+        Thread.currentThread().interrupt();
+        try {
+            committer.closeAndConfirm();
+            assertTrue(Thread.currentThread().isInterrupted());
+        } finally {
+            Thread.interrupted();
+            assertTrue(committer.closeAndConfirm());
+        }
+    }
+
+    private static Thread flusherThread(GroupCommitter committer) throws ReflectiveOperationException {
+        Field flusher = GroupCommitter.class.getDeclaredField("flusher");
+        flusher.setAccessible(true);
+        return (Thread) flusher.get(committer);
     }
 }

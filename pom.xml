@@ -18,6 +18,7 @@
     <module>strata-meta</module>
     <module>strata-client</module>
     <module>strata-it</module>
+    <module>strata-coverage</module>
   </modules>
 
   <properties>
@@ -28,6 +29,7 @@
     <slf4j.version>2.0.13</slf4j.version>
     <curator.version>5.6.0</curator.version>
     <testcontainers.version>1.19.8</testcontainers.version>
+    <jacoco.version>0.8.12</jacoco.version>
   </properties>
 
   <dependencyManagement>
@@ -120,4 +122,31 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <profile>
+      <id>coverage</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.jacoco</groupId>
+            <artifactId>jacoco-maven-plugin</artifactId>
+            <version>${jacoco.version}</version>
+            <executions>
+              <execution>
+                <id>prepare-agent</id>
+                <goals>
+                  <goal>prepare-agent</goal>
+                </goals>
+                <configuration>
+                  <destFile>${project.build.directory}/jacoco.exec</destFile>
+                  <append>true</append>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

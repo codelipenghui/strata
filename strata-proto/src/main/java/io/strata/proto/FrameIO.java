@@ -20,7 +20,9 @@ public final class FrameIO {
         int headerLen = header.remaining();
         int payloadLen = payload.remaining();
         if (headerLen > 0xFFFF) throw new IOException("header too large: " + headerLen);
-        int frameLen = Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen;
+        long computedFrameLen = (long) Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen;
+        if (computedFrameLen > Integer.MAX_VALUE) throw new IOException("frame too large: " + computedFrameLen);
+        int frameLen = (int) computedFrameLen;
         if (frameLen > MAX_FRAME_BYTES) throw new IOException("frame too large: " + frameLen);
 
         short flags = f.flags();

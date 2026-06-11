@@ -16,6 +16,11 @@ public record Frame(short opcode, short apiVersion, short flags, long correlatio
     /** Fixed bytes after the leading u32 length field. */
     public static final int PREAMBLE_AFTER_LEN = 26;
 
+    public Frame {
+        header = readOnlySlice(header);
+        payload = readOnlySlice(payload);
+    }
+
     public boolean isResponse() {
         return (flags & FLAG_RESPONSE) != 0;
     }
@@ -32,13 +37,21 @@ public record Frame(short opcode, short apiVersion, short flags, long correlatio
         return payload.remaining();
     }
 
+    private static ByteBuffer readOnlySlice(ByteBuffer buffer) {
+        return (buffer == null ? ByteBuffer.allocate(0) : buffer.slice()).asReadOnlyBuffer();
+    }
+
+    private static ByteBuffer headerBuffer(byte[] header) {
+        return header != null ? ByteBuffer.wrap(header) : ByteBuffer.allocate(0);
+    }
+
     public static Frame request(Opcode op, byte[] header, ByteBuffer payload, long correlationId) {
         return new Frame(op.code, (short) 1, (short) 0, correlationId,
-                ByteBuffer.wrap(header), payload != null ? payload : ByteBuffer.allocate(0));
+                headerBuffer(header), payload != null ? payload : ByteBuffer.allocate(0));
     }
 
     public static Frame response(Frame req, byte[] header, ByteBuffer payload) {
         return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
-                ByteBuffer.wrap(header), payload != null ? payload : ByteBuffer.allocate(0));
+                headerBuffer(header), payload != null ? payload : ByteBuffer.allocate(0));
     }
 }

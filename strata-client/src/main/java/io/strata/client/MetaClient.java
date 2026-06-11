@@ -10,6 +10,7 @@ import io.strata.proto.ScpClient;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.function.Function;
 
 /** Client-side metadata access (v0: SCP 0x02xx opcodes; v1: Kafka RPC). Rotates endpoints on failure. */
 final class MetaClient implements AutoCloseable {
@@ -29,9 +30,9 @@ final class MetaClient implements AutoCloseable {
         try {
             if (client == null || client.isClosed()) {
                 String ep = config.metadataEndpoints().get(endpointIndex % config.metadataEndpoints().size());
-                String[] hp = ep.split(":");
+                HostPort hp = parseEndpoint(ep);
                 try {
-                    client = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_BROKER, "strata-client");
+                    client = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_BROKER, "strata-client");
                 } catch (IOException e) {
                     // rotation is owned by call(): incrementing here too would double-rotate and,
                     // with two endpoints, pin every retry onto the same dead instance
@@ -42,6 +43,32 @@ final class MetaClient implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+    }
+
+    private record HostPort(String host, int port) {}
+
+    private static HostPort parseEndpoint(String endpoint) {
+        int colon = endpoint == null ? -1 : endpoint.lastIndexOf(':');
+        if (colon <= 0 || colon == endpoint.length() - 1) {
+            throw new ScpException(ErrorCode.INTERNAL, "invalid metadata endpoint: " + endpoint);
+        }
+        String host = endpoint.substring(0, colon);
+        if (host.startsWith("[") != host.endsWith("]")) {
+            throw new ScpException(ErrorCode.INTERNAL, "invalid metadata endpoint brackets: " + endpoint);
+        }
+        if (host.startsWith("[") && host.endsWith("]")) {
+            host = host.substring(1, host.length() - 1);
+        }
+        int port;
+        try {
+            port = Integer.parseInt(endpoint.substring(colon + 1));
+        } catch (NumberFormatException e) {
+            throw new ScpException(ErrorCode.INTERNAL, "invalid metadata endpoint port: " + endpoint);
+        }
+        if (host.isBlank() || !host.equals(host.trim()) || port <= 0 || port > 65_535) {
+            throw new ScpException(ErrorCode.INTERNAL, "invalid metadata endpoint: " + endpoint);
+        }
+        return new HostPort(host, port);
     }
 
     /**
@@ -83,15 +110,33 @@ final class MetaClient implements AutoCloseable {
         throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no reachable metadata leader");
     }
 
+    private <T> T decode(Opcode op, ByteBuffer response, Function<ByteBuffer, T> decoder) {
+        try {
+            return decoder.apply(response);
+        } catch (ScpException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            lock.lock();
+            try {
+                if (client != null) client.close();
+                client = null;
+            } finally {
+                lock.unlock();
+            }
+            throw new ScpException(ErrorCode.INTERNAL, "malformed metadata response for " + op + ": " + e);
+        }
+    }
+
     FileId createFile(SegmentStore.FileSpec spec) {
         var resp = call(Opcode.CREATE_FILE, new Messages.CreateFile(spec.fileKind(), spec.mediaClass(),
                 spec.ackPolicy(), spec.ownerTag()).encode());
-        return Messages.CreateFileResp.decode(resp).fileId();
+        return decode(Opcode.CREATE_FILE, resp, Messages.CreateFileResp::decode).fileId();
     }
 
-    Messages.CreateChunkResp createChunk(FileId fileId, int writeEpoch) {
-        var resp = call(Opcode.CREATE_CHUNK, new Messages.CreateChunk(fileId, writeEpoch, (byte) 0xFF).encode());
-        return Messages.CreateChunkResp.decode(resp);
+    Messages.CreateChunkResp createChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb) {
+        var resp = call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(fileId, writeEpoch, (byte) 0xFF, opIdMsb, opIdLsb).encode());
+        return decode(Opcode.CREATE_CHUNK, resp, Messages.CreateChunkResp::decode);
     }
 
     void sealChunkMeta(io.strata.common.ChunkId chunkId, int writeEpoch, long length, int crc,
@@ -100,9 +145,14 @@ final class MetaClient implements AutoCloseable {
                 new Messages.SealChunkMeta(chunkId, writeEpoch, length, crc, sealedReplicas).encode());
     }
 
+    void abortChunkMeta(io.strata.common.ChunkId chunkId, int writeEpoch, long opIdMsb, long opIdLsb) {
+        call(Opcode.ABORT_CHUNK_META,
+                new Messages.AbortChunkMeta(chunkId, writeEpoch, opIdMsb, opIdLsb).encode());
+    }
+
     Messages.LookupFileResp lookupFile(FileId fileId) {
         var resp = call(Opcode.LOOKUP_FILE, new Messages.LookupFile(fileId).encode());
-        return Messages.LookupFileResp.decode(resp);
+        return decode(Opcode.LOOKUP_FILE, resp, Messages.LookupFileResp::decode);
     }
 
     void sealFile(FileId fileId, long totalLength) {
@@ -111,7 +161,7 @@ final class MetaClient implements AutoCloseable {
 
     Messages.DeleteFilesResp deleteFiles(List<FileId> ids) {
         var resp = call(Opcode.DELETE_FILES, new Messages.DeleteFiles(ids).encode());
-        return Messages.DeleteFilesResp.decode(resp);
+        return decode(Opcode.DELETE_FILES, resp, Messages.DeleteFilesResp::decode);
     }
 
     @Override

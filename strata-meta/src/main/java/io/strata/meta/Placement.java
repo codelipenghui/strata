@@ -42,19 +42,20 @@ final class Placement {
 
     private static NodeRegistry.LiveNode weightedPick(List<NodeRegistry.LiveNode> candidates,
                                                       Set<String> usedHosts) {
-        long totalWeight = 0;
+        double totalWeight = 0;
         List<NodeRegistry.LiveNode> eligible = new ArrayList<>();
         for (NodeRegistry.LiveNode n : candidates) {
             if (usedHosts.contains(n.record.host())) continue;
-            long w = Math.max(1, n.freeBytes);
+            if (n.freeBytes <= 0) continue;
+            double w = Math.max(1.0d, (double) n.freeBytes);
             eligible.add(n);
             totalWeight += w;
         }
         if (eligible.isEmpty()) return null;
-        long r = ThreadLocalRandom.current().nextLong(totalWeight);
-        long acc = 0;
+        double r = ThreadLocalRandom.current().nextDouble(totalWeight);
+        double acc = 0;
         for (NodeRegistry.LiveNode n : eligible) {
-            acc += Math.max(1, n.freeBytes);
+            acc += Math.max(1.0d, (double) n.freeBytes);
             if (r < acc) return n;
         }
         return eligible.get(eligible.size() - 1);

@@ -40,21 +40,36 @@ final class ReaderImpl implements SegmentStore.Reader {
 
     @Override
     public SegmentStore.ReadResult read(long fileOffset, int maxBytes) {
+        if (fileOffset < 0) {
+            throw new ScpException(ErrorCode.INTERNAL, "negative read offset " + fileOffset);
+        }
+        if (maxBytes < 0) {
+            throw new ScpException(ErrorCode.INTERNAL, "negative read maxBytes " + maxBytes);
+        }
         Messages.LookupFileResp f = file;
         long base = 0;
         for (int i = 0; i < f.chunks().size(); i++) {
             Messages.ChunkInfo chunk = f.chunks().get(i);
             boolean last = i == f.chunks().size() - 1;
             if (chunk.state() == ChunkState.SEALED) {
-                if (fileOffset < base + chunk.length()) {
+                if (chunk.length() < 0) {
+                    throw new ScpException(ErrorCode.CORRUPT_CHUNK, "negative chunk length " + chunk.length());
+                }
+                long chunkEnd;
+                try {
+                    chunkEnd = Math.addExact(base, chunk.length());
+                } catch (ArithmeticException e) {
+                    throw new ScpException(ErrorCode.CORRUPT_CHUNK, "file length overflow");
+                }
+                if (fileOffset < chunkEnd) {
                     long chunkOffset = fileOffset - base;
                     int want = (int) Math.min(maxBytes, chunk.length() - chunkOffset);
                     byte[] data = readFromReplicas(chunk, chunkOffset, want, false);
                     boolean eof = f.fileState() == 1 /* SEALED */ && last
-                            && fileOffset + data.length == base + chunk.length();
+                            && fileOffset + data.length == chunkEnd;
                     return new SegmentStore.ReadResult(data, eof);
                 }
-                base += chunk.length();
+                base = chunkEnd;
             } else {
                 // open chunk: serve [fileOffset-base, durableOffset)
                 long chunkOffset = fileOffset - base;
@@ -79,6 +94,12 @@ final class ReaderImpl implements SegmentStore.Reader {
                 ByteBuffer h = frame.headerSlice();
                 Resp.check(h);
                 var resp = Messages.ReadResp.decode(h);
+                if (resp.localEndOffset() < 0 || resp.durableOffset() < 0
+                        || resp.durableOffset() > resp.localEndOffset()) {
+                    last = new ScpException(ErrorCode.CORRUPT_CHUNK,
+                            "bad read offsets from replica " + r.nodeId());
+                    continue;
+                }
                 if (!open && resp.localEndOffset() < chunk.length()) {
                     // a sealed chunk must be served whole: a replica shorter than the descriptor
                     // (seal straggler not yet reconciled away) would return truncated data
@@ -87,11 +108,24 @@ final class ReaderImpl implements SegmentStore.Reader {
                                     + ": " + resp.localEndOffset() + " < " + chunk.length());
                     continue;
                 }
+                if (frame.payloadLength() > maxBytes) {
+                    last = new ScpException(ErrorCode.CORRUPT_CHUNK,
+                            "replica " + r.nodeId() + " returned " + frame.payloadLength()
+                                    + " bytes for max " + maxBytes);
+                    continue;
+                }
+                if (!open && frame.payloadLength() != maxBytes) {
+                    last = new ScpException(ErrorCode.CORRUPT_CHUNK,
+                            "replica " + r.nodeId() + " returned short sealed read "
+                                    + frame.payloadLength() + " != " + maxBytes);
+                    continue;
+                }
                 byte[] data = new byte[frame.payloadLength()];
                 frame.payloadSlice().get(data);
                 if (open) {
                     // never expose bytes above the replica-known durable offset
-                    long visible = Math.max(0, resp.durableOffset() - offset);
+                    long readable = Math.min(resp.localEndOffset(), resp.durableOffset());
+                    long visible = Math.max(0, readable - offset);
                     if (data.length > visible) {
                         data = java.util.Arrays.copyOf(data, (int) visible);
                     }
@@ -99,6 +133,9 @@ final class ReaderImpl implements SegmentStore.Reader {
                 return data;
             } catch (ScpException e) {
                 last = e;
+            } catch (RuntimeException e) {
+                last = new ScpException(ErrorCode.CORRUPT_CHUNK,
+                        "malformed read response from replica " + r.nodeId() + ": " + e);
             }
         }
         throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no readable replica");

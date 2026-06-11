@@ -11,6 +11,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -55,6 +56,23 @@ class AdversarialInputTest {
         // sane messages still decode
         var del = new Messages.DeleteChunks(java.util.List.of(new ChunkId(FileId.random(), 0)));
         assertEquals(del, Messages.DeleteChunks.decode(ByteBuffer.wrap(del.encode())));
+    }
+
+    @Test
+    void adversarialCompletedCommandCountIsRejected() {
+        BufWriter completed = new BufWriter();
+        completed.varint(1_000_001);
+
+        BufWriter heartbeat = new BufWriter();
+        heartbeat.u32(1).u64(2).u64(3).u64(4);
+        heartbeat.varint(0);
+        heartbeat.u32(0);
+        TaggedFields.of(Map.of(Messages.NodeHeartbeat.TAG_COMPLETED_COMMANDS, completed.toBytes()))
+                .writeTo(heartbeat);
+
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> Messages.NodeHeartbeat.decode(ByteBuffer.wrap(heartbeat.toBytes())));
+        assertTrue(e.getMessage().contains("count"), "got: " + e.getMessage());
     }
 
     @Test

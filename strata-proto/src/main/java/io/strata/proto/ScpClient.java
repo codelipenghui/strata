@@ -13,6 +13,7 @@ import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -46,21 +47,44 @@ public final class ScpClient implements AutoCloseable {
     }
 
     public ScpClient(String host, int port, byte clientKind, String clientId, int connectTimeoutMs) throws IOException {
-        socket = new Socket();
-        socket.setTcpNoDelay(true);
-        socket.connect(new InetSocketAddress(host, port), connectTimeoutMs);
-        in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 1 << 16));
-        out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 1 << 16));
+        Socket connected = new Socket();
+        DataInputStream input;
+        DataOutputStream output;
+        Messages.HelloResp hello;
+        try {
+            connected.setTcpNoDelay(true);
+            connected.connect(new InetSocketAddress(host, port), connectTimeoutMs);
+            connected.setSoTimeout(connectTimeoutMs);
+            input = new DataInputStream(new BufferedInputStream(connected.getInputStream(), 1 << 16));
+            output = new DataOutputStream(new BufferedOutputStream(connected.getOutputStream(), 1 << 16));
 
-        FrameIO.write(out, Frame.request(Opcode.HELLO, new Messages.Hello(clientKind, 0, clientId).encode(), null, 0));
-        Frame helloResp = FrameIO.read(in);
-        if (helloResp == null || helloResp.opcode() != Opcode.HELLO.code || !helloResp.isResponse()) {
-            socket.close();
-            throw new IOException("handshake failed");
+            FrameIO.write(output,
+                    Frame.request(Opcode.HELLO, new Messages.Hello(clientKind, 0, clientId).encode(), null, 0));
+            Frame helloResp = FrameIO.read(input);
+            if (helloResp == null || helloResp.opcode() != Opcode.HELLO.code || !helloResp.isResponse()) {
+                throw new IOException("handshake failed");
+            }
+            ByteBuffer hb = helloResp.headerSlice();
+            try {
+                Resp.check(hb);
+                hello = Messages.HelloResp.decode(hb);
+            } catch (ScpException e) {
+                throw e;
+            } catch (RuntimeException e) {
+                throw new IOException("malformed handshake response: " + e, e);
+            }
+            connected.setSoTimeout(0);
+        } catch (IOException | RuntimeException e) {
+            try {
+                connected.close();
+            } catch (IOException ignored) {
+            }
+            throw e;
         }
-        ByteBuffer hb = helloResp.headerSlice();
-        Resp.check(hb);
-        this.serverHello = Messages.HelloResp.decode(hb);
+        socket = connected;
+        in = input;
+        out = output;
+        this.serverHello = hello;
 
         Thread.ofVirtual().name("scp-reader-" + host + ":" + port).start(this::readLoop);
     }
@@ -81,6 +105,10 @@ public final class ScpClient implements AutoCloseable {
             // fall through to failure propagation
         } finally {
             failAll(new IOException("connection closed"));
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+            }
         }
     }
 
@@ -97,6 +125,15 @@ public final class ScpClient implements AutoCloseable {
             return CompletableFuture.failedFuture(new IOException("connection closed"));
         }
         long id = correlation.getAndIncrement();
+        Frame request;
+        try {
+            if (op == null) {
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "opcode is null");
+            }
+            request = Frame.request(op, header, payload, id);
+        } catch (RuntimeException e) {
+            return CompletableFuture.failedFuture(e);
+        }
         CompletableFuture<Frame> fut = new CompletableFuture<>();
         pending.put(id, fut);
         // whatever completes this future — response, connection failure, caller-side timeout or
@@ -106,7 +143,7 @@ public final class ScpClient implements AutoCloseable {
         try {
             writeLock.lock();
             try {
-                FrameIO.write(out, Frame.request(op, header, payload, id));
+                FrameIO.write(out, request);
             } finally {
                 writeLock.unlock();
             }
@@ -124,11 +161,42 @@ public final class ScpClient implements AutoCloseable {
         return fut;
     }
 
+    /**
+     * Pipelined send with a caller-side deadline. A timeout means this connection can no longer
+     * be trusted for future pipelined traffic: the server may answer later, but the correlation
+     * has been abandoned and pools must reconnect rather than reuse a stuck reader path.
+     */
+    public CompletableFuture<Frame> sendWithTimeout(Opcode op, byte[] header, ByteBuffer payload, long timeoutMs) {
+        CompletableFuture<Frame> fut = send(op, header, payload);
+        fut.orTimeout(timeoutMs, TimeUnit.MILLISECONDS);
+        fut.whenComplete((frame, err) -> {
+            if (isTimeout(err)) {
+                close();
+            }
+        });
+        return fut;
+    }
+
+    private static boolean isTimeout(Throwable err) {
+        Throwable t = err;
+        while (t instanceof CompletionException && t.getCause() != null) {
+            t = t.getCause();
+        }
+        return t instanceof TimeoutException;
+    }
+
     /** Synchronous call; returns the response header positioned AFTER the error check. */
     public ByteBuffer call(Opcode op, byte[] header, ByteBuffer payload, long timeoutMs) {
         Frame resp = callFrame(op, header, payload, timeoutMs);
         ByteBuffer hb = resp.headerSlice();
-        Resp.check(hb);
+        try {
+            Resp.check(hb);
+        } catch (ScpException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            close();
+            throw new ScpException(ErrorCode.INTERNAL, "malformed response for " + op + ": " + e);
+        }
         return hb;
     }
 
@@ -144,6 +212,7 @@ public final class ScpClient implements AutoCloseable {
             ScpException timeout = new ScpException(ErrorCode.INTERNAL,
                     "timeout after " + timeoutMs + "ms for " + op);
             fut.completeExceptionally(timeout); // releases the correlation entry (cleanup hook)
+            close();
             throw timeout;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

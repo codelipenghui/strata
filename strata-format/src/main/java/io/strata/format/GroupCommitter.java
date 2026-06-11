@@ -91,6 +91,7 @@ final class GroupCommitter implements AutoCloseable {
     private void run() {
         while (true) {
             long target;
+            boolean accumulate;
             lock.lock();
             try {
                 while (waiters.isEmpty() && !closed) {
@@ -105,11 +106,12 @@ final class GroupCommitter implements AutoCloseable {
                 if (waiters.isEmpty()) {
                     return; // closed and drained
                 }
+                accumulate = !closed;
             } finally {
                 lock.unlock();
             }
 
-            if (!closed) {
+            if (accumulate) {
                 java.util.concurrent.locks.LockSupport.parkNanos(ACCUMULATION_NANOS);
             }
 
@@ -208,5 +210,14 @@ final class GroupCommitter implements AutoCloseable {
             }
         }
         return !flusher.isAlive();
+    }
+
+    boolean isPoisoned() {
+        lock.lock();
+        try {
+            return poisoned;
+        } finally {
+            lock.unlock();
+        }
     }
 }

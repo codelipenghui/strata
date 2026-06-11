@@ -54,7 +54,7 @@ public final class IntegrityLedger implements AutoCloseable {
     }
 
     public void append(ChunkFormats.LedgerEntry entry) throws IOException {
-        channel.write(ByteBuffer.wrap(entry.encode()), (long) entries.size() * LEDGER_ENTRY_SIZE);
+        writeFully(channel, ByteBuffer.wrap(entry.encode()), (long) entries.size() * LEDGER_ENTRY_SIZE);
         entries.add(entry);
     }
 
@@ -89,5 +89,14 @@ public final class IntegrityLedger implements AutoCloseable {
     @Override
     public void close() throws IOException {
         channel.close();
+    }
+
+    private static void writeFully(FileChannel channel, ByteBuffer buffer, long position) throws IOException {
+        long pos = position;
+        while (buffer.hasRemaining()) {
+            int n = channel.write(buffer, pos);
+            if (n <= 0) throw new IOException("write failed at " + pos);
+            pos += n;
+        }
     }
 }

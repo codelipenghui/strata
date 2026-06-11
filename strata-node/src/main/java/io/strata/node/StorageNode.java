@@ -36,17 +36,71 @@ public final class StorageNode implements AutoCloseable {
         Identity identity = loadIdentity(config.dataDir());
         this.nodeId = identity.nodeId;
         this.incarnation = identity.incarnation;
-        this.store = new ChunkStore(config.dataDir().resolve("chunks"));
-        this.server = new ScpServer(config.listenPort(), nodeId,
-                incarnation.getMostSignificantBits(), incarnation.getLeastSignificantBits(),
-                new NodeHandlers(store, this));
-        if (config.metadataEndpoints().isEmpty()) {
-            this.controlLoop = null; // standalone (data-plane tests)
-        } else {
-            this.controlLoop = new ControlLoop(this, config, store);
-            this.controlLoop.start();
+        ChunkStore openedStore = null;
+        ScpServer openedServer = null;
+        ControlLoop startedLoop = null;
+        try {
+            openedStore = new ChunkStore(config.dataDir().resolve("chunks"));
+            openedServer = new ScpServer(config.listenPort(), nodeId,
+                    incarnation.getMostSignificantBits(), incarnation.getLeastSignificantBits(),
+                    new NodeHandlers(openedStore, this));
+            if (!config.metadataEndpoints().isEmpty()) {
+                startedLoop = new ControlLoop(this, config, openedStore);
+                startedLoop.start();
+            }
+            this.store = openedStore;
+            this.server = openedServer;
+            this.controlLoop = startedLoop; // null in standalone data-plane tests
+        } catch (IOException | RuntimeException e) {
+            cleanupFailedStart(startedLoop, openedServer, openedStore, e);
+            throw e;
         }
         log.info("storage node started: port={} incarnation={} nodeId={}", server.port(), incarnation, nodeId);
+    }
+
+    private static void cleanupFailedStart(ControlLoop loop, ScpServer server, ChunkStore store, Throwable failure) {
+        if (loop != null) {
+            try {
+                loop.close();
+            } catch (RuntimeException e) {
+                failure.addSuppressed(e);
+            }
+        }
+        if (server != null) {
+            try {
+                server.close();
+            } catch (RuntimeException e) {
+                failure.addSuppressed(e);
+            }
+        }
+        if (store != null) {
+            try {
+                store.close();
+            } catch (IOException | RuntimeException e) {
+                failure.addSuppressed(e);
+            }
+        }
+    }
+
+    private static Throwable suppress(Throwable failure, Throwable next) {
+        if (failure == null) {
+            return next;
+        }
+        failure.addSuppressed(next);
+        return failure;
+    }
+
+    private static void throwCloseFailure(Throwable failure) throws IOException {
+        if (failure == null) {
+            return;
+        }
+        if (failure instanceof IOException e) {
+            throw e;
+        }
+        if (failure instanceof RuntimeException e) {
+            throw e;
+        }
+        throw new IOException(failure);
     }
 
     public int port() {
@@ -104,8 +158,20 @@ public final class StorageNode implements AutoCloseable {
             try (var in = Files.newInputStream(f)) {
                 p.load(in);
             }
-            return new Identity(Integer.parseInt(p.getProperty("nodeId", "-1")),
-                    UUID.fromString(p.getProperty("incarnation")));
+            String nodeIdText = p.getProperty("nodeId");
+            String incarnationText = p.getProperty("incarnation");
+            if (nodeIdText == null || incarnationText == null) {
+                throw new IOException("storage node identity is missing nodeId or incarnation: " + f);
+            }
+            try {
+                int nodeId = Integer.parseInt(nodeIdText);
+                if (nodeId < -1) {
+                    throw new IllegalArgumentException("nodeId " + nodeId + " < -1");
+                }
+                return new Identity(nodeId, UUID.fromString(incarnationText));
+            } catch (IllegalArgumentException e) {
+                throw new IOException("invalid storage node identity: " + f, e);
+            }
         }
         Identity fresh = new Identity(-1, UUID.randomUUID());
         persistIdentity(dataDir, fresh);
@@ -127,8 +193,24 @@ public final class StorageNode implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
-        if (controlLoop != null) controlLoop.close();
-        server.close();
-        store.close();
+        Throwable failure = null;
+        if (controlLoop != null) {
+            try {
+                controlLoop.close();
+            } catch (RuntimeException e) {
+                failure = suppress(failure, e);
+            }
+        }
+        try {
+            server.close();
+        } catch (RuntimeException e) {
+            failure = suppress(failure, e);
+        }
+        try {
+            store.close();
+        } catch (IOException | RuntimeException e) {
+            failure = suppress(failure, e);
+        }
+        throwCloseFailure(failure);
     }
 }

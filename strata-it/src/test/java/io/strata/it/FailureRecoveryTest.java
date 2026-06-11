@@ -130,6 +130,33 @@ class FailureRecoveryTest {
     }
 
     @Test
+    void staleRecoveryEpochFailsWhenAnyReplicaIsAlreadyFencedHigher() throws Exception {
+        FileId fileId = client.create(SegmentStore.FileSpec.log("recover-stale-epoch"));
+        SegmentStore.Appender zombie = client.openForAppend(fileId, 1);
+        new Workload().appendAcked(zombie, 0, 10);
+
+        var lookup = lookupFile(fileId);
+        var openChunk = lookup.chunks().get(lookup.chunks().size() - 1);
+        var fencedReplica = openChunk.replicas().get(0);
+        String[] hp = fencedReplica.endpoint().split(":");
+        try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
+                ScpClient.KIND_BROKER, "fence")) {
+            direct.call(Opcode.FENCE, new Messages.Fence(openChunk.chunkId(), 3).encode(), null, 5000);
+        }
+
+        ScpException e = assertThrows(ScpException.class, () -> client.recoverAndSeal(fileId, 2));
+        assertEquals(ErrorCode.FENCED_EPOCH, e.code());
+        assertEquals(3, e.detail());
+
+        var after = lookupFile(fileId);
+        assertEquals(io.strata.common.ChunkState.OPEN,
+                after.chunks().get(after.chunks().size() - 1).state(),
+                "stale recovery must not seal metadata after seeing a higher replica fence");
+
+        zombie.close();
+    }
+
+    @Test
     void nodeRestartKeepsIdentityAndData() throws Exception {
         FileId fileId = client.create(SegmentStore.FileSpec.log("restart"));
         Workload workload = new Workload();
