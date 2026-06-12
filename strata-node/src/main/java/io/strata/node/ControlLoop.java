@@ -12,7 +12,6 @@ import io.strata.proto.ScpClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -101,7 +100,7 @@ final class ControlLoop implements AutoCloseable {
         if (meta == null || meta.isClosed()) {
             disconnect();
             String ep = config.metadataEndpoints().get(endpointIndex % config.metadataEndpoints().size());
-            Endpoint hp = parseEndpoint(ep);
+            Endpoint hp = Endpoint.parse(ep, "endpoint", ErrorCode.INTERNAL);
             meta = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_STORAGE_NODE,
                     "node-" + node.incarnation());
             sessionEpoch = -1;
@@ -136,11 +135,8 @@ final class ControlLoop implements AutoCloseable {
             ByteBuffer resp = meta.call(Opcode.NODE_HEARTBEAT, hb.encode(), null, CALL_TIMEOUT_MS);
             var r = Messages.HeartbeatResp.decode(resp);
             commandQueue.addAll(r.commands());
-        } catch (ScpException e) {
-            // re-queue completions so they are reported on the next successful heartbeat
-            completed.addAll(done);
-            throw e;
         } catch (RuntimeException e) {
+            // re-queue completions so they are reported on the next successful heartbeat
             completed.addAll(done);
             throw e;
         }
@@ -200,7 +196,7 @@ final class ControlLoop implements AutoCloseable {
         for (Messages.Replica source : cmd.sources()) {
             if (source.nodeId() == node.nodeId()) continue;
             try {
-                Endpoint hp = parseEndpoint(source.endpoint());
+                Endpoint hp = Endpoint.parse(source.endpoint(), "endpoint", ErrorCode.INTERNAL);
                 try (ScpClient src = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_STORAGE_NODE,
                         "repair-" + node.nodeId())) {
                     byte[] file = fetchWholeFile(src, cmd);
@@ -219,16 +215,8 @@ final class ControlLoop implements AutoCloseable {
         throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no usable source");
     }
 
-    private static Endpoint parseEndpoint(String endpoint) {
-        try {
-            return Endpoint.parse(endpoint);
-        } catch (IllegalArgumentException e) {
-            throw new ScpException(ErrorCode.INTERNAL, "invalid endpoint: " + endpoint);
-        }
-    }
-
     byte[] fetchWholeFile(ScpClient src, Messages.ReplicateCmd cmd) throws IOException {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] out = null;
         long offset = 0;
         long fileLength = -1;
         long maxFileLength = maxRepairFileLength(cmd.expectedLength());
@@ -257,6 +245,7 @@ final class ControlLoop implements AutoCloseable {
             }
             if (fileLength < 0) {
                 fileLength = reportedLength;
+                out = new byte[(int) fileLength]; // bounded by maxFileLength <= Integer.MAX_VALUE
             } else if (reportedLength != fileLength) {
                 throw new ScpException(ErrorCode.CORRUPT_CHUNK,
                         "source file length changed: " + fileLength + " -> " + reportedLength);
@@ -272,12 +261,10 @@ final class ControlLoop implements AutoCloseable {
             if (n == 0 && offset < fileLength) {
                 throw new ScpException(ErrorCode.INTERNAL, "short fetch at " + offset);
             }
-            byte[] part = new byte[n];
-            frame.payloadSlice().get(part);
-            out.write(part);
+            frame.payloadSlice().get(out, (int) offset, n);
             offset += n;
         }
-        return out.toByteArray();
+        return out;
     }
 
     private static long maxRepairFileLength(long expectedLength) {

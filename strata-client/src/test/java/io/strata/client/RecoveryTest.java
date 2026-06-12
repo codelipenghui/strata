@@ -15,7 +15,6 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -975,25 +974,6 @@ class RecoveryTest {
         }
     }
 
-    @Test
-    void bestSealQuorumSkipsSingletonsKeepsFirstTieAndPrefersLargerQuorum() throws Exception {
-        Object singleton = sealKey(4, 10);
-        Object first = sealKey(4, 11);
-        Object tie = sealKey(4, 12);
-        Object largest = sealKey(4, 13);
-        Map<Object, List<Integer>> votes = new LinkedHashMap<>();
-        votes.put(singleton, List.of(9));
-        votes.put(first, List.of(1, 2));
-        votes.put(tie, List.of(3, 4));
-
-        Map.Entry<?, ?> firstWinner = invokeBestSealQuorum(votes);
-        assertEquals(first, firstWinner.getKey());
-
-        votes.put(largest, List.of(5, 6, 7));
-        Map.Entry<?, ?> largestWinner = invokeBestSealQuorum(votes);
-        assertEquals(largest, largestWinner.getKey());
-    }
-
     private static ScpServer sealedFenceReplica(int nodeId, long length, int sealCrc) throws Exception {
         return new ScpServer(0, nodeId, 0, 0, req -> {
             Opcode op = Opcode.fromCode(req.opcode());
@@ -1314,19 +1294,6 @@ class RecoveryTest {
                 ChunkId.class, int.class, long.class, List.class);
         method.setAccessible(true);
         return (long) invoke(method, recovery, chunkId, epoch, dataLength, replicas);
-    }
-
-    private static Object sealKey(long finalLength, int crc) throws Exception {
-        Class<?> type = Class.forName("io.strata.client.Recovery$SealKey");
-        Constructor<?> ctor = type.getDeclaredConstructor(long.class, int.class);
-        ctor.setAccessible(true);
-        return ctor.newInstance(finalLength, crc);
-    }
-
-    private static Map.Entry<?, ?> invokeBestSealQuorum(Map<Object, List<Integer>> votes) throws Exception {
-        Method method = Recovery.class.getDeclaredMethod("bestSealQuorum", Map.class);
-        method.setAccessible(true);
-        return (Map.Entry<?, ?>) invoke(method, null, votes);
     }
 
     private static Object invoke(Method method, Object target, Object... args) throws Exception {

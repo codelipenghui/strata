@@ -3,6 +3,7 @@ package io.strata.meta;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
+import io.strata.common.FileState;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 import io.strata.common.Varint;
@@ -18,36 +19,7 @@ import java.util.Objects;
  * Binary encoding with a leading version byte.
  */
 public final class Records {
-    private static final int MAX_COUNT = 1_000_000;
-
     private Records() {}
-
-    private static int count(ByteBuffer b, String what) {
-        long n = Varint.readUnsigned(b);
-        if (n < 0 || n > MAX_COUNT) {
-            throw new IllegalArgumentException("bad " + what + " count on wire: " + n);
-        }
-        return (int) n;
-    }
-
-    public enum FileState {
-        OPEN(0), SEALED(1), DELETING(2);
-
-        public final byte value;
-
-        FileState(int v) {
-            this.value = (byte) v;
-        }
-
-        static FileState from(byte v) {
-            return switch (v) {
-                case 0 -> OPEN;
-                case 1 -> SEALED;
-                case 2 -> DELETING;
-                default -> throw new IllegalArgumentException("file state " + v);
-            };
-        }
-    }
 
     public enum NodeState {
         REGISTERED(0), DRAINING(1), DEAD(2);
@@ -219,13 +191,13 @@ public final class Records {
             StrataPath path = StrataPath.of(Varint.readString(b));
             int replicationFactor = b.getInt();
             int ackQuorum = b.getInt();
-            boolean fsyncOnAck = readBoolean(b);
+            boolean fsyncOnAck = Varint.readBoolean(b);
             int writerEpoch = b.getInt();
-            FileState state = FileState.from(b.get());
+            FileState state = FileState.fromValue(b.get());
             long created = b.getLong();
             long fileOpMsb = b.getLong();
             long fileOpLsb = b.getLong();
-            int n = count(b, "chunk");
+            int n = Varint.readCount(b, "chunk");
             List<ChunkRecord> chunks = new ArrayList<>(n);
             for (int i = 0; i < n; i++) {
                 int index = b.getInt();
@@ -235,7 +207,7 @@ public final class Records {
                 int epoch = b.getInt();
                 long chunkOpMsb = b.getLong();
                 long chunkOpLsb = b.getLong();
-                int nr = count(b, "replica");
+                int nr = Varint.readCount(b, "replica");
                 List<Integer> replicas = new ArrayList<>(nr);
                 for (int j = 0; j < nr; j++) replicas.add(b.getInt());
                 chunks.add(new ChunkRecord(index, cs, len, crc, epoch, replicas, chunkOpMsb, chunkOpLsb));
@@ -243,13 +215,6 @@ public final class Records {
             return new FileRecord(id, namespace, path, replicationFactor, ackQuorum, fsyncOnAck,
                     writerEpoch, state, created, chunks, fileOpMsb, fileOpLsb);
         }
-    }
-
-    private static boolean readBoolean(ByteBuffer b) {
-        byte value = b.get();
-        if (value == 0) return false;
-        if (value == 1) return true;
-        throw new IllegalArgumentException("bad boolean value on wire: " + (value & 0xFF));
     }
 
     public record NodeRecord(int nodeId, long incMsb, long incLsb, List<String> endpoints,
@@ -260,11 +225,6 @@ public final class Records {
 
         public NodeRecord withState(NodeState s) {
             return new NodeRecord(nodeId, incMsb, incLsb, endpoints, zone, rack, host, capacityBytes, s);
-        }
-
-        public NodeRecord withIncarnation(long msb, long lsb, List<String> eps, String z, String r, String h,
-                                          long capacity) {
-            return new NodeRecord(nodeId, msb, lsb, eps, z, r, h, capacity, NodeState.REGISTERED);
         }
 
         public String endpoint() {
@@ -288,7 +248,7 @@ public final class Records {
             if (version != 2) throw new IllegalArgumentException("node record version " + version);
             int id = b.getInt();
             long msb = b.getLong(), lsb = b.getLong();
-            int ne = count(b, "endpoint");
+            int ne = Varint.readCount(b, "endpoint");
             List<String> eps = new ArrayList<>(ne);
             for (int i = 0; i < ne; i++) eps.add(Varint.readString(b));
             String zone = Varint.readString(b), rack = Varint.readString(b), host = Varint.readString(b);

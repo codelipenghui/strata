@@ -1,5 +1,6 @@
 package io.strata.meta;
 
+import io.strata.common.FileState;
 import io.strata.common.FileId;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
@@ -55,14 +56,14 @@ class ZkMetadataStoreCasTest {
             try (ZkMetadataStore leaderA = new ZkMetadataStore(zk.getConnectString());
                  ZkMetadataStore leaderB = new ZkMetadataStore(zk.getConnectString())) {
                 FileId fileId = FileId.random();
-                Records.FileRecord file = new Records.FileRecord(fileId, "test", "/test-file", 3, 2, false, Records.FileState.OPEN, System.currentTimeMillis(), List.of());
+                Records.FileRecord file = new Records.FileRecord(fileId, "test", "/test-file", 3, 2, false, FileState.OPEN, System.currentTimeMillis(), List.of());
                 leaderA.createFile(file);
                 int v0 = leaderA.getFile(fileId).orElseThrow().version();
 
-                assertTrue(leaderB.updateFile(file.withState(Records.FileState.SEALED), v0));
+                assertTrue(leaderB.updateFile(file.withState(FileState.SEALED), v0));
 
                 assertFalse(leaderA.deleteFile(fileId, v0), "stale-version delete must be rejected");
-                assertEquals(Records.FileState.SEALED,
+                assertEquals(FileState.SEALED,
                         leaderA.getFile(fileId).orElseThrow().value().state(),
                         "the newer file version must survive");
 
@@ -99,7 +100,7 @@ class ZkMetadataStoreCasTest {
         try (TestingServer zk = new TestingServer(true)) {
             try (ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
                 FileId fileId = FileId.random();
-                Records.FileRecord file = new Records.FileRecord(fileId, "test", "/marker-owner", 3, 2, false, Records.FileState.OPEN,
+                Records.FileRecord file = new Records.FileRecord(fileId, "test", "/marker-owner", 3, 2, false, FileState.OPEN,
                         System.currentTimeMillis(), List.of());
                 store.createFile(file);
 

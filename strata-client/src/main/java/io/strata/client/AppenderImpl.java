@@ -15,7 +15,6 @@ import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -23,6 +22,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+
+import static io.strata.common.Checks.checkedAdd;
 
 /**
  * The quorum appender (tech design §5): fan-out to the file's replica set, ack to the caller
@@ -86,16 +87,6 @@ final class AppenderImpl implements StrataFile.Appender {
     }
 
     private record Pending(long chunkEnd, CompletableFuture<StrataFile.AppendAck> future) {}
-
-    private record SealKey(long finalLength, int crc) {}
-
-    private static long checkedAdd(long left, long right, String what) {
-        try {
-            return Math.addExact(left, right);
-        } catch (ArithmeticException e) {
-            throw new ScpException(ErrorCode.CORRUPT_CHUNK, what + " overflow");
-        }
-    }
 
     AppenderImpl(MetaClient meta, NodePool pool, ClientConfig config, io.strata.common.FileId fileId,
                  int epoch, Messages.WritePolicy writePolicy, long existingFileLength) {
@@ -323,7 +314,7 @@ final class AppenderImpl implements StrataFile.Appender {
     private void sealChunkLocked(ChunkSession s, long dataLength) {
         byte[] header = new Messages.SealChunk(s.chunkId, epoch, dataLength).encode();
         ScpException lastErr = null;
-        Map<SealKey, List<Integer>> votes = new LinkedHashMap<>();
+        SealVotes votes = new SealVotes();
         for (int i = 0; i < s.replicas.size(); i++) {
             if (s.failed[i]) continue;
             String endpoint = s.replicas.get(i).endpoint();
@@ -361,20 +352,19 @@ final class AppenderImpl implements StrataFile.Appender {
                         s.chunkId, endpoint, lastErr.getMessage());
                 continue;
             }
-            SealKey key = new SealKey(resp.finalLength(), resp.chunkCrc());
-            votes.computeIfAbsent(key, ignored -> new ArrayList<>()).add(s.replicas.get(i).nodeId());
+            votes.add(resp.finalLength(), resp.chunkCrc(), s.replicas.get(i).nodeId());
         }
-        int okCount = votes.values().stream().mapToInt(List::size).sum();
+        int okCount = votes.total();
         if (okCount < ackQuorum) {
             dieLocked(lastErr != null ? lastErr : new ScpException(ErrorCode.INTERNAL, "seal quorum lost"));
             return;
         }
-        Map.Entry<SealKey, List<Integer>> quorum = bestSealQuorum(votes);
+        Map.Entry<SealVotes.Key, List<Integer>> quorum = votes.best(ackQuorum);
         if (quorum == null) {
             dieLocked(new ScpException(ErrorCode.INTERNAL, "replica seal divergence on " + s.chunkId));
             return;
         }
-        if (votes.size() > 1) {
+        if (votes.divergent()) {
             log.warn("replica seal divergence on {} — committing agreeing quorum {} of {} successful seals",
                     s.chunkId, quorum.getValue().size(), okCount);
         }
@@ -400,17 +390,6 @@ final class AppenderImpl implements StrataFile.Appender {
             // (recoverAndSeal commits the metadata idempotently later)
             dieLocked(metaFailure);
         }
-    }
-
-    private Map.Entry<SealKey, List<Integer>> bestSealQuorum(Map<SealKey, List<Integer>> votes) {
-        Map.Entry<SealKey, List<Integer>> best = null;
-        for (Map.Entry<SealKey, List<Integer>> entry : votes.entrySet()) {
-            if (entry.getValue().size() < ackQuorum) continue;
-            if (best == null || entry.getValue().size() > best.getValue().size()) {
-                best = entry;
-            }
-        }
-        return best;
     }
 
     private void openNewChunkLocked() {

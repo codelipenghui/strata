@@ -59,20 +59,7 @@ final class NettyFrameCodec {
     private static void writePrefix(ByteBuf out, Frame f, ByteBuffer header, int payloadLen,
                                     int payloadCrc, short flags) throws IOException {
         int headerLen = header.remaining();
-        if (headerLen > 0xFFFF) {
-            throw new IOException("header too large: " + headerLen);
-        }
-        if (payloadLen < 0) {
-            throw new IOException("negative payload length: " + payloadLen);
-        }
-        long computedFrameLen = (long) Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen;
-        if (computedFrameLen > Integer.MAX_VALUE) {
-            throw new IOException("frame too large: " + computedFrameLen);
-        }
-        int frameLen = (int) computedFrameLen;
-        if (frameLen > FrameIO.MAX_FRAME_BYTES) {
-            throw new IOException("frame too large: " + frameLen);
-        }
+        int frameLen = FrameIO.checkedFrameLength(headerLen, payloadLen);
 
         out.writeInt(frameLen);
         out.writeByte(Frame.MAGIC);
@@ -95,9 +82,7 @@ final class NettyFrameCodec {
             }
             in.markReaderIndex();
             int frameLen = in.readInt();
-            if (frameLen < Frame.PREAMBLE_AFTER_LEN || frameLen > FrameIO.MAX_FRAME_BYTES) {
-                throw new IOException("bad frame length " + frameLen);
-            }
+            FrameIO.checkFrameLength(frameLen);
             if (in.readableBytes() < frameLen) {
                 in.resetReaderIndex();
                 return;
@@ -107,14 +92,7 @@ final class NettyFrameCodec {
             boolean emitted = false;
             try {
                 int base = frame.readerIndex();
-                byte magic = frame.getByte(base);
-                byte version = frame.getByte(base + 1);
-                if (magic != Frame.MAGIC) {
-                    throw new IOException("bad magic 0x" + Integer.toHexString(magic & 0xFF));
-                }
-                if (version != Frame.FRAME_VERSION) {
-                    throw new IOException("unsupported frame version " + version);
-                }
+                FrameIO.checkMagicAndVersion(frame.getByte(base), frame.getByte(base + 1));
                 short opcode = frame.getShort(base + 2);
                 short apiVersion = frame.getShort(base + 4);
                 short flags = frame.getShort(base + 6);
@@ -122,21 +100,12 @@ final class NettyFrameCodec {
                 int payloadLen = frame.getInt(base + 16);
                 int payloadCrc = frame.getInt(base + 20);
                 int headerLen = frame.getUnsignedShort(base + 24);
-                if (payloadLen < 0) {
-                    throw new IOException("negative payload length " + payloadLen);
-                }
-                if (Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen != frameLen) {
-                    throw new IOException("frame length mismatch: " + frameLen
-                            + " vs header=" + headerLen + " payload=" + payloadLen);
-                }
+                FrameIO.checkBodyGeometry(frameLen, headerLen, payloadLen);
 
                 int headerIndex = base + Frame.PREAMBLE_AFTER_LEN;
                 int payloadIndex = headerIndex + headerLen;
                 if ((flags & Frame.FLAG_PAYLOAD_CRC) != 0 && payloadLen > 0) {
-                    int actual = Crc.of(frame.nioBuffer(payloadIndex, payloadLen));
-                    if (actual != payloadCrc) {
-                        throw new IOException("payload crc mismatch: expected " + payloadCrc + " got " + actual);
-                    }
+                    FrameIO.checkPayloadCrc(payloadCrc, Crc.of(frame.nioBuffer(payloadIndex, payloadLen)));
                 }
                 out.add(Frame.fromOwnedBuffer(opcode, apiVersion, flags, correlationId,
                         frame, headerIndex, headerLen, payloadIndex, payloadLen));

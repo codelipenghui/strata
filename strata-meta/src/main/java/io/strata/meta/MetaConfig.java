@@ -13,8 +13,4 @@ public record MetaConfig(
     public static MetaConfig forTests(String zkConnect) {
         return new MetaConfig(zkConnect, 0, 200, 1_000, 1_500, 300, 3_000);
     }
-
-    public static MetaConfig production(String zkConnect, int port) {
-        return new MetaConfig(zkConnect, port, 1_000, 10_000, 300_000, 30_000, 600_000);
-    }
 }

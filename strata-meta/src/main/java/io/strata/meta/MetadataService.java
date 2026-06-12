@@ -2,8 +2,10 @@ package io.strata.meta;
 
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
+import io.strata.common.Closeables;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.FileState;
 import io.strata.common.ScpException;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
@@ -28,7 +30,8 @@ import java.util.UUID;
  */
 public final class MetadataService implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(MetadataService.class);
-    private static final int CAS_RETRIES = 5;
+    /** Optimistic-concurrency retry bound, shared with RepairCoordinator's descriptor CAS loops. */
+    static final int CAS_RETRIES = 5;
 
     private final MetaConfig config;
     private final MetadataStore store;
@@ -61,63 +64,48 @@ public final class MetadataService implements AutoCloseable {
             openedLatch.start();
             openedRepair.start();
         } catch (Exception e) {
-            cleanupFailedStart(openedRepair, openedServer, openedLatch, openedStore, e);
+            Throwable closeFailure = closeAll(openedRepair, openedServer, openedLatch, openedStore);
+            if (closeFailure != null) {
+                e.addSuppressed(closeFailure);
+            }
             throw e;
         }
         log.info("metadata service started on port {} (zk {})", server.port(), config.zkConnect());
     }
 
-    private static void cleanupFailedStart(RepairCoordinator repair, ScpServer server,
-                                           LeaderLatch leaderLatch, MetadataStore store, Throwable failure) {
+    /** Closes whatever subset of the service's resources exists; returns the accumulated failure. */
+    private static Throwable closeAll(RepairCoordinator repair, ScpServer server,
+                                      LeaderLatch leaderLatch, MetadataStore store) {
+        Throwable failure = null;
         if (repair != null) {
             try {
                 repair.close();
             } catch (RuntimeException e) {
-                failure.addSuppressed(e);
+                failure = Closeables.suppress(failure, e);
             }
         }
         if (server != null) {
             try {
                 server.close();
             } catch (RuntimeException e) {
-                failure.addSuppressed(e);
+                failure = Closeables.suppress(failure, e);
             }
         }
         if (leaderLatch != null) {
             try {
                 leaderLatch.close();
             } catch (IOException | RuntimeException e) {
-                failure.addSuppressed(e);
+                failure = Closeables.suppress(failure, e);
             }
         }
         if (store != null) {
             try {
                 store.close();
             } catch (RuntimeException e) {
-                failure.addSuppressed(e);
+                failure = Closeables.suppress(failure, e);
             }
         }
-    }
-
-    private static Throwable suppress(Throwable failure, Throwable next) {
-        if (failure == null) {
-            return next;
-        }
-        failure.addSuppressed(next);
         return failure;
-    }
-
-    private static void throwCloseFailure(Throwable failure) throws IOException {
-        if (failure == null) {
-            return;
-        }
-        if (failure instanceof IOException e) {
-            throw e;
-        }
-        if (failure instanceof RuntimeException e) {
-            throw e;
-        }
-        throw new IOException(failure);
     }
 
     public int port() {
@@ -207,7 +195,7 @@ public final class MetadataService implements AutoCloseable {
                 // or buggy client must not freeze a file mid-write (validated under CAS, so it
                 // is race-free against concurrent chunk creates)
                 mutateFile(m.fileId(), file -> {
-                    if (file.state() == Records.FileState.DELETING) {
+                    if (file.state() == FileState.DELETING) {
                         // sealing must never resurrect a DELETING file: deletion would stop
                         // half-way, leaving a "live" file with missing chunks
                         throw new ScpException(ErrorCode.PRECONDITION_FAILED, "file is DELETING");
@@ -233,7 +221,7 @@ public final class MetadataService implements AutoCloseable {
                         throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                                 "total length " + total + " != requested " + m.totalLength(), total);
                     }
-                    return file.withState(Records.FileState.SEALED);
+                    return file.withState(FileState.SEALED);
                 });
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
@@ -272,10 +260,10 @@ public final class MetadataService implements AutoCloseable {
             var opt = store.getFile(m.fileId());
             if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, m.fileId().toString());
             Records.FileRecord file = opt.get().value();
-            if (file.state() == Records.FileState.DELETING) {
+            if (file.state() == FileState.DELETING) {
                 throw new ScpException(ErrorCode.PRECONDITION_FAILED, "file is DELETING");
             }
-            if (file.state() == Records.FileState.SEALED) {
+            if (file.state() == FileState.SEALED) {
                 throw new ScpException(ErrorCode.FILE_SEALED, "file state " + file.state());
             }
             boolean hasOpenChunk = file.chunks().stream().anyMatch(c -> c.state() != ChunkState.SEALED);
@@ -301,7 +289,7 @@ public final class MetadataService implements AutoCloseable {
         try {
             store.createFile(new Records.FileRecord(m.fileId(), m.namespace(), m.path(),
                     policy.replicationFactor(), policy.ackQuorum(), policy.fsyncOnAck(),
-                    Records.FileState.OPEN, System.currentTimeMillis(), List.of(),
+                    FileState.OPEN, System.currentTimeMillis(), List.of(),
                     m.opIdMsb(), m.opIdLsb()));
             return m.fileId();
         } catch (KeeperException.NodeExistsException e) {
@@ -338,7 +326,7 @@ public final class MetadataService implements AutoCloseable {
             var opt = store.getFile(m.fileId());
             if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, m.fileId().toString());
             Records.FileRecord file = opt.get().value();
-            if (file.state() != Records.FileState.OPEN) {
+            if (file.state() != FileState.OPEN) {
                 throw new ScpException(ErrorCode.FILE_SEALED, "file state " + file.state());
             }
             if (m.writeEpoch() <= 0) {
@@ -408,7 +396,7 @@ public final class MetadataService implements AutoCloseable {
             var opt = store.getFile(m.chunkId().fileId());
             if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, m.chunkId().toString());
             Records.FileRecord file = opt.get().value();
-            if (file.state() == Records.FileState.DELETING) {
+            if (file.state() == FileState.DELETING) {
                 // an in-flight appender must not mutate a file that deletion is dismantling
                 throw new ScpException(ErrorCode.PRECONDITION_FAILED, "file is DELETING");
             }
@@ -516,7 +504,7 @@ public final class MetadataService implements AutoCloseable {
             throw new ScpException(ErrorCode.FILE_NOT_FOUND, namespace + ":" + path);
         }
         var file = store.getFile(id.get());
-        if (file.isEmpty() || file.get().value().state() == Records.FileState.DELETING) {
+        if (file.isEmpty() || file.get().value().state() == FileState.DELETING) {
             throw new ScpException(ErrorCode.FILE_NOT_FOUND, namespace + ":" + path);
         }
         Records.FileRecord record = file.get().value();
@@ -540,7 +528,7 @@ public final class MetadataService implements AutoCloseable {
             var opt = store.getFile(id);
             if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, id.toString());
             Records.FileRecord current = opt.get().value();
-            Records.FileRecord deleting = current.withState(Records.FileState.DELETING);
+            Records.FileRecord deleting = current.withState(FileState.DELETING);
             if (store.updateFile(deleting, opt.get().version())) {
                 if (!store.deletePath(current.namespace(), current.path(), id)) {
                     throw new ScpException(ErrorCode.INTERNAL,
@@ -554,27 +542,6 @@ public final class MetadataService implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
-        Throwable failure = null;
-        try {
-            repair.close();
-        } catch (RuntimeException e) {
-            failure = suppress(failure, e);
-        }
-        try {
-            server.close();
-        } catch (RuntimeException e) {
-            failure = suppress(failure, e);
-        }
-        try {
-            leaderLatch.close();
-        } catch (IOException | RuntimeException e) {
-            failure = suppress(failure, e);
-        }
-        try {
-            store.close();
-        } catch (RuntimeException e) {
-            failure = suppress(failure, e);
-        }
-        throwCloseFailure(failure);
+        Closeables.throwIfFailed(closeAll(repair, server, leaderLatch, store));
     }
 }

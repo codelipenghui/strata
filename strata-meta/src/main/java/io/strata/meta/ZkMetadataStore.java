@@ -193,15 +193,16 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     private static byte[] fileIdBytes(FileId id) {
-        return ByteBuffer.allocate(16).putLong(id.msb()).putLong(id.lsb()).array();
+        ByteBuffer buf = ByteBuffer.allocate(16);
+        id.writeTo(buf);
+        return buf.array();
     }
 
     private static FileId readFileId(byte[] bytes) {
         if (bytes.length != 16) {
             throw new IllegalArgumentException("bad namespace file id length " + bytes.length);
         }
-        ByteBuffer buf = ByteBuffer.wrap(bytes);
-        return new FileId(buf.getLong(), buf.getLong());
+        return FileId.readFrom(ByteBuffer.wrap(bytes));
     }
 
     @Override

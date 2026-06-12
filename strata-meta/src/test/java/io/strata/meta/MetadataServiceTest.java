@@ -1,5 +1,6 @@
 package io.strata.meta;
 
+import io.strata.common.FileState;
 import io.strata.common.ChunkState;
 import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
@@ -1006,7 +1007,7 @@ class MetadataServiceTest {
     @Test
     void sealFileRejectsCorruptCommittedChunkLengths() throws Exception {
         FileId negative = FileId.random();
-        metadataStore().createFile(new Records.FileRecord(negative, "test", "/negative-length", 3, 2, false, Records.FileState.OPEN, System.currentTimeMillis(),
+        metadataStore().createFile(new Records.FileRecord(negative, "test", "/negative-length", 3, 2, false, FileState.OPEN, System.currentTimeMillis(),
                 List.of(new Records.ChunkRecord(0, ChunkState.SEALED, -1, 0, 1, List.of()))));
 
         ScpException negativeLength = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_FILE,
@@ -1014,7 +1015,7 @@ class MetadataServiceTest {
         assertEquals(ErrorCode.PRECONDITION_FAILED, negativeLength.code());
 
         FileId overflow = FileId.random();
-        metadataStore().createFile(new Records.FileRecord(overflow, "test", "/overflow-length", 3, 2, false, Records.FileState.OPEN, System.currentTimeMillis(),
+        metadataStore().createFile(new Records.FileRecord(overflow, "test", "/overflow-length", 3, 2, false, FileState.OPEN, System.currentTimeMillis(),
                 List.of(
                         new Records.ChunkRecord(0, ChunkState.SEALED, Long.MAX_VALUE, 0, 1, List.of()),
                         new Records.ChunkRecord(1, ChunkState.SEALED, 1, 0, 1, List.of()))));

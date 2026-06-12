@@ -29,15 +29,6 @@ public final class Varint {
         }
     }
 
-    public static int sizeOfUnsigned(long value) {
-        int size = 1;
-        while ((value & ~0x7FL) != 0) {
-            size++;
-            value >>>= 7;
-        }
-        return size;
-    }
-
     public static void writeString(ByteBuffer buf, String s) {
         byte[] bytes = s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
         writeUnsigned(buf, bytes.length);
@@ -67,8 +58,31 @@ public final class Varint {
         return b;
     }
 
-    public static int sizeOfString(String s) {
-        int n = s.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
-        return sizeOfUnsigned(n) + n;
+    /** Sanity bound for any list count on the wire — far above legitimate use. */
+    private static final int MAX_COUNT = 1_000_000;
+
+    /**
+     * Reads a list count and validates it: an adversarial varint (e.g. 0xFFFFFFFF) narrows to a
+     * negative int and would otherwise surface as ArrayList's "Illegal Capacity" — an unchecked
+     * exception that kills the connection thread instead of producing a typed protocol error.
+     */
+    public static int readCount(ByteBuffer buf, String what) {
+        long n = readUnsigned(buf);
+        if (n < 0 || n > MAX_COUNT) {
+            throw new IllegalArgumentException("bad " + what + " count on wire: " + n);
+        }
+        return (int) n;
+    }
+
+    /** Strict 0/1 boolean decoder — any other byte is a typed wire rejection. */
+    public static boolean readBoolean(ByteBuffer buf) {
+        byte value = buf.get();
+        if (value == 0) {
+            return false;
+        }
+        if (value == 1) {
+            return true;
+        }
+        throw new IllegalArgumentException("bad boolean value on wire: " + (value & 0xFF));
     }
 }

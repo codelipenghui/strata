@@ -15,6 +15,15 @@ public record Endpoint(String host, int port) {
         return parse(endpoint, "endpoint");
     }
 
+    /** Like {@link #parse(String, String)}, but maps rejection to a typed SCP error. */
+    public static Endpoint parse(String endpoint, String field, ErrorCode errorCode) {
+        try {
+            return parse(endpoint, field);
+        } catch (IllegalArgumentException e) {
+            throw new ScpException(errorCode, "invalid " + field + ": " + endpoint);
+        }
+    }
+
     public static Endpoint parse(String endpoint, String field) {
         if (endpoint == null) {
             throw new IllegalArgumentException(field + " must be non-null");

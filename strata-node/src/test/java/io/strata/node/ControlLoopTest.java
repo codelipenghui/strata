@@ -2,6 +2,7 @@ package io.strata.node;
 
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
+import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
@@ -762,15 +763,8 @@ class ControlLoopTest {
         }
     }
 
-    private static Object parseEndpoint(String endpoint) throws Exception {
-        Method method = ControlLoop.class.getDeclaredMethod("parseEndpoint", String.class);
-        method.setAccessible(true);
-        try {
-            return method.invoke(null, endpoint);
-        } catch (InvocationTargetException e) {
-            throwCause(e);
-            throw new AssertionError("unreachable");
-        }
+    private static Endpoint parseEndpoint(String endpoint) {
+        return Endpoint.parse(endpoint, "endpoint", ErrorCode.INTERNAL);
     }
 
     private static void throwCause(InvocationTargetException e) throws Exception {

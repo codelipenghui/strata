@@ -208,24 +208,11 @@ class ChunkStoreTest {
     }
 
     private static void readFully(FileChannel channel, ByteBuffer buffer, long position) throws Exception {
-        Method method = ChunkStore.class.getDeclaredMethod("readFully", FileChannel.class, ByteBuffer.class, long.class);
-        method.setAccessible(true);
-        try {
-            method.invoke(null, channel, buffer, position);
-        } catch (InvocationTargetException e) {
-            throw rethrowCause(e);
-        }
+        ChunkFormats.readFully(channel, buffer, position);
     }
 
     private static void writeFully(FileChannel channel, ByteBuffer buffer, long position) throws Exception {
-        Method method = ChunkStore.class.getDeclaredMethod("writeFully", FileChannel.class, ByteBuffer.class,
-                long.class);
-        method.setAccessible(true);
-        try {
-            method.invoke(null, channel, buffer, position);
-        } catch (InvocationTargetException e) {
-            throw rethrowCause(e);
-        }
+        ChunkFormats.writeFully(channel, buffer, position);
     }
 
     private static void cleanupFailedImport(ChunkStore store, Object handle, Path tmp, boolean movedData,

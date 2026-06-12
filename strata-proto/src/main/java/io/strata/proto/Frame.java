@@ -97,14 +97,6 @@ public final class Frame implements AutoCloseable {
         return correlationId;
     }
 
-    public ByteBuffer header() {
-        return headerSlice();
-    }
-
-    public ByteBuffer payload() {
-        return payloadSlice();
-    }
-
     public boolean isResponse() {
         return (flags & FLAG_RESPONSE) != 0;
     }
@@ -152,11 +144,14 @@ public final class Frame implements AutoCloseable {
 
     @Override
     public void close() {
-        if (owner != null && closed.compareAndSet(false, true)) {
-            owner.release();
-        }
-        if (filePayload != null && closed.compareAndSet(false, true)) {
-            filePayload.close();
+        // a frame owns at most one of {retained buffer, file payload} by construction
+        if (closed.compareAndSet(false, true)) {
+            if (owner != null) {
+                owner.release();
+            }
+            if (filePayload != null) {
+                filePayload.close();
+            }
         }
     }
 

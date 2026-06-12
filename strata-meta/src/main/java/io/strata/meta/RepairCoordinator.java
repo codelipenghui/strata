@@ -1,5 +1,6 @@
 package io.strata.meta;
 
+import io.strata.common.FileState;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
@@ -114,7 +115,7 @@ final class RepairCoordinator implements AutoCloseable {
             if (opt.isEmpty()) continue;
             Records.FileRecord file = opt.get().value();
 
-            if (file.state() == Records.FileState.DELETING) {
+            if (file.state() == FileState.DELETING) {
                 driveDeletion(file, opt.get().version());
                 continue;
             }
@@ -281,7 +282,7 @@ final class RepairCoordinator implements AutoCloseable {
                     r.targetNode(), r.chunkId());
             return;
         }
-        for (int attempt = 0; attempt < 5; attempt++) {
+        for (int attempt = 0; attempt < MetadataService.CAS_RETRIES; attempt++) {
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(r.fileId());
             if (opt.isEmpty()) return;
             Records.FileRecord file = opt.get().value();
@@ -313,7 +314,7 @@ final class RepairCoordinator implements AutoCloseable {
     }
 
     private void applyDeleteConfirmed(FileId fileId, ChunkId chunkId, int nodeId) throws Exception {
-        for (int attempt = 0; attempt < 5; attempt++) {
+        for (int attempt = 0; attempt < MetadataService.CAS_RETRIES; attempt++) {
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
             if (opt.isEmpty()) return;
             Records.FileRecord file = opt.get().value();
@@ -322,7 +323,7 @@ final class RepairCoordinator implements AutoCloseable {
                 if (file.chunkId(c.index()).equals(chunkId)) {
                     List<Integer> replicas = new ArrayList<>(c.replicas());
                     replicas.remove(Integer.valueOf(nodeId));
-                    if (!replicas.isEmpty() || file.state() != Records.FileState.DELETING) {
+                    if (!replicas.isEmpty() || file.state() != FileState.DELETING) {
                         // a LIVE file keeps the chunk record even with zero replicas: erasing it
                         // would silently shorten the file (readers' offset accounting shifts) —
                         // total loss must surface as a hard read failure, not missing data
@@ -337,7 +338,7 @@ final class RepairCoordinator implements AutoCloseable {
                 }
             }
             Records.FileRecord updated = file.withChunks(chunks);
-            if (chunks.isEmpty() && file.state() == Records.FileState.DELETING) {
+            if (chunks.isEmpty() && file.state() == FileState.DELETING) {
                 if (store.deleteFile(fileId, opt.get().version())) {
                     log.info("file {} fully deleted", fileId);
                     return;
@@ -366,10 +367,14 @@ final class RepairCoordinator implements AutoCloseable {
             for (Messages.InventoryEntry e : report.entries()) {
                 reported.put(e.chunkId(), e);
             }
+            // one descriptor fetch per file for the whole report: chunks of the same file would
+            // otherwise re-fetch the identical record, and the missing/corrupt sweep below would
+            // fetch every file a second time (reconciliation already tolerates a stale snapshot)
+            Map<FileId, Optional<MetadataStore.Versioned<Records.FileRecord>>> records = new java.util.HashMap<>();
             // orphan detection
             List<ChunkId> orphans = new ArrayList<>();
             for (Messages.InventoryEntry e : report.entries()) {
-                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(e.chunkId().fileId());
+                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = cachedFile(records, e.chunkId().fileId());
                 boolean known = false;
                 if (opt.isPresent()) {
                     for (Records.ChunkRecord c : opt.get().value().chunks()) {
@@ -392,8 +397,8 @@ final class RepairCoordinator implements AutoCloseable {
             // and the replica must stop being a read/repair source (the under-replication scan
             // then re-repairs, and the dropped node's copy becomes an orphan to delete)
             for (FileId fileId : store.listFiles()) {
-                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
-                if (opt.isEmpty() || opt.get().value().state() == Records.FileState.DELETING) continue;
+                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = cachedFile(records, fileId);
+                if (opt.isEmpty() || opt.get().value().state() == FileState.DELETING) continue;
                 Records.FileRecord file = opt.get().value();
                 for (Records.ChunkRecord c : file.chunks()) {
                     if (c.state() != ChunkState.SEALED || !c.replicas().contains(report.nodeId())) {
@@ -429,6 +434,16 @@ final class RepairCoordinator implements AutoCloseable {
         } catch (Exception e) {
             log.warn("inventory reconciliation for node {} failed", report.nodeId(), e);
         }
+    }
+
+    private Optional<MetadataStore.Versioned<Records.FileRecord>> cachedFile(
+            Map<FileId, Optional<MetadataStore.Versioned<Records.FileRecord>>> cache, FileId fileId) throws Exception {
+        Optional<MetadataStore.Versioned<Records.FileRecord>> cached = cache.get(fileId);
+        if (cached == null) {
+            cached = store.getFile(fileId);
+            cache.put(fileId, cached);
+        }
+        return cached;
     }
 
     @Override

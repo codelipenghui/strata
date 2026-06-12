@@ -15,7 +15,6 @@ class StrataPathTest {
         StrataPath path = StrataPath.of("/kafka/cluster-a/topic_A.1/00000000000000000000");
 
         assertEquals("/kafka/cluster-a/topic_A.1/00000000000000000000", path.toString());
-        assertEquals(List.of("kafka", "cluster-a", "topic_A.1", "00000000000000000000"), path.segments());
     }
 
     @Test

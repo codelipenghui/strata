@@ -2,6 +2,7 @@ package io.strata.format;
 
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
+import io.strata.common.Closeables;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
@@ -23,9 +24,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 import java.util.zip.CRC32C;
 
+import static io.strata.common.Checks.checkedAdd;
 import static io.strata.format.ChunkFormats.DATA_START;
 import static io.strata.format.ChunkFormats.HEADER_SIZE;
 import static io.strata.format.ChunkFormats.TRAILER_SIZE;
+import static io.strata.format.ChunkFormats.readFully;
+import static io.strata.format.ChunkFormats.writeFully;
 
 /**
  * Node-local chunk engine (tech design §5, §11): epoch-fenced appends, integrity-ledger crash
@@ -76,6 +80,11 @@ public final class ChunkStore implements AutoCloseable {
         long sealedLength = -1;
         int dataCrc;
         List<Integer> sealedRangeCrcs = List.of();
+
+        /** The end offset served to readers: the sealed length once sealed, the live end before. */
+        long currentEnd() {
+            return state == ChunkState.SEALED ? sealedLength : end;
+        }
 
         Handle(ChunkId id, ChunkFormats.Header header) {
             this.id = id;
@@ -147,35 +156,6 @@ public final class ChunkStore implements AutoCloseable {
         if (value < 0) {
             throw new ScpException(ErrorCode.INTERNAL, "negative " + what + ": " + value);
         }
-    }
-
-    private static long checkedAdd(long left, long right, String what) {
-        try {
-            return Math.addExact(left, right);
-        } catch (ArithmeticException e) {
-            throw new ScpException(ErrorCode.CORRUPT_CHUNK, what + " overflow");
-        }
-    }
-
-    private static Throwable suppress(Throwable failure, Throwable next) {
-        if (failure == null) {
-            return next;
-        }
-        failure.addSuppressed(next);
-        return failure;
-    }
-
-    private static void throwCloseFailure(Throwable failure) throws IOException {
-        if (failure == null) {
-            return;
-        }
-        if (failure instanceof IOException e) {
-            throw e;
-        }
-        if (failure instanceof RuntimeException e) {
-            throw e;
-        }
-        throw new IOException(failure);
     }
 
     private static void checkEpoch(Handle h, int epoch) {
@@ -267,6 +247,9 @@ public final class ChunkStore implements AutoCloseable {
     public java.util.concurrent.CompletableFuture<AppendResult> appendAsync(
             ChunkId id, int epoch, long baseOffset, long durableOffset, ByteBuffer payload) throws IOException {
         Handle h = lookup(id);
+        // CRC the payload before taking the chunk monitor: the pass is state-independent and
+        // would otherwise serialize behind every other append to this chunk
+        int payloadCrc = payload.hasRemaining() ? Crc.of(payload.duplicate()) : 0;
         long newEnd;
         GroupCommitter committer;
         synchronized (h) {
@@ -285,7 +268,6 @@ public final class ChunkStore implements AutoCloseable {
             }
             newEnd = checkedAdd(baseOffset, len, "chunk offset");
             long writePos = checkedAdd(DATA_START, baseOffset, "chunk file offset");
-            int payloadCrc = Crc.of(payload.duplicate());
             writeFully(h.data, payload.duplicate(), writePos);
             h.ledger.append(new ChunkFormats.LedgerEntry(newEnd, payloadCrc, epoch));
             h.end = newEnd;
@@ -326,7 +308,7 @@ public final class ChunkStore implements AutoCloseable {
         requireNonNegative(maxBytes, "read maxBytes");
         Handle h = lookup(id);
         synchronized (h) {
-            long end = h.state == ChunkState.SEALED ? h.sealedLength : h.end;
+            long end = h.currentEnd();
             if (offset >= end) return new ReadResult(new byte[0], end, h.lastKnownDO);
             int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), end - offset);
             byte[] out = new byte[n];
@@ -344,7 +326,7 @@ public final class ChunkStore implements AutoCloseable {
         requireNonNegative(maxBytes, "read maxBytes");
         Handle h = lookup(id);
         synchronized (h) {
-            long end = h.state == ChunkState.SEALED ? h.sealedLength : h.end;
+            long end = h.currentEnd();
             if (offset >= end) {
                 return new ReadRegionResult(null, 0, 0, end, h.lastKnownDO);
             }
@@ -376,8 +358,7 @@ public final class ChunkStore implements AutoCloseable {
                 h.fenceEpoch = fenceEpoch;
                 h.persistSidecar();
             }
-            long end = h.state == ChunkState.SEALED ? h.sealedLength : h.end;
-            return new FenceResult(h.fenceEpoch, end, h.lastKnownDO, h.state);
+            return new FenceResult(h.fenceEpoch, h.currentEnd(), h.lastKnownDO, h.state);
         }
     }
 
@@ -387,8 +368,7 @@ public final class ChunkStore implements AutoCloseable {
     public StatResult stat(ChunkId id) {
         Handle h = lookup(id);
         synchronized (h) {
-            long end = h.state == ChunkState.SEALED ? h.sealedLength : h.end;
-            return new StatResult(h.state, end, h.lastKnownDO, h.writeEpoch, h.fenceEpoch,
+            return new StatResult(h.state, h.currentEnd(), h.lastKnownDO, h.writeEpoch, h.fenceEpoch,
                     h.sealedLength, h.dataCrc);
         }
     }
@@ -559,7 +539,7 @@ public final class ChunkStore implements AutoCloseable {
         Handle h = lookup(id);
         synchronized (h) {
             if (h.ledger == null) return List.of();
-            return List.copyOf(h.ledger.entriesAfter(fromOffset));
+            return h.ledger.entriesAfter(fromOffset);
         }
     }
 
@@ -713,8 +693,7 @@ public final class ChunkStore implements AutoCloseable {
         List<InventoryItem> out = new ArrayList<>();
         for (Handle h : chunks.values()) {
             synchronized (h) {
-                long len = h.state == ChunkState.SEALED ? h.sealedLength : h.end;
-                out.add(new InventoryItem(h.id, h.state, len, h.dataCrc));
+                out.add(new InventoryItem(h.id, h.state, h.currentEnd(), h.dataCrc));
             }
         }
         return out;
@@ -880,8 +859,12 @@ public final class ChunkStore implements AutoCloseable {
                 throw new ScpException(ErrorCode.CRC_MISMATCH,
                         "sealed range crc mismatch on " + h.id + " range " + range);
             }
+            // serve the requested bytes from the just-verified range instead of re-reading disk
+            long copyStart = Math.max(offset, rangeStart);
+            long copyEnd = Math.min(offset + out.length, rangeStart + rangeLen);
+            System.arraycopy(rangeBuf, (int) (copyStart - rangeStart),
+                    out, (int) (copyStart - offset), (int) (copyEnd - copyStart));
         }
-        readFully(h.data, ByteBuffer.wrap(out), checkedAdd(DATA_START, offset, "chunk file offset"));
     }
 
     private static int checkedFooterLength(ChunkFormats.Trailer trailer, long fileLen) {
@@ -959,25 +942,6 @@ public final class ChunkStore implements AutoCloseable {
         throw new ScpException(ErrorCode.CORRUPT_CHUNK, "missing CRC_RANGES section");
     }
 
-    private static void readFully(FileChannel ch, ByteBuffer buf, long position) throws IOException {
-        long pos = position;
-        while (buf.hasRemaining()) {
-            int n = ch.read(buf, pos);
-            if (n < 0) throw new IOException("EOF at " + pos);
-            if (n == 0) throw new IOException("zero-byte read at " + pos);
-            pos += n;
-        }
-    }
-
-    private static void writeFully(FileChannel ch, ByteBuffer buf, long position) throws IOException {
-        long pos = position;
-        while (buf.hasRemaining()) {
-            int n = ch.write(buf, pos);
-            if (n <= 0) throw new IOException("write failed at " + pos);
-            pos += n;
-        }
-    }
-
     @Override
     public void close() throws IOException {
         Throwable failure = null;
@@ -990,20 +954,20 @@ public final class ChunkStore implements AutoCloseable {
                             IOException e = new IOException("group-commit flusher stuck for " + h.id
                                     + " — refusing to close chunk files");
                             log.warn("close {} failed", h.id, e);
-                            failure = suppress(failure, e);
+                            failure = Closeables.suppress(failure, e);
                             mayCloseFiles = false;
                         } else if (h.committer.isPoisoned()) {
                             IOException e = new IOException("group-commit flusher failed for " + h.id
                                     + " — chunk shutdown was not clean");
                             log.warn("close {} failed", h.id, e);
-                            failure = suppress(failure, e);
+                            failure = Closeables.suppress(failure, e);
                             h.committer = null;
                         } else {
                             h.committer = null;
                         }
                     } catch (RuntimeException e) {
                         log.warn("close {} failed", h.id, e);
-                        failure = suppress(failure, e);
+                        failure = Closeables.suppress(failure, e);
                         mayCloseFiles = false;
                     }
                 }
@@ -1014,14 +978,14 @@ public final class ChunkStore implements AutoCloseable {
                     h.persistSidecar(); // persist advisory DO/epochs on clean shutdown
                 } catch (IOException | RuntimeException e) {
                     log.warn("close {} failed", h.id, e);
-                    failure = suppress(failure, e);
+                    failure = Closeables.suppress(failure, e);
                 }
                 if (h.ledger != null) {
                     try {
                         h.ledger.close();
                     } catch (IOException | RuntimeException e) {
                         log.warn("close {} failed", h.id, e);
-                        failure = suppress(failure, e);
+                        failure = Closeables.suppress(failure, e);
                     }
                 }
                 if (h.data != null) {
@@ -1029,7 +993,7 @@ public final class ChunkStore implements AutoCloseable {
                         h.data.close();
                     } catch (IOException | RuntimeException e) {
                         log.warn("close {} failed", h.id, e);
-                        failure = suppress(failure, e);
+                        failure = Closeables.suppress(failure, e);
                     }
                 }
             }
@@ -1037,7 +1001,7 @@ public final class ChunkStore implements AutoCloseable {
         if (failure == null) {
             chunks.clear();
         } else {
-            throwCloseFailure(failure);
+            Closeables.throwIfFailed(failure);
         }
     }
 }

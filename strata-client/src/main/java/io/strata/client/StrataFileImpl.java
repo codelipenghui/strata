@@ -3,12 +3,15 @@ package io.strata.client;
 import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.FileState;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 import io.strata.proto.Messages;
 
 import java.util.Objects;
+
+import static io.strata.common.Checks.addChunkLength;
 
 /** SCP-backed StrataFile handle over one logical file id. */
 final class StrataFileImpl implements StrataFile {
@@ -47,7 +50,7 @@ final class StrataFileImpl implements StrataFile {
     @Override
     public Appender openForAppend() {
         Messages.LookupFileResp file = meta.lookupFile(fileId);
-        if (file.fileState() != 0) {
+        if (file.fileState() != FileState.OPEN.value) {
             throw new ScpException(ErrorCode.FILE_SEALED, "file state " + file.fileState());
         }
         long length = 0;
@@ -56,14 +59,7 @@ final class StrataFileImpl implements StrataFile {
                 throw new ScpException(ErrorCode.INTERNAL,
                         "file has an open chunk — run recoverAndSeal or resume the owning appender");
             }
-            if (c.length() < 0) {
-                throw new ScpException(ErrorCode.CORRUPT_CHUNK, "negative chunk length " + c.length());
-            }
-            try {
-                length = Math.addExact(length, c.length());
-            } catch (ArithmeticException e) {
-                throw new ScpException(ErrorCode.CORRUPT_CHUNK, "file length overflow");
-            }
+            length = addChunkLength(length, c.length());
         }
         int writeEpoch = meta.allocateWriterEpochForAppend(fileId);
         return new AppenderImpl(meta, pool, config, fileId, writeEpoch, file.writePolicy(), length);

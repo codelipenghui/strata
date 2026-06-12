@@ -33,7 +33,7 @@ final class MetaClient implements AutoCloseable {
         try {
             if (client == null || client.isClosed()) {
                 String ep = config.metadataEndpoints().get(endpointIndex % config.metadataEndpoints().size());
-                Endpoint hp = parseEndpoint(ep);
+                Endpoint hp = Endpoint.parse(ep, "metadata endpoint", ErrorCode.INTERNAL);
                 try {
                     client = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_BROKER, "strata-client");
                 } catch (IOException e) {
@@ -45,14 +45,6 @@ final class MetaClient implements AutoCloseable {
             return client;
         } finally {
             lock.unlock();
-        }
-    }
-
-    private static Endpoint parseEndpoint(String endpoint) {
-        try {
-            return Endpoint.parse(endpoint, "metadata endpoint");
-        } catch (IllegalArgumentException e) {
-            throw new ScpException(ErrorCode.INTERNAL, "invalid metadata endpoint: " + endpoint);
         }
     }
 

@@ -22,20 +22,9 @@ import java.util.UUID;
 public final class Messages {
     private Messages() {}
 
-    /** Sanity bound for any list count on the wire — far above legitimate use. */
-    static final int MAX_COUNT = 1_000_000;
-
-    /**
-     * Reads a list count and validates it: an adversarial varint (e.g. 0xFFFFFFFF) narrows to a
-     * negative int and would otherwise surface as ArrayList's "Illegal Capacity" — an unchecked
-     * exception that kills the connection thread instead of producing a typed protocol error.
-     */
+    /** Bounded list-count reader (see {@link Varint#readCount}). */
     static int count(ByteBuffer b) {
-        long n = Varint.readUnsigned(b);
-        if (n < 0 || n > MAX_COUNT) {
-            throw new IllegalArgumentException("bad list count on wire: " + n);
-        }
-        return (int) n;
+        return Varint.readCount(b, "list");
     }
 
     /* ---------- shared sub-structs ---------- */
@@ -127,7 +116,7 @@ public final class Messages {
         }
 
         public static OpenChunk decode(ByteBuffer b) {
-            OpenChunk m = new OpenChunk(ChunkId.readFrom(b), b.getInt(), readBoolean(b),
+            OpenChunk m = new OpenChunk(ChunkId.readFrom(b), b.getInt(), Varint.readBoolean(b),
                     b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
             return m;
@@ -640,19 +629,8 @@ public final class Messages {
         }
 
         private static WritePolicy readFrom(ByteBuffer b) {
-            return new WritePolicy(b.getInt(), b.getInt(), readBoolean(b));
+            return new WritePolicy(b.getInt(), b.getInt(), Varint.readBoolean(b));
         }
-    }
-
-    private static boolean readBoolean(ByteBuffer b) {
-        byte value = b.get();
-        if (value == 0) {
-            return false;
-        }
-        if (value == 1) {
-            return true;
-        }
-        throw new IllegalArgumentException("bad boolean value on wire: " + (value & 0xFF));
     }
 
     public record CreateFile(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy,
@@ -664,16 +642,12 @@ public final class Messages {
             fileId = Objects.requireNonNull(fileId, "fileId");
         }
 
-        public CreateFile(StrataNamespace namespace, StrataPath path) {
-            this(namespace, path, WritePolicy.DEFAULT);
-        }
-
         public CreateFile(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy) {
             this(namespace, path, writePolicy, FileId.random(), UUID.randomUUID());
         }
 
         public CreateFile(String namespace, String path) {
-            this(StrataNamespace.of(namespace), StrataPath.of(path));
+            this(StrataNamespace.of(namespace), StrataPath.of(path), WritePolicy.DEFAULT);
         }
 
         public CreateFile(String namespace, String path, WritePolicy writePolicy) {
@@ -689,11 +663,6 @@ public final class Messages {
         public CreateFile(String namespace, String path, FileId fileId, long opIdMsb, long opIdLsb) {
             this(StrataNamespace.of(namespace), StrataPath.of(path), WritePolicy.DEFAULT,
                     fileId, opIdMsb, opIdLsb);
-        }
-
-        public CreateFile(String namespace, String path, WritePolicy writePolicy,
-                          FileId fileId, long opIdMsb, long opIdLsb) {
-            this(StrataNamespace.of(namespace), StrataPath.of(path), writePolicy, fileId, opIdMsb, opIdLsb);
         }
 
         public byte[] encode() {
@@ -1043,12 +1012,17 @@ public final class Messages {
         }
     }
 
-    /** Shared empty success response (error header only). */
-    public static byte[] okHeader() {
+    private static final byte[] OK_HEADER;
+    static {
         BufWriter w = new BufWriter(8);
         Resp.writeOk(w);
         w.noTags();
-        return w.toBytes();
+        OK_HEADER = w.toBytes();
+    }
+
+    /** Shared empty success response (error header only). */
+    public static byte[] okHeader() {
+        return OK_HEADER.clone();
     }
 
     /** Consumes the error header and the empty tagged block of an ok-only response. */

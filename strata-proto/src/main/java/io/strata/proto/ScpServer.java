@@ -248,15 +248,7 @@ public final class ScpServer implements AutoCloseable {
                 closeFrames(frame, releaseAfterWrite);
                 throw e;
             }
-            write.addListener(f -> closeFrames(frame, releaseAfterWrite));
-            if (closeAfterWrite) {
-                write.addListener(f -> ctx.close());
-            }
-            write.addListener(f -> {
-                if (!f.isSuccess()) {
-                    ctx.close();
-                }
-            });
+            finishWrite(ctx, write, closeAfterWrite, frame, releaseAfterWrite);
         }
 
         private void writeFileResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
@@ -272,6 +264,11 @@ public final class ScpServer implements AutoCloseable {
                 closeFrames(frame, releaseAfterWrite);
                 throw new RuntimeException(e);
             }
+            finishWrite(ctx, write, closeAfterWrite, frame, releaseAfterWrite);
+        }
+
+        private void finishWrite(ChannelHandlerContext ctx, ChannelFuture write, boolean closeAfterWrite,
+                                 Frame frame, Frame releaseAfterWrite) {
             write.addListener(f -> closeFrames(frame, releaseAfterWrite));
             if (closeAfterWrite) {
                 write.addListener(f -> ctx.close());

@@ -1,11 +1,10 @@
 package io.strata.client;
 
+import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -34,31 +33,13 @@ class NodePoolTest {
     }
 
     @Test
-    void endpointParserHandlesBracketedIpv6AndNullGuard() throws Exception {
-        Object parsed = parseEndpoint("[::1]:1234");
-        Method host = parsed.getClass().getDeclaredMethod("host");
-        Method port = parsed.getClass().getDeclaredMethod("port");
-        host.setAccessible(true);
-        port.setAccessible(true);
-        assertEquals("::1", host.invoke(parsed));
-        assertEquals(1234, port.invoke(parsed));
+    void endpointParserHandlesBracketedIpv6AndNullGuard() {
+        Endpoint parsed = Endpoint.parse("[::1]:1234", "storage endpoint", ErrorCode.INTERNAL);
+        assertEquals("::1", parsed.host());
+        assertEquals(1234, parsed.port());
 
-        ScpException e = parseFailure(null);
+        ScpException e = assertThrows(ScpException.class,
+                () -> Endpoint.parse(null, "storage endpoint", ErrorCode.INTERNAL));
         assertEquals(ErrorCode.INTERNAL, e.code());
-    }
-
-    private static Object parseEndpoint(String endpoint) throws Exception {
-        Method method = NodePool.class.getDeclaredMethod("parseEndpoint", String.class);
-        method.setAccessible(true);
-        return method.invoke(null, endpoint);
-    }
-
-    private static ScpException parseFailure(String endpoint) throws Exception {
-        try {
-            parseEndpoint(endpoint);
-            throw new AssertionError("expected parser failure");
-        } catch (InvocationTargetException e) {
-            return (ScpException) e.getCause();
-        }
     }
 }

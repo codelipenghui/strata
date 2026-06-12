@@ -1,5 +1,6 @@
 package io.strata.node;
 
+import io.strata.common.Closeables;
 import io.strata.format.ChunkStore;
 import io.strata.proto.ScpServer;
 import org.slf4j.Logger;
@@ -52,55 +53,40 @@ public final class StorageNode implements AutoCloseable {
             this.server = openedServer;
             this.controlLoop = startedLoop; // null in standalone data-plane tests
         } catch (IOException | RuntimeException e) {
-            cleanupFailedStart(startedLoop, openedServer, openedStore, e);
+            Throwable closeFailure = closeAll(startedLoop, openedServer, openedStore);
+            if (closeFailure != null) {
+                e.addSuppressed(closeFailure);
+            }
             throw e;
         }
         log.info("storage node started: port={} incarnation={} nodeId={}", server.port(), incarnation, nodeId);
     }
 
-    private static void cleanupFailedStart(ControlLoop loop, ScpServer server, ChunkStore store, Throwable failure) {
+    /** Closes whatever subset of the node's resources exists; returns the accumulated failure. */
+    private static Throwable closeAll(ControlLoop loop, ScpServer server, ChunkStore store) {
+        Throwable failure = null;
         if (loop != null) {
             try {
                 loop.close();
             } catch (RuntimeException e) {
-                failure.addSuppressed(e);
+                failure = Closeables.suppress(failure, e);
             }
         }
         if (server != null) {
             try {
                 server.close();
             } catch (RuntimeException e) {
-                failure.addSuppressed(e);
+                failure = Closeables.suppress(failure, e);
             }
         }
         if (store != null) {
             try {
                 store.close();
             } catch (IOException | RuntimeException e) {
-                failure.addSuppressed(e);
+                failure = Closeables.suppress(failure, e);
             }
         }
-    }
-
-    private static Throwable suppress(Throwable failure, Throwable next) {
-        if (failure == null) {
-            return next;
-        }
-        failure.addSuppressed(next);
         return failure;
-    }
-
-    private static void throwCloseFailure(Throwable failure) throws IOException {
-        if (failure == null) {
-            return;
-        }
-        if (failure instanceof IOException e) {
-            throw e;
-        }
-        if (failure instanceof RuntimeException e) {
-            throw e;
-        }
-        throw new IOException(failure);
     }
 
     public int port() {
@@ -193,24 +179,6 @@ public final class StorageNode implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
-        Throwable failure = null;
-        if (controlLoop != null) {
-            try {
-                controlLoop.close();
-            } catch (RuntimeException e) {
-                failure = suppress(failure, e);
-            }
-        }
-        try {
-            server.close();
-        } catch (RuntimeException e) {
-            failure = suppress(failure, e);
-        }
-        try {
-            store.close();
-        } catch (IOException | RuntimeException e) {
-            failure = suppress(failure, e);
-        }
-        throwCloseFailure(failure);
+        Closeables.throwIfFailed(closeAll(controlLoop, server, store));
     }
 }

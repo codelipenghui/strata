@@ -1,5 +1,6 @@
 package io.strata.meta;
 
+import io.strata.common.FileState;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
@@ -30,7 +31,7 @@ class RepairCoordinatorTest {
         FileId liveFile = fileId(1);
         FileId missingFile = fileId(404);
         store.extraListedFiles.add(missingFile);
-        store.createFile(file(liveFile, Records.FileState.SEALED, List.of(sealed(0, 128, 1001, List.of(99)))));
+        store.createFile(file(liveFile, FileState.SEALED, List.of(sealed(0, 128, 1001, List.of(99)))));
 
         new RepairCoordinator(store, registry, config(), () -> true).scanOnce();
 
@@ -45,7 +46,7 @@ class RepairCoordinatorTest {
         NodeRegistry registry = new NodeRegistry(store, config());
         Registered source = register(registry, 10, "source");
         FileId fileId = fileId(2);
-        store.createFile(file(fileId, Records.FileState.SEALED,
+        store.createFile(file(fileId, FileState.SEALED,
                 List.of(sealed(0, 256, 2002, List.of(source.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
@@ -68,7 +69,7 @@ class RepairCoordinatorTest {
         Registered source = register(registry, 30, "source");
         Registered target = register(registry, 40, "target");
         FileId fileId = fileId(3);
-        store.createFile(file(fileId, Records.FileState.SEALED,
+        store.createFile(file(fileId, FileState.SEALED,
                 List.of(sealed(0, 512, 3003, List.of(source.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
@@ -89,7 +90,7 @@ class RepairCoordinatorTest {
         Registered source = register(registry, 31, "source");
         Registered target = register(registry, 41, "target");
         FileId fileId = fileId(31);
-        store.createFile(file(fileId, Records.FileState.SEALED,
+        store.createFile(file(fileId, FileState.SEALED,
                 List.of(sealed(0, 512, 3031, List.of(source.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
         Records.FileRecord file = store.files.get(fileId).value();
@@ -109,7 +110,7 @@ class RepairCoordinatorTest {
         NodeRegistry registry = new NodeRegistry(store, config());
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
         FileId noSourceFile = fileId(32);
-        Records.FileRecord noSource = file(noSourceFile, Records.FileState.SEALED,
+        Records.FileRecord noSource = file(noSourceFile, FileState.SEALED,
                 List.of(sealed(0, 512, 3032, List.of(99, 100, 101))));
 
         issueReplicate(coordinator, noSourceFile, noSource, noSource.chunks().get(0));
@@ -118,7 +119,7 @@ class RepairCoordinatorTest {
         Registered b = register(registry, 330, "full-b");
         Registered c = register(registry, 340, "full-c");
         FileId fullFile = fileId(33);
-        Records.FileRecord full = file(fullFile, Records.FileState.SEALED,
+        Records.FileRecord full = file(fullFile, FileState.SEALED,
                 List.of(sealed(0, 512, 3033, List.of(a.nodeId(), b.nodeId(), c.nodeId()))));
 
         issueReplicate(coordinator, fullFile, full, full.chunks().get(0));
@@ -136,7 +137,7 @@ class RepairCoordinatorTest {
         Registered target = register(registry, 60, "target");
         int deadNode = 999;
         FileId fileId = fileId(4);
-        store.createFile(file(fileId, Records.FileState.SEALED,
+        store.createFile(file(fileId, FileState.SEALED,
                 List.of(sealed(0, 1024, 4004, List.of(source.nodeId(), deadNode)))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
@@ -157,7 +158,7 @@ class RepairCoordinatorTest {
         Registered source = register(registry, 70, "source");
         Registered target = register(registry, 80, "target");
         FileId fileId = fileId(5);
-        store.createFile(file(fileId, Records.FileState.SEALED,
+        store.createFile(file(fileId, FileState.SEALED,
                 List.of(sealed(0, 2048, 5005, List.of(source.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
@@ -190,13 +191,13 @@ class RepairCoordinatorTest {
                 -1, target.nodeId()));
 
         FileId fileId = fileId(52);
-        store.createFile(file(fileId, Records.FileState.SEALED,
+        store.createFile(file(fileId, FileState.SEALED,
                 List.of(sealed(1, 128, 5052, List.of(source.nodeId())))));
         applyReplicaSwap(coordinator, replicateAction(fileId, new ChunkId(fileId, 0), -1, target.nodeId()));
         assertEquals(List.of(source.nodeId()), store.files.get(fileId).value().chunks().get(0).replicas());
 
         FileId targetPresent = fileId(53);
-        store.createFile(file(targetPresent, Records.FileState.SEALED,
+        store.createFile(file(targetPresent, FileState.SEALED,
                 List.of(sealed(0, 128, 5053, List.of(source.nodeId(), target.nodeId())))));
         applyReplicaSwap(coordinator, replicateAction(targetPresent, new ChunkId(targetPresent, 0),
                 999, target.nodeId()));
@@ -204,7 +205,7 @@ class RepairCoordinatorTest {
                 store.files.get(targetPresent).value().chunks().get(0).replicas());
 
         FileId missingDead = fileId(54);
-        store.createFile(file(missingDead, Records.FileState.SEALED,
+        store.createFile(file(missingDead, FileState.SEALED,
                 List.of(sealed(0, 128, 5054, List.of(source.nodeId())))));
         applyReplicaSwap(coordinator, replicateAction(missingDead, new ChunkId(missingDead, 0),
                 999, target.nodeId()));
@@ -218,7 +219,7 @@ class RepairCoordinatorTest {
         Registered source = register(registry, 100, "source");
         Registered target = register(registry, 110, "target");
         FileId fileId = fileId(6);
-        store.createFile(file(fileId, Records.FileState.SEALED,
+        store.createFile(file(fileId, FileState.SEALED,
                 List.of(sealed(0, 4096, 6006, List.of(source.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
@@ -241,7 +242,7 @@ class RepairCoordinatorTest {
         Registered source = register(registry, 111, "source");
         Registered target = register(registry, 112, "target");
         FileId fileId = fileId(61);
-        store.createFile(file(fileId, Records.FileState.SEALED,
+        store.createFile(file(fileId, FileState.SEALED,
                 List.of(sealed(0, 4096, 6061, List.of(source.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
@@ -268,7 +269,7 @@ class RepairCoordinatorTest {
         Registered source = register(registry, 120, "source");
         Registered target = register(registry, 130, "target");
         FileId fileId = fileId(7);
-        store.createFile(file(fileId, Records.FileState.SEALED,
+        store.createFile(file(fileId, FileState.SEALED,
                 List.of(sealed(0, 8192, 7007, List.of(source.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config, () -> true);
 
@@ -287,7 +288,7 @@ class RepairCoordinatorTest {
         NodeRegistry registry = new NodeRegistry(store, config());
         Registered node = register(registry, 140, "node");
         FileId fileId = fileId(8);
-        store.createFile(file(fileId, Records.FileState.DELETING,
+        store.createFile(file(fileId, FileState.DELETING,
                 List.of(sealed(0, 64, 8008, List.of(node.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
@@ -310,7 +311,7 @@ class RepairCoordinatorTest {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
         FileId fileId = fileId(81);
-        store.createFile(file(fileId, Records.FileState.DELETING, List.of()));
+        store.createFile(file(fileId, FileState.DELETING, List.of()));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
         coordinator.scanOnce();
@@ -328,7 +329,7 @@ class RepairCoordinatorTest {
         applyDeleteConfirmed(coordinator, fileId(811), new ChunkId(fileId(811), 0), node.nodeId());
 
         FileId liveFile = fileId(812);
-        store.createFile(file(liveFile, Records.FileState.SEALED,
+        store.createFile(file(liveFile, FileState.SEALED,
                 List.of(sealed(0, 64, 8012, List.of(node.nodeId())))));
         applyDeleteConfirmed(coordinator, liveFile, new ChunkId(liveFile, 0), node.nodeId());
 
@@ -342,7 +343,7 @@ class RepairCoordinatorTest {
         NodeRegistry registry = new NodeRegistry(store, config());
         Registered node = register(registry, 141, "node");
         FileId fileId = fileId(82);
-        store.createFile(file(fileId, Records.FileState.DELETING,
+        store.createFile(file(fileId, FileState.DELETING,
                 List.of(sealed(0, 64, 8082, List.of(node.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
@@ -361,7 +362,7 @@ class RepairCoordinatorTest {
         Registered source = register(registry, 142, "source");
         Registered target = register(registry, 143, "target");
         FileId fileId = fileId(83);
-        store.createFile(file(fileId, Records.FileState.SEALED,
+        store.createFile(file(fileId, FileState.SEALED,
                 List.of(sealed(0, 128, 8083, List.of(source.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
@@ -387,7 +388,7 @@ class RepairCoordinatorTest {
         Registered source = register(registry, 144, "source");
         Registered target = register(registry, 145, "target");
         FileId fileId = fileId(84);
-        store.createFile(file(fileId, Records.FileState.SEALED,
+        store.createFile(file(fileId, FileState.SEALED,
                 List.of(sealed(0, 128, 8084, List.of(source.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
@@ -411,7 +412,7 @@ class RepairCoordinatorTest {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
         FileId fileId = fileId(9);
-        store.createFile(file(fileId, Records.FileState.DELETING,
+        store.createFile(file(fileId, FileState.DELETING,
                 List.of(sealed(0, 32, 9009, List.of()))));
         store.failDeleteFileAttempts = 1;
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
@@ -432,7 +433,7 @@ class RepairCoordinatorTest {
         ChunkId open = new ChunkId(fileId, 2);
         ChunkId deleting = new ChunkId(fileId, 3);
         ChunkId orphan = new ChunkId(fileId(11), 0);
-        store.createFile(file(fileId, Records.FileState.SEALED, List.of(
+        store.createFile(file(fileId, FileState.SEALED, List.of(
                 sealed(0, 100, 100, List.of(node.nodeId())),
                 sealed(1, 200, 200, List.of(node.nodeId())),
                 sealed(2, 300, 300, List.of(node.nodeId())),
@@ -487,11 +488,11 @@ class RepairCoordinatorTest {
         ChunkId healthy = new ChunkId(healthyFile, 0);
         FileId deletingFile = fileId(87);
         FileId openFile = fileId(88);
-        store.createFile(file(healthyFile, Records.FileState.SEALED,
+        store.createFile(file(healthyFile, FileState.SEALED,
                 List.of(sealed(0, 10, 100, List.of(node.nodeId())))));
-        store.createFile(file(deletingFile, Records.FileState.DELETING,
+        store.createFile(file(deletingFile, FileState.DELETING,
                 List.of(sealed(0, 20, 200, List.of(node.nodeId())))));
-        store.createFile(new Records.FileRecord(openFile, "test", "/open-file", 3, 2, true, Records.FileState.OPEN, 1234,
+        store.createFile(new Records.FileRecord(openFile, "test", "/open-file", 3, 2, true, FileState.OPEN, 1234,
                 List.of(new Records.ChunkRecord(0, ChunkState.OPEN, 0, 0, 1, List.of(node.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
@@ -528,7 +529,7 @@ class RepairCoordinatorTest {
         Registered source = register(registry, 149, "source");
         Registered target = register(registry, 159, "target");
         FileId fileId = fileId(813);
-        store.createFile(file(fileId, Records.FileState.SEALED,
+        store.createFile(file(fileId, FileState.SEALED,
                 List.of(sealed(0, 64, 8013, List.of(source.nodeId())))));
         store.throwOnListFiles = true;
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, fast, () -> true);
@@ -616,7 +617,7 @@ class RepairCoordinatorTest {
         method.invoke(coordinator, fileId, chunkId, nodeId);
     }
 
-    private static Records.FileRecord file(FileId fileId, Records.FileState state,
+    private static Records.FileRecord file(FileId fileId, FileState state,
                                            List<Records.ChunkRecord> chunks) {
         return new Records.FileRecord(fileId, "test", "/file-" + fileId, 3, 2, false, state, 1234, chunks);
     }

@@ -130,7 +130,7 @@ final class NodeRegistry {
             throw new ScpException(ErrorCode.PRECONDITION_FAILED, "node registration requires an endpoint");
         }
         for (String endpoint : msg.endpoints()) {
-            validateEndpoint(endpoint);
+            Endpoint.parse(endpoint, "node endpoint", ErrorCode.PRECONDITION_FAILED);
         }
         if (msg.zone() == null || msg.zone().isBlank()
                 || msg.rack() == null || msg.rack().isBlank()
@@ -143,15 +143,6 @@ final class NodeRegistry {
         if (msg.capacities().get(0).capacityBytes() <= 0) {
             throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                     "node capacity must be positive: " + msg.capacities().get(0).capacityBytes());
-        }
-    }
-
-    private static void validateEndpoint(String endpoint) {
-        try {
-            Endpoint.parse(endpoint, "node endpoint");
-        } catch (IllegalArgumentException e) {
-            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
-                    "invalid node endpoint: " + endpoint);
         }
     }
 

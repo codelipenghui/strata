@@ -21,9 +21,16 @@ final class NodePool implements AutoCloseable {
         if (endpoint == null) {
             throw new ScpException(ErrorCode.INTERNAL, "invalid storage endpoint: null");
         }
+        // lock-free fast path: every append/read resolves a connection, and compute() takes the
+        // bin lock even when the cached connection is healthy (worse, a connect() for one dead
+        // endpoint would block lookups of unrelated endpoints hashed to the same bin)
+        ScpClient cached = conns.get(endpoint);
+        if (cached != null && !cached.isClosed()) {
+            return cached;
+        }
         ScpClient c = conns.compute(endpoint, (ep, existing) -> {
             if (existing != null && !existing.isClosed()) return existing;
-            Endpoint hp = parseEndpoint(ep);
+            Endpoint hp = Endpoint.parse(ep, "storage endpoint", ErrorCode.INTERNAL);
             try {
                 return new ScpClient(hp.host(), hp.port(), ScpClient.KIND_BROKER, "strata-client");
             } catch (IOException e) {
@@ -32,14 +39,6 @@ final class NodePool implements AutoCloseable {
         });
         if (c == null) throw new ScpException(ErrorCode.INTERNAL, "storage node unreachable: " + endpoint);
         return c;
-    }
-
-    private static Endpoint parseEndpoint(String endpoint) {
-        try {
-            return Endpoint.parse(endpoint, "storage endpoint");
-        } catch (IllegalArgumentException e) {
-            throw new ScpException(ErrorCode.INTERNAL, "invalid storage endpoint: " + endpoint);
-        }
     }
 
     @Override

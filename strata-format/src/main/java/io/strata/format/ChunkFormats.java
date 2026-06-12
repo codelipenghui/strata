@@ -5,7 +5,9 @@ import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.FileId;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 
 /**
  * On-disk format constants and codecs (tech design §11, v0 format version 1).
@@ -180,6 +182,27 @@ public final class ChunkFormats {
             int entryCrc = b.getInt();
             if (entryCrc != Crc.of(bytes, off, LEDGER_ENTRY_SIZE - 4)) return null;
             return new LedgerEntry(end, crc, epoch);
+        }
+    }
+
+    /* ---------------- positional file I/O shared by the format engine ---------------- */
+
+    static void readFully(FileChannel ch, ByteBuffer buf, long position) throws IOException {
+        long pos = position;
+        while (buf.hasRemaining()) {
+            int n = ch.read(buf, pos);
+            if (n < 0) throw new IOException("EOF at " + pos);
+            if (n == 0) throw new IOException("zero-byte read at " + pos);
+            pos += n;
+        }
+    }
+
+    static void writeFully(FileChannel ch, ByteBuffer buf, long position) throws IOException {
+        long pos = position;
+        while (buf.hasRemaining()) {
+            int n = ch.write(buf, pos);
+            if (n <= 0) throw new IOException("write failed at " + pos);
+            pos += n;
         }
     }
 

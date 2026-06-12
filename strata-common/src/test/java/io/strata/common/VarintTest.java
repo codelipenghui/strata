@@ -18,7 +18,6 @@ class VarintTest {
         for (long v : values) {
             buf.clear();
             Varint.writeUnsigned(buf, v);
-            assertEquals(Varint.sizeOfUnsigned(v), buf.position(), "size mismatch for " + v);
             buf.flip();
             assertEquals(v, Varint.readUnsigned(buf), "roundtrip for " + v);
         }
@@ -90,7 +89,6 @@ class VarintTest {
         ByteBuffer buf = ByteBuffer.allocate(256);
         String value = "strata-存储";
         Varint.writeString(buf, value);
-        assertEquals(buf.position(), Varint.sizeOfString(value));
         Varint.writeBytes(buf, new byte[]{1, 2, 3});
         buf.flip();
         assertEquals(value, Varint.readString(buf));

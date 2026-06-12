@@ -20,10 +20,6 @@ public record StrataPath(String value) implements Comparable<StrataPath> {
         return new StrataPath(value);
     }
 
-    public List<String> segments() {
-        return List.of(value.substring(1).split("/"));
-    }
-
     @Override
     public int compareTo(StrataPath other) {
         return value.compareTo(other.value);

@@ -14,16 +14,52 @@ public final class FrameIO {
 
     private FrameIO() {}
 
+    /* ---------------- geometry validation shared with NettyFrameCodec ---------------- */
+
+    /** Validates encode-side sizes and returns the total frame length. */
+    static int checkedFrameLength(int headerLen, int payloadLen) throws IOException {
+        if (headerLen > 0xFFFF) throw new IOException("header too large: " + headerLen);
+        if (payloadLen < 0) throw new IOException("negative payload length: " + payloadLen);
+        long frameLen = (long) Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen;
+        if (frameLen > MAX_FRAME_BYTES) throw new IOException("frame too large: " + frameLen);
+        return (int) frameLen;
+    }
+
+    static void checkFrameLength(int frameLen) throws IOException {
+        if (frameLen < Frame.PREAMBLE_AFTER_LEN || frameLen > MAX_FRAME_BYTES) {
+            throw new IOException("bad frame length " + frameLen);
+        }
+    }
+
+    static void checkMagicAndVersion(byte magic, byte version) throws IOException {
+        if (magic != Frame.MAGIC) throw new IOException("bad magic 0x" + Integer.toHexString(magic & 0xFF));
+        if (version != Frame.FRAME_VERSION) throw new IOException("unsupported frame version " + version);
+    }
+
+    static void checkBodyGeometry(int frameLen, int headerLen, int payloadLen) throws IOException {
+        if (payloadLen < 0) {
+            // a negative payload length can satisfy the equality check below (26+1+(-1)=26) and
+            // would blow up later as an unchecked IndexOutOfBounds — reject it as protocol error
+            throw new IOException("negative payload length " + payloadLen);
+        }
+        if (Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen != frameLen) {
+            throw new IOException("frame length mismatch: " + frameLen
+                    + " vs header=" + headerLen + " payload=" + payloadLen);
+        }
+    }
+
+    static void checkPayloadCrc(int expected, int actual) throws IOException {
+        if (actual != expected) {
+            throw new IOException("payload crc mismatch: expected " + expected + " got " + actual);
+        }
+    }
+
     public static void write(DataOutputStream out, Frame f) throws IOException {
         ByteBuffer header = f.headerSlice();
         ByteBuffer payload = f.payloadSlice();
         int headerLen = header.remaining();
         int payloadLen = payload.remaining();
-        if (headerLen > 0xFFFF) throw new IOException("header too large: " + headerLen);
-        long computedFrameLen = (long) Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen;
-        if (computedFrameLen > Integer.MAX_VALUE) throw new IOException("frame too large: " + computedFrameLen);
-        int frameLen = (int) computedFrameLen;
-        if (frameLen > MAX_FRAME_BYTES) throw new IOException("frame too large: " + frameLen);
+        int frameLen = checkedFrameLength(headerLen, payloadLen);
 
         short flags = f.flags();
         int payloadCrc = 0;
@@ -64,16 +100,11 @@ public final class FrameIO {
         } catch (EOFException e) {
             return null;
         }
-        if (frameLen < Frame.PREAMBLE_AFTER_LEN || frameLen > MAX_FRAME_BYTES) {
-            throw new IOException("bad frame length " + frameLen);
-        }
+        checkFrameLength(frameLen);
         byte[] body = new byte[frameLen];
         in.readFully(body);
         ByteBuffer buf = ByteBuffer.wrap(body);
-        byte magic = buf.get();
-        byte version = buf.get();
-        if (magic != Frame.MAGIC) throw new IOException("bad magic 0x" + Integer.toHexString(magic & 0xFF));
-        if (version != Frame.FRAME_VERSION) throw new IOException("unsupported frame version " + version);
+        checkMagicAndVersion(buf.get(), buf.get());
         short opcode = buf.getShort();
         short apiVersion = buf.getShort();
         short flags = buf.getShort();
@@ -81,21 +112,11 @@ public final class FrameIO {
         int payloadLen = buf.getInt();
         int payloadCrc = buf.getInt();
         int headerLen = buf.getShort() & 0xFFFF;
-        if (payloadLen < 0) {
-            // a negative payload length can satisfy the equality check below (26+1+(-1)=26) and
-            // would blow up later as an unchecked IndexOutOfBounds — reject it as protocol error
-            throw new IOException("negative payload length " + payloadLen);
-        }
-        if (Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen != frameLen) {
-            throw new IOException("frame length mismatch: " + frameLen + " vs header=" + headerLen + " payload=" + payloadLen);
-        }
+        checkBodyGeometry(frameLen, headerLen, payloadLen);
         ByteBuffer header = ByteBuffer.wrap(body, Frame.PREAMBLE_AFTER_LEN, headerLen).slice();
         ByteBuffer payload = ByteBuffer.wrap(body, Frame.PREAMBLE_AFTER_LEN + headerLen, payloadLen).slice();
         if ((flags & Frame.FLAG_PAYLOAD_CRC) != 0 && payloadLen > 0) {
-            int actual = Crc.of(payload.duplicate());
-            if (actual != payloadCrc) {
-                throw new IOException("payload crc mismatch: expected " + payloadCrc + " got " + actual);
-            }
+            checkPayloadCrc(payloadCrc, Crc.of(payload.duplicate()));
         }
         return new Frame(opcode, apiVersion, flags, correlationId, header, payload);
     }

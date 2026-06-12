@@ -16,7 +16,6 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -1162,34 +1161,6 @@ class AppenderImplTest {
     }
 
     @Test
-    void bestSealQuorumPrefersLargestAgreeingGroup() throws Exception {
-        Object smallerKey = sealKey(1, 11);
-        Object largerKey = sealKey(1, 22);
-        Map<Object, List<Integer>> votes = new LinkedHashMap<>();
-        votes.put(smallerKey, List.of(1, 2));
-        votes.put(largerKey, List.of(1, 2, 3));
-
-        Map.Entry<?, ?> best = bestSealQuorum(votes);
-
-        assertEquals(largerKey, best.getKey());
-        assertEquals(List.of(1, 2, 3), best.getValue());
-    }
-
-    @Test
-    void bestSealQuorumKeepsFirstQuorumWhenVotesTie() throws Exception {
-        Object firstKey = sealKey(1, 11);
-        Object secondKey = sealKey(1, 22);
-        Map<Object, List<Integer>> votes = new LinkedHashMap<>();
-        votes.put(firstKey, List.of(1, 2));
-        votes.put(secondKey, List.of(2, 3));
-
-        Map.Entry<?, ?> best = bestSealQuorum(votes);
-
-        assertEquals(firstKey, best.getKey());
-        assertEquals(List.of(1, 2), best.getValue());
-    }
-
-    @Test
     void sealRejectsQuorumThatReportsWrongFinalLength() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
@@ -1577,20 +1548,6 @@ class AppenderImplTest {
         Method method = AppenderImpl.class.getDeclaredMethod("validReplicaSet", List.class);
         method.setAccessible(true);
         return (Boolean) method.invoke(appender(), replicas);
-    }
-
-    private static Object sealKey(long finalLength, int crc) throws Exception {
-        Class<?> type = Class.forName("io.strata.client.AppenderImpl$SealKey");
-        Constructor<?> ctor = type.getDeclaredConstructor(long.class, int.class);
-        ctor.setAccessible(true);
-        return ctor.newInstance(finalLength, crc);
-    }
-
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    private static Map.Entry<?, ?> bestSealQuorum(Map<Object, List<Integer>> votes) throws Exception {
-        Method method = AppenderImpl.class.getDeclaredMethod("bestSealQuorum", Map.class);
-        method.setAccessible(true);
-        return (Map.Entry<?, ?>) method.invoke(appender(), new LinkedHashMap(votes));
     }
 
     private static ScpServer failingOpenServer(int nodeId) throws Exception {

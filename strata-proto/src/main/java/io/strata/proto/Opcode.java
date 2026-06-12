@@ -35,10 +35,16 @@ public enum Opcode {
         this.code = (short) code;
     }
 
+    private static final Opcode[] BY_CODE;
+    static {
+        int max = 0;
+        for (Opcode o : values()) max = Math.max(max, o.code);
+        BY_CODE = new Opcode[max + 1];
+        for (Opcode o : values()) BY_CODE[o.code] = o;
+    }
+
     public static Opcode fromCode(short code) {
-        for (Opcode o : values()) {
-            if (o.code == code) return o;
-        }
-        return null;
+        if (code < 0 || code >= BY_CODE.length) return null;
+        return BY_CODE[code];
     }
 }

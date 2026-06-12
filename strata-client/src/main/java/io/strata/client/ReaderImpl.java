@@ -2,6 +2,7 @@ package io.strata.client;
 
 import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
+import io.strata.common.FileState;
 import io.strata.common.ScpException;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
@@ -12,6 +13,8 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+
+import static io.strata.common.Checks.addChunkLength;
 
 /**
  * Reader (tech design §6): sealed chunks from any replica; open-chunk reads are clamped to the
@@ -52,20 +55,12 @@ final class ReaderImpl implements StrataFile.Reader {
             Messages.ChunkInfo chunk = f.chunks().get(i);
             boolean last = i == f.chunks().size() - 1;
             if (chunk.state() == ChunkState.SEALED) {
-                if (chunk.length() < 0) {
-                    throw new ScpException(ErrorCode.CORRUPT_CHUNK, "negative chunk length " + chunk.length());
-                }
-                long chunkEnd;
-                try {
-                    chunkEnd = Math.addExact(base, chunk.length());
-                } catch (ArithmeticException e) {
-                    throw new ScpException(ErrorCode.CORRUPT_CHUNK, "file length overflow");
-                }
+                long chunkEnd = addChunkLength(base, chunk.length());
                 if (fileOffset < chunkEnd) {
                     long chunkOffset = fileOffset - base;
                     int want = (int) Math.min(maxBytes, chunk.length() - chunkOffset);
                     byte[] data = readFromReplicas(chunk, chunkOffset, want, false);
-                    boolean eof = f.fileState() == 1 /* SEALED */ && last
+                    boolean eof = f.fileState() == FileState.SEALED.value && last
                             && fileOffset + data.length == chunkEnd;
                     return new StrataFile.ReadResult(data, eof);
                 }
@@ -77,7 +72,7 @@ final class ReaderImpl implements StrataFile.Reader {
                 return new StrataFile.ReadResult(data, false);
             }
         }
-        boolean eof = f.fileState() == 1;
+        boolean eof = f.fileState() == FileState.SEALED.value;
         return new StrataFile.ReadResult(new byte[0], eof);
     }
 

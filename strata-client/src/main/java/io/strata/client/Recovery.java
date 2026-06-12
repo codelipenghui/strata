@@ -4,6 +4,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
+import io.strata.common.FileState;
 import io.strata.common.ScpException;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
@@ -15,10 +16,11 @@ import org.slf4j.LoggerFactory;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Iterator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+
+import static io.strata.common.Checks.addChunkLength;
 
 /**
  * Seal recovery (tech design §7.3): fence reachable replicas at the new epoch, start from the
@@ -34,9 +36,6 @@ import java.util.TreeMap;
 final class Recovery {
     private static final Logger log = LoggerFactory.getLogger(Recovery.class);
     private static final int COPY_CHUNK_BYTES = 4 * 1024 * 1024;
-    private static final byte FILE_OPEN = 0;
-    private static final byte FILE_SEALED = 1;
-    private static final byte FILE_DELETING = 2;
 
     private final MetaClient meta;
     private final NodePool pool;
@@ -82,36 +81,25 @@ final class Recovery {
     private StrataFile.SealInfo recoverAndSeal(io.strata.common.FileId fileId,
                                                Messages.LookupFileResp file,
                                                int writerEpoch) {
-        if (file.fileState() == FILE_DELETING) {
+        if (file.fileState() == FileState.DELETING.value) {
             throw new ScpException(ErrorCode.PRECONDITION_FAILED, "file is DELETING");
         }
-        if (file.fileState() != FILE_OPEN && file.fileState() != FILE_SEALED) {
+        if (file.fileState() != FileState.OPEN.value && file.fileState() != FileState.SEALED.value) {
             throw new ScpException(ErrorCode.INTERNAL, "unknown file state " + file.fileState());
         }
         long total = 0;
         for (Messages.ChunkInfo chunk : file.chunks()) {
             if (chunk.state() == ChunkState.SEALED) {
-                total = addFileLength(total, chunk.length());
+                total = addChunkLength(total, chunk.length());
             } else {
                 if (writerEpoch <= 0) {
                     throw new ScpException(ErrorCode.INTERNAL, "missing writer epoch for open chunk recovery");
                 }
-                total = addFileLength(total, recoverChunk(chunk, writerEpoch));
+                total = addChunkLength(total, recoverChunk(chunk, writerEpoch));
             }
         }
         meta.sealFile(fileId, total);
         return new StrataFile.SealInfo(total);
-    }
-
-    private static long addFileLength(long total, long delta) {
-        if (delta < 0) {
-            throw new ScpException(ErrorCode.CORRUPT_CHUNK, "negative chunk length " + delta);
-        }
-        try {
-            return Math.addExact(total, delta);
-        } catch (ArithmeticException e) {
-            throw new ScpException(ErrorCode.CORRUPT_CHUNK, "file length overflow");
-        }
     }
 
     private long recoverChunk(Messages.ChunkInfo chunk, int writerEpoch) {
@@ -232,8 +220,6 @@ final class Recovery {
 
     private record LedgerCandidate(long previousEnd, Messages.LedgerEntry entry) {}
 
-    private record SealKey(long finalLength, int crc) {}
-
     private Candidate bestContinuation(ChunkId chunkId, List<ReplicaState> reachable,
                                        TreeMap<Long, List<LedgerCandidate>> boundaries, long p) {
         Candidate best = null;
@@ -278,7 +264,7 @@ final class Recovery {
                     if (data == null) {
                         throw new ScpException(ErrorCode.INTERNAL, "no donor for catch-up");
                     }
-                    long expectedEnd = addFileLength(rs.end, data.length);
+                    long expectedEnd = addChunkLength(rs.end, data.length);
                     appendAndVerify(chunkId, writerEpoch, rs, rs.end, ByteBuffer.wrap(data), expectedEnd);
                 }
                 log.info("recovery caught up {} on {} to {}", chunkId, rs.replica.endpoint(), target);
@@ -368,7 +354,7 @@ final class Recovery {
         // replicas that sealed the same length with different bytes would violate invariant
         // §14.6 (the appender's seal path performs the same check)
         ScpException last = null;
-        Map<SealKey, List<Integer>> votes = new LinkedHashMap<>();
+        SealVotes votes = new SealVotes();
         for (ReplicaState rs : replicas) {
             Messages.SealResp resp;
             try {
@@ -396,35 +382,23 @@ final class Recovery {
                         chunkId, rs.replica.endpoint(), last.getMessage());
                 continue;
             }
-            SealKey key = new SealKey(resp.finalLength(), resp.chunkCrc());
-            votes.computeIfAbsent(key, ignored -> new ArrayList<>()).add(rs.replica.nodeId());
+            votes.add(resp.finalLength(), resp.chunkCrc(), rs.replica.nodeId());
         }
-        int ok = votes.values().stream().mapToInt(List::size).sum();
+        int ok = votes.total();
         if (ok < 2) {
             throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "recovery seal quorum lost");
         }
-        Map.Entry<SealKey, List<Integer>> quorum = bestSealQuorum(votes);
+        Map.Entry<SealVotes.Key, List<Integer>> quorum = votes.best(2);
         if (quorum == null) {
             throw new ScpException(ErrorCode.INTERNAL,
                     "replica seal divergence on " + chunkId + " during recovery");
         }
-        if (votes.size() > 1) {
+        if (votes.divergent()) {
             log.warn("recovery seal divergence on {} — committing agreeing quorum {} of {} successful seals",
                     chunkId, quorum.getValue().size(), ok);
         }
         meta.sealChunkMeta(chunkId, epoch, quorum.getKey().finalLength(), quorum.getKey().crc(),
                 List.copyOf(quorum.getValue()));
         return quorum.getKey().finalLength();
-    }
-
-    private static Map.Entry<SealKey, List<Integer>> bestSealQuorum(Map<SealKey, List<Integer>> votes) {
-        Map.Entry<SealKey, List<Integer>> best = null;
-        for (Map.Entry<SealKey, List<Integer>> entry : votes.entrySet()) {
-            if (entry.getValue().size() < 2) continue;
-            if (best == null || entry.getValue().size() > best.getValue().size()) {
-                best = entry;
-            }
-        }
-        return best;
     }
 }

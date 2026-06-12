@@ -1,5 +1,6 @@
 package io.strata.client;
 
+import io.strata.common.Endpoint;
 import io.strata.common.FileId;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
@@ -27,14 +28,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class MetaClientTest {
 
     @Test
-    void endpointParserCoversValidAndInvalidBoundaries() throws Exception {
-        Object host = parseEndpoint("meta.local:2181");
-        assertEquals("meta.local", endpointHost(host));
-        assertEquals(2181, endpointPort(host));
+    void endpointParserCoversValidAndInvalidBoundaries() {
+        Endpoint host = parseEndpoint("meta.local:2181");
+        assertEquals("meta.local", host.host());
+        assertEquals(2181, host.port());
 
-        Object ipv6 = parseEndpoint("[::1]:2181");
-        assertEquals("::1", endpointHost(ipv6));
-        assertEquals(2181, endpointPort(ipv6));
+        Endpoint ipv6 = parseEndpoint("[::1]:2181");
+        assertEquals("::1", ipv6.host());
+        assertEquals(2181, ipv6.port());
 
         assertEquals(ErrorCode.INTERNAL, parseFailure(null).code());
         assertEquals(ErrorCode.INTERNAL, parseFailure("host").code());
@@ -152,31 +153,12 @@ class MetaClientTest {
         }
     }
 
-    private static ScpException parseFailure(String endpoint) throws Exception {
-        try {
-            parseEndpoint(endpoint);
-            throw new AssertionError("expected parser failure");
-        } catch (InvocationTargetException e) {
-            return (ScpException) e.getCause();
-        }
+    private static ScpException parseFailure(String endpoint) {
+        return assertThrows(ScpException.class, () -> parseEndpoint(endpoint));
     }
 
-    private static Object parseEndpoint(String endpoint) throws Exception {
-        Method method = MetaClient.class.getDeclaredMethod("parseEndpoint", String.class);
-        method.setAccessible(true);
-        return method.invoke(null, endpoint);
-    }
-
-    private static String endpointHost(Object endpoint) throws Exception {
-        Method host = endpoint.getClass().getDeclaredMethod("host");
-        host.setAccessible(true);
-        return (String) host.invoke(endpoint);
-    }
-
-    private static int endpointPort(Object endpoint) throws Exception {
-        Method port = endpoint.getClass().getDeclaredMethod("port");
-        port.setAccessible(true);
-        return (int) port.invoke(endpoint);
+    private static Endpoint parseEndpoint(String endpoint) {
+        return Endpoint.parse(endpoint, "metadata endpoint", ErrorCode.INTERNAL);
     }
 
     private static Throwable decodeFailure(MetaClient meta, Opcode op,

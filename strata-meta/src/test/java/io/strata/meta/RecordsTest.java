@@ -1,5 +1,6 @@
 package io.strata.meta;
 
+import io.strata.common.FileState;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
 import io.strata.proto.BufWriter;
@@ -17,10 +18,10 @@ class RecordsTest {
 
     @Test
     void fileAndNodeStatesDecodeAndRejectUnknownValues() {
-        assertEquals(Records.FileState.OPEN, Records.FileState.from((byte) 0));
-        assertEquals(Records.FileState.SEALED, Records.FileState.from((byte) 1));
-        assertEquals(Records.FileState.DELETING, Records.FileState.from((byte) 2));
-        assertThrows(IllegalArgumentException.class, () -> Records.FileState.from((byte) 99));
+        assertEquals(FileState.OPEN, FileState.fromValue((byte) 0));
+        assertEquals(FileState.SEALED, FileState.fromValue((byte) 1));
+        assertEquals(FileState.DELETING, FileState.fromValue((byte) 2));
+        assertThrows(IllegalArgumentException.class, () -> FileState.fromValue((byte) 99));
 
         assertEquals(Records.NodeState.REGISTERED, Records.NodeState.from((byte) 0));
         assertEquals(Records.NodeState.DRAINING, Records.NodeState.from((byte) 1));
@@ -55,7 +56,7 @@ class RecordsTest {
         Records.ChunkRecord chunk = new Records.ChunkRecord(3, ChunkState.SEALED, 4096, 0xAA, 5,
                 List.of(7, 8), 33, 44);
         Records.FileRecord record = new Records.FileRecord(fileId, "test", "/test-file",
-                3, 2, true, Records.FileState.OPEN, 1234, List.of(chunk), 11, 22);
+                3, 2, true, FileState.OPEN, 1234, List.of(chunk), 11, 22);
 
         assertEquals(new io.strata.common.ChunkId(fileId, 3), record.chunkId(3));
         assertEquals(io.strata.common.StrataNamespace.of("test"), record.namespace());
@@ -65,25 +66,25 @@ class RecordsTest {
         assertEquals(5, record.writerEpoch());
         assertTrue(record.createdBy(11, 22));
         assertFalse(record.createdBy(11, 23));
-        assertEquals(Records.FileState.SEALED, record.withState(Records.FileState.SEALED).state());
+        assertEquals(FileState.SEALED, record.withState(FileState.SEALED).state());
         assertEquals(0, record.withChunks(List.of()).chunks().size());
         assertEquals(5, record.withChunks(List.of()).writerEpoch());
         assertEquals(6, record.withWriterEpoch(6).writerEpoch());
         Records.FileRecord typed = new Records.FileRecord(fileId, io.strata.common.StrataNamespace.of("typed"),
                 io.strata.common.StrataPath.of("/typed-file"), 3, 2, false,
-                Records.FileState.OPEN, 1234, List.of());
+                FileState.OPEN, 1234, List.of());
         assertTrue(typed.createdBy(0, 0));
         assertEquals(io.strata.common.StrataPath.of("/typed-file"), typed.path());
         assertEquals(record, Records.FileRecord.decode(record.encode()));
         assertThrows(IllegalArgumentException.class,
                 () -> new Records.FileRecord(fileId, io.strata.common.StrataNamespace.of("test"),
                         io.strata.common.StrataPath.of("/bad-negative-writer-epoch"),
-                        3, 2, false, -1, Records.FileState.OPEN, 1234,
+                        3, 2, false, -1, FileState.OPEN, 1234,
                         List.of(), 0, 0));
         assertThrows(IllegalArgumentException.class,
                 () -> new Records.FileRecord(fileId, io.strata.common.StrataNamespace.of("test"),
                         io.strata.common.StrataPath.of("/bad-stale-writer-epoch"),
-                        3, 2, false, 4, Records.FileState.OPEN, 1234,
+                        3, 2, false, 4, FileState.OPEN, 1234,
                         List.of(chunk), 0, 0));
 
         byte[] invalid = record.encode();
@@ -102,7 +103,7 @@ class RecordsTest {
 
         List<Records.ChunkRecord> chunks = new ArrayList<>(List.of(chunk));
         Records.FileRecord file = new Records.FileRecord(new FileId(1, 2), "test", "/copy-test",
-                3, 2, false, Records.FileState.OPEN, 1, chunks);
+                3, 2, false, FileState.OPEN, 1, chunks);
         chunks.clear();
         assertEquals(List.of(chunk), file.chunks());
         assertThrows(UnsupportedOperationException.class, () -> file.chunks().clear());
@@ -136,12 +137,6 @@ class RecordsTest {
         assertEquals("h:9000", node.endpoint());
         assertEquals("", new Records.NodeRecord(8, 1, 2, List.of(), "z", "r", "host", 1000, Records.NodeState.REGISTERED).endpoint());
 
-        Records.NodeRecord reincarnated = node.withIncarnation(10, 20, List.of("new:1"),
-                "z2", "r2", "host2", 2000);
-        assertEquals(7, reincarnated.nodeId());
-        assertEquals(Records.NodeState.REGISTERED, reincarnated.state());
-        assertEquals("new:1", reincarnated.endpoint());
-
         assertEquals(Records.NodeState.DEAD, node.withState(Records.NodeState.DEAD).state());
         assertEquals(node, Records.NodeRecord.decode(node.encode()));
 
@@ -150,23 +145,11 @@ class RecordsTest {
         assertThrows(IllegalArgumentException.class, () -> Records.NodeRecord.decode(invalid));
     }
 
-    @Test
-    void productionConfigUsesExpectedDefaults() {
-        MetaConfig cfg = MetaConfig.production("zk:2181", 7000);
-        assertEquals("zk:2181", cfg.zkConnect());
-        assertEquals(7000, cfg.listenPort());
-        assertEquals(1_000, cfg.heartbeatIntervalMs());
-        assertEquals(10_000, cfg.leaseMs());
-        assertEquals(300_000, cfg.deadGraceMs());
-        assertEquals(30_000, cfg.repairScanIntervalMs());
-        assertEquals(600_000, cfg.repairCommandTimeoutMs());
-    }
-
     private static byte[] legacyFileRecordBytes(FileId fileId) {
         BufWriter w = new BufWriter();
         w.u8(1);
         w.fileId(fileId);
-        w.u8(1).u8(2).u8(3).string("legacy").u8(Records.FileState.DELETING.value).u64(99);
+        w.u8(1).u8(2).u8(3).string("legacy").u8(FileState.DELETING.value).u64(99);
         w.varint(1);
         w.u32(4).u8(ChunkState.OPEN.value).u64(10).u32(0xBEEF).i32(6);
         w.varint(2).u32(1).u32(2);
@@ -178,7 +161,7 @@ class RecordsTest {
         w.u8(7);
         w.fileId(new FileId(1, 2));
         w.string("test").string("/test-file");
-        w.u32(3).u32(2).u8(0).i32(0).u8(Records.FileState.OPEN.value).u64(1);
+        w.u32(3).u32(2).u8(0).i32(0).u8(FileState.OPEN.value).u64(1);
         w.u64(0).u64(0);
         w.varint(count);
         return w.toBytes();
@@ -189,7 +172,7 @@ class RecordsTest {
         w.u8(7);
         w.fileId(new FileId(1, 2));
         w.string("test").string("/test-file");
-        w.u32(3).u32(2).u8(0).i32(1).u8(Records.FileState.OPEN.value).u64(1);
+        w.u32(3).u32(2).u8(0).i32(1).u8(FileState.OPEN.value).u64(1);
         w.u64(0).u64(0);
         w.varint(1);
         w.u32(0).u8(ChunkState.OPEN.value).u64(0).u32(0).i32(1);
