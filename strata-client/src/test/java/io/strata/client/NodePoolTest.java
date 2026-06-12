@@ -16,6 +16,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class NodePoolTest {
@@ -49,6 +51,51 @@ class NodePoolTest {
         ScpException e = assertThrows(ScpException.class,
                 () -> Endpoint.parse(null, "storage endpoint", ErrorCode.INTERNAL));
         assertEquals(ErrorCode.INTERNAL, e.code());
+    }
+
+    @Test
+    void defaultPoolKeepsOneConnectionPerEndpoint() {
+        try (NodePool pool = new NodePool(new ClientConfig(List.of("127.0.0.1:1"), 1024, 500))) {
+            ManagedScpConnection first = pool.get("127.0.0.1:1234");
+            ManagedScpConnection second = pool.get("127.0.0.1:1234");
+
+            assertSame(first, second);
+        }
+    }
+
+    @Test
+    void configuredPoolRoundRobinsWithinEndpoint() {
+        ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500)
+                .withStorageConnectionsPerEndpoint(3);
+        try (NodePool pool = new NodePool(config)) {
+            ManagedScpConnection first = pool.get("127.0.0.1:1234");
+            ManagedScpConnection second = pool.get("127.0.0.1:1234");
+            ManagedScpConnection third = pool.get("127.0.0.1:1234");
+
+            assertNotSame(first, second);
+            assertNotSame(second, third);
+            assertNotSame(first, third);
+            assertSame(first, pool.get("127.0.0.1:1234"));
+            assertSame(second, pool.get("127.0.0.1:1234"));
+        }
+    }
+
+    @Test
+    void closeShutsDownEveryPooledConnection() {
+        ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500)
+                .withStorageConnectionsPerEndpoint(2);
+        ManagedScpConnection first;
+        ManagedScpConnection second;
+        NodePool pool = new NodePool(config);
+        try {
+            first = pool.get("127.0.0.1:1234");
+            second = pool.get("127.0.0.1:1234");
+        } finally {
+            pool.close();
+        }
+
+        assertThrows(ScpException.class, () -> first.call(Opcode.PING, emptyHeader(), null, 500));
+        assertThrows(ScpException.class, () -> second.call(Opcode.PING, emptyHeader(), null, 500));
     }
 
     @Test

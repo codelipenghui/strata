@@ -65,6 +65,7 @@ final class AppenderImpl implements StrataFile.Appender {
     private static final class ChunkSession {
         final ChunkId chunkId;
         final List<Messages.Replica> replicas;
+        final ManagedScpConnection[] connections;
         final long[] acked;
         final long[] connectionGenerations;
         final boolean[] failed;
@@ -76,6 +77,7 @@ final class AppenderImpl implements StrataFile.Appender {
         ChunkSession(ChunkId chunkId, List<Messages.Replica> replicas) {
             this.chunkId = chunkId;
             this.replicas = replicas;
+            this.connections = new ManagedScpConnection[replicas.size()];
             this.acked = new long[replicas.size()];
             this.connectionGenerations = new long[replicas.size()];
             Arrays.fill(this.connectionGenerations, -1);
@@ -141,7 +143,8 @@ final class AppenderImpl implements StrataFile.Appender {
                 final int replicaIndex = i;
                 CompletableFuture<Frame> f;
                 try {
-                    ManagedScpConnection client = pool.get(s.replicas.get(i).endpoint());
+                    ManagedScpConnection client = s.connections[i] != null
+                            ? s.connections[i] : pool.get(s.replicas.get(i).endpoint());
                     f = s.connectionGenerations[i] >= 0
                             ? client.sendWithTimeout(Opcode.APPEND, header, data.duplicate(), config.callTimeoutMs(),
                                     s.connectionGenerations[i])
@@ -328,10 +331,12 @@ final class AppenderImpl implements StrataFile.Appender {
             ByteBuffer h = null;
             ScpException err = null;
             try {
+                ManagedScpConnection client = s.connections[i] != null
+                        ? s.connections[i] : pool.get(endpoint);
                 h = s.connectionGenerations[i] >= 0
-                        ? pool.get(endpoint).callWithGeneration(Opcode.SEAL_CHUNK, header, null, config.callTimeoutMs(),
+                        ? client.callWithGeneration(Opcode.SEAL_CHUNK, header, null, config.callTimeoutMs(),
                                 s.connectionGenerations[i]).header()
-                        : pool.get(endpoint).call(Opcode.SEAL_CHUNK, header, null, config.callTimeoutMs());
+                        : client.call(Opcode.SEAL_CHUNK, header, null, config.callTimeoutMs());
             } catch (ScpException e) {
                 err = e;
             } finally {
@@ -437,8 +442,10 @@ final class AppenderImpl implements StrataFile.Appender {
             lock.unlock();
             ScpException err = null;
             try {
+                ManagedScpConnection client = pool.pin(endpoint);
                 ManagedScpConnection.CallResult openedResult =
-                        pool.get(endpoint).callWithGeneration(Opcode.OPEN_CHUNK, header, null, config.callTimeoutMs());
+                        client.callWithGeneration(Opcode.OPEN_CHUNK, header, null, config.callTimeoutMs());
+                s.connections[i] = client;
                 s.connectionGenerations[i] = openedResult.generation();
             } catch (ScpException e) {
                 err = e;

@@ -5,6 +5,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.proto.Frame;
+import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.Resp;
@@ -28,6 +29,8 @@ import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -1171,6 +1174,51 @@ class AppenderImplTest {
     }
 
     @Test
+    void appendPinsReplicaConnectionWhenEndpointHasMultipleConnections() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicInteger s1Appends = new AtomicInteger();
+        AtomicInteger s2Appends = new AtomicInteger();
+        AtomicInteger s3Appends = new AtomicInteger();
+
+        try (ScpServer s1 = countedStorageServer(1, s1Appends);
+             ScpServer s2 = countedStorageServer(2, s2Appends);
+             ScpServer s3 = countedStorageServer(3, s3Appends);
+             ScpServer metaServer = metadataForAppender(fileId, chunkId, sealedReplicas, sealedFileLength,
+                     new Messages.Replica(1, endpoint(s1)),
+                     new Messages.Replica(2, endpoint(s2)),
+                     new Messages.Replica(3, endpoint(s3)))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
+                    .withStorageConnectionsPerEndpoint(2);
+            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool(config)) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1,
+                        Messages.WritePolicy.DEFAULT, 0);
+
+                assertEquals(1, appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS).endOffset());
+                Object session = currentSession(appender);
+                ManagedScpConnection pinnedFirstReplica = connections(session)[0];
+                assertNotNull(pinnedFirstReplica);
+                assertNotSame(pinnedFirstReplica, pool.get(endpoint(s1)));
+
+                pinnedFirstReplica.disconnect();
+                assertEquals(2, appender.append(ByteBuffer.wrap(new byte[] {2})).get(1, TimeUnit.SECONDS).endOffset());
+
+                assertEquals(1, s1Appends.get(), "replaced pinned connection must fail without replaying append");
+                assertEquals(2, s2Appends.get());
+                assertEquals(2, s3Appends.get());
+                assertTrue(booleanField(currentSession(appender), "needRoll"));
+
+                StrataFile.SealInfo seal = appender.seal();
+                assertEquals(2, seal.sealedLength());
+                assertEquals(List.of(2, 3), sealedReplicas.get());
+                assertEquals(2L, sealedFileLength.get());
+            }
+        }
+    }
+
+    @Test
     void sealQuorumLossFromSkippedReplicasUsesGenericCause() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
@@ -1551,6 +1599,12 @@ class AppenderImplTest {
         field.set(appender, session);
     }
 
+    private static Object currentSession(AppenderImpl appender) throws Exception {
+        Field field = AppenderImpl.class.getDeclaredField("session");
+        field.setAccessible(true);
+        return field.get(appender);
+    }
+
     private static void setLong(Object target, String fieldName, long value) throws Exception {
         Field field = target.getClass().getDeclaredField(fieldName);
         field.setAccessible(true);
@@ -1563,11 +1617,23 @@ class AppenderImplTest {
         field.setBoolean(target, value);
     }
 
+    private static boolean booleanField(Object target, String fieldName) throws Exception {
+        Field field = target.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.getBoolean(target);
+    }
+
     private static void setBooleanArray(Object target, String fieldName, int index, boolean value) throws Exception {
         Field field = target.getClass().getDeclaredField(fieldName);
         field.setAccessible(true);
         boolean[] values = (boolean[]) field.get(target);
         values[index] = value;
+    }
+
+    private static ManagedScpConnection[] connections(Object session) throws Exception {
+        Field field = session.getClass().getDeclaredField("connections");
+        field.setAccessible(true);
+        return (ManagedScpConnection[]) field.get(session);
     }
 
     @SuppressWarnings("unchecked")

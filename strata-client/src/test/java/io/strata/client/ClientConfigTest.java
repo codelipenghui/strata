@@ -31,6 +31,10 @@ class ClientConfigTest {
         assertThrows(IllegalArgumentException.class, () -> new ClientConfig(List.of("host:65536"), 1, 1));
         assertThrows(IllegalArgumentException.class, () -> new ClientConfig(List.of("host:123"), 0, 1));
         assertThrows(IllegalArgumentException.class, () -> new ClientConfig(List.of("host:123"), 1, 0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ClientConfig(List.of("host:123"), 1, 1, ConnectionPolicy.DEFAULT, 0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ClientConfig(List.of("host:123"), 1, 1, ConnectionPolicy.DEFAULT, -1));
         assertThrows(NullPointerException.class,
                 () -> new ClientConfig(List.of("host:123"), 1, 1, null));
     }
@@ -47,7 +51,9 @@ class ClientConfigTest {
         assertThrows(UnsupportedOperationException.class, () -> cfg.metadataEndpoints().add("127.0.0.1:1"));
         assertEquals(2048, cfg.withChunkRollBytes(2048).chunkRollBytes());
         assertEquals(ConnectionPolicy.DEFAULT, cfg.connectionPolicy());
+        assertEquals(1, cfg.storageConnectionsPerEndpoint());
         ConnectionPolicy policy = ConnectionPolicy.DEFAULT.withHeartbeatIntervalMs(1234);
         assertEquals(policy, cfg.withConnectionPolicy(policy).connectionPolicy());
+        assertEquals(3, cfg.withStorageConnectionsPerEndpoint(3).storageConnectionsPerEndpoint());
     }
 }

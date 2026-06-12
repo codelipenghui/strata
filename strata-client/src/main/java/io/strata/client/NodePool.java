@@ -9,15 +9,16 @@ import io.strata.proto.ScpClient;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * One SCP connection per storage-node endpoint, lazily created, replaced when closed.
- * All appends for a chunk flow through one connection (§10.2 ordering rule) — guaranteed
- * here because an endpoint maps to exactly one connection.
+ * Lazily-created SCP connection pools for storage-node endpoints.
+ * Ordinary idempotent requests are round-robin within an endpoint. Appenders pin the selected
+ * ManagedScpConnection for an open chunk, preserving the per-replica ordering rule.
  */
 final class NodePool implements AutoCloseable {
     private final ClientConfig config;
-    private final Map<String, ManagedScpConnection> conns = new ConcurrentHashMap<>();
+    private final Map<String, EndpointPool> conns = new ConcurrentHashMap<>();
 
     NodePool(ClientConfig config) {
         this.config = config;
@@ -28,18 +29,50 @@ final class NodePool implements AutoCloseable {
     }
 
     ManagedScpConnection get(String endpoint) {
+        return endpointPool(endpoint).next();
+    }
+
+    ManagedScpConnection pin(String endpoint) {
+        return endpointPool(endpoint).next();
+    }
+
+    private EndpointPool endpointPool(String endpoint) {
         if (endpoint == null) {
             throw new ScpException(ErrorCode.INTERNAL, "invalid storage endpoint: null");
         }
         Endpoint.parse(endpoint, "storage endpoint", ErrorCode.INTERNAL);
-        return conns.computeIfAbsent(endpoint, ep -> new ManagedScpConnection(
-                List.of(ep), config.connectionPolicy(), ScpClient.KIND_BROKER,
-                "strata-client", "storage endpoint", false, true));
+        return conns.computeIfAbsent(endpoint, EndpointPool::new);
     }
 
     @Override
     public void close() {
-        conns.values().forEach(ManagedScpConnection::close);
+        conns.values().forEach(EndpointPool::close);
         conns.clear();
+    }
+
+    private final class EndpointPool implements AutoCloseable {
+        private final ManagedScpConnection[] connections;
+        private final AtomicInteger next = new AtomicInteger();
+
+        EndpointPool(String endpoint) {
+            connections = new ManagedScpConnection[config.storageConnectionsPerEndpoint()];
+            for (int i = 0; i < connections.length; i++) {
+                connections[i] = new ManagedScpConnection(
+                        List.of(endpoint), config.connectionPolicy(), ScpClient.KIND_BROKER,
+                        "strata-client-storage-" + i, "storage endpoint", false, true);
+            }
+        }
+
+        ManagedScpConnection next() {
+            int index = Math.floorMod(next.getAndIncrement(), connections.length);
+            return connections[index];
+        }
+
+        @Override
+        public void close() {
+            for (ManagedScpConnection connection : connections) {
+                connection.close();
+            }
+        }
     }
 }
