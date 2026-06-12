@@ -382,6 +382,18 @@ class ChunkStoreTest {
             var r2 = store.read(id, 6, 1024);
             assertArrayEquals("world".getBytes(), r2.bytes());
 
+            try (var region = store.readRegion(id, 6, 1024)) {
+                assertEquals(ChunkFormats.DATA_START + 6, region.filePosition());
+                assertEquals(5, region.length());
+                assertEquals(11, region.localEndOffset());
+                ByteBuffer out = ByteBuffer.allocate(region.length());
+                readFully(region.channel(), out, region.filePosition());
+                out.flip();
+                byte[] bytes = new byte[out.remaining()];
+                out.get(bytes);
+                assertArrayEquals("world".getBytes(), bytes);
+            }
+
             var stat = store.stat(id);
             assertEquals(ChunkState.SEALED, stat.state());
             assertEquals(11, stat.sealedLength());

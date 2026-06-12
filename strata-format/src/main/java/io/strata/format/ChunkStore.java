@@ -311,6 +311,16 @@ public final class ChunkStore implements AutoCloseable {
 
     public record ReadResult(byte[] bytes, long localEndOffset, long lastKnownDO) {}
 
+    public record ReadRegionResult(FileChannel channel, long filePosition, int length,
+                                   long localEndOffset, long lastKnownDO) implements AutoCloseable {
+        @Override
+        public void close() throws IOException {
+            if (channel != null) {
+                channel.close();
+            }
+        }
+    }
+
     public ReadResult read(ChunkId id, long offset, int maxBytes) throws IOException {
         requireNonNegative(offset, "read offset");
         requireNonNegative(maxBytes, "read maxBytes");
@@ -326,6 +336,34 @@ public final class ChunkStore implements AutoCloseable {
                 readFully(h.data, ByteBuffer.wrap(out), checkedAdd(DATA_START, offset, "chunk file offset"));
             }
             return new ReadResult(out, end, h.lastKnownDO);
+        }
+    }
+
+    public ReadRegionResult readRegion(ChunkId id, long offset, int maxBytes) throws IOException {
+        requireNonNegative(offset, "read offset");
+        requireNonNegative(maxBytes, "read maxBytes");
+        Handle h = lookup(id);
+        synchronized (h) {
+            long end = h.state == ChunkState.SEALED ? h.sealedLength : h.end;
+            if (offset >= end) {
+                return new ReadRegionResult(null, 0, 0, end, h.lastKnownDO);
+            }
+            int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), end - offset);
+            if (n == 0) {
+                return new ReadRegionResult(null, 0, 0, end, h.lastKnownDO);
+            }
+            FileChannel readChannel = FileChannel.open(h.dataPath, StandardOpenOption.READ);
+            try {
+                return new ReadRegionResult(readChannel, checkedAdd(DATA_START, offset, "chunk file offset"),
+                        n, end, h.lastKnownDO);
+            } catch (RuntimeException e) {
+                try {
+                    readChannel.close();
+                } catch (IOException closeFailure) {
+                    e.addSuppressed(closeFailure);
+                }
+                throw e;
+            }
         }
     }
 

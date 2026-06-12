@@ -1,6 +1,7 @@
 package io.strata.proto;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.MessageToByteEncoder;
@@ -16,21 +17,13 @@ final class NettyFrameCodec {
     static final class Encoder extends MessageToByteEncoder<Frame> {
         @Override
         protected void encode(ChannelHandlerContext ctx, Frame f, ByteBuf out) throws Exception {
+            if (f.hasFilePayload()) {
+                throw new IOException("file payload frames must be written as a frame prefix plus FileRegion");
+            }
             ByteBuffer header = f.headerSlice();
             ByteBuffer payload = f.payloadSlice();
             int headerLen = header.remaining();
             int payloadLen = payload.remaining();
-            if (headerLen > 0xFFFF) {
-                throw new IOException("header too large: " + headerLen);
-            }
-            long computedFrameLen = (long) Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen;
-            if (computedFrameLen > Integer.MAX_VALUE) {
-                throw new IOException("frame too large: " + computedFrameLen);
-            }
-            int frameLen = (int) computedFrameLen;
-            if (frameLen > FrameIO.MAX_FRAME_BYTES) {
-                throw new IOException("frame too large: " + frameLen);
-            }
 
             short flags = f.flags();
             int payloadCrc = 0;
@@ -39,19 +32,59 @@ final class NettyFrameCodec {
                 flags |= Frame.FLAG_PAYLOAD_CRC;
             }
 
-            out.writeInt(frameLen);
-            out.writeByte(Frame.MAGIC);
-            out.writeByte(Frame.FRAME_VERSION);
-            out.writeShort(f.opcode());
-            out.writeShort(f.apiVersion());
-            out.writeShort(flags);
-            out.writeLong(f.correlationId());
-            out.writeInt(payloadLen);
-            out.writeInt(payloadCrc);
-            out.writeShort(headerLen);
-            out.writeBytes(header.duplicate());
+            writePrefix(out, f, header, payloadLen, payloadCrc, flags);
             out.writeBytes(payload.duplicate());
         }
+    }
+
+    static ByteBuf encodeFilePrefix(ByteBufAllocator allocator, Frame f) throws IOException {
+        if (!f.hasFilePayload()) {
+            throw new IOException("frame has no file payload");
+        }
+        ByteBuffer header = f.headerSlice();
+        int headerLen = header.remaining();
+        ByteBuf out = allocator.buffer(Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + headerLen);
+        boolean success = false;
+        try {
+            writePrefix(out, f, header, f.payloadLength(), 0, f.flags());
+            success = true;
+            return out;
+        } finally {
+            if (!success) {
+                out.release();
+            }
+        }
+    }
+
+    private static void writePrefix(ByteBuf out, Frame f, ByteBuffer header, int payloadLen,
+                                    int payloadCrc, short flags) throws IOException {
+        int headerLen = header.remaining();
+        if (headerLen > 0xFFFF) {
+            throw new IOException("header too large: " + headerLen);
+        }
+        if (payloadLen < 0) {
+            throw new IOException("negative payload length: " + payloadLen);
+        }
+        long computedFrameLen = (long) Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen;
+        if (computedFrameLen > Integer.MAX_VALUE) {
+            throw new IOException("frame too large: " + computedFrameLen);
+        }
+        int frameLen = (int) computedFrameLen;
+        if (frameLen > FrameIO.MAX_FRAME_BYTES) {
+            throw new IOException("frame too large: " + frameLen);
+        }
+
+        out.writeInt(frameLen);
+        out.writeByte(Frame.MAGIC);
+        out.writeByte(Frame.FRAME_VERSION);
+        out.writeShort(f.opcode());
+        out.writeShort(f.apiVersion());
+        out.writeShort(flags);
+        out.writeLong(f.correlationId());
+        out.writeInt(payloadLen);
+        out.writeInt(payloadCrc);
+        out.writeShort(headerLen);
+        out.writeBytes(header.duplicate());
     }
 
     static final class Decoder extends ByteToMessageDecoder {

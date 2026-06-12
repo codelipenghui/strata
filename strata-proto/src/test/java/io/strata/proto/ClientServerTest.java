@@ -11,6 +11,10 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -18,6 +22,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -74,6 +79,39 @@ class ClientServerTest {
         BufWriter w = new BufWriter(4);
         w.noTags();
         return w.toBytes();
+    }
+
+    @Test
+    void fileRegionResponseStreamsPayloadWithoutPayloadCrc() throws Exception {
+        var file = Files.createTempFile("strata-file-region", ".bin");
+        Files.writeString(file, "0123456789", StandardCharsets.UTF_8);
+        AtomicReference<FileChannel> sentChannel = new AtomicReference<>();
+        ScpServer.Handler handler = req -> {
+            FileChannel channel = FileChannel.open(file, StandardOpenOption.READ);
+            sentChannel.set(channel);
+            return ScpServer.okFileRegion(req, Messages.okHeader(), channel, 2, 5);
+        };
+
+        try (ScpServer server = new ScpServer(0, 1, 0xA, 0xB, handler);
+             Socket socket = new Socket("127.0.0.1", server.port());
+             DataInputStream in = new DataInputStream(socket.getInputStream());
+             DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
+            FrameIO.write(out, Frame.request(Opcode.HELLO,
+                    new Messages.Hello(ScpClient.KIND_TOOL, 0, "file-region-test").encode(), null, 1));
+            Resp.check(FrameIO.read(in).headerSlice());
+
+            FrameIO.write(out, Frame.request(Opcode.PING, emptyHeader(), null, 2));
+            Frame response = FrameIO.read(in);
+            Resp.check(response.headerSlice());
+            assertEquals(5, response.payloadLength());
+            assertEquals(0, response.flags() & Frame.FLAG_PAYLOAD_CRC);
+            byte[] payload = new byte[response.payloadLength()];
+            response.payloadSlice().get(payload);
+            assertArrayEquals("23456".getBytes(StandardCharsets.UTF_8), payload);
+            waitFor(() -> sentChannel.get() != null && !sentChannel.get().isOpen());
+        } finally {
+            Files.deleteIfExists(file);
+        }
     }
 
     @Test

@@ -58,9 +58,13 @@ final class NodeHandlers implements ScpServer.Handler {
 
             case READ -> {
                 var m = Messages.Read.decode(h);
-                var r = store.read(m.chunkId(), m.offset(), m.maxBytes());
-                yield ScpServer.ok(req, new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode(),
-                        ByteBuffer.wrap(r.bytes()));
+                var r = store.readRegion(m.chunkId(), m.offset(), m.maxBytes());
+                byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
+                if (r.length() == 0) {
+                    r.close();
+                    yield ScpServer.ok(req, header, null);
+                }
+                yield ScpServer.okFileRegion(req, header, r.channel(), r.filePosition(), r.length());
             }
 
             case FENCE -> {

@@ -4,6 +4,7 @@ import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
+import io.netty.channel.DefaultFileRegion;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
@@ -21,6 +22,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -235,12 +237,40 @@ public final class ScpServer implements AutoCloseable {
                 closeFrames(frame, releaseAfterWrite);
                 return;
             }
+            if (frame.hasFilePayload()) {
+                writeFileResponse(ctx, frame, closeAfterWrite, releaseAfterWrite);
+                return;
+            }
             ChannelFuture write;
             try {
                 write = ctx.writeAndFlush(frame);
             } catch (RuntimeException e) {
                 closeFrames(frame, releaseAfterWrite);
                 throw e;
+            }
+            write.addListener(f -> closeFrames(frame, releaseAfterWrite));
+            if (closeAfterWrite) {
+                write.addListener(f -> ctx.close());
+            }
+            write.addListener(f -> {
+                if (!f.isSuccess()) {
+                    ctx.close();
+                }
+            });
+        }
+
+        private void writeFileResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
+                                       Frame releaseAfterWrite) {
+            Frame.FilePayload file = frame.filePayload();
+            ChannelFuture write;
+            try {
+                var prefix = NettyFrameCodec.encodeFilePrefix(ctx.alloc(), frame);
+                DefaultFileRegion region = new DefaultFileRegion(file.channel(), file.position(), file.length());
+                ctx.write(prefix);
+                write = ctx.writeAndFlush(region);
+            } catch (IOException | RuntimeException e) {
+                closeFrames(frame, releaseAfterWrite);
+                throw new RuntimeException(e);
             }
             write.addListener(f -> closeFrames(frame, releaseAfterWrite));
             if (closeAfterWrite) {
@@ -293,6 +323,11 @@ public final class ScpServer implements AutoCloseable {
     /** Convenience for handlers: success response with header bytes and optional payload. */
     public static Frame ok(Frame req, byte[] header, ByteBuffer payload) {
         return Frame.response(req, header, payload);
+    }
+
+    /** Convenience for handlers: success response whose payload is streamed from a file region. */
+    public static Frame okFileRegion(Frame req, byte[] header, FileChannel channel, long position, int length) {
+        return Frame.fileResponse(req, header, new Frame.FilePayload(channel, position, length));
     }
 
     @Override
