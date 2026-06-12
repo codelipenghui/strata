@@ -37,7 +37,7 @@ final class AppenderImpl implements StrataFile.Appender {
     private static final Logger log = LoggerFactory.getLogger(AppenderImpl.class);
     private static final int REPLICA_SLOTS = 3;
     private static final int OPEN_QUORUM = 2;
-    /** Replica responses are dispatched off the connection reader threads. */
+    /** Replica responses are dispatched off transport event-loop threads. */
     private static final java.util.concurrent.Executor CALLBACKS =
             java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
 

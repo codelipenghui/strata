@@ -1,25 +1,33 @@
 package io.strata.proto;
 
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.group.ChannelGroup;
+import io.netty.channel.group.DefaultChannelGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.util.concurrent.GlobalEventExecutor;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
-import java.net.ServerSocket;
-import java.net.Socket;
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * SCP server: virtual thread per connection, frames processed serially per connection
- * (preserves per-chunk append ordering — tech design §10.2 connection rules).
+ * SCP server over Netty. Handler invocation is serialized per connection on a virtual-thread
+ * executor so blocking storage/metadata code never runs on a Netty event-loop thread.
  */
 public final class ScpServer implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ScpServer.class);
@@ -28,37 +36,60 @@ public final class ScpServer implements AutoCloseable {
      * Handles one request frame; returns the response frame. Throw ScpException for protocol errors.
      *
      * handleAsync is the dispatch entry point: its synchronous portion runs on the connection
-     * thread IN ORDER (validation/writes keep per-chunk contiguity semantics), but the response
-     * may complete later (e.g. group commit) — the connection keeps processing subsequent frames
-     * meanwhile. Out-of-order responses are protocol-legal: clients correlate by id.
+     * handler executor IN ORDER (validation/writes keep per-chunk contiguity semantics), but the
+     * response may complete later (e.g. group commit) — the connection keeps processing subsequent
+     * frames meanwhile. Out-of-order responses are protocol-legal: clients correlate by id.
      */
     public interface Handler {
         Frame handle(Frame request) throws Exception;
 
-        default java.util.concurrent.CompletableFuture<Frame> handleAsync(Frame request) throws Exception {
-            return java.util.concurrent.CompletableFuture.completedFuture(handle(request));
+        default CompletableFuture<Frame> handleAsync(Frame request) throws Exception {
+            return CompletableFuture.completedFuture(handle(request));
         }
     }
 
-    private final ServerSocket serverSocket;
+    private final Channel serverChannel;
+    private final ChannelGroup connections = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
     private final Handler handler;
     private volatile int nodeId; // updatable: a fresh storage node learns its id at registration
     private final long incMsb;
     private final long incLsb;
     private final AtomicBoolean closed = new AtomicBoolean(false);
-    private final Set<Socket> connections = ConcurrentHashMap.newKeySet();
 
     public ScpServer(int port, int nodeId, long incMsb, long incLsb, Handler handler) throws IOException {
-        this.serverSocket = new ServerSocket(port);
         this.handler = handler;
         this.nodeId = nodeId;
         this.incMsb = incMsb;
         this.incLsb = incLsb;
-        Thread.ofVirtual().name("scp-accept-" + port()).start(this::acceptLoop);
+
+        ServerBootstrap bootstrap = new ServerBootstrap()
+                .group(NettyEventLoops.SERVER_BOSS_GROUP, NettyEventLoops.SERVER_WORKER_GROUP)
+                .channel(NioServerSocketChannel.class)
+                .option(ChannelOption.SO_REUSEADDR, true)
+                .childOption(ChannelOption.TCP_NODELAY, true)
+                .childHandler(new ChannelInitializer<SocketChannel>() {
+                    @Override
+                    protected void initChannel(SocketChannel ch) {
+                        ch.pipeline()
+                                .addLast(new NettyFrameCodec.Decoder())
+                                .addLast(new NettyFrameCodec.Encoder())
+                                .addLast(new ConnectionHandler(ch));
+                    }
+                });
+
+        try {
+            ChannelFuture bind = bootstrap.bind(new InetSocketAddress(port)).sync();
+            this.serverChannel = bind.channel();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted", e);
+        } catch (RuntimeException e) {
+            throw new IOException("failed to bind SCP server", e);
+        }
     }
 
     public int port() {
-        return serverSocket.getLocalPort();
+        return ((InetSocketAddress) serverChannel.localAddress()).getPort();
     }
 
     /** Updates the node id announced in HELLO responses (assigned at first registration). */
@@ -66,34 +97,41 @@ public final class ScpServer implements AutoCloseable {
         this.nodeId = nodeId;
     }
 
-    private void acceptLoop() {
-        while (!closed.get()) {
-            try {
-                Socket s = serverSocket.accept();
-                s.setTcpNoDelay(true);
-                connections.add(s);
-                Thread.ofVirtual().name("scp-conn-" + s.getRemoteSocketAddress()).start(() -> serve(s));
-            } catch (IOException e) {
-                if (!closed.get()) log.warn("accept failed", e);
+    private final class ConnectionHandler extends SimpleChannelInboundHandler<Frame> {
+        private final ExecutorService requestExecutor;
+        private final AtomicBoolean connectionOpen = new AtomicBoolean(true);
+        private boolean helloComplete;
+
+        ConnectionHandler(Channel channel) {
+            this.requestExecutor = Executors.newSingleThreadExecutor(
+                    Thread.ofVirtual().name("scp-conn-" + channel.remoteAddress() + "-", 0).factory());
+        }
+
+        @Override
+        public void channelActive(ChannelHandlerContext ctx) {
+            connections.add(ctx.channel());
+        }
+
+        @Override
+        protected void channelRead0(ChannelHandlerContext ctx, Frame frame) {
+            requestExecutor.execute(() -> processFrame(ctx, frame));
+        }
+
+        private void processFrame(ChannelHandlerContext ctx, Frame frame) {
+            if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
                 return;
             }
+            if (!helloComplete) {
+                handleHello(ctx, frame);
+                return;
+            }
+            handleRequest(ctx, frame);
         }
-    }
 
-    private void serve(Socket s) {
-        // ReentrantLock (not synchronized): deferred completions write responses from virtual
-        // threads; blocking socket writes must not pin carriers
-        java.util.concurrent.locks.ReentrantLock writeLock = new java.util.concurrent.locks.ReentrantLock();
-        AtomicBoolean connectionOpen = new AtomicBoolean(true);
-        try {
-            DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream(), 1 << 16));
-            DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream(), 1 << 16));
-
-            Frame hello = FrameIO.read(in);
-            if (hello == null) return;
+        private void handleHello(ChannelHandlerContext ctx, Frame hello) {
             if (hello.opcode() != Opcode.HELLO.code) {
-                writeResponse(s, out, writeLock, connectionOpen, Frame.response(hello,
-                        Resp.error(ErrorCode.UNKNOWN_OPCODE, "first frame must be HELLO", 0), null));
+                writeResponse(ctx, Frame.response(hello,
+                        Resp.error(ErrorCode.UNKNOWN_OPCODE, "first frame must be HELLO", 0), null), true);
                 return;
             }
             try {
@@ -101,58 +139,73 @@ public final class ScpServer implements AutoCloseable {
             } catch (RuntimeException e) {
                 // incompatible version range or malformed HELLO header: answer with a typed
                 // error instead of silently dropping the connection
-                writeResponse(s, out, writeLock, connectionOpen, Frame.response(hello,
-                        Resp.error(ErrorCode.UNSUPPORTED_VERSION, String.valueOf(e.getMessage()), 0), null));
+                writeResponse(ctx, Frame.response(hello,
+                        Resp.error(ErrorCode.UNSUPPORTED_VERSION, String.valueOf(e.getMessage()), 0), null), true);
                 return;
             }
-            writeResponse(s, out, writeLock, connectionOpen, Frame.response(hello,
-                    new Messages.HelloResp(0, nodeId, incMsb, incLsb, FrameIO.MAX_FRAME_BYTES, 1L << 30).encode(), null));
+            helloComplete = true;
+            writeResponse(ctx, Frame.response(hello,
+                    new Messages.HelloResp(0, nodeId, incMsb, incLsb, FrameIO.MAX_FRAME_BYTES, 1L << 30).encode(),
+                    null), false);
+        }
 
-            while (!closed.get()) {
-                Frame req = FrameIO.read(in);
-                if (req == null) return;
-                java.util.concurrent.CompletableFuture<Frame> respF;
-                try {
-                    respF = handler.handleAsync(req);
-                    if (respF == null) {
-                        respF = java.util.concurrent.CompletableFuture.completedFuture(
-                                internalError(req, "handler returned null future"));
-                    }
-                } catch (ScpException e) {
-                    respF = java.util.concurrent.CompletableFuture.completedFuture(
-                            Frame.response(req, Resp.error(e.code(), e.getMessage(), e.detail()), null));
-                } catch (Exception e) {
-                    log.warn("handler error for opcode 0x{}", Integer.toHexString(req.opcode()), e);
-                    respF = java.util.concurrent.CompletableFuture.completedFuture(
-                            Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(e), 0), null));
-                }
-                if (respF.isDone() && !respF.isCompletedExceptionally()) {
-                    writeResponse(s, out, writeLock, connectionOpen,
-                            requireResponse(req, respF.join())); // fast path, no extra hop
-                } else {
-                    respF.whenComplete((resp, err) -> {
-                        Frame frame = resp;
-                        if (err != null) {
-                            Throwable cause = err instanceof java.util.concurrent.CompletionException
-                                    ? err.getCause() : err;
-                            frame = cause instanceof ScpException se
-                                    ? Frame.response(req, Resp.error(se.code(), se.getMessage(), se.detail()), null)
-                                    : Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(cause), 0), null);
-                        }
-                        frame = requireResponse(req, frame);
-                        writeResponse(s, out, writeLock, connectionOpen, frame);
-                    });
-                }
-            }
-        } catch (IOException e) {
-            // connection dropped — normal in failure tests
-        } finally {
-            connectionOpen.set(false);
-            connections.remove(s);
+        private void handleRequest(ChannelHandlerContext ctx, Frame req) {
+            CompletableFuture<Frame> respF;
             try {
-                s.close();
-            } catch (IOException ignored) {
+                respF = handler.handleAsync(req);
+                if (respF == null) {
+                    respF = CompletableFuture.completedFuture(internalError(req, "handler returned null future"));
+                }
+            } catch (ScpException e) {
+                respF = CompletableFuture.completedFuture(
+                        Frame.response(req, Resp.error(e.code(), e.getMessage(), e.detail()), null));
+            } catch (Exception e) {
+                log.warn("handler error for opcode 0x{}", Integer.toHexString(req.opcode()), e);
+                respF = CompletableFuture.completedFuture(
+                        Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(e), 0), null));
             }
+            if (respF.isDone() && !respF.isCompletedExceptionally()) {
+                writeResponse(ctx, requireResponse(req, respF.join()), false); // fast path, no extra hop
+            } else {
+                respF.whenComplete((resp, err) -> {
+                    Frame frame = resp;
+                    if (err != null) {
+                        Throwable cause = err instanceof java.util.concurrent.CompletionException
+                                ? err.getCause() : err;
+                        frame = cause instanceof ScpException se
+                                ? Frame.response(req, Resp.error(se.code(), se.getMessage(), se.detail()), null)
+                                : Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(cause), 0), null);
+                    }
+                    writeResponse(ctx, requireResponse(req, frame), false);
+                });
+            }
+        }
+
+        private void writeResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite) {
+            if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
+                return;
+            }
+            ChannelFuture write = ctx.writeAndFlush(frame);
+            if (closeAfterWrite) {
+                write.addListener(f -> ctx.close());
+            }
+            write.addListener(f -> {
+                if (!f.isSuccess()) {
+                    ctx.close();
+                }
+            });
+        }
+
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) {
+            connectionOpen.set(false);
+            connections.remove(ctx.channel());
+            requestExecutor.shutdownNow();
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            ctx.close();
         }
     }
 
@@ -164,28 +217,6 @@ public final class ScpServer implements AutoCloseable {
         return Frame.response(req, Resp.error(ErrorCode.INTERNAL, message, 0), null);
     }
 
-    private void writeResponse(Socket s, DataOutputStream out,
-                               java.util.concurrent.locks.ReentrantLock writeLock,
-                               AtomicBoolean connectionOpen, Frame frame) {
-        if (closed.get() || !connectionOpen.get() || s.isClosed()) {
-            return;
-        }
-        writeLock.lock();
-        try {
-            if (closed.get() || !connectionOpen.get() || s.isClosed()) {
-                return;
-            }
-            FrameIO.write(out, frame);
-        } catch (IOException e) {
-            try {
-                s.close(); // unblocks the reader loop; connection teardown is the recovery path
-            } catch (IOException ignored) {
-            }
-        } finally {
-            writeLock.unlock();
-        }
-    }
-
     /** Convenience for handlers: success response with header bytes and optional payload. */
     public static Frame ok(Frame req, byte[] header, ByteBuffer payload) {
         return Frame.response(req, header, payload);
@@ -193,16 +224,10 @@ public final class ScpServer implements AutoCloseable {
 
     @Override
     public void close() {
-        closed.set(true);
-        try {
-            serverSocket.close();
-        } catch (IOException ignored) {
+        if (!closed.compareAndSet(false, true)) {
+            return;
         }
-        for (Socket s : connections) {
-            try {
-                s.close();
-            } catch (IOException ignored) {
-            }
-        }
+        serverChannel.close().awaitUninterruptibly(1, java.util.concurrent.TimeUnit.SECONDS);
+        connections.close().awaitUninterruptibly(1, java.util.concurrent.TimeUnit.SECONDS);
     }
 }

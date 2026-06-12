@@ -7,8 +7,6 @@ import org.junit.jupiter.api.Test;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
-import java.io.OutputStream;
-import java.lang.reflect.Field;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
@@ -221,11 +219,10 @@ class ClientServerTest {
         try (ScpServer server = new ScpServer(0, 1, 0, 0,
                 req -> ScpServer.ok(req, Messages.okHeader(), null));
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
-            Socket socket = clientSocket(client);
-            assertFalse(socket.isClosed());
+            assertFalse(client.isClosed());
 
             server.close();
-            waitFor(() -> client.isClosed() && socket.isClosed());
+            waitFor(client::isClosed);
         }
     }
 
@@ -275,18 +272,11 @@ class ClientServerTest {
         try (ScpServer server = new ScpServer(0, 1, 0, 0,
                 req -> ScpServer.ok(req, Messages.okHeader(), null));
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
-            setClientOutput(client, new DataOutputStream(new OutputStream() {
-                @Override
-                public void write(int b) throws IOException {
-                    throw new IOException("synthetic write failure");
-                }
-            }));
-
-            CompletableFuture<Frame> failed = client.send(Opcode.PING, emptyHeader(), null);
+            CompletableFuture<Frame> failed = client.send(Opcode.PING, new byte[0x1_0000], null);
 
             var e = assertThrows(java.util.concurrent.ExecutionException.class, failed::get);
             assertEquals(IOException.class, e.getCause().getClass());
-            assertTrue(e.getCause().getMessage().contains("synthetic write failure"));
+            assertTrue(e.getCause().getMessage().contains("header too large"));
             assertEquals(0, client.pendingCount());
             assertTrue(client.isClosed());
         }
@@ -294,35 +284,30 @@ class ClientServerTest {
 
     @Test
     void sendFailsPendingFutureIfConnectionClosesAfterWrite() throws Exception {
-        try (ScpServer server = new ScpServer(0, 1, 0, 0,
-                req -> ScpServer.ok(req, Messages.okHeader(), null));
-             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
-            AtomicBoolean closed = clientClosedFlag(client);
-            setClientOutput(client, new DataOutputStream(new OutputStream() {
-                private final java.io.ByteArrayOutputStream sink = new java.io.ByteArrayOutputStream();
-
-                @Override
-                public void write(int b) {
-                    sink.write(b);
+        try (ServerSocket server = new ServerSocket(0)) {
+            CompletableFuture<Void> peer = CompletableFuture.runAsync(() -> {
+                try (Socket socket = server.accept()) {
+                    DataInputStream in = new DataInputStream(socket.getInputStream());
+                    DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                    Frame hello = FrameIO.read(in);
+                    FrameIO.write(out, Frame.response(hello,
+                            new Messages.HelloResp(0, 7, 0, 0, FrameIO.MAX_FRAME_BYTES, 1024).encode(), null));
+                    FrameIO.read(in); // request was written; close without responding
+                } catch (Exception e) {
+                    throw new CompletionException(e);
                 }
+            });
 
-                @Override
-                public void write(byte[] b, int off, int len) {
-                    sink.write(b, off, len);
-                }
+            try (ScpClient client = new ScpClient("127.0.0.1", server.getLocalPort(),
+                    ScpClient.KIND_TOOL, "t")) {
+                CompletableFuture<Frame> failed = client.send(Opcode.PING, emptyHeader(), null);
 
-                @Override
-                public void flush() {
-                    closed.set(true);
-                }
-            }));
-
-            CompletableFuture<Frame> failed = client.send(Opcode.PING, emptyHeader(), null);
-
-            var e = assertThrows(java.util.concurrent.ExecutionException.class, failed::get);
-            assertEquals(IOException.class, e.getCause().getClass());
-            assertTrue(e.getCause().getMessage().contains("connection closed"));
-            assertEquals(0, client.pendingCount());
+                var e = assertThrows(java.util.concurrent.ExecutionException.class, failed::get);
+                assertEquals(IOException.class, e.getCause().getClass());
+                assertTrue(e.getCause().getMessage().contains("connection closed"));
+                assertEquals(0, client.pendingCount());
+            }
+            peer.get(3, TimeUnit.SECONDS);
         }
     }
 
@@ -549,7 +534,8 @@ class ClientServerTest {
 
             IOException e = assertThrows(IOException.class,
                     () -> new ScpClient("127.0.0.1", server.getLocalPort(), ScpClient.KIND_TOOL, "bad"));
-            assertTrue(e.getMessage().contains("handshake failed"));
+            assertTrue(e.getMessage().contains("handshake failed")
+                    || e.getMessage().contains("connection closed"), "got: " + e.getMessage());
             accepted.get(3, TimeUnit.SECONDS);
         }
     }
@@ -619,24 +605,6 @@ class ClientServerTest {
         BufWriter w = new BufWriter();
         w.u16(0).u16(0).u8(ScpClient.KIND_TOOL).u64(0).string("old").noTags();
         return w.toBytes();
-    }
-
-    private static void setClientOutput(ScpClient client, DataOutputStream output) throws ReflectiveOperationException {
-        Field out = ScpClient.class.getDeclaredField("out");
-        out.setAccessible(true);
-        out.set(client, output);
-    }
-
-    private static AtomicBoolean clientClosedFlag(ScpClient client) throws ReflectiveOperationException {
-        Field closed = ScpClient.class.getDeclaredField("closed");
-        closed.setAccessible(true);
-        return (AtomicBoolean) closed.get(client);
-    }
-
-    private static Socket clientSocket(ScpClient client) throws ReflectiveOperationException {
-        Field socket = ScpClient.class.getDeclaredField("socket");
-        socket.setAccessible(true);
-        return (Socket) socket.get(client);
     }
 
     private static void waitFor(BooleanSupplier condition) throws InterruptedException {

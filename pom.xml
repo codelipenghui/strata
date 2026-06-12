@@ -30,6 +30,7 @@
     <curator.version>5.6.0</curator.version>
     <testcontainers.version>1.19.8</testcontainers.version>
     <jacoco.version>0.8.12</jacoco.version>
+    <netty.version>4.1.134.Final</netty.version>
   </properties>
 
   <dependencyManagement>
@@ -38,6 +39,13 @@
         <groupId>org.junit</groupId>
         <artifactId>junit-bom</artifactId>
         <version>${junit.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>io.netty</groupId>
+        <artifactId>netty-bom</artifactId>
+        <version>${netty.version}</version>
         <type>pom</type>
         <scope>import</scope>
       </dependency>

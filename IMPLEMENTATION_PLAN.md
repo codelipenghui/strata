@@ -6,7 +6,7 @@ This file is the durable source of truth for the development loop — update the
 ## Locked decisions
 
 - **Stack:** Java 21 (Corretto), Maven multi-module (Maven 3.8.8 installed), JUnit 5, SLF4J-simple.
-- **Networking:** blocking IO on virtual threads (thread-per-connection); correctness first, NIO later if ever needed.
+- **Networking:** Netty NIO transport for SCP; blocking metadata/storage handlers run off the event loop on serialized per-connection virtual-thread executors.
 - **ZK access:** Apache Curator (framework + recipes + curator-test for embedded ZK in tests).
 - **Chaos:** testcontainers + Toxiproxy (gated on Docker availability).
 - **Model checking:** TLA+ (tla2tools.jar fetched on demand), spec under `tla/`.
@@ -23,7 +23,7 @@ This file is the durable source of truth for the development loop — update the
 
 ```
 strata-common   ids (FileId/ChunkId/NodeId), Varint, Crc32C, ErrorCode, exceptions
-strata-proto    SCP frame codec, tagged fields, opcodes, message structs, ScpClient/ScpServer (virtual threads)
+strata-proto    SCP frame codec, tagged fields, opcodes, message structs, Netty-backed ScpClient/ScpServer
 strata-format   chunk file header/footer/trailer, sidecar .meta, integrity ledger .j, ChunkStore engine + crash recovery
 strata-node     storage node: SCP handlers → ChunkStore; register/heartbeat/inventory loop; REPLICATE executor (pull)
 strata-meta     MetadataStore SPI, ZkMetadataStore, MetadataService (SCP listener, placement, leases, repair, retention)

@@ -8,7 +8,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
-/** Blocking frame reader/writer over socket streams. Payload CRC verified when present. */
+/** Blocking frame reader/writer for raw stream tests/tools. Payload CRC verified when present. */
 public final class FrameIO {
     public static final int MAX_FRAME_BYTES = 64 * 1024 * 1024;
 

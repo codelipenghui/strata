@@ -1,15 +1,20 @@
 package io.strata.proto;
 
+import io.netty.bootstrap.Bootstrap;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -22,8 +27,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * One SCP connection: HELLO handshake, then pipelined request/response correlated by id.
- * Thread-safe; writes are serialized, responses dispatched by a reader thread (virtual).
+ * One SCP connection over Netty: HELLO handshake, then pipelined request/response correlated by id.
+ * Thread-safe; Netty serializes channel writes, responses are dispatched by the channel pipeline.
  */
 public final class ScpClient implements AutoCloseable {
     public static final byte KIND_BROKER = 1;
@@ -31,15 +36,11 @@ public final class ScpClient implements AutoCloseable {
     public static final byte KIND_METADATA = 3;
     public static final byte KIND_TOOL = 4;
 
-    private final Socket socket;
-    private final DataInputStream in;
-    private final DataOutputStream out;
-    // ReentrantLock, not synchronized: blocking socket writes under a monitor pin virtual threads
-    private final java.util.concurrent.locks.ReentrantLock writeLock =
-            new java.util.concurrent.locks.ReentrantLock();
+    private final Channel channel;
     private final AtomicLong correlation = new AtomicLong(1);
     private final Map<Long, CompletableFuture<Frame>> pending = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final CompletableFuture<Frame> handshake = new CompletableFuture<>();
     private final Messages.HelloResp serverHello;
 
     public ScpClient(String host, int port, byte clientKind, String clientId) throws IOException {
@@ -47,20 +48,46 @@ public final class ScpClient implements AutoCloseable {
     }
 
     public ScpClient(String host, int port, byte clientKind, String clientId, int connectTimeoutMs) throws IOException {
-        Socket connected = new Socket();
-        DataInputStream input;
-        DataOutputStream output;
+        Channel connected = null;
         Messages.HelloResp hello;
         try {
-            connected.setTcpNoDelay(true);
-            connected.connect(new InetSocketAddress(host, port), connectTimeoutMs);
-            connected.setSoTimeout(connectTimeoutMs);
-            input = new DataInputStream(new BufferedInputStream(connected.getInputStream(), 1 << 16));
-            output = new DataOutputStream(new BufferedOutputStream(connected.getOutputStream(), 1 << 16));
+            Bootstrap bootstrap = new Bootstrap()
+                    .group(NettyEventLoops.CLIENT_GROUP)
+                    .channel(NioSocketChannel.class)
+                    .option(ChannelOption.TCP_NODELAY, true)
+                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, connectTimeoutMs)
+                    .handler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) {
+                            ch.pipeline()
+                                    .addLast(new NettyFrameCodec.Decoder())
+                                    .addLast(new NettyFrameCodec.Encoder())
+                                    .addLast(new ClientHandler());
+                        }
+                    });
 
-            FrameIO.write(output,
-                    Frame.request(Opcode.HELLO, new Messages.Hello(clientKind, 0, clientId).encode(), null, 0));
-            Frame helloResp = FrameIO.read(input);
+            ChannelFuture connectFuture = bootstrap.connect(new InetSocketAddress(host, port));
+            if (!connectFuture.await(connectTimeoutMs, TimeUnit.MILLISECONDS)) {
+                connectFuture.cancel(true);
+                throw new SocketTimeoutException("connect timed out after " + connectTimeoutMs + "ms");
+            }
+            if (!connectFuture.isSuccess()) {
+                throw asIOException(connectFuture.cause());
+            }
+            connected = connectFuture.channel();
+
+            Frame helloFrame = Frame.request(Opcode.HELLO,
+                    new Messages.Hello(clientKind, 0, clientId).encode(), null, 0);
+            ChannelFuture writeHello = connected.writeAndFlush(helloFrame);
+            if (!writeHello.await(connectTimeoutMs, TimeUnit.MILLISECONDS)) {
+                writeHello.cancel(true);
+                throw new SocketTimeoutException("handshake write timed out after " + connectTimeoutMs + "ms");
+            }
+            if (!writeHello.isSuccess()) {
+                throw asIOException(writeHello.cause());
+            }
+
+            Frame helloResp = awaitHandshake(connectTimeoutMs);
             if (helloResp == null || helloResp.opcode() != Opcode.HELLO.code || !helloResp.isResponse()) {
                 throw new IOException("handshake failed");
             }
@@ -73,50 +100,72 @@ public final class ScpClient implements AutoCloseable {
             } catch (RuntimeException e) {
                 throw new IOException("malformed handshake response: " + e, e);
             }
-            connected.setSoTimeout(0);
         } catch (IOException | RuntimeException e) {
-            try {
-                connected.close();
-            } catch (IOException ignored) {
-            }
+            closeChannel(connected);
             throw e;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            closeChannel(connected);
+            throw new IOException("interrupted", e);
         }
-        socket = connected;
-        in = input;
-        out = output;
-        this.serverHello = hello;
+        channel = connected;
+        serverHello = hello;
+    }
 
-        Thread.ofVirtual().name("scp-reader-" + host + ":" + port).start(this::readLoop);
+    private Frame awaitHandshake(int timeoutMs) throws IOException, InterruptedException {
+        try {
+            return handshake.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            throw new SocketTimeoutException("handshake timed out after " + timeoutMs + "ms");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException io) {
+                throw io;
+            }
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new IOException(String.valueOf(cause), cause);
+        }
     }
 
     public Messages.HelloResp serverHello() {
         return serverHello;
     }
 
-    private void readLoop() {
-        try {
-            while (!closed.get()) {
-                Frame f = FrameIO.read(in);
-                if (f == null) break;
-                CompletableFuture<Frame> fut = pending.remove(f.correlationId());
-                if (fut != null) fut.complete(f);
+    private final class ClientHandler extends SimpleChannelInboundHandler<Frame> {
+        @Override
+        protected void channelRead0(ChannelHandlerContext ctx, Frame frame) {
+            if (!handshake.isDone()) {
+                handshake.complete(frame);
+                return;
             }
-        } catch (IOException e) {
-            // fall through to failure propagation
-        } finally {
+            CompletableFuture<Frame> fut = pending.remove(frame.correlationId());
+            if (fut != null) {
+                fut.complete(frame);
+            }
+        }
+
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) {
             failAll(new IOException("connection closed"));
-            try {
-                socket.close();
-            } catch (IOException ignored) {
-            }
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            failAll(asIOException(cause));
+            ctx.close();
         }
     }
 
     private void failAll(Exception e) {
         closed.set(true);
+        handshake.completeExceptionally(e);
         pending.keySet().forEach(id -> {
             CompletableFuture<Frame> fut = pending.remove(id);
-            if (fut != null) fut.completeExceptionally(e);
+            if (fut != null) {
+                fut.completeExceptionally(e);
+            }
         });
     }
 
@@ -134,27 +183,23 @@ public final class ScpClient implements AutoCloseable {
         } catch (RuntimeException e) {
             return CompletableFuture.failedFuture(e);
         }
+
         CompletableFuture<Frame> fut = new CompletableFuture<>();
         pending.put(id, fut);
         // whatever completes this future — response, connection failure, caller-side timeout or
         // orTimeout/cancel — the correlation entry must go with it, or long-lived pipelined
         // connections leak one entry per unanswered request
         fut.whenComplete((r, e) -> pending.remove(id, fut));
-        try {
-            writeLock.lock();
-            try {
-                FrameIO.write(out, request);
-            } finally {
-                writeLock.unlock();
+
+        ChannelFuture write = channel.writeAndFlush(request);
+        write.addListener(f -> {
+            if (!f.isSuccess()) {
+                pending.remove(id);
+                IOException failure = asIOException(f.cause());
+                failAll(failure);
+                fut.completeExceptionally(failure);
             }
-        } catch (IOException e) {
-            pending.remove(id);
-            failAll(e);
-            fut.completeExceptionally(e);
-            return fut;
-        }
-        // failAll() may have swept the map BETWEEN the closed-check above and our put — in that
-        // window nobody will ever complete this future; fail it ourselves rather than orphan it
+        });
         if (closed.get() && pending.remove(id) != null) {
             fut.completeExceptionally(new IOException("connection closed"));
         }
@@ -223,7 +268,7 @@ public final class ScpClient implements AutoCloseable {
     }
 
     public boolean isClosed() {
-        return closed.get();
+        return closed.get() || !channel.isOpen();
     }
 
     /** Outstanding correlation entries — observability and leak tests. */
@@ -233,12 +278,24 @@ public final class ScpClient implements AutoCloseable {
 
     @Override
     public void close() {
-        // fail pending futures synchronously: a caller observing isClosed()==true must be able
-        // to assume no future from this connection is still silently pending
         failAll(new IOException("connection closed"));
-        try {
-            socket.close();
-        } catch (IOException ignored) {
+        if (channel.eventLoop().inEventLoop()) {
+            channel.close();
+        } else {
+            channel.close().awaitUninterruptibly(1, TimeUnit.SECONDS);
         }
+    }
+
+    private static void closeChannel(Channel channel) {
+        if (channel != null) {
+            channel.close().awaitUninterruptibly(1, TimeUnit.SECONDS);
+        }
+    }
+
+    private static IOException asIOException(Throwable cause) {
+        if (cause instanceof IOException io) {
+            return io;
+        }
+        return new IOException(String.valueOf(cause), cause);
     }
 }
