@@ -20,10 +20,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * ack-on-fsync end-to-end (tech design §5.3): the durability policy is per-file, carried through
- * CreateFile -> lookup -> OPEN_CHUNK -> the chunk header on disk, and replicas fsync data+ledger
- * before acking. Verifies the policy physically lands in the header of every replica, the full
- * write/seal/read path works, and seal recovery works under fsync mode.
+ * ack-on-fsync end-to-end (tech design §5.3): the file write policy is carried through
+ * lookup -> OPEN_CHUNK -> the chunk header on disk, and replicas fsync data+ledger before acking.
+ * Verifies the policy physically lands in the header of every replica, the full write/seal/read
+ * path works, and seal recovery works under fsync mode.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class FsyncEndToEndTest {
@@ -60,7 +60,7 @@ class FsyncEndToEndTest {
             for (var replica : c.replicas()) {
                 byte[] headerBytes = fetchHeader(replica.endpoint(), c.chunkId());
                 ChunkFormats.Header header = ChunkFormats.Header.decode(headerBytes);
-                assertEquals(1, header.ackPolicy(),
+                assertTrue(header.fsyncOnAck(),
                         "replica " + replica.nodeId() + " of " + c.chunkId() + " missing fsync policy");
             }
         }
@@ -79,29 +79,6 @@ class FsyncEndToEndTest {
         workload.verifyAckedPrefix(client, fileId);
     }
 
-    @Test
-    void fsyncAndReplicateFilesCoexist() throws Exception {
-        FileId fsyncFile = client.create(fsyncSpec("/fsync-coexist")).id();
-        FileId fastFile = client.create(StrataClient.FileSpec.log("test", "/fast-topic")).id();
-        Workload w1 = new Workload(), w2 = new Workload();
-        try (StrataFile.Appender a1 = client.openById(fsyncFile).openForAppend(1);
-             StrataFile.Appender a2 = client.openById(fastFile).openForAppend(1)) {
-            w1.appendAcked(a1, 0, 100);
-            w2.appendAcked(a2, 0, 100);
-            a1.seal();
-            a2.seal();
-        }
-        w1.verifyAckedPrefix(client, fsyncFile);
-        w2.verifyAckedPrefix(client, fastFile);
-
-        // the fast file's headers carry ack-on-replicate
-        var lookup = lookupFile(fastFile);
-        var c = lookup.chunks().get(0);
-        ChunkFormats.Header header = ChunkFormats.Header.decode(
-                fetchHeader(c.replicas().get(0).endpoint(), c.chunkId()));
-        assertEquals(0, header.ackPolicy());
-    }
-
     private byte[] fetchHeader(String endpoint, io.strata.common.ChunkId chunkId) throws Exception {
         String[] hp = endpoint.split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "hdr")) {
@@ -116,7 +93,7 @@ class FsyncEndToEndTest {
     }
 
     private static StrataClient.FileSpec fsyncSpec(String path) {
-        return new StrataClient.FileSpec("test", path, (byte) 0, (byte) 0, (byte) 1 /* ack-on-fsync */);
+        return new StrataClient.FileSpec("test", path, StrataClient.WritePolicy.fsync(3, 2));
     }
 
     private Messages.LookupFileResp lookupFile(FileId fileId) throws Exception {

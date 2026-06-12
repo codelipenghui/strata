@@ -38,8 +38,8 @@ class FsyncPipelineWireTest {
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "perf")) {
 
             ChunkId id = new ChunkId(FileId.random(), 0);
-            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, (byte) 1 /* fsync */,
-                    (byte) 0, (byte) 0, 1 << 24, 1L).encode(), null, 5000);
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, true /* fsync */,
+                    1 << 24, 1L).encode(), null, 5000);
 
             long start = System.nanoTime();
             List<CompletableFuture<Frame>> futures = new ArrayList<>(appends);

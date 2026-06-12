@@ -102,34 +102,44 @@ public final class Records {
     }
 
     public record FileRecord(FileId fileId, StrataNamespace namespace, StrataPath path,
-                             byte fileKind, byte mediaClass, byte ackPolicy, FileState state, long createdAtMs,
+                             int replicationFactor, int ackQuorum, boolean fsyncOnAck,
+                             FileState state, long createdAtMs,
                              List<ChunkRecord> chunks, long createOpMsb, long createOpLsb) {
         public FileRecord {
             fileId = Objects.requireNonNull(fileId, "fileId");
             namespace = Objects.requireNonNull(namespace, "namespace");
             path = Objects.requireNonNull(path, "path");
+            if (replicationFactor <= 0) {
+                throw new IllegalArgumentException("replicationFactor must be positive: " + replicationFactor);
+            }
+            if (ackQuorum <= 0 || ackQuorum > replicationFactor) {
+                throw new IllegalArgumentException("ackQuorum must be in 1..replicationFactor: " + ackQuorum);
+            }
             state = Objects.requireNonNull(state, "state");
             chunks = List.copyOf(chunks);
         }
 
         public FileRecord(FileId fileId, StrataNamespace namespace, StrataPath path,
-                          byte fileKind, byte mediaClass, byte ackPolicy, FileState state, long createdAtMs,
-                          List<ChunkRecord> chunks) {
-            this(fileId, namespace, path, fileKind, mediaClass, ackPolicy, state, createdAtMs, chunks, 0, 0);
-        }
-
-        public FileRecord(FileId fileId, String namespace, String path,
-                          byte fileKind, byte mediaClass, byte ackPolicy, FileState state, long createdAtMs,
-                          List<ChunkRecord> chunks) {
-            this(fileId, StrataNamespace.of(namespace), StrataPath.of(path), fileKind, mediaClass, ackPolicy,
+                          int replicationFactor, int ackQuorum, boolean fsyncOnAck,
+                          FileState state, long createdAtMs, List<ChunkRecord> chunks) {
+            this(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck,
                     state, createdAtMs, chunks, 0, 0);
         }
 
         public FileRecord(FileId fileId, String namespace, String path,
-                          byte fileKind, byte mediaClass, byte ackPolicy, FileState state, long createdAtMs,
-                          List<ChunkRecord> chunks, long createOpMsb, long createOpLsb) {
-            this(fileId, StrataNamespace.of(namespace), StrataPath.of(path), fileKind, mediaClass, ackPolicy, state,
-                    createdAtMs, chunks,
+                          int replicationFactor, int ackQuorum, boolean fsyncOnAck,
+                          FileState state, long createdAtMs, List<ChunkRecord> chunks) {
+            this(fileId, StrataNamespace.of(namespace), StrataPath.of(path),
+                    replicationFactor, ackQuorum, fsyncOnAck,
+                    state, createdAtMs, chunks, 0, 0);
+        }
+
+        public FileRecord(FileId fileId, String namespace, String path,
+                          int replicationFactor, int ackQuorum, boolean fsyncOnAck,
+                          FileState state, long createdAtMs, List<ChunkRecord> chunks,
+                          long createOpMsb, long createOpLsb) {
+            this(fileId, StrataNamespace.of(namespace), StrataPath.of(path),
+                    replicationFactor, ackQuorum, fsyncOnAck, state, createdAtMs, chunks,
                     createOpMsb, createOpLsb);
         }
 
@@ -138,12 +148,12 @@ public final class Records {
         }
 
         public FileRecord withState(FileState newState) {
-            return new FileRecord(fileId, namespace, path, fileKind, mediaClass, ackPolicy, newState,
+            return new FileRecord(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck, newState,
                     createdAtMs, chunks, createOpMsb, createOpLsb);
         }
 
         public FileRecord withChunks(List<ChunkRecord> newChunks) {
-            return new FileRecord(fileId, namespace, path, fileKind, mediaClass, ackPolicy, state,
+            return new FileRecord(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck, state,
                     createdAtMs, newChunks, createOpMsb, createOpLsb);
         }
 
@@ -153,9 +163,10 @@ public final class Records {
 
         public byte[] encode() {
             BufWriter w = new BufWriter(256);
-            w.u8(4); // record version
+            w.u8(6); // record version
             w.fileId(fileId);
-            w.string(namespace.toString()).string(path.toString()).u8(fileKind).u8(mediaClass).u8(ackPolicy)
+            w.string(namespace.toString()).string(path.toString())
+                    .u32(replicationFactor).u32(ackQuorum).u8(fsyncOnAck ? 1 : 0)
                     .u8(state.value).u64(createdAtMs);
             w.u64(createOpMsb).u64(createOpLsb);
             w.varint(chunks.size());
@@ -171,11 +182,13 @@ public final class Records {
         public static FileRecord decode(byte[] bytes) {
             ByteBuffer b = ByteBuffer.wrap(bytes);
             byte version = b.get();
-            if (version != 4) throw new IllegalArgumentException("file record version " + version);
+            if (version != 6) throw new IllegalArgumentException("file record version " + version);
             FileId id = FileId.readFrom(b);
             StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             StrataPath path = StrataPath.of(Varint.readString(b));
-            byte kind = b.get(), media = b.get(), ack = b.get();
+            int replicationFactor = b.getInt();
+            int ackQuorum = b.getInt();
+            boolean fsyncOnAck = readBoolean(b);
             FileState state = FileState.from(b.get());
             long created = b.getLong();
             long fileOpMsb = b.getLong();
@@ -195,26 +208,31 @@ public final class Records {
                 for (int j = 0; j < nr; j++) replicas.add(b.getInt());
                 chunks.add(new ChunkRecord(index, cs, len, crc, epoch, replicas, chunkOpMsb, chunkOpLsb));
             }
-            return new FileRecord(id, namespace, path, kind, media, ack, state, created, chunks,
-                    fileOpMsb, fileOpLsb);
+            return new FileRecord(id, namespace, path, replicationFactor, ackQuorum, fsyncOnAck,
+                    state, created, chunks, fileOpMsb, fileOpLsb);
         }
     }
 
+    private static boolean readBoolean(ByteBuffer b) {
+        byte value = b.get();
+        if (value == 0) return false;
+        if (value == 1) return true;
+        throw new IllegalArgumentException("bad boolean value on wire: " + (value & 0xFF));
+    }
+
     public record NodeRecord(int nodeId, long incMsb, long incLsb, List<String> endpoints,
-                             String zone, String rack, String host, byte mediaClass,
-                             long capacityBytes, NodeState state) {
+                             String zone, String rack, String host, long capacityBytes, NodeState state) {
         public NodeRecord {
             endpoints = List.copyOf(endpoints);
         }
 
         public NodeRecord withState(NodeState s) {
-            return new NodeRecord(nodeId, incMsb, incLsb, endpoints, zone, rack, host, mediaClass,
-                    capacityBytes, s);
+            return new NodeRecord(nodeId, incMsb, incLsb, endpoints, zone, rack, host, capacityBytes, s);
         }
 
         public NodeRecord withIncarnation(long msb, long lsb, List<String> eps, String z, String r, String h,
-                                          byte media, long capacity) {
-            return new NodeRecord(nodeId, msb, lsb, eps, z, r, h, media, capacity, NodeState.REGISTERED);
+                                          long capacity) {
+            return new NodeRecord(nodeId, msb, lsb, eps, z, r, h, capacity, NodeState.REGISTERED);
         }
 
         public String endpoint() {
@@ -223,29 +241,28 @@ public final class Records {
 
         public byte[] encode() {
             BufWriter w = new BufWriter(128);
-            w.u8(1);
+            w.u8(2);
             w.u32(nodeId).u64(incMsb).u64(incLsb);
             w.varint(endpoints.size());
             for (String e : endpoints) w.string(e);
             w.string(zone).string(rack).string(host);
-            w.u8(mediaClass).u64(capacityBytes).u8(state.value);
+            w.u64(capacityBytes).u8(state.value);
             return w.toBytes();
         }
 
         public static NodeRecord decode(byte[] bytes) {
             ByteBuffer b = ByteBuffer.wrap(bytes);
             byte version = b.get();
-            if (version != 1) throw new IllegalArgumentException("node record version " + version);
+            if (version != 2) throw new IllegalArgumentException("node record version " + version);
             int id = b.getInt();
             long msb = b.getLong(), lsb = b.getLong();
             int ne = count(b, "endpoint");
             List<String> eps = new ArrayList<>(ne);
             for (int i = 0; i < ne; i++) eps.add(Varint.readString(b));
             String zone = Varint.readString(b), rack = Varint.readString(b), host = Varint.readString(b);
-            byte media = b.get();
             long cap = b.getLong();
             NodeState state = NodeState.from(b.get());
-            return new NodeRecord(id, msb, lsb, eps, zone, rack, host, media, cap, state);
+            return new NodeRecord(id, msb, lsb, eps, zone, rack, host, cap, state);
         }
     }
 }

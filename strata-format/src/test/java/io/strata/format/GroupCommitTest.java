@@ -41,7 +41,7 @@ class GroupCommitTest {
     void pipelinedFsyncAppendsCoalesceForces() throws Exception {
         int appends = 400;
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, (byte) 0, (byte) 0, ChunkStore.ACK_ON_FSYNC, 1, 1L);
+            store.open(id, true, 1, 1L);
 
             List<CompletableFuture<ChunkStore.AppendResult>> futures = new ArrayList<>(appends);
             byte[] payload = "group-commit-payload".getBytes();
@@ -75,7 +75,7 @@ class GroupCommitTest {
         // sequential (non-pipelined) appends: each future completion implies a covering force;
         // crash-recovery must retain everything acked even with no clean close
         ChunkStore store = new ChunkStore(dir);
-        store.open(id, (byte) 0, (byte) 0, ChunkStore.ACK_ON_FSYNC, 1, 1L);
+        store.open(id, true, 1, 1L);
         byte[] payload = "durable!".getBytes();
         long offset = 0;
         for (int i = 0; i < 20; i++) {
@@ -97,7 +97,7 @@ class GroupCommitTest {
     @Test
     void sealWithPipelinedFsyncAppendsDrainsCleanly() throws Exception {
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, (byte) 0, (byte) 0, ChunkStore.ACK_ON_FSYNC, 1, 1L);
+            store.open(id, true, 1, 1L);
             byte[] payload = "drain-me".getBytes();
             List<CompletableFuture<ChunkStore.AppendResult>> futures = new ArrayList<>();
             long offset = 0;
@@ -115,7 +115,7 @@ class GroupCommitTest {
     @Test
     void replicateModeDoesNotForce() throws Exception {
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, (byte) 0, (byte) 0, ChunkStore.ACK_ON_REPLICATE, 1, 1L);
+            store.open(id, false, 1, 1L);
             byte[] payload = "fast".getBytes();
             long offset = 0;
             for (int i = 0; i < 50; i++) {

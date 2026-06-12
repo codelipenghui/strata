@@ -50,7 +50,7 @@ final class NodeHandlers implements ScpServer.Handler {
                 if (node.isDraining()) {
                     throw new ScpException(ErrorCode.NO_CAPACITY, "node draining");
                 }
-                store.open(m.chunkId(), m.fileKind(), m.mediaClass(), m.ackPolicy(), m.writeEpoch(), m.createdAtMs());
+                store.open(m.chunkId(), m.fsyncOnAck(), m.writeEpoch(), m.createdAtMs());
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
 

@@ -110,7 +110,7 @@ final class ControlLoop implements AutoCloseable {
             var reg = new Messages.RegisterNode(
                     node.incarnation().getMostSignificantBits(), node.incarnation().getLeastSignificantBits(),
                     List.of(node.endpoint()), config.zone(), config.rack(), config.host(),
-                    List.of(new Messages.MediaCapacity(config.mediaClass(), config.capacityBytes())),
+                    List.of(new Messages.StorageCapacity(config.capacityBytes())),
                     1, 0);
             ByteBuffer resp = meta.call(Opcode.REGISTER_NODE, reg.encode(), null, CALL_TIMEOUT_MS);
             var r = Messages.RegisterResp.decode(resp);
@@ -130,8 +130,7 @@ final class ControlLoop implements AutoCloseable {
         var hb = new Messages.NodeHeartbeat(node.nodeId(),
                 node.incarnation().getMostSignificantBits(), node.incarnation().getLeastSignificantBits(),
                 sessionEpoch,
-                List.of(new Messages.MediaUsage(config.mediaClass(), used,
-                        Math.max(0, config.capacityBytes() - used))),
+                List.of(new Messages.StorageUsage(used, Math.max(0, config.capacityBytes() - used))),
                 commandQueue.size(), done);
         try {
             ByteBuffer resp = meta.call(Opcode.NODE_HEARTBEAT, hb.encode(), null, CALL_TIMEOUT_MS);

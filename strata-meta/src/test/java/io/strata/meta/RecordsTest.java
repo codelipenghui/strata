@@ -55,16 +55,19 @@ class RecordsTest {
         Records.ChunkRecord chunk = new Records.ChunkRecord(3, ChunkState.SEALED, 4096, 0xAA, 5,
                 List.of(7, 8), 33, 44);
         Records.FileRecord record = new Records.FileRecord(fileId, "test", "/test-file",
-                (byte) 1, (byte) 2, (byte) 3, Records.FileState.OPEN, 1234, List.of(chunk), 11, 22);
+                3, 2, true, Records.FileState.OPEN, 1234, List.of(chunk), 11, 22);
 
         assertEquals(new io.strata.common.ChunkId(fileId, 3), record.chunkId(3));
         assertEquals(io.strata.common.StrataNamespace.of("test"), record.namespace());
+        assertEquals(3, record.replicationFactor());
+        assertEquals(2, record.ackQuorum());
+        assertTrue(record.fsyncOnAck());
         assertTrue(record.createdBy(11, 22));
         assertFalse(record.createdBy(11, 23));
         assertEquals(Records.FileState.SEALED, record.withState(Records.FileState.SEALED).state());
         assertEquals(0, record.withChunks(List.of()).chunks().size());
         Records.FileRecord typed = new Records.FileRecord(fileId, io.strata.common.StrataNamespace.of("typed"),
-                io.strata.common.StrataPath.of("/typed-file"), (byte) 1, (byte) 2, (byte) 3,
+                io.strata.common.StrataPath.of("/typed-file"), 3, 2, false,
                 Records.FileState.OPEN, 1234, List.of());
         assertTrue(typed.createdBy(0, 0));
         assertEquals(io.strata.common.StrataPath.of("/typed-file"), typed.path());
@@ -85,15 +88,14 @@ class RecordsTest {
         assertThrows(UnsupportedOperationException.class, () -> chunk.replicas().add(4));
 
         List<Records.ChunkRecord> chunks = new ArrayList<>(List.of(chunk));
-        Records.FileRecord file = new Records.FileRecord(new FileId(1, 2), "test", "/test-file",
-                (byte) 0, (byte) 0, (byte) 0, Records.FileState.OPEN, 1, chunks);
+        Records.FileRecord file = new Records.FileRecord(new FileId(1, 2), "test", "/copy-test",
+                3, 2, false, Records.FileState.OPEN, 1, chunks);
         chunks.clear();
         assertEquals(List.of(chunk), file.chunks());
         assertThrows(UnsupportedOperationException.class, () -> file.chunks().clear());
 
         List<String> endpoints = new ArrayList<>(List.of("h:1"));
-        Records.NodeRecord node = new Records.NodeRecord(1, 1, 2, endpoints,
-                "z", "r", "h", (byte) 0, 1, Records.NodeState.REGISTERED);
+        Records.NodeRecord node = new Records.NodeRecord(1, 1, 2, endpoints, "z", "r", "h", 1, Records.NodeState.REGISTERED);
         endpoints.add("h:2");
         assertEquals(List.of("h:1"), node.endpoints());
         assertThrows(UnsupportedOperationException.class, () -> node.endpoints().add("h:3"));
@@ -117,14 +119,12 @@ class RecordsTest {
 
     @Test
     void nodeRecordRoundtripAndHelpers() {
-        Records.NodeRecord node = new Records.NodeRecord(7, 1, 2, List.of("h:9000"),
-                "z", "r", "host", (byte) 3, 1000, Records.NodeState.DRAINING);
+        Records.NodeRecord node = new Records.NodeRecord(7, 1, 2, List.of("h:9000"), "z", "r", "host", 1000, Records.NodeState.DRAINING);
         assertEquals("h:9000", node.endpoint());
-        assertEquals("", new Records.NodeRecord(8, 1, 2, List.of(), "z", "r", "host",
-                (byte) 3, 1000, Records.NodeState.REGISTERED).endpoint());
+        assertEquals("", new Records.NodeRecord(8, 1, 2, List.of(), "z", "r", "host", 1000, Records.NodeState.REGISTERED).endpoint());
 
         Records.NodeRecord reincarnated = node.withIncarnation(10, 20, List.of("new:1"),
-                "z2", "r2", "host2", (byte) 4, 2000);
+                "z2", "r2", "host2", 2000);
         assertEquals(7, reincarnated.nodeId());
         assertEquals(Records.NodeState.REGISTERED, reincarnated.state());
         assertEquals("new:1", reincarnated.endpoint());

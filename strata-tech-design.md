@@ -54,10 +54,9 @@ Topic-partition ──> segments (Kafka roll policy) ──1:1──> files ─�
 ChunkDescriptor {
   chunkId        (fileId, index)
   state          OPEN | SEALED | DELETING
-  layout         REPLICATED { replicas: [nodeId x3], writeEpoch }   // v1: only layout
+  layout         REPLICATED { replicas: [nodeId x replicationFactor], writeEpoch }   // v1: only layout
                  // future: EC { scheme, stripes... } — additive, never required
   length, crc    (set at seal; authoritative)
-  mediaClass     hdd | nvme | object   (set at create; never changed by the system)
 }
 ```
 
@@ -71,7 +70,7 @@ Built on Kafka's KRaft layer: consensus core untouched; two state machines on tw
 
 Keeps: topics, configs, ACLs, features, broker registration/heartbeats, leadership + leader epochs.
 **Removed:** replica assignment, ISR state and shrink/expand logic, reassignment — Strata partitions are `{leaderBrokerId, leaderEpoch}` and nothing else. This deletion is the main upstream-merge friction point and gets the densest test coverage.
-**Added record types:** `StorageNodeRecord { nodeId, incarnationId, endpoints, topology{zone,rack,host}, mediaClass, capacityBytes, state: REGISTERED|FENCED|DRAINING|DEAD }`.
+**Added record types:** `StorageNodeRecord { nodeId, incarnationId, endpoints, topology{zone,rack,host}, capacityBytes, state: REGISTERED|FENCED|DRAINING|DEAD }`.
 
 ### 4.2 Chunk-map state machine (new, second Raft log)
 
@@ -84,7 +83,7 @@ Broker-facing APIs use Kafka's schema-generated framework (both ends are Kafka-d
 | API | Caller | Transport | Notes |
 |---|---|---|---|
 | `CreateFile` / `DeleteFiles` | broker | Kafka RPC | retention is evaluated by the partition leader (it owns policy); metadata orchestrates physical deletion |
-| `CreateChunk(fileId, mediaClassHint)` → `{chunkId, replicas[3], writeEpoch}` | broker | Kafka RPC | placement decided here (§8); commit-before-write (§9.2 relies on this) |
+| `CreateChunk(fileId)` → `{chunkId, replicas[replicationFactor], writeEpoch}` | broker | Kafka RPC | placement decided here (§8); commit-before-write (§9.2 relies on this) |
 | `SealChunk(chunkId, length, crc)` | broker | Kafka RPC | metadata commit is the authoritative seal point |
 | `LookupChunks(topicIdPartition, offsetRange)` | broker | Kafka RPC | served from leader's in-memory state; brokers cache aggressively (sealed descriptors are immutable) |
 | `REGISTER_NODE` / `NODE_HEARTBEAT` / `INVENTORY_REPORT` | storage node | SCP (§10.4) | heartbeat **responses** carry commands: `REPLICATE`, `DELETE`, `DRAIN` |
@@ -108,10 +107,10 @@ Why this exists: build order. The Strata file service, SCP, on-disk formats, sea
 
 1. Producer → leader broker (standard Kafka produce, unchanged on the wire).
 2. Broker validates (epoch, producer state, transaction state) — in-memory, as Kafka does.
-3. Broker appends the batch to the partition's open chunk: fan-out `APPEND` (§10.3) to all 3 replicas.
+3. Broker appends the batch to the partition's open chunk: fan-out `APPEND` (§10.3) to all replicas selected by the file's `replicationFactor`.
 4. Each replica: checks `writeEpoch ≥` its locally stored max epoch for the chunk (else `FENCED_EPOCH`), enforces contiguity (`baseOffset` must equal local end, else `OFFSET_GAP`; leader retries), appends payload bytes verbatim to the chunk file, appends an entry to the chunk's integrity ledger (§11.3), optionally fsyncs (§5.3), acks.
-5. Broker acks the producer at **2 of 3** replica acks. Latency = second-fastest replica.
-6. Broker inserts the batch into its in-memory tail cache and advances the **durable offset (DO)** = highest contiguous byte acked by ≥2 replicas. DO is piggybacked on the next `APPEND` (replicas learn DO with one-round lag — the BookKeeper LAC pattern). On idle partitions, an empty-payload `APPEND` serves as a DO beacon.
+5. Broker acks the producer at the file's `ackQuorum` replica acks. With the default policy (`replicationFactor=3`, `ackQuorum=2`), latency = second-fastest replica.
+6. Broker inserts the batch into its in-memory tail cache and advances the **durable offset (DO)** = highest contiguous byte acked by at least `ackQuorum` replicas. DO is piggybacked on the next `APPEND` (replicas learn DO with one-round lag — the BookKeeper LAC pattern). On idle partitions, an empty-payload `APPEND` serves as a DO beacon.
 
 ### 5.2 Chunk lifecycle driven by the leader
 
@@ -121,7 +120,7 @@ Why this exists: build order. The Strata file service, SCP, on-disk formats, sea
 
 ### 5.3 Durability policy
 
-Per-topic: `ack-on-replicate` (default; durability = 2 independent nodes, flushes async — Kafka's own stance) or `ack-on-fsync` (replicas fsync data + ledger before acking; belongs on NVMe media class). The policy is carried in `OPEN_CHUNK` and stored per chunk so replicas don't consult config. Benchmarks publish both modes.
+Per-file write policy: `replicationFactor`, `ackQuorum`, and `fsyncOnAck`. The default policy is `replicationFactor=3`, `ackQuorum=2`, `fsyncOnAck=false` (durability = 2 independent nodes, flushes async — Kafka's own stance). When `fsyncOnAck=true`, replicas fsync data + ledger before acking. The fsync choice is carried in `OPEN_CHUNK` and stored per chunk so replicas don't consult config. Benchmarks publish both fsync modes.
 
 **Group commit (fsync mode).** Replicas never force per append: the write lands in the page cache and the ack defers until a per-chunk flusher's force covers it — one force amortizes across every append since the previous one, preceded by a short accumulation window (in-flight fsyncs throttle concurrent writes at the OS level; a clean gap lets a real batch land). Ack latency is ~accumulation + 1–2 force times regardless of pipeline depth. This requires deferred append acks at the server (§10.2 ordering note): validation and writes stay synchronous and in-order on the connection; only the response completes later, which is protocol-legal (correlation ids).
 
@@ -162,7 +161,7 @@ The recovering leader must establish the durable prefix without the old leader's
 3. Scan forward batch-by-batch (`READ` + ledger verification): if a batch exists on **any** reachable replica (CRC-valid), re-replicate it to quorum and advance; stop at the first offset found on none.
 4. Seal at the stop point; write footers; commit `SealChunk`.
 
-Property: any producer-acked batch existed on ≥2 replicas; with ≤1 node failure, ≥1 holder is reachable, so step 3 preserves it. Double failure inside one chunk's replica set within the repair window can lose the un-re-replicated tail — explicitly the same tolerance as Kafka RF=3/acks=all/min.isr=2. Batches beyond the seal point were never acked; discarding them is correct.
+Property: any producer-acked batch existed on at least `ackQuorum` replicas; with failures below the policy's tolerated threshold, at least one holder is reachable, so step 3 preserves it. With the default policy, this is the same tolerance as Kafka RF=3/acks=all/min.isr=2. Batches beyond the seal point were never acked; discarding them is correct.
 
 ### 7.4 Metadata quorum failure
 
@@ -170,9 +169,9 @@ Single-member loss: Raft failover, seconds, invisible to the data path. Quorum l
 
 ## 8. Placement
 
-Inputs at `CreateChunk`: capacity-weighted random selection over `REGISTERED` nodes, filtered by (a) requested `mediaClass`, (b) anti-affinity — no two replicas share the configured failure domain (default: host; recommended: rack/zone where topology allows), (c) exclusion of `SUSPECT/DRAINING/DEAD` nodes and nodes over a fullness watermark. Weights derive from free capacity, so new nodes absorb a proportionate share of *new* writes immediately — never a thundering herd, and never a rebalance. The same selector serves repair-target choice and operator relocation.
+Inputs at `CreateChunk`: capacity-weighted random selection over `REGISTERED` nodes, filtered by (a) anti-affinity — no two replicas share the configured failure domain (default: host; recommended: rack/zone where topology allows), (b) exclusion of `SUSPECT/DRAINING/DEAD` nodes and nodes over a fullness watermark. Weights derive from free capacity, so new nodes absorb a proportionate share of *new* writes immediately — never a thundering herd, and never a rebalance. The same selector serves repair-target choice and operator relocation.
 
-Anti-correlation is a first-order p99.9 concern (quorum latency is bounded by the second-slowest replica): placement must avoid co-locating replicas on shared hosts or shared burst-credit storage. Media classes are static per chunk (no automatic demotion — product doc §3).
+Anti-correlation is a first-order p99.9 concern (quorum latency is bounded by the second-slowest replica): placement must avoid co-locating replicas on shared hosts or shared burst-credit storage.
 
 ## 9. Background work
 
@@ -236,7 +235,7 @@ u16  headerLength
 | Opcode | Name | Request header (v1 fixed fields) | Response (after errorCode) | Payload |
 |---|---|---|---|---|
 | 0x0001 | `HELLO` | see §10.2 | see §10.2 | — |
-| 0x0010 | `OPEN_CHUNK` | chunkId{uuid fileId, u32 index}, i32 writeEpoch, u8 ackPolicy (0 replicate / 1 fsync), u8 mediaClass, u8 fileKind, u64 expectedMaxBytes, u64 createdAtMs | — | — |
+| 0x0010 | `OPEN_CHUNK` | chunkId{uuid fileId, u32 index}, i32 writeEpoch, u8 fsyncOnAck (0/1), u64 expectedMaxBytes, u64 createdAtMs | — | — |
 | 0x0011 | `APPEND` | chunkId, i32 writeEpoch, u64 baseOffset, u64 durableOffset | u64 endOffset | log bytes (may be empty = DO beacon) |
 | 0x0012 | `READ` | chunkId, u64 offset, u32 maxBytes | u64 localEndOffset, u64 durableOffset | chunk bytes |
 | 0x0013 | `FENCE` | chunkId, i32 fenceEpoch | i32 persistedFenceEpoch, u64 localEndOffset, u64 lastKnownDO, u8 state | — |
@@ -259,8 +258,8 @@ Notes: `FETCH_CHUNK` is distinct from `READ` so it can run in a separate QoS/thr
 
 | Opcode | Name | Request (v1) | Response (after errorCode) |
 |---|---|---|---|
-| 0x0101 | `REGISTER_NODE` | uuid incarnationId, array endpoints, topology{string zone, rack, host}, array{u8 mediaClass, u64 capacityBytes}, u32 onDiskFormatMax, u64 featureBits | u32 nodeId, u64 sessionEpoch, u32 heartbeatIntervalMs, u32 leaseMs |
-| 0x0102 | `NODE_HEARTBEAT` | u32 nodeId, uuid incarnationId, u64 sessionEpoch, array{u8 mediaClass, u64 usedBytes, u64 freeBytes}, u32 repairQueueDepth | u64 leaseValidUntilMs, array commands |
+| 0x0101 | `REGISTER_NODE` | uuid incarnationId, array endpoints, topology{string zone, rack, host}, array{u64 capacityBytes}, u32 onDiskFormatMax, u64 featureBits | u32 nodeId, u64 sessionEpoch, u32 heartbeatIntervalMs, u32 leaseMs |
+| 0x0102 | `NODE_HEARTBEAT` | u32 nodeId, uuid incarnationId, u64 sessionEpoch, array{u64 usedBytes, u64 freeBytes}, u32 repairQueueDepth | u64 leaseValidUntilMs, array commands |
 | 0x0103 | `INVENTORY_REPORT` | u32 nodeId, u32 shardIndex, u32 shardCount, array{chunkId, u8 state, u64 length, u32 crc} | u16 ack |
 
 v0 additions: `NODE_HEARTBEAT` requests carry tagged field 0 `completedCommands` (array{u64
@@ -300,7 +299,7 @@ All persistent structures share three rules: every structure begins with `{u32 m
 ```
 [ header block — 4096 bytes, fixed ]
   u32 magic "SCHK" · u16 formatVersion=1 · u16 headerSize
-  uuid fileId · u32 chunkIndex · u8 fileKind · u8 mediaClassAtCreate
+  uuid fileId · u32 chunkIndex · u8 fsyncOnAck
   i32 createWriteEpoch · u64 createdAtMs
   u32 compatFlags · u32 roCompatFlags · u32 incompatFlags
   tagged block · zero padding · u32 headerCrc (last 4 bytes)
@@ -332,7 +331,7 @@ Fixed 64-byte trailer at EOF: `u64 dataLength · u64 footerStart · u32 sectionC
 ### 11.3 Sidecar and integrity ledger (per chunk, node-local, never replicated)
 
 - **Sidecar `<chunk>.meta`** — 512 bytes, single-sector atomic rewrite: `{magic "SMET", u16 ver, i32 writeEpoch, i32 fenceEpoch, u64 lastKnownDO (advisory), u8 state, u32 crc}`. Holds the fencing state that must survive restart (§5.4).
-- **Integrity ledger `<chunk>.j`** — append-only, one fixed 24-byte entry per `APPEND`: `{u64 endOffset, u32 payloadCrc, i32 writeEpoch, u32 reserved, u32 entryCrc}`. Crash recovery scans the ledger, verifies the last entries' CRCs against the data file, and truncates the data file to the last verified `endOffset` — **the storage node never parses payload bytes, even to recover.** Under `ack-on-fsync`, data and ledger are fsynced before ack; under `ack-on-replicate`, both flush lazily. Overhead ≈ 24 B per multi-KB..MB append, written sequentially. The ledger is deleted once the chunk seals (the footer's CRC_RANGES supersede it).
+- **Integrity ledger `<chunk>.j`** — append-only, one fixed 24-byte entry per `APPEND`: `{u64 endOffset, u32 payloadCrc, i32 writeEpoch, u32 reserved, u32 entryCrc}`. Crash recovery scans the ledger, verifies the last entries' CRCs against the data file, and truncates the data file to the last verified `endOffset` — **the storage node never parses payload bytes, even to recover.** When `fsyncOnAck=true`, data and ledger are fsynced before ack; otherwise both flush lazily. Overhead ≈ 24 B per multi-KB..MB append, written sequentially. The ledger is deleted once the chunk seals (the footer's CRC_RANGES supersede it).
 
 ### 11.4 Checkpoint file content (broker-defined, rides ordinary CHECKPOINT files)
 
@@ -354,7 +353,7 @@ The client library the broker embeds (JVM, since the broker is Kafka-derived); t
 interface StrataClient extends AutoCloseable {
   static StrataClient connect(ClientConfig config);
   StrataFile create(FileSpec spec);
-      // spec: StrataNamespace namespace, StrataPath path, fileKind, mediaClass, ackPolicy
+      // spec: StrataNamespace namespace, StrataPath path
   StrataFile open(StrataNamespace namespace, StrataPath path);
   StrataFile openById(FileId id);             // admin/internal escape hatch
   void delete(StrataNamespace namespace, StrataPath path);
@@ -457,7 +456,7 @@ Produce-path latency decomposed by stage (broker processing / storage append / q
 8. **Flow control** — v1 uses static per-connection caps from `HELLO`; whether repair traffic needs dynamic credit-based flow control to protect foreground p99 at scale is unproven either way.
 9. **Compression** — reserved in the frame flags; whether `FETCH_CHUNK` (repair/relocation) benefits enough to justify it, given producers already compress batches.
 10. **ZK backend retirement** — the v0 backend's cutoff point: which milestone flips the conformance gates, and confirmation that no v0 deployment needs its metadata to survive (current answer: none — no migration tooling will be built).
-11. **Group commit for ack-on-fsync** — RESOLVED in v0 (§5.3): per-chunk coalesced forces with a 5 ms accumulation window and deferred append acks. Measured at window 256 on a shared-SSD laptop: p50 2,941 ms → 75 ms (39×), throughput 0.1 → 3.2 MB/s (32×). Remaining tunable: the accumulation window should become a config and be re-calibrated on production hardware (per-node devices interfere less than a shared laptop SSD).
+11. **Group commit for `fsyncOnAck`** — RESOLVED in v0 (§5.3): per-chunk coalesced forces with a 5 ms accumulation window and deferred append acks. Measured at window 256 on a shared-SSD laptop: p50 2,941 ms → 75 ms (39×), throughput 0.1 → 3.2 MB/s (32×). Remaining tunable: the accumulation window should become a config and be re-calibrated on production hardware (per-node devices interfere less than a shared laptop SSD).
 
 ---
 

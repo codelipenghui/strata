@@ -406,7 +406,7 @@ class ControlLoopTest {
 
             ChunkId valid = new ChunkId(FileId.random(), 0);
             byte[] data = "valid".getBytes();
-            store.open(valid, (byte) 0, (byte) 0, ChunkStore.ACK_ON_REPLICATE, 1, 1L);
+            store.open(valid, false, 1, 1L);
             store.append(valid, 1, 0, 0, ByteBuffer.wrap(data));
             var sealed = store.seal(valid, 1, data.length, null);
 
@@ -415,7 +415,7 @@ class ControlLoopTest {
             assertTrue(store.contains(valid));
 
             ChunkId stale = new ChunkId(FileId.random(), 1);
-            store.open(stale, (byte) 0, (byte) 0, ChunkStore.ACK_ON_REPLICATE, 1, 1L);
+            store.open(stale, false, 1, 1L);
             store.append(stale, 1, 0, 0, ByteBuffer.wrap(data));
             store.seal(stale, 1, data.length, null);
 
@@ -427,7 +427,7 @@ class ControlLoopTest {
 
             ChunkId crcZeroDescriptor = new ChunkId(FileId.random(), 2);
             byte[] crcData = "crc-must-not-be-wildcard".getBytes();
-            store.open(crcZeroDescriptor, (byte) 0, (byte) 0, ChunkStore.ACK_ON_REPLICATE, 1, 1L);
+            store.open(crcZeroDescriptor, false, 1, 1L);
             store.append(crcZeroDescriptor, 1, 0, 0, ByteBuffer.wrap(crcData));
             int localCrc = store.seal(crcZeroDescriptor, 1, crcData.length, null).dataCrc();
             assertTrue(localCrc != 0, "test payload must exercise the nonzero-local/zero-expected path");
@@ -446,7 +446,7 @@ class ControlLoopTest {
         try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             ChunkId open = new ChunkId(FileId.random(), 0);
-            node.store().open(open, (byte) 0, (byte) 0, ChunkStore.ACK_ON_REPLICATE, 1, 1L);
+            node.store().open(open, false, 1, 1L);
 
             ScpException e = assertThrows(ScpException.class,
                     () -> invokeReplicate(loop, new Messages.ReplicateCmd(15, open, List.of(),
@@ -479,7 +479,7 @@ class ControlLoopTest {
         byte[] data = "repair-source".getBytes();
         try (ChunkStore sourceStore = new ChunkStore(dir.resolve("source-io"));
              StorageNode node = new StorageNode(NodeConfig.standalone(dir.resolve("target-io")))) {
-            sourceStore.open(chunkId, (byte) 0, (byte) 0, ChunkStore.ACK_ON_REPLICATE, 1, 1L);
+            sourceStore.open(chunkId, false, 1, 1L);
             sourceStore.append(chunkId, 1, 0, 0, ByteBuffer.wrap(data));
             int crc = sourceStore.seal(chunkId, 1, data.length, null).dataCrc();
 
@@ -509,7 +509,7 @@ class ControlLoopTest {
         byte[] data = "repair-source".getBytes();
         try (ChunkStore sourceStore = new ChunkStore(dir.resolve("source"));
              StorageNode node = new StorageNode(NodeConfig.standalone(dir.resolve("target")))) {
-            sourceStore.open(chunkId, (byte) 0, (byte) 0, ChunkStore.ACK_ON_REPLICATE, 1, 1L);
+            sourceStore.open(chunkId, false, 1, 1L);
             sourceStore.append(chunkId, 1, 0, 0, ByteBuffer.wrap(data));
             int crc = sourceStore.seal(chunkId, 1, data.length, null).dataCrc();
 
@@ -734,12 +734,12 @@ class ControlLoopTest {
 
     private static NodeConfig config(ScpServer metaServer, int inventoryIntervalMs) {
         return new NodeConfig(Path.of("."), 0, "127.0.0.1", null, List.of(endpoint(metaServer)),
-                "z", "r", "h", (byte) 0, 1L << 20, inventoryIntervalMs);
+                "z", "r", "h", 1L << 20, inventoryIntervalMs);
     }
 
     private static NodeConfig configWithoutMetadata() {
         return new NodeConfig(Path.of("."), 0, "127.0.0.1", null, List.of(),
-                "z", "r", "h", (byte) 0, 1L << 20, 60_000);
+                "z", "r", "h", 1L << 20, 60_000);
     }
 
     private static void invokeReplicate(ControlLoop loop, Messages.ReplicateCmd cmd) throws Exception {

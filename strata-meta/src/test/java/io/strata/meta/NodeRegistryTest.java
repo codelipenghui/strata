@@ -47,39 +47,39 @@ class NodeRegistryTest {
 
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
                 1, 2, List.of(), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 1)), 1, 0)));
+                List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
                 1, 2, List.of("node:9000"), "z", "r", "h", List.of(), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
                 1, 2, List.of("node:9000"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 0)), 1, 0)));
+                List.of(new Messages.StorageCapacity(0)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
                 1, 2, List.of("node"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 1)), 1, 0)));
+                List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
                 1, 2, List.of("node :9000"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 1)), 1, 0)));
+                List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
                 1, 2, List.of("[::1:9000"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 1)), 1, 0)));
+                List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
                 1, 2, List.of("node:not-a-port"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 1)), 1, 0)));
+                List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
                 1, 2, List.of("node:0"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 1)), 1, 0)));
+                List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
                 1, 2, List.of("node:9000"), "", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 1)), 1, 0)));
+                List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
                 1, 2, List.of(""), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 1)), 1, 0)));
+                List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
                 1, 2, List.of("node:65536"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 1)), 1, 0)));
+                List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertEquals(1, registry.register(new Messages.RegisterNode(
                 1, 2, List.of("[::1]:9000"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 1)), 1, 0)).nodeId());
+                List.of(new Messages.StorageCapacity(1)), 1, 0)).nodeId());
     }
 
     @Test
@@ -90,22 +90,21 @@ class NodeRegistryTest {
 
         ScpException e = assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
                 1, 2, List.of("node:9000"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 1)), 1, 0)));
+                List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertEquals(ErrorCode.NOT_LEADER, e.code());
     }
 
     @Test
     void registerReusesPersistedIdentityAndDrainsHeartbeatCommandsInBatches() throws Exception {
         FakeStore store = new FakeStore();
-        Records.NodeRecord existing = new Records.NodeRecord(9, 11, 12, List.of("old:9000"),
-                "z", "r", "old-host", (byte) 0, 10, Records.NodeState.REGISTERED);
+        Records.NodeRecord existing = new Records.NodeRecord(9, 11, 12, List.of("old:9000"), "z", "r", "old-host", 10, Records.NodeState.REGISTERED);
         store.nodes.put(9, new MetadataStore.Versioned<>(existing, 2));
 
         NodeRegistry registry = new NodeRegistry(store, config());
 
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
                 11, 12, List.of("new:9000"), "z", "r", "new-host",
-                List.of(new Messages.MediaCapacity((byte) 3, 99)), 1, 0));
+                List.of(new Messages.StorageCapacity(99)), 1, 0));
         assertEquals(9, registered.nodeId());
         assertEquals("new:9000", registry.endpointOf(9));
         assertEquals("new-host", registry.hostOf(9));
@@ -115,10 +114,10 @@ class NodeRegistryTest {
         }
         Messages.HeartbeatResp first = registry.heartbeat(new Messages.NodeHeartbeat(
                 9, 11, 12, registered.sessionEpoch(),
-                List.of(new Messages.MediaUsage((byte) 3, 1, 98)), 0, List.of()), (nodeId, ignored) -> {});
+                List.of(new Messages.StorageUsage(1, 98)), 0, List.of()), (nodeId, ignored) -> {});
         Messages.HeartbeatResp second = registry.heartbeat(new Messages.NodeHeartbeat(
                 9, 11, 12, registered.sessionEpoch(),
-                List.of(new Messages.MediaUsage((byte) 3, 1, 98)), 0, List.of()), (nodeId, ignored) -> {});
+                List.of(new Messages.StorageUsage(1, 98)), 0, List.of()), (nodeId, ignored) -> {});
 
         assertEquals(16, first.commands().size());
         assertEquals(2, second.commands().size());
@@ -131,7 +130,7 @@ class NodeRegistryTest {
         NodeRegistry registry = new NodeRegistry(store, config());
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
                 31, 32, List.of("node:9000"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 10)), 1, 0));
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
         List<Integer> completedBy = new ArrayList<>();
 
         Messages.HeartbeatResp heartbeat = registry.heartbeat(new Messages.NodeHeartbeat(
@@ -153,14 +152,14 @@ class NodeRegistryTest {
         NodeRegistry registry = new NodeRegistry(store, config());
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
                 41, 42, List.of("node:9000"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 10)), 1, 0));
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
         NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
         Records.NodeRecord dead = live.record.withState(Records.NodeState.DEAD);
         live.record = dead;
         store.nodes.put(registered.nodeId(), new MetadataStore.Versioned<>(dead, live.recordVersion));
 
         registry.heartbeat(new Messages.NodeHeartbeat(registered.nodeId(), 41, 42, registered.sessionEpoch(),
-                List.of(new Messages.MediaUsage((byte) 0, 1, 9)), 0, List.of()), (nodeId, ignored) -> {});
+                List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), (nodeId, ignored) -> {});
 
         assertTrue(registry.isAlive(registered.nodeId()));
         assertEquals(Records.NodeState.REGISTERED, live.record.state());
@@ -173,7 +172,7 @@ class NodeRegistryTest {
 
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
                 21, 22, List.of("node:9000"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 10)), 1, 0));
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
         NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
         Records.NodeRecord dead = live.record.withState(Records.NodeState.DEAD);
         live.record = dead;
@@ -182,7 +181,7 @@ class NodeRegistryTest {
 
         ScpException e = assertThrows(ScpException.class, () -> registry.heartbeat(
                 new Messages.NodeHeartbeat(registered.nodeId(), 21, 22, registered.sessionEpoch(),
-                        List.of(new Messages.MediaUsage((byte) 0, 1, 9)), 0, List.of()),
+                        List.of(new Messages.StorageUsage(1, 9)), 0, List.of()),
                 (nodeId, ignored) -> {}));
 
         assertEquals(ErrorCode.LEASE_EXPIRED, e.code());
@@ -195,7 +194,7 @@ class NodeRegistryTest {
         NodeRegistry registry = new NodeRegistry(store, config());
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
                 51, 52, List.of("node:9000"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 10)), 1, 0));
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
         NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
         live.leaseUntil = 0;
         store.throwOnPutNode = true;
@@ -210,7 +209,7 @@ class NodeRegistryTest {
         NodeRegistry registry = new NodeRegistry(store, config());
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
                 61, 62, List.of("node:9000"), "z", "r", "h",
-                List.of(new Messages.MediaCapacity((byte) 0, 10)), 1, 0));
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
 
         assertEquals(ErrorCode.NOT_REGISTERED, assertThrows(ScpException.class, () -> registry.heartbeat(
                 new Messages.NodeHeartbeat(999, 61, 62, registered.sessionEpoch(), List.of(), 0, List.of()),
@@ -225,8 +224,7 @@ class NodeRegistryTest {
     }
 
     private static Records.NodeRecord node(int id, Records.NodeState state) {
-        return new Records.NodeRecord(id, id * 10L, id * 10L + 1, List.of("node-" + id + ":9000"),
-                "z", "r", "host-" + id, (byte) 0, 1_000, state);
+        return new Records.NodeRecord(id, id * 10L, id * 10L + 1, List.of("node-" + id + ":9000"), "z", "r", "host-" + id, 1_000, state);
     }
 
     @SuppressWarnings("unchecked")

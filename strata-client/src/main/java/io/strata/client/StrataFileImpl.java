@@ -68,8 +68,7 @@ final class StrataFileImpl implements StrataFile {
                 throw new ScpException(ErrorCode.CORRUPT_CHUNK, "file length overflow");
             }
         }
-        return new AppenderImpl(meta, pool, config, fileId, writeEpoch, file.fileKind(),
-                file.ackPolicy(), length);
+        return new AppenderImpl(meta, pool, config, fileId, writeEpoch, file.writePolicy(), length);
     }
 
     @Override

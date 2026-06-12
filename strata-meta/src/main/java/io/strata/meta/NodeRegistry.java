@@ -95,11 +95,9 @@ final class NodeRegistry {
             }
         }
         int nodeId = nodeIdFound != null ? nodeIdFound : store.nextNodeId();
-        byte mediaClass = msg.capacities().isEmpty() ? 0 : msg.capacities().get(0).mediaClass();
         long capacity = msg.capacities().isEmpty() ? 0 : msg.capacities().get(0).capacityBytes();
         Records.NodeRecord record = new Records.NodeRecord(nodeId, msg.incMsb(), msg.incLsb(),
-                msg.endpoints(), msg.zone(), msg.rack(), msg.host(), mediaClass, capacity,
-                Records.NodeState.REGISTERED);
+                msg.endpoints(), msg.zone(), msg.rack(), msg.host(), capacity, Records.NodeState.REGISTERED);
 
         // CAS write; on conflict re-read once and retry — persistent conflict means another
         // leader is mutating this record, so the node should re-register with the real leader
@@ -169,14 +167,10 @@ final class NodeRegistry {
         long now = System.currentTimeMillis();
         long newLeaseUntil = now + config.leaseMs();
         if (!msg.usages().isEmpty()) {
-            Messages.MediaUsage usage = msg.usages().get(0);
-            if (usage.mediaClass() != n.record.mediaClass()) {
-                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
-                        "heartbeat media class " + usage.mediaClass() + " != registered " + n.record.mediaClass());
-            }
+            Messages.StorageUsage usage = msg.usages().get(0);
             if (usage.usedBytes() < 0 || usage.freeBytes() < 0) {
                 throw new ScpException(ErrorCode.PRECONDITION_FAILED,
-                        "negative media usage from node " + msg.nodeId());
+                        "negative storage usage from node " + msg.nodeId());
             }
             n.freeBytes = usage.freeBytes();
         }

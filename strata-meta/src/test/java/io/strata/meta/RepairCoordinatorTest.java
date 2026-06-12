@@ -491,8 +491,7 @@ class RepairCoordinatorTest {
                 List.of(sealed(0, 10, 100, List.of(node.nodeId())))));
         store.createFile(file(deletingFile, Records.FileState.DELETING,
                 List.of(sealed(0, 20, 200, List.of(node.nodeId())))));
-        store.createFile(new Records.FileRecord(openFile, "test", "/open-file",
-                (byte) 1, MEDIA, (byte) 1, Records.FileState.OPEN, 1234,
+        store.createFile(new Records.FileRecord(openFile, "test", "/open-file", 3, 2, true, Records.FileState.OPEN, 1234,
                 List.of(new Records.ChunkRecord(0, ChunkState.OPEN, 0, 0, 1, List.of(node.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
@@ -561,14 +560,15 @@ class RepairCoordinatorTest {
     }
 
     private static MetaConfig config(int repairCommandTimeoutMs) {
-        return new MetaConfig("unused", 0, 1, 60_000, 0, 1, repairCommandTimeoutMs);
+        return new MetaConfig("unused", 0, 1, 60_000, 0, 1,
+                repairCommandTimeoutMs);
     }
 
     private static Registered register(NodeRegistry registry, long incMsb, String host) throws Exception {
         long incLsb = incMsb + 1;
         Messages.RegisterResp resp = registry.register(new Messages.RegisterNode(
                 incMsb, incLsb, List.of(host + ":9000"), "zone", "rack", host,
-                List.of(new Messages.MediaCapacity(MEDIA, 1_000_000)), 1, 0));
+                List.of(new Messages.StorageCapacity(1_000_000)), 1, 0));
         return new Registered(resp.nodeId(), incMsb, incLsb, resp.sessionEpoch());
     }
 
@@ -576,7 +576,7 @@ class RepairCoordinatorTest {
                                                     Registered node,
                                                     List<Messages.CompletedCommand> completedCommands) {
         return registry.heartbeat(new Messages.NodeHeartbeat(node.nodeId(), node.incMsb(), node.incLsb(),
-                node.sessionEpoch(), List.of(new Messages.MediaUsage(MEDIA, 0, 1_000_000)),
+                node.sessionEpoch(), List.of(new Messages.StorageUsage(0, 1_000_000)),
                 0, completedCommands), coordinator::onCommandCompleted);
     }
 
@@ -618,8 +618,7 @@ class RepairCoordinatorTest {
 
     private static Records.FileRecord file(FileId fileId, Records.FileState state,
                                            List<Records.ChunkRecord> chunks) {
-        return new Records.FileRecord(fileId, "test", "/file-" + fileId,
-                (byte) 1, MEDIA, (byte) 1, state, 1234, chunks);
+        return new Records.FileRecord(fileId, "test", "/file-" + fileId, 3, 2, false, state, 1234, chunks);
     }
 
     private static Records.ChunkRecord sealed(int index, long length, int crc, List<Integer> replicas) {

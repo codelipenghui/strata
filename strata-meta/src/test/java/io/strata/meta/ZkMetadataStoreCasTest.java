@@ -29,8 +29,7 @@ class ZkMetadataStoreCasTest {
             try (ZkMetadataStore leaderA = new ZkMetadataStore(zk.getConnectString());
                  ZkMetadataStore leaderB = new ZkMetadataStore(zk.getConnectString())) {
 
-                Records.NodeRecord node = new Records.NodeRecord(7, 1L, 2L, List.of("h:9000"),
-                        "z", "r", "host7", (byte) 0, 1L << 30, Records.NodeState.REGISTERED);
+                Records.NodeRecord node = new Records.NodeRecord(7, 1L, 2L, List.of("h:9000"), "z", "r", "host7", 1L << 30, Records.NodeState.REGISTERED);
                 assertTrue(leaderA.putNode(node, -1), "create must succeed");
                 assertFalse(leaderA.putNode(node, -1), "double-create must fail");
 
@@ -56,8 +55,7 @@ class ZkMetadataStoreCasTest {
             try (ZkMetadataStore leaderA = new ZkMetadataStore(zk.getConnectString());
                  ZkMetadataStore leaderB = new ZkMetadataStore(zk.getConnectString())) {
                 FileId fileId = FileId.random();
-                Records.FileRecord file = new Records.FileRecord(fileId, "test", "/test-file",
-                        (byte) 0, (byte) 0, (byte) 0, Records.FileState.OPEN, System.currentTimeMillis(), List.of());
+                Records.FileRecord file = new Records.FileRecord(fileId, "test", "/test-file", 3, 2, false, Records.FileState.OPEN, System.currentTimeMillis(), List.of());
                 leaderA.createFile(file);
                 int v0 = leaderA.getFile(fileId).orElseThrow().version();
 
@@ -101,8 +99,7 @@ class ZkMetadataStoreCasTest {
         try (TestingServer zk = new TestingServer(true)) {
             try (ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
                 FileId fileId = FileId.random();
-                Records.FileRecord file = new Records.FileRecord(fileId, "test", "/marker-owner",
-                        (byte) 0, (byte) 0, (byte) 0, Records.FileState.OPEN,
+                Records.FileRecord file = new Records.FileRecord(fileId, "test", "/marker-owner", 3, 2, false, Records.FileState.OPEN,
                         System.currentTimeMillis(), List.of());
                 store.createFile(file);
 

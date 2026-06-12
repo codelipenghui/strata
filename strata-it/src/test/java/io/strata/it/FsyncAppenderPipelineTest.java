@@ -24,7 +24,8 @@ class FsyncAppenderPipelineTest {
              StrataClient client = StrataClient.connect(
                      ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(64L << 20))) {
 
-            FileId fileId = client.create(new StrataClient.FileSpec("test", "/diag", (byte) 0, (byte) 0, (byte) 1)).id();
+            FileId fileId = client.create(new StrataClient.FileSpec("test", "/diag",
+                    StrataClient.WritePolicy.fsync(3, 2))).id();
             byte[] payload = new byte[512];
 
             try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {

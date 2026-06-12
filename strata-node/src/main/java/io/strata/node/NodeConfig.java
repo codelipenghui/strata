@@ -18,7 +18,6 @@ public record NodeConfig(
         String zone,
         String rack,
         String host,
-        byte mediaClass,
         long capacityBytes,
         int inventoryIntervalMs
 ) {
@@ -63,21 +62,21 @@ public record NodeConfig(
 
     public static NodeConfig standalone(Path dataDir) {
         return new NodeConfig(dataDir, 0, "127.0.0.1", null, List.of(), "z0", "r0",
-                "h-" + dataDir.getFileName(), (byte) 0, 1L << 40, 60_000);
+                "h-" + dataDir.getFileName(), 1L << 40, 60_000);
     }
 
     public static NodeConfig withMetadata(Path dataDir, List<String> metadataEndpoints, String host) {
         return new NodeConfig(dataDir, 0, "127.0.0.1", null, metadataEndpoints, "z0", "r0",
-                host, (byte) 0, 1L << 40, 5_000);
+                host, 1L << 40, 5_000);
     }
 
     public NodeConfig withListenPort(int port) {
         return new NodeConfig(dataDir, port, advertisedHost, advertisedEndpointOverride,
-                metadataEndpoints, zone, rack, host, mediaClass, capacityBytes, inventoryIntervalMs);
+                metadataEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs);
     }
 
     public NodeConfig withAdvertisedEndpoint(String endpoint) {
         return new NodeConfig(dataDir, listenPort, advertisedHost, endpoint,
-                metadataEndpoints, zone, rack, host, mediaClass, capacityBytes, inventoryIntervalMs);
+                metadataEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs);
     }
 }

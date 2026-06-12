@@ -28,7 +28,7 @@ class FormatsTest {
 
     @Test
     void headerRoundtripAndCrc() {
-        var h = new ChunkFormats.Header(id, (byte) 0, (byte) 1, (byte) 1, 5, 1718000000000L, 0, 0, 0);
+        var h = new ChunkFormats.Header(id, true, 5, 1718000000000L, 0, 0, 0);
         byte[] bytes = h.encode();
         assertEquals(ChunkFormats.HEADER_SIZE, bytes.length);
         assertEquals(h, ChunkFormats.Header.decode(bytes));
@@ -39,14 +39,14 @@ class FormatsTest {
 
     @Test
     void unknownIncompatFlagRejected() {
-        var h = new ChunkFormats.Header(id, (byte) 0, (byte) 0, (byte) 0, 1, 1, 0, 0, 0x8000);
+        var h = new ChunkFormats.Header(id, false, 1, 1, 0, 0, 0x8000);
         byte[] bytes = h.encode();
         assertThrows(CorruptChunkException.class, () -> ChunkFormats.Header.decode(bytes));
     }
 
     @Test
     void headerSizeFieldMustMatchFormat() {
-        var h = new ChunkFormats.Header(id, (byte) 0, (byte) 0, (byte) 0, 1, 1, 0, 0, 0);
+        var h = new ChunkFormats.Header(id, false, 1, 1, 0, 0, 0);
         byte[] bytes = h.encode();
         ByteBuffer.wrap(bytes).putShort(6, (short) 128);
         refreshHeaderCrc(bytes);
@@ -55,7 +55,7 @@ class FormatsTest {
 
     @Test
     void headerDecodeRejectsMalformedFixedFields() {
-        var h = new ChunkFormats.Header(id, (byte) 0, (byte) 0, (byte) 0, 1, 1, 0, 0, 0);
+        var h = new ChunkFormats.Header(id, false, 1, 1, 0, 0, 0);
         assertThrows(CorruptChunkException.class, () -> ChunkFormats.Header.decode(new byte[1]));
 
         byte[] badMagic = h.encode();

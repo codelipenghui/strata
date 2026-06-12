@@ -37,8 +37,6 @@ import static io.strata.format.ChunkFormats.TRAILER_SIZE;
 public final class ChunkStore implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ChunkStore.class);
 
-    public static final byte ACK_ON_REPLICATE = 0;
-    public static final byte ACK_ON_FSYNC = 1;
     /** Per-request read/fetch cap: callers loop; the frame layer tops out at 64 MB anyway. */
     public static final int MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 
@@ -97,7 +95,7 @@ public final class ChunkStore implements AutoCloseable {
         }
 
         void startCommitterIfFsync(java.util.concurrent.atomic.AtomicLong counter) {
-            if (header.ackPolicy() == ACK_ON_FSYNC) {
+            if (header.fsyncOnAck()) {
                 committer = new GroupCommitter(id.toString(), () -> {
                     // both must be durable before acking; either alone is safe for recovery
                     data.force(false);
@@ -187,17 +185,9 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    private static void checkAckPolicy(byte ackPolicy) {
-        if (ackPolicy != ACK_ON_REPLICATE && ackPolicy != ACK_ON_FSYNC) {
-            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
-                    "unsupported ack policy " + (ackPolicy & 0xFF));
-        }
-    }
-
     /* ---------------- operations ---------------- */
 
-    public void open(ChunkId id, byte fileKind, byte mediaClass, byte ackPolicy, int writeEpoch,
-                     long createdAtMs) throws IOException {
+    public void open(ChunkId id, boolean fsyncOnAck, int writeEpoch, long createdAtMs) throws IOException {
         reserveNewChunk(id);
         Handle h = null;
         boolean dataCreated = false;
@@ -205,9 +195,7 @@ public final class ChunkStore implements AutoCloseable {
         boolean metaOwned = false;
         boolean installed = false;
         try {
-            checkAckPolicy(ackPolicy);
-            ChunkFormats.Header header = new ChunkFormats.Header(id, fileKind, mediaClass, ackPolicy,
-                    writeEpoch, createdAtMs, 0, 0, 0);
+            ChunkFormats.Header header = new ChunkFormats.Header(id, fsyncOnAck, writeEpoch, createdAtMs, 0, 0, 0);
             h = new Handle(id, header);
             if (Files.exists(h.dataPath)) throw chunkAlreadyExists(id);
             boolean ledgerPreexisted = Files.exists(h.ledgerPath);

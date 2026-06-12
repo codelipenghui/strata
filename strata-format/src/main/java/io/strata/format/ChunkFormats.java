@@ -38,7 +38,7 @@ public final class ChunkFormats {
 
     /* ---------------- header block (4096B, CRC over [0,4092) in last 4 bytes) ---------------- */
 
-    public record Header(ChunkId chunkId, byte fileKind, byte mediaClass, byte ackPolicy,
+    public record Header(ChunkId chunkId, boolean fsyncOnAck,
                          int createWriteEpoch, long createdAtMs,
                          int compatFlags, int roCompatFlags, int incompatFlags) {
 
@@ -48,7 +48,7 @@ public final class ChunkFormats {
             b.putShort((short) FORMAT_VERSION);
             b.putShort((short) HEADER_SIZE);
             chunkId.writeTo(b);
-            b.put(fileKind).put(mediaClass).put(ackPolicy);
+            b.put((byte) (fsyncOnAck ? 1 : 0));
             b.putInt(createWriteEpoch);
             b.putLong(createdAtMs);
             b.putInt(compatFlags).putInt(roCompatFlags).putInt(incompatFlags);
@@ -71,12 +71,19 @@ public final class ChunkFormats {
             short headerSize = b.getShort();
             if (headerSize != HEADER_SIZE) throw new CorruptChunkException("bad header size field " + headerSize);
             ChunkId id = ChunkId.readFrom(b);
-            byte kind = b.get(), media = b.get(), ack = b.get();
+            boolean fsync = readBoolean(b);
             int epoch = b.getInt();
             long created = b.getLong();
             int compat = b.getInt(), roCompat = b.getInt(), incompat = b.getInt();
             if (incompat != 0) throw new CorruptChunkException("unknown incompat flags 0x" + Integer.toHexString(incompat));
-            return new Header(id, kind, media, ack, epoch, created, compat, roCompat, incompat);
+            return new Header(id, fsync, epoch, created, compat, roCompat, incompat);
+        }
+
+        private static boolean readBoolean(ByteBuffer b) {
+            byte value = b.get();
+            if (value == 0) return false;
+            if (value == 1) return true;
+            throw new CorruptChunkException("bad boolean value in header: " + (value & 0xFF));
         }
     }
 

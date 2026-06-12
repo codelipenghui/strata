@@ -110,7 +110,7 @@ class StorageNodeWireTest {
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
 
             // open
-            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, (byte) 0, (byte) 0, (byte) 0,
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
                     1 << 20, 1718000000000L).encode(), null, 5000);
 
             // pipelined appends
@@ -190,7 +190,7 @@ class StorageNodeWireTest {
 
             node.setDraining(true);
             ScpException draining = assertThrows(ScpException.class, () -> client.call(Opcode.OPEN_CHUNK,
-                    new Messages.OpenChunk(new ChunkId(FileId.random(), 0), 1, (byte) 0, (byte) 0, (byte) 0,
+                    new Messages.OpenChunk(new ChunkId(FileId.random(), 0), 1, false,
                             1 << 20, 1L).encode(), null, 5000));
             assertEquals(ErrorCode.NO_CAPACITY, draining.code());
 
@@ -211,7 +211,7 @@ class StorageNodeWireTest {
         ChunkId chunk = new ChunkId(FileId.random(), 0);
         try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
-            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk, 1, (byte) 0, (byte) 0, (byte) 0,
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk, 1, false,
                     1 << 20, 1L).encode(), null, 5000);
 
             ScpException malformedFooter = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK,
@@ -226,7 +226,7 @@ class StorageNodeWireTest {
         try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "t")) {
             incarnation = node.incarnation();
-            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, (byte) 0, (byte) 0, (byte) 0,
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
                     1 << 20, 1L).encode(), null, 5000);
             client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0).encode(),
                     ByteBuffer.wrap("persistent".getBytes()), 5000);

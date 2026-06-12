@@ -113,14 +113,16 @@ final class MetaClient implements AutoCloseable {
     }
 
     FileId createFile(StrataClient.FileSpec spec) {
+        StrataClient.WritePolicy policy = spec.writePolicy();
         var resp = call(Opcode.CREATE_FILE, new Messages.CreateFile(spec.namespace(), spec.path(),
-                spec.fileKind(), spec.mediaClass(), spec.ackPolicy()).encode());
+                new Messages.WritePolicy(policy.replicationFactor(), policy.ackQuorum(), policy.fsyncOnAck()))
+                .encode());
         return decode(Opcode.CREATE_FILE, resp, Messages.CreateFileResp::decode).fileId();
     }
 
     Messages.CreateChunkResp createChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb) {
         var resp = call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(fileId, writeEpoch, (byte) 0xFF, opIdMsb, opIdLsb).encode());
+                new Messages.CreateChunk(fileId, writeEpoch, opIdMsb, opIdLsb).encode());
         return decode(Opcode.CREATE_CHUNK, resp, Messages.CreateChunkResp::decode);
     }
 

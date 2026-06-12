@@ -117,17 +117,17 @@ public final class Messages {
 
     /* ---------- data plane ---------- */
 
-    public record OpenChunk(ChunkId chunkId, int writeEpoch, byte ackPolicy, byte mediaClass,
-                            byte fileKind, long expectedMaxBytes, long createdAtMs) {
+    public record OpenChunk(ChunkId chunkId, int writeEpoch, boolean fsyncOnAck,
+                            long expectedMaxBytes, long createdAtMs) {
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(writeEpoch).u8(ackPolicy).u8(mediaClass).u8(fileKind)
+            w.chunkId(chunkId).i32(writeEpoch).u8(fsyncOnAck ? 1 : 0)
                     .u64(expectedMaxBytes).u64(createdAtMs).noTags();
             return w.toBytes();
         }
 
         public static OpenChunk decode(ByteBuffer b) {
-            OpenChunk m = new OpenChunk(ChunkId.readFrom(b), b.getInt(), b.get(), b.get(), b.get(),
+            OpenChunk m = new OpenChunk(ChunkId.readFrom(b), b.getInt(), readBoolean(b),
                     b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
             return m;
@@ -408,11 +408,11 @@ public final class Messages {
 
     /* ---------- control plane: storage node <-> metadata ---------- */
 
-    public record MediaCapacity(byte mediaClass, long capacityBytes) {}
+    public record StorageCapacity(long capacityBytes) {}
 
     public record RegisterNode(long incMsb, long incLsb, List<String> endpoints,
                                String zone, String rack, String host,
-                               List<MediaCapacity> capacities, int onDiskFormatMax, long featureBits) {
+                               List<StorageCapacity> capacities, int onDiskFormatMax, long featureBits) {
         public RegisterNode {
             endpoints = List.copyOf(endpoints);
             capacities = List.copyOf(capacities);
@@ -425,7 +425,7 @@ public final class Messages {
             for (String e : endpoints) w.string(e);
             w.string(zone).string(rack).string(host);
             w.varint(capacities.size());
-            for (MediaCapacity c : capacities) w.u8(c.mediaClass()).u64(c.capacityBytes());
+            for (StorageCapacity c : capacities) w.u64(c.capacityBytes());
             w.u32(onDiskFormatMax).u64(featureBits).noTags();
             return w.toBytes();
         }
@@ -437,8 +437,8 @@ public final class Messages {
             for (int i = 0; i < ne; i++) eps.add(Varint.readString(b));
             String zone = Varint.readString(b), rack = Varint.readString(b), host = Varint.readString(b);
             int nc = count(b);
-            List<MediaCapacity> caps = new ArrayList<>(nc);
-            for (int i = 0; i < nc; i++) caps.add(new MediaCapacity(b.get(), b.getLong()));
+            List<StorageCapacity> caps = new ArrayList<>(nc);
+            for (int i = 0; i < nc; i++) caps.add(new StorageCapacity(b.getLong()));
             int fmt = b.getInt();
             long features = b.getLong();
             TaggedFields.readFrom(b);
@@ -461,12 +461,12 @@ public final class Messages {
         }
     }
 
-    public record MediaUsage(byte mediaClass, long usedBytes, long freeBytes) {}
+    public record StorageUsage(long usedBytes, long freeBytes) {}
 
     public record CompletedCommand(long commandId, short status) {}
 
     public record NodeHeartbeat(int nodeId, long incMsb, long incLsb, long sessionEpoch,
-                                List<MediaUsage> usages, int repairQueueDepth,
+                                List<StorageUsage> usages, int repairQueueDepth,
                                 List<CompletedCommand> completedCommands) {
         public static final int TAG_COMPLETED_COMMANDS = 0;
 
@@ -479,7 +479,7 @@ public final class Messages {
             BufWriter w = new BufWriter();
             w.u32(nodeId).u64(incMsb).u64(incLsb).u64(sessionEpoch);
             w.varint(usages.size());
-            for (MediaUsage u : usages) w.u8(u.mediaClass()).u64(u.usedBytes()).u64(u.freeBytes());
+            for (StorageUsage u : usages) w.u64(u.usedBytes()).u64(u.freeBytes());
             w.u32(repairQueueDepth);
             if (completedCommands.isEmpty()) {
                 w.noTags();
@@ -497,8 +497,8 @@ public final class Messages {
             long msb = b.getLong(), lsb = b.getLong();
             long session = b.getLong();
             int nu = count(b);
-            List<MediaUsage> us = new ArrayList<>(nu);
-            for (int i = 0; i < nu; i++) us.add(new MediaUsage(b.get(), b.getLong(), b.getLong()));
+            List<StorageUsage> us = new ArrayList<>(nu);
+            for (int i = 0; i < nu; i++) us.add(new StorageUsage(b.getLong(), b.getLong()));
             int depth = b.getInt();
             TaggedFields tags = TaggedFields.readFrom(b);
             List<CompletedCommand> done = new ArrayList<>();
@@ -623,45 +623,91 @@ public final class Messages {
 
     /* ---------- v0 client <-> metadata ---------- */
 
-    public record CreateFile(StrataNamespace namespace, StrataPath path, byte fileKind, byte mediaClass, byte ackPolicy,
+    public record WritePolicy(int replicationFactor, int ackQuorum, boolean fsyncOnAck) {
+        public static final WritePolicy DEFAULT = new WritePolicy(3, 2, false);
+
+        public WritePolicy {
+            if (replicationFactor <= 0) {
+                throw new IllegalArgumentException("replicationFactor must be positive: " + replicationFactor);
+            }
+            if (ackQuorum <= 0 || ackQuorum > replicationFactor) {
+                throw new IllegalArgumentException("ackQuorum must be in 1..replicationFactor: " + ackQuorum);
+            }
+        }
+
+        private void writeTo(BufWriter w) {
+            w.u32(replicationFactor).u32(ackQuorum).u8(fsyncOnAck ? 1 : 0);
+        }
+
+        private static WritePolicy readFrom(ByteBuffer b) {
+            return new WritePolicy(b.getInt(), b.getInt(), readBoolean(b));
+        }
+    }
+
+    private static boolean readBoolean(ByteBuffer b) {
+        byte value = b.get();
+        if (value == 0) {
+            return false;
+        }
+        if (value == 1) {
+            return true;
+        }
+        throw new IllegalArgumentException("bad boolean value on wire: " + (value & 0xFF));
+    }
+
+    public record CreateFile(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy,
                              FileId fileId, long opIdMsb, long opIdLsb) {
         public CreateFile {
             namespace = Objects.requireNonNull(namespace, "namespace");
             path = Objects.requireNonNull(path, "path");
+            writePolicy = Objects.requireNonNull(writePolicy, "writePolicy");
             fileId = Objects.requireNonNull(fileId, "fileId");
         }
 
-        public CreateFile(StrataNamespace namespace, StrataPath path, byte fileKind, byte mediaClass, byte ackPolicy) {
-            this(namespace, path, fileKind, mediaClass, ackPolicy, FileId.random(), UUID.randomUUID());
+        public CreateFile(StrataNamespace namespace, StrataPath path) {
+            this(namespace, path, WritePolicy.DEFAULT);
         }
 
-        public CreateFile(String namespace, String path, byte fileKind, byte mediaClass, byte ackPolicy) {
-            this(StrataNamespace.of(namespace), StrataPath.of(path), fileKind, mediaClass, ackPolicy);
+        public CreateFile(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy) {
+            this(namespace, path, writePolicy, FileId.random(), UUID.randomUUID());
         }
 
-        private CreateFile(StrataNamespace namespace, StrataPath path, byte fileKind, byte mediaClass, byte ackPolicy,
+        public CreateFile(String namespace, String path) {
+            this(StrataNamespace.of(namespace), StrataPath.of(path));
+        }
+
+        public CreateFile(String namespace, String path, WritePolicy writePolicy) {
+            this(StrataNamespace.of(namespace), StrataPath.of(path), writePolicy);
+        }
+
+        private CreateFile(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy,
                            FileId fileId, UUID opId) {
-            this(namespace, path, fileKind, mediaClass, ackPolicy, fileId,
+            this(namespace, path, writePolicy, fileId,
                     opId.getMostSignificantBits(), opId.getLeastSignificantBits());
         }
 
-        public CreateFile(String namespace, String path, byte fileKind, byte mediaClass, byte ackPolicy,
-                          FileId fileId, long opIdMsb, long opIdLsb) {
-            this(StrataNamespace.of(namespace), StrataPath.of(path), fileKind, mediaClass, ackPolicy,
+        public CreateFile(String namespace, String path, FileId fileId, long opIdMsb, long opIdLsb) {
+            this(StrataNamespace.of(namespace), StrataPath.of(path), WritePolicy.DEFAULT,
                     fileId, opIdMsb, opIdLsb);
+        }
+
+        public CreateFile(String namespace, String path, WritePolicy writePolicy,
+                          FileId fileId, long opIdMsb, long opIdLsb) {
+            this(StrataNamespace.of(namespace), StrataPath.of(path), writePolicy, fileId, opIdMsb, opIdLsb);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).string(path.toString()).u8(fileKind).u8(mediaClass).u8(ackPolicy)
-                    .fileId(fileId).u64(opIdMsb).u64(opIdLsb).noTags();
+            w.string(namespace.toString()).string(path.toString());
+            writePolicy.writeTo(w);
+            w.fileId(fileId).u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
         public static CreateFile decode(ByteBuffer b) {
             CreateFile m = new CreateFile(StrataNamespace.of(Varint.readString(b)),
-                    StrataPath.of(Varint.readString(b)), b.get(), b.get(), b.get(), FileId.readFrom(b),
-                    b.getLong(), b.getLong());
+                    StrataPath.of(Varint.readString(b)), WritePolicy.readFrom(b),
+                    FileId.readFrom(b), b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }
@@ -682,26 +728,23 @@ public final class Messages {
         }
     }
 
-    public record CreateChunk(FileId fileId, int writeEpoch, byte mediaClassHint,
-                              long opIdMsb, long opIdLsb) {
-        public CreateChunk(FileId fileId, int writeEpoch, byte mediaClassHint) {
-            this(fileId, writeEpoch, mediaClassHint, UUID.randomUUID());
+    public record CreateChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb) {
+        public CreateChunk(FileId fileId, int writeEpoch) {
+            this(fileId, writeEpoch, UUID.randomUUID());
         }
 
-        private CreateChunk(FileId fileId, int writeEpoch, byte mediaClassHint, UUID opId) {
-            this(fileId, writeEpoch, mediaClassHint,
-                    opId.getMostSignificantBits(), opId.getLeastSignificantBits());
+        private CreateChunk(FileId fileId, int writeEpoch, UUID opId) {
+            this(fileId, writeEpoch, opId.getMostSignificantBits(), opId.getLeastSignificantBits());
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.fileId(fileId).i32(writeEpoch).u8(mediaClassHint).u64(opIdMsb).u64(opIdLsb).noTags();
+            w.fileId(fileId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
         public static CreateChunk decode(ByteBuffer b) {
-            CreateChunk m = new CreateChunk(FileId.readFrom(b), b.getInt(), b.get(),
-                    b.getLong(), b.getLong());
+            CreateChunk m = new CreateChunk(FileId.readFrom(b), b.getInt(), b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }
@@ -845,25 +888,27 @@ public final class Messages {
         }
     }
 
-    public record LookupFileResp(StrataNamespace namespace, StrataPath path, byte fileKind, byte ackPolicy,
+    public record LookupFileResp(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy,
                                  byte fileState,
                                  List<ChunkInfo> chunks) {
-        public LookupFileResp(String namespace, String path, byte fileKind, byte ackPolicy, byte fileState,
+        public LookupFileResp(String namespace, String path, WritePolicy writePolicy, byte fileState,
                               List<ChunkInfo> chunks) {
-            this(StrataNamespace.of(namespace), StrataPath.of(path), fileKind, ackPolicy, fileState, chunks);
+            this(StrataNamespace.of(namespace), StrataPath.of(path), writePolicy, fileState, chunks);
         }
 
         public LookupFileResp {
             namespace = Objects.requireNonNull(namespace, "namespace");
             path = Objects.requireNonNull(path, "path");
+            writePolicy = Objects.requireNonNull(writePolicy, "writePolicy");
             chunks = List.copyOf(chunks);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
             Resp.writeOk(w);
-            w.string(namespace.toString()).string(path.toString()).u8(fileKind).u8(ackPolicy)
-                    .u8(fileState).varint(chunks.size());
+            w.string(namespace.toString()).string(path.toString());
+            writePolicy.writeTo(w);
+            w.u8(fileState).varint(chunks.size());
             for (ChunkInfo c : chunks) ChunkInfo.write(w, c);
             w.noTags();
             return w.toBytes();
@@ -872,12 +917,13 @@ public final class Messages {
         public static LookupFileResp decode(ByteBuffer b) {
             StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             StrataPath path = StrataPath.of(Varint.readString(b));
-            byte kind = b.get(), ack = b.get(), state = b.get();
+            WritePolicy writePolicy = WritePolicy.readFrom(b);
+            byte state = b.get();
             int n = count(b);
             List<ChunkInfo> cs = new ArrayList<>(n);
             for (int i = 0; i < n; i++) cs.add(ChunkInfo.read(b));
             TaggedFields.readFrom(b);
-            return new LookupFileResp(namespace, path, kind, ack, state, cs);
+            return new LookupFileResp(namespace, path, writePolicy, state, cs);
         }
     }
 

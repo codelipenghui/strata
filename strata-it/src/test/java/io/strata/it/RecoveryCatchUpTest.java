@@ -37,10 +37,10 @@ class RecoveryCatchUpTest {
             Messages.CreateChunkResp chunk;
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
                 fileId = Messages.CreateFileResp.decode(meta.call(Opcode.CREATE_FILE,
-                        new Messages.CreateFile("test", "/lag", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000))
+                        new Messages.CreateFile("test", "/lag").encode(), null, 5000))
                         .fileId();
                 chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
-                        new Messages.CreateChunk(fileId, 1, (byte) 0xFF).encode(), null, 5000));
+                        new Messages.CreateChunk(fileId, 1).encode(), null, 5000));
             }
 
             byte[] a = "AAAA".getBytes(), b = "BBBB".getBytes(), c = "CCCC".getBytes();
@@ -52,7 +52,7 @@ class RecoveryCatchUpTest {
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "w")) {
                     node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1,
-                            (byte) 0, (byte) 0, (byte) 0, 1 << 20, 1L).encode(), null, 5000);
+                            false, 1 << 20, 1L).encode(), null, 5000);
                     node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0).encode(),
                             ByteBuffer.wrap(a), 5000);
                     if (i < 2) {
@@ -105,11 +105,11 @@ class RecoveryCatchUpTest {
             Messages.CreateChunkResp chunk;
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
                 fileId = Messages.CreateFileResp.decode(meta.call(Opcode.CREATE_FILE,
-                                new Messages.CreateFile("test", "/short-sealed", (byte) 0, (byte) 0, (byte) 0)
+                                new Messages.CreateFile("test", "/short-sealed")
                                         .encode(), null, 5000))
                         .fileId();
                 chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
-                        new Messages.CreateChunk(fileId, 1, (byte) 0xFF).encode(), null, 5000));
+                        new Messages.CreateChunk(fileId, 1).encode(), null, 5000));
             }
 
             byte[] a = "AAAA".getBytes(StandardCharsets.UTF_8);
@@ -121,7 +121,7 @@ class RecoveryCatchUpTest {
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "w")) {
                     node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1,
-                            (byte) 0, (byte) 0, (byte) 0, 1 << 20, 1L).encode(), null, 5000);
+                            false, 1 << 20, 1L).encode(), null, 5000);
                     node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0).encode(),
                             ByteBuffer.wrap(a), 5000);
                     if (i == 0) {
@@ -165,10 +165,10 @@ class RecoveryCatchUpTest {
             Messages.CreateChunkResp chunk;
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
                 fileId = Messages.CreateFileResp.decode(meta.call(Opcode.CREATE_FILE,
-                        new Messages.CreateFile("test", "/partial", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000))
+                        new Messages.CreateFile("test", "/partial").encode(), null, 5000))
                         .fileId();
                 chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
-                        new Messages.CreateChunk(fileId, 1, (byte) 0xFF).encode(), null, 5000));
+                        new Messages.CreateChunk(fileId, 1).encode(), null, 5000));
             }
 
             byte[] a = "AAAA".getBytes(StandardCharsets.UTF_8);
@@ -182,7 +182,7 @@ class RecoveryCatchUpTest {
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "w")) {
                     node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1,
-                            (byte) 0, (byte) 0, (byte) 0, 1 << 20, 1L).encode(), null, 5000);
+                            false, 1 << 20, 1L).encode(), null, 5000);
                     node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0).encode(),
                             ByteBuffer.wrap(a), 5000);
                     node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 4, 4).encode(),

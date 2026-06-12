@@ -14,6 +14,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -24,9 +25,11 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * The quorum appender (tech design §5): fan-out to 3 replicas, ack to the caller at 2-of-3,
- * durable offset = second-highest replica-acked end, piggybacked on subsequent appends.
- * Single-replica failure triggers seal-and-roll (§7.2 fast path: roll IS the ensemble change);
+ * The quorum appender (tech design §5): fan-out to the file's replica set, ack to the caller
+ * once the file's ack quorum has accepted the append, and piggyback that durable offset on
+ * subsequent appends.
+ * Replica failure triggers seal-and-roll while the remaining replicas can still satisfy quorum
+ * (§7.2 fast path: roll IS the ensemble change);
  * a FENCED_EPOCH from any replica kills the appender permanently (§12 guarantees).
  *
  * Locking: ReentrantLock + Condition, never `synchronized` — virtual threads blocking inside a
@@ -35,8 +38,6 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 final class AppenderImpl implements StrataFile.Appender {
     private static final Logger log = LoggerFactory.getLogger(AppenderImpl.class);
-    private static final int REPLICA_SLOTS = 3;
-    private static final int OPEN_QUORUM = 2;
     /** Replica responses are dispatched off transport event-loop threads. */
     private static final java.util.concurrent.Executor CALLBACKS =
             java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
@@ -46,8 +47,9 @@ final class AppenderImpl implements StrataFile.Appender {
     private final ClientConfig config;
     private final io.strata.common.FileId fileId;
     private final int epoch;
-    private final byte fileKind;
-    private final byte ackPolicy;
+    private final int replicationFactor;
+    private final int ackQuorum;
+    private final boolean fsyncOnAck;
 
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition progress = lock.newCondition();
@@ -62,16 +64,18 @@ final class AppenderImpl implements StrataFile.Appender {
     private static final class ChunkSession {
         final ChunkId chunkId;
         final List<Messages.Replica> replicas;
-        final long[] acked = new long[3];
-        final boolean[] failed = new boolean[3];
+        final long[] acked;
+        final boolean[] failed;
         long end;                      // chunk-local next append offset
-        long durable;                  // chunk-local DO (second-highest acked)
+        long durable;                  // chunk-local DO (ack-quorum threshold)
         final ArrayDeque<Pending> pending = new ArrayDeque<>();
         boolean needRoll;
 
         ChunkSession(ChunkId chunkId, List<Messages.Replica> replicas) {
             this.chunkId = chunkId;
             this.replicas = replicas;
+            this.acked = new long[replicas.size()];
+            this.failed = new boolean[replicas.size()];
         }
 
         int failedCount() {
@@ -94,14 +98,15 @@ final class AppenderImpl implements StrataFile.Appender {
     }
 
     AppenderImpl(MetaClient meta, NodePool pool, ClientConfig config, io.strata.common.FileId fileId,
-                 int epoch, byte fileKind, byte ackPolicy, long existingFileLength) {
+                 int epoch, Messages.WritePolicy writePolicy, long existingFileLength) {
         this.meta = meta;
         this.pool = pool;
         this.config = config;
         this.fileId = fileId;
         this.epoch = epoch;
-        this.fileKind = fileKind;
-        this.ackPolicy = ackPolicy;
+        this.replicationFactor = writePolicy.replicationFactor();
+        this.ackQuorum = writePolicy.ackQuorum();
+        this.fsyncOnAck = writePolicy.fsyncOnAck();
         this.fileBase = existingFileLength;
     }
 
@@ -235,26 +240,22 @@ final class AppenderImpl implements StrataFile.Appender {
         s.failed[replicaIndex] = true;
         log.warn("replica {} ({}) failed for chunk {}: {}", replicaIndex,
                 s.replicas.get(replicaIndex).endpoint(), s.chunkId, cause.getMessage());
-        if (s.failedCount() >= 2) {
+        if (s.replicas.size() - s.failedCount() < ackQuorum) {
             dieLocked(new ScpException(ErrorCode.INTERNAL, "quorum lost on chunk " + s.chunkId + ": " + cause));
             return;
         }
-        // single failure: the remaining two replicas must both ack — DO still advances; once the
-        // pipeline drains we roll to a fresh replica set (roll IS the ensemble change)
+        // failure leaves a short replica set; once the pipeline drains we roll to a fresh set
+        // (roll IS the ensemble change)
         s.needRoll = true;
         advanceDurableLocked(s);
         progress.signalAll();
     }
 
-    /** DO = second-highest acked end across replicas (failed replicas keep their frozen value). */
+    /** DO = ackQuorum-th highest acked end across replicas (failed replicas keep their frozen value). */
     private void advanceDurableLocked(ChunkSession s) {
-        long a = s.acked[0], b = s.acked[1], c = s.acked[2];
-        long max = Math.max(a, Math.max(b, c));
-        long second = (a == max) ? Math.max(b, c)
-                : (b == max) ? Math.max(a, c)
-                : Math.max(a, b);
-        if (second > s.durable) {
-            s.durable = second;
+        long quorumEnd = quorumAckedEnd(s.acked);
+        if (quorumEnd > s.durable) {
+            s.durable = quorumEnd;
             while (!s.pending.isEmpty() && s.pending.peekFirst().chunkEnd() <= s.durable) {
                 Pending p = s.pending.peekFirst();
                 StrataFile.AppendAck ack;
@@ -269,6 +270,12 @@ final class AppenderImpl implements StrataFile.Appender {
             }
             progress.signalAll();
         }
+    }
+
+    private long quorumAckedEnd(long[] acked) {
+        long[] sorted = acked.clone();
+        Arrays.sort(sorted);
+        return sorted[sorted.length - ackQuorum];
     }
 
     /** Seals the current chunk (if any) at its fully-acked end and opens a successor. Lock held. */
@@ -358,7 +365,7 @@ final class AppenderImpl implements StrataFile.Appender {
             votes.computeIfAbsent(key, ignored -> new ArrayList<>()).add(s.replicas.get(i).nodeId());
         }
         int okCount = votes.values().stream().mapToInt(List::size).sum();
-        if (okCount < OPEN_QUORUM) {
+        if (okCount < ackQuorum) {
             dieLocked(lastErr != null ? lastErr : new ScpException(ErrorCode.INTERNAL, "seal quorum lost"));
             return;
         }
@@ -395,10 +402,10 @@ final class AppenderImpl implements StrataFile.Appender {
         }
     }
 
-    private static Map.Entry<SealKey, List<Integer>> bestSealQuorum(Map<SealKey, List<Integer>> votes) {
+    private Map.Entry<SealKey, List<Integer>> bestSealQuorum(Map<SealKey, List<Integer>> votes) {
         Map.Entry<SealKey, List<Integer>> best = null;
         for (Map.Entry<SealKey, List<Integer>> entry : votes.entrySet()) {
-            if (entry.getValue().size() < OPEN_QUORUM) continue;
+            if (entry.getValue().size() < ackQuorum) continue;
             if (best == null || entry.getValue().size() > best.getValue().size()) {
                 best = entry;
             }
@@ -433,7 +440,7 @@ final class AppenderImpl implements StrataFile.Appender {
             return;
         }
         ChunkSession s = new ChunkSession(created.chunkId(), created.replicas());
-        byte[] header = new Messages.OpenChunk(created.chunkId(), epoch, ackPolicy, (byte) 0, fileKind,
+        byte[] header = new Messages.OpenChunk(created.chunkId(), epoch, fsyncOnAck,
                 config.chunkRollBytes(), System.currentTimeMillis()).encode();
         int ok = 0;
         List<Messages.Replica> opened = new ArrayList<>(s.replicas.size());
@@ -463,10 +470,13 @@ final class AppenderImpl implements StrataFile.Appender {
                 return;
             }
         }
-        if (ok < OPEN_QUORUM) {
+        if (ok < ackQuorum) {
             abortCreatedChunkLocked(s.chunkId, createOp, opened);
             dieLocked(new ScpException(ErrorCode.INTERNAL, "cannot open chunk on a quorum"));
             return;
+        }
+        if (ok < s.replicas.size()) {
+            s.needRoll = true;
         }
         session = s;
     }
@@ -477,8 +487,8 @@ final class AppenderImpl implements StrataFile.Appender {
                 && validReplicaSet(created.replicas());
     }
 
-    private static boolean validReplicaSet(List<Messages.Replica> replicas) {
-        if (replicas.size() != REPLICA_SLOTS) return false;
+    private boolean validReplicaSet(List<Messages.Replica> replicas) {
+        if (replicas.size() != replicationFactor) return false;
         java.util.HashSet<Integer> nodeIds = new java.util.HashSet<>();
         java.util.HashSet<String> endpoints = new java.util.HashSet<>();
         for (Messages.Replica r : replicas) {

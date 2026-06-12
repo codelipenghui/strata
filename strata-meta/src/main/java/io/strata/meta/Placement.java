@@ -17,11 +17,10 @@ import java.util.concurrent.ThreadLocalRandom;
 final class Placement {
 
     /** Picks {@code count} distinct nodes; throws NO_CAPACITY when impossible. */
-    static List<NodeRegistry.LiveNode> choose(NodeRegistry registry, int count, byte mediaClass,
+    static List<NodeRegistry.LiveNode> choose(NodeRegistry registry, int count,
                                               Set<Integer> excludeNodes, Set<String> excludeHosts) {
         List<NodeRegistry.LiveNode> candidates = new ArrayList<>();
         for (NodeRegistry.LiveNode n : registry.aliveNodes()) {
-            if (n.record.mediaClass() != mediaClass) continue;
             if (excludeNodes.contains(n.record.nodeId())) continue;
             candidates.add(n);
         }
@@ -31,7 +30,7 @@ final class Placement {
             NodeRegistry.LiveNode pick = weightedPick(candidates, usedHosts);
             if (pick == null) {
                 throw new ScpException(ErrorCode.NO_CAPACITY,
-                        "need " + count + " nodes (mediaClass " + mediaClass + "), found " + picked.size());
+                        "need " + count + " nodes, found " + picked.size());
             }
             picked.add(pick);
             usedHosts.add(pick.record.host());

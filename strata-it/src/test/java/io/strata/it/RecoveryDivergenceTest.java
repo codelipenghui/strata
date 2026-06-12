@@ -80,10 +80,10 @@ class RecoveryDivergenceTest {
         io.strata.common.FileId fileId;
         try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
             var file = Messages.CreateFileResp.decode(meta.call(Opcode.CREATE_FILE,
-                    new Messages.CreateFile("test", path, (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
+                    new Messages.CreateFile("test", path).encode(), null, 5000));
             fileId = file.fileId();
             chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
-                    new Messages.CreateChunk(fileId, 1, (byte) 0xFF).encode(), null, 5000));
+                    new Messages.CreateChunk(fileId, 1).encode(), null, 5000));
         }
         assertEquals(payloads.size(), chunk.replicas().size());
 
@@ -93,7 +93,7 @@ class RecoveryDivergenceTest {
             try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                     ScpClient.KIND_TOOL, "writer")) {
                 node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1,
-                        (byte) 0, (byte) 0, (byte) 0, 1 << 20, 1L).encode(), null, 5000);
+                        false, 1 << 20, 1L).encode(), null, 5000);
                 node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0).encode(),
                         ByteBuffer.wrap(payloads.get(i)), 5000);
             }

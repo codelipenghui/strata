@@ -52,7 +52,7 @@ class ChunkStoreTest {
     }
 
     private void open(ChunkStore store, ChunkId id, int epoch) throws IOException {
-        store.open(id, (byte) 0, (byte) 0, ChunkStore.ACK_ON_REPLICATE, epoch, 1718000000000L);
+        store.open(id, false, epoch, 1718000000000L);
     }
 
     private byte[] sealedBytes(ChunkStore store, ChunkId chunkId, String payload) throws IOException {
@@ -181,8 +181,7 @@ class ChunkStoreTest {
         Class<?> type = Class.forName("io.strata.format.ChunkStore$Handle");
         Constructor<?> ctor = type.getDeclaredConstructor(ChunkStore.class, ChunkId.class, ChunkFormats.Header.class);
         ctor.setAccessible(true);
-        return ctor.newInstance(store, chunkId, new ChunkFormats.Header(chunkId, (byte) 0, (byte) 0,
-                ChunkStore.ACK_ON_REPLICATE, 1, 1718000000000L, 0, 0, 0));
+        return ctor.newInstance(store, chunkId, new ChunkFormats.Header(chunkId, false, 1, 1718000000000L, 0, 0, 0));
     }
 
     private static int checkedFooterLength(ChunkFormats.Trailer trailer, long fileLen) throws Exception {
@@ -528,7 +527,7 @@ class ChunkStoreTest {
     @Test
     void malformedCallerFooterDoesNotStopOpenFsyncCommitter() throws Exception {
         try (ChunkStore store = newStore()) {
-            store.open(id, (byte) 0, (byte) 0, ChunkStore.ACK_ON_FSYNC, 1, 1718000000000L);
+            store.open(id, true, 1, 1718000000000L);
 
             assertEquals(ErrorCode.PRECONDITION_FAILED, assertThrows(ScpException.class,
                     () -> store.seal(id, 1, 0, ByteBuffer.wrap(new byte[] {1, 2, 3}))).code());
@@ -709,17 +708,6 @@ class ChunkStoreTest {
                 creating(store).remove(id);
             }
             assertEquals(ErrorCode.CHUNK_NOT_FOUND, store.delete(id));
-        }
-    }
-
-    @Test
-    void openRejectsUnsupportedAckPolicy() throws Exception {
-        try (ChunkStore store = newStore()) {
-            ScpException e = assertThrows(ScpException.class, () ->
-                    store.open(id, (byte) 0, (byte) 0, (byte) 99, 1, 1718000000000L));
-            assertEquals(ErrorCode.PRECONDITION_FAILED, e.code());
-            assertEquals(ErrorCode.CHUNK_NOT_FOUND,
-                    assertThrows(ScpException.class, () -> store.stat(id)).code());
         }
     }
 

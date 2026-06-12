@@ -262,13 +262,11 @@ public final class MetadataService implements AutoCloseable {
     }
 
     private FileId createFile(Messages.CreateFile m) throws Exception {
-        if (m.ackPolicy() != 0 && m.ackPolicy() != 1) {
-            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
-                    "unsupported ack policy " + (m.ackPolicy() & 0xFF));
-        }
+        Messages.WritePolicy policy = m.writePolicy();
         try {
             store.createFile(new Records.FileRecord(m.fileId(), m.namespace(), m.path(),
-                    m.fileKind(), m.mediaClass(), m.ackPolicy(), Records.FileState.OPEN, System.currentTimeMillis(), List.of(),
+                    policy.replicationFactor(), policy.ackQuorum(), policy.fsyncOnAck(),
+                    Records.FileState.OPEN, System.currentTimeMillis(), List.of(),
                     m.opIdMsb(), m.opIdLsb()));
             return m.fileId();
         } catch (KeeperException.NodeExistsException e) {
@@ -291,12 +289,13 @@ public final class MetadataService implements AutoCloseable {
     }
 
     private static boolean sameCreateRequest(Records.FileRecord existing, Messages.CreateFile requested) {
+        Messages.WritePolicy requestedPolicy = requested.writePolicy();
         return existing.createdBy(requested.opIdMsb(), requested.opIdLsb())
                 && existing.namespace().equals(requested.namespace())
                 && existing.path().equals(requested.path())
-                && existing.fileKind() == requested.fileKind()
-                && existing.mediaClass() == requested.mediaClass()
-                && existing.ackPolicy() == requested.ackPolicy();
+                && existing.replicationFactor() == requestedPolicy.replicationFactor()
+                && existing.ackQuorum() == requestedPolicy.ackQuorum()
+                && existing.fsyncOnAck() == requestedPolicy.fsyncOnAck();
     }
 
     private Messages.CreateChunkResp createChunk(Messages.CreateChunk m) throws Exception {
@@ -326,11 +325,9 @@ public final class MetadataService implements AutoCloseable {
                             "tail chunk " + tail.index() + " is OPEN — seal or recover it first");
                 }
             }
-            byte mediaClass = m.mediaClassHint() != (byte) 0xFF ? m.mediaClassHint() : file.mediaClass();
-            List<NodeRegistry.LiveNode> nodes = Placement.choose(registry, 3, mediaClass,
-                    Set.of(), Set.of());
-            List<Integer> replicaIds = new ArrayList<>(3);
-            List<Messages.Replica> replicas = new ArrayList<>(3);
+            List<NodeRegistry.LiveNode> nodes = Placement.choose(registry, file.replicationFactor(), Set.of(), Set.of());
+            List<Integer> replicaIds = new ArrayList<>(file.replicationFactor());
+            List<Messages.Replica> replicas = new ArrayList<>(file.replicationFactor());
             for (NodeRegistry.LiveNode n : nodes) {
                 replicaIds.add(n.record.nodeId());
                 replicas.add(new Messages.Replica(n.record.nodeId(), n.record.endpoint()));
@@ -396,7 +393,7 @@ public final class MetadataService implements AutoCloseable {
                             throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                                     "sealed-replica set disjoint from descriptor replicas");
                         }
-                        if (confirmed.size() < 2) {
+                        if (confirmed.size() < file.ackQuorum()) {
                             throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                                     "sealed-replica set is below quorum");
                         }
@@ -453,7 +450,8 @@ public final class MetadataService implements AutoCloseable {
             chunks.add(new Messages.ChunkInfo(file.chunkId(c.index()), c.state(), c.length(), c.crc(),
                     c.writeEpoch(), replicas));
         }
-        return new Messages.LookupFileResp(file.namespace(), file.path(), file.fileKind(), file.ackPolicy(),
+        return new Messages.LookupFileResp(file.namespace(), file.path(),
+                new Messages.WritePolicy(file.replicationFactor(), file.ackQuorum(), file.fsyncOnAck()),
                 file.state().value, chunks);
     }
 

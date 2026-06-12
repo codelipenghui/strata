@@ -103,8 +103,7 @@ class RepairAndRetentionTest {
         StorageNode node = cluster.nodes.get(0);
         ChunkId orphan = new ChunkId(FileId.random(), 0);
         try (ScpClient direct = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_TOOL, "planter")) {
-            direct.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(orphan, 1, (byte) 0, (byte) 0, (byte) 0,
-                    1 << 20, System.currentTimeMillis()).encode(), null, 5000);
+            direct.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(orphan, 1, false, 1 << 20, System.currentTimeMillis()).encode(), null, 5000);
             direct.call(Opcode.APPEND, new Messages.Append(orphan, 1, 0, 0).encode(),
                     ByteBuffer.wrap("orphan-bytes".getBytes()), 5000);
             direct.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(orphan, 1, 12).encode(), null, 5000);

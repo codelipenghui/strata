@@ -25,7 +25,6 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 final class RepairCoordinator implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(RepairCoordinator.class);
-    private static final int REPLICATION_FACTOR = 3;
 
     private sealed interface Action permits ReplicateAction, DeleteAction {
         int executingNode();
@@ -127,7 +126,7 @@ final class RepairCoordinator implements AutoCloseable {
                 for (int nodeId : chunk.replicas()) {
                     if (!registry.isDead(nodeId)) live++;
                 }
-                if (live < REPLICATION_FACTOR && live > 0) {
+                if (live < file.replicationFactor() && live > 0) {
                     repairs.add(new Repair(fileId, file, chunk, live));
                 } else if (live == 0) {
                     log.error("chunk {} has NO live replicas — data loss exposure, cannot repair", chunkId);
@@ -179,7 +178,7 @@ final class RepairCoordinator implements AutoCloseable {
             }
         }
         if (sources.isEmpty()) return;
-        if (deadNode < 0 && chunk.replicas().size() >= REPLICATION_FACTOR) {
+        if (deadNode < 0 && chunk.replicas().size() >= file.replicationFactor()) {
             return; // fully replicated on live nodes — nothing to do
         }
         // deadNode >= 0: swap the dead member out. deadNode < 0 with a short replica list:
@@ -189,7 +188,7 @@ final class RepairCoordinator implements AutoCloseable {
 
         List<NodeRegistry.LiveNode> targets;
         try {
-            targets = Placement.choose(registry, 1, file.mediaClass(), existing, usedHosts);
+            targets = Placement.choose(registry, 1, existing, usedHosts);
         } catch (Exception e) {
             log.warn("no repair target for {}: {}", chunkId, e.getMessage());
             return;
@@ -296,7 +295,7 @@ final class RepairCoordinator implements AutoCloseable {
                 if (r.deadNode() >= 0 && c.replicas().contains(r.deadNode())) {
                     chunks.set(i, c.withReplicaSwapped(r.deadNode(), r.targetNode()));
                     changed = true;
-                } else if (r.deadNode() < 0 && c.replicas().size() < REPLICATION_FACTOR) {
+                } else if (r.deadNode() < 0 && c.replicas().size() < file.replicationFactor()) {
                     List<Integer> grown = new ArrayList<>(c.replicas());
                     grown.add(r.targetNode());
                     chunks.set(i, c.withReplicas(grown));

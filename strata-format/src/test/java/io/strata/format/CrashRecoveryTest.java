@@ -30,7 +30,7 @@ class CrashRecoveryTest {
     private final ChunkId id = new ChunkId(FileId.random(), 0);
 
     private void open(ChunkStore store) throws IOException {
-        store.open(id, (byte) 0, (byte) 0, ChunkStore.ACK_ON_REPLICATE, 1, 1718000000000L);
+        store.open(id, false, 1, 1718000000000L);
     }
 
     private Path dataPath() {

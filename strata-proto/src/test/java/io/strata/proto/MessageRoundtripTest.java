@@ -23,7 +23,7 @@ class MessageRoundtripTest {
 
     @Test
     void dataPlaneRoundtrips() {
-        var open = new Messages.OpenChunk(c, 5, (byte) 1, (byte) 0, (byte) 0, 1 << 30, 1718000000000L);
+        var open = new Messages.OpenChunk(c, 5, true, 1 << 30, 1718000000000L);
         assertEquals(open, Messages.OpenChunk.decode(buf(open.encode())));
 
         var append = new Messages.Append(c, 5, 1024, 512);
@@ -82,14 +82,14 @@ class MessageRoundtripTest {
     @Test
     void controlPlaneRoundtrips() {
         var reg = new Messages.RegisterNode(1L, 2L, List.of("h1:9000", "h2:9000"), "z1", "r1", "host1",
-                List.of(new Messages.MediaCapacity((byte) 0, 1L << 40)), 1, 0);
+                List.of(new Messages.StorageCapacity(1L << 40)), 1, 0);
         assertEquals(reg, Messages.RegisterNode.decode(buf(reg.encode())));
 
         var regResp = new Messages.RegisterResp(42, 9, 1000, 10000);
         assertEquals(regResp, decodeResp(regResp.encode(), Messages.RegisterResp::decode));
 
         var hb = new Messages.NodeHeartbeat(42, 1, 2, 9,
-                List.of(new Messages.MediaUsage((byte) 0, 100, 900)), 3,
+                List.of(new Messages.StorageUsage(100, 900)), 3,
                 List.of(new Messages.CompletedCommand(7, (short) 0)));
         assertEquals(hb, Messages.NodeHeartbeat.decode(buf(hb.encode())));
 
@@ -123,13 +123,13 @@ class MessageRoundtripTest {
 
     @Test
     void clientMetaRoundtrips() {
-        var cf = new Messages.CreateFile("test", "/kafka/topicA/0/00000000000000000000", (byte) 0, (byte) 0, (byte) 0);
+        var cf = new Messages.CreateFile("test", "/kafka/topicA/0/00000000000000000000");
         assertEquals(cf, Messages.CreateFile.decode(buf(cf.encode())));
 
         var cfr = new Messages.CreateFileResp(f);
         assertEquals(cfr, decodeResp(cfr.encode(), Messages.CreateFileResp::decode));
 
-        var cc = new Messages.CreateChunk(f, 5, (byte) 0);
+        var cc = new Messages.CreateChunk(f, 5);
         assertEquals(cc, Messages.CreateChunk.decode(buf(cc.encode())));
 
         var ccr = new Messages.CreateChunkResp(c, 5,
@@ -152,8 +152,9 @@ class MessageRoundtripTest {
         assertEquals(lpr, decodeResp(lpr.encode(), Messages.LookupPathResp::decode));
 
         var lfr = new Messages.LookupFileResp("test", "/kafka/topicA/0/00000000000000000000",
-                (byte) 0, (byte) 0, (byte) 0, List.of(
-                new Messages.ChunkInfo(c, ChunkState.OPEN, 0, 0, 5, List.of(new Messages.Replica(1, "a:1")))));
+                Messages.WritePolicy.DEFAULT, (byte) 0, List.of(
+                        new Messages.ChunkInfo(c, ChunkState.OPEN, 0, 0, 5,
+                                List.of(new Messages.Replica(1, "a:1")))));
         assertEquals(lfr, decodeResp(lfr.encode(), Messages.LookupFileResp::decode));
 
         var df = new Messages.DeleteFiles(List.of(f));

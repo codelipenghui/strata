@@ -17,21 +17,44 @@ public interface StrataClient extends AutoCloseable {
         return new StrataClientImpl(Objects.requireNonNull(config, "config"));
     }
 
-    record FileSpec(StrataNamespace namespace, StrataPath path, byte fileKind, byte mediaClass, byte ackPolicy) {
-        public FileSpec {
-            namespace = Objects.requireNonNull(namespace, "namespace");
-            path = Objects.requireNonNull(path, "path");
-            if (ackPolicy != 0 && ackPolicy != 1) {
-                throw new IllegalArgumentException("unsupported ack policy " + (ackPolicy & 0xFF));
+    record WritePolicy(int replicationFactor, int ackQuorum, boolean fsyncOnAck) {
+        public static final WritePolicy DEFAULT = new WritePolicy(3, 2, false);
+
+        public WritePolicy {
+            if (replicationFactor <= 0) {
+                throw new IllegalArgumentException("replicationFactor must be positive: " + replicationFactor);
+            }
+            if (ackQuorum <= 0 || ackQuorum > replicationFactor) {
+                throw new IllegalArgumentException("ackQuorum must be in 1..replicationFactor: " + ackQuorum);
             }
         }
 
-        public FileSpec(String namespace, String path, byte fileKind, byte mediaClass, byte ackPolicy) {
-            this(StrataNamespace.of(namespace), StrataPath.of(path), fileKind, mediaClass, ackPolicy);
+        public static WritePolicy replicated(int replicationFactor, int ackQuorum) {
+            return new WritePolicy(replicationFactor, ackQuorum, false);
+        }
+
+        public static WritePolicy fsync(int replicationFactor, int ackQuorum) {
+            return new WritePolicy(replicationFactor, ackQuorum, true);
+        }
+    }
+
+    record FileSpec(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy) {
+        public FileSpec {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+            path = Objects.requireNonNull(path, "path");
+            writePolicy = Objects.requireNonNull(writePolicy, "writePolicy");
+        }
+
+        public FileSpec(String namespace, String path) {
+            this(StrataNamespace.of(namespace), StrataPath.of(path), WritePolicy.DEFAULT);
+        }
+
+        public FileSpec(String namespace, String path, WritePolicy writePolicy) {
+            this(StrataNamespace.of(namespace), StrataPath.of(path), writePolicy);
         }
 
         public static FileSpec log(String namespace, String path) {
-            return new FileSpec(namespace, path, (byte) 0, (byte) 0, (byte) 0);
+            return new FileSpec(namespace, path);
         }
     }
 

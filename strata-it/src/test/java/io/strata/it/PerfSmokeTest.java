@@ -52,12 +52,8 @@ class PerfSmokeTest {
                         "%n=== Strata v0 perf smoke: %d records x %d B, window %d, 3 nodes in-process ===%n",
                         RECORDS, RECORD_SIZE, WINDOW);
 
-                var replicate = runWrite(client,
-                        new StrataClient.FileSpec("test", "/perf-rep", (byte) 0, (byte) 0, (byte) 0), RECORDS, WINDOW);
+                var replicate = runWrite(client, new StrataClient.FileSpec("test", "/perf-rep"), RECORDS, WINDOW);
                 printWrite("write ack-on-replicate (window " + WINDOW + ") ", replicate.result());
-                var fsync = runWrite(client,
-                        new StrataClient.FileSpec("test", "/perf-fsync", (byte) 0, (byte) 0, (byte) 1), FSYNC_RECORDS, FSYNC_WINDOW);
-                printWrite("write ack-on-fsync     (window " + FSYNC_WINDOW + ")  ", fsync.result());
 
                 ReadResult read = runRead(client, replicate.fileId());
                 printRead("read  sequential 64KB ", read);
@@ -65,10 +61,20 @@ class PerfSmokeTest {
                 // pathology guards, deliberately loose (CI machines vary wildly)
                 assertTrue(p(replicate.result().latenciesNanos(), 99) < 1_000_000_000L,
                         "replicate-mode write p99 above 1s — pathological");
-                assertTrue(p(fsync.result().latenciesNanos(), 99) < 2_000_000_000L,
-                        "fsync-mode write p99 above 2s — pathological");
                 assertTrue(read.throughputMBs() > 5.0,
                         "sequential read below 5 MB/s — pathological");
+            }
+        }
+
+        try (MiniCluster cluster = new MiniCluster(3)) {
+            ClientConfig cfg = ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(64L << 20);
+            try (StrataClient client = StrataClient.connect(cfg)) {
+                var fsync = runWrite(client, new StrataClient.FileSpec("test", "/perf-fsync",
+                                StrataClient.WritePolicy.fsync(3, 2)),
+                        FSYNC_RECORDS, FSYNC_WINDOW);
+                printWrite("write ack-on-fsync     (window " + FSYNC_WINDOW + ")  ", fsync.result());
+                assertTrue(p(fsync.result().latenciesNanos(), 99) < 2_000_000_000L,
+                        "fsync-mode write p99 above 2s — pathological");
             }
         }
     }
