@@ -367,9 +367,9 @@ interface StrataFile {
   FileId id();
   StrataNamespace namespace();
   StrataPath path();
-  Appender openForAppend(int writeEpoch);
+  Appender openForAppend();
   Reader openForRead();
-  SealInfo recoverAndSeal(int newEpoch);
+  SealInfo recoverAndSeal();
       // fence all chunks -> seal-recover the open tail (§7.3) -> returns sealed length
 }
 

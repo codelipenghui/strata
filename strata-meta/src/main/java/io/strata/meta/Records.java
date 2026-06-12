@@ -103,7 +103,7 @@ public final class Records {
 
     public record FileRecord(FileId fileId, StrataNamespace namespace, StrataPath path,
                              int replicationFactor, int ackQuorum, boolean fsyncOnAck,
-                             FileState state, long createdAtMs,
+                             int writerEpoch, FileState state, long createdAtMs,
                              List<ChunkRecord> chunks, long createOpMsb, long createOpLsb) {
         public FileRecord {
             fileId = Objects.requireNonNull(fileId, "fileId");
@@ -115,15 +115,31 @@ public final class Records {
             if (ackQuorum <= 0 || ackQuorum > replicationFactor) {
                 throw new IllegalArgumentException("ackQuorum must be in 1..replicationFactor: " + ackQuorum);
             }
+            if (writerEpoch < 0) {
+                throw new IllegalArgumentException("writerEpoch must be non-negative: " + writerEpoch);
+            }
             state = Objects.requireNonNull(state, "state");
             chunks = List.copyOf(chunks);
+            int chunkMaxEpoch = maxChunkEpoch(chunks);
+            if (writerEpoch < chunkMaxEpoch) {
+                throw new IllegalArgumentException("writerEpoch " + writerEpoch
+                        + " is below max chunk epoch " + chunkMaxEpoch);
+            }
         }
 
         public FileRecord(FileId fileId, StrataNamespace namespace, StrataPath path,
                           int replicationFactor, int ackQuorum, boolean fsyncOnAck,
                           FileState state, long createdAtMs, List<ChunkRecord> chunks) {
             this(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck,
-                    state, createdAtMs, chunks, 0, 0);
+                    maxChunkEpoch(chunks), state, createdAtMs, chunks, 0, 0);
+        }
+
+        public FileRecord(FileId fileId, StrataNamespace namespace, StrataPath path,
+                          int replicationFactor, int ackQuorum, boolean fsyncOnAck,
+                          FileState state, long createdAtMs, List<ChunkRecord> chunks,
+                          long createOpMsb, long createOpLsb) {
+            this(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck,
+                    maxChunkEpoch(chunks), state, createdAtMs, chunks, createOpMsb, createOpLsb);
         }
 
         public FileRecord(FileId fileId, String namespace, String path,
@@ -131,7 +147,7 @@ public final class Records {
                           FileState state, long createdAtMs, List<ChunkRecord> chunks) {
             this(fileId, StrataNamespace.of(namespace), StrataPath.of(path),
                     replicationFactor, ackQuorum, fsyncOnAck,
-                    state, createdAtMs, chunks, 0, 0);
+                    maxChunkEpoch(chunks), state, createdAtMs, chunks, 0, 0);
         }
 
         public FileRecord(FileId fileId, String namespace, String path,
@@ -139,8 +155,16 @@ public final class Records {
                           FileState state, long createdAtMs, List<ChunkRecord> chunks,
                           long createOpMsb, long createOpLsb) {
             this(fileId, StrataNamespace.of(namespace), StrataPath.of(path),
-                    replicationFactor, ackQuorum, fsyncOnAck, state, createdAtMs, chunks,
+                    replicationFactor, ackQuorum, fsyncOnAck, maxChunkEpoch(chunks), state, createdAtMs, chunks,
                     createOpMsb, createOpLsb);
+        }
+
+        private static int maxChunkEpoch(List<ChunkRecord> chunks) {
+            int max = 0;
+            for (ChunkRecord chunk : chunks) {
+                max = Math.max(max, chunk.writeEpoch());
+            }
+            return max;
         }
 
         public ChunkId chunkId(int index) {
@@ -148,13 +172,20 @@ public final class Records {
         }
 
         public FileRecord withState(FileState newState) {
-            return new FileRecord(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck, newState,
+            return new FileRecord(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck, writerEpoch,
+                    newState,
                     createdAtMs, chunks, createOpMsb, createOpLsb);
         }
 
         public FileRecord withChunks(List<ChunkRecord> newChunks) {
-            return new FileRecord(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck, state,
+            return new FileRecord(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck,
+                    Math.max(writerEpoch, maxChunkEpoch(newChunks)), state,
                     createdAtMs, newChunks, createOpMsb, createOpLsb);
+        }
+
+        public FileRecord withWriterEpoch(int newWriterEpoch) {
+            return new FileRecord(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck,
+                    newWriterEpoch, state, createdAtMs, chunks, createOpMsb, createOpLsb);
         }
 
         public boolean createdBy(long opMsb, long opLsb) {
@@ -163,11 +194,11 @@ public final class Records {
 
         public byte[] encode() {
             BufWriter w = new BufWriter(256);
-            w.u8(6); // record version
+            w.u8(7); // record version
             w.fileId(fileId);
             w.string(namespace.toString()).string(path.toString())
                     .u32(replicationFactor).u32(ackQuorum).u8(fsyncOnAck ? 1 : 0)
-                    .u8(state.value).u64(createdAtMs);
+                    .i32(writerEpoch).u8(state.value).u64(createdAtMs);
             w.u64(createOpMsb).u64(createOpLsb);
             w.varint(chunks.size());
             for (ChunkRecord c : chunks) {
@@ -182,13 +213,14 @@ public final class Records {
         public static FileRecord decode(byte[] bytes) {
             ByteBuffer b = ByteBuffer.wrap(bytes);
             byte version = b.get();
-            if (version != 6) throw new IllegalArgumentException("file record version " + version);
+            if (version != 7) throw new IllegalArgumentException("file record version " + version);
             FileId id = FileId.readFrom(b);
             StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             StrataPath path = StrataPath.of(Varint.readString(b));
             int replicationFactor = b.getInt();
             int ackQuorum = b.getInt();
             boolean fsyncOnAck = readBoolean(b);
+            int writerEpoch = b.getInt();
             FileState state = FileState.from(b.get());
             long created = b.getLong();
             long fileOpMsb = b.getLong();
@@ -209,7 +241,7 @@ public final class Records {
                 chunks.add(new ChunkRecord(index, cs, len, crc, epoch, replicas, chunkOpMsb, chunkOpLsb));
             }
             return new FileRecord(id, namespace, path, replicationFactor, ackQuorum, fsyncOnAck,
-                    state, created, chunks, fileOpMsb, fileOpLsb);
+                    writerEpoch, state, created, chunks, fileOpMsb, fileOpLsb);
         }
     }
 

@@ -50,7 +50,7 @@ class RepairAndRetentionTest {
     void nodeDeathRepairsAllChunksBackToRf3() throws Exception {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/repair-me")).id();
         Workload workload = new Workload();
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 1200); // several chunks across 4 nodes
             appender.seal();
         }
@@ -122,7 +122,7 @@ class RepairAndRetentionTest {
     void fileDeletionConvergesOnNodes() throws Exception {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/delete-me")).id();
         Workload workload = new Workload();
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 600);
             appender.seal();
         }

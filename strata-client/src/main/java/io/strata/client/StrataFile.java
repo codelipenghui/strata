@@ -19,13 +19,13 @@ public interface StrataFile {
 
     StrataPath path();
 
-    /** Single writer per epoch; a higher epoch anywhere kills this appender permanently. */
-    Appender openForAppend(int writeEpoch);
+    /** Opens a single-writer appender; metadata allocates the fencing epoch. */
+    Appender openForAppend();
 
     Reader openForRead();
 
-    /** Fences the file at newEpoch, seal-recovers the open tail (§7.3), returns the sealed length. */
-    SealInfo recoverAndSeal(int newEpoch);
+    /** Fences any open writer, seal-recovers the open tail (§7.3), returns the sealed length. */
+    SealInfo recoverAndSeal();
 
     record AppendAck(long endOffset, long durableOffset) {}
 
@@ -34,7 +34,7 @@ public interface StrataFile {
     record ReadResult(byte[] data, boolean endOfFile) {}
 
     interface Appender extends AutoCloseable {
-        /** Pipelined; completes on quorum (2/3) ack. Offsets are file-logical. */
+        /** Pipelined; completes on the file's ack quorum. Offsets are file-logical. */
         CompletableFuture<AppendAck> append(ByteBuffer data);
 
         long durableOffset();

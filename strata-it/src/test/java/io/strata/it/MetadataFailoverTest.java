@@ -33,7 +33,7 @@ class MetadataFailoverTest {
                 List<Integer> nodeIdsBefore = new ArrayList<>();
                 for (var n : cluster.nodes) nodeIdsBefore.add(n.nodeId());
 
-                try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
+                try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
                     workload.appendAcked(appender, 0, 300);
 
                     // kill the current leader

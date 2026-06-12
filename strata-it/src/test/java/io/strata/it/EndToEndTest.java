@@ -47,7 +47,7 @@ class EndToEndTest {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/topicA-0")).id();
         Workload workload = new Workload();
 
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 1500); // ~24 KB -> several 4 KB chunk rolls
             assertEquals(workload.ackedBytes(), appender.durableOffset());
             var sealed = appender.seal();
@@ -93,7 +93,7 @@ class EndToEndTest {
     void tailReadNeverExceedsDurableOffset() throws Exception {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/topicB-0")).id();
         Workload workload = new Workload();
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 50);
 
             try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
@@ -114,7 +114,7 @@ class EndToEndTest {
     void emptyAppendCompletesWithoutCreatingAChunk() throws Exception {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/empty-append")).id();
 
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
             var ack = appender.append(ByteBuffer.allocate(0)).get(1, TimeUnit.SECONDS);
             assertEquals(0, ack.endOffset());
             assertEquals(0, ack.durableOffset());

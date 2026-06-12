@@ -28,7 +28,7 @@ class FsyncAppenderPipelineTest {
                     StrataClient.WritePolicy.fsync(3, 2))).id();
             byte[] payload = new byte[512];
 
-            try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
+            try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
                 long start = System.nanoTime();
                 List<CompletableFuture<StrataFile.AppendAck>> futures = new ArrayList<>(appends);
                 for (int i = 0; i < appends; i++) {

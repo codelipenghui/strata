@@ -183,6 +183,12 @@ public final class MetadataService implements AutoCloseable {
                 yield ScpServer.ok(req, createChunk(m).encode(), null);
             }
 
+            case ALLOCATE_WRITER_EPOCH -> {
+                var m = Messages.AllocateWriterEpoch.decode(h);
+                yield ScpServer.ok(req, new Messages.AllocateWriterEpochResp(allocateWriterEpoch(m)).encode(),
+                        null);
+            }
+
             case SEAL_CHUNK_META -> {
                 var m = Messages.SealChunkMeta.decode(h);
                 sealChunk(m);
@@ -261,6 +267,35 @@ public final class MetadataService implements AutoCloseable {
         };
     }
 
+    private int allocateWriterEpoch(Messages.AllocateWriterEpoch m) throws Exception {
+        for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
+            var opt = store.getFile(m.fileId());
+            if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, m.fileId().toString());
+            Records.FileRecord file = opt.get().value();
+            if (file.state() == Records.FileState.DELETING) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED, "file is DELETING");
+            }
+            if (file.state() == Records.FileState.SEALED) {
+                throw new ScpException(ErrorCode.FILE_SEALED, "file state " + file.state());
+            }
+            boolean hasOpenChunk = file.chunks().stream().anyMatch(c -> c.state() != ChunkState.SEALED);
+            if (m.purpose() == Messages.AllocateWriterEpoch.FOR_APPEND && hasOpenChunk) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "file has an open chunk — run recoverAndSeal or resume the owning appender");
+            }
+            int nextEpoch;
+            try {
+                nextEpoch = Math.addExact(file.writerEpoch(), 1);
+            } catch (ArithmeticException e) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED, "writer epoch overflow");
+            }
+            if (store.updateFile(file.withWriterEpoch(nextEpoch), opt.get().version())) {
+                return nextEpoch;
+            }
+        }
+        throw new ScpException(ErrorCode.INTERNAL, "allocateWriterEpoch CAS exhausted");
+    }
+
     private FileId createFile(Messages.CreateFile m) throws Exception {
         Messages.WritePolicy policy = m.writePolicy();
         try {
@@ -306,7 +341,18 @@ public final class MetadataService implements AutoCloseable {
             if (file.state() != Records.FileState.OPEN) {
                 throw new ScpException(ErrorCode.FILE_SEALED, "file state " + file.state());
             }
-            // stale-leader guard: a new epoch may already own this file (fence precedence)
+            if (m.writeEpoch() <= 0) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "writeEpoch must be positive: " + m.writeEpoch());
+            }
+            // stale-leader guard: a newer writer/recovery may already own this file
+            if (m.writeEpoch() < file.writerEpoch()) {
+                throw new ScpException(ErrorCode.FENCED_EPOCH, "file epoch " + file.writerEpoch(),
+                        file.writerEpoch());
+            }
+            // legacy/internal callers may still provide the first epoch directly; record that
+            // allocation atomically with the chunk descriptor.
+            int updatedWriterEpoch = Math.max(file.writerEpoch(), m.writeEpoch());
             int maxEpoch = file.chunks().stream().mapToInt(Records.ChunkRecord::writeEpoch).max().orElse(-1);
             if (m.writeEpoch() < maxEpoch) {
                 throw new ScpException(ErrorCode.FENCED_EPOCH, "file epoch " + maxEpoch, maxEpoch);
@@ -337,7 +383,7 @@ public final class MetadataService implements AutoCloseable {
             List<Records.ChunkRecord> chunks = new ArrayList<>(file.chunks());
             chunks.add(new Records.ChunkRecord(index, ChunkState.OPEN, 0, 0, m.writeEpoch(), replicaIds,
                     m.opIdMsb(), m.opIdLsb()));
-            Records.FileRecord updated = file.withChunks(chunks);
+            Records.FileRecord updated = file.withWriterEpoch(updatedWriterEpoch).withChunks(chunks);
             // commit-before-write: the descriptor exists before the client opens chunks anywhere
             if (store.updateFile(updated, opt.get().version())) {
                 return new Messages.CreateChunkResp(new ChunkId(m.fileId(), index), m.writeEpoch(), replicas);
@@ -381,6 +427,10 @@ public final class MetadataService implements AutoCloseable {
                         // same length but different crc is byte divergence — never swallow it
                         throw new ScpException(ErrorCode.CHUNK_SEALED,
                                 "sealed at " + c.length() + " crc " + c.crc(), c.length());
+                    }
+                    if (m.writeEpoch() < file.writerEpoch()) {
+                        throw new ScpException(ErrorCode.FENCED_EPOCH, "file epoch " + file.writerEpoch(),
+                                file.writerEpoch());
                     }
                     Records.ChunkRecord sealed = c.sealed(m.length(), m.crc(), m.writeEpoch());
                     if (!m.sealedReplicas().isEmpty()) {
@@ -426,6 +476,10 @@ public final class MetadataService implements AutoCloseable {
             if (tail.state() != ChunkState.OPEN) {
                 throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                         "cannot abort " + tail.state() + " chunk " + m.chunkId());
+            }
+            if (m.writeEpoch() < file.writerEpoch()) {
+                throw new ScpException(ErrorCode.FENCED_EPOCH, "file epoch " + file.writerEpoch(),
+                        file.writerEpoch());
             }
             if (tail.writeEpoch() != m.writeEpoch() || !tail.createdBy(m.opIdMsb(), m.opIdLsb())) {
                 throw new ScpException(ErrorCode.FENCED_EPOCH,

@@ -26,7 +26,8 @@ public enum Opcode {
     DELETE_FILES(0x0205),
     SEAL_FILE(0x0206),
     ABORT_CHUNK_META(0x0207),
-    LOOKUP_PATH(0x0208);
+    LOOKUP_PATH(0x0208),
+    ALLOCATE_WRITER_EPOCH(0x0209);
 
     public final short code;
 

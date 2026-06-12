@@ -771,6 +771,53 @@ public final class Messages {
         }
     }
 
+    public record AllocateWriterEpoch(FileId fileId, byte purpose) {
+        public static final byte FOR_APPEND = 1;
+        public static final byte FOR_RECOVERY = 2;
+
+        public AllocateWriterEpoch {
+            fileId = Objects.requireNonNull(fileId, "fileId");
+            if (purpose != FOR_APPEND && purpose != FOR_RECOVERY) {
+                throw new IllegalArgumentException("unknown writer epoch purpose " + (purpose & 0xFF));
+            }
+        }
+
+        public static AllocateWriterEpoch forAppend(FileId fileId) {
+            return new AllocateWriterEpoch(fileId, FOR_APPEND);
+        }
+
+        public static AllocateWriterEpoch forRecovery(FileId fileId) {
+            return new AllocateWriterEpoch(fileId, FOR_RECOVERY);
+        }
+
+        public byte[] encode() {
+            BufWriter w = new BufWriter();
+            w.fileId(fileId).u8(purpose).noTags();
+            return w.toBytes();
+        }
+
+        public static AllocateWriterEpoch decode(ByteBuffer b) {
+            AllocateWriterEpoch m = new AllocateWriterEpoch(FileId.readFrom(b), b.get());
+            TaggedFields.readFrom(b);
+            return m;
+        }
+    }
+
+    public record AllocateWriterEpochResp(int writerEpoch) {
+        public byte[] encode() {
+            BufWriter w = new BufWriter();
+            Resp.writeOk(w);
+            w.i32(writerEpoch).noTags();
+            return w.toBytes();
+        }
+
+        public static AllocateWriterEpochResp decode(ByteBuffer b) {
+            AllocateWriterEpochResp m = new AllocateWriterEpochResp(b.getInt());
+            TaggedFields.readFrom(b);
+            return m;
+        }
+    }
+
     /**
      * sealedReplicas: node ids that confirmed the seal — the descriptor keeps only these (a
      * replica skipped during seal would otherwise stay listed and serve short/stale reads).

@@ -63,8 +63,25 @@ final class Recovery {
         }
     }
 
-    StrataFile.SealInfo recoverAndSeal(io.strata.common.FileId fileId, int newEpoch) {
+    StrataFile.SealInfo recoverAndSeal(io.strata.common.FileId fileId) {
         Messages.LookupFileResp file = meta.lookupFile(fileId);
+        boolean needsRecovery = file.chunks().stream().anyMatch(c -> c.state() != ChunkState.SEALED);
+        int writerEpoch = 0;
+        if (needsRecovery) {
+            writerEpoch = meta.allocateWriterEpochForRecovery(fileId);
+            file = meta.lookupFile(fileId);
+        }
+        return recoverAndSeal(fileId, file, writerEpoch);
+    }
+
+    StrataFile.SealInfo recoverAndSeal(io.strata.common.FileId fileId, int writerEpoch) {
+        Messages.LookupFileResp file = meta.lookupFile(fileId);
+        return recoverAndSeal(fileId, file, writerEpoch);
+    }
+
+    private StrataFile.SealInfo recoverAndSeal(io.strata.common.FileId fileId,
+                                               Messages.LookupFileResp file,
+                                               int writerEpoch) {
         if (file.fileState() == FILE_DELETING) {
             throw new ScpException(ErrorCode.PRECONDITION_FAILED, "file is DELETING");
         }
@@ -76,7 +93,10 @@ final class Recovery {
             if (chunk.state() == ChunkState.SEALED) {
                 total = addFileLength(total, chunk.length());
             } else {
-                total = addFileLength(total, recoverChunk(chunk, newEpoch));
+                if (writerEpoch <= 0) {
+                    throw new ScpException(ErrorCode.INTERNAL, "missing writer epoch for open chunk recovery");
+                }
+                total = addFileLength(total, recoverChunk(chunk, writerEpoch));
             }
         }
         meta.sealFile(fileId, total);
@@ -94,7 +114,7 @@ final class Recovery {
         }
     }
 
-    private long recoverChunk(Messages.ChunkInfo chunk, int newEpoch) {
+    private long recoverChunk(Messages.ChunkInfo chunk, int writerEpoch) {
         ChunkId chunkId = chunk.chunkId();
 
         // 1. fence all reachable replicas; collect their state
@@ -103,7 +123,7 @@ final class Recovery {
             if (r.endpoint().isEmpty()) continue;
             try {
                 ByteBuffer h = pool.get(r.endpoint()).call(Opcode.FENCE,
-                        new Messages.Fence(chunkId, newEpoch).encode(), null, config.callTimeoutMs());
+                        new Messages.Fence(chunkId, writerEpoch).encode(), null, config.callTimeoutMs());
                 Messages.FenceResp fence = Messages.FenceResp.decode(h);
                 validateFenceResp(chunkId, r, fence);
                 reachable.add(new ReplicaState(r, fence));
@@ -142,14 +162,14 @@ final class Recovery {
             if (rs.state == ChunkState.SEALED) {
                 long len = rs.end;
                 log.info("chunk {} found sealed at {} on {}", chunkId, len, rs.replica.endpoint());
-                catchUp(chunkId, newEpoch, reachable, len);
-                return finishSeal(chunkId, newEpoch, len, reachable);
+                catchUp(chunkId, writerEpoch, reachable, len);
+                return finishSeal(chunkId, writerEpoch, len, reachable);
             }
         }
 
         // 2. start from the durable floor and catch lagging replicas up to it before walking
         //    boundaries above it
-        catchUp(chunkId, newEpoch, reachable, p);
+        catchUp(chunkId, writerEpoch, reachable, p);
 
         // 3. merge ledger boundaries above p from all reachable replicas
         TreeMap<Long, List<LedgerCandidate>> boundaries = new TreeMap<>();
@@ -189,7 +209,7 @@ final class Recovery {
                 try {
                     int suffixOffset = (int) (rs.end - p);
                     int suffixLength = (int) (end - rs.end);
-                    appendAndVerify(chunkId, newEpoch, rs, p,
+                    appendAndVerify(chunkId, writerEpoch, rs, p,
                             ByteBuffer.wrap(batch, suffixOffset, suffixLength), end);
                 } catch (ScpException e) {
                     if (e.code() == ErrorCode.FENCED_EPOCH) {
@@ -205,7 +225,7 @@ final class Recovery {
         }
 
         log.info("seal-recovery: chunk {} sealing at {}", chunkId, p);
-        return finishSeal(chunkId, newEpoch, p, reachable);
+        return finishSeal(chunkId, writerEpoch, p, reachable);
     }
 
     private record Candidate(long end, byte[] bytes) {}
@@ -241,7 +261,7 @@ final class Recovery {
      * sealed short. The donor region is below the durable offset (or a sealed copy), so the
      * bytes are quorum-trusted; wire integrity is covered by frame payload CRCs.
      */
-    private void catchUp(ChunkId chunkId, int newEpoch, List<ReplicaState> reachable, long target) {
+    private void catchUp(ChunkId chunkId, int writerEpoch, List<ReplicaState> reachable, long target) {
         Iterator<ReplicaState> it = reachable.iterator();
         while (it.hasNext()) {
             ReplicaState rs = it.next();
@@ -259,7 +279,7 @@ final class Recovery {
                         throw new ScpException(ErrorCode.INTERNAL, "no donor for catch-up");
                     }
                     long expectedEnd = addFileLength(rs.end, data.length);
-                    appendAndVerify(chunkId, newEpoch, rs, rs.end, ByteBuffer.wrap(data), expectedEnd);
+                    appendAndVerify(chunkId, writerEpoch, rs, rs.end, ByteBuffer.wrap(data), expectedEnd);
                 }
                 log.info("recovery caught up {} on {} to {}", chunkId, rs.replica.endpoint(), target);
             } catch (ScpException e) {

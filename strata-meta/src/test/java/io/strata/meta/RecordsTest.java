@@ -62,16 +62,29 @@ class RecordsTest {
         assertEquals(3, record.replicationFactor());
         assertEquals(2, record.ackQuorum());
         assertTrue(record.fsyncOnAck());
+        assertEquals(5, record.writerEpoch());
         assertTrue(record.createdBy(11, 22));
         assertFalse(record.createdBy(11, 23));
         assertEquals(Records.FileState.SEALED, record.withState(Records.FileState.SEALED).state());
         assertEquals(0, record.withChunks(List.of()).chunks().size());
+        assertEquals(5, record.withChunks(List.of()).writerEpoch());
+        assertEquals(6, record.withWriterEpoch(6).writerEpoch());
         Records.FileRecord typed = new Records.FileRecord(fileId, io.strata.common.StrataNamespace.of("typed"),
                 io.strata.common.StrataPath.of("/typed-file"), 3, 2, false,
                 Records.FileState.OPEN, 1234, List.of());
         assertTrue(typed.createdBy(0, 0));
         assertEquals(io.strata.common.StrataPath.of("/typed-file"), typed.path());
         assertEquals(record, Records.FileRecord.decode(record.encode()));
+        assertThrows(IllegalArgumentException.class,
+                () -> new Records.FileRecord(fileId, io.strata.common.StrataNamespace.of("test"),
+                        io.strata.common.StrataPath.of("/bad-negative-writer-epoch"),
+                        3, 2, false, -1, Records.FileState.OPEN, 1234,
+                        List.of(), 0, 0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new Records.FileRecord(fileId, io.strata.common.StrataNamespace.of("test"),
+                        io.strata.common.StrataPath.of("/bad-stale-writer-epoch"),
+                        3, 2, false, 4, Records.FileState.OPEN, 1234,
+                        List.of(chunk), 0, 0));
 
         byte[] invalid = record.encode();
         invalid[0] = 99;
@@ -162,9 +175,10 @@ class RecordsTest {
 
     private static byte[] fileRecordWithChunkCount(int count) {
         BufWriter w = new BufWriter();
-        w.u8(4);
+        w.u8(7);
         w.fileId(new FileId(1, 2));
-        w.string("test").string("/test-file").u8(0).u8(0).u8(0).u8(Records.FileState.OPEN.value).u64(1);
+        w.string("test").string("/test-file");
+        w.u32(3).u32(2).u8(0).i32(0).u8(Records.FileState.OPEN.value).u64(1);
         w.u64(0).u64(0);
         w.varint(count);
         return w.toBytes();
@@ -172,9 +186,10 @@ class RecordsTest {
 
     private static byte[] fileRecordWithReplicaCount(int count) {
         BufWriter w = new BufWriter();
-        w.u8(4);
+        w.u8(7);
         w.fileId(new FileId(1, 2));
-        w.string("test").string("/test-file").u8(0).u8(0).u8(0).u8(Records.FileState.OPEN.value).u64(1);
+        w.string("test").string("/test-file");
+        w.u32(3).u32(2).u8(0).i32(1).u8(Records.FileState.OPEN.value).u64(1);
         w.u64(0).u64(0);
         w.varint(1);
         w.u32(0).u8(ChunkState.OPEN.value).u64(0).u32(0).i32(1);

@@ -87,7 +87,7 @@ class PerfSmokeTest {
         byte[] payload = new byte[RECORD_SIZE];
         java.util.concurrent.ThreadLocalRandom.current().nextBytes(payload);
 
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
             // warmup (not measured)
             await(appendWindowed(appender, payload, Math.min(WARMUP, records), null, window));
 

@@ -61,7 +61,7 @@ class ChaosTest {
                     FileId fileId = client.create(StrataClient.FileSpec.log("test", "/slow-replica")).id();
                     Workload workload = new Workload();
 
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
+                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 20); // warm-up: chunk spans all 3 nodes
 
                         // stall the proxied replica's responses by 3s
@@ -110,7 +110,7 @@ class ChaosTest {
                     FileId fileId = client.create(StrataClient.FileSpec.log("test", "/blackhole")).id();
                     Workload workload = new Workload();
 
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
+                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 100);
 
                         // drop all responses from the proxied replica, forever
@@ -142,7 +142,7 @@ class ChaosTest {
                 FileId fileId = client.create(StrataClient.FileSpec.log("test", "/zk-outage")).id();
                 Workload workload = new Workload();
 
-                try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
+                try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
                     workload.appendAcked(appender, 0, 50);
 
                     // freeze ZooKeeper (SIGSTOP semantics)

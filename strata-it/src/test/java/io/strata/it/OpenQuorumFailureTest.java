@@ -29,7 +29,7 @@ class OpenQuorumFailureTest {
             cluster.killNode(1);
             cluster.killNode(2);
 
-            try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
+            try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[]{1})));
                 assertEquals(ErrorCode.INTERNAL, e.code());

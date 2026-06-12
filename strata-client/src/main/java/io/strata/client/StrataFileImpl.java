@@ -45,7 +45,7 @@ final class StrataFileImpl implements StrataFile {
     }
 
     @Override
-    public Appender openForAppend(int writeEpoch) {
+    public Appender openForAppend() {
         Messages.LookupFileResp file = meta.lookupFile(fileId);
         if (file.fileState() != 0) {
             throw new ScpException(ErrorCode.FILE_SEALED, "file state " + file.fileState());
@@ -56,9 +56,6 @@ final class StrataFileImpl implements StrataFile {
                 throw new ScpException(ErrorCode.INTERNAL,
                         "file has an open chunk — run recoverAndSeal or resume the owning appender");
             }
-            if (c.writeEpoch() > writeEpoch) {
-                throw new ScpException(ErrorCode.FENCED_EPOCH, "file epoch " + c.writeEpoch(), c.writeEpoch());
-            }
             if (c.length() < 0) {
                 throw new ScpException(ErrorCode.CORRUPT_CHUNK, "negative chunk length " + c.length());
             }
@@ -68,6 +65,7 @@ final class StrataFileImpl implements StrataFile {
                 throw new ScpException(ErrorCode.CORRUPT_CHUNK, "file length overflow");
             }
         }
+        int writeEpoch = meta.allocateWriterEpochForAppend(fileId);
         return new AppenderImpl(meta, pool, config, fileId, writeEpoch, file.writePolicy(), length);
     }
 
@@ -77,7 +75,7 @@ final class StrataFileImpl implements StrataFile {
     }
 
     @Override
-    public SealInfo recoverAndSeal(int newEpoch) {
-        return new Recovery(meta, pool, config).recoverAndSeal(fileId, newEpoch);
+    public SealInfo recoverAndSeal() {
+        return new Recovery(meta, pool, config).recoverAndSeal(fileId);
     }
 }

@@ -207,28 +207,23 @@ class StrataClientBehaviorTest {
              StrataClient client = StrataClient.connect(ClientConfig.of(endpoint(meta)))) {
             lookup.set(new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1, List.of()));
             assertEquals(ErrorCode.FILE_SEALED,
-                    assertThrows(ScpException.class, () -> client.openById(fileId).openForAppend(1)).code());
+                    assertThrows(ScpException.class, () -> client.openById(fileId).openForAppend()).code());
 
             lookup.set(new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 0,
                     List.of(chunk(chunkId, ChunkState.OPEN, 0, 0, 1))));
             assertEquals(ErrorCode.INTERNAL,
-                    assertThrows(ScpException.class, () -> client.openById(fileId).openForAppend(1)).code());
-
-            lookup.set(new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 0,
-                    List.of(chunk(chunkId, ChunkState.SEALED, 5, 0, 3))));
-            assertEquals(ErrorCode.FENCED_EPOCH,
-                    assertThrows(ScpException.class, () -> client.openById(fileId).openForAppend(2)).code());
+                    assertThrows(ScpException.class, () -> client.openById(fileId).openForAppend()).code());
 
             lookup.set(new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 0,
                     List.of(chunk(chunkId, ChunkState.SEALED, -1, 0, 1))));
             assertEquals(ErrorCode.CORRUPT_CHUNK,
-                    assertThrows(ScpException.class, () -> client.openById(fileId).openForAppend(1)).code());
+                    assertThrows(ScpException.class, () -> client.openById(fileId).openForAppend()).code());
 
             lookup.set(new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 0,
                     List.of(chunk(new ChunkId(fileId, 0), ChunkState.SEALED, Long.MAX_VALUE, 0, 1),
                             chunk(new ChunkId(fileId, 1), ChunkState.SEALED, 1, 0, 1))));
             assertEquals(ErrorCode.CORRUPT_CHUNK,
-                    assertThrows(ScpException.class, () -> client.openById(fileId).openForAppend(1)).code());
+                    assertThrows(ScpException.class, () -> client.openById(fileId).openForAppend()).code());
         }
     }
 

@@ -136,6 +136,18 @@ class MessageRoundtripTest {
                 List.of(new Messages.Replica(1, "a:1"), new Messages.Replica(2, "b:2"), new Messages.Replica(3, "c:3")));
         assertEquals(ccr, decodeResp(ccr.encode(), Messages.CreateChunkResp::decode));
 
+        var appendEpoch = Messages.AllocateWriterEpoch.forAppend(f);
+        assertEquals(appendEpoch, Messages.AllocateWriterEpoch.decode(buf(appendEpoch.encode())));
+
+        var recoveryEpoch = Messages.AllocateWriterEpoch.forRecovery(f);
+        assertEquals(recoveryEpoch, Messages.AllocateWriterEpoch.decode(buf(recoveryEpoch.encode())));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> new Messages.AllocateWriterEpoch(f, (byte) 99));
+
+        var epochResp = new Messages.AllocateWriterEpochResp(7);
+        assertEquals(epochResp, decodeResp(epochResp.encode(), Messages.AllocateWriterEpochResp::decode));
+
         var scm = new Messages.SealChunkMeta(c, 5, 4096, 0xDD, List.of(1, 2));
         assertEquals(scm, Messages.SealChunkMeta.decode(buf(scm.encode())));
 

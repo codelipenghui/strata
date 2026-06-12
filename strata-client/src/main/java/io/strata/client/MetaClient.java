@@ -126,6 +126,16 @@ final class MetaClient implements AutoCloseable {
         return decode(Opcode.CREATE_CHUNK, resp, Messages.CreateChunkResp::decode);
     }
 
+    int allocateWriterEpochForAppend(FileId fileId) {
+        var resp = call(Opcode.ALLOCATE_WRITER_EPOCH, Messages.AllocateWriterEpoch.forAppend(fileId).encode());
+        return decode(Opcode.ALLOCATE_WRITER_EPOCH, resp, Messages.AllocateWriterEpochResp::decode).writerEpoch();
+    }
+
+    int allocateWriterEpochForRecovery(FileId fileId) {
+        var resp = call(Opcode.ALLOCATE_WRITER_EPOCH, Messages.AllocateWriterEpoch.forRecovery(fileId).encode());
+        return decode(Opcode.ALLOCATE_WRITER_EPOCH, resp, Messages.AllocateWriterEpochResp::decode).writerEpoch();
+    }
+
     void sealChunkMeta(io.strata.common.ChunkId chunkId, int writeEpoch, long length, int crc,
                        java.util.List<Integer> sealedReplicas) {
         call(Opcode.SEAL_CHUNK_META,

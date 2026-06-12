@@ -239,6 +239,10 @@ class MetadataServiceTest {
                 new Messages.CreateChunk(missing, 1).encode(), null, 5000));
         assertEquals(ErrorCode.FILE_NOT_FOUND, createChunk.code());
 
+        ScpException allocate = assertThrows(ScpException.class, () -> client.call(Opcode.ALLOCATE_WRITER_EPOCH,
+                Messages.AllocateWriterEpoch.forAppend(missing).encode(), null, 5000));
+        assertEquals(ErrorCode.FILE_NOT_FOUND, allocate.code());
+
         ScpException sealChunk = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
                 new Messages.SealChunkMeta(new ChunkId(missing, 0), 1, 10, 0x1, List.of()).encode(),
                 null, 5000));
@@ -783,6 +787,52 @@ class MetadataServiceTest {
     }
 
     @Test
+    void allocateWriterEpochFencesAppendAndRecoveryOwnership() {
+        registerTrio("epochHost");
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", "/writer-epoch").encode(), null, 5000));
+
+        var first = Messages.AllocateWriterEpochResp.decode(client.call(Opcode.ALLOCATE_WRITER_EPOCH,
+                Messages.AllocateWriterEpoch.forAppend(file.fileId()).encode(), null, 5000));
+        assertEquals(1, first.writerEpoch());
+
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), first.writerEpoch(), 900, 901).encode(), null, 5000));
+        assertEquals(first.writerEpoch(), chunk.writeEpoch());
+
+        ScpException appendWhileOpen = assertThrows(ScpException.class, () -> client.call(
+                Opcode.ALLOCATE_WRITER_EPOCH,
+                Messages.AllocateWriterEpoch.forAppend(file.fileId()).encode(), null, 5000));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, appendWhileOpen.code());
+
+        var recovery = Messages.AllocateWriterEpochResp.decode(client.call(Opcode.ALLOCATE_WRITER_EPOCH,
+                Messages.AllocateWriterEpoch.forRecovery(file.fileId()).encode(), null, 5000));
+        assertEquals(2, recovery.writerEpoch());
+
+        ScpException staleSeal = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), first.writerEpoch(), 10, 0xA, List.of()).encode(),
+                null, 5000));
+        assertEquals(ErrorCode.FENCED_EPOCH, staleSeal.code());
+
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(chunk.chunkId(), recovery.writerEpoch(), 10, 0xA, List.of()).encode(),
+                null, 5000);
+
+        var nextAppend = Messages.AllocateWriterEpochResp.decode(client.call(Opcode.ALLOCATE_WRITER_EPOCH,
+                Messages.AllocateWriterEpoch.forAppend(file.fileId()).encode(), null, 5000));
+        assertEquals(3, nextAppend.writerEpoch());
+
+        ScpException staleCreate = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), recovery.writerEpoch()).encode(), null, 5000));
+        assertEquals(ErrorCode.FENCED_EPOCH, staleCreate.code());
+
+        var nextChunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(file.fileId(), nextAppend.writerEpoch()).encode(), null, 5000));
+        assertEquals(1, nextChunk.chunkId().index());
+        assertEquals(nextAppend.writerEpoch(), nextChunk.writeEpoch());
+    }
+
+    @Test
     void abortChunkRejectsSealedTailButMissingChunkAbortIsIdempotent() {
         registerTrio("abortSealedHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
@@ -809,6 +859,10 @@ class MetadataServiceTest {
                 new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
 
         client.call(Opcode.DELETE_FILES, new Messages.DeleteFiles(List.of(file.fileId())).encode(), null, 5000);
+
+        ScpException allocate = assertThrows(ScpException.class, () -> client.call(Opcode.ALLOCATE_WRITER_EPOCH,
+                Messages.AllocateWriterEpoch.forAppend(file.fileId()).encode(), null, 5000));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, allocate.code());
 
         // an in-flight appender's seal must not mutate a DELETING file...
         ScpException sealChunk = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
@@ -940,6 +994,10 @@ class MetadataServiceTest {
                 new Messages.LookupFile(file.fileId()).encode(), null, 5000));
         assertEquals(1, lookup.fileState());
 
+        ScpException allocate = assertThrows(ScpException.class, () -> client.call(Opcode.ALLOCATE_WRITER_EPOCH,
+                Messages.AllocateWriterEpoch.forAppend(file.fileId()).encode(), null, 5000));
+        assertEquals(ErrorCode.FILE_SEALED, allocate.code());
+
         ScpException sealedFile = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 2).encode(), null, 5000));
         assertEquals(ErrorCode.FILE_SEALED, sealedFile.code());
@@ -981,6 +1039,23 @@ class MetadataServiceTest {
             assertEquals(ErrorCode.INTERNAL, createChunk.code());
             assertTrue(createChunk.getMessage().contains("createChunk CAS exhausted"));
             assertTrue(createRejecting.updateCalls >= 5);
+        } finally {
+            replaceStore(original);
+        }
+
+        var allocateEpochFile = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", "/cas-allocate-epoch").encode(),
+                null, 5000));
+        UpdateRejectingStore epochRejecting = new UpdateRejectingStore(metadataStore());
+        original = replaceStore(epochRejecting);
+        try {
+            ScpException allocateEpoch = assertThrows(ScpException.class,
+                    () -> client.call(Opcode.ALLOCATE_WRITER_EPOCH,
+                            Messages.AllocateWriterEpoch.forAppend(allocateEpochFile.fileId()).encode(),
+                            null, 5000));
+            assertEquals(ErrorCode.INTERNAL, allocateEpoch.code());
+            assertTrue(allocateEpoch.getMessage().contains("allocateWriterEpoch CAS exhausted"));
+            assertTrue(epochRejecting.updateCalls >= 5);
         } finally {
             replaceStore(original);
         }

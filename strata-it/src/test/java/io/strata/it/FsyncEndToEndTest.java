@@ -47,7 +47,7 @@ class FsyncEndToEndTest {
     void fsyncPolicyReachesEveryReplicaHeaderAndDataSurvives() throws Exception {
         FileId fileId = client.create(fsyncSpec("/fsync-policy")).id();
         Workload workload = new Workload();
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 500); // several rolls under fsync
             appender.seal();
         }
@@ -70,10 +70,10 @@ class FsyncEndToEndTest {
     void sealRecoveryWorksUnderFsyncMode() throws Exception {
         FileId fileId = client.create(fsyncSpec("/fsync-recovery")).id();
         Workload workload = new Workload();
-        StrataFile.Appender zombie = client.openById(fileId).openForAppend(1);
+        StrataFile.Appender zombie = client.openById(fileId).openForAppend();
         workload.appendAcked(zombie, 0, 120);
 
-        var sealed = client.openById(fileId).recoverAndSeal(2);
+        var sealed = client.openById(fileId).recoverAndSeal();
         assertTrue(sealed.sealedLength() >= workload.ackedBytes());
         zombie.close();
         workload.verifyAckedPrefix(client, fileId);
