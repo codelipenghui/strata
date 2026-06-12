@@ -1,5 +1,7 @@
 package io.strata.client;
 
+import io.strata.common.Endpoint;
+
 import java.util.List;
 
 /** Client configuration. chunkRollBytes is ~1 GB nominal in production; tests use small values. */
@@ -29,31 +31,6 @@ public record ClientConfig(List<String> metadataEndpoints, long chunkRollBytes, 
     }
 
     private static void validateEndpoint(String endpoint) {
-        if (endpoint == null || endpoint.isBlank()) {
-            throw new IllegalArgumentException("metadata endpoint must not be blank");
-        }
-        int colon = endpoint.lastIndexOf(':');
-        if (colon <= 0 || colon == endpoint.length() - 1) {
-            throw new IllegalArgumentException("metadata endpoint must be host:port: " + endpoint);
-        }
-        String host = endpoint.substring(0, colon);
-        if (host.startsWith("[") != host.endsWith("]")) {
-            throw new IllegalArgumentException("metadata endpoint has unbalanced brackets: " + endpoint);
-        }
-        if (host.startsWith("[") && host.endsWith("]")) {
-            host = host.substring(1, host.length() - 1);
-        }
-        if (host.isBlank() || !host.equals(host.trim())) {
-            throw new IllegalArgumentException("metadata endpoint host must be non-blank: " + endpoint);
-        }
-        int port;
-        try {
-            port = Integer.parseInt(endpoint.substring(colon + 1));
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("metadata endpoint port must be numeric: " + endpoint, e);
-        }
-        if (port < 1 || port > 65_535) {
-            throw new IllegalArgumentException("metadata endpoint port out of range: " + endpoint);
-        }
+        Endpoint.parse(endpoint, "metadata endpoint");
     }
 }

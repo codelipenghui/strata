@@ -273,11 +273,12 @@ public final class MetadataService implements AutoCloseable {
             return m.fileId();
         } catch (KeeperException.NodeExistsException e) {
             var existing = store.getFile(m.fileId());
-            if (existing.isPresent()
-                    && existing.get().value().createdBy(m.opIdMsb(), m.opIdLsb())
-                    && existing.get().value().namespace().equals(m.namespace())
-                    && existing.get().value().path().equals(m.path())) {
-                return m.fileId();
+            if (existing.isPresent()) {
+                if (sameCreateRequest(existing.get().value(), m)) {
+                    return m.fileId();
+                }
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "file id already exists for a different create request: " + m.fileId());
             }
             var pathOwner = store.resolvePath(m.namespace(), m.path());
             if (pathOwner.isPresent()) {
@@ -287,6 +288,15 @@ public final class MetadataService implements AutoCloseable {
             throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                     "file id already exists for a different create request: " + m.fileId());
         }
+    }
+
+    private static boolean sameCreateRequest(Records.FileRecord existing, Messages.CreateFile requested) {
+        return existing.createdBy(requested.opIdMsb(), requested.opIdLsb())
+                && existing.namespace().equals(requested.namespace())
+                && existing.path().equals(requested.path())
+                && existing.fileKind() == requested.fileKind()
+                && existing.mediaClass() == requested.mediaClass()
+                && existing.ackPolicy() == requested.ackPolicy();
     }
 
     private Messages.CreateChunkResp createChunk(Messages.CreateChunk m) throws Exception {
@@ -455,6 +465,10 @@ public final class MetadataService implements AutoCloseable {
         }
         var file = store.getFile(id.get());
         if (file.isEmpty() || file.get().value().state() == Records.FileState.DELETING) {
+            throw new ScpException(ErrorCode.FILE_NOT_FOUND, namespace + ":" + path);
+        }
+        Records.FileRecord record = file.get().value();
+        if (!record.namespace().equals(namespace) || !record.path().equals(path)) {
             throw new ScpException(ErrorCode.FILE_NOT_FOUND, namespace + ":" + path);
         }
         return id.get();

@@ -1,6 +1,7 @@
 package io.strata.client;
 
 import io.strata.common.ErrorCode;
+import io.strata.common.Endpoint;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
@@ -32,7 +33,7 @@ final class MetaClient implements AutoCloseable {
         try {
             if (client == null || client.isClosed()) {
                 String ep = config.metadataEndpoints().get(endpointIndex % config.metadataEndpoints().size());
-                HostPort hp = parseEndpoint(ep);
+                Endpoint hp = parseEndpoint(ep);
                 try {
                     client = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_BROKER, "strata-client");
                 } catch (IOException e) {
@@ -47,30 +48,12 @@ final class MetaClient implements AutoCloseable {
         }
     }
 
-    private record HostPort(String host, int port) {}
-
-    private static HostPort parseEndpoint(String endpoint) {
-        int colon = endpoint == null ? -1 : endpoint.lastIndexOf(':');
-        if (colon <= 0 || colon == endpoint.length() - 1) {
-            throw new ScpException(ErrorCode.INTERNAL, "invalid metadata endpoint: " + endpoint);
-        }
-        String host = endpoint.substring(0, colon);
-        if (host.startsWith("[") != host.endsWith("]")) {
-            throw new ScpException(ErrorCode.INTERNAL, "invalid metadata endpoint brackets: " + endpoint);
-        }
-        if (host.startsWith("[") && host.endsWith("]")) {
-            host = host.substring(1, host.length() - 1);
-        }
-        int port;
+    private static Endpoint parseEndpoint(String endpoint) {
         try {
-            port = Integer.parseInt(endpoint.substring(colon + 1));
-        } catch (NumberFormatException e) {
-            throw new ScpException(ErrorCode.INTERNAL, "invalid metadata endpoint port: " + endpoint);
-        }
-        if (host.isBlank() || !host.equals(host.trim()) || port <= 0 || port > 65_535) {
+            return Endpoint.parse(endpoint, "metadata endpoint");
+        } catch (IllegalArgumentException e) {
             throw new ScpException(ErrorCode.INTERNAL, "invalid metadata endpoint: " + endpoint);
         }
-        return new HostPort(host, port);
     }
 
     /**

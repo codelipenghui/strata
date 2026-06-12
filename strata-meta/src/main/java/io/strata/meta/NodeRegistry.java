@@ -1,5 +1,6 @@
 package io.strata.meta;
 
+import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
 import io.strata.proto.Messages;
@@ -148,26 +149,11 @@ final class NodeRegistry {
     }
 
     private static void validateEndpoint(String endpoint) {
-        int colon = endpoint.lastIndexOf(':');
-        if (colon <= 0 || colon == endpoint.length() - 1) {
-            throw new ScpException(ErrorCode.PRECONDITION_FAILED, "node endpoint must be host:port: " + endpoint);
-        }
-        String host = endpoint.substring(0, colon);
-        if (host.startsWith("[") != host.endsWith("]")) {
-            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
-                    "node endpoint has unbalanced brackets: " + endpoint);
-        }
-        if (host.startsWith("[") && host.endsWith("]")) {
-            host = host.substring(1, host.length() - 1);
-        }
-        int port;
         try {
-            port = Integer.parseInt(endpoint.substring(colon + 1));
-        } catch (NumberFormatException e) {
-            throw new ScpException(ErrorCode.PRECONDITION_FAILED, "node endpoint port must be numeric: " + endpoint);
-        }
-        if (host.isBlank() || !host.equals(host.trim()) || port <= 0 || port > 65_535) {
-            throw new ScpException(ErrorCode.PRECONDITION_FAILED, "invalid node endpoint: " + endpoint);
+            Endpoint.parse(endpoint, "node endpoint");
+        } catch (IllegalArgumentException e) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                    "invalid node endpoint: " + endpoint);
         }
     }
 

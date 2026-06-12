@@ -1,5 +1,7 @@
 package io.strata.node;
 
+import io.strata.common.Endpoint;
+
 import java.nio.file.Path;
 import java.util.List;
 
@@ -56,32 +58,7 @@ public record NodeConfig(
     }
 
     private static void validateEndpoint(String endpoint, String field) {
-        if (endpoint == null) {
-            throw new IllegalArgumentException(field + " must be non-null");
-        }
-        int colon = endpoint.lastIndexOf(':');
-        if (colon <= 0 || colon == endpoint.length() - 1) {
-            throw new IllegalArgumentException(field + " must be host:port: " + endpoint);
-        }
-        String host = endpoint.substring(0, colon);
-        if (host.startsWith("[") != host.endsWith("]")) {
-            throw new IllegalArgumentException(field + " has unbalanced brackets: " + endpoint);
-        }
-        if (host.startsWith("[") && host.endsWith("]")) {
-            host = host.substring(1, host.length() - 1);
-        }
-        if (host.isBlank() || !host.equals(host.trim())) {
-            throw new IllegalArgumentException(field + " host must be non-blank: " + endpoint);
-        }
-        int port;
-        try {
-            port = Integer.parseInt(endpoint.substring(colon + 1));
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException(field + " port must be numeric: " + endpoint);
-        }
-        if (port <= 0 || port > 65_535) {
-            throw new IllegalArgumentException(field + " port out of range: " + endpoint);
-        }
+        Endpoint.parse(endpoint, field);
     }
 
     public static NodeConfig standalone(Path dataDir) {

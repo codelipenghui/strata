@@ -162,6 +162,27 @@ class MetadataServiceTest {
     }
 
     @Test
+    void lookupPathRejectsMarkerThatPointsAtDifferentLogicalFile() throws Exception {
+        var first = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", "/marker-identity-a", (byte) 0, (byte) 0, (byte) 0)
+                        .encode(), null, 5000));
+        var second = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", "/marker-identity-b", (byte) 0, (byte) 0, (byte) 0)
+                        .encode(), null, 5000));
+
+        metadataStore().curator().setData()
+                .forPath("/strata/namespaces/test/paths/marker-identity-a/__file", fileIdBytes(second.fileId()));
+
+        ScpException wrongBinding = assertThrows(ScpException.class, () -> client.call(Opcode.LOOKUP_PATH,
+                new Messages.LookupPath("test", "/marker-identity-a").encode(), null, 5000));
+        assertEquals(ErrorCode.FILE_NOT_FOUND, wrongBinding.code());
+
+        var byId = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
+                new Messages.LookupFile(first.fileId()).encode(), null, 5000));
+        assertEquals(io.strata.common.StrataPath.of("/marker-identity-a"), byId.path());
+    }
+
+    @Test
     void pingEchoesPayloadAndUnknownOpcodesAreRejected() throws Exception {
         byte[] payload = "metadata-ping".getBytes();
         Frame ping = client.callFrame(Opcode.PING, Messages.okHeader(), ByteBuffer.wrap(payload), 5000);
@@ -493,6 +514,12 @@ class MetadataServiceTest {
         return metadataStore().curator().getChildren().forPath("/strata/leader").size();
     }
 
+    private static byte[] fileIdBytes(FileId fileId) {
+        ByteBuffer b = ByteBuffer.allocate(16);
+        fileId.writeTo(b);
+        return b.array();
+    }
+
     private MetadataStore replaceStore(MetadataStore replacement) throws Exception {
         Field field = MetadataService.class.getDeclaredField("store");
         field.setAccessible(true);
@@ -628,6 +655,13 @@ class MetadataServiceTest {
         assertEquals(file1.fileId(), file2.fileId());
         assertEquals(requested, file1.fileId());
 
+        assertCreateReplayConflict("/idem-kind", (byte) 0, (byte) 13, (byte) 0,
+                (byte) 1, (byte) 13, (byte) 0);
+        assertCreateReplayConflict("/idem-media", (byte) 0, (byte) 13, (byte) 0,
+                (byte) 0, (byte) 14, (byte) 0);
+        assertCreateReplayConflict("/idem-ack", (byte) 0, (byte) 13, (byte) 0,
+                (byte) 0, (byte) 13, (byte) 1);
+
         ScpException conflictingFile = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/idem", (byte) 0, (byte) 13, (byte) 0,
                         requested, 101, 201).encode(), null, 5000));
@@ -643,6 +677,21 @@ class MetadataServiceTest {
         ScpException conflictingChunk = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file1.fileId(), 1, (byte) 13, 301, 401).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, conflictingChunk.code());
+    }
+
+    private void assertCreateReplayConflict(String path, byte kind, byte media, byte ack,
+                                            byte replayKind, byte replayMedia, byte replayAck) {
+        FileId requested = FileId.random();
+        long opMsb = requested.msb();
+        long opLsb = requested.lsb();
+        client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", path, kind, media, ack, requested, opMsb, opLsb).encode(),
+                null, 5000);
+
+        ScpException conflict = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", path, replayKind, replayMedia, replayAck,
+                        requested, opMsb, opLsb).encode(), null, 5000));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, conflict.code());
     }
 
     @Test

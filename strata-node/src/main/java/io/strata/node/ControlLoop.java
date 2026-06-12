@@ -1,6 +1,7 @@
 package io.strata.node;
 
 import io.strata.common.ChunkState;
+import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
 import io.strata.format.ChunkFormats;
@@ -100,7 +101,7 @@ final class ControlLoop implements AutoCloseable {
         if (meta == null || meta.isClosed()) {
             disconnect();
             String ep = config.metadataEndpoints().get(endpointIndex % config.metadataEndpoints().size());
-            HostPort hp = parseEndpoint(ep);
+            Endpoint hp = parseEndpoint(ep);
             meta = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_STORAGE_NODE,
                     "node-" + node.incarnation());
             sessionEpoch = -1;
@@ -200,7 +201,7 @@ final class ControlLoop implements AutoCloseable {
         for (Messages.Replica source : cmd.sources()) {
             if (source.nodeId() == node.nodeId()) continue;
             try {
-                HostPort hp = parseEndpoint(source.endpoint());
+                Endpoint hp = parseEndpoint(source.endpoint());
                 try (ScpClient src = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_STORAGE_NODE,
                         "repair-" + node.nodeId())) {
                     byte[] file = fetchWholeFile(src, cmd);
@@ -219,30 +220,12 @@ final class ControlLoop implements AutoCloseable {
         throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no usable source");
     }
 
-    private record HostPort(String host, int port) {}
-
-    private static HostPort parseEndpoint(String endpoint) {
-        int colon = endpoint == null ? -1 : endpoint.lastIndexOf(':');
-        if (colon <= 0 || colon == endpoint.length() - 1) {
-            throw new ScpException(ErrorCode.INTERNAL, "invalid endpoint: " + endpoint);
-        }
-        String host = endpoint.substring(0, colon);
-        if (host.startsWith("[") != host.endsWith("]")) {
-            throw new ScpException(ErrorCode.INTERNAL, "invalid endpoint brackets: " + endpoint);
-        }
-        if (host.startsWith("[") && host.endsWith("]")) {
-            host = host.substring(1, host.length() - 1);
-        }
-        int port;
+    private static Endpoint parseEndpoint(String endpoint) {
         try {
-            port = Integer.parseInt(endpoint.substring(colon + 1));
-        } catch (NumberFormatException e) {
-            throw new ScpException(ErrorCode.INTERNAL, "invalid endpoint port: " + endpoint);
-        }
-        if (host.isBlank() || !host.equals(host.trim()) || port <= 0 || port > 65_535) {
+            return Endpoint.parse(endpoint);
+        } catch (IllegalArgumentException e) {
             throw new ScpException(ErrorCode.INTERNAL, "invalid endpoint: " + endpoint);
         }
-        return new HostPort(host, port);
     }
 
     byte[] fetchWholeFile(ScpClient src, Messages.ReplicateCmd cmd) throws IOException {
