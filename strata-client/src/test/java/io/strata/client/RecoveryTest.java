@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -90,7 +91,31 @@ class RecoveryTest {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.PRECONDITION_FAILED, e.code());
-                assertEquals(false, storageTouched.get());
+                assertFalse(storageTouched.get());
+            }
+        }
+    }
+
+    @Test
+    void unknownFileStateRecoveryFailsBeforeFencingReplicas() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicBoolean storageTouched = new AtomicBoolean(false);
+
+        try (ScpServer storage = new ScpServer(0, 1, 0, 0, req -> {
+            storageTouched.set(true);
+            throw new ScpException(ErrorCode.INTERNAL, "storage should not be contacted");
+        });
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     new Messages.LookupFileResp("test", "/test/file", (byte) 0, (byte) 0, (byte) 99,
+                             List.of(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                                     new Messages.Replica(1, endpoint(storage)))))), null)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
+                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertFalse(storageTouched.get());
             }
         }
     }

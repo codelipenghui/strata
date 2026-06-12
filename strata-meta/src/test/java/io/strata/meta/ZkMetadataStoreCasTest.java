@@ -7,10 +7,12 @@ import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
 
+import java.nio.ByteBuffer;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -92,5 +94,34 @@ class ZkMetadataStoreCasTest {
                 curator.close();
             }
         }
+    }
+
+    @Test
+    void pathMarkersMustContainAFullFileIdAndMatchDeleteExpectation() throws Exception {
+        try (TestingServer zk = new TestingServer(true)) {
+            try (ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
+                FileId fileId = FileId.random();
+                Records.FileRecord file = new Records.FileRecord(fileId, "test", "/marker-owner",
+                        (byte) 0, (byte) 0, (byte) 0, Records.FileState.OPEN,
+                        System.currentTimeMillis(), List.of());
+                store.createFile(file);
+
+                FileId other = FileId.random();
+                store.curator().setData().forPath(markerPath("test", "/marker-owner"), fileIdBytes(other));
+                assertEquals(other, store.resolvePath(file.namespace(), file.path()).orElseThrow());
+                assertFalse(store.deletePath(file.namespace(), file.path(), fileId));
+
+                store.curator().setData().forPath(markerPath("test", "/marker-owner"), new byte[] {1, 2, 3});
+                assertThrows(IllegalArgumentException.class, () -> store.resolvePath(file.namespace(), file.path()));
+            }
+        }
+    }
+
+    private static String markerPath(String namespace, String path) {
+        return "/strata/namespaces/" + namespace + "/paths" + path + "/__file";
+    }
+
+    private static byte[] fileIdBytes(FileId id) {
+        return ByteBuffer.allocate(16).putLong(id.msb()).putLong(id.lsb()).array();
     }
 }

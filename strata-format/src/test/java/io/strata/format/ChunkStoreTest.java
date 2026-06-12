@@ -575,6 +575,25 @@ class ChunkStoreTest {
     }
 
     @Test
+    void closeReportsSidecarPersistenceFailureAndKeepsChunkForRetry() throws Exception {
+        ChunkStore store = newStore();
+        open(store, id, 1);
+        Path metaPath = dir.resolve(ChunkFormats.baseName(id) + ".meta");
+        Files.delete(metaPath);
+        Files.createDirectory(metaPath);
+
+        IOException failure = assertThrows(IOException.class, store::close);
+        assertTrue(failure.getMessage().contains("Is a directory")
+                || failure.getMessage().contains("is a directory")
+                || failure.getMessage().contains(metaPath.toString()), "got: " + failure.getMessage());
+        assertTrue(store.contains(id), "failed close must keep the chunk visible for retry");
+
+        Files.delete(metaPath);
+        store.close();
+        assertEquals(false, store.contains(id));
+    }
+
+    @Test
     void closePropagatesPoisonedCommitterButAllowsRetry() throws Exception {
         ChunkStore store = newStore();
         open(store, id, 1);

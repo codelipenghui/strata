@@ -1,6 +1,12 @@
 package io.strata.proto;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.DecoderException;
+import io.netty.handler.codec.EncoderException;
 import io.strata.common.ChunkId;
+import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import org.junit.jupiter.api.Test;
@@ -14,7 +20,9 @@ import java.nio.ByteBuffer;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -95,5 +103,88 @@ class AdversarialInputTest {
                 assertEquals(ErrorCode.UNSUPPORTED_VERSION, e.code());
             }
         }
+    }
+
+    @Test
+    void nettyDecoderBuffersPartialFramesAndRejectsMalformedFrames() {
+        EmbeddedChannel partialLength = new EmbeddedChannel(new NettyFrameCodec.Decoder());
+        try {
+            assertFalse(partialLength.writeInbound(Unpooled.wrappedBuffer(new byte[] {0, 1})));
+            assertNull(partialLength.readInbound());
+        } finally {
+            partialLength.finishAndReleaseAll();
+        }
+
+        EmbeddedChannel partialFrame = new EmbeddedChannel(new NettyFrameCodec.Decoder());
+        try {
+            ByteBuf buf = Unpooled.buffer();
+            buf.writeInt(Frame.PREAMBLE_AFTER_LEN);
+            buf.writeByte(Frame.MAGIC);
+            assertFalse(partialFrame.writeInbound(buf));
+            assertNull(partialFrame.readInbound());
+        } finally {
+            partialFrame.finishAndReleaseAll();
+        }
+
+        assertDecoderRejects(rawLengthFrame(Frame.PREAMBLE_AFTER_LEN - 1), "bad frame length");
+        assertDecoderRejects(rawLengthFrame(FrameIO.MAX_FRAME_BYTES + 1), "bad frame length");
+        assertDecoderRejects(rawFrame(Frame.PREAMBLE_AFTER_LEN, (byte) 0, Frame.FRAME_VERSION,
+                (short) 0, 0, 0, 0, new byte[0]), "bad magic");
+        assertDecoderRejects(rawFrame(Frame.PREAMBLE_AFTER_LEN, Frame.MAGIC, (byte) 99,
+                (short) 0, 0, 0, 0, new byte[0]), "unsupported frame version");
+        assertDecoderRejects(rawFrame(Frame.PREAMBLE_AFTER_LEN, Frame.MAGIC, Frame.FRAME_VERSION,
+                (short) 0, -1, 0, 0, new byte[0]), "negative payload length");
+        assertDecoderRejects(rawFrame(Frame.PREAMBLE_AFTER_LEN + 1, Frame.MAGIC, Frame.FRAME_VERSION,
+                (short) 0, 0, 0, 0, new byte[] {0}), "frame length mismatch");
+        assertDecoderRejects(rawFrame(Frame.PREAMBLE_AFTER_LEN + 1, Frame.MAGIC, Frame.FRAME_VERSION,
+                Frame.FLAG_PAYLOAD_CRC, 1, Crc.of(ByteBuffer.wrap(new byte[] {2})), 0, new byte[] {1}),
+                "payload crc mismatch");
+    }
+
+    @Test
+    void nettyEncoderRejectsOversizedHeadersBeforeWriting() {
+        EmbeddedChannel encoder = new EmbeddedChannel(new NettyFrameCodec.Encoder());
+        try {
+            EncoderException e = assertThrows(EncoderException.class, () -> encoder.writeOutbound(
+                    Frame.request(Opcode.PING, new byte[0x1_0000], null, 1)));
+            assertTrue(e.getCause() instanceof IOException);
+            assertTrue(e.getCause().getMessage().contains("header too large"));
+        } finally {
+            encoder.finishAndReleaseAll();
+        }
+    }
+
+    private static void assertDecoderRejects(ByteBuf frame, String expectedMessage) {
+        EmbeddedChannel channel = new EmbeddedChannel(new NettyFrameCodec.Decoder());
+        try {
+            DecoderException e = assertThrows(DecoderException.class, () -> channel.writeInbound(frame));
+            assertTrue(e.getCause() instanceof IOException);
+            assertTrue(e.getCause().getMessage().contains(expectedMessage), "got: " + e.getCause().getMessage());
+        } finally {
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    private static ByteBuf rawFrame(int frameLen, byte magic, byte version, short flags, int payloadLen,
+                                    int payloadCrc, int headerLen, byte[] body) {
+        ByteBuf out = Unpooled.buffer(Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + body.length);
+        out.writeInt(frameLen);
+        out.writeByte(magic);
+        out.writeByte(version);
+        out.writeShort(Opcode.PING.code);
+        out.writeShort(1);
+        out.writeShort(flags);
+        out.writeLong(7);
+        out.writeInt(payloadLen);
+        out.writeInt(payloadCrc);
+        out.writeShort(headerLen);
+        out.writeBytes(body);
+        return out;
+    }
+
+    private static ByteBuf rawLengthFrame(int frameLen) {
+        ByteBuf out = Unpooled.buffer(Integer.BYTES);
+        out.writeInt(frameLen);
+        return out;
     }
 }

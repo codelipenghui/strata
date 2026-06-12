@@ -267,6 +267,25 @@ class MetadataServiceTest {
     }
 
     @Test
+    void deleteFilesReportsInternalWhenPathMarkerBelongsToAnotherFile() throws Exception {
+        var created = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", "/delete-path-owner-mismatch",
+                        (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
+
+        DeletePathRejectingStore rejecting = new DeletePathRejectingStore(metadataStore());
+        MetadataStore original = replaceStore(rejecting);
+        try {
+            var delete = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
+                    new Messages.DeleteFiles(List.of(created.fileId())).encode(), null, 5000));
+
+            assertEquals(ErrorCode.INTERNAL.code, delete.codes().get(0).shortValue());
+            assertEquals(1, rejecting.deletePathCalls);
+        } finally {
+            replaceStore(original);
+        }
+    }
+
+    @Test
     void fileChunkLifecycleWithPlacement() throws Exception {
         byte mediaClass = 21;
         FakeNode n1 = new FakeNode("hostA", mediaClass);
@@ -544,17 +563,11 @@ class MetadataServiceTest {
         }
     }
 
-    private static final class UpdateRejectingStore implements MetadataStore {
-        private final MetadataStore delegate;
-        int updateCalls;
+    private static class DelegatingMetadataStore implements MetadataStore {
+        protected final MetadataStore delegate;
 
-        private UpdateRejectingStore(MetadataStore delegate) {
+        private DelegatingMetadataStore(MetadataStore delegate) {
             this.delegate = delegate;
-        }
-
-        @Override
-        public void createFile(Records.FileRecord record) throws Exception {
-            delegate.createFile(record);
         }
 
         @Override
@@ -569,9 +582,13 @@ class MetadataServiceTest {
         }
 
         @Override
-        public boolean updateFile(Records.FileRecord record, int expectedVersion) {
-            updateCalls++;
-            return false;
+        public void createFile(Records.FileRecord record) throws Exception {
+            delegate.createFile(record);
+        }
+
+        @Override
+        public boolean updateFile(Records.FileRecord record, int expectedVersion) throws Exception {
+            return delegate.updateFile(record, expectedVersion);
         }
 
         @Override
@@ -612,6 +629,35 @@ class MetadataServiceTest {
 
         @Override
         public void close() {
+        }
+    }
+
+    private static final class UpdateRejectingStore extends DelegatingMetadataStore {
+        int updateCalls;
+
+        private UpdateRejectingStore(MetadataStore delegate) {
+            super(delegate);
+        }
+
+        @Override
+        public boolean updateFile(Records.FileRecord record, int expectedVersion) {
+            updateCalls++;
+            return false;
+        }
+    }
+
+    private static final class DeletePathRejectingStore extends DelegatingMetadataStore {
+        int deletePathCalls;
+
+        private DeletePathRejectingStore(MetadataStore delegate) {
+            super(delegate);
+        }
+
+        @Override
+        public boolean deletePath(io.strata.common.StrataNamespace namespace, io.strata.common.StrataPath path,
+                                  FileId expectedFileId) {
+            deletePathCalls++;
+            return false;
         }
     }
 

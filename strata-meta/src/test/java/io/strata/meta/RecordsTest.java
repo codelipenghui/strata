@@ -63,6 +63,11 @@ class RecordsTest {
         assertFalse(record.createdBy(11, 23));
         assertEquals(Records.FileState.SEALED, record.withState(Records.FileState.SEALED).state());
         assertEquals(0, record.withChunks(List.of()).chunks().size());
+        Records.FileRecord typed = new Records.FileRecord(fileId, io.strata.common.StrataNamespace.of("typed"),
+                io.strata.common.StrataPath.of("/typed-file"), (byte) 1, (byte) 2, (byte) 3,
+                Records.FileState.OPEN, 1234, List.of());
+        assertTrue(typed.createdBy(0, 0));
+        assertEquals(io.strata.common.StrataPath.of("/typed-file"), typed.path());
         assertEquals(record, Records.FileRecord.decode(record.encode()));
 
         byte[] invalid = record.encode();

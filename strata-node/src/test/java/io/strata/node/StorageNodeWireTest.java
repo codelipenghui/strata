@@ -26,6 +26,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -60,6 +62,46 @@ class StorageNodeWireTest {
 
         IOException e = assertThrows(IOException.class, () -> new StorageNode(NodeConfig.standalone(dir)));
         assertTrue(e.getMessage().contains("identity"));
+    }
+
+    @Test
+    void identityFileMustContainBothNodeIdAndIncarnation() throws Exception {
+        Files.writeString(dir.resolve("identity.properties"), "nodeId=1\n");
+
+        IOException e = assertThrows(IOException.class, () -> new StorageNode(NodeConfig.standalone(dir)));
+        assertTrue(e.getMessage().contains("missing nodeId or incarnation"));
+    }
+
+    @Test
+    void identityRejectsNodeIdsBelowUnassignedSentinel() throws Exception {
+        Files.writeString(dir.resolve("identity.properties"),
+                "nodeId=-2\nincarnation=" + UUID.randomUUID() + "\n");
+
+        IOException e = assertThrows(IOException.class, () -> new StorageNode(NodeConfig.standalone(dir)));
+        assertTrue(e.getMessage().contains("invalid storage node identity"));
+    }
+
+    @Test
+    void nodeIdentityAndAdvertisedEndpointAreVolumeBound() throws Exception {
+        NodeConfig config = NodeConfig.standalone(dir).withAdvertisedEndpoint("published-node:19000");
+        UUID incarnation;
+        try (StorageNode node = new StorageNode(config)) {
+            assertEquals("published-node:19000", node.endpoint());
+            assertEquals(-1, node.nodeId());
+            assertFalse(node.isDraining());
+            assertEquals(config, node.config());
+            assertNotNull(node.store());
+
+            node.nodeIdAssigned(-1);
+            node.nodeIdAssigned(42);
+            assertEquals(42, node.nodeId());
+            incarnation = node.incarnation();
+        }
+
+        try (StorageNode reopened = new StorageNode(NodeConfig.standalone(dir))) {
+            assertEquals(42, reopened.nodeId());
+            assertEquals(incarnation, reopened.incarnation());
+        }
     }
 
     @Test

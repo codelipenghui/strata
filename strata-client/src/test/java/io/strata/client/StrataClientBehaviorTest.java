@@ -27,6 +27,15 @@ class StrataClientBehaviorTest {
         assertThrows(NullPointerException.class, () -> StrataClient.FileSpec.log("test", null));
         assertThrows(IllegalArgumentException.class,
                 () -> new StrataClient.FileSpec("test", "/test-file", (byte) 0, (byte) 0, (byte) 2));
+
+        StrataClient.FilePath path = new StrataClient.FilePath("test", "/test-file");
+        assertEquals("test", path.namespace().toString());
+        assertEquals("/test-file", path.path().toString());
+        assertThrows(NullPointerException.class,
+                () -> new StrataClient.FilePath(null, io.strata.common.StrataPath.of("/test-file")));
+        assertThrows(NullPointerException.class,
+                () -> new StrataClient.FilePath(io.strata.common.StrataNamespace.of("test"), null));
+        assertThrows(NullPointerException.class, () -> StrataClient.connect(null));
     }
 
     @Test
