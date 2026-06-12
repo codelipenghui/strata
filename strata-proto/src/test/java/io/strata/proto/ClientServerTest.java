@@ -1,6 +1,7 @@
 package io.strata.proto;
 
 import io.strata.common.ErrorCode;
+import io.strata.common.ConnectionPolicy;
 import io.strata.common.ScpException;
 import org.junit.jupiter.api.Test;
 
@@ -79,6 +80,108 @@ class ClientServerTest {
         BufWriter w = new BufWriter(4);
         w.noTags();
         return w.toBytes();
+    }
+
+    @Test
+    void managedConnectionHeartbeatsIdleHealthyConnection() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger pings = new java.util.concurrent.atomic.AtomicInteger();
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
+                if (Opcode.fromCode(req.opcode()) == Opcode.PING) {
+                    pings.incrementAndGet();
+                    return ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
+                }
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+             });
+             ManagedScpConnection conn = managed(endpoint(server), 50, 100, 10_000)) {
+            conn.call(Opcode.PING, emptyHeader(), null, 500);
+
+            waitFor(() -> pings.get() >= 2);
+        }
+    }
+
+    @Test
+    void managedConnectionHeartbeatTimeoutClosesConnection() throws Exception {
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicInteger pings = new java.util.concurrent.atomic.AtomicInteger();
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
+                if (Opcode.fromCode(req.opcode()) == Opcode.PING) {
+                    if (pings.incrementAndGet() > 1) {
+                        release.await();
+                    }
+                    return ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
+                }
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+             });
+             ManagedScpConnection conn = managed(endpoint(server), 50, 50, 10_000)) {
+            conn.call(Opcode.PING, emptyHeader(), null, 500);
+            long generation = conn.generation();
+
+            waitFor(() -> pings.get() > 1 && conn.generation() > generation);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void managedConnectionIdleEvictionAllowsFutureReconnect() throws Exception {
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
+                if (Opcode.fromCode(req.opcode()) == Opcode.PING) {
+                    return ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
+                }
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+             });
+             ManagedScpConnection conn = managed(endpoint(server), 50, 100, 120)) {
+            conn.call(Opcode.PING, emptyHeader(), null, 500);
+            long connectedGeneration = conn.generation();
+
+            waitFor(() -> conn.generation() > connectedGeneration);
+            long evictedGeneration = conn.generation();
+
+            conn.call(Opcode.PING, emptyHeader(), null, 500);
+            assertTrue(conn.generation() > evictedGeneration);
+        }
+    }
+
+    @Test
+    void managedConnectionDoesNotEvictPendingRequestAsIdle() throws Exception {
+        java.util.concurrent.CountDownLatch requestStarted = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch releaseRequest = new java.util.concurrent.CountDownLatch(1);
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
+                Opcode op = Opcode.fromCode(req.opcode());
+                if (op == Opcode.READ) {
+                    requestStarted.countDown();
+                    releaseRequest.await();
+                    return ScpServer.ok(req, Messages.okHeader(), null);
+                }
+                if (op == Opcode.PING) {
+                    return ScpServer.ok(req, Messages.okHeader(), null);
+                }
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+             });
+             ManagedScpConnection conn = managed(endpoint(server), 30, 100, 80)) {
+            CompletableFuture<Frame> future = conn.sendWithTimeout(Opcode.READ, emptyHeader(), null, 1_000);
+            assertTrue(requestStarted.await(1, TimeUnit.SECONDS));
+            long generation = conn.generation();
+
+            TimeUnit.MILLISECONDS.sleep(180);
+            assertFalse(future.isDone());
+            assertEquals(generation, conn.generation());
+
+            releaseRequest.countDown();
+            Resp.check(future.get(1, TimeUnit.SECONDS).headerSlice());
+        } finally {
+            releaseRequest.countDown();
+        }
+    }
+
+    @Test
+    void managedConnectionCloseStopsMonitorThread() throws Exception {
+        ManagedScpConnection conn = managed("127.0.0.1:1", 50, 50, 120);
+        assertTrue(conn.monitorAliveForTests());
+
+        conn.close();
+
+        waitFor(() -> !conn.monitorAliveForTests());
     }
 
     @Test
@@ -654,6 +757,17 @@ class ClientServerTest {
         BufWriter w = new BufWriter();
         w.u16(0).u16(0).u8(ScpClient.KIND_TOOL).u64(0).string("old").noTags();
         return w.toBytes();
+    }
+
+    private static ManagedScpConnection managed(String endpoint, int heartbeatIntervalMs,
+                                                int heartbeatTimeoutMs, int idleTimeoutMs) {
+        return new ManagedScpConnection(List.of(endpoint),
+                new ConnectionPolicy(500, heartbeatIntervalMs, heartbeatTimeoutMs, idleTimeoutMs, 50, 200),
+                ScpClient.KIND_TOOL, "managed-test", "test endpoint", false, true);
+    }
+
+    private static String endpoint(ScpServer server) {
+        return "127.0.0.1:" + server.port();
     }
 
     private static void waitFor(BooleanSupplier condition) throws InterruptedException {

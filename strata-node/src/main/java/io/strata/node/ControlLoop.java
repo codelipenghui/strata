@@ -1,12 +1,15 @@
 package io.strata.node;
 
 import io.strata.common.ChunkState;
+import io.strata.common.ConnectionPolicy;
 import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
+import io.strata.common.ScpConnectionException;
 import io.strata.common.ScpException;
 import io.strata.format.ChunkFormats;
 import io.strata.format.ChunkStore;
 import io.strata.proto.Messages;
+import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
 import org.slf4j.Logger;
@@ -19,6 +22,7 @@ import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Storage-node control plane (tech design §10.4): register, heartbeat (commands ride the
@@ -38,15 +42,19 @@ final class ControlLoop implements AutoCloseable {
     private final LinkedBlockingQueue<Messages.Command> commandQueue = new LinkedBlockingQueue<>();
     private final ConcurrentLinkedQueue<Messages.CompletedCommand> completed = new ConcurrentLinkedQueue<>();
 
-    private volatile ScpClient meta;
+    private volatile ManagedScpConnection meta;
     private volatile long sessionEpoch = -1;
     private volatile int heartbeatIntervalMs = 1_000;
     private int endpointIndex = 0;
+    private int reconnectBackoffMs;
 
     ControlLoop(StorageNode node, NodeConfig config, ChunkStore store) {
         this.node = node;
         this.config = config;
         this.store = store;
+        this.reconnectBackoffMs = config != null
+                ? config.connectionPolicy().reconnectInitialBackoffMs()
+                : ConnectionPolicy.DEFAULT.reconnectInitialBackoffMs();
     }
 
     private final java.util.List<Thread> threads = new java.util.ArrayList<>(3);
@@ -62,9 +70,14 @@ final class ControlLoop implements AutoCloseable {
             try {
                 ensureRegistered();
                 heartbeatOnce();
+                resetBackoff();
                 Thread.sleep(heartbeatIntervalMs);
             } catch (InterruptedException e) {
                 return;
+            } catch (ScpConnectionException e) {
+                log.warn("metadata connection problem: {} — reconnecting", e.toString());
+                rotateEndpoint();
+                sleepQuiet(nextBackoffMs());
             } catch (ScpException e) {
                 if (e.code() == ErrorCode.LEASE_EXPIRED || e.code() == ErrorCode.NOT_REGISTERED) {
                     log.warn("session invalid ({}), re-registering", e.code());
@@ -74,12 +87,11 @@ final class ControlLoop implements AutoCloseable {
                 } else {
                     log.warn("control-loop error: {}", e.getMessage());
                 }
-                sleepQuiet(200);
+                sleepQuiet(nextBackoffMs());
             } catch (Exception e) {
                 log.warn("metadata connection problem: {} — reconnecting", e.toString());
-                disconnect();
                 rotateEndpoint();
-                sleepQuiet(200);
+                sleepQuiet(nextBackoffMs());
             }
         }
     }
@@ -97,12 +109,13 @@ final class ControlLoop implements AutoCloseable {
     }
 
     private void ensureRegisteredLocked() throws IOException {
-        if (meta == null || meta.isClosed()) {
+        if (meta == null) {
             disconnect();
             String ep = config.metadataEndpoints().get(endpointIndex % config.metadataEndpoints().size());
-            Endpoint hp = Endpoint.parse(ep, "endpoint", ErrorCode.INTERNAL);
-            meta = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_STORAGE_NODE,
-                    "node-" + node.incarnation());
+            Endpoint.parse(ep, "endpoint", ErrorCode.INTERNAL);
+            meta = new ManagedScpConnection(List.of(ep), config.connectionPolicy(),
+                    ScpClient.KIND_STORAGE_NODE, "node-" + node.incarnation(),
+                    "metadata endpoint", false, false);
             sessionEpoch = -1;
         }
         if (sessionEpoch < 0) {
@@ -297,8 +310,8 @@ final class ControlLoop implements AutoCloseable {
                 if (++cycle % 10 == 0) {
                     store.scrubOnce();
                 }
-                ScpClient m = meta;
-                if (m == null || m.isClosed() || sessionEpoch < 0) continue;
+                ManagedScpConnection m = meta;
+                if (m == null || sessionEpoch < 0) continue;
                 List<Messages.InventoryEntry> entries = new ArrayList<>();
                 for (var item : store.inventory()) {
                     entries.add(new Messages.InventoryEntry(item.chunkId(), item.state(), item.length(), item.crc()));
@@ -317,10 +330,23 @@ final class ControlLoop implements AutoCloseable {
     }
 
     private void disconnect() {
-        ScpClient m = meta;
+        ManagedScpConnection m = meta;
         meta = null;
         sessionEpoch = -1;
         if (m != null) m.close();
+    }
+
+    private void resetBackoff() {
+        reconnectBackoffMs = config.connectionPolicy().reconnectInitialBackoffMs();
+    }
+
+    private int nextBackoffMs() {
+        int base = reconnectBackoffMs;
+        int jitter = ThreadLocalRandom.current().nextInt(Math.max(1, base / 10 + 1));
+        long next = Math.min((long) config.connectionPolicy().reconnectMaxBackoffMs(),
+                Math.max((long) base * 2, base + 1L));
+        reconnectBackoffMs = (int) next;
+        return Math.min(config.connectionPolicy().reconnectMaxBackoffMs(), base + jitter);
     }
 
     private static void sleepQuiet(long ms) {

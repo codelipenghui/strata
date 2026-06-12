@@ -3,10 +3,11 @@ package io.strata.client;
 import io.strata.common.Endpoint;
 import io.strata.common.FileId;
 import io.strata.common.ErrorCode;
+import io.strata.common.ConnectionPolicy;
 import io.strata.common.ScpException;
 import io.strata.proto.Messages;
+import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.Opcode;
-import io.strata.proto.ScpClient;
 import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 
@@ -17,10 +18,11 @@ import java.net.ServerSocket;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -63,20 +65,29 @@ class MetaClientTest {
     }
 
     @Test
-    void malformedMetadataResponseClosesExistingConnectionAndClearsClient() throws Exception {
-        try (ScpServer server = new ScpServer(0, 1, 0, 0,
-                req -> ScpServer.ok(req, Messages.okHeader(), null));
-             ScpClient scp = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_BROKER, "test");
+    void malformedMetadataResponseDisconnectsManagedConnection() throws Exception {
+        FileId id = FileId.random();
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
+                Opcode op = Opcode.fromCode(req.opcode());
+                if (op == Opcode.CREATE_FILE) {
+                    return ScpServer.ok(req, new Messages.CreateFileResp(id).encode(), null);
+                }
+                if (op == Opcode.PING) {
+                    return ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
+                }
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+             });
              MetaClient meta = new MetaClient(new ClientConfig(List.of(endpoint(server)), 1024, 100))) {
-            setClient(meta, scp);
+            assertEquals(id, meta.createFile(StrataClient.FileSpec.log("test", "/test-file")));
+            ManagedScpConnection connection = connectionField(meta);
+            long before = connection.generation();
 
             Throwable thrown = decodeFailure(meta, Opcode.CREATE_FILE, ignored -> {
                 throw new IllegalArgumentException("bad response");
             });
 
             assertEquals(ErrorCode.INTERNAL, ((ScpException) thrown).code());
-            assertTrue(scp.isClosed());
-            assertNull(clientField(meta));
+            assertNotEquals(before, connection.generation());
         }
     }
 
@@ -100,6 +111,26 @@ class MetaClientTest {
     }
 
     @Test
+    void metadataCallUsesNextEndpointAfterConnectFailure() throws Exception {
+        int deadPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            deadPort = socket.getLocalPort();
+        }
+        FileId id = FileId.random();
+        try (ScpServer leader = new ScpServer(0, 1, 0, 0,
+                req -> ScpServer.ok(req, new Messages.CreateFileResp(id).encode(), null))) {
+            ConnectionPolicy policy = ConnectionPolicy.DEFAULT
+                    .withConnectTimeoutMs(100)
+                    .withHeartbeatIntervalMs(1_000);
+            try (MetaClient meta = new MetaClient(new ClientConfig(
+                    List.of("127.0.0.1:" + deadPort, endpoint(leader)), 1024, 200, policy))) {
+
+                assertEquals(id, meta.createFile(StrataClient.FileSpec.log("test", "/test-file")));
+            }
+        }
+    }
+
+    @Test
     void metadataCallRetriesRetriableErrorsWithoutRotating() throws Exception {
         AtomicInteger calls = new AtomicInteger();
         FileId id = FileId.random();
@@ -114,6 +145,45 @@ class MetaClientTest {
             assertEquals(id, meta.createFile(StrataClient.FileSpec.log("test", "/test-file")));
 
             assertEquals(2, calls.get());
+        }
+    }
+
+    @Test
+    void metadataHeartbeatReconnectsToNextEndpointAfterLeaderConnectionDies() throws Exception {
+        FileId firstId = FileId.random();
+        FileId secondId = FileId.random();
+        AtomicInteger secondPings = new AtomicInteger();
+        try (ScpServer first = new ScpServer(0, 1, 0, 0, req -> {
+                Opcode op = Opcode.fromCode(req.opcode());
+                if (op == Opcode.CREATE_FILE) {
+                    return ScpServer.ok(req, new Messages.CreateFileResp(firstId).encode(), null);
+                }
+                if (op == Opcode.PING) {
+                    return ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
+                }
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+             });
+             ScpServer second = new ScpServer(0, 1, 0, 0, req -> {
+                 Opcode op = Opcode.fromCode(req.opcode());
+                 if (op == Opcode.CREATE_FILE) {
+                     return ScpServer.ok(req, new Messages.CreateFileResp(secondId).encode(), null);
+                 }
+                 if (op == Opcode.PING) {
+                     secondPings.incrementAndGet();
+                     return ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
+                 }
+                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+             })) {
+            ConnectionPolicy policy = new ConnectionPolicy(500, 50, 50, 10_000, 50, 200);
+            ClientConfig config = new ClientConfig(List.of(endpoint(first), endpoint(second)), 1024, 500, policy);
+            try (MetaClient meta = new MetaClient(config)) {
+                assertEquals(firstId, meta.createFile(StrataClient.FileSpec.log("test", "/first")));
+                first.close();
+
+                waitFor(() -> secondPings.get() > 0);
+
+                assertEquals(secondId, meta.createFile(StrataClient.FileSpec.log("test", "/second")));
+            }
         }
     }
 
@@ -173,19 +243,24 @@ class MetaClientTest {
         }
     }
 
-    private static void setClient(MetaClient meta, ScpClient client) throws ReflectiveOperationException {
-        Field field = MetaClient.class.getDeclaredField("client");
+    private static ManagedScpConnection connectionField(MetaClient meta) throws ReflectiveOperationException {
+        Field field = MetaClient.class.getDeclaredField("connection");
         field.setAccessible(true);
-        field.set(meta, client);
-    }
-
-    private static Object clientField(MetaClient meta) throws ReflectiveOperationException {
-        Field field = MetaClient.class.getDeclaredField("client");
-        field.setAccessible(true);
-        return field.get(meta);
+        return (ManagedScpConnection) field.get(meta);
     }
 
     private static String endpoint(ScpServer server) {
         return "127.0.0.1:" + server.port();
+    }
+
+    private static void waitFor(BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (System.currentTimeMillis() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        throw new AssertionError("condition not met before deadline");
     }
 }

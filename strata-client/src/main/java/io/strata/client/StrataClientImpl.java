@@ -14,11 +14,12 @@ import java.util.Objects;
 final class StrataClientImpl implements StrataClient {
     private final ClientConfig config;
     private final MetaClient meta;
-    private final NodePool pool = new NodePool();
+    private final NodePool pool;
 
     StrataClientImpl(ClientConfig config) {
         this.config = config;
         this.meta = new MetaClient(config);
+        this.pool = new NodePool(config);
     }
 
     @Override

@@ -57,6 +57,7 @@ public final class ScpClient implements AutoCloseable {
                     .channel(NioSocketChannel.class)
                     .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                     .option(ChannelOption.TCP_NODELAY, true)
+                    .option(ChannelOption.SO_KEEPALIVE, true)
                     .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, connectTimeoutMs)
                     .handler(new ChannelInitializer<SocketChannel>() {
                         @Override

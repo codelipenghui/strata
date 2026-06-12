@@ -10,7 +10,15 @@ public class ScpException extends RuntimeException {
     }
 
     public ScpException(ErrorCode code, String message, long detail) {
-        super(code + ": " + message);
+        this(code, message, detail, null);
+    }
+
+    public ScpException(ErrorCode code, String message, Throwable cause) {
+        this(code, message, 0, cause);
+    }
+
+    public ScpException(ErrorCode code, String message, long detail, Throwable cause) {
+        super(code + ": " + message, cause);
         this.code = code;
         this.detail = detail;
     }

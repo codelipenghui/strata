@@ -1,5 +1,6 @@
 package io.strata.client;
 
+import io.strata.common.ConnectionPolicy;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -30,6 +31,8 @@ class ClientConfigTest {
         assertThrows(IllegalArgumentException.class, () -> new ClientConfig(List.of("host:65536"), 1, 1));
         assertThrows(IllegalArgumentException.class, () -> new ClientConfig(List.of("host:123"), 0, 1));
         assertThrows(IllegalArgumentException.class, () -> new ClientConfig(List.of("host:123"), 1, 0));
+        assertThrows(NullPointerException.class,
+                () -> new ClientConfig(List.of("host:123"), 1, 1, null));
     }
 
     @Test
@@ -43,5 +46,8 @@ class ClientConfigTest {
         assertEquals(List.of("[::1]:2181"), cfg.metadataEndpoints());
         assertThrows(UnsupportedOperationException.class, () -> cfg.metadataEndpoints().add("127.0.0.1:1"));
         assertEquals(2048, cfg.withChunkRollBytes(2048).chunkRollBytes());
+        assertEquals(ConnectionPolicy.DEFAULT, cfg.connectionPolicy());
+        ConnectionPolicy policy = ConnectionPolicy.DEFAULT.withHeartbeatIntervalMs(1234);
+        assertEquals(policy, cfg.withConnectionPolicy(policy).connectionPolicy());
     }
 }

@@ -22,7 +22,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -1130,6 +1132,45 @@ class AppenderImplTest {
     }
 
     @Test
+    void replacedReplicaConnectionFailsReplicaWithoutReplayingAppend() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicInteger s1Appends = new AtomicInteger();
+        AtomicInteger s2Appends = new AtomicInteger();
+        AtomicInteger s3Appends = new AtomicInteger();
+
+        try (ScpServer s1 = countedStorageServer(1, s1Appends);
+             ScpServer s2 = countedStorageServer(2, s2Appends);
+             ScpServer s3 = countedStorageServer(3, s3Appends);
+             ScpServer metaServer = metadataForAppender(fileId, chunkId, sealedReplicas, sealedFileLength,
+                     new Messages.Replica(1, endpoint(s1)),
+                     new Messages.Replica(2, endpoint(s2)),
+                     new Messages.Replica(3, endpoint(s3)))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool(config)) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1,
+                        Messages.WritePolicy.DEFAULT, 0);
+
+                assertEquals(1, appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS).endOffset());
+                waitFor(() -> s1Appends.get() == 1 && s2Appends.get() == 1 && s3Appends.get() == 1);
+                pool.get(endpoint(s1)).disconnect();
+
+                assertEquals(2, appender.append(ByteBuffer.wrap(new byte[] {2})).get(1, TimeUnit.SECONDS).endOffset());
+                assertEquals(1, s1Appends.get(), "replaced replica connection must not receive replayed append");
+                assertEquals(2, s2Appends.get());
+                assertEquals(2, s3Appends.get());
+
+                StrataFile.SealInfo seal = appender.seal();
+                assertEquals(2, seal.sealedLength());
+                assertEquals(List.of(2, 3), sealedReplicas.get());
+                assertEquals(2L, sealedFileLength.get());
+            }
+        }
+    }
+
+    @Test
     void sealQuorumLossFromSkippedReplicasUsesGenericCause() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
@@ -1578,6 +1619,26 @@ class AppenderImplTest {
         });
     }
 
+    private static ScpServer countedStorageServer(int nodeId, AtomicInteger appends) throws Exception {
+        return new ScpServer(0, nodeId, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.OPEN_CHUNK) {
+                return ScpServer.ok(req, Messages.okHeader(), null);
+            }
+            if (op == Opcode.APPEND) {
+                appends.incrementAndGet();
+                Messages.Append append = Messages.Append.decode(req.headerSlice());
+                return ScpServer.ok(req,
+                        new Messages.AppendResp(append.baseOffset() + req.payloadLength()).encode(), null);
+            }
+            if (op == Opcode.SEAL_CHUNK) {
+                Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
+                return ScpServer.ok(req, new Messages.SealResp(seal.dataLength(), 123).encode(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+    }
+
     private static ScpServer storageServer(int nodeId, int sealCrc, boolean failSeal) throws Exception {
         return storageServer(nodeId, sealCrc, failSeal, 0);
     }
@@ -1664,5 +1725,16 @@ class AppenderImplTest {
 
     private static String endpoint(ScpServer server) {
         return "127.0.0.1:" + server.port();
+    }
+
+    private static void waitFor(BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        assertTrue(condition.getAsBoolean());
     }
 }

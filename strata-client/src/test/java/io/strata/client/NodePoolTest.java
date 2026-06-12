@@ -1,13 +1,21 @@
 package io.strata.client;
 
+import io.strata.common.ConnectionPolicy;
 import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
+import io.strata.proto.BufWriter;
+import io.strata.proto.ManagedScpConnection;
+import io.strata.proto.Messages;
+import io.strata.proto.Opcode;
+import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class NodePoolTest {
@@ -41,5 +49,37 @@ class NodePoolTest {
         ScpException e = assertThrows(ScpException.class,
                 () -> Endpoint.parse(null, "storage endpoint", ErrorCode.INTERNAL));
         assertEquals(ErrorCode.INTERNAL, e.code());
+    }
+
+    @Test
+    void replacesClosedStorageConnectionOnNextUse() throws Exception {
+        AtomicInteger pings = new AtomicInteger();
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
+                if (Opcode.fromCode(req.opcode()) == Opcode.PING) {
+                    pings.incrementAndGet();
+                    return ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
+                }
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+             });
+             NodePool pool = new NodePool(new ClientConfig(List.of("127.0.0.1:1"), 1024, 500,
+                     new ConnectionPolicy(500, 1_000, 100, 10_000, 50, 200)))) {
+            ManagedScpConnection conn = pool.get(endpoint(server));
+            conn.call(Opcode.PING, emptyHeader(), null, 500);
+            long firstGeneration = conn.generation();
+
+            conn.disconnect();
+            conn.call(Opcode.PING, emptyHeader(), null, 500);
+
+            assertNotEquals(firstGeneration, conn.generation());
+            assertEquals(2, pings.get());
+        }
+    }
+
+    private static byte[] emptyHeader() {
+        return new BufWriter(4).noTags().toBytes();
+    }
+
+    private static String endpoint(ScpServer server) {
+        return "127.0.0.1:" + server.port();
     }
 }

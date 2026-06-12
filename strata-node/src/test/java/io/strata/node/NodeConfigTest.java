@@ -1,5 +1,6 @@
 package io.strata.node;
 
+import io.strata.common.ConnectionPolicy;
 import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
@@ -28,6 +29,7 @@ class NodeConfigTest {
         assertEquals(base.host(), withPort.host());
         assertEquals(base.capacityBytes(), withPort.capacityBytes());
         assertEquals(base.inventoryIntervalMs(), withPort.inventoryIntervalMs());
+        assertEquals(base.connectionPolicy(), withPort.connectionPolicy());
 
         NodeConfig withEndpoint = withPort.withAdvertisedEndpoint("proxy:19000");
         assertEquals(123, withEndpoint.listenPort());
@@ -39,6 +41,10 @@ class NodeConfigTest {
         assertEquals(base.host(), withEndpoint.host());
         assertEquals(base.capacityBytes(), withEndpoint.capacityBytes());
         assertEquals(base.inventoryIntervalMs(), withEndpoint.inventoryIntervalMs());
+        assertEquals(base.connectionPolicy(), withEndpoint.connectionPolicy());
+
+        ConnectionPolicy policy = ConnectionPolicy.DEFAULT.withIdleTimeoutMs(1234);
+        assertEquals(policy, base.withConnectionPolicy(policy).connectionPolicy());
     }
 
     @Test
@@ -93,5 +99,7 @@ class NodeConfigTest {
                 null, List.of(), "zone", "rack", "host", 0, 1));
         assertThrows(IllegalArgumentException.class, () -> new NodeConfig(Path.of("data"), 0, "127.0.0.1",
                 null, List.of(), "zone", "rack", "host", 1, 0));
+        assertThrows(NullPointerException.class, () -> new NodeConfig(Path.of("data"), 0, "127.0.0.1",
+                null, List.of(), "zone", "rack", "host", 1, 1, null));
     }
 }

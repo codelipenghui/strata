@@ -1,9 +1,11 @@
 package io.strata.node;
 
+import io.strata.common.ConnectionPolicy;
 import io.strata.common.Endpoint;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Storage node configuration. metadataEndpoints empty = standalone mode (no registration loop) —
@@ -19,8 +21,16 @@ public record NodeConfig(
         String rack,
         String host,
         long capacityBytes,
-        int inventoryIntervalMs
+        int inventoryIntervalMs,
+        ConnectionPolicy connectionPolicy
 ) {
+    public NodeConfig(Path dataDir, int listenPort, String advertisedHost, String advertisedEndpointOverride,
+                      List<String> metadataEndpoints, String zone, String rack, String host,
+                      long capacityBytes, int inventoryIntervalMs) {
+        this(dataDir, listenPort, advertisedHost, advertisedEndpointOverride, metadataEndpoints,
+                zone, rack, host, capacityBytes, inventoryIntervalMs, ConnectionPolicy.DEFAULT);
+    }
+
     public NodeConfig {
         if (dataDir == null) {
             throw new IllegalArgumentException("dataDir must be non-null");
@@ -48,6 +58,7 @@ public record NodeConfig(
         if (inventoryIntervalMs <= 0) {
             throw new IllegalArgumentException("inventoryIntervalMs must be positive: " + inventoryIntervalMs);
         }
+        connectionPolicy = Objects.requireNonNull(connectionPolicy, "connectionPolicy");
     }
 
     private static void requireText(String value, String field) {
@@ -72,11 +83,16 @@ public record NodeConfig(
 
     public NodeConfig withListenPort(int port) {
         return new NodeConfig(dataDir, port, advertisedHost, advertisedEndpointOverride,
-                metadataEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs);
+                metadataEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy);
     }
 
     public NodeConfig withAdvertisedEndpoint(String endpoint) {
         return new NodeConfig(dataDir, listenPort, advertisedHost, endpoint,
-                metadataEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs);
+                metadataEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy);
+    }
+
+    public NodeConfig withConnectionPolicy(ConnectionPolicy policy) {
+        return new NodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                metadataEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, policy);
     }
 }

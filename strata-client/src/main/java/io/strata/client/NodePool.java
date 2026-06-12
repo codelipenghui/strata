@@ -3,9 +3,10 @@ package io.strata.client;
 import io.strata.common.ErrorCode;
 import io.strata.common.Endpoint;
 import io.strata.common.ScpException;
+import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.ScpClient;
 
-import java.io.IOException;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -15,35 +16,30 @@ import java.util.concurrent.ConcurrentHashMap;
  * here because an endpoint maps to exactly one connection.
  */
 final class NodePool implements AutoCloseable {
-    private final Map<String, ScpClient> conns = new ConcurrentHashMap<>();
+    private final ClientConfig config;
+    private final Map<String, ManagedScpConnection> conns = new ConcurrentHashMap<>();
 
-    ScpClient get(String endpoint) {
+    NodePool(ClientConfig config) {
+        this.config = config;
+    }
+
+    NodePool() {
+        this(new ClientConfig(List.of("127.0.0.1:1"), 1, 1));
+    }
+
+    ManagedScpConnection get(String endpoint) {
         if (endpoint == null) {
             throw new ScpException(ErrorCode.INTERNAL, "invalid storage endpoint: null");
         }
-        // lock-free fast path: every append/read resolves a connection, and compute() takes the
-        // bin lock even when the cached connection is healthy (worse, a connect() for one dead
-        // endpoint would block lookups of unrelated endpoints hashed to the same bin)
-        ScpClient cached = conns.get(endpoint);
-        if (cached != null && !cached.isClosed()) {
-            return cached;
-        }
-        ScpClient c = conns.compute(endpoint, (ep, existing) -> {
-            if (existing != null && !existing.isClosed()) return existing;
-            Endpoint hp = Endpoint.parse(ep, "storage endpoint", ErrorCode.INTERNAL);
-            try {
-                return new ScpClient(hp.host(), hp.port(), ScpClient.KIND_BROKER, "strata-client");
-            } catch (IOException e) {
-                return null;
-            }
-        });
-        if (c == null) throw new ScpException(ErrorCode.INTERNAL, "storage node unreachable: " + endpoint);
-        return c;
+        Endpoint.parse(endpoint, "storage endpoint", ErrorCode.INTERNAL);
+        return conns.computeIfAbsent(endpoint, ep -> new ManagedScpConnection(
+                List.of(ep), config.connectionPolicy(), ScpClient.KIND_BROKER,
+                "strata-client", "storage endpoint", false, true));
     }
 
     @Override
     public void close() {
-        conns.values().forEach(ScpClient::close);
+        conns.values().forEach(ManagedScpConnection::close);
         conns.clear();
     }
 }

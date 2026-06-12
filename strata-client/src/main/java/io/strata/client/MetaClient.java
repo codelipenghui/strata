@@ -1,51 +1,28 @@
 package io.strata.client;
 
 import io.strata.common.ErrorCode;
-import io.strata.common.Endpoint;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 import io.strata.proto.Messages;
+import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
 
-import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.function.Function;
 
 /** Client-side metadata access (v0: SCP 0x02xx opcodes; v1: Kafka RPC). Rotates endpoints on failure. */
 final class MetaClient implements AutoCloseable {
-    // ReentrantLock, not synchronized: connect() blocks, and virtual threads must not pin carriers
-    private final java.util.concurrent.locks.ReentrantLock lock =
-            new java.util.concurrent.locks.ReentrantLock();
     private final ClientConfig config;
-    private ScpClient client;
-    private int endpointIndex;
+    private final ManagedScpConnection connection;
 
     MetaClient(ClientConfig config) {
         this.config = config;
-    }
-
-    private ScpClient conn() {
-        lock.lock();
-        try {
-            if (client == null || client.isClosed()) {
-                String ep = config.metadataEndpoints().get(endpointIndex % config.metadataEndpoints().size());
-                Endpoint hp = Endpoint.parse(ep, "metadata endpoint", ErrorCode.INTERNAL);
-                try {
-                    client = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_BROKER, "strata-client");
-                } catch (IOException e) {
-                    // rotation is owned by call(): incrementing here too would double-rotate and,
-                    // with two endpoints, pin every retry onto the same dead instance
-                    throw new ScpException(ErrorCode.INTERNAL, "metadata unreachable at " + ep + ": " + e);
-                }
-            }
-            return client;
-        } finally {
-            lock.unlock();
-        }
+        this.connection = new ManagedScpConnection(config.metadataEndpoints(), config.connectionPolicy(),
+                ScpClient.KIND_BROKER, "strata-client", "metadata endpoint", true, true);
     }
 
     /**
@@ -58,23 +35,14 @@ final class MetaClient implements AutoCloseable {
         ScpException last = null;
         while (System.currentTimeMillis() < deadline) {
             try {
-                return conn().call(op, header, null, config.callTimeoutMs());
+                return connection.call(op, header, null, config.callTimeoutMs());
             } catch (ScpException e) {
                 last = e;
-                boolean rotate = e.code() == ErrorCode.NOT_LEADER
-                        || (e.code() == ErrorCode.INTERNAL && e.retriable());
-                if (!rotate && !e.retriable()) {
+                if (!e.retriable()) {
                     throw e;
                 }
-                if (rotate) {
-                    lock.lock();
-                    try {
-                        endpointIndex++;
-                        if (client != null) client.close();
-                        client = null;
-                    } finally {
-                        lock.unlock();
-                    }
+                if (e.code() == ErrorCode.NOT_LEADER) {
+                    connection.rotateEndpoint();
                 }
                 try {
                     Thread.sleep(200);
@@ -93,13 +61,7 @@ final class MetaClient implements AutoCloseable {
         } catch (ScpException e) {
             throw e;
         } catch (RuntimeException e) {
-            lock.lock();
-            try {
-                if (client != null) client.close();
-                client = null;
-            } finally {
-                lock.unlock();
-            }
+            connection.disconnect();
             throw new ScpException(ErrorCode.INTERNAL, "malformed metadata response for " + op + ": " + e);
         }
     }
@@ -160,11 +122,6 @@ final class MetaClient implements AutoCloseable {
 
     @Override
     public void close() {
-        lock.lock();
-        try {
-            if (client != null) client.close();
-        } finally {
-            lock.unlock();
-        }
+        connection.close();
     }
 }
