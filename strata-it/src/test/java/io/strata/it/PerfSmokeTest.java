@@ -3,7 +3,6 @@ package io.strata.it;
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
-import io.strata.client.StrataClient;
 import io.strata.common.FileId;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -54,10 +53,10 @@ class PerfSmokeTest {
                         RECORDS, RECORD_SIZE, WINDOW);
 
                 var replicate = runWrite(client,
-                        new StrataClient.FileSpec((byte) 0, (byte) 0, (byte) 0, "perf-rep"), RECORDS, WINDOW);
+                        new StrataClient.FileSpec("test", "/perf-rep", (byte) 0, (byte) 0, (byte) 0), RECORDS, WINDOW);
                 printWrite("write ack-on-replicate (window " + WINDOW + ") ", replicate.result());
                 var fsync = runWrite(client,
-                        new StrataClient.FileSpec((byte) 0, (byte) 0, (byte) 1, "perf-fsync"), FSYNC_RECORDS, FSYNC_WINDOW);
+                        new StrataClient.FileSpec("test", "/perf-fsync", (byte) 0, (byte) 0, (byte) 1), FSYNC_RECORDS, FSYNC_WINDOW);
                 printWrite("write ack-on-fsync     (window " + FSYNC_WINDOW + ")  ", fsync.result());
 
                 ReadResult read = runRead(client, replicate.fileId());
@@ -82,7 +81,7 @@ class PerfSmokeTest {
         byte[] payload = new byte[RECORD_SIZE];
         java.util.concurrent.ThreadLocalRandom.current().nextBytes(payload);
 
-        try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
             // warmup (not measured)
             await(appendWindowed(appender, payload, Math.min(WARMUP, records), null, window));
 
@@ -121,7 +120,7 @@ class PerfSmokeTest {
     }
 
     private ReadResult runRead(StrataClient client, FileId fileId) {
-        try (StrataFile.Reader reader = client.open(fileId).openForRead()) {
+        try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
             long[] latencies = new long[4096];
             int reads = 0;
             long bytes = 0;

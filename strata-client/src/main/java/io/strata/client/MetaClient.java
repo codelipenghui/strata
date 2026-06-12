@@ -3,6 +3,8 @@ package io.strata.client;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -128,8 +130,8 @@ final class MetaClient implements AutoCloseable {
     }
 
     FileId createFile(StrataClient.FileSpec spec) {
-        var resp = call(Opcode.CREATE_FILE, new Messages.CreateFile(spec.fileKind(), spec.mediaClass(),
-                spec.ackPolicy(), spec.ownerTag()).encode());
+        var resp = call(Opcode.CREATE_FILE, new Messages.CreateFile(spec.namespace(), spec.path(),
+                spec.fileKind(), spec.mediaClass(), spec.ackPolicy()).encode());
         return decode(Opcode.CREATE_FILE, resp, Messages.CreateFileResp::decode).fileId();
     }
 
@@ -153,6 +155,11 @@ final class MetaClient implements AutoCloseable {
     Messages.LookupFileResp lookupFile(FileId fileId) {
         var resp = call(Opcode.LOOKUP_FILE, new Messages.LookupFile(fileId).encode());
         return decode(Opcode.LOOKUP_FILE, resp, Messages.LookupFileResp::decode);
+    }
+
+    FileId lookupPath(StrataNamespace namespace, StrataPath path) {
+        var resp = call(Opcode.LOOKUP_PATH, new Messages.LookupPath(namespace, path).encode());
+        return decode(Opcode.LOOKUP_PATH, resp, Messages.LookupPathResp::decode).fileId();
     }
 
     void sealFile(FileId fileId, long totalLength) {

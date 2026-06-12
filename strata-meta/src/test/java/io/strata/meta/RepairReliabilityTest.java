@@ -164,7 +164,7 @@ class RepairReliabilityTest {
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/t", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
@@ -242,7 +242,7 @@ class RepairReliabilityTest {
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/t", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
@@ -274,7 +274,7 @@ class RepairReliabilityTest {
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/t", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
@@ -313,7 +313,7 @@ class RepairReliabilityTest {
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/t", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
 
@@ -356,7 +356,7 @@ class RepairReliabilityTest {
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/t", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
@@ -386,7 +386,7 @@ class RepairReliabilityTest {
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/t", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
@@ -427,7 +427,7 @@ class RepairReliabilityTest {
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/t", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
@@ -481,7 +481,7 @@ class RepairReliabilityTest {
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/t", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
@@ -533,7 +533,7 @@ class RepairReliabilityTest {
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/t", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
@@ -569,7 +569,7 @@ class RepairReliabilityTest {
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/t", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
@@ -602,7 +602,7 @@ class RepairReliabilityTest {
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/t", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
@@ -644,7 +644,7 @@ class RepairReliabilityTest {
             nodes.add(n);
         }
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/t", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 0).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,

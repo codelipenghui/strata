@@ -3,7 +3,6 @@ package io.strata.it;
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
-import io.strata.client.StrataClient;
 import io.strata.common.FileId;
 import io.strata.format.ChunkFormats;
 import io.strata.proto.Messages;
@@ -29,9 +28,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class FsyncEndToEndTest {
 
-    private static final StrataClient.FileSpec FSYNC_SPEC =
-            new StrataClient.FileSpec((byte) 0, (byte) 0, (byte) 1 /* ack-on-fsync */, "fsync-topic");
-
     private MiniCluster cluster;
     private StrataClient client;
 
@@ -49,9 +45,9 @@ class FsyncEndToEndTest {
 
     @Test
     void fsyncPolicyReachesEveryReplicaHeaderAndDataSurvives() throws Exception {
-        FileId fileId = client.create(FSYNC_SPEC).id();
+        FileId fileId = client.create(fsyncSpec("/fsync-policy")).id();
         Workload workload = new Workload();
-        try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
             workload.appendAcked(appender, 0, 500); // several rolls under fsync
             appender.seal();
         }
@@ -72,12 +68,12 @@ class FsyncEndToEndTest {
 
     @Test
     void sealRecoveryWorksUnderFsyncMode() throws Exception {
-        FileId fileId = client.create(FSYNC_SPEC).id();
+        FileId fileId = client.create(fsyncSpec("/fsync-recovery")).id();
         Workload workload = new Workload();
-        StrataFile.Appender zombie = client.open(fileId).openForAppend(1);
+        StrataFile.Appender zombie = client.openById(fileId).openForAppend(1);
         workload.appendAcked(zombie, 0, 120);
 
-        var sealed = client.open(fileId).recoverAndSeal(2);
+        var sealed = client.openById(fileId).recoverAndSeal(2);
         assertTrue(sealed.sealedLength() >= workload.ackedBytes());
         zombie.close();
         workload.verifyAckedPrefix(client, fileId);
@@ -85,11 +81,11 @@ class FsyncEndToEndTest {
 
     @Test
     void fsyncAndReplicateFilesCoexist() throws Exception {
-        FileId fsyncFile = client.create(FSYNC_SPEC).id();
-        FileId fastFile = client.create(StrataClient.FileSpec.log("fast-topic")).id();
+        FileId fsyncFile = client.create(fsyncSpec("/fsync-coexist")).id();
+        FileId fastFile = client.create(StrataClient.FileSpec.log("test", "/fast-topic")).id();
         Workload w1 = new Workload(), w2 = new Workload();
-        try (StrataFile.Appender a1 = client.open(fsyncFile).openForAppend(1);
-             StrataFile.Appender a2 = client.open(fastFile).openForAppend(1)) {
+        try (StrataFile.Appender a1 = client.openById(fsyncFile).openForAppend(1);
+             StrataFile.Appender a2 = client.openById(fastFile).openForAppend(1)) {
             w1.appendAcked(a1, 0, 100);
             w2.appendAcked(a2, 0, 100);
             a1.seal();
@@ -117,6 +113,10 @@ class FsyncEndToEndTest {
             frame.payloadSlice().get(bytes);
             return bytes;
         }
+    }
+
+    private static StrataClient.FileSpec fsyncSpec(String path) {
+        return new StrataClient.FileSpec("test", path, (byte) 0, (byte) 0, (byte) 1 /* ack-on-fsync */);
     }
 
     private Messages.LookupFileResp lookupFile(FileId fileId) throws Exception {

@@ -237,12 +237,18 @@ public final class MetadataService implements AutoCloseable {
                 yield ScpServer.ok(req, lookup(m.fileId()).encode(), null);
             }
 
+            case LOOKUP_PATH -> {
+                var m = Messages.LookupPath.decode(h);
+                yield ScpServer.ok(req, new Messages.LookupPathResp(lookupPath(m.namespace(), m.path())).encode(),
+                        null);
+            }
+
             case DELETE_FILES -> {
                 var m = Messages.DeleteFiles.decode(h);
                 List<Short> codes = new ArrayList<>();
                 for (FileId id : m.fileIds()) {
                     try {
-                        mutateFile(id, file -> file.withState(Records.FileState.DELETING));
+                        markDeleting(id);
                         codes.add(ErrorCode.OK.code);
                     } catch (ScpException e) {
                         codes.add(e.code().code);
@@ -261,14 +267,22 @@ public final class MetadataService implements AutoCloseable {
                     "unsupported ack policy " + (m.ackPolicy() & 0xFF));
         }
         try {
-            store.createFile(new Records.FileRecord(m.fileId(), m.fileKind(), m.mediaClass(), m.ackPolicy(),
-                    m.ownerTag(), Records.FileState.OPEN, System.currentTimeMillis(), List.of(),
+            store.createFile(new Records.FileRecord(m.fileId(), m.namespace(), m.path(),
+                    m.fileKind(), m.mediaClass(), m.ackPolicy(), Records.FileState.OPEN, System.currentTimeMillis(), List.of(),
                     m.opIdMsb(), m.opIdLsb()));
             return m.fileId();
         } catch (KeeperException.NodeExistsException e) {
             var existing = store.getFile(m.fileId());
-            if (existing.isPresent() && existing.get().value().createdBy(m.opIdMsb(), m.opIdLsb())) {
+            if (existing.isPresent()
+                    && existing.get().value().createdBy(m.opIdMsb(), m.opIdLsb())
+                    && existing.get().value().namespace().equals(m.namespace())
+                    && existing.get().value().path().equals(m.path())) {
                 return m.fileId();
+            }
+            var pathOwner = store.resolvePath(m.namespace(), m.path());
+            if (pathOwner.isPresent()) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "path already exists: " + m.namespace() + ":" + m.path());
             }
             throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                     "file id already exists for a different create request: " + m.fileId());
@@ -429,7 +443,21 @@ public final class MetadataService implements AutoCloseable {
             chunks.add(new Messages.ChunkInfo(file.chunkId(c.index()), c.state(), c.length(), c.crc(),
                     c.writeEpoch(), replicas));
         }
-        return new Messages.LookupFileResp(file.fileKind(), file.ackPolicy(), file.state().value, chunks);
+        return new Messages.LookupFileResp(file.namespace(), file.path(), file.fileKind(), file.ackPolicy(),
+                file.state().value, chunks);
+    }
+
+    private FileId lookupPath(io.strata.common.StrataNamespace namespace,
+                              io.strata.common.StrataPath path) throws Exception {
+        var id = store.resolvePath(namespace, path);
+        if (id.isEmpty()) {
+            throw new ScpException(ErrorCode.FILE_NOT_FOUND, namespace + ":" + path);
+        }
+        var file = store.getFile(id.get());
+        if (file.isEmpty() || file.get().value().state() == Records.FileState.DELETING) {
+            throw new ScpException(ErrorCode.FILE_NOT_FOUND, namespace + ":" + path);
+        }
+        return id.get();
     }
 
     private void mutateFile(FileId id, java.util.function.UnaryOperator<Records.FileRecord> fn) throws Exception {
@@ -439,6 +467,23 @@ public final class MetadataService implements AutoCloseable {
             if (store.updateFile(fn.apply(opt.get().value()), opt.get().version())) return;
         }
         throw new ScpException(ErrorCode.INTERNAL, "file mutation CAS exhausted");
+    }
+
+    private void markDeleting(FileId id) throws Exception {
+        for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
+            var opt = store.getFile(id);
+            if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, id.toString());
+            Records.FileRecord current = opt.get().value();
+            Records.FileRecord deleting = current.withState(Records.FileState.DELETING);
+            if (store.updateFile(deleting, opt.get().version())) {
+                if (!store.deletePath(current.namespace(), current.path(), id)) {
+                    throw new ScpException(ErrorCode.INTERNAL,
+                            "path " + current.namespace() + ":" + current.path() + " is bound to a different file");
+                }
+                return;
+            }
+        }
+        throw new ScpException(ErrorCode.INTERNAL, "delete CAS exhausted");
     }
 
     @Override

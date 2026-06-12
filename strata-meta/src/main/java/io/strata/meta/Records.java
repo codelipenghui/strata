@@ -3,16 +3,19 @@ package io.strata.meta;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 import io.strata.common.Varint;
 import io.strata.proto.BufWriter;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Metadata records persisted by the MetadataStore backend (tech design §4.2 state, v0 shapes).
- * Binary encoding with a leading version byte; additive evolution only.
+ * Binary encoding with a leading version byte.
  */
 public final class Records {
     private static final int MAX_COUNT = 1_000_000;
@@ -98,16 +101,36 @@ public final class Records {
         }
     }
 
-    public record FileRecord(FileId fileId, byte fileKind, byte mediaClass, byte ackPolicy,
-                             String ownerTag, FileState state, long createdAtMs, List<ChunkRecord> chunks,
-                             long createOpMsb, long createOpLsb) {
+    public record FileRecord(FileId fileId, StrataNamespace namespace, StrataPath path,
+                             byte fileKind, byte mediaClass, byte ackPolicy, FileState state, long createdAtMs,
+                             List<ChunkRecord> chunks, long createOpMsb, long createOpLsb) {
         public FileRecord {
+            fileId = Objects.requireNonNull(fileId, "fileId");
+            namespace = Objects.requireNonNull(namespace, "namespace");
+            path = Objects.requireNonNull(path, "path");
+            state = Objects.requireNonNull(state, "state");
             chunks = List.copyOf(chunks);
         }
 
-        public FileRecord(FileId fileId, byte fileKind, byte mediaClass, byte ackPolicy,
-                          String ownerTag, FileState state, long createdAtMs, List<ChunkRecord> chunks) {
-            this(fileId, fileKind, mediaClass, ackPolicy, ownerTag, state, createdAtMs, chunks, 0, 0);
+        public FileRecord(FileId fileId, StrataNamespace namespace, StrataPath path,
+                          byte fileKind, byte mediaClass, byte ackPolicy, FileState state, long createdAtMs,
+                          List<ChunkRecord> chunks) {
+            this(fileId, namespace, path, fileKind, mediaClass, ackPolicy, state, createdAtMs, chunks, 0, 0);
+        }
+
+        public FileRecord(FileId fileId, String namespace, String path,
+                          byte fileKind, byte mediaClass, byte ackPolicy, FileState state, long createdAtMs,
+                          List<ChunkRecord> chunks) {
+            this(fileId, StrataNamespace.of(namespace), StrataPath.of(path), fileKind, mediaClass, ackPolicy,
+                    state, createdAtMs, chunks, 0, 0);
+        }
+
+        public FileRecord(FileId fileId, String namespace, String path,
+                          byte fileKind, byte mediaClass, byte ackPolicy, FileState state, long createdAtMs,
+                          List<ChunkRecord> chunks, long createOpMsb, long createOpLsb) {
+            this(fileId, StrataNamespace.of(namespace), StrataPath.of(path), fileKind, mediaClass, ackPolicy, state,
+                    createdAtMs, chunks,
+                    createOpMsb, createOpLsb);
         }
 
         public ChunkId chunkId(int index) {
@@ -115,12 +138,12 @@ public final class Records {
         }
 
         public FileRecord withState(FileState newState) {
-            return new FileRecord(fileId, fileKind, mediaClass, ackPolicy, ownerTag, newState,
+            return new FileRecord(fileId, namespace, path, fileKind, mediaClass, ackPolicy, newState,
                     createdAtMs, chunks, createOpMsb, createOpLsb);
         }
 
         public FileRecord withChunks(List<ChunkRecord> newChunks) {
-            return new FileRecord(fileId, fileKind, mediaClass, ackPolicy, ownerTag, state,
+            return new FileRecord(fileId, namespace, path, fileKind, mediaClass, ackPolicy, state,
                     createdAtMs, newChunks, createOpMsb, createOpLsb);
         }
 
@@ -130,9 +153,10 @@ public final class Records {
 
         public byte[] encode() {
             BufWriter w = new BufWriter(256);
-            w.u8(2); // record version
+            w.u8(4); // record version
             w.fileId(fileId);
-            w.u8(fileKind).u8(mediaClass).u8(ackPolicy).string(ownerTag).u8(state.value).u64(createdAtMs);
+            w.string(namespace.toString()).string(path.toString()).u8(fileKind).u8(mediaClass).u8(ackPolicy)
+                    .u8(state.value).u64(createdAtMs);
             w.u64(createOpMsb).u64(createOpLsb);
             w.varint(chunks.size());
             for (ChunkRecord c : chunks) {
@@ -147,14 +171,15 @@ public final class Records {
         public static FileRecord decode(byte[] bytes) {
             ByteBuffer b = ByteBuffer.wrap(bytes);
             byte version = b.get();
-            if (version != 1 && version != 2) throw new IllegalArgumentException("file record version " + version);
+            if (version != 4) throw new IllegalArgumentException("file record version " + version);
             FileId id = FileId.readFrom(b);
+            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataPath path = StrataPath.of(Varint.readString(b));
             byte kind = b.get(), media = b.get(), ack = b.get();
-            String owner = Varint.readString(b);
             FileState state = FileState.from(b.get());
             long created = b.getLong();
-            long fileOpMsb = version >= 2 ? b.getLong() : 0;
-            long fileOpLsb = version >= 2 ? b.getLong() : 0;
+            long fileOpMsb = b.getLong();
+            long fileOpLsb = b.getLong();
             int n = count(b, "chunk");
             List<ChunkRecord> chunks = new ArrayList<>(n);
             for (int i = 0; i < n; i++) {
@@ -163,14 +188,15 @@ public final class Records {
                 long len = b.getLong();
                 int crc = b.getInt();
                 int epoch = b.getInt();
-                long chunkOpMsb = version >= 2 ? b.getLong() : 0;
-                long chunkOpLsb = version >= 2 ? b.getLong() : 0;
+                long chunkOpMsb = b.getLong();
+                long chunkOpLsb = b.getLong();
                 int nr = count(b, "replica");
                 List<Integer> replicas = new ArrayList<>(nr);
                 for (int j = 0; j < nr; j++) replicas.add(b.getInt());
                 chunks.add(new ChunkRecord(index, cs, len, crc, epoch, replicas, chunkOpMsb, chunkOpLsb));
             }
-            return new FileRecord(id, kind, media, ack, owner, state, created, chunks, fileOpMsb, fileOpLsb);
+            return new FileRecord(id, namespace, path, kind, media, ack, state, created, chunks,
+                    fileOpMsb, fileOpLsb);
         }
     }
 

@@ -25,7 +25,8 @@ public enum Opcode {
     LOOKUP_FILE(0x0204),
     DELETE_FILES(0x0205),
     SEAL_FILE(0x0206),
-    ABORT_CHUNK_META(0x0207);
+    ABORT_CHUNK_META(0x0207),
+    LOOKUP_PATH(0x0208);
 
     public final short code;
 

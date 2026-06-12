@@ -92,7 +92,7 @@ class MetaClientTest {
              MetaClient meta = new MetaClient(new ClientConfig(
                      List.of(endpoint(standby), endpoint(leader)), 1024, 100))) {
 
-            assertEquals(id, meta.createFile(StrataClient.FileSpec.log("owner")));
+            assertEquals(id, meta.createFile(StrataClient.FileSpec.log("test", "/test-file")));
 
             assertEquals(1, standbyCalls.get());
         }
@@ -110,7 +110,7 @@ class MetaClientTest {
              });
              MetaClient meta = new MetaClient(new ClientConfig(List.of(endpoint(server)), 1024, 100))) {
 
-            assertEquals(id, meta.createFile(StrataClient.FileSpec.log("owner")));
+            assertEquals(id, meta.createFile(StrataClient.FileSpec.log("test", "/test-file")));
 
             assertEquals(2, calls.get());
         }
@@ -143,7 +143,7 @@ class MetaClientTest {
         Thread.currentThread().interrupt();
         try {
             ScpException e = assertThrows(ScpException.class,
-                    () -> meta.createFile(StrataClient.FileSpec.log("owner")));
+                    () -> meta.createFile(StrataClient.FileSpec.log("test", "/test-file")));
             assertEquals(ErrorCode.INTERNAL, e.code());
             assertTrue(Thread.currentThread().isInterrupted());
         } finally {

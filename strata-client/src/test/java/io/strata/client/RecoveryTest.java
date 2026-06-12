@@ -82,7 +82,7 @@ class RecoveryTest {
             throw new ScpException(ErrorCode.INTERNAL, "storage should not be contacted");
         });
              ScpServer metaServer = metadataServer(new AtomicReference<>(
-                     new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 2,
+                     new Messages.LookupFileResp("test", "/test/file", (byte) 0, (byte) 0, (byte) 2,
                              List.of(chunk(chunkId, ChunkState.OPEN, 0, 1,
                                      new Messages.Replica(1, endpoint(storage)))))), null)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
@@ -1343,7 +1343,7 @@ class RecoveryTest {
     }
 
     private static Messages.LookupFileResp lookup(Messages.ChunkInfo... chunks) {
-        return new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0, List.of(chunks));
+        return new Messages.LookupFileResp("test", "/test/file", (byte) 0, (byte) 0, (byte) 0, List.of(chunks));
     }
 
     private static Messages.ChunkInfo chunk(ChunkId id, ChunkState state, long length, int epoch,

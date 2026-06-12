@@ -25,7 +25,7 @@ class ReaderImplTest {
     @Test
     void sealedMetadataLengthOverflowIsTypedCorruption() throws Exception {
         FileId fileId = FileId.random();
-        Messages.LookupFileResp lookup = new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
+        Messages.LookupFileResp lookup = new Messages.LookupFileResp("test", "/test/file", (byte) 0, (byte) 0, (byte) 1,
                 List.of(chunk(new ChunkId(fileId, 0), ChunkState.SEALED, Long.MAX_VALUE,
                                 new Messages.Replica(1, "")),
                         chunk(new ChunkId(fileId, 1), ChunkState.SEALED, 1,
@@ -46,7 +46,7 @@ class ReaderImplTest {
     void emptyFileReadUsesMetadataFileStateForEof() throws Exception {
         FileId fileId = FileId.random();
         AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>(
-                new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1, List.of()));
+                new Messages.LookupFileResp("test", "/test/file", (byte) 0, (byte) 0, (byte) 1, List.of()));
 
         try (ScpServer metaServer = metadataServer(lookup)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
@@ -55,7 +55,7 @@ class ReaderImplTest {
 
                 assertTrue(reader.read(0, 1).endOfFile());
 
-                lookup.set(new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0, List.of()));
+                lookup.set(new Messages.LookupFileResp("test", "/test/file", (byte) 0, (byte) 0, (byte) 0, List.of()));
                 reader.refresh();
                 assertFalse(reader.read(0, 1).endOfFile());
             }
@@ -69,7 +69,7 @@ class ReaderImplTest {
 
         try (ScpServer replica = readReplica(new Messages.ReadResp(3, 3), new byte[] {1, 2, 3});
              ScpServer metaServer = metadataServer(new AtomicReference<>(
-                     new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0,
+                     new Messages.LookupFileResp("test", "/test/file", (byte) 0, (byte) 0, (byte) 0,
                              List.of(chunk(chunkId, ChunkState.SEALED, 3,
                                      new Messages.Replica(1, endpoint(replica)))))))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
@@ -90,7 +90,7 @@ class ReaderImplTest {
 
         try (ScpServer shortReplica = readReplica(new Messages.ReadResp(3, 3), new byte[] {1, 2, 3});
              ScpServer metaServer = metadataServer(new AtomicReference<>(
-                     new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
+                     new Messages.LookupFileResp("test", "/test/file", (byte) 0, (byte) 0, (byte) 1,
                              List.of(chunk(chunkId, ChunkState.SEALED, 5,
                                      new Messages.Replica(1, endpoint(shortReplica)))))))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
@@ -116,7 +116,7 @@ class ReaderImplTest {
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + req.opcode());
         });
              ScpServer metaServer = metadataServer(new AtomicReference<>(
-                     new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1,
+                     new Messages.LookupFileResp("test", "/test/file", (byte) 0, (byte) 0, (byte) 1,
                              List.of(chunk(chunkId, ChunkState.SEALED, 3,
                                      new Messages.Replica(1, endpoint(failingReplica)))))))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
@@ -136,7 +136,7 @@ class ReaderImplTest {
 
         try (ScpServer replica = readReplica(new Messages.ReadResp(4, 4), new byte[] {1, 2, 3, 4});
              ScpServer metaServer = metadataServer(new AtomicReference<>(
-                     new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0,
+                     new Messages.LookupFileResp("test", "/test/file", (byte) 0, (byte) 0, (byte) 0,
                              List.of(chunk(chunkId, ChunkState.OPEN, 0,
                                      new Messages.Replica(1, endpoint(replica)))))))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
@@ -158,7 +158,7 @@ class ReaderImplTest {
         try (ScpServer negativeLocalEnd = readReplica(new Messages.ReadResp(-1, 0), new byte[0]);
              ScpServer negativeDurable = readReplica(new Messages.ReadResp(1, -1), new byte[0]);
              ScpServer metaServer = metadataServer(new AtomicReference<>(
-                     new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0,
+                     new Messages.LookupFileResp("test", "/test/file", (byte) 0, (byte) 0, (byte) 0,
                              List.of(chunk(chunkId, ChunkState.OPEN, 0,
                                      new Messages.Replica(1, endpoint(negativeLocalEnd)),
                                      new Messages.Replica(2, endpoint(negativeDurable)))))))) {
@@ -190,7 +190,7 @@ class ReaderImplTest {
                      Messages.ChunkInfo chunk = new Messages.ChunkInfo(chunkId, ChunkState.SEALED, 3, 0, 1,
                              List.of(new Messages.Replica(1, endpoint(badReplica))));
                      return ScpServer.ok(req,
-                             new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 1, List.of(chunk)).encode(),
+                             new Messages.LookupFileResp("test", "/test/file", (byte) 0, (byte) 0, (byte) 1, List.of(chunk)).encode(),
                              null);
                  }
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + req.opcode());

@@ -1,6 +1,8 @@
 package io.strata.meta;
 
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 
 import java.util.List;
 import java.util.Optional;
@@ -23,8 +25,12 @@ public interface MetadataStore extends AutoCloseable {
 
     Optional<Versioned<Records.FileRecord>> getFile(FileId id) throws Exception;
 
+    Optional<FileId> resolvePath(StrataNamespace namespace, StrataPath path) throws Exception;
+
     /** CAS update; returns false on version conflict. */
     boolean updateFile(Records.FileRecord record, int expectedVersion) throws Exception;
+
+    boolean deletePath(StrataNamespace namespace, StrataPath path, FileId expectedFileId) throws Exception;
 
     /** CAS delete; returns false on version conflict. */
     boolean deleteFile(FileId id, int expectedVersion) throws Exception;

@@ -9,7 +9,7 @@
 ## TL;DR
 
 - **The gap.** Every modern fix for Kafka's storage problem — WarpStream, AutoMQ, Bufstream, Confluent Freight, Diskless Kafka (KIP-1150) — assumes an S3-class object store underneath. Self-managed datacenters, regulated and air-gapped environments, sovereign clouds, and edge deployments are excluded, yet they feel Kafka's storage pain most acutely.
-- **The product.** Keep the Kafka protocol and ecosystem unchanged. Make brokers diskless and stateless. Store all log data in a purpose-built, quorum-replicated segment store on commodity disks. Coordinate with a compact, KRaft-based metadata plane.
+- **The product.** Keep the Kafka protocol and ecosystem unchanged. Make brokers diskless and stateless. Store all log data in a purpose-built, quorum-replicated Strata file service on commodity disks. Coordinate with a compact, KRaft-based metadata plane.
 - **The wins.** Storage scales by adding storage nodes, not brokers. Operations move metadata, never data. Cold data ages in place on cheap media — no tiering pipeline, because nothing ever needs to migrate. Quorum acks keep produce p99 flat.
 - **The position.** Kafka compatibility + disaggregated storage + no object-store dependency. No product on the market offers all three.
 - **The reach.** Sealed-data placement is pluggable — local media, object store, or hybrid — so one architecture serves both self-managed and cloud deployments.
@@ -28,7 +28,8 @@ Self-managed Kafka operators face four compounding problems:
 Strata separates the Kafka protocol from log storage. Three independently scalable parts:
 
 - **Diskless, stateless brokers** speak the full Kafka protocol — produce, fetch, consumer groups, transactions. They hold no durable state: restarts take seconds, any broker can lead any partition, and broker failure moves leadership (a metadata operation), never data.
-- **A purpose-built segment store** on commodity disks. Actively written data is quorum-replicated (3 replicas, ack on 2) for low, flat write latency; sealed data is immutable and ages in place on cheap, dense media until retention deletes it. There is no tiering pipeline, because data never lives on brokers in the first place.
+- **A purpose-built Strata file service** on commodity disks. Actively written data is quorum-replicated (3 replicas, ack on 2) for low, flat write latency; sealed data is immutable and ages in place on cheap, dense media until retention deletes it. There is no tiering pipeline, because data never lives on brokers in the first place.
+- **First-class file namespaces** let one Strata storage cluster serve multiple Kafka clusters or tenants while keeping paths, future ACLs, and quotas separate.
 - **A compact metadata plane** built on Kafka's own KRaft — consulted at chunk boundaries and leadership changes, never per message.
 
 Two operational facts that follow: a failed broker's 1,000 partitions re-lead in seconds with zero data movement; a failed 100 TB storage node is re-replicated by the whole pool in parallel — hours, not the days a Kafka broker replacement takes — and the exposure window *shrinks* as the cluster grows.
@@ -73,12 +74,12 @@ Four observations structure the field:
 
 **Why a product, not a KIP.** KIP-1150's design is shaped by object-store semantics — batched writes, hundreds-of-milliseconds acks — the structural opposite of a low-latency quorum path; there is no interface to plug into. And the surgery Strata performs is more than upstream could absorb on any realistic timeline (KIP-405, far smaller, took years). Fork-and-track keeps full compatibility while owning the storage engine.
 
-**How it gets built.** Broker and metadata plane are derived from the Apache Kafka codebase — the fork-and-replace path AutoMQ has proven in production — inheriting the protocol surface, the coordinators, and KRaft, which converts the top compatibility risk from build risk into merge maintenance. The segment store is new code with no Kafka dependency. (Detail: tech design §2, §4, §10–§12.)
+**How it gets built.** Broker and metadata plane are derived from the Apache Kafka codebase — the fork-and-replace path AutoMQ has proven in production — inheriting the protocol surface, the coordinators, and KRaft, which converts the top compatibility risk from build risk into merge maintenance. The Strata file service is new code with no Kafka dependency. (Detail: tech design §2, §4, §10–§12.)
 
 ## 6. Delivery phasing
 
-- **v0 — storage engine bootstrap (internal milestone, not a release).** The segment store, chunk protocol, and repair machinery are built and validated against a thin ZooKeeper-backed metadata service behind the same interfaces — decoupling the first implementation from the Kafka-fork timeline, so the riskiest new engineering is proven while the controller work lands in parallel. ZooKeeper is a development expedient with explicit retirement criteria, never a shipped configuration.
-- **v1 — the structural wins.** Quorum-replicated segment store, diskless brokers, KRaft-based metadata plane, Kafka protocol core. Delivers what Kafka structurally cannot: independent storage scaling, seconds-level failover, flat produce p99, passive balancing. Cold data stays at 3x. Protocol compatibility is staffed as a first-class workstream.
+- **v0 — storage engine bootstrap (internal milestone, not a release).** The Strata file service, chunk protocol, and repair machinery are built and validated against a thin ZooKeeper-backed metadata service behind the same interfaces — decoupling the first implementation from the Kafka-fork timeline, so the riskiest new engineering is proven while the controller work lands in parallel. ZooKeeper is a development expedient with explicit retirement criteria, never a shipped configuration.
+- **v1 — the structural wins.** Quorum-replicated Strata file service, diskless brokers, KRaft-based metadata plane, Kafka protocol core. Delivers what Kafka structurally cannot: independent storage scaling, seconds-level failover, flat produce p99, passive balancing. Cold data stays at 3x. Protocol compatibility is staffed as a first-class workstream.
 - **v1.x — heterogeneous media.** Media-aware placement (latency-critical topics to NVMe, everything else to dense HDD) plus relocation and decommission tooling. Still no migration pipeline.
 - **Future exploration — erasure coding (not committed).** Could cut cold-data overhead from 3x toward ~1.4x; the only forward dependency (a polymorphic chunk-layout descriptor) ships in v1. Kafka, KIP-405, and Northguard v1 all ship without EC — current scope concedes nothing.
 

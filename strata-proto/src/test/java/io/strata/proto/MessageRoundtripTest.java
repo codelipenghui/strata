@@ -123,7 +123,7 @@ class MessageRoundtripTest {
 
     @Test
     void clientMetaRoundtrips() {
-        var cf = new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "topicA-0");
+        var cf = new Messages.CreateFile("test", "/kafka/topicA/0/00000000000000000000", (byte) 0, (byte) 0, (byte) 0);
         assertEquals(cf, Messages.CreateFile.decode(buf(cf.encode())));
 
         var cfr = new Messages.CreateFileResp(f);
@@ -145,7 +145,14 @@ class MessageRoundtripTest {
         var lf = new Messages.LookupFile(f);
         assertEquals(lf, Messages.LookupFile.decode(buf(lf.encode())));
 
-        var lfr = new Messages.LookupFileResp((byte) 0, (byte) 0, (byte) 0, List.of(
+        var lp = new Messages.LookupPath("test", "/kafka/topicA/0/00000000000000000000");
+        assertEquals(lp, Messages.LookupPath.decode(buf(lp.encode())));
+
+        var lpr = new Messages.LookupPathResp(f);
+        assertEquals(lpr, decodeResp(lpr.encode(), Messages.LookupPathResp::decode));
+
+        var lfr = new Messages.LookupFileResp("test", "/kafka/topicA/0/00000000000000000000",
+                (byte) 0, (byte) 0, (byte) 0, List.of(
                 new Messages.ChunkInfo(c, ChunkState.OPEN, 0, 0, 5, List.of(new Messages.Replica(1, "a:1")))));
         assertEquals(lfr, decodeResp(lfr.encode(), Messages.LookupFileResp::decode));
 

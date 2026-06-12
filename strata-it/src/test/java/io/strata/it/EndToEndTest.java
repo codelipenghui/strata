@@ -3,7 +3,6 @@ package io.strata.it;
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
-import io.strata.client.StrataClient;
 import io.strata.common.FileId;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -45,10 +44,10 @@ class EndToEndTest {
 
     @Test
     void writeRollSealReadBack() throws Exception {
-        FileId fileId = client.create(StrataClient.FileSpec.log("topicA-0")).id();
+        FileId fileId = client.create(StrataClient.FileSpec.log("test", "/topicA-0")).id();
         Workload workload = new Workload();
 
-        try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
             workload.appendAcked(appender, 0, 1500); // ~24 KB -> several 4 KB chunk rolls
             assertEquals(workload.ackedBytes(), appender.durableOffset());
             var sealed = appender.seal();
@@ -92,12 +91,12 @@ class EndToEndTest {
 
     @Test
     void tailReadNeverExceedsDurableOffset() throws Exception {
-        FileId fileId = client.create(StrataClient.FileSpec.log("topicB-0")).id();
+        FileId fileId = client.create(StrataClient.FileSpec.log("test", "/topicB-0")).id();
         Workload workload = new Workload();
-        try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
             workload.appendAcked(appender, 0, 50);
 
-            try (StrataFile.Reader reader = client.open(fileId).openForRead()) {
+            try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
                 var r = reader.read(0, 1 << 20);
                 // open-chunk read is clamped to the replica-known DO (may lag by one append round)
                 assertTrue(r.data().length <= workload.ackedBytes(),
@@ -113,9 +112,9 @@ class EndToEndTest {
 
     @Test
     void emptyAppendCompletesWithoutCreatingAChunk() throws Exception {
-        FileId fileId = client.create(StrataClient.FileSpec.log("empty-append")).id();
+        FileId fileId = client.create(StrataClient.FileSpec.log("test", "/empty-append")).id();
 
-        try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
             var ack = appender.append(ByteBuffer.allocate(0)).get(1, TimeUnit.SECONDS);
             assertEquals(0, ack.endOffset());
             assertEquals(0, ack.durableOffset());

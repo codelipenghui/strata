@@ -3,7 +3,6 @@ package io.strata.it;
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
-import io.strata.client.StrataClient;
 import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
@@ -49,9 +48,9 @@ class RepairAndRetentionTest {
 
     @Test
     void nodeDeathRepairsAllChunksBackToRf3() throws Exception {
-        FileId fileId = client.create(StrataClient.FileSpec.log("repair-me")).id();
+        FileId fileId = client.create(StrataClient.FileSpec.log("test", "/repair-me")).id();
         Workload workload = new Workload();
-        try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
             workload.appendAcked(appender, 0, 1200); // several chunks across 4 nodes
             appender.seal();
         }
@@ -122,9 +121,9 @@ class RepairAndRetentionTest {
 
     @Test
     void fileDeletionConvergesOnNodes() throws Exception {
-        FileId fileId = client.create(StrataClient.FileSpec.log("delete-me")).id();
+        FileId fileId = client.create(StrataClient.FileSpec.log("test", "/delete-me")).id();
         Workload workload = new Workload();
-        try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
+        try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
             workload.appendAcked(appender, 0, 600);
             appender.seal();
         }
@@ -132,7 +131,7 @@ class RepairAndRetentionTest {
         List<ChunkId> chunkIds = lookup.chunks().stream().map(Messages.ChunkInfo::chunkId).toList();
         assertTrue(chunkIds.size() >= 2);
 
-        client.delete(List.of(fileId));
+        client.deleteById(List.of(fileId));
 
         // metadata record disappears once all replicas confirm physical deletion
         long deadline = System.currentTimeMillis() + 30_000;

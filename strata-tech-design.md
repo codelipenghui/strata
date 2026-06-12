@@ -31,7 +31,7 @@ Storage node <──(SCP: fetch-chunk)──> Storage node      [repair/relocati
 Metadata members ──(Raft)──> Metadata members           [quorum-internal only]
 ```
 
-**Codebase strategy.** Broker and metadata plane are derived from the Apache Kafka codebase — fork-and-replace, the path AutoMQ has proven in production. Deriving the metadata plane is a *requirement* of the KRaft decision (using KRaft means running Kafka's controller code); deriving the broker is a *choice* made for compatibility economics — the group and transaction coordinators live inside the broker, so a clean-room broker would reimplement the hardest compatibility surface regardless of how it reached the metadata plane. KRaft's consensus core is consumed untouched; all extensions are additive (new record types, new RPC APIs, the chunk-map state machine as a new Raft-layer client — the same pattern AutoMQ used for its stream/object metadata). The single invasive change is removing ISR and replica assignment from the controller's partition model (§4.1) — the main source of upstream-merge friction. Strata's custom records and APIs sit behind their own feature-level lane (§4.3) so rolling upgrades stay safe. The segment store contains no Kafka code; its language is an open decision (§17.5). A v0 bootstrap path (§4.4) decouples the first implementation from the fork timeline entirely: the storage engine is built and validated against a ZooKeeper-backed metadata service behind the same interfaces, while the controller work lands in parallel.
+**Codebase strategy.** Broker and metadata plane are derived from the Apache Kafka codebase — fork-and-replace, the path AutoMQ has proven in production. Deriving the metadata plane is a *requirement* of the KRaft decision (using KRaft means running Kafka's controller code); deriving the broker is a *choice* made for compatibility economics — the group and transaction coordinators live inside the broker, so a clean-room broker would reimplement the hardest compatibility surface regardless of how it reached the metadata plane. KRaft's consensus core is consumed untouched; all extensions are additive (new record types, new RPC APIs, the chunk-map state machine as a new Raft-layer client — the same pattern AutoMQ used for its stream/object metadata). The single invasive change is removing ISR and replica assignment from the controller's partition model (§4.1) — the main source of upstream-merge friction. Strata's custom records and APIs sit behind their own feature-level lane (§4.3) so rolling upgrades stay safe. The Strata file service contains no Kafka code; its language is an open decision (§17.5). A v0 bootstrap path (§4.4) decouples the first implementation from the fork timeline entirely: the storage engine is built and validated against a ZooKeeper-backed metadata service behind the same interfaces, while the controller work lands in parallel.
 
 Two load-bearing disciplines, stated once and assumed everywhere below:
 
@@ -98,9 +98,9 @@ The chunk-map and node-registry logic sits behind a **`MetadataStore` SPI** with
 - **ZooKeeper (v0 — development and prototype only).** A thin active/standby metadata service (ZK leader election) persists chunk descriptors and the node registry to znodes and hosts the repair coordinator — the BookKeeper pattern (pluggable metadata drivers; elected auditor). For v0, the same service can assign partition leadership and epochs for the test harness or a minimal broker; the storage layer only ever sees monotonic epochs through the same client API.
 - **KRaft (v1 — the product backend).** §4.1–§4.3.
 
-Three rules make the backend swappable rather than load-bearing: (1) the SCP control surface (§10.4) and segment-store client behavior are **identical across backends** — storage nodes and brokers cannot tell which is running; (2) commands ride heartbeat responses on both backends — ZK watches are never exposed as semantics; (3) ZooKeeper never appears in the Kafka fork — it exists only inside the v0 service, which is new code.
+Three rules make the backend swappable rather than load-bearing: (1) the SCP control surface (§10.4) and Strata client behavior are **identical across backends** — storage nodes and brokers cannot tell which is running; (2) commands ride heartbeat responses on both backends — ZK watches are never exposed as semantics; (3) ZooKeeper never appears in the Kafka fork — it exists only inside the v0 service, which is new code.
 
-Why this exists: build order. The segment store, SCP, on-disk formats, seal recovery, and repair are buildable and testable before any controller surgery lands; the fork work proceeds in parallel and binds at v1. The named risk is calcification (Pravega shipped on its ZK scaffolding and never escaped). Exit criteria are explicit: v1 GA requires the SPI conformance suite green on **both** backends, KRaft at full parity, the ZK backend excluded from product builds, and **no metadata-migration promise for v0 clusters** — prototype data does not survive to v1, by design and by announcement.
+Why this exists: build order. The Strata file service, SCP, on-disk formats, seal recovery, and repair are buildable and testable before any controller surgery lands; the fork work proceeds in parallel and binds at v1. The named risk is calcification (Pravega shipped on its ZK scaffolding and never escaped). Exit criteria are explicit: v1 GA requires the SPI conformance suite green on **both** backends, KRaft at full parity, the ZK backend excluded from product builds, and **no metadata-migration promise for v0 clusters** — prototype data does not survive to v1, by design and by announcement.
 
 ## 5. Write path
 
@@ -267,8 +267,8 @@ v0 additions: `NODE_HEARTBEAT` requests carry tagged field 0 `completedCommands`
 commandId, u16 status}) so the repair coordinator learns command completion on the next heartbeat;
 `REPLICATE` params gained `expectedLength`. The v0 client↔metadata APIs ride SCP in the 0x02xx
 range (`CREATE_FILE` 0x0201, `CREATE_CHUNK` 0x0202, `SEAL_CHUNK_META` 0x0203, `LOOKUP_FILE` 0x0204,
-`DELETE_FILES` 0x0205, `SEAL_FILE` 0x0206) — v1 moves broker-facing APIs to Kafka RPC per §10.1;
-the 0x02xx range stays reserved for tools.
+`DELETE_FILES` 0x0205, `SEAL_FILE` 0x0206, `ABORT_CHUNK_META` 0x0207, `LOOKUP_PATH` 0x0208) — v1 moves
+broker-facing APIs to Kafka RPC per §10.1; the 0x02xx range stays reserved for tools.
 
 Command encoding (in heartbeat responses): `u8 type` + tagged params. v1 types: `REPLICATE{chunkId, sources: array{nodeId, endpoint}, u8 priority, expectedCrc}` (pull via `FETCH_CHUNK`), `DELETE{chunkIds}`, `DRAIN{}` (node enters DRAINING; serve reads/copies, refuse `OPEN_CHUNK`). New command types are additive; a node MUST ignore unknown command types and report them in the next heartbeat (tagged field `unknownCommandTypes`) so operators see version skew instead of silent no-ops.
 
@@ -354,14 +354,20 @@ The client library the broker embeds (JVM, since the broker is Kafka-derived); t
 interface StrataClient extends AutoCloseable {
   static StrataClient connect(ClientConfig config);
   StrataFile create(FileSpec spec);
-      // spec: fileKind, mediaClass, ackPolicy, owner tag (opaque to storage)
-  StrataFile open(FileId id);
-  void delete(FileId id);
-  void delete(List<FileId> ids);
+      // spec: StrataNamespace namespace, StrataPath path, fileKind, mediaClass, ackPolicy
+  StrataFile open(StrataNamespace namespace, StrataPath path);
+  StrataFile openById(FileId id);             // admin/internal escape hatch
+  void delete(StrataNamespace namespace, StrataPath path);
+  void delete(List<FilePath> paths);          // FilePath{StrataNamespace namespace, StrataPath path}
+  void delete(StrataFile file);               // deletes by the handle's immutable FileId
+  void deleteById(FileId id);                 // admin/internal escape hatch
+  void deleteById(List<FileId> ids);
 }
 
 interface StrataFile {
   FileId id();
+  StrataNamespace namespace();
+  StrataPath path();
   Appender openForAppend(int writeEpoch);
   Reader openForRead();
   SealInfo recoverAndSeal(int newEpoch);
@@ -382,6 +388,13 @@ interface Reader extends AutoCloseable {
 }
 ```
 
+The user-facing logical name is `(StrataNamespace, StrataPath)`, not a local filesystem path.
+`StrataNamespace` is a single identifier (for example one Kafka cluster or tenant) and is the future
+ACL/quota root. `StrataPath` is absolute within that namespace (`/topic/partition/segment`),
+canonical (no trailing slash, empty segment, `.`, or `..`), and unique only inside its namespace
+while a file is live. Parent path segments are explicit namespace nodes so future ACLs can be
+attached above individual files; file identity remains the immutable, globally unique `FileId`.
+
 **Guarantees.**
 - *Single writer:* at most one live `Appender` per file per epoch; a higher epoch anywhere kills lower-epoch appenders permanently (`FencedException`; the appender is dead, not retriable).
 - *Ordering & durability:* appends complete in order; a completed append is on ≥2 independent nodes; `durableOffset` is monotonic.
@@ -397,8 +410,8 @@ interface Reader extends AutoCloseable {
 | Kafka mechanism | Strata disposition |
 |---|---|
 | Wire protocol, all client APIs | kept (fork); compatibility tracked by running Kafka's client/system test suites against Strata in CI |
-| `ReplicaManager`, `UnifiedLog`, ISR, truncation, follower fetch | **removed** — replaced by segment-store client (§12) + tail cache |
-| Group coordinator, transaction coordinator | kept, run in brokers; their internal compacted topics are ordinary partitions on the segment store; coordinator failover = leadership move |
+| `ReplicaManager`, `UnifiedLog`, ISR, truncation, follower fetch | **removed** — replaced by `StrataClient`/`StrataFile` (§12) + tail cache |
+| Group coordinator, transaction coordinator | kept, run in brokers; their internal compacted topics are ordinary Strata files; coordinator failover = leadership move |
 | Producer state / snapshots | per-segment checkpoint file (§11.4) + sealed footer; rebuilt on failover from checkpoint + bounded tail replay |
 | Offset & time index, aborted-txn index | checkpoint file (open) / footer (sealed) |
 | Leader-epoch cache (KIP-320 fencing for clients) | append-only per-partition epoch→offset map in the checkpoint; never truncated because logs never diverge |
@@ -467,7 +480,7 @@ The general-purpose alternatives each fail one of these tests. Object stores fai
 
 The natural internal challenge: a quorum-replicated, disaggregated log store already exists (BookKeeper), with a Kafka protocol layer (KoP). The answer: three of BookKeeper's foundational decisions — each rational for its original workload (multi-tenant, millions of small entries, lowest-latency fsync) — invert into liabilities under Kafka's workload (single writer, large sequential batches, file-granularity lifecycle, contiguous-byte reads).
 
-| | BookKeeper (under KoP) | Strata segment store |
+| | BookKeeper (under KoP) | Strata file service |
 |---|---|---|
 | **Addressing model** | (ledgerId, entryId) — record-oriented; every entry's location must be tracked | byte offset — "the address is the offset"; location is arithmetic |
 | **Location index** | RocksDB (LSM) per bookie, written on the entry hot path | sparse index appended in-band (checkpoint file / sealed footer); no KV engine anywhere in the data path |

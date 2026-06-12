@@ -1,6 +1,8 @@
 package io.strata.client;
 
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 
 import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
@@ -12,6 +14,10 @@ import java.util.concurrent.CompletableFuture;
 public interface StrataFile {
 
     FileId id();
+
+    StrataNamespace namespace();
+
+    StrataPath path();
 
     /** Single writer per epoch; a higher epoch anywhere kills this appender permanently. */
     Appender openForAppend(int writeEpoch);

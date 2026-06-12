@@ -12,12 +12,13 @@ This file is the durable source of truth for the development loop — update the
 - **Model checking:** TLA+ (tla2tools.jar fetched on demand), spec under `tla/`.
 - **v0 protocol additions** (additive per tech design §10.6; fold back into the design doc at finalize):
   - `READ_LEDGER` (0x0019): returns integrity-ledger entries from an offset — seal recovery needs per-append boundaries without parsing payload.
-  - Client↔metadata over SCP, opcode range 0x02xx: `CREATE_FILE` 0x0201, `CREATE_CHUNK` 0x0202, `SEAL_CHUNK_META` 0x0203, `LOOKUP_FILE` 0x0204, `DELETE_FILES` 0x0205. (v1 moves broker-facing APIs to Kafka RPC; range stays for tools.)
+  - Client↔metadata over SCP, opcode range 0x02xx: `CREATE_FILE` 0x0201, `CREATE_CHUNK` 0x0202, `SEAL_CHUNK_META` 0x0203, `LOOKUP_FILE` 0x0204, `DELETE_FILES` 0x0205, `SEAL_FILE` 0x0206, `ABORT_CHUNK_META` 0x0207, `LOOKUP_PATH` 0x0208. (v1 moves broker-facing APIs to Kafka RPC; range stays for tools.)
   - `NODE_HEARTBEAT` request gains tagged field `completedCommands` (commandId → status) so the repair coordinator learns copy completion.
   - `SEAL_CHUNK` (0x0015): footer sections from caller are optional; the node always computes CRC_RANGES + STATS itself so recovery-sealed chunks are byte-identical across replicas.
   - Error codes added: 15 NOT_LEADER (tagged leader hint), 16 NO_CAPACITY (placement cannot find 3 nodes).
 - **v0 epoch source:** the caller (test harness) supplies `writeEpoch` — monotonic per file. v1 replaces this with Kafka controller leader epochs; storage layer is agnostic.
 - **v0 metadata service:** single active instance in tests (Curator leader election implemented); leases in leader memory, registrations + file/chunk records in ZK (CAS via znode versions, leader-only writes).
+- **File naming:** every file has a first-class `StrataNamespace` plus `StrataPath`. `FileId` is globally unique; `(namespace, path)` is unique only while a file is live. The v0 ZK backend stores path bindings under `/strata/namespaces/<namespace>/paths/<path>/__file`, leaving that namespace node as the future ACL/quota root.
 
 ## Module layout
 

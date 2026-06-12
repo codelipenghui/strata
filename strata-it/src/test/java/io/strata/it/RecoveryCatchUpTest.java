@@ -37,7 +37,7 @@ class RecoveryCatchUpTest {
             Messages.CreateChunkResp chunk;
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
                 fileId = Messages.CreateFileResp.decode(meta.call(Opcode.CREATE_FILE,
-                        new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "lag").encode(), null, 5000))
+                        new Messages.CreateFile("test", "/lag", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000))
                         .fileId();
                 chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
                         new Messages.CreateChunk(fileId, 1, (byte) 0xFF).encode(), null, 5000));
@@ -64,7 +64,7 @@ class RecoveryCatchUpTest {
                 }
             }
 
-            var sealed = client.open(fileId).recoverAndSeal(2);
+            var sealed = client.openById(fileId).recoverAndSeal(2);
             assertEquals(12, sealed.sealedLength(), "all quorum-durable bytes must be preserved");
 
             // EVERY replica in the descriptor must now serve the full sealed chunk byte-identically
@@ -105,7 +105,7 @@ class RecoveryCatchUpTest {
             Messages.CreateChunkResp chunk;
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
                 fileId = Messages.CreateFileResp.decode(meta.call(Opcode.CREATE_FILE,
-                                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "short-sealed")
+                                new Messages.CreateFile("test", "/short-sealed", (byte) 0, (byte) 0, (byte) 0)
                                         .encode(), null, 5000))
                         .fileId();
                 chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
@@ -136,7 +136,7 @@ class RecoveryCatchUpTest {
                 }
             }
 
-            var sealed = client.open(fileId).recoverAndSeal(2);
+            var sealed = client.openById(fileId).recoverAndSeal(2);
             assertEquals(8, sealed.sealedLength(),
                     "a short sealed replica must not truncate quorum-durable bytes");
 
@@ -149,7 +149,7 @@ class RecoveryCatchUpTest {
                     "the short sealed copy must be excluded from the descriptor");
             assertTrue(lookup.chunks().get(0).replicas().stream().noneMatch(r -> r.nodeId() == shortReplica));
 
-            try (var reader = client.open(fileId).openForRead()) {
+            try (var reader = client.openById(fileId).openForRead()) {
                 assertEquals("AAAABBBB", new String(reader.read(0, 16).data(), StandardCharsets.UTF_8));
             }
         }
@@ -165,7 +165,7 @@ class RecoveryCatchUpTest {
             Messages.CreateChunkResp chunk;
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
                 fileId = Messages.CreateFileResp.decode(meta.call(Opcode.CREATE_FILE,
-                        new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, "partial").encode(), null, 5000))
+                        new Messages.CreateFile("test", "/partial", (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000))
                         .fileId();
                 chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
                         new Messages.CreateChunk(fileId, 1, (byte) 0xFF).encode(), null, 5000));
@@ -192,7 +192,7 @@ class RecoveryCatchUpTest {
                 }
             }
 
-            var sealed = client.open(fileId).recoverAndSeal(2);
+            var sealed = client.openById(fileId).recoverAndSeal(2);
             assertEquals(12, sealed.sealedLength(),
                     "recovery must preserve the full valid batch, not stop at a shorter partial boundary");
 

@@ -491,8 +491,8 @@ class RepairCoordinatorTest {
                 List.of(sealed(0, 10, 100, List.of(node.nodeId())))));
         store.createFile(file(deletingFile, Records.FileState.DELETING,
                 List.of(sealed(0, 20, 200, List.of(node.nodeId())))));
-        store.createFile(new Records.FileRecord(openFile, (byte) 1, MEDIA, (byte) 1, "owner",
-                Records.FileState.OPEN, 1234,
+        store.createFile(new Records.FileRecord(openFile, "test", "/open-file",
+                (byte) 1, MEDIA, (byte) 1, Records.FileState.OPEN, 1234,
                 List.of(new Records.ChunkRecord(0, ChunkState.OPEN, 0, 0, 1, List.of(node.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
@@ -618,8 +618,8 @@ class RepairCoordinatorTest {
 
     private static Records.FileRecord file(FileId fileId, Records.FileState state,
                                            List<Records.ChunkRecord> chunks) {
-        return new Records.FileRecord(fileId, (byte) 1, MEDIA, (byte) 1, "owner",
-                state, 1234, chunks);
+        return new Records.FileRecord(fileId, "test", "/file-" + fileId,
+                (byte) 1, MEDIA, (byte) 1, state, 1234, chunks);
     }
 
     private static Records.ChunkRecord sealed(int index, long length, int crc, List<Integer> replicas) {
@@ -646,6 +646,7 @@ class RepairCoordinatorTest {
 
     private static final class FakeStore implements MetadataStore {
         private final Map<FileId, Versioned<Records.FileRecord>> files = new LinkedHashMap<>();
+        private final Map<Name, FileId> paths = new LinkedHashMap<>();
         private final Map<Integer, Versioned<Records.NodeRecord>> nodes = new LinkedHashMap<>();
         private final List<FileId> extraListedFiles = new ArrayList<>();
         private int nextNodeId = 1;
@@ -659,7 +660,11 @@ class RepairCoordinatorTest {
             if (files.containsKey(record.fileId())) {
                 throw new IllegalStateException("file already exists");
             }
+            if (paths.containsKey(new Name(record.namespace(), record.path()))) {
+                throw new IllegalStateException("path already exists");
+            }
             files.put(record.fileId(), new Versioned<>(record, 0));
+            paths.put(new Name(record.namespace(), record.path()), record.fileId());
         }
 
         @Override
@@ -668,6 +673,12 @@ class RepairCoordinatorTest {
                 throw new IllegalStateException("getFile failure");
             }
             return Optional.ofNullable(files.get(id));
+        }
+
+        @Override
+        public Optional<FileId> resolvePath(io.strata.common.StrataNamespace namespace,
+                                            io.strata.common.StrataPath path) {
+            return Optional.ofNullable(paths.get(new Name(namespace, path)));
         }
 
         @Override
@@ -686,6 +697,21 @@ class RepairCoordinatorTest {
         }
 
         @Override
+        public boolean deletePath(io.strata.common.StrataNamespace namespace, io.strata.common.StrataPath path,
+                                  FileId expectedFileId) {
+            Name name = new Name(namespace, path);
+            FileId current = paths.get(name);
+            if (current == null) {
+                return true;
+            }
+            if (!current.equals(expectedFileId)) {
+                return false;
+            }
+            paths.remove(name);
+            return true;
+        }
+
+        @Override
         public boolean deleteFile(FileId id, int expectedVersion) {
             Versioned<Records.FileRecord> current = files.get(id);
             if (current == null) {
@@ -700,6 +726,7 @@ class RepairCoordinatorTest {
                 return false;
             }
             files.remove(id);
+            paths.remove(new Name(current.value().namespace(), current.value().path()), id);
             return true;
         }
 
@@ -749,4 +776,6 @@ class RepairCoordinatorTest {
         public void close() {
         }
     }
+
+    private record Name(io.strata.common.StrataNamespace namespace, io.strata.common.StrataPath path) {}
 }

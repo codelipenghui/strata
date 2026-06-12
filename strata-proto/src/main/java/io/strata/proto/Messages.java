@@ -3,12 +3,15 @@ package io.strata.proto;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 import io.strata.common.Varint;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 
 /**
@@ -620,28 +623,45 @@ public final class Messages {
 
     /* ---------- v0 client <-> metadata ---------- */
 
-    public record CreateFile(byte fileKind, byte mediaClass, byte ackPolicy, String ownerTag,
+    public record CreateFile(StrataNamespace namespace, StrataPath path, byte fileKind, byte mediaClass, byte ackPolicy,
                              FileId fileId, long opIdMsb, long opIdLsb) {
-        public CreateFile(byte fileKind, byte mediaClass, byte ackPolicy, String ownerTag) {
-            this(fileKind, mediaClass, ackPolicy, ownerTag, FileId.random(), UUID.randomUUID());
+        public CreateFile {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+            path = Objects.requireNonNull(path, "path");
+            fileId = Objects.requireNonNull(fileId, "fileId");
         }
 
-        private CreateFile(byte fileKind, byte mediaClass, byte ackPolicy, String ownerTag,
+        public CreateFile(StrataNamespace namespace, StrataPath path, byte fileKind, byte mediaClass, byte ackPolicy) {
+            this(namespace, path, fileKind, mediaClass, ackPolicy, FileId.random(), UUID.randomUUID());
+        }
+
+        public CreateFile(String namespace, String path, byte fileKind, byte mediaClass, byte ackPolicy) {
+            this(StrataNamespace.of(namespace), StrataPath.of(path), fileKind, mediaClass, ackPolicy);
+        }
+
+        private CreateFile(StrataNamespace namespace, StrataPath path, byte fileKind, byte mediaClass, byte ackPolicy,
                            FileId fileId, UUID opId) {
-            this(fileKind, mediaClass, ackPolicy, ownerTag, fileId,
+            this(namespace, path, fileKind, mediaClass, ackPolicy, fileId,
                     opId.getMostSignificantBits(), opId.getLeastSignificantBits());
+        }
+
+        public CreateFile(String namespace, String path, byte fileKind, byte mediaClass, byte ackPolicy,
+                          FileId fileId, long opIdMsb, long opIdLsb) {
+            this(StrataNamespace.of(namespace), StrataPath.of(path), fileKind, mediaClass, ackPolicy,
+                    fileId, opIdMsb, opIdLsb);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.u8(fileKind).u8(mediaClass).u8(ackPolicy).string(ownerTag)
+            w.string(namespace.toString()).string(path.toString()).u8(fileKind).u8(mediaClass).u8(ackPolicy)
                     .fileId(fileId).u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
         public static CreateFile decode(ByteBuffer b) {
-            CreateFile m = new CreateFile(b.get(), b.get(), b.get(), Varint.readString(b),
-                    FileId.readFrom(b), b.getLong(), b.getLong());
+            CreateFile m = new CreateFile(StrataNamespace.of(Varint.readString(b)),
+                    StrataPath.of(Varint.readString(b)), b.get(), b.get(), b.get(), FileId.readFrom(b),
+                    b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }
@@ -769,6 +789,45 @@ public final class Messages {
         }
     }
 
+    public record LookupPath(StrataNamespace namespace, StrataPath path) {
+        public LookupPath {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+            path = Objects.requireNonNull(path, "path");
+        }
+
+        public LookupPath(String namespace, String path) {
+            this(StrataNamespace.of(namespace), StrataPath.of(path));
+        }
+
+        public byte[] encode() {
+            BufWriter w = new BufWriter();
+            w.string(namespace.toString()).string(path.toString()).noTags();
+            return w.toBytes();
+        }
+
+        public static LookupPath decode(ByteBuffer b) {
+            LookupPath m = new LookupPath(StrataNamespace.of(Varint.readString(b)),
+                    StrataPath.of(Varint.readString(b)));
+            TaggedFields.readFrom(b);
+            return m;
+        }
+    }
+
+    public record LookupPathResp(FileId fileId) {
+        public byte[] encode() {
+            BufWriter w = new BufWriter();
+            Resp.writeOk(w);
+            w.fileId(fileId).noTags();
+            return w.toBytes();
+        }
+
+        public static LookupPathResp decode(ByteBuffer b) {
+            LookupPathResp m = new LookupPathResp(FileId.readFrom(b));
+            TaggedFields.readFrom(b);
+            return m;
+        }
+    }
+
     public record ChunkInfo(ChunkId chunkId, ChunkState state, long length, int crc,
                             int writeEpoch, List<Replica> replicas) {
         public ChunkInfo {
@@ -786,28 +845,39 @@ public final class Messages {
         }
     }
 
-    public record LookupFileResp(byte fileKind, byte ackPolicy, byte fileState, List<ChunkInfo> chunks) {
+    public record LookupFileResp(StrataNamespace namespace, StrataPath path, byte fileKind, byte ackPolicy,
+                                 byte fileState,
+                                 List<ChunkInfo> chunks) {
+        public LookupFileResp(String namespace, String path, byte fileKind, byte ackPolicy, byte fileState,
+                              List<ChunkInfo> chunks) {
+            this(StrataNamespace.of(namespace), StrataPath.of(path), fileKind, ackPolicy, fileState, chunks);
+        }
+
         public LookupFileResp {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+            path = Objects.requireNonNull(path, "path");
             chunks = List.copyOf(chunks);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
             Resp.writeOk(w);
-            w.u8(fileKind).u8(ackPolicy).u8(fileState);
-            w.varint(chunks.size());
+            w.string(namespace.toString()).string(path.toString()).u8(fileKind).u8(ackPolicy)
+                    .u8(fileState).varint(chunks.size());
             for (ChunkInfo c : chunks) ChunkInfo.write(w, c);
             w.noTags();
             return w.toBytes();
         }
 
         public static LookupFileResp decode(ByteBuffer b) {
+            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataPath path = StrataPath.of(Varint.readString(b));
             byte kind = b.get(), ack = b.get(), state = b.get();
             int n = count(b);
             List<ChunkInfo> cs = new ArrayList<>(n);
             for (int i = 0; i < n; i++) cs.add(ChunkInfo.read(b));
             TaggedFields.readFrom(b);
-            return new LookupFileResp(kind, ack, state, cs);
+            return new LookupFileResp(namespace, path, kind, ack, state, cs);
         }
     }
 

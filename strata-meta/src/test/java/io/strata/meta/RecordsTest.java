@@ -50,31 +50,25 @@ class RecordsTest {
     }
 
     @Test
-    void fileRecordRoundtripAndLegacyDecode() {
+    void fileRecordRoundtripAndRejectsUnknownVersions() {
         FileId fileId = new FileId(1, 2);
         Records.ChunkRecord chunk = new Records.ChunkRecord(3, ChunkState.SEALED, 4096, 0xAA, 5,
                 List.of(7, 8), 33, 44);
-        Records.FileRecord record = new Records.FileRecord(fileId, (byte) 1, (byte) 2, (byte) 3,
-                "owner", Records.FileState.OPEN, 1234, List.of(chunk), 11, 22);
+        Records.FileRecord record = new Records.FileRecord(fileId, "test", "/test-file",
+                (byte) 1, (byte) 2, (byte) 3, Records.FileState.OPEN, 1234, List.of(chunk), 11, 22);
 
         assertEquals(new io.strata.common.ChunkId(fileId, 3), record.chunkId(3));
+        assertEquals(io.strata.common.StrataNamespace.of("test"), record.namespace());
         assertTrue(record.createdBy(11, 22));
         assertFalse(record.createdBy(11, 23));
         assertEquals(Records.FileState.SEALED, record.withState(Records.FileState.SEALED).state());
         assertEquals(0, record.withChunks(List.of()).chunks().size());
         assertEquals(record, Records.FileRecord.decode(record.encode()));
 
-        Records.FileRecord legacy = Records.FileRecord.decode(legacyFileRecordBytes(fileId));
-        assertEquals(fileId, legacy.fileId());
-        assertEquals(Records.FileState.DELETING, legacy.state());
-        assertEquals(0, legacy.createOpMsb());
-        assertEquals(0, legacy.createOpLsb());
-        assertEquals(0, legacy.chunks().get(0).createOpMsb());
-        assertEquals(0, legacy.chunks().get(0).createOpLsb());
-
         byte[] invalid = record.encode();
         invalid[0] = 99;
         assertThrows(IllegalArgumentException.class, () -> Records.FileRecord.decode(invalid));
+        assertThrows(IllegalArgumentException.class, () -> Records.FileRecord.decode(legacyFileRecordBytes(fileId)));
     }
 
     @Test
@@ -86,8 +80,8 @@ class RecordsTest {
         assertThrows(UnsupportedOperationException.class, () -> chunk.replicas().add(4));
 
         List<Records.ChunkRecord> chunks = new ArrayList<>(List.of(chunk));
-        Records.FileRecord file = new Records.FileRecord(new FileId(1, 2), (byte) 0, (byte) 0, (byte) 0,
-                "owner", Records.FileState.OPEN, 1, chunks);
+        Records.FileRecord file = new Records.FileRecord(new FileId(1, 2), "test", "/test-file",
+                (byte) 0, (byte) 0, (byte) 0, Records.FileState.OPEN, 1, chunks);
         chunks.clear();
         assertEquals(List.of(chunk), file.chunks());
         assertThrows(UnsupportedOperationException.class, () -> file.chunks().clear());
@@ -163,9 +157,9 @@ class RecordsTest {
 
     private static byte[] fileRecordWithChunkCount(int count) {
         BufWriter w = new BufWriter();
-        w.u8(2);
+        w.u8(4);
         w.fileId(new FileId(1, 2));
-        w.u8(0).u8(0).u8(0).string("owner").u8(Records.FileState.OPEN.value).u64(1);
+        w.string("test").string("/test-file").u8(0).u8(0).u8(0).u8(Records.FileState.OPEN.value).u64(1);
         w.u64(0).u64(0);
         w.varint(count);
         return w.toBytes();
@@ -173,9 +167,9 @@ class RecordsTest {
 
     private static byte[] fileRecordWithReplicaCount(int count) {
         BufWriter w = new BufWriter();
-        w.u8(2);
+        w.u8(4);
         w.fileId(new FileId(1, 2));
-        w.u8(0).u8(0).u8(0).string("owner").u8(Records.FileState.OPEN.value).u64(1);
+        w.string("test").string("/test-file").u8(0).u8(0).u8(0).u8(Records.FileState.OPEN.value).u64(1);
         w.u64(0).u64(0);
         w.varint(1);
         w.u32(0).u8(ChunkState.OPEN.value).u64(0).u32(0).i32(1);

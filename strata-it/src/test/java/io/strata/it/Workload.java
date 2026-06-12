@@ -69,7 +69,7 @@ final class Workload {
     }
 
     static byte[] readAll(StrataClient store, io.strata.common.FileId fileId, int atLeast) {
-        try (StrataFile.Reader reader = store.open(fileId).openForRead()) {
+        try (StrataFile.Reader reader = store.openById(fileId).openForRead()) {
             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
             long offset = 0;
             int idleRounds = 0;

@@ -4,6 +4,8 @@ import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 import io.strata.proto.Messages;
 
 import java.util.Objects;
@@ -14,17 +16,32 @@ final class StrataFileImpl implements StrataFile {
     private final NodePool pool;
     private final ClientConfig config;
     private final FileId fileId;
+    private final StrataNamespace namespace;
+    private final StrataPath path;
 
-    StrataFileImpl(MetaClient meta, NodePool pool, ClientConfig config, FileId fileId) {
+    StrataFileImpl(MetaClient meta, NodePool pool, ClientConfig config, FileId fileId,
+                   StrataNamespace namespace, StrataPath path) {
         this.meta = Objects.requireNonNull(meta, "meta");
         this.pool = Objects.requireNonNull(pool, "pool");
         this.config = Objects.requireNonNull(config, "config");
         this.fileId = Objects.requireNonNull(fileId, "fileId");
+        this.namespace = Objects.requireNonNull(namespace, "namespace");
+        this.path = Objects.requireNonNull(path, "path");
     }
 
     @Override
     public FileId id() {
         return fileId;
+    }
+
+    @Override
+    public StrataNamespace namespace() {
+        return namespace;
+    }
+
+    @Override
+    public StrataPath path() {
+        return path;
     }
 
     @Override

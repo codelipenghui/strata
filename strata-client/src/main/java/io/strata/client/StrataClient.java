@@ -1,6 +1,8 @@
 package io.strata.client;
 
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 
 import java.util.List;
 import java.util.Objects;
@@ -15,34 +17,64 @@ public interface StrataClient extends AutoCloseable {
         return new StrataClientImpl(Objects.requireNonNull(config, "config"));
     }
 
-    record FileSpec(byte fileKind, byte mediaClass, byte ackPolicy, String ownerTag) {
+    record FileSpec(StrataNamespace namespace, StrataPath path, byte fileKind, byte mediaClass, byte ackPolicy) {
         public FileSpec {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+            path = Objects.requireNonNull(path, "path");
             if (ackPolicy != 0 && ackPolicy != 1) {
                 throw new IllegalArgumentException("unsupported ack policy " + (ackPolicy & 0xFF));
             }
-            if (ownerTag == null) {
-                throw new IllegalArgumentException("ownerTag must not be null");
-            }
         }
 
-        public static FileSpec log(String ownerTag) {
-            return new FileSpec((byte) 0, (byte) 0, (byte) 0, ownerTag);
+        public FileSpec(String namespace, String path, byte fileKind, byte mediaClass, byte ackPolicy) {
+            this(StrataNamespace.of(namespace), StrataPath.of(path), fileKind, mediaClass, ackPolicy);
+        }
+
+        public static FileSpec log(String namespace, String path) {
+            return new FileSpec(namespace, path, (byte) 0, (byte) 0, (byte) 0);
+        }
+    }
+
+    record FilePath(StrataNamespace namespace, StrataPath path) {
+        public FilePath {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+            path = Objects.requireNonNull(path, "path");
+        }
+
+        public FilePath(String namespace, String path) {
+            this(StrataNamespace.of(namespace), StrataPath.of(path));
         }
     }
 
     StrataFile create(FileSpec spec);
 
-    StrataFile open(FileId fileId);
+    StrataFile open(StrataNamespace namespace, StrataPath path);
 
-    default void delete(FileId fileId) {
-        delete(List.of(Objects.requireNonNull(fileId, "fileId")));
+    StrataFile openById(FileId fileId);
+
+    default StrataFile open(String namespace, String path) {
+        return open(StrataNamespace.of(namespace), StrataPath.of(path));
+    }
+
+    default void delete(StrataNamespace namespace, StrataPath path) {
+        delete(List.of(new FilePath(namespace, path)));
     }
 
     default void delete(StrataFile file) {
-        delete(Objects.requireNonNull(file, "file").id());
+        deleteById(Objects.requireNonNull(file, "file").id());
     }
 
-    void delete(List<FileId> fileIds);
+    default void delete(String namespace, String path) {
+        delete(StrataNamespace.of(namespace), StrataPath.of(path));
+    }
+
+    void delete(List<FilePath> paths);
+
+    default void deleteById(FileId fileId) {
+        deleteById(List.of(Objects.requireNonNull(fileId, "fileId")));
+    }
+
+    void deleteById(List<FileId> fileIds);
 
     @Override
     void close();

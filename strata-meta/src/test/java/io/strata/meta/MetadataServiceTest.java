@@ -111,17 +111,54 @@ class MetadataServiceTest {
     @Test
     void createFileRejectsUnsupportedAckPolicy() {
         ScpException e = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 99, "bad-policy").encode(),
+                new Messages.CreateFile("test", "/bad-policy", (byte) 0, (byte) 0, (byte) 99).encode(),
                 null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, e.code());
 
         assertEquals("127.0.0.1:" + service.port(), service.endpoint());
         var accepted = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 0, (byte) 1, "fsync-policy").encode(),
+                new Messages.CreateFile("test", "/fsync-policy", (byte) 0, (byte) 0, (byte) 1).encode(),
                 null, 5000));
         var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
                 new Messages.LookupFile(accepted.fileId()).encode(), null, 5000));
         assertEquals(1, lookup.ackPolicy());
+    }
+
+    @Test
+    void createFileBindsAndDeletesLogicalPath() {
+        var created = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", "/namespace/topicA/0/segment-0", (byte) 0, (byte) 0, (byte) 0)
+                        .encode(), null, 5000));
+
+        var byPath = Messages.LookupPathResp.decode(client.call(Opcode.LOOKUP_PATH,
+                new Messages.LookupPath("test", "/namespace/topicA/0/segment-0").encode(), null, 5000));
+        assertEquals(created.fileId(), byPath.fileId());
+
+        var byId = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
+                new Messages.LookupFile(created.fileId()).encode(), null, 5000));
+        assertEquals(io.strata.common.StrataNamespace.of("test"), byId.namespace());
+        assertEquals(io.strata.common.StrataPath.of("/namespace/topicA/0/segment-0"), byId.path());
+
+        ScpException duplicate = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", "/namespace/topicA/0/segment-0", (byte) 0, (byte) 0, (byte) 0)
+                        .encode(), null, 5000));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, duplicate.code());
+
+        var samePathOtherNamespace = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test-alt", "/namespace/topicA/0/segment-0", (byte) 0, (byte) 0, (byte) 0)
+                        .encode(), null, 5000));
+        var byOtherNamespace = Messages.LookupPathResp.decode(client.call(Opcode.LOOKUP_PATH,
+                new Messages.LookupPath("test-alt", "/namespace/topicA/0/segment-0").encode(), null, 5000));
+        assertEquals(samePathOtherNamespace.fileId(), byOtherNamespace.fileId());
+
+        var delete = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
+                new Messages.DeleteFiles(List.of(created.fileId(), samePathOtherNamespace.fileId())).encode(),
+                null, 5000));
+        assertEquals(List.of(ErrorCode.OK.code, ErrorCode.OK.code), delete.codes());
+
+        ScpException missing = assertThrows(ScpException.class, () -> client.call(Opcode.LOOKUP_PATH,
+                new Messages.LookupPath("test", "/namespace/topicA/0/segment-0").encode(), null, 5000));
+        assertEquals(ErrorCode.FILE_NOT_FOUND, missing.code());
     }
 
     @Test
@@ -221,7 +258,7 @@ class MetadataServiceTest {
 
         // create file
         var fileResp = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, mediaClass, (byte) 0, "topicA-0").encode(), null, 5000));
+                new Messages.CreateFile("test", "/topicA-0", (byte) 0, mediaClass, (byte) 0).encode(), null, 5000));
         FileId fileId = fileResp.fileId();
 
         // create chunk: 3 replicas, all distinct nodes and hosts
@@ -422,7 +459,7 @@ class MetadataServiceTest {
                 null, 5000);
 
         var fileResp = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, mediaClass, (byte) 0, "full").encode(), null, 5000));
+                new Messages.CreateFile("test", "/full", (byte) 0, mediaClass, (byte) 0).encode(), null, 5000));
         ScpException noCapacity = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(fileResp.fileId(), 1, mediaClass).encode(), null, 5000));
         assertEquals(ErrorCode.NO_CAPACITY, noCapacity.code());
@@ -499,9 +536,21 @@ class MetadataServiceTest {
         }
 
         @Override
+        public java.util.Optional<FileId> resolvePath(io.strata.common.StrataNamespace namespace,
+                                                      io.strata.common.StrataPath path) throws Exception {
+            return delegate.resolvePath(namespace, path);
+        }
+
+        @Override
         public boolean updateFile(Records.FileRecord record, int expectedVersion) {
             updateCalls++;
             return false;
+        }
+
+        @Override
+        public boolean deletePath(io.strata.common.StrataNamespace namespace, io.strata.common.StrataPath path,
+                                  FileId expectedFileId) throws Exception {
+            return delegate.deletePath(namespace, path, expectedFileId);
         }
 
         @Override
@@ -543,7 +592,7 @@ class MetadataServiceTest {
     void createChunkRejectedWhileTailChunkIsOpen() {
         registerTrio((byte) 11, "tailHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 11, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/tail-open", (byte) 0, (byte) 11, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 11).encode(), null, 5000));
 
@@ -570,8 +619,8 @@ class MetadataServiceTest {
         registerTrio((byte) 13, "idemHost");
 
         FileId requested = FileId.random();
-        var createFile = new Messages.CreateFile((byte) 0, (byte) 13, (byte) 0,
-                "idem", requested, 100, 200);
+        var createFile = new Messages.CreateFile("test", "/idem", (byte) 0, (byte) 13, (byte) 0,
+                requested, 100, 200);
         var file1 = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 createFile.encode(), null, 5000));
         var file2 = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
@@ -580,8 +629,8 @@ class MetadataServiceTest {
         assertEquals(requested, file1.fileId());
 
         ScpException conflictingFile = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 13, (byte) 0,
-                        "idem", requested, 101, 201).encode(), null, 5000));
+                new Messages.CreateFile("test", "/idem", (byte) 0, (byte) 13, (byte) 0,
+                        requested, 101, 201).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, conflictingFile.code());
 
         var createChunk = new Messages.CreateChunk(file1.fileId(), 1, (byte) 13, 300, 400);
@@ -600,7 +649,7 @@ class MetadataServiceTest {
     void abortChunkRemovesOnlyMatchingOpenTail() {
         registerTrio((byte) 14, "abortHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 14, (byte) 0, "abort").encode(), null, 5000));
+                new Messages.CreateFile("test", "/abort", (byte) 0, (byte) 14, (byte) 0).encode(), null, 5000));
         var createChunk = new Messages.CreateChunk(file.fileId(), 1, (byte) 14, 500, 600);
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 createChunk.encode(), null, 5000));
@@ -634,7 +683,7 @@ class MetadataServiceTest {
     void abortChunkIsIdempotentOnlyForMissingChunksNotNonTailChunks() {
         registerTrio((byte) 17, "abortTailHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 17, (byte) 0, "abort-non-tail").encode(), null, 5000));
+                new Messages.CreateFile("test", "/abort-non-tail", (byte) 0, (byte) 17, (byte) 0).encode(), null, 5000));
         var chunk0 = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 17, 700, 800).encode(), null, 5000));
 
@@ -658,7 +707,7 @@ class MetadataServiceTest {
     void abortChunkRejectsSealedTailButMissingChunkAbortIsIdempotent() {
         registerTrio((byte) 18, "abortSealedHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 18, (byte) 0, "abort-sealed").encode(), null, 5000));
+                new Messages.CreateFile("test", "/abort-sealed", (byte) 0, (byte) 18, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 18, 710, 810).encode(), null, 5000));
 
@@ -676,7 +725,7 @@ class MetadataServiceTest {
     void deletingFileCannotBeSealedOrResurrected() {
         registerTrio((byte) 12, "delHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 12, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/deleting-seal", (byte) 0, (byte) 12, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 12).encode(), null, 5000));
 
@@ -706,7 +755,7 @@ class MetadataServiceTest {
     void chunkSealIdempotenceRequiresMatchingCrc() {
         registerTrio((byte) 5, "crcHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 5, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/seal-length", (byte) 0, (byte) 5, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 5).encode(), null, 5000));
 
@@ -730,7 +779,7 @@ class MetadataServiceTest {
     void sealChunkMetaRejectsNegativeLength() {
         registerTrio((byte) 16, "negSealHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 16, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/seal-replica-quorum", (byte) 0, (byte) 16, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 16).encode(), null, 5000));
 
@@ -748,7 +797,7 @@ class MetadataServiceTest {
     void sealChunkMetaRequiresConfirmedReplicaQuorumWhenProvided() {
         registerTrio((byte) 15, "sealQuorumHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 15, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/seal-replica-retain", (byte) 0, (byte) 15, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 15).encode(), null, 5000));
 
@@ -769,7 +818,7 @@ class MetadataServiceTest {
     void sealChunkMetaRejectsDisjointConfirmedReplicas() {
         registerTrio((byte) 19, "sealDisjointHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 19, (byte) 0, "seal-disjoint").encode(), null, 5000));
+                new Messages.CreateFile("test", "/seal-disjoint", (byte) 0, (byte) 19, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 19).encode(), null, 5000));
 
@@ -788,7 +837,7 @@ class MetadataServiceTest {
     void sealFileValidatesChunkStatesAndTotalLength() {
         registerTrio((byte) 6, "sfHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 6, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/seal-file-state", (byte) 0, (byte) 6, (byte) 0).encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 1, (byte) 6).encode(), null, 5000));
 
@@ -820,8 +869,8 @@ class MetadataServiceTest {
     @Test
     void sealFileRejectsCorruptCommittedChunkLengths() throws Exception {
         FileId negative = FileId.random();
-        metadataStore().createFile(new Records.FileRecord(negative, (byte) 0, (byte) 101, (byte) 0,
-                "negative-length", Records.FileState.OPEN, System.currentTimeMillis(),
+        metadataStore().createFile(new Records.FileRecord(negative, "test", "/negative-length",
+                (byte) 0, (byte) 101, (byte) 0, Records.FileState.OPEN, System.currentTimeMillis(),
                 List.of(new Records.ChunkRecord(0, ChunkState.SEALED, -1, 0, 1, List.of()))));
 
         ScpException negativeLength = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_FILE,
@@ -829,8 +878,8 @@ class MetadataServiceTest {
         assertEquals(ErrorCode.PRECONDITION_FAILED, negativeLength.code());
 
         FileId overflow = FileId.random();
-        metadataStore().createFile(new Records.FileRecord(overflow, (byte) 0, (byte) 102, (byte) 0,
-                "overflow-length", Records.FileState.OPEN, System.currentTimeMillis(),
+        metadataStore().createFile(new Records.FileRecord(overflow, "test", "/overflow-length",
+                (byte) 0, (byte) 102, (byte) 0, Records.FileState.OPEN, System.currentTimeMillis(),
                 List.of(
                         new Records.ChunkRecord(0, ChunkState.SEALED, Long.MAX_VALUE, 0, 1, List.of()),
                         new Records.ChunkRecord(1, ChunkState.SEALED, 1, 0, 1, List.of()))));
@@ -846,7 +895,7 @@ class MetadataServiceTest {
         registerTrio(mediaClass, "casHost");
 
         var createChunkFile = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, mediaClass, (byte) 0, "cas-create-chunk").encode(),
+                new Messages.CreateFile("test", "/cas-create-chunk", (byte) 0, mediaClass, (byte) 0).encode(),
                 null, 5000));
         UpdateRejectingStore createRejecting = new UpdateRejectingStore(metadataStore());
         MetadataStore original = replaceStore(createRejecting);
@@ -861,7 +910,7 @@ class MetadataServiceTest {
         }
 
         var chunkFile = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, mediaClass, (byte) 0, "cas-chunk").encode(), null, 5000));
+                new Messages.CreateFile("test", "/cas-chunk", (byte) 0, mediaClass, (byte) 0).encode(), null, 5000));
         var createChunk = new Messages.CreateChunk(chunkFile.fileId(), 1, mediaClass, 7000, 8000);
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 createChunk.encode(), null, 5000));
@@ -892,7 +941,7 @@ class MetadataServiceTest {
         }
 
         var sealFile = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, mediaClass, (byte) 0, "cas-seal-file").encode(),
+                new Messages.CreateFile("test", "/cas-seal-file", (byte) 0, mediaClass, (byte) 0).encode(),
                 null, 5000));
         UpdateRejectingStore mutateRejecting = new UpdateRejectingStore(metadataStore());
         original = replaceStore(mutateRejecting);
@@ -924,7 +973,7 @@ class MetadataServiceTest {
             n.session = resp.sessionEpoch();
         }
         var fileResp = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, (byte) 7, (byte) 0, "t").encode(), null, 5000));
+                new Messages.CreateFile("test", "/sealed-overflow", (byte) 0, (byte) 7, (byte) 0).encode(), null, 5000));
 
         // only 2 distinct hosts with mediaClass 7 -> NO_CAPACITY
         ScpException e = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
@@ -945,7 +994,7 @@ class MetadataServiceTest {
         }
 
         var fileResp = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile((byte) 0, mediaClass, (byte) 0, "huge").encode(), null, 5000));
+                new Messages.CreateFile("test", "/huge", (byte) 0, mediaClass, (byte) 0).encode(), null, 5000));
         var chunkResp = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(fileResp.fileId(), 1, mediaClass).encode(), null, 5000));
 

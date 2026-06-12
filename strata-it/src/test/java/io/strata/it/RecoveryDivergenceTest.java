@@ -27,11 +27,11 @@ class RecoveryDivergenceTest {
     void recoveryCommitsAgreeingSealQuorumAndDropsOutlier() throws Exception {
         try (MiniCluster cluster = new MiniCluster(3);
              StrataClient client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()))) {
-            var setup = createOpenChunkWithReplicaPayloads(cluster, "majority",
+            var setup = createOpenChunkWithReplicaPayloads(cluster, "/majority",
                     List.of("AAAA".getBytes(), "AAAA".getBytes(), "BBBB".getBytes()));
 
             String[] hp = cluster.metaEndpoint().split(":");
-            var sealed = client.open(setup.fileId()).recoverAndSeal(2);
+            var sealed = client.openById(setup.fileId()).recoverAndSeal(2);
             assertEquals(4, sealed.sealedLength());
 
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
@@ -42,7 +42,7 @@ class RecoveryDivergenceTest {
                         "metadata must retain only the agreeing seal quorum");
             }
 
-            try (var reader = client.open(setup.fileId()).openForRead()) {
+            try (var reader = client.openById(setup.fileId()).openForRead()) {
                 assertArrayEquals("AAAA".getBytes(), reader.read(0, 4).data());
             }
         }
@@ -52,10 +52,10 @@ class RecoveryDivergenceTest {
     void recoveryRefusesToSealDivergenceWithoutQuorum() throws Exception {
         try (MiniCluster cluster = new MiniCluster(3);
              StrataClient client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()))) {
-            var setup = createOpenChunkWithReplicaPayloads(cluster, "split",
+            var setup = createOpenChunkWithReplicaPayloads(cluster, "/split",
                     List.of("AAAA".getBytes(), "BBBB".getBytes(), "CCCC".getBytes()));
 
-            ScpException e = assertThrows(ScpException.class, () -> client.open(setup.fileId()).recoverAndSeal(2));
+            ScpException e = assertThrows(ScpException.class, () -> client.openById(setup.fileId()).recoverAndSeal(2));
             assertEquals(ErrorCode.INTERNAL, e.code());
             assertTrue(e.getMessage().contains("divergence"),
                     "expected a divergence failure, got: " + e.getMessage());
@@ -73,14 +73,14 @@ class RecoveryDivergenceTest {
 
     private record OpenChunkSetup(io.strata.common.FileId fileId, Messages.CreateChunkResp chunk) {}
 
-    private static OpenChunkSetup createOpenChunkWithReplicaPayloads(MiniCluster cluster, String owner,
+    private static OpenChunkSetup createOpenChunkWithReplicaPayloads(MiniCluster cluster, String path,
                                                                     List<byte[]> payloads) throws Exception {
         String[] hp = cluster.metaEndpoint().split(":");
         Messages.CreateChunkResp chunk;
         io.strata.common.FileId fileId;
         try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
             var file = Messages.CreateFileResp.decode(meta.call(Opcode.CREATE_FILE,
-                    new Messages.CreateFile((byte) 0, (byte) 0, (byte) 0, owner).encode(), null, 5000));
+                    new Messages.CreateFile("test", path, (byte) 0, (byte) 0, (byte) 0).encode(), null, 5000));
             fileId = file.fileId();
             chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
                     new Messages.CreateChunk(fileId, 1, (byte) 0xFF).encode(), null, 5000));

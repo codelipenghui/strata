@@ -254,7 +254,19 @@ class NodeRegistryTest {
         }
 
         @Override
+        public Optional<FileId> resolvePath(io.strata.common.StrataNamespace namespace,
+                                            io.strata.common.StrataPath path) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
         public boolean updateFile(Records.FileRecord record, int expectedVersion) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean deletePath(io.strata.common.StrataNamespace namespace, io.strata.common.StrataPath path,
+                                  FileId expectedFileId) {
             throw new UnsupportedOperationException();
         }
 

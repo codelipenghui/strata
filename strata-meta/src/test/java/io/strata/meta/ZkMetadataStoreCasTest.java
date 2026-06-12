@@ -54,8 +54,8 @@ class ZkMetadataStoreCasTest {
             try (ZkMetadataStore leaderA = new ZkMetadataStore(zk.getConnectString());
                  ZkMetadataStore leaderB = new ZkMetadataStore(zk.getConnectString())) {
                 FileId fileId = FileId.random();
-                Records.FileRecord file = new Records.FileRecord(fileId, (byte) 0, (byte) 0, (byte) 0,
-                        "owner", Records.FileState.OPEN, System.currentTimeMillis(), List.of());
+                Records.FileRecord file = new Records.FileRecord(fileId, "test", "/test-file",
+                        (byte) 0, (byte) 0, (byte) 0, Records.FileState.OPEN, System.currentTimeMillis(), List.of());
                 leaderA.createFile(file);
                 int v0 = leaderA.getFile(fileId).orElseThrow().version();
 

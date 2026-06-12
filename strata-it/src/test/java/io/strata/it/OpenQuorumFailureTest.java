@@ -3,7 +3,6 @@ package io.strata.it;
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
-import io.strata.client.StrataClient;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
@@ -25,12 +24,12 @@ class OpenQuorumFailureTest {
         try (MiniCluster cluster = new MiniCluster(3);
              StrataClient client = StrataClient.connect(new ClientConfig(
                      List.of(cluster.metaEndpoint()), 4096, 500))) {
-            FileId fileId = client.create(StrataClient.FileSpec.log("open-abort")).id();
+            FileId fileId = client.create(StrataClient.FileSpec.log("test", "/open-abort")).id();
 
             cluster.killNode(1);
             cluster.killNode(2);
 
-            try (StrataFile.Appender appender = client.open(fileId).openForAppend(1)) {
+            try (StrataFile.Appender appender = client.openById(fileId).openForAppend(1)) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[]{1})));
                 assertEquals(ErrorCode.INTERNAL, e.code());
