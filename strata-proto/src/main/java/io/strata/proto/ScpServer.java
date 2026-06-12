@@ -1,6 +1,7 @@
 package io.strata.proto;
 
 import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
@@ -20,7 +21,9 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -39,6 +42,10 @@ public final class ScpServer implements AutoCloseable {
      * handler executor IN ORDER (validation/writes keep per-chunk contiguity semantics), but the
      * response may complete later (e.g. group commit) — the connection keeps processing subsequent
      * frames meanwhile. Out-of-order responses are protocol-legal: clients correlate by id.
+     *
+     * Request header/payload slices are valid during the synchronous handleAsync call. Async
+     * continuations that need request bytes after handleAsync returns must copy them first; the
+     * server may release retained transport buffers if the connection closes before completion.
      */
     public interface Handler {
         Frame handle(Frame request) throws Exception;
@@ -65,7 +72,9 @@ public final class ScpServer implements AutoCloseable {
         ServerBootstrap bootstrap = new ServerBootstrap()
                 .group(NettyEventLoops.SERVER_BOSS_GROUP, NettyEventLoops.SERVER_WORKER_GROUP)
                 .channel(NioServerSocketChannel.class)
+                .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                 .option(ChannelOption.SO_REUSEADDR, true)
+                .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                 .childOption(ChannelOption.TCP_NODELAY, true)
                 .childHandler(new ChannelInitializer<SocketChannel>() {
                     @Override
@@ -99,6 +108,7 @@ public final class ScpServer implements AutoCloseable {
 
     private final class ConnectionHandler extends SimpleChannelInboundHandler<Frame> {
         private final ExecutorService requestExecutor;
+        private final Set<Frame> inFlightAsyncRequests = ConcurrentHashMap.newKeySet();
         private final AtomicBoolean connectionOpen = new AtomicBoolean(true);
         private boolean helloComplete;
 
@@ -114,11 +124,46 @@ public final class ScpServer implements AutoCloseable {
 
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, Frame frame) {
-            requestExecutor.execute(() -> processFrame(ctx, frame));
+            FrameTask task = new FrameTask(ctx, frame);
+            try {
+                requestExecutor.execute(task);
+            } catch (RuntimeException | Error e) {
+                task.closeIfPending();
+                throw e;
+            }
+        }
+
+        private final class FrameTask implements Runnable {
+            private final ChannelHandlerContext ctx;
+            private final Frame frame;
+            private final AtomicBoolean started = new AtomicBoolean(false);
+
+            private FrameTask(ChannelHandlerContext ctx, Frame frame) {
+                this.ctx = ctx;
+                this.frame = frame;
+            }
+
+            @Override
+            public void run() {
+                started.set(true);
+                try {
+                    processFrame(ctx, frame);
+                } catch (RuntimeException | Error e) {
+                    frame.close();
+                    throw e;
+                }
+            }
+
+            private void closeIfPending() {
+                if (started.compareAndSet(false, true)) {
+                    frame.close();
+                }
+            }
         }
 
         private void processFrame(ChannelHandlerContext ctx, Frame frame) {
             if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
+                frame.close();
                 return;
             }
             if (!helloComplete) {
@@ -131,7 +176,7 @@ public final class ScpServer implements AutoCloseable {
         private void handleHello(ChannelHandlerContext ctx, Frame hello) {
             if (hello.opcode() != Opcode.HELLO.code) {
                 writeResponse(ctx, Frame.response(hello,
-                        Resp.error(ErrorCode.UNKNOWN_OPCODE, "first frame must be HELLO", 0), null), true);
+                        Resp.error(ErrorCode.UNKNOWN_OPCODE, "first frame must be HELLO", 0), null), true, hello);
                 return;
             }
             try {
@@ -140,13 +185,14 @@ public final class ScpServer implements AutoCloseable {
                 // incompatible version range or malformed HELLO header: answer with a typed
                 // error instead of silently dropping the connection
                 writeResponse(ctx, Frame.response(hello,
-                        Resp.error(ErrorCode.UNSUPPORTED_VERSION, String.valueOf(e.getMessage()), 0), null), true);
+                        Resp.error(ErrorCode.UNSUPPORTED_VERSION, String.valueOf(e.getMessage()), 0), null), true,
+                        hello);
                 return;
             }
             helloComplete = true;
             writeResponse(ctx, Frame.response(hello,
                     new Messages.HelloResp(0, nodeId, incMsb, incLsb, FrameIO.MAX_FRAME_BYTES, 1L << 30).encode(),
-                    null), false);
+                    null), false, hello);
         }
 
         private void handleRequest(ChannelHandlerContext ctx, Frame req) {
@@ -165,9 +211,11 @@ public final class ScpServer implements AutoCloseable {
                         Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(e), 0), null));
             }
             if (respF.isDone() && !respF.isCompletedExceptionally()) {
-                writeResponse(ctx, requireResponse(req, respF.join()), false); // fast path, no extra hop
+                writeResponse(ctx, requireResponse(req, respF.join()), false, req); // fast path, no extra hop
             } else {
+                inFlightAsyncRequests.add(req);
                 respF.whenComplete((resp, err) -> {
+                    inFlightAsyncRequests.remove(req);
                     Frame frame = resp;
                     if (err != null) {
                         Throwable cause = err instanceof java.util.concurrent.CompletionException
@@ -176,16 +224,25 @@ public final class ScpServer implements AutoCloseable {
                                 ? Frame.response(req, Resp.error(se.code(), se.getMessage(), se.detail()), null)
                                 : Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(cause), 0), null);
                     }
-                    writeResponse(ctx, requireResponse(req, frame), false);
+                    writeResponse(ctx, requireResponse(req, frame), false, req);
                 });
             }
         }
 
-        private void writeResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite) {
+        private void writeResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
+                                   Frame releaseAfterWrite) {
             if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
+                closeFrames(frame, releaseAfterWrite);
                 return;
             }
-            ChannelFuture write = ctx.writeAndFlush(frame);
+            ChannelFuture write;
+            try {
+                write = ctx.writeAndFlush(frame);
+            } catch (RuntimeException e) {
+                closeFrames(frame, releaseAfterWrite);
+                throw e;
+            }
+            write.addListener(f -> closeFrames(frame, releaseAfterWrite));
             if (closeAfterWrite) {
                 write.addListener(f -> ctx.close());
             }
@@ -196,11 +253,27 @@ public final class ScpServer implements AutoCloseable {
             });
         }
 
+        private void closeFrames(Frame frame, Frame releaseAfterWrite) {
+            frame.close();
+            if (releaseAfterWrite != frame) {
+                releaseAfterWrite.close();
+            }
+        }
+
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
             connectionOpen.set(false);
             connections.remove(ctx.channel());
-            requestExecutor.shutdownNow();
+            for (Frame frame : inFlightAsyncRequests) {
+                if (inFlightAsyncRequests.remove(frame)) {
+                    frame.close();
+                }
+            }
+            for (Runnable task : requestExecutor.shutdownNow()) {
+                if (task instanceof FrameTask frameTask) {
+                    frameTask.closeIfPending();
+                }
+            }
         }
 
         @Override

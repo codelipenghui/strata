@@ -1,6 +1,7 @@
 package io.strata.proto;
 
 import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
@@ -54,6 +55,7 @@ public final class ScpClient implements AutoCloseable {
             Bootstrap bootstrap = new Bootstrap()
                     .group(NettyEventLoops.CLIENT_GROUP)
                     .channel(NioSocketChannel.class)
+                    .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                     .option(ChannelOption.TCP_NODELAY, true)
                     .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, connectTimeoutMs)
                     .handler(new ChannelInitializer<SocketChannel>() {
@@ -136,13 +138,19 @@ public final class ScpClient implements AutoCloseable {
     private final class ClientHandler extends SimpleChannelInboundHandler<Frame> {
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, Frame frame) {
+            Frame response;
+            try {
+                response = frame.copyToHeap();
+            } finally {
+                frame.close();
+            }
             if (!handshake.isDone()) {
-                handshake.complete(frame);
+                handshake.complete(response);
                 return;
             }
-            CompletableFuture<Frame> fut = pending.remove(frame.correlationId());
+            CompletableFuture<Frame> fut = pending.remove(response.correlationId());
             if (fut != null) {
-                fut.complete(frame);
+                fut.complete(response);
             }
         }
 

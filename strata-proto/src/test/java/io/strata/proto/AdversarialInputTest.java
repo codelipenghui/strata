@@ -19,6 +19,7 @@ import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -139,6 +140,28 @@ class AdversarialInputTest {
         assertDecoderRejects(rawFrame(Frame.PREAMBLE_AFTER_LEN + 1, Frame.MAGIC, Frame.FRAME_VERSION,
                 Frame.FLAG_PAYLOAD_CRC, 1, Crc.of(ByteBuffer.wrap(new byte[] {2})), 0, new byte[] {1}),
                 "payload crc mismatch");
+    }
+
+    @Test
+    void nettyDecoderEmitsOwnedFrameReleasedByFrameClose() {
+        EmbeddedChannel channel = new EmbeddedChannel(new NettyFrameCodec.Decoder());
+        byte[] payload = new byte[] {1, 2, 3};
+        try {
+            assertTrue(channel.writeInbound(rawFrame(Frame.PREAMBLE_AFTER_LEN + payload.length,
+                    Frame.MAGIC, Frame.FRAME_VERSION, Frame.FLAG_PAYLOAD_CRC, payload.length,
+                    Crc.of(ByteBuffer.wrap(payload)), 0, payload)));
+            Frame frame = channel.readInbound();
+            assertTrue(frame.ownsBuffer());
+            assertEquals(1, frame.ownerRefCnt());
+            byte[] decoded = new byte[frame.payloadLength()];
+            frame.payloadSlice().get(decoded);
+            assertArrayEquals(payload, decoded);
+
+            frame.close();
+            assertEquals(0, frame.ownerRefCnt());
+        } finally {
+            channel.finishAndReleaseAll();
+        }
     }
 
     @Test

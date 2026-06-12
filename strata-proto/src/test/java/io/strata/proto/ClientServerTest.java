@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
@@ -30,9 +31,11 @@ class ClientServerTest {
 
     @Test
     void pipelinedEchoAndErrors() throws Exception {
+        List<Frame> serverRequests = new CopyOnWriteArrayList<>();
         ScpServer.Handler handler = req -> {
             if (req.opcode() == Opcode.PING.code) {
                 // echo payload back
+                serverRequests.add(req);
                 return ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "nope");
@@ -49,12 +52,14 @@ class ClientServerTest {
                 }
                 for (int i = 0; i < 100; i++) {
                     Frame resp = futures.get(i).get();
+                    assertFalse(resp.ownsBuffer(), "client responses must not expose retained Netty buffers");
                     ByteBuffer hb = resp.headerSlice();
                     Resp.check(hb);
                     byte[] p = new byte[resp.payloadLength()];
                     resp.payloadSlice().get(p);
                     assertArrayEquals(("payload-" + i).getBytes(), p);
                 }
+                waitFor(() -> serverRequests.stream().allMatch(req -> req.ownerRefCnt() == 0));
 
                 // server-side ScpException becomes a typed client-side exception
                 ScpException e = assertThrows(ScpException.class,
@@ -151,6 +156,7 @@ class ClientServerTest {
 
     @Test
     void asyncHandlerFailuresBecomeTypedErrors() throws Exception {
+        List<Frame> serverRequests = new CopyOnWriteArrayList<>();
         ScpServer.Handler handler = new ScpServer.Handler() {
             @Override
             public Frame handle(Frame request) {
@@ -159,6 +165,7 @@ class ClientServerTest {
 
             @Override
             public CompletableFuture<Frame> handleAsync(Frame request) {
+                serverRequests.add(request);
                 Opcode op = Opcode.fromCode(request.opcode());
                 if (op == Opcode.PING) {
                     return CompletableFuture.failedFuture(new CompletionException(
@@ -179,6 +186,7 @@ class ClientServerTest {
                     () -> client.call(Opcode.READ, emptyHeader(), null, 2000));
             assertEquals(ErrorCode.INTERNAL, internal.code());
             assertTrue(internal.getMessage().contains("async boom"));
+            waitFor(() -> serverRequests.stream().allMatch(req -> req.ownerRefCnt() == 0));
         }
     }
 
@@ -203,11 +211,14 @@ class ClientServerTest {
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
             CompletableFuture<Frame> pending = client.send(Opcode.PING, emptyHeader(), null);
             Frame request = seenRequest.get(3, TimeUnit.SECONDS);
+            assertTrue(request.ownsBuffer());
+            assertEquals(1, request.ownerRefCnt());
 
             server.close();
             var e = assertThrows(java.util.concurrent.ExecutionException.class,
                     () -> pending.get(3, TimeUnit.SECONDS));
             assertEquals(IOException.class, e.getCause().getClass());
+            waitFor(() -> request.ownerRefCnt() == 0);
 
             delayed.complete(ScpServer.ok(request, Messages.okHeader(), null));
             assertTrue(delayed.isDone());

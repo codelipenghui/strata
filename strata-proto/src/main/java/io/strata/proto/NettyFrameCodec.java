@@ -70,41 +70,49 @@ final class NettyFrameCodec {
                 return;
             }
 
-            byte magic = in.readByte();
-            byte version = in.readByte();
-            if (magic != Frame.MAGIC) {
-                throw new IOException("bad magic 0x" + Integer.toHexString(magic & 0xFF));
-            }
-            if (version != Frame.FRAME_VERSION) {
-                throw new IOException("unsupported frame version " + version);
-            }
-            short opcode = in.readShort();
-            short apiVersion = in.readShort();
-            short flags = in.readShort();
-            long correlationId = in.readLong();
-            int payloadLen = in.readInt();
-            int payloadCrc = in.readInt();
-            int headerLen = in.readUnsignedShort();
-            if (payloadLen < 0) {
-                throw new IOException("negative payload length " + payloadLen);
-            }
-            if (Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen != frameLen) {
-                throw new IOException("frame length mismatch: " + frameLen
-                        + " vs header=" + headerLen + " payload=" + payloadLen);
-            }
+            ByteBuf frame = in.readRetainedSlice(frameLen);
+            boolean emitted = false;
+            try {
+                int base = frame.readerIndex();
+                byte magic = frame.getByte(base);
+                byte version = frame.getByte(base + 1);
+                if (magic != Frame.MAGIC) {
+                    throw new IOException("bad magic 0x" + Integer.toHexString(magic & 0xFF));
+                }
+                if (version != Frame.FRAME_VERSION) {
+                    throw new IOException("unsupported frame version " + version);
+                }
+                short opcode = frame.getShort(base + 2);
+                short apiVersion = frame.getShort(base + 4);
+                short flags = frame.getShort(base + 6);
+                long correlationId = frame.getLong(base + 8);
+                int payloadLen = frame.getInt(base + 16);
+                int payloadCrc = frame.getInt(base + 20);
+                int headerLen = frame.getUnsignedShort(base + 24);
+                if (payloadLen < 0) {
+                    throw new IOException("negative payload length " + payloadLen);
+                }
+                if (Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen != frameLen) {
+                    throw new IOException("frame length mismatch: " + frameLen
+                            + " vs header=" + headerLen + " payload=" + payloadLen);
+                }
 
-            byte[] header = new byte[headerLen];
-            byte[] payload = new byte[payloadLen];
-            in.readBytes(header);
-            in.readBytes(payload);
-            if ((flags & Frame.FLAG_PAYLOAD_CRC) != 0 && payloadLen > 0) {
-                int actual = Crc.of(ByteBuffer.wrap(payload));
-                if (actual != payloadCrc) {
-                    throw new IOException("payload crc mismatch: expected " + payloadCrc + " got " + actual);
+                int headerIndex = base + Frame.PREAMBLE_AFTER_LEN;
+                int payloadIndex = headerIndex + headerLen;
+                if ((flags & Frame.FLAG_PAYLOAD_CRC) != 0 && payloadLen > 0) {
+                    int actual = Crc.of(frame.nioBuffer(payloadIndex, payloadLen));
+                    if (actual != payloadCrc) {
+                        throw new IOException("payload crc mismatch: expected " + payloadCrc + " got " + actual);
+                    }
+                }
+                out.add(Frame.fromOwnedBuffer(opcode, apiVersion, flags, correlationId,
+                        frame, headerIndex, headerLen, payloadIndex, payloadLen));
+                emitted = true;
+            } finally {
+                if (!emitted) {
+                    frame.release();
                 }
             }
-            out.add(new Frame(opcode, apiVersion, flags, correlationId,
-                    ByteBuffer.wrap(header), ByteBuffer.wrap(payload)));
         }
     }
 }
