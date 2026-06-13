@@ -205,9 +205,10 @@ The release-gate map lives in `CORRECTNESS.md`. The short version:
 `scripts/verify.sh --soak` — bounded multi-seed stress/fault soak; tune with `-Dstrata.soak.iterations`, `-Dstrata.soak.batches`, and `-Dstrata.soak.seed`.
 `scripts/verify.sh --tlc` — TLA+ model checking.
 
-`.github/workflows/correctness.yml` runs the default, current compatibility/conformance, embedded
-fault, and TLA+ model-checking gates on pull requests and pushes to `main`; scheduled/manual runs
-also execute Docker chaos and a larger bounded soak.
+`.github/workflows/ci.yml` runs the default, current compatibility/conformance, embedded fault,
+and TLA+ model-checking gates on pull requests and pushes to `main`.
+`.github/workflows/correctness.yml` runs the same gates plus Docker chaos and a larger bounded soak
+on scheduled/manual deep-confidence runs.
 Manual workflow runs can disable individual gates and can replay a soak with explicit
 `soak_iterations`, `soak_batches`, and `soak_seed` inputs.
 Exact stress/fault case replay is supported with

@@ -113,12 +113,14 @@ when the external replay needs an aggregate coverage report.
 
 ## CI Policy
 
-`.github/workflows/correctness.yml` runs the default, current compatibility/conformance, embedded
-fault, and TLA+ model-checking gates on pull requests and pushes to `main`. Scheduled and manual
-runs also cover Docker/Toxiproxy chaos and bounded stress/fault soak. Manual runs can supply
-`compat_versions` to add the SCP released-artifact compatibility matrix to the compatibility job.
-Test reports, process-crash logs, metadata-process logs, and replayable correctness artifacts are
-uploaded as artifacts.
+`.github/workflows/ci.yml` is the pull-request and `main` push merge gate. It runs the default,
+current compatibility/conformance, embedded fault, and TLA+ model-checking gates, then uploads
+test reports, process-crash logs, metadata-process logs, and replayable correctness artifacts.
+
+`.github/workflows/correctness.yml` is the scheduled/manual deep-confidence workflow. Scheduled
+runs cover the CI gates plus Docker/Toxiproxy chaos and bounded stress/fault soak. Manual runs can
+toggle individual gates and supply `compat_versions` to add the SCP released-artifact
+compatibility matrix to the compatibility job.
 
 ## Known Remaining Gaps
 
