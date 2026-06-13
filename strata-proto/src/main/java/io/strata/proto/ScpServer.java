@@ -1,6 +1,7 @@
 package io.strata.proto;
 
 import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
@@ -15,6 +16,7 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import io.strata.common.ErrorCode;
+import io.strata.common.FailureInjector;
 import io.strata.common.ScpException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -254,17 +256,36 @@ public final class ScpServer implements AutoCloseable {
 
         private void writeFileResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
                                        Frame releaseAfterWrite) {
+            // The prefix and the file region are two separate writes that MUST land in the channel's
+            // outbound buffer with nothing between them. Async handlers complete on other threads
+            // (e.g. the group-commit flusher writing an APPEND ack), and their single writeAndFlush
+            // can otherwise be marshalled onto the event loop BETWEEN this prefix and region —
+            // slotting a whole frame mid-response and corrupting the stream. Issuing both from one
+            // event-loop task makes the pair atomic relative to every other write on this channel.
+            if (ctx.channel().eventLoop().inEventLoop()) {
+                writeFileResponseOnEventLoop(ctx, frame, closeAfterWrite, releaseAfterWrite);
+            } else {
+                ctx.channel().eventLoop().execute(
+                        () -> writeFileResponseOnEventLoop(ctx, frame, closeAfterWrite, releaseAfterWrite));
+            }
+        }
+
+        private void writeFileResponseOnEventLoop(ChannelHandlerContext ctx, Frame frame,
+                                                  boolean closeAfterWrite, Frame releaseAfterWrite) {
             Frame.FilePayload file = frame.filePayload();
-            ChannelFuture write;
+            ByteBuf prefix;
+            DefaultFileRegion region;
             try {
-                var prefix = NettyFrameCodec.encodeFilePrefix(ctx.alloc(), frame);
-                DefaultFileRegion region = new DefaultFileRegion(file.channel(), file.position(), file.length());
-                ctx.write(prefix);
-                write = ctx.writeAndFlush(region);
+                prefix = NettyFrameCodec.encodeFilePrefix(ctx.alloc(), frame);
+                region = new DefaultFileRegion(file.channel(), file.position(), file.length());
             } catch (IOException | RuntimeException e) {
                 closeFrames(frame, releaseAfterWrite);
-                throw new RuntimeException(e);
+                ctx.close();
+                return;
             }
+            ctx.write(prefix);
+            FailureInjector.point("scp.writeFileResponse.betweenPrefixAndRegion");
+            ChannelFuture write = ctx.writeAndFlush(region);
             finishWrite(ctx, write, closeAfterWrite, frame, releaseAfterWrite);
         }
 

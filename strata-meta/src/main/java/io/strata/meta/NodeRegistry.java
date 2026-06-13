@@ -33,6 +33,10 @@ final class NodeRegistry {
         volatile long leaseUntil;
         volatile long freeBytes;
         final Queue<Messages.Command> pending = new ConcurrentLinkedQueue<>();
+        // (record, recordVersion) is a coupled invariant updated by a read-modify-write from the
+        // repair-scan thread, heartbeat handler threads, and register. ReentrantLock (not
+        // synchronized) so the ZK I/O inside the critical section does not pin a virtual thread.
+        final java.util.concurrent.locks.ReentrantLock lock = new java.util.concurrent.locks.ReentrantLock();
 
         boolean alive(long now) {
             return record.state() == Records.NodeState.REGISTERED && leaseUntil >= now;
@@ -117,11 +121,17 @@ final class NodeRegistry {
         int committedVersion = store.getNode(nodeId).map(MetadataStore.Versioned::version).orElse(version + 1);
 
         LiveNode n = live.computeIfAbsent(nodeId, k -> new LiveNode());
-        n.record = record;
-        n.recordVersion = committedVersion;
-        n.sessionEpoch = sessionCounter.incrementAndGet();
-        n.leaseUntil = System.currentTimeMillis() + config.leaseMs();
-        n.freeBytes = capacity;
+        n.lock.lock();
+        try {
+            // publish the new session's (record, recordVersion) pair atomically w.r.t. markState
+            n.record = record;
+            n.recordVersion = committedVersion;
+            n.sessionEpoch = sessionCounter.incrementAndGet();
+            n.leaseUntil = System.currentTimeMillis() + config.leaseMs();
+            n.freeBytes = capacity;
+        } finally {
+            n.lock.unlock();
+        }
         log.info("node {} registered ({} @ {}), session {}", nodeId, msg.host(), msg.endpoints(), n.sessionEpoch);
         return new Messages.RegisterResp(nodeId, n.sessionEpoch, config.heartbeatIntervalMs(), config.leaseMs());
     }
@@ -221,26 +231,35 @@ final class NodeRegistry {
     }
 
     private boolean markState(LiveNode n, Records.NodeState state) {
-        Records.NodeRecord updated = n.record.withState(state);
+        // Serialize the (record, recordVersion) read-modify-write per node: this runs concurrently
+        // from the repair-scan thread (expireScan), heartbeat handler threads (DEAD->REGISTERED
+        // resurrection), and register. Without the lock the version increment can tear or the pair
+        // can be written half-from-one-update, leaving recordVersion out of step with the znode.
+        n.lock.lock();
         try {
-            if (store.putNode(updated, n.recordVersion)) {
-                n.recordVersion = n.recordVersion + 1;
-                n.record = updated;
-                return true;
-            } else {
-                // CAS lost: another leader owns this record now (e.g. we are deposed and it just
-                // re-registered the node) — adopt the store's view instead of overwriting it
-                store.getNode(n.record.nodeId()).ifPresent(v -> {
-                    n.record = v.value();
-                    n.recordVersion = v.version();
-                });
-                log.warn("node {} state transition to {} lost CAS — adopted store state {}",
-                        updated.nodeId(), state, n.record.state());
+            Records.NodeRecord updated = n.record.withState(state);
+            try {
+                if (store.putNode(updated, n.recordVersion)) {
+                    n.recordVersion = n.recordVersion + 1;
+                    n.record = updated;
+                    return true;
+                } else {
+                    // CAS lost: another leader owns this record now (e.g. we are deposed and it just
+                    // re-registered the node) — adopt the store's view instead of overwriting it
+                    store.getNode(n.record.nodeId()).ifPresent(v -> {
+                        n.record = v.value();
+                        n.recordVersion = v.version();
+                    });
+                    log.warn("node {} state transition to {} lost CAS — adopted store state {}",
+                            updated.nodeId(), state, n.record.state());
+                    return false;
+                }
+            } catch (Exception e) {
+                log.warn("persisting node {} state {} failed", n.record.nodeId(), state, e);
                 return false;
             }
-        } catch (Exception e) {
-            log.warn("persisting node {} state {} failed", n.record.nodeId(), state, e);
-            return false;
+        } finally {
+            n.lock.unlock();
         }
     }
 

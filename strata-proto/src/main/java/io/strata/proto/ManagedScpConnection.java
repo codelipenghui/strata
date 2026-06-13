@@ -4,6 +4,7 @@ import io.strata.common.Backoff;
 import io.strata.common.ConnectionPolicy;
 import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
+import io.strata.common.FailureInjector;
 import io.strata.common.ScpConnectionException;
 import io.strata.common.ScpException;
 
@@ -266,13 +267,26 @@ public final class ManagedScpConnection implements AutoCloseable {
             if (idleMs >= policy.idleTimeoutMs()
                     && activeApplicationCalls.get() == 0
                     && (current == null || current.pendingCount() == 0)) {
+                FailureInjector.point("scp.monitor.idleClose.beforeLock");
                 lock.lock();
                 try {
-                    closeCurrentLocked();
-                    maintainConnection = false;
+                    // Re-validate under the lock before evicting: the idle conditions above were
+                    // read WITHOUT the lock, so an application call may have incremented the
+                    // in-flight counter and acquired the live client in the window since. Closing
+                    // here would yank the connection out from under that call (a spurious
+                    // ScpConnectionException). acquire() bumps the counter before it takes the
+                    // lock, so any racing call is guaranteed visible to this re-check.
+                    ScpClient live = client;
+                    if (activeApplicationCalls.get() == 0
+                            && System.currentTimeMillis() - lastApplicationActivityMs >= policy.idleTimeoutMs()
+                            && (live == null || live.pendingCount() == 0)) {
+                        closeCurrentLocked();
+                        maintainConnection = false;
+                    }
                 } finally {
                     lock.unlock();
                 }
+                FailureInjector.point("scp.monitor.idleClose.afterSection");
                 continue;
             }
 
@@ -281,7 +295,7 @@ public final class ManagedScpConnection implements AutoCloseable {
                     if (tryReconnect()) {
                         delayMs = policy.heartbeatIntervalMs();
                     } else {
-                        delayMs = backoff.nextMs();
+                        delayMs = backoffNextMs();
                     }
                 }
                 continue;
@@ -291,7 +305,7 @@ public final class ManagedScpConnection implements AutoCloseable {
             }
             try {
                 current.call(Opcode.PING, EMPTY_HEADER, null, policy.heartbeatTimeoutMs());
-                backoff.reset();
+                backoffReset();
             } catch (RuntimeException e) {
                 lock.lock();
                 try {
@@ -304,7 +318,7 @@ public final class ManagedScpConnection implements AutoCloseable {
                 } finally {
                     lock.unlock();
                 }
-                delayMs = backoff.nextMs();
+                delayMs = backoffNextMs();
             }
         }
     }
@@ -319,6 +333,28 @@ public final class ManagedScpConnection implements AutoCloseable {
             return true;
         } catch (RuntimeException e) {
             return false;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // Backoff is documented as not thread-safe (single control thread). It is touched from the
+    // monitor thread (here) and, via connectLocked(), from application threads that reconnect
+    // inline — so every access must hold the same lock connectLocked() runs under, or the two
+    // threads race on Backoff's non-volatile cursor.
+    private int backoffNextMs() {
+        lock.lock();
+        try {
+            return backoff.nextMs();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void backoffReset() {
+        lock.lock();
+        try {
+            backoff.reset();
         } finally {
             lock.unlock();
         }

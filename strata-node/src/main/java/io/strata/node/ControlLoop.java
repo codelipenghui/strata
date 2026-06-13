@@ -46,7 +46,9 @@ final class ControlLoop implements AutoCloseable {
     private volatile ManagedScpConnection meta;
     private volatile long sessionEpoch = -1;
     private volatile int heartbeatIntervalMs = 1_000;
-    private int endpointIndex = 0;
+    // confined to the control (run) thread today; volatile guards the lock-discipline asymmetry —
+    // read under connLock in ensureRegisteredLocked, written lock-free in rotateEndpoint
+    private volatile int endpointIndex = 0;
     private final Backoff backoff;
 
     ControlLoop(StorageNode node, NodeConfig config, ChunkStore store) {
@@ -69,6 +71,9 @@ final class ControlLoop implements AutoCloseable {
         while (!closed.get()) {
             try {
                 ensureRegistered();
+                if (closed.get()) {
+                    continue; // raced with close(): skip heartbeat (meta may be absent) and exit
+                }
                 heartbeatOnce();
                 backoff.reset();
                 Thread.sleep(heartbeatIntervalMs);
@@ -109,6 +114,10 @@ final class ControlLoop implements AutoCloseable {
     }
 
     private void ensureRegisteredLocked() throws IOException {
+        if (closed.get()) {
+            // shutting down: do not create a fresh connection that close() might race past
+            return;
+        }
         if (meta == null) {
             disconnect();
             String ep = config.metadataEndpoints().get(endpointIndex % config.metadataEndpoints().size());
@@ -344,12 +353,15 @@ final class ControlLoop implements AutoCloseable {
     @Override
     public void close() {
         closed.set(true);
-        disconnect();
         // executeCommands blocks in commandQueue.take() and the loops in sleep — interrupt so
         // the virtual threads exit promptly instead of lingering per closed node
         for (Thread t : threads) {
             t.interrupt();
         }
+        // Join BEFORE disconnecting: the control thread can create a fresh metadata connection
+        // (and its monitor thread) in the window between observing !closed and here, which a
+        // disconnect placed earlier would miss — leaking the connection. Once the threads are
+        // joined nobody else creates connections, so this disconnect closes the last one for good.
         for (Thread t : threads) {
             try {
                 t.join(2_000);
@@ -357,5 +369,6 @@ final class ControlLoop implements AutoCloseable {
                 Thread.currentThread().interrupt();
             }
         }
+        disconnect();
     }
 }

@@ -33,6 +33,7 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -40,6 +41,33 @@ class ControlLoopTest {
 
     @TempDir
     Path dir;
+
+    @Test
+    void closingControlLoopOpensNoMetadataConnection() throws Exception {
+        // Finding: close() used to disconnect() BEFORE joining the control thread, and
+        // ensureRegistered() never checked the closed flag — so the control thread could open a
+        // fresh ManagedScpConnection (and its monitor virtual thread) after shutdown began,
+        // leaking it. The guard below is the deterministic half of that fix: a control loop that
+        // observes itself closed must not open a connection at all.
+        try (ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.REGISTER_NODE) {
+                Messages.RegisterNode.decode(req.headerSlice());
+                return ScpServer.ok(req, new Messages.RegisterResp(7, 11, 1, 60_000).encode(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+             StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+            ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
+            getClosed(loop).set(true);
+
+            invoke(loop, "ensureRegistered"); // the control thread runs this each iteration
+
+            assertNull(get(loop, "meta"),
+                    "a control loop observed as closed must not open a new metadata connection");
+            loop.close();
+        }
+    }
 
     @Test
     void startLaunchesWorkersAndCloseStopsThem() throws Exception {

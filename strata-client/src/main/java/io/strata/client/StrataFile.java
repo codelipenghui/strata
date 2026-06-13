@@ -34,7 +34,15 @@ public interface StrataFile {
     record ReadResult(byte[] data, boolean endOfFile) {}
 
     interface Appender extends AutoCloseable {
-        /** Pipelined; completes on the file's ack quorum. Offsets are file-logical. */
+        /**
+         * Pipelined; completes on the file's ack quorum. Offsets are file-logical.
+         *
+         * <p>The bytes of {@code data} are NOT copied: the appender serializes them asynchronously
+         * on the transport thread after this method returns. The caller must not mutate or reuse
+         * {@code data} until the returned future completes, and must not hand the same buffer to
+         * two concurrent {@code append} calls — either races the serializer and corrupts the
+         * written bytes.
+         */
         CompletableFuture<AppendAck> append(ByteBuffer data);
 
         long durableOffset();
