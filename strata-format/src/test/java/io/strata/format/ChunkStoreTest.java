@@ -724,6 +724,51 @@ class ChunkStoreTest {
     }
 
     @Test
+    void readRegionResultIsStableSnapshotAcrossConcurrentSealTruncate() throws Exception {
+        // A reader resolves a region on an OPEN chunk; the data plane transfers that region LATER,
+        // off the chunk lock. If a seal truncates the never-acked tail in between, a zero-copy
+        // region over the shared inode would stream the seal footer/trailer (silent corruption) or
+        // short-transfer (frame desync). readRegion must hand back a stable snapshot of an OPEN
+        // chunk so the deferred transfer cannot observe the truncation.
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            store.append(id, 1, 0, 0, bytes("COMMITTED"));      // [0,9) survives the seal
+            store.append(id, 1, 9, 9, bytes("TAILTAILTAIL"));   // [9,21) never-acked, will be cut
+            assertEquals(21, store.stat(id).localEndOffset());
+
+            // reader resolves the tail region [9,21) of the still-OPEN chunk
+            ChunkStore.ReadRegionResult region = store.readRegion(id, 9, 1024);
+            assertEquals(12, region.length());
+            try {
+                // a concurrent seal truncates exactly the bytes this region covers
+                var sealed = store.seal(id, 1, 9, null);
+                assertEquals(9, sealed.finalLength());
+
+                // the region handed out BEFORE the seal must still yield the original tail bytes —
+                // not the freshly written footer/trailer, and not a short read
+                byte[] got = consumeRegion(region);
+                assertArrayEquals("TAILTAILTAIL".getBytes(), got,
+                        "readRegion result must be a stable snapshot unaffected by a concurrent seal-truncate");
+            } finally {
+                region.close();
+            }
+        }
+    }
+
+    /** Reads a region result whether it is a heap snapshot (open chunks) or a zero-copy channel. */
+    private static byte[] consumeRegion(ChunkStore.ReadRegionResult r) throws Exception {
+        if (r.bytes() != null) {
+            return r.bytes();
+        }
+        ByteBuffer buf = ByteBuffer.allocate(r.length());
+        readFully(r.channel(), buf, r.filePosition());
+        buf.flip();
+        byte[] out = new byte[buf.remaining()];
+        buf.get(out);
+        return out;
+    }
+
+    @Test
     void sealRejectsInvalidLengthsAndConflictingReseal() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);

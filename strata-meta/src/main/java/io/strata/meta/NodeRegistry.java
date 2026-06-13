@@ -176,16 +176,24 @@ final class NodeRegistry {
             }
             n.freeBytes = usage.freeBytes();
         }
-        if (n.record.state() == Records.NodeState.DEAD) {
-            // it came back within the same incarnation — resurrect (repair may already be
-            // running; descriptor CAS keeps both sides idempotent)
-            if (!markState(n, Records.NodeState.REGISTERED)
-                    && n.record.state() != Records.NodeState.REGISTERED) {
-                throw new ScpException(ErrorCode.LEASE_EXPIRED,
-                        "node " + msg.nodeId() + " state is " + n.record.state());
+        // Renew the lease (and, if needed, resurrect) under n.lock so the (state, leaseUntil) pair
+        // is published atomically. Otherwise expireScan could observe a just-resurrected REGISTERED
+        // node still carrying its stale expired lease and immediately re-declare it DEAD.
+        n.lock.lock();
+        try {
+            if (n.record.state() == Records.NodeState.DEAD) {
+                // it came back within the same incarnation — resurrect (repair may already be
+                // running; descriptor CAS keeps both sides idempotent)
+                if (!markState(n, Records.NodeState.REGISTERED) // reentrant on n.lock
+                        && n.record.state() != Records.NodeState.REGISTERED) {
+                    throw new ScpException(ErrorCode.LEASE_EXPIRED,
+                            "node " + msg.nodeId() + " state is " + n.record.state());
+                }
             }
+            n.leaseUntil = newLeaseUntil;
+        } finally {
+            n.lock.unlock();
         }
-        n.leaseUntil = newLeaseUntil;
         for (Messages.CompletedCommand c : msg.completedCommands()) {
             onCompleted.accept(msg.nodeId(), c);
         }
@@ -217,9 +225,10 @@ final class NodeRegistry {
         long now = System.currentTimeMillis();
         List<Integer> newlyDead = new ArrayList<>();
         for (LiveNode n : live.values()) {
+            // cheap unlocked pre-filter; the authoritative decision re-validates under n.lock
             if (n.record.state() == Records.NodeState.REGISTERED
                     && n.leaseUntil + config.deadGraceMs() < now) {
-                if (markState(n, Records.NodeState.DEAD)) {
+                if (declareDeadIfStillExpired(n, now)) {
                     n.pending.clear();
                     newlyDead.add(n.record.nodeId());
                     log.warn("node {} declared DEAD (lease expired {}ms ago)",
@@ -228,6 +237,26 @@ final class NodeRegistry {
             }
         }
         return newlyDead;
+    }
+
+    /**
+     * Transitions a node to DEAD only if it is STILL an expired REGISTERED node when re-checked
+     * under n.lock. The expireScan pre-filter reads (state, leaseUntil) WITHOUT the lock; a
+     * heartbeat can renew the lease or resurrect the node in the window before this runs, so the
+     * decision must be re-validated atomically with the CAS — otherwise a freshly-heartbeated live
+     * node could be declared DEAD (TOCTOU, same shape as the idle-connection eviction race).
+     */
+    private boolean declareDeadIfStillExpired(LiveNode n, long now) {
+        n.lock.lock();
+        try {
+            if (n.record.state() != Records.NodeState.REGISTERED
+                    || n.leaseUntil + config.deadGraceMs() >= now) {
+                return false;
+            }
+            return markState(n, Records.NodeState.DEAD);
+        } finally {
+            n.lock.unlock();
+        }
     }
 
     private boolean markState(LiveNode n, Records.NodeState state) {

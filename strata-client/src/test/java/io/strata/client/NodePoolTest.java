@@ -130,6 +130,22 @@ class NodePoolTest {
     }
 
     @Test
+    void getAfterCloseIsRejectedRatherThanLeakingAFreshPool() {
+        NodePool pool = new NodePool(new ClientConfig(List.of("127.0.0.1:1"), 1024, 500));
+        pool.get("127.0.0.1:1234"); // establish one endpoint pool
+        pool.close();
+
+        // a get() after close must be rejected (so a racing get cannot leak a fresh EndpointPool
+        // and its monitor threads past close); both a known and a brand-new endpoint reject
+        ScpException known = assertThrows(ScpException.class, () -> pool.get("127.0.0.1:1234"));
+        assertEquals(ErrorCode.INTERNAL, known.code());
+        assertTrue(known.getMessage().contains("closed"));
+        ScpException fresh = assertThrows(ScpException.class, () -> pool.get("127.0.0.1:5678"));
+        assertEquals(ErrorCode.INTERNAL, fresh.code());
+        assertTrue(fresh.getMessage().contains("closed"));
+    }
+
+    @Test
     void replacesClosedStorageConnectionOnNextUse() throws Exception {
         AtomicInteger pings = new AtomicInteger();
         try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {

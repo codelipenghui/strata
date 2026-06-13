@@ -293,7 +293,13 @@ public final class ChunkStore implements AutoCloseable {
 
     public record ReadResult(byte[] bytes, long localEndOffset, long lastKnownDO) {}
 
-    public record ReadRegionResult(FileChannel channel, long filePosition, int length,
+    /**
+     * A read response that is EITHER a zero-copy file region (sealed chunks, whose data is
+     * immutable) OR a heap snapshot of the bytes (open chunks, materialized under the chunk lock
+     * so a concurrent seal-truncate cannot corrupt a deferred transfer). Exactly one of
+     * {@code channel} / {@code bytes} is set for a non-empty result.
+     */
+    public record ReadRegionResult(FileChannel channel, long filePosition, int length, byte[] bytes,
                                    long localEndOffset, long lastKnownDO) implements AutoCloseable {
         @Override
         public void close() throws IOException {
@@ -328,16 +334,30 @@ public final class ChunkStore implements AutoCloseable {
         synchronized (h) {
             long end = h.currentEnd();
             if (offset >= end) {
-                return new ReadRegionResult(null, 0, 0, end, h.lastKnownDO);
+                return new ReadRegionResult(null, 0, 0, null, end, h.lastKnownDO);
             }
             int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), end - offset);
             if (n == 0) {
-                return new ReadRegionResult(null, 0, 0, end, h.lastKnownDO);
+                return new ReadRegionResult(null, 0, 0, null, end, h.lastKnownDO);
             }
+            long filePos = checkedAdd(DATA_START, offset, "chunk file offset");
+            if (h.state != ChunkState.SEALED) {
+                // OPEN chunk: a concurrent seal can truncate the never-acked tail of this shared
+                // inode. A zero-copy region resolved LATER (the data-plane transfers the file
+                // region off the chunk lock, on the transport event loop) could then stream the
+                // seal footer/trailer as payload, or short-transfer past the new EOF — silent
+                // corruption / SCP frame desync. Materialize a stable snapshot HERE under the lock
+                // (as read() does) so the wire payload is fixed before the lock is released.
+                byte[] out = new byte[n];
+                readFully(h.data, ByteBuffer.wrap(out), filePos);
+                return new ReadRegionResult(null, 0, n, out, end, h.lastKnownDO);
+            }
+            // SEALED: the data region is immutable (no further append/seal/truncate); a concurrent
+            // delete only unlinks the path while this independent FD keeps the inode alive, so the
+            // deferred zero-copy transfer is safe.
             FileChannel readChannel = FileChannel.open(h.dataPath, StandardOpenOption.READ);
             try {
-                return new ReadRegionResult(readChannel, checkedAdd(DATA_START, offset, "chunk file offset"),
-                        n, end, h.lastKnownDO);
+                return new ReadRegionResult(readChannel, filePos, n, null, end, h.lastKnownDO);
             } catch (RuntimeException e) {
                 try {
                     readChannel.close();

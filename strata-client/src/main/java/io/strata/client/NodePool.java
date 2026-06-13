@@ -6,9 +6,11 @@ import io.strata.common.ScpException;
 import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.ScpClient;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -19,6 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 final class NodePool implements AutoCloseable {
     private final ClientConfig config;
     private final Map<String, EndpointPool> conns = new ConcurrentHashMap<>();
+    private final AtomicBoolean closed = new AtomicBoolean(false);
 
     NodePool(ClientConfig config) {
         this.config = config;
@@ -37,13 +40,33 @@ final class NodePool implements AutoCloseable {
             throw new ScpException(ErrorCode.INTERNAL, "invalid storage endpoint: null");
         }
         Endpoint.parse(endpoint, "storage endpoint", ErrorCode.INTERNAL);
-        return conns.computeIfAbsent(endpoint, EndpointPool::new);
+        if (closed.get()) {
+            throw new ScpException(ErrorCode.INTERNAL, "node pool is closed");
+        }
+        EndpointPool pool = conns.computeIfAbsent(endpoint, EndpointPool::new);
+        if (closed.get()) {
+            // raced with close(): if our insert slipped past the close sweep, close it here so its
+            // connections and monitor threads do not leak; either way reject rather than hand back
+            // a pool that close() may have already torn down
+            if (conns.remove(endpoint, pool)) {
+                pool.close();
+            }
+            throw new ScpException(ErrorCode.INTERNAL, "node pool is closed");
+        }
+        return pool;
     }
 
     @Override
     public void close() {
-        conns.values().forEach(EndpointPool::close);
-        conns.clear();
+        // set closed BEFORE the sweep so a racing get() observes it and closes its own late insert;
+        // remove-and-close each pool (clear() alone would drop references without closing them)
+        closed.set(true);
+        for (String endpoint : new ArrayList<>(conns.keySet())) {
+            EndpointPool pool = conns.remove(endpoint);
+            if (pool != null) {
+                pool.close();
+            }
+        }
     }
 
     private final class EndpointPool implements AutoCloseable {
