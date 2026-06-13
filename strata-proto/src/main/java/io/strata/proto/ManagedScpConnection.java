@@ -1,5 +1,6 @@
 package io.strata.proto;
 
+import io.strata.common.Backoff;
 import io.strata.common.ConnectionPolicy;
 import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
@@ -11,7 +12,6 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
@@ -46,7 +46,7 @@ public final class ManagedScpConnection implements AutoCloseable {
     private volatile boolean maintainConnection;
 
     private int endpointIndex;
-    private int reconnectBackoffMs;
+    private final Backoff backoff;
 
     public ManagedScpConnection(List<String> endpoints, ConnectionPolicy policy, byte clientKind,
                                 String clientId, String endpointLabel, boolean rotateOnFailure,
@@ -61,7 +61,7 @@ public final class ManagedScpConnection implements AutoCloseable {
         this.endpointLabel = Objects.requireNonNull(endpointLabel, "endpointLabel");
         this.rotateOnFailure = rotateOnFailure;
         this.genericHeartbeat = genericHeartbeat;
-        this.reconnectBackoffMs = policy.reconnectInitialBackoffMs();
+        this.backoff = new Backoff(policy.reconnectInitialBackoffMs(), policy.reconnectMaxBackoffMs());
         this.monitorThread = Thread.ofVirtual().name("scp-conn-monitor-" + clientId + "-", 0)
                 .start(this::monitorLoop);
     }
@@ -208,7 +208,7 @@ public final class ManagedScpConnection implements AutoCloseable {
         try {
             client = new ScpClient(hp.host(), hp.port(), clientKind, clientId, policy.connectTimeoutMs());
             generation++;
-            reconnectBackoffMs = policy.reconnectInitialBackoffMs();
+            backoff.reset();
             return client;
         } catch (IOException e) {
             if (rotateOnFailure && endpoints.size() > 1) {
@@ -281,7 +281,7 @@ public final class ManagedScpConnection implements AutoCloseable {
                     if (tryReconnect()) {
                         delayMs = policy.heartbeatIntervalMs();
                     } else {
-                        delayMs = nextBackoffMs();
+                        delayMs = backoff.nextMs();
                     }
                 }
                 continue;
@@ -291,7 +291,7 @@ public final class ManagedScpConnection implements AutoCloseable {
             }
             try {
                 current.call(Opcode.PING, EMPTY_HEADER, null, policy.heartbeatTimeoutMs());
-                reconnectBackoffMs = policy.reconnectInitialBackoffMs();
+                backoff.reset();
             } catch (RuntimeException e) {
                 lock.lock();
                 try {
@@ -304,7 +304,7 @@ public final class ManagedScpConnection implements AutoCloseable {
                 } finally {
                     lock.unlock();
                 }
-                delayMs = nextBackoffMs();
+                delayMs = backoff.nextMs();
             }
         }
     }
@@ -322,14 +322,6 @@ public final class ManagedScpConnection implements AutoCloseable {
         } finally {
             lock.unlock();
         }
-    }
-
-    private int nextBackoffMs() {
-        int base = reconnectBackoffMs;
-        int jitter = ThreadLocalRandom.current().nextInt(Math.max(1, base / 10 + 1));
-        long next = Math.min((long) policy.reconnectMaxBackoffMs(), Math.max((long) base * 2, base + 1L));
-        reconnectBackoffMs = (int) next;
-        return Math.min(policy.reconnectMaxBackoffMs(), base + jitter);
     }
 
     private static void sleepQuiet(long ms) {

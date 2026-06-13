@@ -12,9 +12,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Lazily-created SCP connection pools for storage-node endpoints.
- * Ordinary idempotent requests are round-robin within an endpoint. Appenders pin the selected
- * ManagedScpConnection for an open chunk, preserving the per-replica ordering rule.
+ * Lazily-created SCP connection pools for storage-node endpoints. {@link #get} hands out a
+ * round-robin connection within an endpoint; callers that need per-replica ordering (appenders and
+ * readers) cache the returned connection for the lifetime of an open chunk.
  */
 final class NodePool implements AutoCloseable {
     private final ClientConfig config;
@@ -29,10 +29,6 @@ final class NodePool implements AutoCloseable {
     }
 
     ManagedScpConnection get(String endpoint) {
-        return endpointPool(endpoint).next();
-    }
-
-    ManagedScpConnection pin(String endpoint) {
         return endpointPool(endpoint).next();
     }
 

@@ -485,7 +485,7 @@ final class AppenderImpl implements StrataFile.Appender {
             lock.unlock();
             ScpException err = null;
             try {
-                ManagedScpConnection client = pool.pin(endpoint);
+                ManagedScpConnection client = pool.get(endpoint);
                 ManagedScpConnection.CallResult openedResult =
                         client.callWithGeneration(Opcode.OPEN_CHUNK, header, null, config.callTimeoutMs());
                 s.connections[i] = client;

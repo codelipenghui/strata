@@ -11,11 +11,10 @@ import io.strata.proto.Opcode;
 import io.strata.proto.Resp;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 
 import static io.strata.common.Checks.addChunkLength;
 
@@ -81,15 +80,20 @@ final class ReaderImpl implements StrataFile.Reader {
     }
 
     private byte[] readFromReplicas(Messages.ChunkInfo chunk, long offset, int maxBytes, boolean open) {
-        List<Messages.Replica> replicas = new ArrayList<>(chunk.replicas());
-        Collections.shuffle(replicas);
+        List<Messages.Replica> replicas = chunk.replicas();
+        if (replicas.isEmpty()) {
+            throw new ScpException(ErrorCode.INTERNAL, "no readable replica");
+        }
+        // spread the first attempt across replicas without copying/shuffling the list per read
+        int start = ThreadLocalRandom.current().nextInt(replicas.size());
+        byte[] readHeader = new Messages.Read(chunk.chunkId(), offset, maxBytes).encode();
         ScpException last = null;
-        for (Messages.Replica r : replicas) {
+        for (int i = 0; i < replicas.size(); i++) {
+            Messages.Replica r = replicas.get((start + i) % replicas.size());
             if (r.endpoint().isEmpty()) continue;
             try {
                 Frame frame = connectionFor(r.endpoint()).callFrame(Opcode.READ,
-                        new Messages.Read(chunk.chunkId(), offset, maxBytes).encode(), null,
-                        config.callTimeoutMs());
+                        readHeader, null, config.callTimeoutMs());
                 ByteBuffer h = frame.headerSlice();
                 Resp.check(h);
                 var resp = Messages.ReadResp.decode(h);
@@ -141,7 +145,7 @@ final class ReaderImpl implements StrataFile.Reader {
     }
 
     private ManagedScpConnection connectionFor(String endpoint) {
-        return pinnedConnections.computeIfAbsent(endpoint, pool::pin);
+        return pinnedConnections.computeIfAbsent(endpoint, pool::get);
     }
 
     @Override

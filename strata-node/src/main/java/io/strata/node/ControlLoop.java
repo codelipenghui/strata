@@ -1,5 +1,7 @@
 package io.strata.node;
 
+import io.strata.common.Backoff;
+import io.strata.common.Checks;
 import io.strata.common.ChunkState;
 import io.strata.common.ConnectionPolicy;
 import io.strata.common.Endpoint;
@@ -22,7 +24,6 @@ import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Storage-node control plane (tech design §10.4): register, heartbeat (commands ride the
@@ -46,15 +47,14 @@ final class ControlLoop implements AutoCloseable {
     private volatile long sessionEpoch = -1;
     private volatile int heartbeatIntervalMs = 1_000;
     private int endpointIndex = 0;
-    private int reconnectBackoffMs;
+    private final Backoff backoff;
 
     ControlLoop(StorageNode node, NodeConfig config, ChunkStore store) {
         this.node = node;
         this.config = config;
         this.store = store;
-        this.reconnectBackoffMs = config != null
-                ? config.connectionPolicy().reconnectInitialBackoffMs()
-                : ConnectionPolicy.DEFAULT.reconnectInitialBackoffMs();
+        ConnectionPolicy policy = config != null ? config.connectionPolicy() : ConnectionPolicy.DEFAULT;
+        this.backoff = new Backoff(policy.reconnectInitialBackoffMs(), policy.reconnectMaxBackoffMs());
     }
 
     private final java.util.List<Thread> threads = new java.util.ArrayList<>(3);
@@ -70,14 +70,14 @@ final class ControlLoop implements AutoCloseable {
             try {
                 ensureRegistered();
                 heartbeatOnce();
-                resetBackoff();
+                backoff.reset();
                 Thread.sleep(heartbeatIntervalMs);
             } catch (InterruptedException e) {
                 return;
             } catch (ScpConnectionException e) {
                 log.warn("metadata connection problem: {} — reconnecting", e.toString());
                 rotateEndpoint();
-                sleepQuiet(nextBackoffMs());
+                sleepQuiet(backoff.nextMs());
             } catch (ScpException e) {
                 if (e.code() == ErrorCode.LEASE_EXPIRED || e.code() == ErrorCode.NOT_REGISTERED) {
                     log.warn("session invalid ({}), re-registering", e.code());
@@ -87,11 +87,11 @@ final class ControlLoop implements AutoCloseable {
                 } else {
                     log.warn("control-loop error: {}", e.getMessage());
                 }
-                sleepQuiet(nextBackoffMs());
+                sleepQuiet(backoff.nextMs());
             } catch (Exception e) {
                 log.warn("metadata connection problem: {} — reconnecting", e.toString());
                 rotateEndpoint();
-                sleepQuiet(nextBackoffMs());
+                sleepQuiet(backoff.nextMs());
             }
         }
     }
@@ -284,14 +284,9 @@ final class ControlLoop implements AutoCloseable {
         if (expectedLength < 0) {
             throw new ScpException(ErrorCode.CORRUPT_CHUNK, "negative expected repair length");
         }
-        long max;
-        try {
-            max = Math.addExact(ChunkFormats.HEADER_SIZE, expectedLength);
-            max = Math.addExact(max, ChunkFormats.TRAILER_SIZE);
-            max = Math.addExact(max, MAX_REPAIR_FOOTER_BYTES);
-        } catch (ArithmeticException e) {
-            throw new ScpException(ErrorCode.CORRUPT_CHUNK, "repair length overflow");
-        }
+        long max = Checks.checkedAdd(ChunkFormats.HEADER_SIZE, expectedLength, "repair length");
+        max = Checks.checkedAdd(max, ChunkFormats.TRAILER_SIZE, "repair length");
+        max = Checks.checkedAdd(max, MAX_REPAIR_FOOTER_BYTES, "repair length");
         if (max > Integer.MAX_VALUE) {
             throw new ScpException(ErrorCode.INTERNAL,
                     "repair file too large for in-memory import: " + expectedLength);
@@ -336,19 +331,6 @@ final class ControlLoop implements AutoCloseable {
         meta = null;
         sessionEpoch = -1;
         if (m != null) m.close();
-    }
-
-    private void resetBackoff() {
-        reconnectBackoffMs = config.connectionPolicy().reconnectInitialBackoffMs();
-    }
-
-    private int nextBackoffMs() {
-        int base = reconnectBackoffMs;
-        int jitter = ThreadLocalRandom.current().nextInt(Math.max(1, base / 10 + 1));
-        long next = Math.min((long) config.connectionPolicy().reconnectMaxBackoffMs(),
-                Math.max((long) base * 2, base + 1L));
-        reconnectBackoffMs = (int) next;
-        return Math.min(config.connectionPolicy().reconnectMaxBackoffMs(), base + jitter);
     }
 
     private static void sleepQuiet(long ms) {

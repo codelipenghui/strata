@@ -602,14 +602,14 @@ public final class Messages {
         public static InventoryReport decode(ByteBuffer b) {
             int nodeId = b.getInt();
             long incMsb = b.getLong(), incLsb = b.getLong(), sessionEpoch = b.getLong();
-            int shard = b.getInt(), count = b.getInt();
+            int shard = b.getInt(), shardCount = b.getInt();
             int n = count(b);
             List<InventoryEntry> es = new ArrayList<>(n);
             for (int i = 0; i < n; i++) {
                 es.add(new InventoryEntry(ChunkId.readFrom(b), ChunkState.fromValue(b.get()), b.getLong(), b.getInt()));
             }
             TaggedFields.readFrom(b);
-            return new InventoryReport(nodeId, incMsb, incLsb, sessionEpoch, shard, count, es);
+            return new InventoryReport(nodeId, incMsb, incLsb, sessionEpoch, shard, shardCount, es);
         }
     }
 
