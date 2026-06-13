@@ -2,8 +2,6 @@ package io.strata.it;
 
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
-import io.strata.common.ErrorCode;
-import io.strata.common.ScpException;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -14,12 +12,11 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Seal recovery must commit only byte-identical sealed replicas (invariant §14.6): one divergent
- * outlier can be dropped if an agreeing quorum exists, but a three-way split must not be committed.
+ * outlier can be dropped if an agreeing quorum exists, but a three-way split above the durable
+ * floor must be truncated rather than committed.
  */
 class RecoveryDivergenceTest {
 
@@ -49,24 +46,22 @@ class RecoveryDivergenceTest {
     }
 
     @Test
-    void recoveryRefusesToSealDivergenceWithoutQuorum() throws Exception {
+    void recoveryTruncatesDivergentTailWithoutQuorum() throws Exception {
         try (MiniCluster cluster = new MiniCluster(3);
              StrataClient client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()))) {
             var setup = createOpenChunkWithReplicaPayloads(cluster, "/split",
                     List.of("AAAA".getBytes(), "BBBB".getBytes(), "CCCC".getBytes()));
 
-            ScpException e = assertThrows(ScpException.class, () -> client.openById(setup.fileId()).recoverAndSeal());
-            assertEquals(ErrorCode.INTERNAL, e.code());
-            assertTrue(e.getMessage().contains("divergence"),
-                    "expected a divergence failure, got: " + e.getMessage());
+            var sealed = client.openById(setup.fileId()).recoverAndSeal();
+            assertEquals(0, sealed.sealedLength(),
+                    "recovery must not commit a tail without an agreeing quorum");
 
-            // and metadata must NOT have recorded a sealed chunk
             String[] hp = cluster.metaEndpoint().split(":");
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
                 var lookup = Messages.LookupFileResp.decode(meta.call(Opcode.LOOKUP_FILE,
                         new Messages.LookupFile(setup.fileId()).encode(), null, 5000));
-                assertEquals(io.strata.common.ChunkState.OPEN, lookup.chunks().get(0).state(),
-                        "metadata must not commit a divergent seal");
+                assertEquals(io.strata.common.ChunkState.SEALED, lookup.chunks().get(0).state());
+                assertEquals(0, lookup.chunks().get(0).length());
             }
         }
     }

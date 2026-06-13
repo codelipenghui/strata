@@ -1,0 +1,239 @@
+name: correctness
+
+"on":
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "23 9 * * *"
+  workflow_dispatch:
+    inputs:
+      run_default:
+        description: Run the default unit and integration gate
+        required: true
+        type: boolean
+        default: true
+      run_fault:
+        description: Run the embedded stress/fault gate
+        required: true
+        type: boolean
+        default: true
+      run_docker_chaos:
+        description: Run the Docker/Toxiproxy chaos gate
+        required: true
+        type: boolean
+        default: true
+      run_soak:
+        description: Run the stress/fault soak gate
+        required: true
+        type: boolean
+        default: true
+      run_tlc:
+        description: Run the TLA+ model-checking gate
+        required: true
+        type: boolean
+        default: true
+      run_compat:
+        description: Run the current compatibility/conformance gate
+        required: true
+        type: boolean
+        default: true
+      soak_iterations:
+        description: Number of soak seed iterations
+        required: true
+        type: string
+        default: "10"
+      soak_batches:
+        description: Number of batches per stress/fault case
+        required: true
+        type: string
+        default: "75"
+      soak_seed:
+        description: Optional hex or decimal base seed for reproducing a failed soak
+        required: false
+        type: string
+        default: ""
+      compat_versions:
+        description: Space- or comma-separated released strata-proto versions for SCP compatibility
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: correctness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  default:
+    name: default verification
+    if: github.event_name != 'workflow_dispatch' || inputs.run_default
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Run default correctness suite
+        run: ./scripts/verify.sh
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-default
+          path: |
+            **/target/surefire-reports/**
+            strata-it/target/correctness-artifacts/**
+            strata-it/target/chaos-process-logs/**
+            strata-it/target/external-nemesis-process-logs/**
+            strata-it/target/external-control-nemesis-process-logs/**
+            strata-it/target/process-crash-logs/**
+            strata-it/target/metadata-process-logs/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  fault:
+    name: embedded fault and process-crash verification
+    if: github.event_name != 'workflow_dispatch' || inputs.run_fault
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Run embedded stress/fault and process-crash suite
+        run: ./scripts/verify.sh --skip-default --fault
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-fault
+          path: |
+            **/target/surefire-reports/**
+            strata-it/target/correctness-artifacts/**
+            strata-it/target/chaos-process-logs/**
+            strata-it/target/external-nemesis-process-logs/**
+            strata-it/target/external-control-nemesis-process-logs/**
+            strata-it/target/process-crash-logs/**
+            strata-it/target/metadata-process-logs/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  model-check:
+    name: TLA+ model checking
+    if: github.event_name != 'workflow_dispatch' || inputs.run_tlc
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Run TLA+ model checker
+        run: ./scripts/verify.sh --skip-default --tlc
+
+  compatibility:
+    name: compatibility and conformance
+    if: github.event_name != 'workflow_dispatch' || inputs.run_compat || inputs.compat_versions != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Run current compatibility and optional released-artifact matrix
+        env:
+          STRATA_COMPAT_VERSIONS: ${{ inputs.compat_versions }}
+        run: ./scripts/verify.sh --skip-default --compat
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-compatibility
+          path: |
+            **/target/surefire-reports/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  docker-chaos:
+    name: Docker chaos verification
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_docker_chaos)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Run Docker/Toxiproxy chaos suite
+        run: ./scripts/verify.sh --skip-default --chaos
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-docker-chaos
+          path: |
+            **/target/surefire-reports/**
+            strata-it/target/correctness-artifacts/**
+            strata-it/target/chaos-process-logs/**
+            strata-it/target/external-nemesis-process-logs/**
+            strata-it/target/external-control-nemesis-process-logs/**
+            strata-it/target/process-crash-logs/**
+            strata-it/target/metadata-process-logs/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  soak:
+    name: bounded soak verification
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_soak)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Run stress/fault soak
+        env:
+          SOAK_ITERATIONS: ${{ inputs.soak_iterations || '10' }}
+          SOAK_BATCHES: ${{ inputs.soak_batches || '75' }}
+          SOAK_SEED: ${{ inputs.soak_seed || '' }}
+        run: |
+          set -euo pipefail
+          args=(--skip-default --soak "-Dstrata.soak.iterations=${SOAK_ITERATIONS}" "-Dstrata.soak.batches=${SOAK_BATCHES}")
+          if [[ -n "${SOAK_SEED}" ]]; then
+            args+=("-Dstrata.soak.seed=${SOAK_SEED}")
+          fi
+          ./scripts/verify.sh "${args[@]}"
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-soak
+          path: |
+            **/target/surefire-reports/**
+            strata-it/target/correctness-artifacts/**
+            strata-it/target/chaos-process-logs/**
+            strata-it/target/external-nemesis-process-logs/**
+            strata-it/target/external-control-nemesis-process-logs/**
+            strata-it/target/process-crash-logs/**
+            strata-it/target/metadata-process-logs/**
+          if-no-files-found: ignore
+          retention-days: 14

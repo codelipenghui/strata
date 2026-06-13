@@ -47,7 +47,8 @@ public final class MetadataService implements AutoCloseable {
         RepairCoordinator openedRepair = null;
         ScpServer openedServer = null;
         try {
-            openedStore = new ZkMetadataStore(config.zkConnect());
+            openedStore = new ZkMetadataStore(config.zkConnect(),
+                    config.zkSessionTimeoutMs(), config.zkConnectionTimeoutMs());
             NodeRegistry openedRegistry = new NodeRegistry(openedStore, config);
             UUID serviceId = UUID.randomUUID();
             openedLatch = new LeaderLatch(openedStore.curator(), "/strata/leader", serviceId.toString());
@@ -295,7 +296,9 @@ public final class MetadataService implements AutoCloseable {
         } catch (KeeperException.NodeExistsException e) {
             var existing = store.getFile(m.fileId());
             if (existing.isPresent()) {
-                if (sameCreateRequest(existing.get().value(), m)) {
+                Records.FileRecord record = existing.get().value();
+                if (sameCreateRequest(record, m) && record.state() != FileState.DELETING
+                        && pathStillOwnsCreate(record, m)) {
                     return m.fileId();
                 }
                 throw new ScpException(ErrorCode.PRECONDITION_FAILED,
@@ -309,6 +312,13 @@ public final class MetadataService implements AutoCloseable {
             throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                     "file id already exists for a different create request: " + m.fileId());
         }
+    }
+
+    private boolean pathStillOwnsCreate(Records.FileRecord existing, Messages.CreateFile requested)
+            throws Exception {
+        return store.resolvePath(existing.namespace(), existing.path())
+                .filter(requested.fileId()::equals)
+                .isPresent();
     }
 
     private static boolean sameCreateRequest(Records.FileRecord existing, Messages.CreateFile requested) {
@@ -326,6 +336,9 @@ public final class MetadataService implements AutoCloseable {
             var opt = store.getFile(m.fileId());
             if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, m.fileId().toString());
             Records.FileRecord file = opt.get().value();
+            if (file.state() == FileState.DELETING) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED, "file is DELETING");
+            }
             if (file.state() != FileState.OPEN) {
                 throw new ScpException(ErrorCode.FILE_SEALED, "file state " + file.state());
             }
@@ -359,7 +372,8 @@ public final class MetadataService implements AutoCloseable {
                             "tail chunk " + tail.index() + " is OPEN — seal or recover it first");
                 }
             }
-            List<NodeRegistry.LiveNode> nodes = Placement.choose(registry, file.replicationFactor(), Set.of(), Set.of());
+            List<NodeRegistry.LiveNode> nodes = Placement.choose(registry, file.replicationFactor(),
+                    Set.copyOf(m.excludedNodeIds()), Set.of());
             List<Integer> replicaIds = new ArrayList<>(file.replicationFactor());
             List<Messages.Replica> replicas = new ArrayList<>(file.replicationFactor());
             for (NodeRegistry.LiveNode n : nodes) {
@@ -452,6 +466,9 @@ public final class MetadataService implements AutoCloseable {
             var opt = store.getFile(m.chunkId().fileId());
             if (opt.isEmpty()) return; // idempotent after deletion
             Records.FileRecord file = opt.get().value();
+            if (file.state() == FileState.DELETING) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED, "file is DELETING");
+            }
             if (file.chunks().isEmpty()) return; // already aborted
             List<Records.ChunkRecord> chunks = new ArrayList<>(file.chunks());
             Records.ChunkRecord tail = chunks.get(chunks.size() - 1);

@@ -5,18 +5,24 @@ import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -151,6 +157,62 @@ class ReaderImplTest {
     }
 
     @Test
+    void readerPinsEndpointConnectionAcrossReads() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+
+        try (ScpServer replica = readReplica(new Messages.ReadResp(1, 1), new byte[] {7});
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1,
+                             List.of(chunk(chunkId, ChunkState.SEALED, 1,
+                                     new Messages.Replica(1, endpoint(replica)))))))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
+                    .withStorageConnectionsPerEndpoint(2);
+            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool(config)) {
+                ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
+                String replicaEndpoint = endpoint(replica);
+
+                assertArrayEquals(new byte[] {7}, reader.read(0, 1).data());
+                ManagedScpConnection pinned = pinnedConnection(reader, replicaEndpoint);
+                assertNotNull(pinned);
+                assertSame(pinned, pinnedConnection(reader, replicaEndpoint));
+
+                assertArrayEquals(new byte[] {7}, reader.read(0, 1).data());
+                assertSame(pinned, pinnedConnection(reader, replicaEndpoint));
+                assertNotSame(pinned, pool.get(replicaEndpoint),
+                        "a reader must reuse its pinned connection instead of round-robining per read");
+            }
+        }
+    }
+
+    @Test
+    void independentReadersCanUseDifferentEndpointPoolConnections() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+
+        try (ScpServer replica = readReplica(new Messages.ReadResp(1, 1), new byte[] {9});
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1,
+                             List.of(chunk(chunkId, ChunkState.SEALED, 1,
+                                     new Messages.Replica(1, endpoint(replica)))))))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
+                    .withStorageConnectionsPerEndpoint(2);
+            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool(config)) {
+                ReaderImpl first = new ReaderImpl(meta, pool, config, fileId);
+                ReaderImpl second = new ReaderImpl(meta, pool, config, fileId);
+                String replicaEndpoint = endpoint(replica);
+
+                assertArrayEquals(new byte[] {9}, first.read(0, 1).data());
+                assertArrayEquals(new byte[] {9}, second.read(0, 1).data());
+
+                assertNotSame(pinnedConnection(first, replicaEndpoint),
+                        pinnedConnection(second, replicaEndpoint),
+                        "connection pooling should spread independent reader sessions");
+            }
+        }
+    }
+
+    @Test
     void negativeReplicaOffsetsAreRejected() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
@@ -232,5 +294,14 @@ class ReaderImplTest {
     private static Messages.ChunkInfo chunk(ChunkId chunkId, ChunkState state, long length,
                                             Messages.Replica... replicas) {
         return new Messages.ChunkInfo(chunkId, state, length, 0, 1, List.of(replicas));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static ManagedScpConnection pinnedConnection(ReaderImpl reader, String endpoint) throws Exception {
+        Field field = ReaderImpl.class.getDeclaredField("pinnedConnections");
+        field.setAccessible(true);
+        Map<String, ManagedScpConnection> connections =
+                (Map<String, ManagedScpConnection>) field.get(reader);
+        return connections.get(endpoint);
     }
 }

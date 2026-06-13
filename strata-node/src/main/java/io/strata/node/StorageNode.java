@@ -45,13 +45,15 @@ public final class StorageNode implements AutoCloseable {
             openedServer = new ScpServer(config.listenPort(), nodeId,
                     incarnation.getMostSignificantBits(), incarnation.getLeastSignificantBits(),
                     new NodeHandlers(openedStore, this));
-            if (!config.metadataEndpoints().isEmpty()) {
-                startedLoop = new ControlLoop(this, config, openedStore);
-                startedLoop.start();
-            }
             this.store = openedStore;
             this.server = openedServer;
-            this.controlLoop = startedLoop; // null in standalone data-plane tests
+            if (!config.metadataEndpoints().isEmpty()) {
+                startedLoop = new ControlLoop(this, config, openedStore);
+                this.controlLoop = startedLoop;
+                startedLoop.start();
+            } else {
+                this.controlLoop = null; // null in standalone data-plane tests
+            }
         } catch (IOException | RuntimeException e) {
             Throwable closeFailure = closeAll(startedLoop, openedServer, openedStore);
             if (closeFailure != null) {

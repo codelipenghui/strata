@@ -57,7 +57,10 @@ final class RepairCoordinator implements AutoCloseable {
     private final AtomicLong commandIds = new AtomicLong(System.currentTimeMillis());
     private final Map<Long, Action> inflight = new ConcurrentHashMap<>();
     private final Set<ChunkId> chunksBeingRepaired = ConcurrentHashMap.newKeySet();
+    private final Map<ReplicaKey, Long> recentlyCommittedReplicas = new ConcurrentHashMap<>();
     private volatile Thread scanThread;
+
+    private record ReplicaKey(ChunkId chunkId, int nodeId) {}
 
     RepairCoordinator(MetadataStore store, NodeRegistry registry, MetaConfig config,
                       java.util.function.BooleanSupplier isLeader) {
@@ -286,6 +289,9 @@ final class RepairCoordinator implements AutoCloseable {
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(r.fileId());
             if (opt.isEmpty()) return;
             Records.FileRecord file = opt.get().value();
+            if (file.state() == FileState.DELETING) {
+                return;
+            }
             List<Records.ChunkRecord> chunks = new ArrayList<>(file.chunks());
             boolean changed = false;
             for (int i = 0; i < chunks.size(); i++) {
@@ -306,6 +312,12 @@ final class RepairCoordinator implements AutoCloseable {
             if (!changed) return;
             Records.FileRecord updated = file.withChunks(chunks);
             if (store.updateFile(updated, opt.get().version())) {
+                recentlyCommittedReplicas.put(new ReplicaKey(r.chunkId(), r.targetNode()),
+                        System.currentTimeMillis());
+                registry.removePending(r.targetNode(), command ->
+                        command instanceof Messages.DeleteCmd d
+                                && d.chunkIds().contains(r.chunkId())
+                                && !inflight.containsKey(d.commandId()));
                 log.info("descriptor swap: {} {} -> {}", r.chunkId(), r.deadNode(), r.targetNode());
                 return;
             }
@@ -356,11 +368,12 @@ final class RepairCoordinator implements AutoCloseable {
      */
     void onInventory(Messages.InventoryReport report) {
         try {
-            if (!registry.isAlive(report.nodeId())) {
+            if (!registry.isCurrentSession(report.nodeId(), report.incMsb(), report.incLsb(),
+                    report.sessionEpoch())) {
                 // Inventory is destructive: a missing/corrupt report can drop replicas from file
-                // descriptors. Only accept it from a node with a current lease; stale or forged
-                // reports must not erase healthy replicas.
-                log.warn("ignoring inventory report from non-live node {}", report.nodeId());
+                // descriptors. Only accept it from the currently leased incarnation/session;
+                // stale or forged reports must not erase healthy replicas.
+                log.warn("ignoring inventory report from stale or non-live node {}", report.nodeId());
                 return;
             }
             Map<ChunkId, Messages.InventoryEntry> reported = new java.util.HashMap<>();
@@ -384,7 +397,9 @@ final class RepairCoordinator implements AutoCloseable {
                         }
                     }
                 }
-                if (!known) orphans.add(e.chunkId());
+                if (!known && !isRepairProtected(e.chunkId(), report.nodeId())) {
+                    orphans.add(e.chunkId());
+                }
             }
             if (!orphans.isEmpty()) {
                 long cmdId = commandIds.incrementAndGet();
@@ -405,6 +420,9 @@ final class RepairCoordinator implements AutoCloseable {
                         continue;
                     }
                     ChunkId chunkId = file.chunkId(c.index());
+                    if (isRepairProtected(chunkId, report.nodeId())) {
+                        continue;
+                    }
                     Messages.InventoryEntry entry = reported.get(chunkId);
                     if (entry == null) {
                         log.warn("node {} lost sealed chunk {} — dropping replica for re-repair",
@@ -434,6 +452,38 @@ final class RepairCoordinator implements AutoCloseable {
         } catch (Exception e) {
             log.warn("inventory reconciliation for node {} failed", report.nodeId(), e);
         }
+    }
+
+    private boolean isRepairProtected(ChunkId chunkId, int nodeId) {
+        if (isRepairInFlightTo(chunkId, nodeId)) {
+            return true;
+        }
+        ReplicaKey key = new ReplicaKey(chunkId, nodeId);
+        Long committedAt = recentlyCommittedReplicas.get(key);
+        if (committedAt == null) {
+            return false;
+        }
+        long graceMs = inventoryStalenessGraceMs();
+        if (System.currentTimeMillis() - committedAt <= graceMs) {
+            return true;
+        }
+        recentlyCommittedReplicas.remove(key, committedAt);
+        return false;
+    }
+
+    private boolean isRepairInFlightTo(ChunkId chunkId, int nodeId) {
+        for (Action action : inflight.values()) {
+            if (action instanceof ReplicateAction r
+                    && r.targetNode() == nodeId
+                    && r.chunkId().equals(chunkId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private long inventoryStalenessGraceMs() {
+        return Math.max(config.repairCommandTimeoutMs(), config.leaseMs() + config.deadGraceMs());
     }
 
     private Optional<MetadataStore.Versioned<Records.FileRecord>> cachedFile(

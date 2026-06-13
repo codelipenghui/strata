@@ -125,6 +125,24 @@ class NodeRegistryTest {
     }
 
     @Test
+    void replicaLookupLoadsNodesPersistedAfterStandbyConstruction() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry standbyRegistry = new NodeRegistry(store, config());
+        Records.NodeRecord late = new Records.NodeRecord(17, 171, 172,
+                List.of("late:9000"), "z", "r", "late-host", 10, Records.NodeState.REGISTERED);
+        store.nodes.put(17, new MetadataStore.Versioned<>(late, 4));
+
+        assertEquals("late:9000", standbyRegistry.endpointOf(17));
+        assertEquals("late-host", standbyRegistry.hostOf(17));
+        assertEquals(new Messages.Replica(17, "late:9000"), standbyRegistry.replicaOf(17));
+        assertFalse(standbyRegistry.isAlive(17));
+
+        NodeRegistry.LiveNode cached = liveNodes(standbyRegistry).get(17);
+        assertEquals(4, cached.recordVersion);
+        assertEquals(0, cached.leaseUntil);
+    }
+
+    @Test
     void heartbeatWithEmptyUsageReportsCompletionsAndUnknownHelpersAreEmpty() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());

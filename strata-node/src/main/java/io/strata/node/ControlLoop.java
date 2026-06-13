@@ -316,7 +316,9 @@ final class ControlLoop implements AutoCloseable {
                 for (var item : store.inventory()) {
                     entries.add(new Messages.InventoryEntry(item.chunkId(), item.state(), item.length(), item.crc()));
                 }
-                var report = new Messages.InventoryReport(node.nodeId(), 0, 1, entries);
+                var report = new Messages.InventoryReport(node.nodeId(),
+                        node.incarnation().getMostSignificantBits(), node.incarnation().getLeastSignificantBits(),
+                        sessionEpoch, 0, 1, entries);
                 m.call(Opcode.INVENTORY_REPORT, report.encode(), null, CALL_TIMEOUT_MS);
             } catch (Exception e) {
                 log.debug("inventory report failed: {}", e.toString());

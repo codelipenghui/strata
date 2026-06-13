@@ -91,7 +91,6 @@ class RecoveryCatchUpTest {
                 }
             }
             assertEquals(1, hashes.size(), "replicas must be byte-identical after recovery");
-            assertTrue(true);
         }
     }
 

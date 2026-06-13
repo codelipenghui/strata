@@ -5,6 +5,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.FileState;
 import io.strata.common.ScpException;
 import io.strata.proto.Frame;
+import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.Resp;
@@ -13,6 +14,8 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static io.strata.common.Checks.addChunkLength;
 
@@ -25,6 +28,7 @@ final class ReaderImpl implements StrataFile.Reader {
     private final NodePool pool;
     private final ClientConfig config;
     private final io.strata.common.FileId fileId;
+    private final Map<String, ManagedScpConnection> pinnedConnections = new ConcurrentHashMap<>();
 
     private volatile Messages.LookupFileResp file;
 
@@ -83,7 +87,7 @@ final class ReaderImpl implements StrataFile.Reader {
         for (Messages.Replica r : replicas) {
             if (r.endpoint().isEmpty()) continue;
             try {
-                Frame frame = pool.get(r.endpoint()).callFrame(Opcode.READ,
+                Frame frame = connectionFor(r.endpoint()).callFrame(Opcode.READ,
                         new Messages.Read(chunk.chunkId(), offset, maxBytes).encode(), null,
                         config.callTimeoutMs());
                 ByteBuffer h = frame.headerSlice();
@@ -134,6 +138,10 @@ final class ReaderImpl implements StrataFile.Reader {
             }
         }
         throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no readable replica");
+    }
+
+    private ManagedScpConnection connectionFor(String endpoint) {
+        return pinnedConnections.computeIfAbsent(endpoint, pool::pin);
     }
 
     @Override

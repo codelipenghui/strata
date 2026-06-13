@@ -184,13 +184,43 @@ re-registration on a live connection (stateless RPC), one reviewer self-retracti
 
 ## Correctness invariants under test (tech design §14)
 
-1. Acked data (quorum 2-of-3) survives any single node failure through seal — verified by the recorder/verifier harness in every integration & chaos test.
-2. Single writer per epoch: a fenced appender can never ack again.
-3. Readers never see bytes above the durable offset.
-4. Commit-before-write: chunk exists in metadata before any byte lands on a node.
-5. Sealed replicas are byte-identical (whole-file CRC equality across replicas).
-6. Crash recovery converges to a CRC-verified prefix without parsing payload.
+The release-gate map lives in `CORRECTNESS.md`. The short version:
+
+1. Acked data survives storage failure, process crash, metadata failover, full cold restart, ZK
+   restart, repair, and stress/fault schedules.
+2. Fenced writers cannot ack again, and ambiguous storage reconnects roll instead of replaying
+   appends on a replacement connection.
+3. Readers never see bytes above the durable or sealed prefix.
+4. Commit-before-write keeps orphan cleanup safe.
+5. Seal recovery commits only a quorum-recoverable, CRC-verified prefix.
+6. Sealed replicas are byte-identical, including raw chunk header, data, footer, and trailer.
+7. Namespace/path lookup remains stable across metadata restart, and delete/recreate binds the path
+   only to the replacement file id.
 
 ## How to verify
 
-`scripts/verify.sh` — unit + integration (no Docker needed; embedded ZK). Chaos: `mvn -pl strata-it test -Dchaos=true` (requires Docker). TLA+: `scripts/tlc.sh`.
+`scripts/verify.sh` — unit + integration (no Docker needed; embedded ZK).
+`scripts/verify.sh --fault` — embedded stress/fault, process-crash, repair, and recovery gate.
+`scripts/verify.sh --chaos` — Docker/Toxiproxy chaos gate.
+`scripts/verify.sh --soak` — bounded multi-seed stress/fault soak; tune with `-Dstrata.soak.iterations`, `-Dstrata.soak.batches`, and `-Dstrata.soak.seed`.
+`scripts/verify.sh --tlc` — TLA+ model checking.
+
+`.github/workflows/correctness.yml` runs the default, current compatibility/conformance, embedded
+fault, and TLA+ model-checking gates on pull requests and pushes to `main`; scheduled/manual runs
+also execute Docker chaos and a larger bounded soak.
+Manual workflow runs can disable individual gates and can replay a soak with explicit
+`soak_iterations`, `soak_batches`, and `soak_seed` inputs.
+Exact stress/fault case replay is supported with
+`-Dstrata.stress.case=<case> -Dstrata.stress.seed=<artifact-seed> -Dstrata.stress.batches=<artifact-batches>`.
+Full stress/fault matrix replay, used by soak iteration artifacts, is supported with
+`--stress-only -Dstrata.stress.seed=<artifact-seed> -Dstrata.stress.batches=<artifact-batches>`.
+Targeted fault and chaos artifact replay is supported with `-Dtest=<TestClass#method>`;
+`verify.sh` and `coverage.sh` both audit the artifacts produced by that one test without requiring
+unrelated matrix artifacts.
+CI uploads surefire reports and storage child-process logs from `strata-it/target/process-crash-logs`
+so process-crash failures include the node-side evidence needed for replay and diagnosis.
+The embedded fault gate also covers full service cold restart: clients, metadata, and storage
+services are stopped, storage nodes restart from the same data directories against the same ZK
+state, and tests verify sealed-file readability plus recovery of an abandoned open chunk.
+It also restarts the embedded ZooKeeper server itself before bringing metadata/storage back,
+proving the v0 ZK metadata records survive a metadata-store process restart.

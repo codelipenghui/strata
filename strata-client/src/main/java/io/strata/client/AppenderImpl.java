@@ -15,8 +15,10 @@ import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -61,6 +63,7 @@ final class AppenderImpl implements StrataFile.Appender {
     private boolean rolling;
     private boolean dead;
     private ScpException deathCause;
+    private final Set<Integer> excludedPlacementNodes = new HashSet<>();
 
     private static final class ChunkSession {
         final ChunkId chunkId;
@@ -238,6 +241,7 @@ final class AppenderImpl implements StrataFile.Appender {
     private void onReplicaFailureLocked(ChunkSession s, int replicaIndex, ScpException cause) {
         if (s.failed[replicaIndex]) return;
         s.failed[replicaIndex] = true;
+        excludedPlacementNodes.add(s.replicas.get(replicaIndex).nodeId());
         log.warn("replica {} ({}) failed for chunk {}: {}", replicaIndex,
                 s.replicas.get(replicaIndex).endpoint(), s.chunkId, cause.getMessage());
         if (s.replicas.size() - s.failedCount() < ackQuorum) {
@@ -407,36 +411,75 @@ final class AppenderImpl implements StrataFile.Appender {
     }
 
     private void openNewChunkLocked() {
+        ScpException firstFailure = null;
+        ScpException lastFailure = null;
+        for (int attempt = 0; attempt <= replicationFactor; attempt++) {
+            OpenChunkResult result = tryOpenNewChunkLocked();
+            if (result.opened()) {
+                return;
+            }
+            if (firstFailure == null) {
+                firstFailure = result.failure();
+            }
+            lastFailure = result.failure();
+            if (dead) {
+                return;
+            }
+            if (result.failedNodeIds().isEmpty()) {
+                break;
+            }
+            excludedPlacementNodes.addAll(result.failedNodeIds());
+        }
+        ScpException failure = firstFailure != null ? firstFailure : lastFailure;
+        dieLocked(failure != null ? failure
+                : new ScpException(ErrorCode.INTERNAL, "cannot open chunk on a quorum"));
+    }
+
+    private OpenChunkResult tryOpenNewChunkLocked() {
         // failover resilience lives in MetaClient.call (deadline-based retry); a failure here
         // means the metadata plane stayed unreachable past the deadline
         Messages.CreateChunkResp created;
         UUID createOp = UUID.randomUUID();
+        Set<Integer> placementExclusions = Set.copyOf(excludedPlacementNodes);
         lock.unlock();
         try {
             created = meta.createChunk(fileId, epoch,
-                    createOp.getMostSignificantBits(), createOp.getLeastSignificantBits());
+                    createOp.getMostSignificantBits(), createOp.getLeastSignificantBits(),
+                    placementExclusions);
         } catch (ScpException e) {
-            lock.lock();
-            dieLocked(e);
-            return;
+            if (e.code() != ErrorCode.NO_CAPACITY || placementExclusions.isEmpty()) {
+                lock.lock();
+                dieLocked(e);
+                return OpenChunkResult.failed(e, Set.of());
+            }
+            try {
+                created = meta.createChunk(fileId, epoch,
+                        createOp.getMostSignificantBits(), createOp.getLeastSignificantBits());
+            } catch (ScpException retryFailure) {
+                lock.lock();
+                return OpenChunkResult.failed(retryFailure, Set.of());
+            }
         } finally {
             if (!lock.isHeldByCurrentThread()) lock.lock();
         }
         if (dead) {
             abortCreatedChunkLocked(created.chunkId(), createOp, List.of());
-            return;
+            return OpenChunkResult.failed(deathCause, Set.of());
         }
         if (!validCreatedChunk(created)) {
             abortCreatedChunkLocked(created.chunkId(), createOp, List.of());
-            dieLocked(new ScpException(ErrorCode.INTERNAL,
-                    "metadata returned invalid created chunk for " + created.chunkId()));
-            return;
+            ScpException failure = new ScpException(ErrorCode.INTERNAL,
+                    "metadata returned invalid created chunk for " + created.chunkId());
+            dieLocked(failure);
+            return OpenChunkResult.failed(failure, Set.of());
         }
         ChunkSession s = new ChunkSession(created.chunkId(), created.replicas());
         byte[] header = new Messages.OpenChunk(created.chunkId(), epoch, fsyncOnAck,
                 config.chunkRollBytes(), System.currentTimeMillis()).encode();
         int ok = 0;
         List<Messages.Replica> opened = new ArrayList<>(s.replicas.size());
+        Set<Integer> failedNodeIds = new HashSet<>();
+        ScpException lastErr = null;
         for (int i = 0; i < s.replicas.size(); i++) {
             String endpoint = s.replicas.get(i).endpoint();
             lock.unlock();
@@ -453,7 +496,9 @@ final class AppenderImpl implements StrataFile.Appender {
                 lock.lock();
             }
             if (err != null) {
+                lastErr = err;
                 s.failed[i] = true;
+                failedNodeIds.add(s.replicas.get(i).nodeId());
                 log.warn("open {} on replica {} failed: {}", s.chunkId, endpoint, err.getMessage());
                 if (err.code() == ErrorCode.FENCED_EPOCH) {
                     dieLocked(err);
@@ -464,18 +509,30 @@ final class AppenderImpl implements StrataFile.Appender {
             }
             if (dead) {
                 abortCreatedChunkLocked(s.chunkId, createOp, opened);
-                return;
+                return OpenChunkResult.failed(deathCause, failedNodeIds);
             }
         }
         if (ok < ackQuorum) {
             abortCreatedChunkLocked(s.chunkId, createOp, opened);
-            dieLocked(new ScpException(ErrorCode.INTERNAL, "cannot open chunk on a quorum"));
-            return;
+            return OpenChunkResult.failed(
+                    new ScpException(ErrorCode.INTERNAL, "cannot open chunk on a quorum"), failedNodeIds);
         }
+        excludedPlacementNodes.addAll(failedNodeIds);
         if (ok < s.replicas.size()) {
             s.needRoll = true;
         }
         session = s;
+        return OpenChunkResult.success();
+    }
+
+    private record OpenChunkResult(boolean opened, ScpException failure, Set<Integer> failedNodeIds) {
+        static OpenChunkResult success() {
+            return new OpenChunkResult(true, null, Set.of());
+        }
+
+        static OpenChunkResult failed(ScpException failure, Set<Integer> failedNodeIds) {
+            return new OpenChunkResult(false, failure, Set.copyOf(failedNodeIds));
+        }
     }
 
     private boolean validCreatedChunk(Messages.CreateChunkResp created) {

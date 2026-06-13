@@ -12,6 +12,7 @@ import io.strata.proto.ScpClient;
 
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Function;
 
 /** Client-side metadata access (v0: SCP 0x02xx opcodes; v1: Kafka RPC). Rotates endpoints on failure. */
@@ -75,8 +76,14 @@ final class MetaClient implements AutoCloseable {
     }
 
     Messages.CreateChunkResp createChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb) {
+        return createChunk(fileId, writeEpoch, opIdMsb, opIdLsb, Set.of());
+    }
+
+    Messages.CreateChunkResp createChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb,
+                                         Set<Integer> excludedNodeIds) {
         var resp = call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(fileId, writeEpoch, opIdMsb, opIdLsb).encode());
+                new Messages.CreateChunk(fileId, writeEpoch, opIdMsb, opIdLsb,
+                        List.copyOf(excludedNodeIds)).encode());
         return decode(Opcode.CREATE_CHUNK, resp, Messages.CreateChunkResp::decode);
     }
 

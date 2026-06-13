@@ -16,7 +16,6 @@ import org.junit.jupiter.api.TestInstance;
 
 import java.nio.ByteBuffer;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -34,7 +33,9 @@ class FsyncEndToEndTest {
     @BeforeAll
     void setup() throws Exception {
         cluster = new MiniCluster(3);
-        client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(4 * 1024));
+        client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint())
+                .withChunkRollBytes(4 * 1024)
+                .withStorageConnectionsPerEndpoint(3));
     }
 
     @AfterAll
@@ -47,14 +48,16 @@ class FsyncEndToEndTest {
     void fsyncPolicyReachesEveryReplicaHeaderAndDataSurvives() throws Exception {
         FileId fileId = client.create(fsyncSpec("/fsync-policy")).id();
         Workload workload = new Workload();
+        StrataFile.SealInfo sealed;
         try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 500); // several rolls under fsync
-            appender.seal();
+            sealed = appender.seal();
         }
         workload.verifyAckedPrefix(client, fileId);
 
         // the policy must be burned into the chunk header on EVERY replica
-        var lookup = lookupFile(fileId);
+        var lookup = ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
+                sealed.sealedLength());
         assertTrue(lookup.chunks().size() >= 2);
         for (var c : lookup.chunks()) {
             for (var replica : c.replicas()) {
@@ -77,6 +80,7 @@ class FsyncEndToEndTest {
         assertTrue(sealed.sealedLength() >= workload.ackedBytes());
         zombie.close();
         workload.verifyAckedPrefix(client, fileId);
+        ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
     }
 
     private byte[] fetchHeader(String endpoint, io.strata.common.ChunkId chunkId) throws Exception {
@@ -96,11 +100,4 @@ class FsyncEndToEndTest {
         return new StrataClient.FileSpec("test", path, StrataClient.WritePolicy.fsync(3, 2));
     }
 
-    private Messages.LookupFileResp lookupFile(FileId fileId) throws Exception {
-        String[] hp = cluster.metaEndpoint().split(":");
-        try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
-            ByteBuffer h = direct.call(Opcode.LOOKUP_FILE, new Messages.LookupFile(fileId).encode(), null, 5000);
-            return Messages.LookupFileResp.decode(h);
-        }
-    }
 }

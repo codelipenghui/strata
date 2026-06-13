@@ -730,6 +730,37 @@ class MetadataServiceTest {
     }
 
     @Test
+    void createFileReplayAfterDeleteCannotReturnOldFileOrClearReplacementPath() {
+        FileId requested = FileId.random();
+        var create = new Messages.CreateFile("test", "/idem-after-delete", requested, 1200, 1300);
+        var created = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                create.encode(), null, 5000));
+        assertEquals(requested, created.fileId());
+
+        var delete = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
+                new Messages.DeleteFiles(List.of(requested)).encode(), null, 5000));
+        assertEquals(List.of(ErrorCode.OK.code), delete.codes());
+
+        ScpException staleReplay = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_FILE,
+                create.encode(), null, 5000));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, staleReplay.code());
+
+        var replacement = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", "/idem-after-delete").encode(), null, 5000));
+        assertNotEquals(requested, replacement.fileId());
+        var byPath = Messages.LookupPathResp.decode(client.call(Opcode.LOOKUP_PATH,
+                new Messages.LookupPath("test", "/idem-after-delete").encode(), null, 5000));
+        assertEquals(replacement.fileId(), byPath.fileId());
+
+        ScpException staleAfterReplacement = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_FILE,
+                create.encode(), null, 5000));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, staleAfterReplacement.code());
+        var stillReplacement = Messages.LookupPathResp.decode(client.call(Opcode.LOOKUP_PATH,
+                new Messages.LookupPath("test", "/idem-after-delete").encode(), null, 5000));
+        assertEquals(replacement.fileId(), stillReplacement.fileId());
+    }
+
+    @Test
     void abortChunkRemovesOnlyMatchingOpenTail() {
         registerTrio("abortHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
@@ -878,11 +909,19 @@ class MetadataServiceTest {
 
         ScpException createChunk = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(file.fileId(), 2).encode(), null, 5000));
-        assertEquals(ErrorCode.FILE_SEALED, createChunk.code());
+        assertEquals(ErrorCode.PRECONDITION_FAILED, createChunk.code());
+
+        // stale abort must not remove the open chunk descriptor while deletion is coordinating
+        // physical cleanup.
+        ScpException abortChunk = assertThrows(ScpException.class, () -> client.call(Opcode.ABORT_CHUNK_META,
+                new Messages.AbortChunkMeta(chunk.chunkId(), 1, 0, 0).encode(), null, 5000));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, abortChunk.code());
 
         var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
                 new Messages.LookupFile(file.fileId()).encode(), null, 5000));
         assertEquals(2, lookup.fileState(), "file must remain DELETING");
+        assertEquals(1, lookup.chunks().size(), "stale abort must not hide replicas from deletion");
+        assertEquals(ChunkState.OPEN, lookup.chunks().get(0).state());
     }
 
     @Test

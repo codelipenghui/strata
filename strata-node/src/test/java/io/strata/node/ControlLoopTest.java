@@ -2,6 +2,7 @@ package io.strata.node;
 
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
+import io.strata.common.ConnectionPolicy;
 import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
@@ -312,6 +313,74 @@ class ControlLoopTest {
             assertThrows(RuntimeException.class, () -> invoke(loop, "heartbeatOnce"));
             assertEquals(1, completed.size(), "malformed heartbeat response must preserve completions for retry");
 
+            loop.close();
+        }
+    }
+
+    @Test
+    void failedHeartbeatCompletionIsResentAfterEndpointRotationAndReregistration() throws Exception {
+        AtomicInteger firstHeartbeats = new AtomicInteger();
+        AtomicInteger secondHeartbeats = new AtomicInteger();
+        AtomicReference<List<Messages.CompletedCommand>> firstReported = new AtomicReference<>(List.of());
+        AtomicReference<List<Messages.CompletedCommand>> secondReported = new AtomicReference<>(List.of());
+        AtomicReference<AtomicBoolean> closedRef = new AtomicReference<>();
+
+        try (ScpServer standby = new ScpServer(0, 0, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.REGISTER_NODE) {
+                Messages.RegisterNode.decode(req.headerSlice());
+                return ScpServer.ok(req, new Messages.RegisterResp(7, 11, 1, 1_000).encode(), null);
+            }
+            if (op == Opcode.NODE_HEARTBEAT) {
+                Messages.NodeHeartbeat heartbeat = Messages.NodeHeartbeat.decode(req.headerSlice());
+                firstReported.set(heartbeat.completedCommands());
+                firstHeartbeats.incrementAndGet();
+                throw new ScpException(ErrorCode.NOT_LEADER, "standby");
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+             ScpServer leader = new ScpServer(0, 0, 0, 0, req -> {
+                 Opcode op = Opcode.fromCode(req.opcode());
+                 if (op == Opcode.REGISTER_NODE) {
+                     Messages.RegisterNode.decode(req.headerSlice());
+                     return ScpServer.ok(req, new Messages.RegisterResp(7, 22, 1, 1_000).encode(), null);
+                 }
+                 if (op == Opcode.NODE_HEARTBEAT) {
+                     Messages.NodeHeartbeat heartbeat = Messages.NodeHeartbeat.decode(req.headerSlice());
+                     secondReported.set(heartbeat.completedCommands());
+                     secondHeartbeats.incrementAndGet();
+                     closedRef.get().set(true);
+                     return ScpServer.ok(req,
+                             new Messages.HeartbeatResp(System.currentTimeMillis() + 1_000, List.of()).encode(),
+                             null);
+                 }
+                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+             });
+             StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+            ControlLoop loop = new ControlLoop(node,
+                    config(List.of(endpoint(standby), endpoint(leader)), 60_000), node.store());
+            closedRef.set(getClosed(loop));
+            ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
+            completed.add(new Messages.CompletedCommand(99, ErrorCode.OK.code));
+
+            Thread worker = Thread.ofVirtual().name("control-loop-test-completion-rotation").start(() -> {
+                try {
+                    invoke(loop, "run");
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            waitFor(() -> secondHeartbeats.get() == 1);
+            worker.join(2_000);
+
+            assertEquals(1, firstHeartbeats.get());
+            assertEquals(List.of(new Messages.CompletedCommand(99, ErrorCode.OK.code)), firstReported.get());
+            assertEquals(List.of(new Messages.CompletedCommand(99, ErrorCode.OK.code)), secondReported.get(),
+                    "completion drained into a failed heartbeat must be resent after re-registration");
+            assertTrue(completed.isEmpty(), "successful resend should clear the completion queue");
+            assertEquals(1, getInt(loop, "endpointIndex"));
+            assertEquals(22, getLong(loop, "sessionEpoch"));
             loop.close();
         }
     }
@@ -734,8 +803,13 @@ class ControlLoopTest {
     }
 
     private static NodeConfig config(ScpServer metaServer, int inventoryIntervalMs) {
-        return new NodeConfig(Path.of("."), 0, "127.0.0.1", null, List.of(endpoint(metaServer)),
-                "z", "r", "h", 1L << 20, inventoryIntervalMs);
+        return config(List.of(endpoint(metaServer)), inventoryIntervalMs);
+    }
+
+    private static NodeConfig config(List<String> metadataEndpoints, int inventoryIntervalMs) {
+        ConnectionPolicy testPolicy = new ConnectionPolicy(1_000, 1_000, 100, 1_000, 1, 1);
+        return new NodeConfig(Path.of("."), 0, "127.0.0.1", null, metadataEndpoints,
+                "z", "r", "h", 1L << 20, inventoryIntervalMs, testPolicy);
     }
 
     private static NodeConfig configWithoutMetadata() {

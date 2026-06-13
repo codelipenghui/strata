@@ -11,7 +11,10 @@ import io.strata.proto.Opcode;
 import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -19,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class NodePoolTest {
 
@@ -99,6 +103,33 @@ class NodePoolTest {
     }
 
     @Test
+    void closeStopsEveryPooledConnectionMonitorThread() throws Exception {
+        ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500)
+                .withStorageConnectionsPerEndpoint(3);
+        String endpoint = "127.0.0.1:1234";
+        ManagedScpConnection[] connections;
+        NodePool pool = new NodePool(config);
+        try {
+            pool.get(endpoint);
+            pool.get(endpoint);
+            pool.get(endpoint);
+            connections = pooledConnections(pool, endpoint);
+            assertEquals(3, connections.length);
+        } finally {
+            pool.close();
+        }
+
+        waitFor(() -> {
+            for (ManagedScpConnection connection : connections) {
+                if (monitorAlive(connection)) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
+
+    @Test
     void replacesClosedStorageConnectionOnNextUse() throws Exception {
         AtomicInteger pings = new AtomicInteger();
         try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
@@ -128,5 +159,37 @@ class NodePoolTest {
 
     private static String endpoint(ScpServer server) {
         return "127.0.0.1:" + server.port();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static ManagedScpConnection[] pooledConnections(NodePool pool, String endpoint) throws Exception {
+        Field connsField = NodePool.class.getDeclaredField("conns");
+        connsField.setAccessible(true);
+        Map<String, ?> conns = (Map<String, ?>) connsField.get(pool);
+        Object endpointPool = conns.get(endpoint);
+        Field connectionsField = endpointPool.getClass().getDeclaredField("connections");
+        connectionsField.setAccessible(true);
+        return (ManagedScpConnection[]) connectionsField.get(endpointPool);
+    }
+
+    private static boolean monitorAlive(ManagedScpConnection connection) throws Exception {
+        Method method = ManagedScpConnection.class.getDeclaredMethod("monitorAliveForTests");
+        method.setAccessible(true);
+        return (Boolean) method.invoke(connection);
+    }
+
+    private static void waitFor(CheckedBoolean condition) throws Exception {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        assertTrue(condition.getAsBoolean(), "condition not met before deadline");
+    }
+
+    private interface CheckedBoolean {
+        boolean getAsBoolean() throws Exception;
     }
 }

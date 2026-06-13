@@ -4,18 +4,12 @@ import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
-import io.strata.proto.Messages;
-import io.strata.proto.Opcode;
-import io.strata.proto.Resp;
-import io.strata.proto.ScpClient;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 
 import java.nio.ByteBuffer;
-import java.util.HashSet;
-import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -33,7 +27,9 @@ class EndToEndTest {
     void setup() throws Exception {
         cluster = new MiniCluster(3);
         // small chunks force several rolls in one test
-        client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(4096));
+        client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint())
+                .withChunkRollBytes(4096)
+                .withStorageConnectionsPerEndpoint(3));
     }
 
     @AfterAll
@@ -57,35 +53,12 @@ class EndToEndTest {
         // every acked byte reads back, in order, to EOF
         workload.verifyAckedPrefix(client, fileId);
 
-        // metadata: multiple chunks, all sealed, RF=3 each
-        var lookup = lookup(fileId);
+        // metadata and storage replicas agree on the sealed file shape
+        var lookup = ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
+                workload.ackedBytes());
         assertTrue(lookup.chunks().size() >= 5, "expected several chunks, got " + lookup.chunks().size());
-        long totalLength = 0;
         for (var c : lookup.chunks()) {
-            assertEquals(io.strata.common.ChunkState.SEALED, c.state());
             assertEquals(3, c.replicas().size());
-            totalLength += c.length();
-        }
-        assertEquals(workload.ackedBytes(), totalLength);
-
-        // invariant §14.6: sealed replicas are byte-identical, whole file including header+footer
-        for (var c : lookup.chunks()) {
-            Set<String> distinctFiles = new HashSet<>();
-            for (var replica : c.replicas()) {
-                String[] hp = replica.endpoint().split(":");
-                try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
-                        ScpClient.KIND_TOOL, "verify")) {
-                    var frame = direct.callFrame(Opcode.FETCH_CHUNK,
-                            new Messages.FetchChunk(c.chunkId(), 0, Integer.MAX_VALUE).encode(), null, 5000);
-                    ByteBuffer h = frame.headerSlice();
-                    Resp.check(h);
-                    byte[] bytes = new byte[frame.payloadLength()];
-                    frame.payloadSlice().get(bytes);
-                    distinctFiles.add(java.util.HexFormat.of().formatHex(
-                            java.security.MessageDigest.getInstance("SHA-256").digest(bytes)));
-                }
-            }
-            assertEquals(1, distinctFiles.size(), "replicas of " + c.chunkId() + " diverge");
         }
     }
 
@@ -122,16 +95,8 @@ class EndToEndTest {
             assertEquals(0, appender.seal().sealedLength());
         }
 
-        var lookup = lookup(fileId);
+        var lookup = ConsistencyVerifier.lookupFile(cluster, fileId);
         assertEquals(1, lookup.fileState(), "empty sealed file should be SEALED");
         assertEquals(0, lookup.chunks().size(), "empty append must not create an empty chunk");
-    }
-
-    private Messages.LookupFileResp lookup(FileId fileId) throws Exception {
-        String[] hp = cluster.metaEndpoint().split(":");
-        try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
-            ByteBuffer h = direct.call(Opcode.LOOKUP_FILE, new Messages.LookupFile(fileId).encode(), null, 5000);
-            return Messages.LookupFileResp.decode(h);
-        }
     }
 }

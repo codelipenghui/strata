@@ -5,7 +5,9 @@ import io.strata.client.StrataFile;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
@@ -47,6 +49,16 @@ final class Workload {
 
     synchronized long ackedBytes() {
         return expected.length();
+    }
+
+    synchronized String ackedSha256() {
+        try {
+            byte[] expectedBytes = expected.toString().getBytes(StandardCharsets.UTF_8);
+            return HexFormat.of().formatHex(
+                    MessageDigest.getInstance("SHA-256").digest(expectedBytes));
+        } catch (Exception e) {
+            throw new IllegalStateException("sha256 unavailable", e);
+        }
     }
 
     synchronized int ackedCount() {

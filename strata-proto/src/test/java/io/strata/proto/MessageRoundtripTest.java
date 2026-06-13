@@ -102,7 +102,7 @@ class MessageRoundtripTest {
                 new Messages.DrainCmd(3)));
         assertEquals(hbResp, decodeResp(hbResp.encode(), Messages.HeartbeatResp::decode));
 
-        var inv = new Messages.InventoryReport(42, 0, 1,
+        var inv = new Messages.InventoryReport(42, 1, 2, 9, 0, 1,
                 List.of(new Messages.InventoryEntry(c, ChunkState.SEALED, 4096, 0xAB)));
         assertEquals(inv, Messages.InventoryReport.decode(buf(inv.encode())));
     }
@@ -131,6 +131,9 @@ class MessageRoundtripTest {
 
         var cc = new Messages.CreateChunk(f, 5);
         assertEquals(cc, Messages.CreateChunk.decode(buf(cc.encode())));
+
+        var ccExcluded = new Messages.CreateChunk(f, 5, 11, 12, List.of(2, 4));
+        assertEquals(ccExcluded, Messages.CreateChunk.decode(buf(ccExcluded.encode())));
 
         var ccr = new Messages.CreateChunkResp(c, 5,
                 List.of(new Messages.Replica(1, "a:1"), new Messages.Replica(2, "b:2"), new Messages.Replica(3, "c:3")));

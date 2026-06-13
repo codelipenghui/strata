@@ -25,13 +25,13 @@ import static io.strata.common.Checks.addChunkLength;
 /**
  * Seal recovery (tech design §7.3): fence reachable replicas at the new epoch, start from the
  * highest piggybacked DO, CATCH UP any replica that is behind that point (a replica's piggybacked
- * DO is clamped to its own end, so p can exceed a lagging replica's data), then walk the
- * integrity-ledger boundaries forward, preserving any batch found CRC-valid on any reachable
- * replica by re-replicating it. A replica that cannot be brought to the seal point is EVICTED
- * from the recovery set — sealing it would either fail or leave a short copy in the descriptor.
+ * DO is clamped to its own end, so p can exceed a lagging replica's data), then walk only
+ * quorum-recoverable integrity-ledger boundaries forward. A replica that cannot be brought to the
+ * seal point is EVICTED from the recovery set — sealing it would either fail or leave a short copy
+ * in the descriptor.
  *
- * Tolerance: requires >=2 replicas at the seal point (same fault model as min.insync.replicas=2).
- * Bytes beyond the seal point were never producer-acked; discarding them is correct.
+ * Tolerance: requires the file's configured ack quorum at the seal point. Bytes beyond the seal
+ * point were never producer-acked; discarding them is correct.
  */
 final class Recovery {
     private static final Logger log = LoggerFactory.getLogger(Recovery.class);
@@ -95,14 +95,14 @@ final class Recovery {
                 if (writerEpoch <= 0) {
                     throw new ScpException(ErrorCode.INTERNAL, "missing writer epoch for open chunk recovery");
                 }
-                total = addChunkLength(total, recoverChunk(chunk, writerEpoch));
+                total = addChunkLength(total, recoverChunk(chunk, writerEpoch, file.writePolicy().ackQuorum()));
             }
         }
         meta.sealFile(fileId, total);
         return new StrataFile.SealInfo(total);
     }
 
-    private long recoverChunk(Messages.ChunkInfo chunk, int writerEpoch) {
+    private long recoverChunk(Messages.ChunkInfo chunk, int writerEpoch, int ackQuorum) {
         ChunkId chunkId = chunk.chunkId();
 
         // 1. fence all reachable replicas; collect their state
@@ -124,7 +124,7 @@ final class Recovery {
                 log.warn("fence {} on {} returned malformed response: {}", chunkId, r.endpoint(), e.toString());
             }
         }
-        requireQuorum(chunkId, reachable);
+        requireQuorum(chunkId, reachable, ackQuorum);
 
         // The highest piggybacked DO is the recovery floor: bytes below it were quorum-durable.
         // A sealed replica shorter than this floor is not an authoritative mid-seal remnant; it
@@ -142,7 +142,7 @@ final class Recovery {
                 reachableIt.remove();
             }
         }
-        requireQuorum(chunkId, reachable);
+        requireQuorum(chunkId, reachable, ackQuorum);
 
         // a replica may already hold a sealed copy (writer died mid-seal): its length is the
         // authoritative seal point — bring the others up to it and seal them too
@@ -150,14 +150,14 @@ final class Recovery {
             if (rs.state == ChunkState.SEALED) {
                 long len = rs.end;
                 log.info("chunk {} found sealed at {} on {}", chunkId, len, rs.replica.endpoint());
-                catchUp(chunkId, writerEpoch, reachable, len);
-                return finishSeal(chunkId, writerEpoch, len, reachable);
+                catchUp(chunkId, writerEpoch, reachable, len, ackQuorum);
+                return finishSeal(chunkId, writerEpoch, len, reachable, ackQuorum);
             }
         }
 
         // 2. start from the durable floor and catch lagging replicas up to it before walking
         //    boundaries above it
-        catchUp(chunkId, writerEpoch, reachable, p);
+        catchUp(chunkId, writerEpoch, reachable, p, ackQuorum);
 
         // 3. merge ledger boundaries above p from all reachable replicas
         TreeMap<Long, List<LedgerCandidate>> boundaries = new TreeMap<>();
@@ -179,11 +179,11 @@ final class Recovery {
             }
         }
 
-        // 4. walk forward: re-replicate every batch found CRC-valid anywhere. At each point, prefer
-        // the farthest valid continuation; a shorter valid boundary from one replica must not block
-        // a larger intact append held by another replica.
+        // 4. walk forward: re-replicate every batch that an agreeing quorum can still prove.
+        // At each point, prefer the farthest valid continuation; a shorter valid boundary from
+        // one replica must not block a larger intact append held by a quorum of replicas.
         while (true) {
-            Candidate candidate = bestContinuation(chunkId, reachable, boundaries, p);
+            Candidate candidate = bestContinuation(chunkId, reachable, boundaries, p, ackQuorum);
             if (candidate == null) {
                 break; // gap: nothing reachable holds these bytes — they were never quorum-acked
             }
@@ -208,37 +208,74 @@ final class Recovery {
                     it.remove();
                 }
             }
-            requireQuorum(chunkId, reachable);
+            requireQuorum(chunkId, reachable, ackQuorum);
             p = end;
         }
 
         log.info("seal-recovery: chunk {} sealing at {}", chunkId, p);
-        return finishSeal(chunkId, writerEpoch, p, reachable);
+        return finishSeal(chunkId, writerEpoch, p, reachable, ackQuorum);
     }
 
     private record Candidate(long end, byte[] bytes) {}
 
     private record LedgerCandidate(long previousEnd, Messages.LedgerEntry entry) {}
 
+    private static final class CandidateCount {
+        final byte[] bytes;
+        int count;
+
+        CandidateCount(byte[] bytes) {
+            this.bytes = bytes;
+            this.count = 1;
+        }
+    }
+
     private Candidate bestContinuation(ChunkId chunkId, List<ReplicaState> reachable,
-                                       TreeMap<Long, List<LedgerCandidate>> boundaries, long p) {
+                                       TreeMap<Long, List<LedgerCandidate>> boundaries, long p,
+                                       int ackQuorum) {
         Candidate best = null;
         for (var entry : boundaries.tailMap(p, false).entrySet()) {
             long end = entry.getKey();
             for (LedgerCandidate ledger : entry.getValue()) {
                 if (ledger.previousEnd() != p) continue;
-                for (ReplicaState rs : reachable) {
-                    if (rs.end < end) continue;
-                    byte[] data = readRange(chunkId, rs, p, end);
-                    if (data != null && Crc.of(data) == ledger.entry().payloadCrc()) {
-                        best = new Candidate(end, data);
-                        break;
-                    }
+                Candidate candidate = quorumCandidate(chunkId, reachable, p, end,
+                        ledger.entry().payloadCrc(), ackQuorum);
+                if (candidate != null) {
+                    best = candidate;
+                    break;
                 }
-                if (best != null && best.end() == end) break;
             }
         }
         return best;
+    }
+
+    private Candidate quorumCandidate(ChunkId chunkId, List<ReplicaState> reachable, long from, long to,
+                                      int payloadCrc, int ackQuorum) {
+        List<CandidateCount> counts = new ArrayList<>();
+        for (ReplicaState rs : reachable) {
+            if (rs.end < to) continue;
+            byte[] data = readRange(chunkId, rs, from, to);
+            if (data == null || Crc.of(data) != payloadCrc) {
+                continue;
+            }
+            for (CandidateCount candidate : counts) {
+                if (java.util.Arrays.equals(candidate.bytes, data)) {
+                    candidate.count++;
+                    if (candidate.count >= ackQuorum) {
+                        return new Candidate(to, candidate.bytes);
+                    }
+                    data = null;
+                    break;
+                }
+            }
+            if (data != null) {
+                if (ackQuorum <= 1) {
+                    return new Candidate(to, data);
+                }
+                counts.add(new CandidateCount(data));
+            }
+        }
+        return null;
     }
 
     /**
@@ -247,7 +284,8 @@ final class Recovery {
      * sealed short. The donor region is below the durable offset (or a sealed copy), so the
      * bytes are quorum-trusted; wire integrity is covered by frame payload CRCs.
      */
-    private void catchUp(ChunkId chunkId, int writerEpoch, List<ReplicaState> reachable, long target) {
+    private void catchUp(ChunkId chunkId, int writerEpoch, List<ReplicaState> reachable, long target,
+                         int ackQuorum) {
         Iterator<ReplicaState> it = reachable.iterator();
         while (it.hasNext()) {
             ReplicaState rs = it.next();
@@ -277,7 +315,7 @@ final class Recovery {
                 it.remove();
             }
         }
-        requireQuorum(chunkId, reachable);
+        requireQuorum(chunkId, reachable, ackQuorum);
     }
 
     /** Reads [from, to) from one replica; null on failure or short read. */
@@ -341,15 +379,16 @@ final class Recovery {
         target.end = actualEnd;
     }
 
-    private static void requireQuorum(ChunkId chunkId, List<ReplicaState> reachable) {
-        if (reachable.size() < 2) {
+    private static void requireQuorum(ChunkId chunkId, List<ReplicaState> reachable, int ackQuorum) {
+        if (reachable.size() < ackQuorum) {
             throw new ScpException(ErrorCode.INTERNAL,
                     "chunk " + chunkId + " unavailable: " + reachable.size()
-                            + " usable replicas (need 2)");
+                            + " usable replicas (need " + ackQuorum + ")");
         }
     }
 
-    private long finishSeal(ChunkId chunkId, int epoch, long dataLength, List<ReplicaState> replicas) {
+    private long finishSeal(ChunkId chunkId, int epoch, long dataLength, List<ReplicaState> replicas,
+                            int ackQuorum) {
         // seal every usable replica; require quorum AND agreement — committing metadata over
         // replicas that sealed the same length with different bytes would violate invariant
         // §14.6 (the appender's seal path performs the same check)
@@ -385,10 +424,10 @@ final class Recovery {
             votes.add(resp.finalLength(), resp.chunkCrc(), rs.replica.nodeId());
         }
         int ok = votes.total();
-        if (ok < 2) {
+        if (ok < ackQuorum) {
             throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "recovery seal quorum lost");
         }
-        Map.Entry<SealVotes.Key, List<Integer>> quorum = votes.best(2);
+        Map.Entry<SealVotes.Key, List<Integer>> quorum = votes.best(ackQuorum);
         if (quorum == null) {
             throw new ScpException(ErrorCode.INTERNAL,
                     "replica seal divergence on " + chunkId + " during recovery");

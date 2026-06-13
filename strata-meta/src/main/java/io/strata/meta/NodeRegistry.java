@@ -15,6 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
+import java.util.function.Predicate;
 
 /**
  * Liveness and command delivery (tech design §7.2 detection, §10.4 command flow).
@@ -194,6 +195,13 @@ final class NodeRegistry {
         }
     }
 
+    void removePending(int nodeId, Predicate<Messages.Command> predicate) {
+        LiveNode n = live.get(nodeId);
+        if (n != null) {
+            n.pending.removeIf(predicate);
+        }
+    }
+
     /** Marks nodes whose lease expired past the dead grace as DEAD; returns newly dead node ids. */
     List<Integer> expireScan() {
         long now = System.currentTimeMillis();
@@ -255,17 +263,50 @@ final class NodeRegistry {
         return n != null && n.alive(System.currentTimeMillis());
     }
 
-    String endpointOf(int nodeId) {
+    boolean isCurrentSession(int nodeId, long incMsb, long incLsb, long sessionEpoch) {
         LiveNode n = live.get(nodeId);
+        return n != null
+                && n.record.incMsb() == incMsb
+                && n.record.incLsb() == incLsb
+                && n.sessionEpoch == sessionEpoch
+                && n.alive(System.currentTimeMillis());
+    }
+
+    String endpointOf(int nodeId) {
+        LiveNode n = liveNodeOrPersisted(nodeId);
         return n == null ? "" : n.record.endpoint();
     }
 
     String hostOf(int nodeId) {
-        LiveNode n = live.get(nodeId);
+        LiveNode n = liveNodeOrPersisted(nodeId);
         return n == null ? null : n.record.host();
     }
 
     Messages.Replica replicaOf(int nodeId) {
         return new Messages.Replica(nodeId, endpointOf(nodeId));
+    }
+
+    private LiveNode liveNodeOrPersisted(int nodeId) {
+        LiveNode n = live.get(nodeId);
+        if (n != null) {
+            return n;
+        }
+        try {
+            var persisted = store.getNode(nodeId);
+            if (persisted.isEmpty()) {
+                return null;
+            }
+            LiveNode loaded = new LiveNode();
+            loaded.record = persisted.get().value();
+            loaded.recordVersion = persisted.get().version();
+            loaded.sessionEpoch = -1;
+            loaded.leaseUntil = 0;
+            loaded.freeBytes = loaded.record.capacityBytes();
+            LiveNode raced = live.putIfAbsent(nodeId, loaded);
+            return raced != null ? raced : loaded;
+        } catch (Exception e) {
+            log.warn("loading node {} from metadata store failed", nodeId, e);
+            return null;
+        }
     }
 }

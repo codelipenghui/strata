@@ -20,30 +20,44 @@ import java.util.concurrent.TimeUnit;
 /**
  * ZooKeeper backend (tech design §4.4, v0 only — development/prototype; retired at v1 GA).
  * Layout: /strata/files/<fileId> (FileRecord, CAS by znode version),
- * /strata/namespaces/<namespace>/paths/<path segments>/__file (FileId binding),
+ * /strata/file-ids/<fileId> (permanent FileId reservation),
+ * /strata/namespaces/<namespace>/paths/<path segments>/__file (FileId binding or empty tombstone),
  * /strata/nodes/<nodeId>, /strata/ids/seq- (sequential, node-id allocation).
  */
 public final class ZkMetadataStore implements MetadataStore {
     private static final String FILES = "/strata/files";
+    private static final String FILE_IDS = "/strata/file-ids";
     private static final String NAMESPACES = "/strata/namespaces";
     private static final String NODES = "/strata/nodes";
     private static final String IDS = "/strata/ids";
     private static final String FILE_MARKER = "__file";
+    private static final byte[] DELETED_FILE_MARKER = new byte[0];
 
     private final CuratorFramework curator;
     private final boolean ownsCurator;
+    private final int connectionTimeoutMs;
 
     public ZkMetadataStore(String zkConnect) {
-        this(CuratorFrameworkFactory.newClient(zkConnect, new ExponentialBackoffRetry(100, 5)), true);
+        this(zkConnect, 60_000, 15_000);
+    }
+
+    public ZkMetadataStore(String zkConnect, int sessionTimeoutMs, int connectionTimeoutMs) {
+        this(CuratorFrameworkFactory.builder()
+                .connectString(zkConnect)
+                .sessionTimeoutMs(sessionTimeoutMs)
+                .connectionTimeoutMs(connectionTimeoutMs)
+                .retryPolicy(new ExponentialBackoffRetry(100, 5))
+                .build(), true, connectionTimeoutMs);
     }
 
     public ZkMetadataStore(CuratorFramework curator) {
-        this(curator, false);
+        this(curator, false, 10_000);
     }
 
-    private ZkMetadataStore(CuratorFramework curator, boolean ownsCurator) {
+    private ZkMetadataStore(CuratorFramework curator, boolean ownsCurator, int connectionTimeoutMs) {
         this.curator = curator;
         this.ownsCurator = ownsCurator;
+        this.connectionTimeoutMs = connectionTimeoutMs;
         boolean initialized = false;
         try {
             if (ownsCurator) {
@@ -61,8 +75,9 @@ public final class ZkMetadataStore implements MetadataStore {
 
     private void awaitConnected() {
         try {
-            if (!curator.blockUntilConnected(10, TimeUnit.SECONDS)) {
-                throw new IllegalStateException("zk connection timed out");
+            if (!curator.blockUntilConnected(connectionTimeoutMs, TimeUnit.MILLISECONDS)) {
+                throw new IllegalStateException("zk connection timed out after "
+                        + connectionTimeoutMs + "ms");
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -72,7 +87,7 @@ public final class ZkMetadataStore implements MetadataStore {
 
     private void init() {
         try {
-            for (String path : new String[]{FILES, NAMESPACES, NODES, IDS}) {
+            for (String path : new String[]{FILES, FILE_IDS, NAMESPACES, NODES, IDS}) {
                 try {
                     if (curator.checkExists().forPath(path) == null) {
                         curator.create().creatingParentsIfNeeded().forPath(path);
@@ -94,12 +109,25 @@ public final class ZkMetadataStore implements MetadataStore {
     @Override
     public void createFile(Records.FileRecord record) throws Exception {
         ensureNamespaceDir(record.namespace(), record.path());
-        List<CuratorOp> ops = List.of(
-                curator.transactionOp().create().forPath(FILES + "/" + record.fileId(), record.encode()),
-                curator.transactionOp().create()
-                        .forPath(fileMarkerPath(record.namespace(), record.path()), fileIdBytes(record.fileId()))
-        );
-        curator.transaction().forOperations(ops);
+        String markerPath = fileMarkerPath(record.namespace(), record.path());
+        Optional<PathMarker> marker = readPathMarker(record.namespace(), record.path());
+        if (marker.isPresent() && marker.get().fileId().isPresent()) {
+            throw new KeeperException.NodeExistsException(markerPath);
+        }
+        List<CuratorOp> ops = new ArrayList<>();
+        ops.add(curator.transactionOp().create().forPath(FILE_IDS + "/" + record.fileId(), new byte[0]));
+        ops.add(curator.transactionOp().create().forPath(FILES + "/" + record.fileId(), record.encode()));
+        if (marker.isPresent()) {
+            ops.add(curator.transactionOp().setData().withVersion(marker.get().version())
+                    .forPath(markerPath, fileIdBytes(record.fileId())));
+        } else {
+            ops.add(curator.transactionOp().create().forPath(markerPath, fileIdBytes(record.fileId())));
+        }
+        try {
+            curator.transaction().forOperations(ops);
+        } catch (KeeperException.BadVersionException e) {
+            throw new KeeperException.NodeExistsException(markerPath);
+        }
     }
 
     @Override
@@ -115,12 +143,11 @@ public final class ZkMetadataStore implements MetadataStore {
 
     @Override
     public Optional<FileId> resolvePath(StrataNamespace namespace, StrataPath path) throws Exception {
-        try {
-            byte[] data = curator.getData().forPath(fileMarkerPath(namespace, path));
-            return Optional.of(readFileId(data));
-        } catch (KeeperException.NoNodeException e) {
+        Optional<PathMarker> marker = readPathMarker(namespace, path);
+        if (marker.isEmpty() || marker.get().fileId().isEmpty()) {
             return Optional.empty();
         }
+        return marker.get().fileId();
     }
 
     @Override
@@ -128,27 +155,32 @@ public final class ZkMetadataStore implements MetadataStore {
         try {
             curator.setData().withVersion(expectedVersion).forPath(FILES + "/" + record.fileId(), record.encode());
             return true;
-        } catch (KeeperException.BadVersionException e) {
+        } catch (KeeperException.BadVersionException | KeeperException.NoNodeException e) {
             return false;
         }
     }
 
     @Override
     public boolean deletePath(StrataNamespace namespace, StrataPath path, FileId expectedFileId) throws Exception {
+        Optional<PathMarker> marker = readPathMarker(namespace, path);
+        if (marker.isEmpty() || marker.get().fileId().isEmpty()) {
+            return true;
+        }
+        if (!marker.get().fileId().get().equals(expectedFileId)) {
+            return false;
+        }
         try {
-            byte[] data = curator.getData().forPath(fileMarkerPath(namespace, path));
-            if (!readFileId(data).equals(expectedFileId)) {
-                return false;
-            }
-            curator.delete().forPath(fileMarkerPath(namespace, path));
+            curator.setData().withVersion(marker.get().version())
+                    .forPath(fileMarkerPath(namespace, path), DELETED_FILE_MARKER);
             return true;
-        } catch (KeeperException.NoNodeException ignored) {
-            return true;
+        } catch (KeeperException.BadVersionException | KeeperException.NoNodeException e) {
+            return pathNoLongerBinds(namespace, path, expectedFileId);
         }
     }
 
     @Override
     public boolean deleteFile(FileId id, int expectedVersion) throws Exception {
+        String filePath = FILES + "/" + id;
         try {
             Optional<Versioned<Records.FileRecord>> current = getFile(id);
             if (current.isEmpty()) {
@@ -157,13 +189,23 @@ public final class ZkMetadataStore implements MetadataStore {
             if (current.get().version() != expectedVersion) {
                 return false;
             }
-            curator.delete().withVersion(expectedVersion).forPath(FILES + "/" + id);
-            deletePath(current.get().value().namespace(), current.get().value().path(), id);
+            Records.FileRecord record = current.get().value();
+            Optional<PathMarker> marker = readPathMarker(record.namespace(), record.path());
+            if (marker.isPresent() && marker.get().fileId().map(id::equals).orElse(false)) {
+                List<CuratorOp> ops = List.of(
+                        curator.transactionOp().delete().withVersion(expectedVersion).forPath(filePath),
+                        curator.transactionOp().setData().withVersion(marker.get().version())
+                                .forPath(fileMarkerPath(record.namespace(), record.path()), DELETED_FILE_MARKER)
+                );
+                curator.transaction().forOperations(ops);
+            } else {
+                curator.delete().withVersion(expectedVersion).forPath(filePath);
+            }
             return true;
         } catch (KeeperException.BadVersionException e) {
             return false;
         } catch (KeeperException.NoNodeException ignored) {
-            return true;
+            return getFile(id).isEmpty();
         }
     }
 
@@ -198,11 +240,35 @@ public final class ZkMetadataStore implements MetadataStore {
         return buf.array();
     }
 
-    private static FileId readFileId(byte[] bytes) {
+    private static Optional<FileId> readFileId(byte[] bytes) {
+        if (bytes.length == 0) {
+            return Optional.empty();
+        }
         if (bytes.length != 16) {
             throw new IllegalArgumentException("bad namespace file id length " + bytes.length);
         }
-        return FileId.readFrom(ByteBuffer.wrap(bytes));
+        return Optional.of(FileId.readFrom(ByteBuffer.wrap(bytes)));
+    }
+
+    private Optional<PathMarker> readPathMarker(StrataNamespace namespace, StrataPath path) throws Exception {
+        try {
+            Stat stat = new Stat();
+            byte[] data = curator.getData().storingStatIn(stat).forPath(fileMarkerPath(namespace, path));
+            return Optional.of(new PathMarker(readFileId(data), stat.getVersion()));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    private boolean pathNoLongerBinds(StrataNamespace namespace, StrataPath path, FileId expectedFileId)
+            throws Exception {
+        Optional<PathMarker> latest = readPathMarker(namespace, path);
+        return latest.isEmpty()
+                || latest.get().fileId().isEmpty()
+                || !latest.get().fileId().get().equals(expectedFileId);
+    }
+
+    private record PathMarker(Optional<FileId> fileId, int version) {
     }
 
     @Override
@@ -222,7 +288,8 @@ public final class ZkMetadataStore implements MetadataStore {
                 curator.setData().withVersion(expectedVersion).forPath(path, record.encode());
             }
             return true;
-        } catch (KeeperException.NodeExistsException | KeeperException.BadVersionException e) {
+        } catch (KeeperException.NodeExistsException | KeeperException.BadVersionException
+                 | KeeperException.NoNodeException e) {
             return false;
         }
     }

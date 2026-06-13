@@ -21,6 +21,10 @@ public interface MetadataStore extends AutoCloseable {
 
     /* ---- file / chunk records ---- */
 
+    /**
+     * Creates a file and permanently reserves its FileId. A deleted FileId must not become
+     * creatable again; otherwise a delayed CREATE replay can resurrect a deleted file.
+     */
     void createFile(Records.FileRecord record) throws Exception;
 
     Optional<Versioned<Records.FileRecord>> getFile(FileId id) throws Exception;

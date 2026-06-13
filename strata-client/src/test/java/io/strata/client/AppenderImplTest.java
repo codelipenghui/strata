@@ -19,6 +19,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -671,6 +672,70 @@ class AppenderImplTest {
                 assertTrue(e.getMessage().contains("cannot open chunk on a quorum"));
                 assertTrue(aborted.get());
                 assertTrue(cleanupDeleteAttempted.get());
+            }
+        }
+    }
+
+    @Test
+    void openRetryWithExclusionsKeepsOriginalQuorumFailureWhenPlacementRunsOut() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicBoolean aborted = new AtomicBoolean();
+        AtomicInteger createCalls = new AtomicInteger();
+        AtomicReference<List<Integer>> excludedRetry = new AtomicReference<>();
+        AtomicBoolean fallbackWithoutExclusions = new AtomicBoolean();
+
+        try (ScpServer opened = new ScpServer(0, 1, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.OPEN_CHUNK) {
+                return ScpServer.ok(req, Messages.okHeader(), null);
+            }
+            if (op == Opcode.DELETE_CHUNKS) {
+                Messages.DeleteChunks.decode(req.headerSlice());
+                return ScpServer.ok(req, Messages.okHeader(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+             ScpServer failedA = failingOpenServer(2);
+             ScpServer failedB = failingOpenServer(3);
+             ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
+                 Opcode op = Opcode.fromCode(req.opcode());
+                 if (op == Opcode.CREATE_CHUNK) {
+                     Messages.CreateChunk create = Messages.CreateChunk.decode(req.headerSlice());
+                     int call = createCalls.incrementAndGet();
+                     if (call == 1) {
+                         assertTrue(create.excludedNodeIds().isEmpty());
+                         return ScpServer.ok(req, new Messages.CreateChunkResp(chunkId, 1, List.of(
+                                 new Messages.Replica(1, endpoint(opened)),
+                                 new Messages.Replica(2, endpoint(failedA)),
+                                 new Messages.Replica(3, endpoint(failedB)))).encode(), null);
+                     }
+                     if (call == 2) {
+                         excludedRetry.set(create.excludedNodeIds());
+                         throw new ScpException(ErrorCode.NO_CAPACITY, "no spare nodes");
+                     }
+                     fallbackWithoutExclusions.set(create.excludedNodeIds().isEmpty());
+                     throw new ScpException(ErrorCode.NO_CAPACITY, "still no quorum");
+                 }
+                 if (op == Opcode.ABORT_CHUNK_META) {
+                     Messages.AbortChunkMeta.decode(req.headerSlice());
+                     aborted.set(true);
+                     return ScpServer.ok(req, Messages.okHeader(), null);
+                 }
+                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+             })) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1,
+                        Messages.WritePolicy.DEFAULT, 0);
+
+                ScpException e = assertThrows(ScpException.class,
+                        () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
+                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertTrue(e.getMessage().contains("cannot open chunk on a quorum"));
+                assertTrue(aborted.get());
+                assertEquals(Set.of(2, 3), Set.copyOf(excludedRetry.get()));
+                assertTrue(fallbackWithoutExclusions.get());
             }
         }
     }
@@ -1463,7 +1528,7 @@ class AppenderImplTest {
 
                 ScpException e = assertThrows(ScpException.class, appender::seal);
                 assertEquals(ErrorCode.CORRUPT_CHUNK, e.code());
-                assertEquals(List.of(1, 2, 3), sealedReplicas.get());
+                assertCommittedDefaultSealQuorum(sealedReplicas.get());
             }
         }
     }
@@ -1497,7 +1562,7 @@ class AppenderImplTest {
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
                 assertEquals(ErrorCode.CORRUPT_CHUNK, e.code());
-                assertEquals(List.of(1, 2, 3), sealedReplicas.get());
+                assertCommittedDefaultSealQuorum(sealedReplicas.get());
             }
         }
     }
@@ -1523,7 +1588,7 @@ class AppenderImplTest {
 
                 ScpException sealFailure = assertThrows(ScpException.class, appender::seal);
                 assertEquals(ErrorCode.INTERNAL, sealFailure.code());
-                assertEquals(List.of(1, 2, 3), sealedReplicas.get());
+                assertCommittedDefaultSealQuorum(sealedReplicas.get());
                 assertEquals(null, sealedFileLength.get());
 
                 ScpException later = assertThrows(ScpException.class,
@@ -1628,6 +1693,14 @@ class AppenderImplTest {
         field.setAccessible(true);
         boolean[] values = (boolean[]) field.get(target);
         values[index] = value;
+    }
+
+    private static void assertCommittedDefaultSealQuorum(List<Integer> sealedReplicas) {
+        assertNotNull(sealedReplicas);
+        assertTrue(sealedReplicas.size() >= Messages.WritePolicy.DEFAULT.ackQuorum());
+        assertTrue(sealedReplicas.size() <= Messages.WritePolicy.DEFAULT.replicationFactor());
+        assertEquals(sealedReplicas.size(), new java.util.HashSet<>(sealedReplicas).size());
+        assertTrue(List.of(1, 2, 3).containsAll(sealedReplicas));
     }
 
     private static ManagedScpConnection[] connections(Object session) throws Exception {

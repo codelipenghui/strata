@@ -582,14 +582,15 @@ public final class Messages {
 
     public record InventoryEntry(ChunkId chunkId, ChunkState state, long length, int crc) {}
 
-    public record InventoryReport(int nodeId, int shardIndex, int shardCount, List<InventoryEntry> entries) {
+    public record InventoryReport(int nodeId, long incMsb, long incLsb, long sessionEpoch,
+                                  int shardIndex, int shardCount, List<InventoryEntry> entries) {
         public InventoryReport {
             entries = List.copyOf(entries);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.u32(nodeId).u32(shardIndex).u32(shardCount);
+            w.u32(nodeId).u64(incMsb).u64(incLsb).u64(sessionEpoch).u32(shardIndex).u32(shardCount);
             w.varint(entries.size());
             for (InventoryEntry e : entries) {
                 w.chunkId(e.chunkId()).u8(e.state().value).u64(e.length()).u32(e.crc());
@@ -599,14 +600,16 @@ public final class Messages {
         }
 
         public static InventoryReport decode(ByteBuffer b) {
-            int nodeId = b.getInt(), shard = b.getInt(), count = b.getInt();
+            int nodeId = b.getInt();
+            long incMsb = b.getLong(), incLsb = b.getLong(), sessionEpoch = b.getLong();
+            int shard = b.getInt(), count = b.getInt();
             int n = count(b);
             List<InventoryEntry> es = new ArrayList<>(n);
             for (int i = 0; i < n; i++) {
                 es.add(new InventoryEntry(ChunkId.readFrom(b), ChunkState.fromValue(b.get()), b.getLong(), b.getInt()));
             }
             TaggedFields.readFrom(b);
-            return new InventoryReport(nodeId, shard, count, es);
+            return new InventoryReport(nodeId, incMsb, incLsb, sessionEpoch, shard, count, es);
         }
     }
 
@@ -697,25 +700,60 @@ public final class Messages {
         }
     }
 
-    public record CreateChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb) {
+    public record CreateChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb,
+                              List<Integer> excludedNodeIds) {
+        public static final int TAG_EXCLUDED_NODE_IDS = 0;
+
+        public CreateChunk {
+            excludedNodeIds = List.copyOf(excludedNodeIds);
+        }
+
         public CreateChunk(FileId fileId, int writeEpoch) {
             this(fileId, writeEpoch, UUID.randomUUID());
         }
 
+        public CreateChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb) {
+            this(fileId, writeEpoch, opIdMsb, opIdLsb, List.of());
+        }
+
         private CreateChunk(FileId fileId, int writeEpoch, UUID opId) {
-            this(fileId, writeEpoch, opId.getMostSignificantBits(), opId.getLeastSignificantBits());
+            this(fileId, writeEpoch, opId.getMostSignificantBits(), opId.getLeastSignificantBits(), List.of());
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.fileId(fileId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb).noTags();
+            w.fileId(fileId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb);
+            if (excludedNodeIds.isEmpty()) {
+                w.noTags();
+            } else {
+                BufWriter excluded = new BufWriter();
+                excluded.varint(excludedNodeIds.size());
+                for (int nodeId : excludedNodeIds) excluded.u32(nodeId);
+                TaggedFields.of(Map.of(TAG_EXCLUDED_NODE_IDS, excluded.toBytes())).writeTo(w);
+            }
             return w.toBytes();
         }
 
         public static CreateChunk decode(ByteBuffer b) {
-            CreateChunk m = new CreateChunk(FileId.readFrom(b), b.getInt(), b.getLong(), b.getLong());
-            TaggedFields.readFrom(b);
-            return m;
+            FileId fileId = FileId.readFrom(b);
+            int writeEpoch = b.getInt();
+            long opIdMsb = b.getLong();
+            long opIdLsb = b.getLong();
+            TaggedFields tags = TaggedFields.readFrom(b);
+            byte[] rawExcluded = tags.get(TAG_EXCLUDED_NODE_IDS);
+            List<Integer> excluded = List.of();
+            if (rawExcluded != null) {
+                ByteBuffer excludedBuf = ByteBuffer.wrap(rawExcluded);
+                int n = count(excludedBuf);
+                List<Integer> ids = new ArrayList<>(n);
+                for (int i = 0; i < n; i++) ids.add(excludedBuf.getInt());
+                if (excludedBuf.hasRemaining()) {
+                    throw new IllegalArgumentException(
+                            "trailing bytes in CreateChunk excluded-node tag: " + excludedBuf.remaining());
+                }
+                excluded = ids;
+            }
+            return new CreateChunk(fileId, writeEpoch, opIdMsb, opIdLsb, excluded);
         }
     }
 

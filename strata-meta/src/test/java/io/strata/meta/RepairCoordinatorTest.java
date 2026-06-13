@@ -84,6 +84,57 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void inventoryDoesNotDeleteRepairTargetCopyWhileCommandIsInFlight() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Registered source = register(registry, 301, "source");
+        Registered target = register(registry, 401, "target");
+        FileId fileId = fileId(301);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        store.createFile(file(fileId, FileState.SEALED,
+                List.of(sealed(0, 512, 3001, List.of(source.nodeId())))));
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
+
+        coordinator.scanOnce();
+        Messages.ReplicateCmd replicate = assertInstanceOf(Messages.ReplicateCmd.class,
+                onlyCommand(heartbeat(registry, coordinator, target, List.of())));
+        coordinator.onInventory(inventory(target, List.of(
+                new Messages.InventoryEntry(chunkId, ChunkState.SEALED, 512, 3001))));
+        assertTrue(heartbeat(registry, coordinator, target, List.of()).commands().isEmpty());
+        registry.enqueue(target.nodeId(), new Messages.DeleteCmd(123, List.of(chunkId)));
+
+        Messages.HeartbeatResp afterCompletion = heartbeat(registry, coordinator, target,
+                List.of(new Messages.CompletedCommand(replicate.commandId(), (short) 0)));
+
+        assertTrue(afterCompletion.commands().isEmpty());
+        assertEquals(List.of(source.nodeId(), target.nodeId()),
+                store.files.get(fileId).value().chunks().get(0).replicas());
+    }
+
+    @Test
+    void staleMissingInventoryAfterRepairSwapDoesNotDropNewReplica() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Registered source = register(registry, 302, "source");
+        Registered target = register(registry, 402, "target");
+        FileId fileId = fileId(302);
+        store.createFile(file(fileId, FileState.SEALED,
+                List.of(sealed(0, 512, 3002, List.of(source.nodeId())))));
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
+
+        coordinator.scanOnce();
+        Messages.ReplicateCmd replicate = assertInstanceOf(Messages.ReplicateCmd.class,
+                onlyCommand(heartbeat(registry, coordinator, target, List.of())));
+        coordinator.onCommandCompleted(target.nodeId(),
+                new Messages.CompletedCommand(replicate.commandId(), (short) 0));
+        coordinator.onInventory(inventory(target, List.of()));
+
+        assertEquals(List.of(source.nodeId(), target.nodeId()),
+                store.files.get(fileId).value().chunks().get(0).replicas());
+        assertTrue(heartbeat(registry, coordinator, target, List.of()).commands().isEmpty());
+    }
+
+    @Test
     void duplicateReplicateIssueIsSuppressedByChunkMarker() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
@@ -356,6 +407,28 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void expiredDeleteCommandIsRetriedByNextScan() throws Exception {
+        FakeStore store = new FakeStore();
+        MetaConfig config = config(-1);
+        NodeRegistry registry = new NodeRegistry(store, config);
+        Registered node = register(registry, 1411, "delete-target");
+        FileId fileId = fileId(821);
+        store.createFile(file(fileId, FileState.DELETING,
+                List.of(sealed(0, 64, 8821, List.of(node.nodeId())))));
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config, () -> true);
+
+        coordinator.scanOnce();
+        coordinator.scanOnce();
+
+        Messages.HeartbeatResp heartbeat = heartbeat(registry, coordinator, node, List.of());
+        assertEquals(2, heartbeat.commands().size());
+        assertEquals(List.of(new ChunkId(fileId, 0)),
+                assertInstanceOf(Messages.DeleteCmd.class, heartbeat.commands().get(0)).chunkIds());
+        assertEquals(List.of(new ChunkId(fileId, 0)),
+                assertInstanceOf(Messages.DeleteCmd.class, heartbeat.commands().get(1)).chunkIds());
+    }
+
+    @Test
     void replicaSwapCasExhaustionLeavesDescriptorForNextScan() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
@@ -440,7 +513,7 @@ class RepairCoordinatorTest {
                 sealed(3, 400, 400, List.of(node.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
-        coordinator.onInventory(new Messages.InventoryReport(node.nodeId(), 0, 1, List.of(
+        coordinator.onInventory(inventory(node, List.of(
                 new Messages.InventoryEntry(corrupt, ChunkState.SEALED, 201, 200),
                 new Messages.InventoryEntry(open, ChunkState.OPEN, 300, 300),
                 new Messages.InventoryEntry(deleting, ChunkState.DELETING, 400, 400),
@@ -468,14 +541,31 @@ class RepairCoordinatorTest {
         NodeRegistry registry = new NodeRegistry(store, config());
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
-        coordinator.onInventory(new Messages.InventoryReport(999, 0, 1,
+        coordinator.onInventory(new Messages.InventoryReport(999, 1, 2, 3, 0, 1,
                 List.of(new Messages.InventoryEntry(new ChunkId(fileId(85), 0), ChunkState.SEALED, 1, 1))));
 
         Registered node = register(registry, 146, "node");
         store.throwOnListFiles = true;
-        coordinator.onInventory(new Messages.InventoryReport(node.nodeId(), 0, 1, List.of()));
+        coordinator.onInventory(inventory(node, List.of()));
         store.throwOnListFiles = false;
 
+        assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
+    }
+
+    @Test
+    void inventoryIgnoresStaleSessionForLiveNode() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Registered node = register(registry, 1461, "node");
+        FileId fileId = fileId(851);
+        store.createFile(file(fileId, FileState.SEALED,
+                List.of(sealed(0, 10, 100, List.of(node.nodeId())))));
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
+
+        coordinator.onInventory(new Messages.InventoryReport(node.nodeId(), node.incMsb(), node.incLsb(),
+                node.sessionEpoch() - 1, 0, 1, List.of()));
+
+        assertEquals(List.of(node.nodeId()), store.files.get(fileId).value().chunks().get(0).replicas());
         assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
     }
 
@@ -496,7 +586,7 @@ class RepairCoordinatorTest {
                 List.of(new Records.ChunkRecord(0, ChunkState.OPEN, 0, 0, 1, List.of(node.nodeId())))));
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
-        coordinator.onInventory(new Messages.InventoryReport(node.nodeId(), 0, 1, List.of(
+        coordinator.onInventory(inventory(node, List.of(
                 new Messages.InventoryEntry(healthy, ChunkState.SEALED, 10, 100))));
 
         assertEquals(List.of(node.nodeId()), store.files.get(healthyFile).value().chunks().get(0).replicas());
@@ -579,6 +669,11 @@ class RepairCoordinatorTest {
         return registry.heartbeat(new Messages.NodeHeartbeat(node.nodeId(), node.incMsb(), node.incLsb(),
                 node.sessionEpoch(), List.of(new Messages.StorageUsage(0, 1_000_000)),
                 0, completedCommands), coordinator::onCommandCompleted);
+    }
+
+    private static Messages.InventoryReport inventory(Registered node, List<Messages.InventoryEntry> entries) {
+        return new Messages.InventoryReport(node.nodeId(), node.incMsb(), node.incLsb(),
+                node.sessionEpoch(), 0, 1, entries);
     }
 
     private static Messages.Command onlyCommand(Messages.HeartbeatResp heartbeat) {
