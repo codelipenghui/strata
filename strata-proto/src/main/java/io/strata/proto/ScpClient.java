@@ -222,8 +222,17 @@ public final class ScpClient implements AutoCloseable {
      */
     public CompletableFuture<Frame> sendWithTimeout(Opcode op, byte[] header, ByteBuffer payload, long timeoutMs) {
         CompletableFuture<Frame> fut = send(op, header, payload);
-        fut.orTimeout(timeoutMs, TimeUnit.MILLISECONDS);
+        // Schedule the deadline on THIS connection's Netty event loop rather than
+        // CompletableFuture.orTimeout, which routes every call through one process-wide Delayer
+        // executor. Under a deep append pipeline (responses arrive fast, so each timeout is
+        // scheduled then immediately cancelled) that single delay-queue heap is a top CPU cost
+        // (schedule + heap-remove per request, ~135k/s); per-event-loop timers spread the load
+        // across the I/O threads and Netty's scheduled-task cancellation is cheap.
+        io.netty.util.concurrent.ScheduledFuture<?> deadline = channel.eventLoop().schedule(
+                () -> fut.completeExceptionally(new TimeoutException("timed out after " + timeoutMs + "ms")),
+                timeoutMs, TimeUnit.MILLISECONDS);
         fut.whenComplete((frame, err) -> {
+            deadline.cancel(false);
             if (isTimeout(err)) {
                 close();
             }
