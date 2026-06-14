@@ -1,4 +1,9 @@
+# The runtime image needs exactly one file: the server fat jar. Exclude every target/ tree to keep
+# the build context tiny, then re-include just strata-server's jar (ignore-dir-keep-one-file form).
 **/target
+!strata-server/target
+strata-server/target/*
+!strata-server/target/strata-server.jar
 .git
 .github
 *.jfr

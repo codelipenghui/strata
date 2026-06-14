@@ -1,6 +1,11 @@
 # A runnable single-host Strata cluster: ZooKeeper + one metadata service + a 3-node fleet (RF=3).
-#   docker compose up --build
 # Clients reach the metadata plane at localhost:9200.
+#
+#   ./scripts/build-image.sh     # packages the jar + builds strata-server:local
+#   docker compose up            # starts the cluster using that image
+#
+# The image carries the pre-built fat jar (see Dockerfile), so build it first. Plain `up` reuses
+# strata-server:local; `up --build` re-runs the Dockerfile and likewise needs the jar present.
 #
 # This is a development/soak topology, not a production deployment (single ZK, single metadata
 # service, co-located on one host). It exists to exercise the real server processes end to end.
