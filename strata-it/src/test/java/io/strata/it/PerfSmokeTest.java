@@ -117,28 +117,35 @@ class PerfSmokeTest {
                         PAR_FILES, PAR_RECORDS, RECORD_SIZE, WINDOW, PAR_READERS, PAR_READ_PASSES);
 
                 // Writes fan out across files; one appender per file (single-writer-per-file).
-                ParallelWriteResult w = runParallelWrite(client, PAR_FILES, PAR_RECORDS, WINDOW);
-                printWrite("parallel write " + PAR_FILES + " files (1 writer each)   ",
-                        new WriteResult(w.latencies(), w.throughputMBs()));
-                System.out.printf(Locale.ROOT,
-                        "  -> physical write incl. replicas (x%d) = %7.1f MB/s  "
-                                + "(target: near disk write ceiling)%n",
-                        REPLICATION_FACTOR, w.throughputMBs() * REPLICATION_FACTOR);
+                // Measure BOTH durability modes. Only ack-on-fsync forces the bytes to disk
+                // BEFORE acking, so only its physical number is apples-to-apples with a forced
+                // disk write ceiling. Ack-on-replicate acks on page-cache quorum and can briefly
+                // run ABOVE the sustained disk rate by buffering — do not compare it to a forced
+                // ceiling. The replicate files also feed the read test below.
+                ParallelWriteResult wRep = runParallelWrite(client, PAR_FILES, PAR_RECORDS, WINDOW,
+                        StrataClient.WritePolicy.DEFAULT, "/par-rep-");
+                printParallelWrite("parallel write " + PAR_FILES + " files, ack-on-replicate", wRep);
+
+                ParallelWriteResult wFsync = runParallelWrite(client, PAR_FILES, PAR_RECORDS, WINDOW,
+                        StrataClient.WritePolicy.fsync(REPLICATION_FACTOR, 2), "/par-fsync-");
+                printParallelWrite("parallel write " + PAR_FILES + " files, ack-on-fsync   ", wFsync);
 
                 // Many readers on ONE file — the no-single-reader-per-file property, concurrent
                 // zero-copy region transfer from a single sealed chunk.
-                ReadResult single = runParallelRead(client, List.of(w.fileIds().get(0)),
-                        PAR_READERS, PAR_READ_PASSES, w.perFileBytes());
+                ReadResult single = runParallelRead(client, List.of(wRep.fileIds().get(0)),
+                        PAR_READERS, PAR_READ_PASSES, wRep.perFileBytes());
                 printRead("parallel read  1 file  x " + PAR_READERS + " readers     ", single);
 
                 // One reader per file across all files — independent chunks/streams in parallel.
-                ReadResult multi = runParallelRead(client, w.fileIds(),
-                        w.fileIds().size(), PAR_READ_PASSES, w.perFileBytes());
+                ReadResult multi = runParallelRead(client, wRep.fileIds(),
+                        wRep.fileIds().size(), PAR_READ_PASSES, wRep.perFileBytes());
                 printRead("parallel read  " + PAR_FILES + " files x " + PAR_FILES + " readers     ", multi);
 
                 // pathology guards, deliberately loose (machine + contention vary wildly)
-                assertTrue(w.throughputMBs() > 10.0,
-                        "parallel multi-file write below 10 MB/s — pathological");
+                assertTrue(wRep.throughputMBs() > 10.0,
+                        "parallel ack-on-replicate write below 10 MB/s — pathological");
+                assertTrue(wFsync.throughputMBs() > 5.0,
+                        "parallel ack-on-fsync write below 5 MB/s — pathological");
                 assertTrue(single.throughputMBs() > 50.0,
                         "parallel single-file read below 50 MB/s — pathological");
                 assertTrue(multi.throughputMBs() > 50.0,
@@ -151,15 +158,16 @@ class PerfSmokeTest {
                                        double throughputMBs, long perFileBytes) {}
 
     /** F files, one appender each, all driven concurrently; aggregate ack throughput. */
-    private ParallelWriteResult runParallelWrite(StrataClient client, int files,
-                                                 int recordsPerFile, int window) throws Exception {
+    private ParallelWriteResult runParallelWrite(StrataClient client, int files, int recordsPerFile,
+                                                 int window, StrataClient.WritePolicy policy,
+                                                 String pathPrefix) throws Exception {
         byte[] payload = new byte[RECORD_SIZE];
         ThreadLocalRandom.current().nextBytes(payload);
 
         List<FileId> ids = new ArrayList<>();
         List<StrataFile.Appender> appenders = new ArrayList<>();
         for (int f = 0; f < files; f++) {
-            FileId id = client.create(new StrataClient.FileSpec("test", "/par-write-" + f)).id();
+            FileId id = client.create(new StrataClient.FileSpec("test", pathPrefix + f, policy)).id();
             ids.add(id);
             appenders.add(client.openById(id).openForAppend());
         }
@@ -361,6 +369,14 @@ class PerfSmokeTest {
                 "%s  p50=%6.2fms  p95=%6.2fms  p99=%6.2fms  max=%7.2fms  throughput=%7.1f MB/s%n",
                 label, ms(p(r.latenciesNanos(), 50)), ms(p(r.latenciesNanos(), 95)),
                 ms(p(r.latenciesNanos(), 99)), ms(p(r.latenciesNanos(), 100)), r.throughputMBs());
+    }
+
+    /** Write line plus the physical (with-replicas) throughput — the disk-ceiling comparison. */
+    private static void printParallelWrite(String label, ParallelWriteResult w) {
+        printWrite(label + " ", new WriteResult(w.latencies(), w.throughputMBs()));
+        System.out.printf(Locale.ROOT,
+                "  -> physical write incl. replicas (x%d) = %7.1f MB/s%n",
+                REPLICATION_FACTOR, w.throughputMBs() * REPLICATION_FACTOR);
     }
 
     private static void printRead(String label, ReadResult r) {
