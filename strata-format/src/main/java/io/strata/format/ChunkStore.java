@@ -249,7 +249,9 @@ public final class ChunkStore implements AutoCloseable {
         Handle h = lookup(id);
         // CRC the payload before taking the chunk monitor: the pass is state-independent and
         // would otherwise serialize behind every other append to this chunk
-        int payloadCrc = payload.hasRemaining() ? Crc.of(payload.duplicate()) : 0;
+        // Crc.of(ByteBuffer) duplicates the buffer internally, so it leaves payload's position
+        // and limit intact — no need to allocate an outer duplicate here.
+        int payloadCrc = payload.hasRemaining() ? Crc.of(payload) : 0;
         long newEnd;
         GroupCommitter committer;
         synchronized (h) {

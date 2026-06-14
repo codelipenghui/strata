@@ -167,9 +167,19 @@ public final class ChunkFormats {
 
         public byte[] encode() {
             ByteBuffer b = ByteBuffer.allocate(LEDGER_ENTRY_SIZE);
-            b.putLong(endOffset).putInt(payloadCrc).putInt(writeEpoch).putInt(0);
-            b.putInt(Crc.of(b.array(), 0, LEDGER_ENTRY_SIZE - 4));
+            encodeInto(b);
             return b.array();
+        }
+
+        /**
+         * Encodes the 24-byte entry into {@code b} at its current position (heap-backed buffer),
+         * so the hot append path can reuse one scratch buffer instead of allocating a byte[] plus
+         * two ByteBuffer wrappers per record. Byte-identical on-disk content to {@link #encode}.
+         */
+        public void encodeInto(ByteBuffer b) {
+            int start = b.position();
+            b.putLong(endOffset).putInt(payloadCrc).putInt(writeEpoch).putInt(0);
+            b.putInt(Crc.of(b.array(), b.arrayOffset() + start, LEDGER_ENTRY_SIZE - 4));
         }
 
         /** Returns null if the entry bytes are invalid (torn write — recovery stops here). */

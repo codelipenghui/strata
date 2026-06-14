@@ -91,9 +91,10 @@ public final class BufWriter {
         return fileId(c.fileId()).u32(c.index());
     }
 
-    /** Empty tagged-fields block. */
+    /** Empty tagged-fields block. varint(0) is exactly one 0x00 byte, so u8 avoids varint()'s
+     *  per-call ByteBuffer.wrap allocation — and every encoded message ends with one of these. */
     public BufWriter noTags() {
-        return varint(0);
+        return u8(0);
     }
 
     public int size() {

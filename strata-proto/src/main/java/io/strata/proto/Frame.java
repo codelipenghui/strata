@@ -160,6 +160,11 @@ public final class Frame implements AutoCloseable {
     }
 
     private static ByteBuffer copy(ByteBuffer source) {
+        if (source == null || !source.hasRemaining()) {
+            // header-only responses (e.g. the APPEND ack) carry an empty payload; reuse the shared
+            // empty buffer instead of allocating a zero-length array + wrapper per response
+            return EMPTY.duplicate();
+        }
         ByteBuffer duplicate = source.duplicate();
         byte[] bytes = new byte[duplicate.remaining()];
         duplicate.get(bytes);

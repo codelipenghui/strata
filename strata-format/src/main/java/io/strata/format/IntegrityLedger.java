@@ -19,6 +19,9 @@ import static io.strata.format.ChunkFormats.LEDGER_ENTRY_SIZE;
 public final class IntegrityLedger implements AutoCloseable {
     private final FileChannel channel;
     private final List<ChunkFormats.LedgerEntry> entries; // in-memory mirror, ordered by endOffset
+    // appends are single-threaded under the owning chunk's monitor, so one scratch buffer can be
+    // reused for every entry encode instead of allocating a byte[] + two wrappers per record
+    private final ByteBuffer scratch = ByteBuffer.allocate(LEDGER_ENTRY_SIZE);
 
     private IntegrityLedger(FileChannel channel, List<ChunkFormats.LedgerEntry> entries) {
         this.channel = channel;
@@ -54,7 +57,10 @@ public final class IntegrityLedger implements AutoCloseable {
     }
 
     public void append(ChunkFormats.LedgerEntry entry) throws IOException {
-        ChunkFormats.writeFully(channel, ByteBuffer.wrap(entry.encode()), (long) entries.size() * LEDGER_ENTRY_SIZE);
+        scratch.clear();
+        entry.encodeInto(scratch);
+        scratch.flip();
+        ChunkFormats.writeFully(channel, scratch, (long) entries.size() * LEDGER_ENTRY_SIZE);
         entries.add(entry);
     }
 

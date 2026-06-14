@@ -125,7 +125,9 @@ public final class Messages {
 
     public record Append(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset) {
         public byte[] encode() {
-            BufWriter w = new BufWriter();
+            // fixed 41 bytes: chunkId 20 + i32 4 + u64 8 + u64 8 + noTags 1 — size exactly so the
+            // per-append writer never over-allocates (this runs once per record, for all 3 replicas)
+            BufWriter w = new BufWriter(41);
             w.chunkId(chunkId).i32(writeEpoch).u64(baseOffset).u64(durableOffset).noTags();
             return w.toBytes();
         }
