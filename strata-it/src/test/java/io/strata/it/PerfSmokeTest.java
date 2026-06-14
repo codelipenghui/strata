@@ -52,6 +52,11 @@ class PerfSmokeTest {
     private static final int PAR_RECORDS = Integer.getInteger("perf.par.records", 8_000);
     private static final int PAR_READERS = Integer.getInteger("perf.par.readers", 8);
     private static final int PAR_READ_PASSES = Integer.getInteger("perf.par.readPasses", 4);
+    // Files use FileSpec's default WritePolicy (RF=3, ackQuorum=2). The "total throughput with
+    // replicas" — logical x RF — is what should approach the disk's raw write bandwidth, since
+    // all replicas land on disk. Measure the disk ceiling separately (e.g. a sequential
+    // FileChannel write+fsync micro-benchmark) and compare against the physical number below.
+    private static final int REPLICATION_FACTOR = 3;
 
     record WriteResult(long[] latenciesNanos, double throughputMBs) {}
 
@@ -115,6 +120,10 @@ class PerfSmokeTest {
                 ParallelWriteResult w = runParallelWrite(client, PAR_FILES, PAR_RECORDS, WINDOW);
                 printWrite("parallel write " + PAR_FILES + " files (1 writer each)   ",
                         new WriteResult(w.latencies(), w.throughputMBs()));
+                System.out.printf(Locale.ROOT,
+                        "  -> physical write incl. replicas (x%d) = %7.1f MB/s  "
+                                + "(target: near disk write ceiling)%n",
+                        REPLICATION_FACTOR, w.throughputMBs() * REPLICATION_FACTOR);
 
                 // Many readers on ONE file — the no-single-reader-per-file property, concurrent
                 // zero-copy region transfer from a single sealed chunk.
