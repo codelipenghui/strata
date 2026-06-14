@@ -41,8 +41,9 @@ public final class StrataServer {
         switch (role) {
             case "node" -> runNode();
             case "meta" -> runMeta();
+            case "perf" -> StrataPerf.run(args);
             default -> {
-                System.err.println("unknown role '" + role + "': expected 'node' or 'meta'");
+                System.err.println("unknown role '" + role + "': expected 'node', 'meta', or 'perf'");
                 System.exit(2);
             }
         }
@@ -139,7 +140,7 @@ public final class StrataServer {
         }
     }
 
-    private static String env(String key, String def) {
+    static String env(String key, String def) {
         String v = System.getenv(key);
         return (v == null || v.isBlank()) ? def : v.trim();
     }

@@ -112,6 +112,15 @@ services:
     depends_on:
       - prometheus
 
+  # One-off load generator — does NOT start with `up` (profile-gated). Runs on the cluster network
+  # so it can reach the nodes by their advertised hostnames. Use scripts/perf.sh, or:
+  #   docker compose run --rm --no-deps loadgen perf --meta meta:9200 --workload write --duration 120
+  loadgen:
+    <<: *strata
+    profiles: ["tools"]
+    restart: "no"
+    command: ["perf", "--meta", "meta:9200", "--workload", "write", "--duration", "120"]
+
 volumes:
   node1-data:
   node2-data:
