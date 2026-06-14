@@ -8,6 +8,7 @@ import io.strata.meta.MetadataService;
 import io.strata.node.StorageNode;
 import io.strata.proto.RequestObserver;
 
+import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -78,9 +79,13 @@ final class ServerMetrics {
 
     /**
      * A per-request latency observer recording into a {@code strata_scp_request_duration} timer
-     * tagged by opcode + status (with p50/p95/p99). Timers are cached per opcode+status so the
-     * per-request cost is a map lookup + a histogram record — no meter (re)building on the path.
-     * For an async APPEND in fsync mode this latency includes the group-commit/fsync wait.
+     * tagged by opcode + status. Emits a Prometheus HISTOGRAM (cumulative {@code _bucket{le}}
+     * series) rather than client-side quantiles, so percentiles can be aggregated correctly across
+     * the node fleet at query time (histogram_quantile over summed buckets) and re-quantiled at any
+     * window — pre-computed per-instance quantiles cannot be averaged across instances. Explicit SLO
+     * buckets (1ms..5s) bound the cardinality and pick boundaries meaningful for SCP request latency.
+     * Timers are cached per opcode+status, so the per-request cost is a map lookup + a histogram
+     * record. For an async APPEND in fsync mode this latency includes the group-commit/fsync wait.
      */
     static RequestObserver requestObserver(MeterRegistry reg) {
         Map<String, Timer> timers = new ConcurrentHashMap<>();
@@ -90,7 +95,11 @@ final class ServerMetrics {
                             .description("request handler latency by opcode (incl. async durability wait)")
                             .tag("opcode", opcode)
                             .tag("status", status)
-                            .publishPercentiles(0.5, 0.95, 0.99)
+                            .serviceLevelObjectives(
+                                    Duration.ofMillis(1), Duration.ofMillis(2), Duration.ofMillis(5),
+                                    Duration.ofMillis(10), Duration.ofMillis(25), Duration.ofMillis(50),
+                                    Duration.ofMillis(100), Duration.ofMillis(250), Duration.ofMillis(500),
+                                    Duration.ofSeconds(1), Duration.ofMillis(2500), Duration.ofSeconds(5))
                             .register(reg))
                     .record(durationNanos, TimeUnit.NANOSECONDS);
         };

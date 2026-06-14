@@ -103,10 +103,10 @@
       "fieldConfig": { "defaults": { "unit": "s" } }
     },
     {
-      "id": 15, "type": "timeseries", "title": "Request latency p99 (by opcode)",
+      "id": 15, "type": "timeseries", "title": "Request latency p99 (by opcode, fleet-aggregated)",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [ { "expr": "strata_scp_request_duration_seconds{quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{role}}/{{opcode}}" } ],
+      "targets": [ { "expr": "histogram_quantile(0.99, sum by (le, role, opcode) (rate(strata_scp_request_duration_seconds_bucket[5m])))", "refId": "A", "legendFormat": "{{role}}/{{opcode}}" } ],
       "fieldConfig": { "defaults": { "unit": "s" } }
     },
     {
