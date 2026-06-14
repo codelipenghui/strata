@@ -192,20 +192,42 @@ final class MiniCluster implements AutoCloseable {
 
     @Override
     public void close() throws Exception {
-        for (StorageNode n : nodes) {
-            try {
-                n.close();
-            } catch (IOException ignored) {
+        try {
+            for (StorageNode n : nodes) {
+                try {
+                    n.close();
+                } catch (IOException ignored) {
+                }
             }
-        }
-        for (MetadataService m : metas) {
-            try {
-                m.close();
-            } catch (Exception ignored) {
+            for (MetadataService m : metas) {
+                try {
+                    m.close();
+                } catch (Exception ignored) {
+                }
             }
+            if (zk != null) {
+                zk.close();
+            }
+        } finally {
+            // Delete the node data tree on close — otherwise every MiniCluster run leaks its
+            // chunk/ledger files under the system temp dir (write/perf tests write GBs each),
+            // which accumulates and fills the disk over many runs.
+            deleteRecursively(root);
         }
-        if (zk != null) {
-            zk.close();
+    }
+
+    private static void deleteRecursively(Path dir) {
+        if (dir == null) {
+            return;
+        }
+        try (java.util.stream.Stream<Path> walk = Files.walk(dir)) {
+            walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    Files.deleteIfExists(p);
+                } catch (IOException ignored) {
+                }
+            });
+        } catch (IOException ignored) {
         }
     }
 }
