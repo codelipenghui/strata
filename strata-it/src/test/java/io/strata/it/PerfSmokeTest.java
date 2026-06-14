@@ -189,16 +189,18 @@ class PerfSmokeTest {
                 System.out.println("-- read latency: read size (sealed chunk, zero-copy region) --");
                 long sealedBytes = 60L << 20;
                 FileId sealed = buildSealedFile(client, "/lat-read", 1 << 20, 60);
+                long[] read64k = null;
                 for (int size : readSizes) {
-                    printLat(String.format(Locale.ROOT, "  read %9dB", size),
-                            readLatency(client, sealed, size, sealedBytes));
+                    long[] lat = readLatency(client, sealed, size, sealedBytes);
+                    if (size == 65_536) read64k = lat;
+                    printLat(String.format(Locale.ROOT, "  read %9dB", size), lat);
                 }
 
                 System.out.println("-- read latency: open-chunk tail (materialized under lock) --");
                 printLat("  read     65536B (open) ", openTailReadLatency(client, "/lat-open", 65_536));
 
-                // pathology guards, deliberately loose
-                assertTrue(p(readLatency(client, sealed, 65_536, sealedBytes), 99) < 200_000_000L,
+                // pathology guard, deliberately loose — asserts on the 64KB run above, not a re-measure
+                assertTrue(p(read64k, 99) < 200_000_000L,
                         "sealed 64KB read p99 above 200ms — pathological");
             }
         }
@@ -342,16 +344,9 @@ class PerfSmokeTest {
                 int n = 0;
                 long bytes = 0;
                 for (int pass = 0; pass < passes; pass++) {
-                    long offset = 0;
-                    while (true) {
-                        long t0 = System.nanoTime();
-                        StrataFile.ReadResult rr = reader.read(offset, READ_SIZE);
-                        if (rr.data().length == 0) break;
-                        if (n < lat.length) lat[n++] = System.nanoTime() - t0;
-                        bytes += rr.data().length;
-                        offset += rr.data().length;
-                        if (rr.endOfFile()) break;
-                    }
+                    ReadPass p = readToEnd(reader, lat, n);
+                    bytes += p.bytes();
+                    n = p.latencyCount();
                 }
                 perReader[r] = Arrays.copyOf(lat, n);
                 bytesPerReader[r] = bytes;
@@ -453,26 +448,37 @@ class PerfSmokeTest {
         CompletableFuture.allOf(futures).get(10, TimeUnit.MINUTES);
     }
 
+    private record ReadPass(long bytes, int latencyCount) {}
+
+    /**
+     * Reads one reader from 0 to EOF in READ_SIZE chunks, timing each read into {@code latOut}
+     * starting at {@code latStart} (until the array fills). Returns bytes read and the next free
+     * latency index. Shared by the throughput readers ({@link #runRead}, {@link #runParallelRead}).
+     */
+    private static ReadPass readToEnd(StrataFile.Reader reader, long[] latOut, int latStart) {
+        long bytes = 0;
+        long offset = 0;
+        int i = latStart;
+        while (true) {
+            long t0 = System.nanoTime();
+            StrataFile.ReadResult rr = reader.read(offset, READ_SIZE);
+            if (rr.data().length == 0) break;
+            if (i < latOut.length) latOut[i++] = System.nanoTime() - t0;
+            bytes += rr.data().length;
+            offset += rr.data().length;
+            if (rr.endOfFile()) break;
+        }
+        return new ReadPass(bytes, i);
+    }
+
     private ReadResult runRead(StrataClient client, FileId fileId) {
         try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
             long[] latencies = new long[4096];
-            int reads = 0;
-            long bytes = 0;
             long start = System.nanoTime();
-            long offset = 0;
-            while (true) {
-                long t0 = System.nanoTime();
-                StrataFile.ReadResult r = reader.read(offset, READ_SIZE);
-                if (r.data().length == 0) break;
-                if (reads < latencies.length) latencies[reads] = System.nanoTime() - t0;
-                reads++;
-                bytes += r.data().length;
-                offset += r.data().length;
-                if (r.endOfFile()) break;
-            }
+            ReadPass pass = readToEnd(reader, latencies, 0);
             long elapsed = System.nanoTime() - start;
-            double mbs = ((double) bytes / (1 << 20)) / (elapsed / 1e9);
-            return new ReadResult(Arrays.copyOf(latencies, Math.min(reads, latencies.length)), mbs);
+            double mbs = ((double) pass.bytes() / (1 << 20)) / (elapsed / 1e9);
+            return new ReadResult(Arrays.copyOf(latencies, pass.latencyCount()), mbs);
         }
     }
 
@@ -483,26 +489,28 @@ class PerfSmokeTest {
         return sorted[Math.max(0, Math.min(idx, sorted.length - 1))];
     }
 
-    private static void printWrite(String label, WriteResult r) {
+    /** Percentile + throughput line shared by every write/read print path. */
+    private static void printStats(String label, long[] latenciesNanos, double throughputMBs) {
         System.out.printf(Locale.ROOT,
                 "%s  p50=%6.2fms  p95=%6.2fms  p99=%6.2fms  max=%7.2fms  throughput=%7.1f MB/s%n",
-                label, ms(p(r.latenciesNanos(), 50)), ms(p(r.latenciesNanos(), 95)),
-                ms(p(r.latenciesNanos(), 99)), ms(p(r.latenciesNanos(), 100)), r.throughputMBs());
+                label, ms(p(latenciesNanos, 50)), ms(p(latenciesNanos, 95)),
+                ms(p(latenciesNanos, 99)), ms(p(latenciesNanos, 100)), throughputMBs);
+    }
+
+    private static void printWrite(String label, WriteResult r) {
+        printStats(label, r.latenciesNanos(), r.throughputMBs());
     }
 
     /** Write line plus the physical (with-replicas) throughput — the disk-ceiling comparison. */
     private static void printParallelWrite(String label, ParallelWriteResult w) {
-        printWrite(label + " ", new WriteResult(w.latencies(), w.throughputMBs()));
+        printStats(label + " ", w.latencies(), w.throughputMBs());
         System.out.printf(Locale.ROOT,
                 "  -> physical write incl. replicas (x%d) = %7.1f MB/s%n",
                 REPLICATION_FACTOR, w.throughputMBs() * REPLICATION_FACTOR);
     }
 
     private static void printRead(String label, ReadResult r) {
-        System.out.printf(Locale.ROOT,
-                "%s  p50=%6.2fms  p95=%6.2fms  p99=%6.2fms  max=%7.2fms  throughput=%7.1f MB/s%n",
-                label, ms(p(r.latenciesNanos(), 50)), ms(p(r.latenciesNanos(), 95)),
-                ms(p(r.latenciesNanos(), 99)), ms(p(r.latenciesNanos(), 100)), r.throughputMBs());
+        printStats(label, r.latenciesNanos(), r.throughputMBs());
     }
 
     private static double ms(long nanos) {
