@@ -66,6 +66,12 @@ public final class ScpServer implements AutoCloseable {
     private final long incMsb;
     private final long incLsb;
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private volatile RequestObserver requestObserver; // optional; set by the metrics layer
+
+    /** Installs (or clears) the per-request latency observer. Safe to set after the server starts. */
+    public void setRequestObserver(RequestObserver observer) {
+        this.requestObserver = observer;
+    }
 
     public ScpServer(int port, int nodeId, long incMsb, long incLsb, Handler handler) throws IOException {
         this.handler = handler;
@@ -201,26 +207,33 @@ public final class ScpServer implements AutoCloseable {
         }
 
         private void handleRequest(ChannelHandlerContext ctx, Frame req) {
+            long startNanos = System.nanoTime();
             CompletableFuture<Frame> respF;
+            boolean handlerFailed = false;
             try {
                 respF = handler.handleAsync(req);
                 if (respF == null) {
                     respF = CompletableFuture.completedFuture(internalError(req, "handler returned null future"));
+                    handlerFailed = true;
                 }
             } catch (ScpException e) {
                 respF = CompletableFuture.completedFuture(
                         Frame.response(req, Resp.error(e.code(), e.getMessage(), e.detail()), null));
+                handlerFailed = true;
             } catch (Exception e) {
                 log.warn("handler error for opcode 0x{}", Integer.toHexString(req.opcode()), e);
                 respF = CompletableFuture.completedFuture(
                         Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(e), 0), null));
+                handlerFailed = true;
             }
             if (respF.isDone() && !respF.isCompletedExceptionally()) {
+                observeRequest(req, startNanos, !handlerFailed);
                 writeResponse(ctx, requireResponse(req, respF.join()), false, req); // fast path, no extra hop
             } else {
                 inFlightAsyncRequests.add(req);
                 respF.whenComplete((resp, err) -> {
                     inFlightAsyncRequests.remove(req);
+                    observeRequest(req, startNanos, err == null);
                     Frame frame = resp;
                     if (err != null) {
                         Throwable cause = err instanceof java.util.concurrent.CompletionException
@@ -232,6 +245,15 @@ public final class ScpServer implements AutoCloseable {
                     writeResponse(ctx, requireResponse(req, frame), false, req);
                 });
             }
+        }
+
+        private void observeRequest(Frame req, long startNanos, boolean success) {
+            RequestObserver obs = requestObserver;
+            if (obs == null) {
+                return;
+            }
+            Opcode op = Opcode.fromCode(req.opcode());
+            obs.observe(op != null ? op.name() : "unknown", System.nanoTime() - startNanos, success);
         }
 
         private void writeResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,

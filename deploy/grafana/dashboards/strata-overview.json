@@ -101,6 +101,20 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [ { "expr": "sum by (instance) (rate(jvm_gc_pause_seconds_sum[1m]))", "refId": "A", "legendFormat": "{{instance}}" } ],
       "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 15, "type": "timeseries", "title": "Request latency p99 (by opcode)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "strata_scp_request_duration_seconds{quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{role}}/{{opcode}}" } ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 16, "type": "timeseries", "title": "Request rate (by opcode)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "sum by (role, opcode) (rate(strata_scp_request_duration_seconds_count[1m]))", "refId": "A", "legendFormat": "{{role}}/{{opcode}}" } ],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
     }
   ]
 }

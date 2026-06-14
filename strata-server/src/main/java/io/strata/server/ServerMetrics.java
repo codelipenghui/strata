@@ -3,8 +3,14 @@ package io.strata.server;
 import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import io.strata.meta.MetadataService;
 import io.strata.node.StorageNode;
+import io.strata.proto.RequestObserver;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Registers Strata's domain metrics on the meter registry by wiring Micrometer gauges/counters to
@@ -68,5 +74,25 @@ final class ServerMetrics {
                 .description("appended records (rate() = write ops/sec)").register(reg);
         FunctionCounter.builder("strata_node_append_bytes", n, StorageNode::appendBytes)
                 .description("appended payload bytes (rate() = write throughput)").register(reg);
+    }
+
+    /**
+     * A per-request latency observer recording into a {@code strata_scp_request_duration} timer
+     * tagged by opcode + status (with p50/p95/p99). Timers are cached per opcode+status so the
+     * per-request cost is a map lookup + a histogram record — no meter (re)building on the path.
+     * For an async APPEND in fsync mode this latency includes the group-commit/fsync wait.
+     */
+    static RequestObserver requestObserver(MeterRegistry reg) {
+        Map<String, Timer> timers = new ConcurrentHashMap<>();
+        return (opcode, durationNanos, success) -> {
+            String status = success ? "ok" : "error";
+            timers.computeIfAbsent(opcode + ':' + status, k -> Timer.builder("strata_scp_request_duration")
+                            .description("request handler latency by opcode (incl. async durability wait)")
+                            .tag("opcode", opcode)
+                            .tag("status", status)
+                            .publishPercentiles(0.5, 0.95, 0.99)
+                            .register(reg))
+                    .record(durationNanos, TimeUnit.NANOSECONDS);
+        };
     }
 }

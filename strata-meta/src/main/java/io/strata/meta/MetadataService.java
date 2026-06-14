@@ -163,6 +163,11 @@ public final class MetadataService implements AutoCloseable {
         return registry.livenessCounts().dead();
     }
 
+    /** Installs a per-request latency observer on the control-plane server (used by the metrics layer). */
+    public void setRequestObserver(io.strata.proto.RequestObserver observer) {
+        server.setRequestObserver(observer);
+    }
+
     /** Test hook: force one reconciliation pass now. */
     public void reconcileNow() throws Exception {
         registry.expireScan();

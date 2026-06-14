@@ -60,7 +60,10 @@ public final class StrataServer {
         MetadataService service = new MetadataService(config);
         log.info("metadata service started: endpoint={} zk={} leader={}",
                 service.endpoint(), config.zkConnect(), service.isLeader());
-        AutoCloseable metrics = startMetrics("meta", reg -> ServerMetrics.registerMeta(reg, service));
+        AutoCloseable metrics = startMetrics("meta", reg -> {
+            ServerMetrics.registerMeta(reg, service);
+            service.setRequestObserver(ServerMetrics.requestObserver(reg));
+        });
         awaitShutdown("metadata service", metrics, service);
     }
 
@@ -80,7 +83,10 @@ public final class StrataServer {
         StorageNode node = new StorageNode(config);
         log.info("storage node started: endpoint={} dataDir={} meta={}",
                 node.endpoint(), config.dataDir(), config.metadataEndpoints());
-        AutoCloseable metrics = startMetrics("node", reg -> ServerMetrics.registerNode(reg, node));
+        AutoCloseable metrics = startMetrics("node", reg -> {
+            ServerMetrics.registerNode(reg, node);
+            node.setRequestObserver(ServerMetrics.requestObserver(reg));
+        });
         awaitShutdown("storage node", metrics, node);
     }
 
