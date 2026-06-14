@@ -17,6 +17,7 @@
     <module>strata-node</module>
     <module>strata-meta</module>
     <module>strata-client</module>
+    <module>strata-server</module>
     <module>strata-it</module>
     <module>strata-coverage</module>
   </modules>

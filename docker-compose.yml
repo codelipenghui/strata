@@ -1,0 +1,87 @@
+# A runnable single-host Strata cluster: ZooKeeper + one metadata service + a 3-node fleet (RF=3).
+#   docker compose up --build
+# Clients reach the metadata plane at localhost:9200.
+#
+# This is a development/soak topology, not a production deployment (single ZK, single metadata
+# service, co-located on one host). It exists to exercise the real server processes end to end.
+
+x-strata: &strata
+  image: strata-server:local
+  build: .
+  restart: unless-stopped
+
+services:
+  zookeeper:
+    image: zookeeper:3.9
+    environment:
+      ZOO_4LW_COMMANDS_WHITELIST: "ruok,srvr,mntr"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  meta:
+    <<: *strata
+    command: ["meta"]
+    environment:
+      STRATA_ZK_CONNECT: "zookeeper:2181"
+      STRATA_LISTEN_PORT: "9200"
+    ports:
+      - "9200:9200"   # metadata plane, for clients on the host
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+
+  node1:
+    <<: *strata
+    command: ["node"]
+    environment:
+      STRATA_META_ENDPOINTS: "meta:9200"
+      STRATA_LISTEN_PORT: "9100"
+      STRATA_ADVERTISED_HOST: "node1"
+      STRATA_HOST: "node1"
+      STRATA_ZONE: "z0"
+      STRATA_RACK: "r0"
+      STRATA_DATA_DIR: "/data"
+    volumes:
+      - node1-data:/data
+    depends_on:
+      - meta
+
+  node2:
+    <<: *strata
+    command: ["node"]
+    environment:
+      STRATA_META_ENDPOINTS: "meta:9200"
+      STRATA_LISTEN_PORT: "9100"
+      STRATA_ADVERTISED_HOST: "node2"
+      STRATA_HOST: "node2"
+      STRATA_ZONE: "z0"
+      STRATA_RACK: "r1"
+      STRATA_DATA_DIR: "/data"
+    volumes:
+      - node2-data:/data
+    depends_on:
+      - meta
+
+  node3:
+    <<: *strata
+    command: ["node"]
+    environment:
+      STRATA_META_ENDPOINTS: "meta:9200"
+      STRATA_LISTEN_PORT: "9100"
+      STRATA_ADVERTISED_HOST: "node3"
+      STRATA_HOST: "node3"
+      STRATA_ZONE: "z0"
+      STRATA_RACK: "r2"
+      STRATA_DATA_DIR: "/data"
+    volumes:
+      - node3-data:/data
+    depends_on:
+      - meta
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

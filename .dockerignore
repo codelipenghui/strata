@@ -1,0 +1,8 @@
+**/target
+.git
+.github
+*.jfr
+docs
+tla
+scripts
+**/*.md
