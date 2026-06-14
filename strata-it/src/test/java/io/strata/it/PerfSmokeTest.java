@@ -8,10 +8,16 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -37,6 +43,15 @@ class PerfSmokeTest {
     private static final int FSYNC_RECORDS = Integer.getInteger("perf.fsyncRecords", 4_000);
     private static final int WARMUP = 1_000;
     private static final int READ_SIZE = 64 * 1024;
+
+    // Parallel coverage (the real shapes the design supports): writes fan out across many files
+    // (single writer per file), reads fan out both across files AND across many readers on ONE
+    // file (no single-reader-per-file limit). Defaults are modest so the smoke run stays quick;
+    // raise perf.par.* for a real saturation sweep.
+    private static final int PAR_FILES = Integer.getInteger("perf.par.files", 8);
+    private static final int PAR_RECORDS = Integer.getInteger("perf.par.records", 8_000);
+    private static final int PAR_READERS = Integer.getInteger("perf.par.readers", 8);
+    private static final int PAR_READ_PASSES = Integer.getInteger("perf.par.readPasses", 4);
 
     record WriteResult(long[] latenciesNanos, double throughputMBs) {}
 
@@ -77,6 +92,183 @@ class PerfSmokeTest {
                         "fsync-mode write p99 above 2s — pathological");
             }
         }
+    }
+
+    /**
+     * Parallel coverage. The single-stream numbers above are latency-bound (one op in flight) and
+     * do NOT reflect what the design sustains: writes scale by fanning out across files (single
+     * writer per file), reads scale by fanning out streams — across files AND across many readers
+     * on the SAME file (no single-reader-per-file limit). These aggregate-throughput numbers are
+     * the ones to compare against hardware bandwidth.
+     */
+    @Test
+    void parallelWriteAndRead() throws Exception {
+        try (MiniCluster cluster = new MiniCluster(3)) {
+            ClientConfig cfg = ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(64L << 20);
+            try (StrataClient client = StrataClient.connect(cfg)) {
+                System.out.printf(Locale.ROOT,
+                        "%n=== Strata v0 perf parallel: %d files x %d records x %d B, window %d, "
+                                + "%d readers, %d read passes, 3 nodes in-process ===%n",
+                        PAR_FILES, PAR_RECORDS, RECORD_SIZE, WINDOW, PAR_READERS, PAR_READ_PASSES);
+
+                // Writes fan out across files; one appender per file (single-writer-per-file).
+                ParallelWriteResult w = runParallelWrite(client, PAR_FILES, PAR_RECORDS, WINDOW);
+                printWrite("parallel write " + PAR_FILES + " files (1 writer each)   ",
+                        new WriteResult(w.latencies(), w.throughputMBs()));
+
+                // Many readers on ONE file — the no-single-reader-per-file property, concurrent
+                // zero-copy region transfer from a single sealed chunk.
+                ReadResult single = runParallelRead(client, List.of(w.fileIds().get(0)),
+                        PAR_READERS, PAR_READ_PASSES, w.perFileBytes());
+                printRead("parallel read  1 file  x " + PAR_READERS + " readers     ", single);
+
+                // One reader per file across all files — independent chunks/streams in parallel.
+                ReadResult multi = runParallelRead(client, w.fileIds(),
+                        w.fileIds().size(), PAR_READ_PASSES, w.perFileBytes());
+                printRead("parallel read  " + PAR_FILES + " files x " + PAR_FILES + " readers     ", multi);
+
+                // pathology guards, deliberately loose (machine + contention vary wildly)
+                assertTrue(w.throughputMBs() > 10.0,
+                        "parallel multi-file write below 10 MB/s — pathological");
+                assertTrue(single.throughputMBs() > 50.0,
+                        "parallel single-file read below 50 MB/s — pathological");
+                assertTrue(multi.throughputMBs() > 50.0,
+                        "parallel multi-file read below 50 MB/s — pathological");
+            }
+        }
+    }
+
+    private record ParallelWriteResult(List<FileId> fileIds, long[] latencies,
+                                       double throughputMBs, long perFileBytes) {}
+
+    /** F files, one appender each, all driven concurrently; aggregate ack throughput. */
+    private ParallelWriteResult runParallelWrite(StrataClient client, int files,
+                                                 int recordsPerFile, int window) throws Exception {
+        byte[] payload = new byte[RECORD_SIZE];
+        ThreadLocalRandom.current().nextBytes(payload);
+
+        List<FileId> ids = new ArrayList<>();
+        List<StrataFile.Appender> appenders = new ArrayList<>();
+        for (int f = 0; f < files; f++) {
+            FileId id = client.create(new StrataClient.FileSpec("test", "/par-write-" + f)).id();
+            ids.add(id);
+            appenders.add(client.openById(id).openForAppend());
+        }
+        try {
+            int warm = Math.min(WARMUP, recordsPerFile);
+            runConcurrent(files, f ->
+                    await(appendWindowed(appenders.get(f), payload, warm, null, window)));
+
+            long[][] perFile = new long[files][];
+            long start = System.nanoTime();
+            runConcurrent(files, f -> {
+                long[] lat = new long[recordsPerFile];
+                perFile[f] = lat;
+                await(appendWindowed(appenders.get(f), payload, recordsPerFile, lat, window));
+            });
+            long elapsed = System.nanoTime() - start;
+
+            long sealedLen = 0;
+            for (StrataFile.Appender ap : appenders) {
+                sealedLen = ap.seal().sealedLength();
+            }
+            double mbs = ((double) files * recordsPerFile * RECORD_SIZE / (1 << 20)) / (elapsed / 1e9);
+            return new ParallelWriteResult(ids, merge(perFile), mbs, sealedLen);
+        } finally {
+            for (StrataFile.Appender ap : appenders) {
+                try {
+                    ap.close();
+                } catch (RuntimeException ignored) {
+                }
+            }
+        }
+    }
+
+    /**
+     * {@code readers} reader streams driven concurrently, each assigned a file round-robin and
+     * reading it fully {@code passes} times. Readers are pre-opened so connection setup is excluded
+     * from the timed window; aggregate throughput = all bytes read / wall-clock.
+     */
+    private ReadResult runParallelRead(StrataClient client, List<FileId> files, int readers,
+                                       int passes, long perFileBytes) throws Exception {
+        List<StrataFile.Reader> rds = new ArrayList<>();
+        for (int r = 0; r < readers; r++) {
+            rds.add(client.openById(files.get(r % files.size())).openForRead());
+        }
+        try {
+            long[][] perReader = new long[readers][];
+            long[] bytesPerReader = new long[readers];
+            int cap = (int) (passes * (perFileBytes / READ_SIZE + 2)) + 2;
+            long start = System.nanoTime();
+            runConcurrent(readers, r -> {
+                StrataFile.Reader reader = rds.get(r);
+                long[] lat = new long[cap];
+                int n = 0;
+                long bytes = 0;
+                for (int pass = 0; pass < passes; pass++) {
+                    long offset = 0;
+                    while (true) {
+                        long t0 = System.nanoTime();
+                        StrataFile.ReadResult rr = reader.read(offset, READ_SIZE);
+                        if (rr.data().length == 0) break;
+                        if (n < lat.length) lat[n++] = System.nanoTime() - t0;
+                        bytes += rr.data().length;
+                        offset += rr.data().length;
+                        if (rr.endOfFile()) break;
+                    }
+                }
+                perReader[r] = Arrays.copyOf(lat, n);
+                bytesPerReader[r] = bytes;
+            });
+            long elapsed = System.nanoTime() - start;
+            double mbs = ((double) Arrays.stream(bytesPerReader).sum() / (1 << 20)) / (elapsed / 1e9);
+            return new ReadResult(merge(perReader), mbs);
+        } finally {
+            for (StrataFile.Reader reader : rds) {
+                try {
+                    reader.close();
+                } catch (RuntimeException ignored) {
+                }
+            }
+        }
+    }
+
+    /** Runs body(0..n-1) concurrently on virtual threads; rethrows the first failure. */
+    private static void runConcurrent(int n, ConcurrentBody body) throws Exception {
+        try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<Future<?>> futures = new ArrayList<>(n);
+            for (int i = 0; i < n; i++) {
+                final int idx = i;
+                futures.add(exec.submit(() -> {
+                    body.run(idx);
+                    return null;
+                }));
+            }
+            for (Future<?> f : futures) {
+                f.get();
+            }
+        }
+    }
+
+    @FunctionalInterface
+    private interface ConcurrentBody {
+        void run(int index) throws Exception;
+    }
+
+    private static long[] merge(long[][] parts) {
+        int total = 0;
+        for (long[] part : parts) {
+            if (part != null) total += part.length;
+        }
+        long[] out = new long[total];
+        int i = 0;
+        for (long[] part : parts) {
+            if (part != null) {
+                System.arraycopy(part, 0, out, i, part.length);
+                i += part.length;
+            }
+        }
+        return out;
     }
 
     private record WriteRun(FileId fileId, WriteResult result) {}
