@@ -106,6 +106,11 @@ public final class ZkMetadataStore implements MetadataStore {
         return curator;
     }
 
+    /** Whether the ZooKeeper connection is currently live (a LOST connection freezes the control plane). */
+    public boolean isConnected() {
+        return curator.getZookeeperClient().isConnected();
+    }
+
     @Override
     public void createFile(Records.FileRecord record) throws Exception {
         ensureNamespaceDir(record.namespace(), record.path());

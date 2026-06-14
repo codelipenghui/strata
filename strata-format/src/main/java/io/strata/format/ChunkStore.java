@@ -49,6 +49,10 @@ public final class ChunkStore implements AutoCloseable {
     private final Set<ChunkId> creating = ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.atomic.AtomicLong forceCount =
             new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong appendOps =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong appendBytes =
+            new java.util.concurrent.atomic.AtomicLong();
 
     public ChunkStore(Path dir) throws IOException {
         this.dir = dir;
@@ -59,6 +63,34 @@ public final class ChunkStore implements AutoCloseable {
     /** Number of group-commit force() calls — observability + coalescing tests. */
     public long fsyncForceCount() {
         return forceCount.get();
+    }
+
+    /** Total appended records since start (observability; drives write-ops/sec via rate()). */
+    public long appendOps() {
+        return appendOps.get();
+    }
+
+    /** Total appended payload bytes since start (observability; drives write throughput). */
+    public long appendBytes() {
+        return appendBytes.get();
+    }
+
+    /** Open (being-written) chunk count — best-effort snapshot for observability. */
+    public int openChunks() {
+        return countByState(ChunkState.OPEN);
+    }
+
+    /** Sealed (immutable) chunk count — best-effort snapshot for observability. */
+    public int sealedChunks() {
+        return countByState(ChunkState.SEALED);
+    }
+
+    private int countByState(ChunkState state) {
+        int n = 0;
+        for (Handle h : chunks.values()) {
+            if (h.state == state) n++;
+        }
+        return n;
     }
 
     /* ---------------- per-chunk state ---------------- */
@@ -273,6 +305,8 @@ public final class ChunkStore implements AutoCloseable {
             writeFully(h.data, payload.duplicate(), writePos);
             h.ledger.append(new ChunkFormats.LedgerEntry(newEnd, payloadCrc, epoch));
             h.end = newEnd;
+            appendOps.incrementAndGet();
+            appendBytes.addAndGet(len);
             committer = h.committer;
         }
         if (committer == null) {

@@ -62,6 +62,30 @@ final class NodeRegistry {
         }
     }
 
+    public record LivenessCounts(int alive, int suspect, int dead) {}
+
+    /**
+     * Best-effort liveness snapshot for metrics: ALIVE = lease valid; SUSPECT = lease expired but
+     * within the dead-grace window (or awaiting the next expireScan); DEAD = persisted dead. Reads
+     * leaseUntil without the per-node lock — fine for a gauge, which only needs an approximate view.
+     */
+    public LivenessCounts livenessCounts() {
+        long now = System.currentTimeMillis();
+        int alive = 0, suspect = 0, dead = 0;
+        for (LiveNode n : live.values()) {
+            if (n.record.state() == Records.NodeState.DEAD) {
+                dead++;
+            } else if (n.record.state() == Records.NodeState.REGISTERED) {
+                if (n.leaseUntil >= now) {
+                    alive++;
+                } else {
+                    suspect++;
+                }
+            }
+        }
+        return new LivenessCounts(alive, suspect, dead);
+    }
+
     // ReentrantLock, not synchronized: registration does ZK I/O and runs on server virtual threads
     private final java.util.concurrent.locks.ReentrantLock registerLock =
             new java.util.concurrent.locks.ReentrantLock();

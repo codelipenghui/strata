@@ -60,6 +60,37 @@ final class RepairCoordinator implements AutoCloseable {
     private final Map<ReplicaKey, Long> recentlyCommittedReplicas = new ConcurrentHashMap<>();
     private volatile Thread scanThread;
 
+    // Durability gauges, refreshed by each scanOnce so the metrics endpoint reads them in O(1)
+    // (no extra ZK scan per scrape). volatile: written by the scan thread, read by the HTTP thread.
+    private volatile int underReplicatedChunks;
+    private volatile int unavailableChunks;
+    private volatile int chunksAtMinRedundancy;
+
+    /** SEALED chunks with 0 &lt; live replicas &lt; replicationFactor (last scan). */
+    public int underReplicatedChunks() {
+        return underReplicatedChunks;
+    }
+
+    /** SEALED chunks with zero live replicas — unreadable, unrepairable, data-loss exposure (last scan). */
+    public int unavailableChunks() {
+        return unavailableChunks;
+    }
+
+    /** SEALED chunks down to a single live replica — one failure from loss (last scan). */
+    public int chunksAtMinRedundancy() {
+        return chunksAtMinRedundancy;
+    }
+
+    /** Repair/delete commands currently outstanding. */
+    public int repairInflight() {
+        return inflight.size();
+    }
+
+    /** Distinct chunks currently being repaired (working-set / backlog depth). */
+    public int repairBacklog() {
+        return chunksBeingRepaired.size();
+    }
+
     private record ReplicaKey(ChunkId chunkId, int nodeId) {}
 
     RepairCoordinator(MetadataStore store, NodeRegistry registry, MetaConfig config,
@@ -112,6 +143,7 @@ final class RepairCoordinator implements AutoCloseable {
         sweepStuckCommands();
         record Repair(FileId fileId, Records.FileRecord file, Records.ChunkRecord chunk, int liveReplicas) {}
         List<Repair> repairs = new ArrayList<>();
+        int under = 0, unavailable = 0, atMin = 0; // durability census, published to gauges at the end
 
         for (FileId fileId : store.listFiles()) {
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
@@ -125,11 +157,18 @@ final class RepairCoordinator implements AutoCloseable {
             for (Records.ChunkRecord chunk : file.chunks()) {
                 if (chunk.state() != ChunkState.SEALED) continue; // open chunks belong to their writer
                 ChunkId chunkId = file.chunkId(chunk.index());
-                if (chunksBeingRepaired.contains(chunkId)) continue;
                 int live = 0;
                 for (int nodeId : chunk.replicas()) {
                     if (!registry.isDead(nodeId)) live++;
                 }
+                // durability census — counted for every sealed chunk regardless of in-flight repair
+                if (live == 0) {
+                    unavailable++;
+                } else if (live < file.replicationFactor()) {
+                    under++;
+                    if (live == 1) atMin++;
+                }
+                if (chunksBeingRepaired.contains(chunkId)) continue;
                 if (live < file.replicationFactor() && live > 0) {
                     repairs.add(new Repair(fileId, file, chunk, live));
                 } else if (live == 0) {
@@ -137,6 +176,9 @@ final class RepairCoordinator implements AutoCloseable {
                 }
             }
         }
+        underReplicatedChunks = under;
+        unavailableChunks = unavailable;
+        chunksAtMinRedundancy = atMin;
 
         // exposure priority: fewest live replicas first (tech design §7.2)
         repairs.sort(java.util.Comparator.comparingInt(Repair::liveReplicas));

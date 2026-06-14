@@ -61,6 +61,11 @@ final class ControlLoop implements AutoCloseable {
 
     private final java.util.List<Thread> threads = new java.util.ArrayList<>(3);
 
+    /** Whether the node currently holds a metadata registration (lease session). */
+    boolean registered() {
+        return sessionEpoch >= 0;
+    }
+
     void start() {
         threads.add(Thread.ofVirtual().name("node-control-" + node.incarnation()).start(this::run));
         threads.add(Thread.ofVirtual().name("node-cmd-exec-" + node.incarnation()).start(this::executeCommands));

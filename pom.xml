@@ -17,6 +17,7 @@
     <module>strata-node</module>
     <module>strata-meta</module>
     <module>strata-client</module>
+    <module>strata-metrics</module>
     <module>strata-server</module>
     <module>strata-it</module>
     <module>strata-coverage</module>
@@ -32,6 +33,7 @@
     <testcontainers.version>1.19.8</testcontainers.version>
     <jacoco.version>0.8.12</jacoco.version>
     <netty.version>4.1.134.Final</netty.version>
+    <micrometer.version>1.12.13</micrometer.version>
   </properties>
 
   <dependencyManagement>
@@ -47,6 +49,13 @@
         <groupId>io.netty</groupId>
         <artifactId>netty-bom</artifactId>
         <version>${netty.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>io.micrometer</groupId>
+        <artifactId>micrometer-bom</artifactId>
+        <version>${micrometer.version}</version>
         <type>pom</type>
         <scope>import</scope>
       </dependency>

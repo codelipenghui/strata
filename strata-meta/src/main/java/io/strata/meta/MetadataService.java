@@ -121,6 +121,48 @@ public final class MetadataService implements AutoCloseable {
         return leaderLatch.hasLeadership();
     }
 
+    // --- observability accessors (read-only; consumed by the metrics layer in strata-server) ---
+
+    /** Whether ZooKeeper is reachable; a LOST connection freezes all metadata mutations. */
+    public boolean zkConnected() {
+        return !(store instanceof ZkMetadataStore zk) || zk.isConnected();
+    }
+
+    /** SEALED chunks below their replication factor (last reconciliation scan). */
+    public int underReplicatedChunks() {
+        return repair.underReplicatedChunks();
+    }
+
+    /** SEALED chunks with zero live replicas — data-loss exposure (last scan). */
+    public int unavailableChunks() {
+        return repair.unavailableChunks();
+    }
+
+    /** SEALED chunks down to a single live replica — one failure from loss (last scan). */
+    public int chunksAtMinRedundancy() {
+        return repair.chunksAtMinRedundancy();
+    }
+
+    public int repairInflight() {
+        return repair.repairInflight();
+    }
+
+    public int repairBacklog() {
+        return repair.repairBacklog();
+    }
+
+    public int aliveNodes() {
+        return registry.livenessCounts().alive();
+    }
+
+    public int suspectNodes() {
+        return registry.livenessCounts().suspect();
+    }
+
+    public int deadNodes() {
+        return registry.livenessCounts().dead();
+    }
+
     /** Test hook: force one reconciliation pass now. */
     public void reconcileNow() throws Exception {
         registry.expireScan();

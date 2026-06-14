@@ -106,6 +106,41 @@ public final class StorageNode implements AutoCloseable {
         return nodeId;
     }
 
+    // --- observability accessors (read-only; consumed by the metrics layer in strata-server) ---
+
+    /** Whether this node currently holds a metadata registration (false in standalone mode). */
+    public boolean registered() {
+        return controlLoop != null && controlLoop.registered();
+    }
+
+    public long diskUsedBytes() {
+        return store.usedBytes();
+    }
+
+    public long capacityBytes() {
+        return config.capacityBytes();
+    }
+
+    public int openChunks() {
+        return store.openChunks();
+    }
+
+    public int sealedChunks() {
+        return store.sealedChunks();
+    }
+
+    public long fsyncForceCount() {
+        return store.fsyncForceCount();
+    }
+
+    public long appendOps() {
+        return store.appendOps();
+    }
+
+    public long appendBytes() {
+        return store.appendBytes();
+    }
+
     public UUID incarnation() {
         return incarnation;
     }
