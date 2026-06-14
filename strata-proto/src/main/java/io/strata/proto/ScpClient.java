@@ -19,7 +19,6 @@ import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -241,11 +240,7 @@ public final class ScpClient implements AutoCloseable {
     }
 
     private static boolean isTimeout(Throwable err) {
-        Throwable t = err;
-        while (t instanceof CompletionException && t.getCause() != null) {
-            t = t.getCause();
-        }
-        return t instanceof TimeoutException;
+        return ScpException.rootCause(err) instanceof TimeoutException;
     }
 
     /** Synchronous call; returns the response header positioned AFTER the error check. */

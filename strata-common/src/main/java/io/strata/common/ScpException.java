@@ -1,5 +1,7 @@
 package io.strata.common;
 
+import java.util.concurrent.CompletionException;
+
 /** Carries an SCP error code across layers; thrown by servers, reconstructed by clients. */
 public class ScpException extends RuntimeException {
     private final ErrorCode code;
@@ -33,5 +35,14 @@ public class ScpException extends RuntimeException {
 
     public boolean retriable() {
         return code.retriable;
+    }
+
+    /** Strips the CompletionException wrappers a CompletableFuture adds, returning the real cause. */
+    public static Throwable rootCause(Throwable t) {
+        Throwable cause = t;
+        while (cause instanceof CompletionException && cause.getCause() != null) {
+            cause = cause.getCause();
+        }
+        return cause;
     }
 }

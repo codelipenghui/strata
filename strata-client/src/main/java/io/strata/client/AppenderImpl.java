@@ -231,11 +231,7 @@ final class AppenderImpl implements StrataFile.Appender {
     }
 
     private static ScpException asScpException(Throwable err) {
-        Throwable t = err;
-        while (t instanceof java.util.concurrent.CompletionException && t.getCause() != null) {
-            t = t.getCause();
-        }
-        return t instanceof ScpException e ? e : null;
+        return ScpException.rootCause(err) instanceof ScpException e ? e : null;
     }
 
     private void onReplicaFailureLocked(ChunkSession s, int replicaIndex, ScpException cause) {

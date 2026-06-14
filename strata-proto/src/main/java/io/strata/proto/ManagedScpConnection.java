@@ -212,9 +212,7 @@ public final class ManagedScpConnection implements AutoCloseable {
             backoff.reset();
             return client;
         } catch (IOException e) {
-            if (rotateOnFailure && endpoints.size() > 1) {
-                endpointIndex++;
-            }
+            maybeAdvanceEndpointLocked();
             throw new ScpConnectionException(endpointLabel + " unreachable at " + endpoint + ": " + e, e);
         }
     }
@@ -234,12 +232,7 @@ public final class ManagedScpConnection implements AutoCloseable {
         }
         lock.lock();
         try {
-            if (client == seen) {
-                if (rotateOnFailure && endpoints.size() > 1) {
-                    endpointIndex++;
-                }
-                closeCurrentLocked();
-            }
+            closeIfCurrentLocked(seen);
         } finally {
             lock.unlock();
         }
@@ -251,6 +244,21 @@ public final class ManagedScpConnection implements AutoCloseable {
         if (c != null) {
             generation++;
             c.close();
+        }
+    }
+
+    /** Advance to the next endpoint on failure when rotation is enabled. Caller holds {@code lock}. */
+    private void maybeAdvanceEndpointLocked() {
+        if (rotateOnFailure && endpoints.size() > 1) {
+            endpointIndex++;
+        }
+    }
+
+    /** If the live client is still {@code failed}, rotate (if enabled) and close it. Caller holds {@code lock}. */
+    private void closeIfCurrentLocked(ScpClient failed) {
+        if (client == failed) {
+            maybeAdvanceEndpointLocked();
+            closeCurrentLocked();
         }
     }
 
@@ -309,12 +317,7 @@ public final class ManagedScpConnection implements AutoCloseable {
             } catch (RuntimeException e) {
                 lock.lock();
                 try {
-                    if (client == current) {
-                        if (rotateOnFailure && endpoints.size() > 1) {
-                            endpointIndex++;
-                        }
-                        closeCurrentLocked();
-                    }
+                    closeIfCurrentLocked(current);
                 } finally {
                     lock.unlock();
                 }
