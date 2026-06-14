@@ -57,6 +57,10 @@ class PerfSmokeTest {
     // all replicas land on disk. Measure the disk ceiling separately (e.g. a sequential
     // FileChannel write+fsync micro-benchmark) and compare against the physical number below.
     private static final int REPLICATION_FACTOR = 3;
+    // Latency profile measures each op with ONE op in flight — the latency FLOOR (no queueing),
+    // which is what a latency-sensitive caller sees. Swept across durability mode, record size,
+    // read size, and sealed (zero-copy) vs open (materialized) read paths.
+    private static final int LAT_SAMPLES = Integer.getInteger("perf.lat.samples", 1_000);
 
     record WriteResult(long[] latenciesNanos, double throughputMBs) {}
 
@@ -152,6 +156,121 @@ class PerfSmokeTest {
                         "parallel multi-file read below 50 MB/s — pathological");
             }
         }
+    }
+
+    /**
+     * Latency profile across workloads, each measured with ONE op in flight (the floor a
+     * latency-sensitive caller sees, with no pipeline queueing). Write latency is swept over
+     * {durability mode} x {record size}; read latency over {read size} on a sealed (zero-copy)
+     * chunk, plus an open-chunk tail read (materialized under the chunk lock). Throughput tests
+     * above show the loaded/pipelined latency; this isolates the unloaded per-op cost.
+     */
+    @Test
+    void latencyProfile() throws Exception {
+        int[] writeSizes = {1_024, 65_536, 1 << 20};
+        int[] readSizes = {4_096, 65_536, 262_144, 1 << 20};
+        try (MiniCluster cluster = new MiniCluster(3)) {
+            ClientConfig cfg = ClientConfig.of(cluster.metaEndpoint()).withChunkRollBytes(64L << 20);
+            try (StrataClient client = StrataClient.connect(cfg)) {
+                System.out.printf(Locale.ROOT,
+                        "%n=== Strata v0 latency profile (1 op in flight = floor), 3 nodes in-process ===%n");
+
+                System.out.println("-- write ack latency: durability mode x record size --");
+                for (int size : writeSizes) {
+                    printLat(String.format(Locale.ROOT, "  write replicate %7dB", size),
+                            writeLatency(client, "/lat-rep-" + size, StrataClient.WritePolicy.DEFAULT, size));
+                }
+                for (int size : writeSizes) {
+                    printLat(String.format(Locale.ROOT, "  write fsync     %7dB", size),
+                            writeLatency(client, "/lat-fsync-" + size,
+                                    StrataClient.WritePolicy.fsync(REPLICATION_FACTOR, 2), size));
+                }
+
+                System.out.println("-- read latency: read size (sealed chunk, zero-copy region) --");
+                long sealedBytes = 60L << 20;
+                FileId sealed = buildSealedFile(client, "/lat-read", 1 << 20, 60);
+                for (int size : readSizes) {
+                    printLat(String.format(Locale.ROOT, "  read %9dB", size),
+                            readLatency(client, sealed, size, sealedBytes));
+                }
+
+                System.out.println("-- read latency: open-chunk tail (materialized under lock) --");
+                printLat("  read     65536B (open) ", openTailReadLatency(client, "/lat-open", 65_536));
+
+                // pathology guards, deliberately loose
+                assertTrue(p(readLatency(client, sealed, 65_536, sealedBytes), 99) < 200_000_000L,
+                        "sealed 64KB read p99 above 200ms — pathological");
+            }
+        }
+    }
+
+    /** Per-append ack latency with one append in flight (no queueing), then seal. */
+    private long[] writeLatency(StrataClient client, String path, StrataClient.WritePolicy policy,
+                                int recordSize) throws Exception {
+        int samples = Math.min(LAT_SAMPLES, Math.max(200, (256 << 20) / recordSize));
+        int warm = Math.min(samples / 5, 200);
+        byte[] payload = new byte[recordSize];
+        ThreadLocalRandom.current().nextBytes(payload);
+        FileId id = client.create(new StrataClient.FileSpec("test", path, policy)).id();
+        try (StrataFile.Appender ap = client.openById(id).openForAppend()) {
+            await(appendWindowed(ap, payload, warm, null, 1));
+            long[] lat = new long[samples];
+            await(appendWindowed(ap, payload, samples, lat, 1));
+            ap.seal();
+            return lat;
+        }
+    }
+
+    private FileId buildSealedFile(StrataClient client, String path, int recordSize, int records)
+            throws Exception {
+        byte[] payload = new byte[recordSize];
+        ThreadLocalRandom.current().nextBytes(payload);
+        FileId id = client.create(new StrataClient.FileSpec("test", path)).id();
+        try (StrataFile.Appender ap = client.openById(id).openForAppend()) {
+            await(appendWindowed(ap, payload, records, null, 16));
+            ap.seal();
+        }
+        return id;
+    }
+
+    /** Single-read latency at a fixed read size, cycling offsets across the file. */
+    private long[] readLatency(StrataClient client, FileId fileId, int readSize, long fileBytes) {
+        int warm = Math.min(LAT_SAMPLES / 5, 200);
+        long span = Math.max(1, fileBytes - readSize);
+        try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
+            for (int i = 0; i < warm; i++) {
+                reader.read((long) i * readSize % span, readSize);
+            }
+            long[] lat = new long[LAT_SAMPLES];
+            for (int i = 0; i < lat.length; i++) {
+                long off = (long) i * readSize % span;
+                long t0 = System.nanoTime();
+                reader.read(off, readSize);
+                lat[i] = System.nanoTime() - t0;
+            }
+            return lat;
+        }
+    }
+
+    /** Read latency on an OPEN (unsealed) chunk — exercises the materialize-under-lock path. */
+    private long[] openTailReadLatency(StrataClient client, String path, int readSize) throws Exception {
+        byte[] payload = new byte[readSize];
+        ThreadLocalRandom.current().nextBytes(payload);
+        FileId id = client.create(new StrataClient.FileSpec("test", path)).id();
+        StrataFile.Appender ap = client.openById(id).openForAppend();
+        try {
+            await(appendWindowed(ap, payload, 256, null, 32)); // fill a durable tail, do NOT seal
+            long durable = ap.durableOffset();
+            return readLatency(client, id, readSize, durable);
+        } finally {
+            ap.close();
+        }
+    }
+
+    private static void printLat(String label, long[] lat) {
+        System.out.printf(Locale.ROOT,
+                "%s  p50=%7.3fms  p95=%7.3fms  p99=%7.3fms  max=%8.3fms  (n=%d)%n",
+                label, ms(p(lat, 50)), ms(p(lat, 95)), ms(p(lat, 99)), ms(p(lat, 100)), lat.length);
     }
 
     private record ParallelWriteResult(List<FileId> fileIds, long[] latencies,
