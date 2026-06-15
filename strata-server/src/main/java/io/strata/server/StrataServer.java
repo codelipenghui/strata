@@ -57,7 +57,8 @@ public final class StrataServer {
                 intEnv("STRATA_LEASE_MS", 10_000),
                 intEnv("STRATA_DEAD_GRACE_MS", 30_000),
                 intEnv("STRATA_REPAIR_SCAN_INTERVAL_MS", 5_000),
-                intEnv("STRATA_REPAIR_COMMAND_TIMEOUT_MS", 30_000));
+                intEnv("STRATA_REPAIR_COMMAND_TIMEOUT_MS", 30_000))
+                .withAdvertisedHost(env("STRATA_ADVERTISED_HOST", hostname()));
         MetadataService service = new MetadataService(config);
         log.info("metadata service started: endpoint={} zk={} leader={}",
                 service.endpoint(), config.zkConnect(), service.isLeader());

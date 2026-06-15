@@ -218,7 +218,7 @@ public final class ScpServer implements AutoCloseable {
                 }
             } catch (ScpException e) {
                 respF = CompletableFuture.completedFuture(
-                        Frame.response(req, Resp.error(e.code(), e.getMessage(), e.detail()), null));
+                        Frame.response(req, Resp.error(e.code(), e.getMessage(), e.detail(), e.leaderHint()), null));
                 handlerFailed = true;
             } catch (Exception e) {
                 log.warn("handler error for opcode 0x{}", Integer.toHexString(req.opcode()), e);
@@ -239,7 +239,7 @@ public final class ScpServer implements AutoCloseable {
                         Throwable cause = err instanceof java.util.concurrent.CompletionException
                                 ? err.getCause() : err;
                         frame = cause instanceof ScpException se
-                                ? Frame.response(req, Resp.error(se.code(), se.getMessage(), se.detail()), null)
+                                ? Frame.response(req, Resp.error(se.code(), se.getMessage(), se.detail(), se.leaderHint()), null)
                                 : Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(cause), 0), null);
                     }
                     writeResponse(ctx, requireResponse(req, frame), false, req);

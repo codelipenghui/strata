@@ -43,7 +43,12 @@ final class MetaClient implements AutoCloseable {
                     throw e;
                 }
                 if (e.code() == ErrorCode.NOT_LEADER) {
-                    connection.rotateEndpoint();
+                    String leader = e.leaderHint();
+                    if (leader != null && !leader.isBlank()) {
+                        connection.preferEndpoint(leader);  // jump straight to the leader
+                    } else {
+                        connection.rotateEndpoint();        // unknown leader (election) — round-robin
+                    }
                 }
                 try {
                     Thread.sleep(200);

@@ -39,6 +39,7 @@ public final class MetadataService implements AutoCloseable {
     private final RepairCoordinator repair;
     private final ScpServer server;
     private final LeaderLatch leaderLatch;
+    private final String advertisedEndpoint;  // this node's reachable host:port — the leader hint clients redirect to
 
     public MetadataService(MetaConfig config) throws Exception {
         this.config = config;
@@ -51,17 +52,22 @@ public final class MetadataService implements AutoCloseable {
                     config.zkSessionTimeoutMs(), config.zkConnectionTimeoutMs());
             NodeRegistry openedRegistry = new NodeRegistry(openedStore, config);
             UUID serviceId = UUID.randomUUID();
-            openedLatch = new LeaderLatch(openedStore.curator(), "/strata/leader", serviceId.toString());
+
+            // Build the SCP server first so the leader latch can advertise this node's real bound
+            // endpoint (the listen port may be ephemeral) as its participant id — that endpoint is
+            // exactly what a standby returns as the NOT_LEADER redirect hint.
+            openedServer = new ScpServer(config.listenPort(), 0,
+                    serviceId.getMostSignificantBits(), serviceId.getLeastSignificantBits(), this::handle);
+            this.advertisedEndpoint = config.advertisedHost() + ":" + openedServer.port();
+            openedLatch = new LeaderLatch(openedStore.curator(), "/strata/leader", advertisedEndpoint);
             openedRepair = new RepairCoordinator(openedStore, openedRegistry, config, openedLatch::hasLeadership);
 
             this.store = openedStore;
             this.registry = openedRegistry;
+            this.server = openedServer;
             this.leaderLatch = openedLatch;
             this.repair = openedRepair;
 
-            openedServer = new ScpServer(config.listenPort(), 0,
-                    serviceId.getMostSignificantBits(), serviceId.getLeastSignificantBits(), this::handle);
-            this.server = openedServer;
             openedLatch.start();
             openedRepair.start();
         } catch (Exception e) {
@@ -71,7 +77,7 @@ public final class MetadataService implements AutoCloseable {
             }
             throw e;
         }
-        log.info("metadata service started on port {} (zk {})", server.port(), config.zkConnect());
+        log.info("metadata service started on {} (zk {})", advertisedEndpoint, config.zkConnect());
     }
 
     /** Closes whatever subset of the service's resources exists; returns the accumulated failure. */
@@ -114,7 +120,7 @@ public final class MetadataService implements AutoCloseable {
     }
 
     public String endpoint() {
-        return "127.0.0.1:" + port();
+        return advertisedEndpoint;
     }
 
     public boolean isLeader() {
@@ -175,8 +181,30 @@ public final class MetadataService implements AutoCloseable {
     }
 
     private void requireLeader() {
-        if (!leaderLatch.hasLeadership()) {
-            throw new ScpException(ErrorCode.NOT_LEADER, "not the metadata leader");
+        LeaderLatch latch = this.leaderLatch;
+        if (latch == null || !latch.hasLeadership()) {
+            throw new ScpException(ErrorCode.NOT_LEADER, "not the metadata leader", 0, leaderHint());
+        }
+    }
+
+    /**
+     * The current leader's advertised endpoint, for a NOT_LEADER redirect — or null if unknown
+     * (election in progress, or this node thinks it is the leader). A ZooKeeper read, only walked on
+     * the rejection path (never on the leader), so misdirected clients leave after one round-trip.
+     */
+    private String leaderHint() {
+        LeaderLatch latch = this.leaderLatch;
+        if (latch == null) {
+            return null;
+        }
+        try {
+            String leader = latch.getLeader().getId();
+            if (leader == null || leader.isBlank() || leader.equals(advertisedEndpoint)) {
+                return null;
+            }
+            return leader;
+        } catch (Exception e) {
+            return null;
         }
     }
 

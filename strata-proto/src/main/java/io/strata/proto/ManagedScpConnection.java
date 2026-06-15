@@ -47,6 +47,7 @@ public final class ManagedScpConnection implements AutoCloseable {
     private volatile boolean maintainConnection;
 
     private int endpointIndex;
+    private String preferredEndpoint;  // set by preferEndpoint() to follow a NOT_LEADER redirect; guarded by lock
     private final Backoff backoff;
 
     public ManagedScpConnection(List<String> endpoints, ConnectionPolicy policy, byte clientKind,
@@ -142,7 +143,24 @@ public final class ManagedScpConnection implements AutoCloseable {
     public void rotateEndpoint() {
         lock.lock();
         try {
+            preferredEndpoint = null;
             endpointIndex++;
+            closeCurrentLocked();
+            maintainConnection = true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Redirect the next (re)connect straight to {@code endpoint}, bypassing round-robin — used to
+     * follow a NOT_LEADER leader hint. If that endpoint turns out unreachable the next connect falls
+     * back to the configured list; {@link #rotateEndpoint()} also clears the preference.
+     */
+    public void preferEndpoint(String endpoint) {
+        lock.lock();
+        try {
+            preferredEndpoint = endpoint;
             closeCurrentLocked();
             maintainConnection = true;
         } finally {
@@ -204,7 +222,10 @@ public final class ManagedScpConnection implements AutoCloseable {
             return client;
         }
         closeCurrentLocked();
-        String endpoint = endpoints.get(Math.floorMod(endpointIndex, endpoints.size()));
+        boolean preferred = preferredEndpoint != null;
+        String endpoint = preferred
+                ? preferredEndpoint
+                : endpoints.get(Math.floorMod(endpointIndex, endpoints.size()));
         Endpoint hp = Endpoint.parse(endpoint, endpointLabel, ErrorCode.INTERNAL);
         try {
             client = new ScpClient(hp.host(), hp.port(), clientKind, clientId, policy.connectTimeoutMs());
@@ -212,7 +233,11 @@ public final class ManagedScpConnection implements AutoCloseable {
             backoff.reset();
             return client;
         } catch (IOException e) {
-            maybeAdvanceEndpointLocked();
+            if (preferred) {
+                preferredEndpoint = null;  // hinted leader unreachable — fall back to the configured list
+            } else {
+                maybeAdvanceEndpointLocked();
+            }
             throw new ScpConnectionException(endpointLabel + " unreachable at " + endpoint + ": " + e, e);
         }
     }
