@@ -2,6 +2,8 @@
 # `combined` mode — data (:9100) plus a co-resident metadata service (:9200). One node is elected
 # metadata leader; the others are warm standbys, and clients reach the leader via the NOT_LEADER
 # redirect. There is no separate strata-meta to deploy — the metadata plane scales with the nodes.
+# Clients run inside the cluster network (e.g. the loadgen) and reach nodes by name, following the
+# redirect to the leader, so no metadata port is published to the host.
 #
 #   ./scripts/build-image.sh     # packages the jar + builds strata-server:local
 #   docker compose up            # starts the cluster using that image
@@ -45,11 +47,6 @@ services:
       STRATA_ZONE: "z0"
       STRATA_RACK: "r0"
       STRATA_DATA_DIR: "/data"
-    ports:
-      # Host access to the metadata plane. Reliable only while node1 is the leader: a host client that
-      # lands on a standby gets a redirect hint of "nodeN:9200", which host DNS can't resolve. The
-      # in-cluster loadgen (below) resolves node names and follows redirects, so it's the reliable path.
-      - "9200:9200"
     volumes:
       - node1-data:/data
     depends_on:
