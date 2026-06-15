@@ -110,7 +110,7 @@ services:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "3000:3000"   # open http://localhost:3000 -> "Strata — Cluster Overview"
+      - "3000:3000"   # open http://localhost:3000 -> Strata dashboards: Cluster / Node / JVM
     depends_on:
       - prometheus
 

@@ -75,6 +75,10 @@ final class ServerMetrics {
                 .description("appended records (rate() = write ops/sec)").register(reg);
         FunctionCounter.builder("strata_node_append_bytes", n, StorageNode::appendBytes)
                 .description("appended payload bytes (rate() = write throughput)").register(reg);
+        FunctionCounter.builder("strata_node_read_ops", n, StorageNode::readOps)
+                .description("client READ operations served (rate() = read ops/sec)").register(reg);
+        FunctionCounter.builder("strata_node_read_bytes", n, StorageNode::readBytes)
+                .description("client READ payload bytes served (rate() = read throughput)").register(reg);
     }
 
     /**

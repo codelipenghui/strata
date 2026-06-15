@@ -1485,6 +1485,61 @@ class ChunkStoreTest {
     }
 
     @Test
+    void readCountersTrackServedReads() throws Exception {
+        try (ChunkStore store = newStore()) {
+            assertEquals(0, store.readOps());
+            assertEquals(0, store.readBytes());
+
+            open(store, id, 1);
+            store.append(id, 1, 0, 0, bytes("hello world")); // 11 bytes, chunk still OPEN
+
+            // OPEN-chunk read: bytes materialized under the lock, counted by served length
+            var r1 = store.readRegion(id, 0, 1024);
+            assertEquals(11, r1.length());
+            assertEquals(1, store.readOps());
+            assertEquals(11, store.readBytes());
+
+            // partial read accrues
+            var r2 = store.readRegion(id, 6, 1024); // "world" -> 5 bytes
+            assertEquals(5, r2.length());
+            assertEquals(2, store.readOps());
+            assertEquals(16, store.readBytes());
+
+            // read at/after end serves nothing and must NOT count
+            var r3 = store.readRegion(id, 11, 1024);
+            assertEquals(0, r3.length());
+            assertEquals(2, store.readOps());
+            assertEquals(16, store.readBytes());
+
+            // SEALED read path (zero-copy region) also counts
+            store.seal(id, 1, 11, null);
+            var r4 = store.readRegion(id, 0, 1024);
+            assertEquals(11, r4.length());
+            assertEquals(3, store.readOps());
+            assertEquals(27, store.readBytes());
+        }
+    }
+
+    @Test
+    void readCountersIgnoreNonClientReadPaths() throws Exception {
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            store.append(id, 1, 0, 0, bytes("abc")); // 3 bytes
+
+            // legacy synchronous read() is NOT the client data-path and must not count
+            store.read(id, 0, 1024);
+            assertEquals(0, store.readOps());
+            assertEquals(0, store.readBytes());
+
+            // FETCH_CHUNK (replication) goes through fetch(), also out of scope
+            store.seal(id, 1, 3, null);
+            store.fetch(id, 0, Integer.MAX_VALUE);
+            assertEquals(0, store.readOps());
+            assertEquals(0, store.readBytes());
+        }
+    }
+
+    @Test
     void failedDeleteKeepsChunkVisibleForRetry() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
