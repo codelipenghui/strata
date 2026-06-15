@@ -161,6 +161,10 @@ public final class StorageNode implements AutoCloseable {
         return store.readBytes();
     }
 
+    public long backgroundFlushes() {
+        return store.backgroundFlushes();
+    }
+
     /** Installs a per-request latency observer on the data-plane server (used by the metrics layer). */
     public void setRequestObserver(io.strata.proto.RequestObserver observer) {
         server.setRequestObserver(observer);

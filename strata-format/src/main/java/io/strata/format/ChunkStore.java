@@ -21,6 +21,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 import java.util.zip.CRC32C;
 
@@ -57,16 +60,37 @@ public final class ChunkStore implements AutoCloseable {
             new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong readBytes =
             new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong backgroundFlushes =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    // Background writeback: a daemon periodically fsyncs OPEN, non-ack-on-fsync chunks that have
+    // accumulated enough new data since their last flush, so the dirty-page backlog never grows to a
+    // whole chunk and the seal-time fsync stays small. Best-effort, decoupled from the append/ack path.
+    private static final long BG_FLUSH_INTERVAL_MS = 500;
+    private static final long BG_FLUSH_THRESHOLD_BYTES = 4L << 20; // 4 MiB
+    private final ScheduledExecutorService flusher;
 
     public ChunkStore(Path dir) throws IOException {
         this.dir = dir;
         Files.createDirectories(dir);
         recoverAll();
+        this.flusher = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "chunk-writeback-" + dir.getFileName());
+            t.setDaemon(true);
+            return t;
+        });
+        flusher.scheduleWithFixedDelay(this::backgroundFlushSafely,
+                BG_FLUSH_INTERVAL_MS, BG_FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
     /** Number of group-commit force() calls — observability + coalescing tests. */
     public long fsyncForceCount() {
         return forceCount.get();
+    }
+
+    /** Number of background-writeback fsyncs of open chunks — observability; should keep seals cheap. */
+    public long backgroundFlushes() {
+        return backgroundFlushes.get();
     }
 
     /** Total appended records since start (observability; drives write-ops/sec via rate()). */
@@ -107,6 +131,53 @@ public final class ChunkStore implements AutoCloseable {
         return n;
     }
 
+    private void backgroundFlushSafely() {
+        try {
+            backgroundFlushOnce();
+        } catch (Throwable t) {
+            log.warn("background chunk-writeback round failed", t);
+        }
+    }
+
+    /**
+     * Best-effort writeback: fsync each OPEN, non-ack-on-fsync chunk that has accumulated at least
+     * {@link #BG_FLUSH_THRESHOLD_BYTES} since its last background flush, bounding the dirty backlog a
+     * later seal must flush. The force runs OUTSIDE the chunk monitor (it is slow and safe to run
+     * concurrently with positional appends); the monitor is held only to read state and record
+     * progress. Package-private so tests can drive a round deterministically.
+     */
+    void backgroundFlushOnce() {
+        for (Handle h : chunks.values()) {
+            long flushTo;
+            FileChannel data;
+            synchronized (h) {
+                // ack-on-fsync chunks already force continuously via their committer; sealed chunks are
+                // immutable and were forced at seal — neither needs background writeback
+                if (h.state != ChunkState.OPEN || h.committer != null) {
+                    continue;
+                }
+                if (h.end - h.bgFlushedOffset < BG_FLUSH_THRESHOLD_BYTES) {
+                    continue;
+                }
+                flushTo = h.end;
+                data = h.data;
+            }
+            try {
+                data.force(false); // flushes all currently-dirty pages (>= flushTo)
+            } catch (IOException | RuntimeException e) {
+                // a concurrent delete/close can close the channel mid-flush; just retry next round
+                log.warn("background writeback of {} failed (will retry)", h.id, e);
+                continue;
+            }
+            synchronized (h) {
+                if (h.bgFlushedOffset < flushTo) {
+                    h.bgFlushedOffset = flushTo;
+                }
+            }
+            backgroundFlushes.incrementAndGet();
+        }
+    }
+
     /* ---------------- per-chunk state ---------------- */
 
     private final class Handle {
@@ -120,6 +191,7 @@ public final class ChunkStore implements AutoCloseable {
         GroupCommitter committer; // non-null only for OPEN ack-on-fsync chunks
         ChunkState state;
         long end;               // logical data length
+        long bgFlushedOffset;   // end offset already pushed to disk by background writeback
         int writeEpoch;
         int fenceEpoch;
         long lastKnownDO;
@@ -1081,6 +1153,18 @@ public final class ChunkStore implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
+        // Stop background writeback first so it can't race the file close/delete below. shutdown()
+        // (not shutdownNow()) avoids interrupting an in-flight force(), which — FileChannel being an
+        // InterruptibleChannel — would close the channel out from under the close path.
+        flusher.shutdown();
+        try {
+            if (!flusher.awaitTermination(5, TimeUnit.SECONDS)) {
+                flusher.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            flusher.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
         Throwable failure = null;
         for (Handle h : chunks.values()) {
             synchronized (h) {

@@ -79,6 +79,8 @@ final class ServerMetrics {
                 .description("client READ operations served (rate() = read ops/sec)").register(reg);
         FunctionCounter.builder("strata_node_read_bytes", n, StorageNode::readBytes)
                 .description("client READ payload bytes served (rate() = read throughput)").register(reg);
+        FunctionCounter.builder("strata_node_background_flush", n, StorageNode::backgroundFlushes)
+                .description("background-writeback fsyncs of open chunks").register(reg);
     }
 
     /**
