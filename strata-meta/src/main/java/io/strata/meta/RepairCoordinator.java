@@ -60,6 +60,10 @@ final class RepairCoordinator implements AutoCloseable {
     private final Map<ReplicaKey, Long> recentlyCommittedReplicas = new ConcurrentHashMap<>();
     private volatile Thread scanThread;
 
+    // A deleted file's record is kept as a DELETED tombstone (fencing a delayed CREATE replay from
+    // resurrecting it) and reaped only after this window — comfortably longer than any create-retry.
+    private static final long DELETED_TOMBSTONE_TTL_MS = 600_000;
+
     // Durability gauges, refreshed by each scanOnce so the metrics endpoint reads them in O(1)
     // (no extra ZK scan per scrape). volatile: written by the scan thread, read by the HTTP thread.
     private volatile int underReplicatedChunks;
@@ -128,6 +132,7 @@ final class RepairCoordinator implements AutoCloseable {
                 }
                 registry.expireScan();
                 scanOnce();
+                store.sweepDeletedFiles(DELETED_TOMBSTONE_TTL_MS);
             } catch (InterruptedException e) {
                 return;
             } catch (Exception e) {

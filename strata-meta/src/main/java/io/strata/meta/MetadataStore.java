@@ -22,8 +22,9 @@ public interface MetadataStore extends AutoCloseable {
     /* ---- file / chunk records ---- */
 
     /**
-     * Creates a file and permanently reserves its FileId. A deleted FileId must not become
-     * creatable again; otherwise a delayed CREATE replay can resurrect a deleted file.
+     * Creates a file. A deleted FileId must not become creatable again until its DELETED tombstone
+     * is swept ({@link #sweepDeletedFiles}); otherwise a delayed CREATE replay could resurrect a
+     * deleted file. The create fails while the tombstone is present.
      */
     void createFile(Records.FileRecord record) throws Exception;
 
@@ -39,7 +40,15 @@ public interface MetadataStore extends AutoCloseable {
     /** CAS delete; returns false on version conflict. */
     boolean deleteFile(FileId id, int expectedVersion) throws Exception;
 
+    /** Live file ids (excludes DELETED tombstones awaiting sweep). */
     List<FileId> listFiles() throws Exception;
+
+    /**
+     * Reaps DELETED file tombstones whose deletion is older than {@code olderThanMs}. Until reaped,
+     * a tombstone keeps its FileId un-creatable (fencing a delayed CREATE replay); the window must
+     * exceed the longest possible create-retry delay. Returns the number reaped.
+     */
+    int sweepDeletedFiles(long olderThanMs) throws Exception;
 
     /* ---- node registry ---- */
 

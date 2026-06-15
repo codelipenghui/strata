@@ -1,16 +1,15 @@
 package io.strata.meta;
 
 import io.strata.common.FileId;
+import io.strata.common.FileState;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 
 class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest {
 
@@ -43,11 +42,12 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
                 ensureOpen();
                 PathKey pathKey = new PathKey(record.namespace(), record.path());
                 PathMarker marker = state.paths.get(pathKey);
-                if (state.reservedFileIds.contains(record.fileId())
+                // files.containsKey covers both a live file and an unswept DELETED tombstone — a
+                // replayed CREATE for a deleted-but-unswept id must fail.
+                if (state.files.containsKey(record.fileId())
                         || marker != null && marker.fileId().isPresent()) {
                     throw new IllegalStateException("file already exists: " + record.fileId());
                 }
-                state.reservedFileIds.add(record.fileId());
                 state.files.put(record.fileId(), new Versioned<>(record, 0));
                 state.paths.put(pathKey, marker == null
                         ? new PathMarker(Optional.of(record.fileId()), 0)
@@ -59,7 +59,11 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
         public Optional<Versioned<Records.FileRecord>> getFile(FileId id) {
             synchronized (state) {
                 ensureOpen();
-                return Optional.ofNullable(state.files.get(id));
+                Versioned<Records.FileRecord> v = state.files.get(id);
+                if (v == null || v.value().state() == FileState.DELETED) {
+                    return Optional.empty();  // a swept-pending tombstone is logically gone
+                }
+                return Optional.of(v);
             }
         }
 
@@ -107,7 +111,7 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
             synchronized (state) {
                 ensureOpen();
                 Versioned<Records.FileRecord> current = state.files.get(id);
-                if (current == null) {
+                if (current == null || current.value().state() == FileState.DELETED) {
                     return true;
                 }
                 if (current.version() != expectedVersion) {
@@ -119,7 +123,9 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
                 if (marker != null && marker.fileId().map(id::equals).orElse(false)) {
                     state.paths.put(pathKey, marker.withFileId(Optional.empty()));
                 }
-                state.files.remove(id);
+                // Tombstone the record (fences a replayed CREATE) until the sweeper reaps it.
+                state.files.put(id, new Versioned<>(record.withState(FileState.DELETED), current.version() + 1));
+                state.deletedAtMs.put(id, System.currentTimeMillis());
                 return true;
             }
         }
@@ -128,9 +134,33 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
         public List<FileId> listFiles() {
             synchronized (state) {
                 ensureOpen();
-                ArrayList<FileId> files = new ArrayList<>(state.files.keySet());
+                ArrayList<FileId> files = new ArrayList<>();
+                for (Map.Entry<FileId, Versioned<Records.FileRecord>> e : state.files.entrySet()) {
+                    if (e.getValue().value().state() != FileState.DELETED) {  // skip tombstones
+                        files.add(e.getKey());
+                    }
+                }
                 files.sort(FileId::compareTo);
                 return files;
+            }
+        }
+
+        @Override
+        public int sweepDeletedFiles(long olderThanMs) {
+            synchronized (state) {
+                ensureOpen();
+                long now = System.currentTimeMillis();
+                int reaped = 0;
+                for (FileId id : new ArrayList<>(state.files.keySet())) {
+                    Long deletedAt = state.deletedAtMs.get(id);
+                    if (state.files.get(id).value().state() == FileState.DELETED
+                            && deletedAt != null && now - deletedAt >= olderThanMs) {
+                        state.files.remove(id);
+                        state.deletedAtMs.remove(id);
+                        reaped++;
+                    }
+                }
+                return reaped;
             }
         }
 
@@ -197,7 +227,7 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
 
         private static final class State {
             private final Map<FileId, Versioned<Records.FileRecord>> files = new HashMap<>();
-            private final Set<FileId> reservedFileIds = new HashSet<>();
+            private final Map<FileId, Long> deletedAtMs = new HashMap<>();
             private final Map<PathKey, PathMarker> paths = new HashMap<>();
             private final Map<Integer, Versioned<Records.NodeRecord>> nodes = new HashMap<>();
             private int nextNodeId = 1;

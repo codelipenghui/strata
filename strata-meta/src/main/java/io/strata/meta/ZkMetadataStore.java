@@ -1,6 +1,7 @@
 package io.strata.meta;
 
 import io.strata.common.FileId;
+import io.strata.common.FileState;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 import org.apache.curator.framework.CuratorFramework;
@@ -19,14 +20,13 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * ZooKeeper backend (tech design §4.4, v0 only — development/prototype; retired at v1 GA).
- * Layout: /strata/files/<fileId> (FileRecord, CAS by znode version),
- * /strata/file-ids/<fileId> (permanent FileId reservation),
+ * Layout: /strata/files/<fileId> (FileRecord, CAS by znode version; a deleted file is left as a
+ * DELETED tombstone that fences a replayed CREATE until the sweeper reaps it),
  * /strata/namespaces/<namespace>/paths/<path segments>/__file (FileId binding or empty tombstone),
  * /strata/nodes/<nodeId>, /strata/ids/seq- (sequential, node-id allocation).
  */
 public final class ZkMetadataStore implements MetadataStore {
     private static final String FILES = "/strata/files";
-    private static final String FILE_IDS = "/strata/file-ids";
     private static final String NAMESPACES = "/strata/namespaces";
     private static final String NODES = "/strata/nodes";
     private static final String IDS = "/strata/ids";
@@ -87,7 +87,7 @@ public final class ZkMetadataStore implements MetadataStore {
 
     private void init() {
         try {
-            for (String path : new String[]{FILES, FILE_IDS, NAMESPACES, NODES, IDS}) {
+            for (String path : new String[]{FILES, NAMESPACES, NODES, IDS}) {
                 try {
                     if (curator.checkExists().forPath(path) == null) {
                         curator.create().creatingParentsIfNeeded().forPath(path);
@@ -120,7 +120,6 @@ public final class ZkMetadataStore implements MetadataStore {
             throw new KeeperException.NodeExistsException(markerPath);
         }
         List<CuratorOp> ops = new ArrayList<>();
-        ops.add(curator.transactionOp().create().forPath(FILE_IDS + "/" + record.fileId(), new byte[0]));
         ops.add(curator.transactionOp().create().forPath(FILES + "/" + record.fileId(), record.encode()));
         if (marker.isPresent()) {
             ops.add(curator.transactionOp().setData().withVersion(marker.get().version())
@@ -140,7 +139,11 @@ public final class ZkMetadataStore implements MetadataStore {
         try {
             Stat stat = new Stat();
             byte[] data = curator.getData().storingStatIn(stat).forPath(FILES + "/" + id);
-            return Optional.of(new Versioned<>(Records.FileRecord.decode(data), stat.getVersion()));
+            Records.FileRecord record = Records.FileRecord.decode(data);
+            if (record.state() == FileState.DELETED) {
+                return Optional.empty();  // a swept-pending tombstone is logically gone
+            }
+            return Optional.of(new Versioned<>(record, stat.getVersion()));
         } catch (KeeperException.NoNodeException e) {
             return Optional.empty();
         }
@@ -195,16 +198,19 @@ public final class ZkMetadataStore implements MetadataStore {
                 return false;
             }
             Records.FileRecord record = current.get().value();
+            // Leave a DELETED tombstone in place of the record (a swept-later id reservation) so a
+            // replayed CREATE for this id still collides on the existing znode; the sweeper reaps it.
+            byte[] tombstone = record.withState(FileState.DELETED).encode();
             Optional<PathMarker> marker = readPathMarker(record.namespace(), record.path());
             if (marker.isPresent() && marker.get().fileId().map(id::equals).orElse(false)) {
                 List<CuratorOp> ops = List.of(
-                        curator.transactionOp().delete().withVersion(expectedVersion).forPath(filePath),
+                        curator.transactionOp().setData().withVersion(expectedVersion).forPath(filePath, tombstone),
                         curator.transactionOp().setData().withVersion(marker.get().version())
                                 .forPath(fileMarkerPath(record.namespace(), record.path()), DELETED_FILE_MARKER)
                 );
                 curator.transaction().forOperations(ops);
             } else {
-                curator.delete().withVersion(expectedVersion).forPath(filePath);
+                curator.setData().withVersion(expectedVersion).forPath(filePath, tombstone);
             }
             return true;
         } catch (KeeperException.BadVersionException e) {
@@ -218,9 +224,39 @@ public final class ZkMetadataStore implements MetadataStore {
     public List<FileId> listFiles() throws Exception {
         List<FileId> out = new ArrayList<>();
         for (String child : curator.getChildren().forPath(FILES)) {
-            out.add(FileId.fromString(child));
+            FileId id = FileId.fromString(child);
+            if (getFile(id).isPresent()) {  // skip DELETED tombstones awaiting sweep
+                out.add(id);
+            }
         }
         return out;
+    }
+
+    @Override
+    public int sweepDeletedFiles(long olderThanMs) throws Exception {
+        long now = System.currentTimeMillis();
+        int reaped = 0;
+        for (String child : curator.getChildren().forPath(FILES)) {
+            String path = FILES + "/" + child;
+            Stat stat = new Stat();
+            byte[] data;
+            try {
+                data = curator.getData().storingStatIn(stat).forPath(path);
+            } catch (KeeperException.NoNodeException e) {
+                continue;  // reaped concurrently
+            }
+            if (Records.FileRecord.decode(data).state() != FileState.DELETED
+                    || now - stat.getMtime() < olderThanMs) {
+                continue;  // live/DELETING, or still inside the fencing window
+            }
+            try {
+                curator.delete().withVersion(stat.getVersion()).forPath(path);
+                reaped++;
+            } catch (KeeperException.BadVersionException | KeeperException.NoNodeException ignored) {
+                // raced with another mutation/sweeper; leave it for the next pass
+            }
+        }
+        return reaped;
     }
 
     private void ensureNamespaceDir(StrataNamespace namespace, StrataPath path) throws Exception {

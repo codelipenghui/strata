@@ -583,6 +583,11 @@ class MetadataServiceTest {
         }
 
         @Override
+        public int sweepDeletedFiles(long olderThanMs) throws Exception {
+            return delegate.sweepDeletedFiles(olderThanMs);
+        }
+
+        @Override
         public boolean updateFile(Records.FileRecord record, int expectedVersion) throws Exception {
             return delegate.updateFile(record, expectedVersion);
         }

@@ -763,6 +763,11 @@ class RepairCoordinatorTest {
         }
 
         @Override
+        public int sweepDeletedFiles(long olderThanMs) {
+            return 0;
+        }
+
+        @Override
         public Optional<Versioned<Records.FileRecord>> getFile(FileId id) {
             if (throwOnGetFile) {
                 throw new IllegalStateException("getFile failure");

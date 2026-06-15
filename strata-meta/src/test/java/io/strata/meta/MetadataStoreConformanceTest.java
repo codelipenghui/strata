@@ -68,6 +68,30 @@ abstract class MetadataStoreConformanceTest {
     }
 
     @Test
+    void sweepingDeletedTombstonesFreesTheIdForReuse() throws Exception {
+        try (Backend backend = startBackend();
+             MetadataStore store = backend.openStore()) {
+            FileId fileId = new FileId(99, 1);
+            store.createFile(file(fileId, "tenant-a", "/logs/swept/segment-0", FileState.OPEN));
+            int version = store.getFile(fileId).orElseThrow().version();
+            assertTrue(store.deleteFile(fileId, version));
+            assertTrue(store.getFile(fileId).isEmpty());
+
+            // While the tombstone is unswept, the id stays reserved against a replayed create.
+            assertThrows(Exception.class,
+                    () -> store.createFile(file(fileId, "tenant-a", "/logs/swept/segment-1", FileState.OPEN)),
+                    "an unswept tombstone must still fence a recreate of the same id");
+
+            // Sweeping reaps tombstones older than the window (0 = reap all); the id is then reusable.
+            assertEquals(1, store.sweepDeletedFiles(0));
+            Records.FileRecord reborn = file(fileId, "tenant-a", "/logs/swept/segment-1", FileState.OPEN);
+            store.createFile(reborn);
+            assertEquals(reborn, store.getFile(fileId).orElseThrow().value());
+            assertEquals(Set.of(fileId), fileIds(store));
+        }
+    }
+
+    @Test
     void namespacePathBindingsAreScopedAndReplacementSafe() throws Exception {
         try (Backend backend = startBackend();
              MetadataStore store = backend.openStore()) {

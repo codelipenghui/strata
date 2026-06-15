@@ -276,6 +276,11 @@ class NodeRegistryTest {
         }
 
         @Override
+        public int sweepDeletedFiles(long olderThanMs) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
         public boolean updateFile(Records.FileRecord record, int expectedVersion) {
             throw new UnsupportedOperationException();
         }
