@@ -61,7 +61,11 @@ final class RepairCoordinator implements AutoCloseable {
     private volatile Thread scanThread;
 
     // A deleted file's record is kept as a DELETED tombstone (fencing a delayed CREATE replay from
-    // resurrecting it) and reaped only after this window — comfortably longer than any create-retry.
+    // resurrecting it) and reaped only after this window. INVARIANT: it must exceed the longest
+    // possible create-replay delay — the client create-retry deadline (max(15s, callTimeoutMs), see
+    // MetaClient) plus the meta<->ZK clock-skew the mtime-based sweep tolerates — and it must exceed
+    // repairScanIntervalMs (the sweep cadence). 10 min vs the 15s default is a ~40x margin; raise it
+    // if callTimeoutMs is ever configured near it.
     private static final long DELETED_TOMBSTONE_TTL_MS = 600_000;
 
     // Durability gauges, refreshed by each scanOnce so the metrics endpoint reads them in O(1)

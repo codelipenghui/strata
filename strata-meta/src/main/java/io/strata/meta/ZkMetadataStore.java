@@ -234,6 +234,10 @@ public final class ZkMetadataStore implements MetadataStore {
 
     @Override
     public int sweepDeletedFiles(long olderThanMs) throws Exception {
+        // Ages tombstones by the znode mtime (set when deleteFile wrote DELETED). Relies on a DELETED
+        // znode never being mutated again (every writer goes through getFile, which hides it), so
+        // mtime == delete time. The meta clock (now) is compared to the ZK-server mtime, so olderThanMs
+        // must absorb that skew — see DELETED_TOMBSTONE_TTL_MS.
         long now = System.currentTimeMillis();
         int reaped = 0;
         for (String child : curator.getChildren().forPath(FILES)) {
