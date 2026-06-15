@@ -58,6 +58,9 @@ public final class StrataServer {
                 intEnv("STRATA_DEAD_GRACE_MS", 30_000),
                 intEnv("STRATA_REPAIR_SCAN_INTERVAL_MS", 5_000),
                 intEnv("STRATA_REPAIR_COMMAND_TIMEOUT_MS", 30_000))
+                // Endpoint a standby returns as the NOT_LEADER redirect hint. In containers/k8s the
+                // hostname() default is the container/pod id — set STRATA_ADVERTISED_HOST to a name
+                // clients can resolve (the service/DNS name) whenever more than one replica runs.
                 .withAdvertisedHost(env("STRATA_ADVERTISED_HOST", hostname()));
         MetadataService service = new MetadataService(config);
         log.info("metadata service started: endpoint={} zk={} leader={}",

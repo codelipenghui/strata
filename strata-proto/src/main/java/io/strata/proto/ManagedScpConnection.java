@@ -226,7 +226,16 @@ public final class ManagedScpConnection implements AutoCloseable {
         String endpoint = preferred
                 ? preferredEndpoint
                 : endpoints.get(Math.floorMod(endpointIndex, endpoints.size()));
-        Endpoint hp = Endpoint.parse(endpoint, endpointLabel, ErrorCode.INTERNAL);
+        Endpoint hp;
+        try {
+            hp = Endpoint.parse(endpoint, endpointLabel, ErrorCode.INTERNAL);
+        } catch (RuntimeException e) {
+            if (!preferred) {
+                throw e;  // a configured endpoint is malformed — a real config error, surface it
+            }
+            preferredEndpoint = null;  // unparseable leader hint — drop it; next connect uses the list
+            throw new ScpConnectionException(endpointLabel + " bad leader hint " + endpoint + ": " + e, e);
+        }
         try {
             client = new ScpClient(hp.host(), hp.port(), clientKind, clientId, policy.connectTimeoutMs());
             generation++;

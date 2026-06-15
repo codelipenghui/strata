@@ -32,6 +32,9 @@ services:
     environment:
       STRATA_ZK_CONNECT: "zookeeper:2181"
       STRATA_LISTEN_PORT: "9200"
+      # Endpoint a standby hands back as the NOT_LEADER redirect hint. The hostname() default is the
+      # container id (not resolvable by peers); set it to the service name. Required once >1 replica runs.
+      STRATA_ADVERTISED_HOST: "meta"
     ports:
       - "9200:9200"   # metadata plane, for clients on the host
     depends_on:
