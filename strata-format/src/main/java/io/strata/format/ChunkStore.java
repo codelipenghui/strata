@@ -79,12 +79,12 @@ public final class ChunkStore implements AutoCloseable {
         return appendBytes.get();
     }
 
-    /** Total client READ operations that served data since start (drives read-ops/sec via rate()). */
+    /** Total client READ operations that served data since start (drives read-ops/sec via rate()). Only {@link #readRegion} updates this; {@code read()} and {@code fetch()} do not. */
     public long readOps() {
         return readOps.get();
     }
 
-    /** Total client READ payload bytes served since start (drives read throughput via rate()). */
+    /** Total client READ payload bytes served since start (drives read throughput via rate()). Only {@link #readRegion} updates this; {@code read()} and {@code fetch()} do not. */
     public long readBytes() {
         return readBytes.get();
     }

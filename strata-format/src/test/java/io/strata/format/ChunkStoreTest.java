@@ -1521,6 +1521,25 @@ class ChunkStoreTest {
     }
 
     @Test
+    void readCountersIgnoreNonClientReadPaths() throws Exception {
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            store.append(id, 1, 0, 0, bytes("abc")); // 3 bytes
+
+            // legacy synchronous read() is NOT the client data-path and must not count
+            store.read(id, 0, 1024);
+            assertEquals(0, store.readOps());
+            assertEquals(0, store.readBytes());
+
+            // FETCH_CHUNK (replication) goes through fetch(), also out of scope
+            store.seal(id, 1, 3, null);
+            store.fetch(id, 0, Integer.MAX_VALUE);
+            assertEquals(0, store.readOps());
+            assertEquals(0, store.readBytes());
+        }
+    }
+
+    @Test
     void failedDeleteKeepsChunkVisibleForRetry() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
