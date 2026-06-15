@@ -13,6 +13,10 @@ WORKDIR /app
 COPY strata-server/target/strata-server.jar /app/strata-server.jar
 # Storage nodes persist chunk data here; mount a volume in production.
 VOLUME ["/data"]
+# Document the listeners (so they show in `docker ps`). EXPOSE does NOT gate connectivity —
+# same-network containers already reach these regardless; nothing is published to the host here:
+#   9100 data (SCP) · 9200 metadata (SCP) · 9300 Prometheus /metrics
+EXPOSE 9100 9200 9300
 # Default JVM flags; override with JAVA_OPTS. Container-aware heap sizing.
 ENV JAVA_OPTS="-XX:MaxRAMPercentage=70 -XX:+ExitOnOutOfMemoryError"
 ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/strata-server.jar \"$@\"", "--"]
