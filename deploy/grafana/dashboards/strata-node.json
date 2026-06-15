@@ -1,0 +1,725 @@
+{
+  "uid": "strata-node",
+  "title": "Strata — Node",
+  "tags": ["strata"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "Strata dashboards",
+      "asDropdown": true,
+      "keepTime": true,
+      "includeVars": true,
+      "tags": ["strata"],
+      "icon": "external link"
+    }
+  ],
+  "templating": { "list": [
+    {
+      "name": "node",
+      "label": "Node",
+      "type": "query",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "query": { "query": "label_values(strata_node_disk_used_bytes, instance)", "refId": "StandardVariableQuery" },
+      "includeAll": true,
+      "multi": true,
+      "allValue": ".*",
+      "current": { "text": "All", "value": "$__all" },
+      "refresh": 2,
+      "sort": 1
+    },
+    {
+      "name": "opcode",
+      "label": "Opcode",
+      "type": "query",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "query": { "query": "label_values(strata_scp_request_duration_seconds_count, opcode)", "refId": "StandardVariableQuery" },
+      "includeAll": true,
+      "multi": true,
+      "allValue": ".*",
+      "current": { "text": "All", "value": "$__all" },
+      "refresh": 2,
+      "sort": 1
+    }
+  ] },
+  "panels": [
+
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Overview",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Nodes registered",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "targets": [
+        { "expr": "sum(strata_node_registered{instance=~\"$node\"})", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Capacity used (max)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "targets": [
+        { "expr": "max(strata_node_capacity_used_ratio{instance=~\"$node\"})", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.8 },
+              { "color": "red", "value": 0.9 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Disk used",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "targets": [
+        { "expr": "sum(strata_node_disk_used_bytes{instance=~\"$node\"})", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Open chunks",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "targets": [
+        { "expr": "sum(strata_node_chunks{instance=~\"$node\",state=\"open\"})", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Sealed chunks",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "targets": [
+        { "expr": "sum(strata_node_chunks{instance=~\"$node\",state=\"sealed\"})", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Write throughput",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 5 },
+      "targets": [
+        { "expr": "sum(rate(strata_node_append_bytes_total{instance=~\"$node\"}[$__rate_interval]))", "refId": "A", "instant": false }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Read throughput",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 5 },
+      "targets": [
+        { "expr": "sum(rate(strata_node_read_bytes_total{instance=~\"$node\"}[$__rate_interval]))", "refId": "A", "instant": false }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "fsync/s",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 5 },
+      "targets": [
+        { "expr": "sum(rate(strata_node_groupcommit_force_total{instance=~\"$node\"}[$__rate_interval]))", "refId": "A", "instant": false }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Capacity & storage",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "collapsed": false
+    },
+
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Capacity used ratio by node",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "targets": [
+        { "expr": "strata_node_capacity_used_ratio{instance=~\"$node\"}", "refId": "A", "legendFormat": "{{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.8 },
+              { "color": "red", "value": 0.9 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Disk used vs capacity by node",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "targets": [
+        { "expr": "strata_node_disk_used_bytes{instance=~\"$node\"}", "refId": "A", "legendFormat": "{{instance}} used" },
+        { "expr": "strata_node_capacity_bytes{instance=~\"$node\"}", "refId": "B", "legendFormat": "{{instance}} capacity" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Local chunks by state",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "targets": [
+        { "expr": "sum by (instance, state)(strata_node_chunks{instance=~\"$node\"})", "refId": "A", "legendFormat": "{{instance}} {{state}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 20,
+      "type": "row",
+      "title": "I/O throughput",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "collapsed": false
+    },
+
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Write throughput by node",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 27 },
+      "targets": [
+        { "expr": "sum by (instance)(rate(strata_node_append_bytes_total{instance=~\"$node\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Read throughput by node",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 27 },
+      "targets": [
+        { "expr": "sum by (instance)(rate(strata_node_read_bytes_total{instance=~\"$node\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Append & read ops/s by node",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 35 },
+      "targets": [
+        { "expr": "sum by (instance)(rate(strata_node_append_ops_total{instance=~\"$node\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{instance}} append" },
+        { "expr": "sum by (instance)(rate(strata_node_read_ops_total{instance=~\"$node\"}[$__rate_interval]))", "refId": "B", "legendFormat": "{{instance}} read" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Group-commit force/s (fsync) by node",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 35 },
+      "targets": [
+        { "expr": "sum by (instance)(rate(strata_node_groupcommit_force_total{instance=~\"$node\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Avg bytes per append",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 43 },
+      "targets": [
+        {
+          "expr": "sum by (instance)(rate(strata_node_append_bytes_total{instance=~\"$node\"}[$__rate_interval])) / clamp_min(sum by (instance)(rate(strata_node_append_ops_total{instance=~\"$node\"}[$__rate_interval])), 1)",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Avg bytes per read",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 43 },
+      "targets": [
+        {
+          "expr": "sum by (instance)(rate(strata_node_read_bytes_total{instance=~\"$node\"}[$__rate_interval])) / clamp_min(sum by (instance)(rate(strata_node_read_ops_total{instance=~\"$node\"}[$__rate_interval])), 1)",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Appends per fsync (batch efficiency)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 51 },
+      "targets": [
+        {
+          "expr": "sum by (instance)(rate(strata_node_append_ops_total{instance=~\"$node\"}[$__rate_interval])) / clamp_min(sum by (instance)(rate(strata_node_groupcommit_force_total{instance=~\"$node\"}[$__rate_interval])), 1)",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Requests on this node (RED)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 59 },
+      "collapsed": false
+    },
+
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Request rate by opcode",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 60 },
+      "targets": [
+        { "expr": "sum by (opcode)(rate(strata_scp_request_duration_seconds_count{instance=~\"$node\",opcode=~\"$opcode\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{opcode}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Error rate by opcode",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 60 },
+      "targets": [
+        { "expr": "sum by (opcode)(rate(strata_scp_request_duration_seconds_count{instance=~\"$node\",opcode=~\"$opcode\",status=\"error\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{opcode}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "p99 latency by opcode",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 68 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, opcode)(rate(strata_scp_request_duration_seconds_bucket{instance=~\"$node\",opcode=~\"$opcode\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "{{opcode}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Latency p50/p90/p99 (selected opcodes)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 68 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le)(rate(strata_scp_request_duration_seconds_bucket{instance=~\"$node\",opcode=~\"$opcode\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le)(rate(strata_scp_request_duration_seconds_bucket{instance=~\"$node\",opcode=~\"$opcode\"}[$__rate_interval])))",
+          "refId": "B",
+          "legendFormat": "p90"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le)(rate(strata_scp_request_duration_seconds_bucket{instance=~\"$node\",opcode=~\"$opcode\"}[$__rate_interval])))",
+          "refId": "C",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 35,
+      "type": "heatmap",
+      "title": "Request latency heatmap",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 76 },
+      "targets": [
+        {
+          "expr": "sum by (le)(rate(strata_scp_request_duration_seconds_bucket{instance=~\"$node\",opcode=~\"$opcode\"}[$__rate_interval]))",
+          "refId": "A",
+          "format": "heatmap",
+          "legendFormat": "{{le}}"
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "yAxis": { "unit": "s" },
+        "color": { "scheme": "Spectral", "mode": "scheme" }
+      }
+    },
+
+    {
+      "id": 40,
+      "type": "row",
+      "title": "JVM quicklook",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 84 },
+      "collapsed": false
+    },
+
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Heap used by node",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 85 },
+      "links": [
+        { "title": "Open JVM dashboard", "url": "/d/strata-jvm?var-node=${node}&${__url_time_range}" }
+      ],
+      "targets": [
+        { "expr": "sum by (instance)(jvm_memory_used_bytes{area=\"heap\",instance=~\"$node\"})", "refId": "A", "legendFormat": "{{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Process CPU by node",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 85 },
+      "targets": [
+        { "expr": "process_cpu_usage{instance=~\"$node\"}", "refId": "A", "legendFormat": "{{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    }
+
+  ]
+}
