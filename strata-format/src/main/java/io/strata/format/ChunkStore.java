@@ -53,6 +53,10 @@ public final class ChunkStore implements AutoCloseable {
             new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong appendBytes =
             new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong readOps =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong readBytes =
+            new java.util.concurrent.atomic.AtomicLong();
 
     public ChunkStore(Path dir) throws IOException {
         this.dir = dir;
@@ -73,6 +77,16 @@ public final class ChunkStore implements AutoCloseable {
     /** Total appended payload bytes since start (observability; drives write throughput). */
     public long appendBytes() {
         return appendBytes.get();
+    }
+
+    /** Total client READ operations that served data since start (drives read-ops/sec via rate()). */
+    public long readOps() {
+        return readOps.get();
+    }
+
+    /** Total client READ payload bytes served since start (drives read throughput via rate()). */
+    public long readBytes() {
+        return readBytes.get();
     }
 
     /** Open (being-written) chunk count — best-effort snapshot for observability. */
@@ -376,6 +390,9 @@ public final class ChunkStore implements AutoCloseable {
             if (n == 0) {
                 return new ReadRegionResult(null, 0, 0, null, end, h.lastKnownDO);
             }
+            // observability: count client READ bytes served (mirrors append counters; drives read throughput)
+            readOps.incrementAndGet();
+            readBytes.addAndGet(n);
             long filePos = checkedAdd(DATA_START, offset, "chunk file offset");
             if (h.state != ChunkState.SEALED) {
                 // OPEN chunk: a concurrent seal can truncate the never-acked tail of this shared
