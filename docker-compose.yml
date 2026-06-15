@@ -1,5 +1,7 @@
-# A runnable single-host Strata cluster: ZooKeeper + one metadata service + a 3-node fleet (RF=3).
-# Clients reach the metadata plane at localhost:9200.
+# A runnable single-host Strata cluster: ZooKeeper + a 3-node fleet where each node runs in
+# `combined` mode — data (:9100) plus a co-resident metadata service (:9200). One node is elected
+# metadata leader; the others are warm standbys, and clients reach the leader via the NOT_LEADER
+# redirect. There is no separate strata-meta to deploy — the metadata plane scales with the nodes.
 #
 #   ./scripts/build-image.sh     # packages the jar + builds strata-server:local
 #   docker compose up            # starts the cluster using that image
@@ -7,8 +9,8 @@
 # The image carries the pre-built fat jar (see Dockerfile), so build it first. Plain `up` reuses
 # strata-server:local; `up --build` re-runs the Dockerfile and likewise needs the jar present.
 #
-# This is a development/soak topology, not a production deployment (single ZK, single metadata
-# service, co-located on one host). It exists to exercise the real server processes end to end.
+# This is a development/soak topology, not a production deployment (single ZK, co-located on one
+# host). It exercises the real server processes end to end.
 
 x-strata: &strata
   image: strata-server:local
@@ -26,42 +28,41 @@ services:
       timeout: 3s
       retries: 10
 
-  meta:
-    <<: *strata
-    command: ["meta"]
-    environment:
-      STRATA_ZK_CONNECT: "zookeeper:2181"
-      STRATA_LISTEN_PORT: "9200"
-      # Endpoint a standby hands back as the NOT_LEADER redirect hint. The hostname() default is the
-      # container id (not resolvable by peers); set it to the service name. Required once >1 replica runs.
-      STRATA_ADVERTISED_HOST: "meta"
-    ports:
-      - "9200:9200"   # metadata plane, for clients on the host
-    depends_on:
-      zookeeper:
-        condition: service_healthy
-
+  # Each node is `combined`: a StorageNode (:9100) + a MetadataService (:9200) in one process.
+  # STRATA_META_ENDPOINTS lists all three nodes' meta ports, so each node and any in-cluster client
+  # find the current leader (one hop, via the redirect). STRATA_ADVERTISED_HOST is the name peers
+  # resolve and is also the leader's NOT_LEADER redirect hint.
   node1:
     <<: *strata
-    command: ["node"]
+    command: ["combined"]
     environment:
-      STRATA_META_ENDPOINTS: "meta:9200"
+      STRATA_ZK_CONNECT: "zookeeper:2181"
+      STRATA_META_ENDPOINTS: "node1:9200,node2:9200,node3:9200"
+      STRATA_META_LISTEN_PORT: "9200"
       STRATA_LISTEN_PORT: "9100"
       STRATA_ADVERTISED_HOST: "node1"
       STRATA_HOST: "node1"
       STRATA_ZONE: "z0"
       STRATA_RACK: "r0"
       STRATA_DATA_DIR: "/data"
+    ports:
+      # Host access to the metadata plane. Reliable only while node1 is the leader: a host client that
+      # lands on a standby gets a redirect hint of "nodeN:9200", which host DNS can't resolve. The
+      # in-cluster loadgen (below) resolves node names and follows redirects, so it's the reliable path.
+      - "9200:9200"
     volumes:
       - node1-data:/data
     depends_on:
-      - meta
+      zookeeper:
+        condition: service_healthy
 
   node2:
     <<: *strata
-    command: ["node"]
+    command: ["combined"]
     environment:
-      STRATA_META_ENDPOINTS: "meta:9200"
+      STRATA_ZK_CONNECT: "zookeeper:2181"
+      STRATA_META_ENDPOINTS: "node1:9200,node2:9200,node3:9200"
+      STRATA_META_LISTEN_PORT: "9200"
       STRATA_LISTEN_PORT: "9100"
       STRATA_ADVERTISED_HOST: "node2"
       STRATA_HOST: "node2"
@@ -71,13 +72,16 @@ services:
     volumes:
       - node2-data:/data
     depends_on:
-      - meta
+      zookeeper:
+        condition: service_healthy
 
   node3:
     <<: *strata
-    command: ["node"]
+    command: ["combined"]
     environment:
-      STRATA_META_ENDPOINTS: "meta:9200"
+      STRATA_ZK_CONNECT: "zookeeper:2181"
+      STRATA_META_ENDPOINTS: "node1:9200,node2:9200,node3:9200"
+      STRATA_META_LISTEN_PORT: "9200"
       STRATA_LISTEN_PORT: "9100"
       STRATA_ADVERTISED_HOST: "node3"
       STRATA_HOST: "node3"
@@ -87,9 +91,10 @@ services:
     volumes:
       - node3-data:/data
     depends_on:
-      - meta
+      zookeeper:
+        condition: service_healthy
 
-  # --- observability: scrapes each process's /metrics (:9300) and renders the Strata dashboard ---
+  # --- observability: scrapes each combined node's /metrics (:9300) and renders the dashboard ---
   prometheus:
     image: prom/prometheus:v2.54.1
     command:
@@ -99,7 +104,7 @@ services:
     ports:
       - "9090:9090"
     depends_on:
-      - meta
+      - node1
 
   grafana:
     image: grafana/grafana:11.2.0
@@ -115,14 +120,14 @@ services:
     depends_on:
       - prometheus
 
-  # One-off load generator — does NOT start with `up` (profile-gated). Runs on the cluster network
-  # so it can reach the nodes by their advertised hostnames. Use scripts/perf.sh, or:
-  #   docker compose run --rm --no-deps loadgen perf --meta meta:9200 --workload write --duration 120
+  # One-off load generator — does NOT start with `up` (profile-gated). Runs on the cluster network so
+  # it resolves node names and follows leader redirects. Use scripts/perf.sh, or:
+  #   docker compose run --rm --no-deps loadgen perf --meta node1:9200 --workload write --duration 120
   loadgen:
     <<: *strata
     profiles: ["tools"]
     restart: "no"
-    command: ["perf", "--meta", "meta:9200", "--workload", "write", "--duration", "120"]
+    command: ["perf", "--meta", "node1:9200", "--workload", "write", "--duration", "120"]
 
 volumes:
   node1-data:

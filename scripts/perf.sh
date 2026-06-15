@@ -6,4 +6,4 @@
 #   ./scripts/perf.sh --workload read  --read-size 65536 --readers 8 --duration 120
 set -euo pipefail
 cd "$(dirname "$0")/.."
-exec docker compose run --rm --no-deps loadgen perf --meta meta:9200 "$@"
+exec docker compose run --rm --no-deps loadgen perf --meta node1:9200 "$@"
