@@ -537,6 +537,27 @@
     },
 
     {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Background writeback fsync/s by node",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 51 },
+      "targets": [
+        { "expr": "sum by (instance)(rate(strata_node_background_flush_total{instance=~\"$node\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 10, "showPoints": "never" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
       "id": 30,
       "type": "row",
       "title": "Requests on this node (RED)",
