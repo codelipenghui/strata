@@ -42,7 +42,7 @@ final class StrataPerf {
     static void run(String[] argv) throws Exception {
         Map<String, String> a = parse(argv);
         String meta = a.getOrDefault("meta",
-                StrataServer.env("STRATA_META_ENDPOINTS", "localhost:9200")).split(",")[0].trim();
+                StrataServer.env("STRATA_META_ENDPOINTS", "localhost:9100")).split(",")[0].trim();
         String workload = a.getOrDefault("workload", "write");
         int recordSize = intArg(a, "record-size", 64 * 1024);
         int files = intArg(a, "files", 8);

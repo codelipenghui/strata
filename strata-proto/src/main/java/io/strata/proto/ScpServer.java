@@ -57,6 +57,30 @@ public final class ScpServer implements AutoCloseable {
         default CompletableFuture<Frame> handleAsync(Frame request) throws Exception {
             return CompletableFuture.completedFuture(handle(request));
         }
+
+        /**
+         * Composes two handlers onto one listener: opcodes &gt;= 0x0100 (control plane — storage-node
+         * registration + client metadata RPCs) route to {@code controlPlane}; everything else (data
+         * plane; PING too) to {@code dataPlane}. HELLO never reaches a handler (the server answers it).
+         * Lets a combined node serve data + metadata on a single SCP port.
+         */
+        static Handler route(Handler dataPlane, Handler controlPlane) {
+            return new Handler() {
+                @Override
+                public Frame handle(Frame request) throws Exception {
+                    return pick(request).handle(request);
+                }
+
+                @Override
+                public CompletableFuture<Frame> handleAsync(Frame request) throws Exception {
+                    return pick(request).handleAsync(request);
+                }
+
+                private Handler pick(Frame request) {
+                    return (request.opcode() & 0xFFFF) >= 0x0100 ? controlPlane : dataPlane;
+                }
+            };
+        }
     }
 
     private final Channel serverChannel;

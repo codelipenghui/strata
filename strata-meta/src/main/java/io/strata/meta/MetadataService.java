@@ -42,7 +42,18 @@ public final class MetadataService implements AutoCloseable {
     private final String advertisedEndpoint;  // this node's reachable host:port — the leader hint clients redirect to
 
     public MetadataService(MetaConfig config) throws Exception {
+        this(config, null);
+    }
+
+    /**
+     * Embedded mode when {@code advertisedEndpoint} is non-null: runs the latch/repair/store but binds
+     * NO SCP server — the caller serves {@link #handler()} on its own listener (a combined node's data
+     * port), and {@code advertisedEndpoint} is that listener's reachable host:port (the NOT_LEADER
+     * redirect hint). Null = standalone: bind an own server on {@code config.listenPort()}.
+     */
+    public MetadataService(MetaConfig config, String advertisedEndpoint) throws Exception {
         this.config = config;
+        boolean embedded = advertisedEndpoint != null;
         ZkMetadataStore openedStore = null;
         LeaderLatch openedLatch = null;
         RepairCoordinator openedRepair = null;
@@ -53,13 +64,18 @@ public final class MetadataService implements AutoCloseable {
             NodeRegistry openedRegistry = new NodeRegistry(openedStore, config);
             UUID serviceId = UUID.randomUUID();
 
-            // Build the SCP server first so the leader latch can advertise this node's real bound
-            // endpoint (the listen port may be ephemeral) as its participant id — that endpoint is
-            // exactly what a standby returns as the NOT_LEADER redirect hint.
-            openedServer = new ScpServer(config.listenPort(), 0,
-                    serviceId.getMostSignificantBits(), serviceId.getLeastSignificantBits(), this::handle);
-            this.advertisedEndpoint = config.advertisedHost() + ":" + openedServer.port();
-            openedLatch = new LeaderLatch(openedStore.curator(), "/strata/leader", advertisedEndpoint);
+            if (embedded) {
+                // No own listener — the caller (a combined node) serves handler() on its port; that
+                // is the endpoint the latch advertises as the NOT_LEADER redirect hint.
+                this.advertisedEndpoint = advertisedEndpoint;
+            } else {
+                // Build the SCP server first so the latch advertises this node's real bound endpoint
+                // (the listen port may be ephemeral) — what a standby returns as the redirect hint.
+                openedServer = new ScpServer(config.listenPort(), 0,
+                        serviceId.getMostSignificantBits(), serviceId.getLeastSignificantBits(), this::handle);
+                this.advertisedEndpoint = config.advertisedHost() + ":" + openedServer.port();
+            }
+            openedLatch = new LeaderLatch(openedStore.curator(), "/strata/leader", this.advertisedEndpoint);
             openedRepair = new RepairCoordinator(openedStore, openedRegistry, config, openedLatch::hasLeadership);
 
             this.store = openedStore;
@@ -77,7 +93,8 @@ public final class MetadataService implements AutoCloseable {
             }
             throw e;
         }
-        log.info("metadata service started on {} (zk {})", advertisedEndpoint, config.zkConnect());
+        log.info("metadata service started ({}) on {} (zk {})",
+                embedded ? "embedded" : "standalone", this.advertisedEndpoint, config.zkConnect());
     }
 
     /** Closes whatever subset of the service's resources exists; returns the accumulated failure. */
@@ -116,11 +133,17 @@ public final class MetadataService implements AutoCloseable {
     }
 
     public int port() {
-        return server.port();
+        return server != null ? server.port() : -1;  // -1 in embedded mode (served on the host's port)
     }
 
     public String endpoint() {
         return advertisedEndpoint;
+    }
+
+    /** SCP handler for the metadata (control-plane) opcodes. In embedded mode the caller serves this
+     *  on its own listener; standalone, it is already wired to this service's own server. */
+    public ScpServer.Handler handler() {
+        return this::handle;
     }
 
     public boolean isLeader() {
@@ -171,7 +194,9 @@ public final class MetadataService implements AutoCloseable {
 
     /** Installs a per-request latency observer on the control-plane server (used by the metrics layer). */
     public void setRequestObserver(io.strata.proto.RequestObserver observer) {
-        server.setRequestObserver(observer);
+        if (server != null) {  // embedded mode: requests are observed on the host node's server
+            server.setRequestObserver(observer);
+        }
     }
 
     /** Test hook: force one reconciliation pass now. */

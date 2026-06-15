@@ -32,6 +32,15 @@ public final class StorageNode implements AutoCloseable {
     private final UUID incarnation;
 
     public StorageNode(NodeConfig config) throws IOException {
+        this(config, null);
+    }
+
+    /**
+     * With a non-null {@code metaHandler}, this node's single SCP listener also serves the
+     * control-plane/metadata opcodes by routing them to that handler — combined mode, where a
+     * co-resident metadata service shares the node's port instead of binding its own.
+     */
+    public StorageNode(NodeConfig config, ScpServer.Handler metaHandler) throws IOException {
         this.config = config;
         Files.createDirectories(config.dataDir());
         Identity identity = loadIdentity(config.dataDir());
@@ -42,9 +51,12 @@ public final class StorageNode implements AutoCloseable {
         ControlLoop startedLoop = null;
         try {
             openedStore = new ChunkStore(config.dataDir().resolve("chunks"));
+            NodeHandlers dataHandler = new NodeHandlers(openedStore, this);
+            ScpServer.Handler handler = metaHandler == null
+                    ? dataHandler
+                    : ScpServer.Handler.route(dataHandler, metaHandler);
             openedServer = new ScpServer(config.listenPort(), nodeId,
-                    incarnation.getMostSignificantBits(), incarnation.getLeastSignificantBits(),
-                    new NodeHandlers(openedStore, this));
+                    incarnation.getMostSignificantBits(), incarnation.getLeastSignificantBits(), handler);
             this.store = openedStore;
             this.server = openedServer;
             if (!config.metadataEndpoints().isEmpty()) {

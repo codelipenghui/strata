@@ -32,20 +32,22 @@ class CombinedServerTest {
     void combinedNodeServesMetadataAndRegistersItsStorageNode() throws Exception {
         try (TestingServer zk = new TestingServer(true)) {
             Path dataDir = Files.createTempDirectory("strata-combined-it");
-            int metaPort = freePort();
-            MetaConfig metaConfig = new MetaConfig(zk.getConnectString(), metaPort,
-                    200, 1_000, 1_500, 300, 3_000, 5_000, 20_000, "127.0.0.1");
-            NodeConfig nodeConfig = NodeConfig.withMetadata(
-                    dataDir, List.of("127.0.0.1:" + metaPort), "host-0");
+            int port = freePort();
+            // The meta is embedded (server-less) and shares the node's listener, so its own listenPort
+            // is unused here.
+            MetaConfig metaConfig = MetaConfig.forTests(zk.getConnectString());
+            NodeConfig nodeConfig = NodeConfig
+                    .withMetadata(dataDir, List.of("127.0.0.1:" + port), "host-0")
+                    .withListenPort(port);
 
             try (StrataServer.Combined combined = StrataServer.startCombined(metaConfig, nodeConfig)) {
-                // Both halves are up and talking: the co-resident node registers with the
-                // co-resident meta leader (registration is leader-gated, so this also confirms the
-                // embedded meta won the latch).
+                // Both planes share ONE listener: the co-resident node registers with the co-resident
+                // meta leader over that single port (registration is leader-gated, so this also
+                // confirms the embedded meta won the latch).
                 awaitRegistered(zk.getConnectString(), 1);
 
-                // The co-resident meta serves client metadata RPCs.
-                try (StrataClient client = StrataClient.connect(ClientConfig.of(combined.meta().endpoint()))) {
+                // Metadata RPCs are served on the same SCP port as the data plane.
+                try (StrataClient client = StrataClient.connect(ClientConfig.of(combined.node().endpoint()))) {
                     FileId a = client.create(StrataClient.FileSpec.log("combined", "/a")).id();
                     FileId b = client.create(StrataClient.FileSpec.log("combined", "/b")).id();
                     assertNotNull(a);

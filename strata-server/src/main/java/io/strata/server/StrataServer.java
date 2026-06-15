@@ -102,16 +102,16 @@ public final class StrataServer {
      * metadata plane scales with the data fleet and there is no separate {@code strata-meta} to
      * deploy. Every combined node hosts a meta instance; one is elected leader (the rest are warm
      * standbys) and serves all metadata RPCs — clients reach it via the {@code NOT_LEADER} redirect.
-     * The meta listens on {@code STRATA_META_LISTEN_PORT} (default 9200), the node on
-     * {@code STRATA_LISTEN_PORT} (9100); {@code STRATA_META_ENDPOINTS} lists the meta-eligible nodes
-     * (including this one).
+     * Both planes share one SCP listener on {@code STRATA_LISTEN_PORT} (default 9100): data opcodes go
+     * to the storage node, metadata opcodes to the co-resident meta. {@code STRATA_META_ENDPOINTS}
+     * lists the meta-eligible nodes (including this one) at that port.
      */
     private static void runCombined() throws Exception {
         String hostname = hostname();
         String advertisedHost = env("STRATA_ADVERTISED_HOST", hostname);
         MetaConfig metaConfig = new MetaConfig(
                 required("STRATA_ZK_CONNECT"),
-                intEnv("STRATA_META_LISTEN_PORT", 9_200),
+                intEnv("STRATA_LISTEN_PORT", 9_100),  // unused in embedded mode (meta shares the node's listener)
                 intEnv("STRATA_HEARTBEAT_INTERVAL_MS", 3_000),
                 intEnv("STRATA_LEASE_MS", 10_000),
                 intEnv("STRATA_DEAD_GRACE_MS", 30_000),
@@ -130,8 +130,7 @@ public final class StrataServer {
                 longEnv("STRATA_CAPACITY_BYTES", 1L << 40),  // 1 TiB
                 intEnv("STRATA_INVENTORY_INTERVAL_MS", 30_000));
         Combined combined = startCombined(metaConfig, nodeConfig);
-        log.info("combined node started: meta={} node={} zk={}",
-                combined.meta().endpoint(), combined.node().endpoint(), metaConfig.zkConnect());
+        log.info("combined node started: scp={} zk={}", combined.node().endpoint(), metaConfig.zkConnect());
         awaitShutdown("combined node", combined);
     }
 
@@ -144,16 +143,27 @@ public final class StrataServer {
         MetadataService meta = null;
         StorageNode node = null;
         try {
-            meta = new MetadataService(metaConfig);
-            node = new StorageNode(nodeConfig);
+            // One SCP listener for both planes: the meta runs embedded (no own port), served on the
+            // node's listener which routes metadata opcodes to it. The meta advertises the node's
+            // reachable endpoint as the NOT_LEADER redirect hint, so combined mode needs a FIXED node
+            // port — an ephemeral (0) port would advertise an unreachable ":0" hint before the real
+            // port is even bound.
+            if (nodeConfig.listenPort() == 0) {
+                throw new IllegalArgumentException(
+                        "combined mode requires a fixed node listenPort (not ephemeral 0): the embedded "
+                                + "meta advertises advertisedHost:listenPort as its leader redirect hint");
+            }
+            String combinedEndpoint = nodeConfig.advertisedHost() + ":" + nodeConfig.listenPort();
+            meta = new MetadataService(metaConfig, combinedEndpoint);
+            node = new StorageNode(nodeConfig, meta.handler());
             MetadataService startedMeta = meta;
             StorageNode startedNode = node;
             AutoCloseable metrics = startMetrics("combined", reg -> {
                 ServerMetrics.registerMeta(reg, startedMeta);
                 ServerMetrics.registerNode(reg, startedNode);
-                var observer = ServerMetrics.requestObserver(reg);
-                startedMeta.setRequestObserver(observer);
-                startedNode.setRequestObserver(observer);
+                // The single (node) listener serves both planes, so observe there; the embedded meta
+                // has no server of its own.
+                startedNode.setRequestObserver(ServerMetrics.requestObserver(reg));
             });
             return new Combined(meta, node, metrics);
         } catch (Exception e) {
