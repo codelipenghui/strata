@@ -113,9 +113,49 @@ public final class ChunkStore implements AutoCloseable {
         int dataCrc;
         List<Integer> sealedRangeCrcs = List.of();
 
+        // Running CRC state for an OPEN chunk: the whole-chunk CRC and the per-CRC_RANGE_SIZE range
+        // CRCs are folded as bytes are appended (and rebuilt from the verified prefix on recovery),
+        // so seal can emit them without re-reading the data region. Unused once SEALED.
+        final CRC32C runningWhole = new CRC32C();
+        CRC32C runningRange = new CRC32C();
+        long rangeRemaining = ChunkFormats.CRC_RANGE_SIZE;
+        final List<Integer> completedRangeCrcs = new ArrayList<>();
+
         /** The end offset served to readers: the sealed length once sealed, the live end before. */
         long currentEnd() {
             return state == ChunkState.SEALED ? sealedLength : end;
+        }
+
+        /**
+         * Folds freshly-appended logical bytes into the running whole + range CRCs, rolling a range
+         * CRC every CRC_RANGE_SIZE. Must be called in append order while holding this handle's
+         * monitor; {@code payload}'s position/limit are left untouched.
+         */
+        void crcAccumulate(ByteBuffer payload) {
+            ByteBuffer src = payload.duplicate();
+            while (src.hasRemaining()) {
+                int n = (int) Math.min(src.remaining(), rangeRemaining);
+                ByteBuffer slice = src.duplicate();
+                slice.limit(slice.position() + n);
+                runningWhole.update(slice.duplicate());
+                runningRange.update(slice);
+                src.position(src.position() + n);
+                rangeRemaining -= n;
+                if (rangeRemaining == 0) {
+                    completedRangeCrcs.add((int) runningRange.getValue());
+                    runningRange.reset();
+                    rangeRemaining = ChunkFormats.CRC_RANGE_SIZE;
+                }
+            }
+        }
+
+        /** Emits the accumulated CRCs in the same shape scanDataCrcs produces, without re-reading. */
+        CrcScan snapshotRunningCrcs() {
+            List<Integer> ranges = new ArrayList<>(completedRangeCrcs);
+            if (rangeRemaining != ChunkFormats.CRC_RANGE_SIZE) { // a partial final range holds bytes
+                ranges.add((int) runningRange.getValue());
+            }
+            return new CrcScan((int) runningWhole.getValue(), ranges);
         }
 
         Handle(ChunkId id, ChunkFormats.Header header) {
@@ -304,6 +344,11 @@ public final class ChunkStore implements AutoCloseable {
             long writePos = checkedAdd(DATA_START, baseOffset, "chunk file offset");
             writeFully(h.data, payload.duplicate(), writePos);
             h.ledger.append(new ChunkFormats.LedgerEntry(newEnd, payloadCrc, epoch));
+            // Fold into the running whole + range CRCs ONLY after the data + ledger writes commit: a
+            // throwing ledger.append must leave the accumulators (and h.end) untouched, or a same-offset
+            // retry on this Handle would fold the same bytes twice and corrupt the seal-time snapshot.
+            // crcAccumulate is pure CPU under the monitor — it preserves append order and cannot throw.
+            h.crcAccumulate(payload);
             h.end = newEnd;
             appendOps.incrementAndGet();
             appendBytes.addAndGet(len);
@@ -456,7 +501,9 @@ public final class ChunkStore implements AutoCloseable {
             // Node-computed sections are deterministic, so replicas stay byte-identical. Compute
             // them before stopping the fsync committer; caller validation or read verification
             // failures must leave an OPEN ack-on-fsync chunk with its committer still running.
-            CrcScan scan = scanDataCrcs(h, dataLength);
+            // Common path: seal at the live end — emit the CRCs accumulated during append, no re-read.
+            // A truncating seal (dataLength < end, e.g. after recovery) can't use the running state.
+            CrcScan scan = dataLength == h.end ? h.snapshotRunningCrcs() : scanDataCrcs(h, dataLength);
             int ledgerEntryCount = ledgerEntriesThrough(h.ledger, dataLength);
 
             // stop the group committer BEFORE truncating: its flusher must not race the truncate,
@@ -880,6 +927,7 @@ public final class ChunkStore implements AutoCloseable {
                 ByteBuffer bb = ByteBuffer.wrap(buf, 0, len);
                 readFully(h.data, bb, checkedAdd(DATA_START, start, "chunk file offset"));
                 if (Crc.of(buf, 0, len) != e.payloadCrc()) break; // corrupt tail
+                h.crcAccumulate(ByteBuffer.wrap(buf, 0, len)); // rebuild running CRCs from the verified prefix
                 verifiedEnd = e.endOffset();
             }
             h.ledger.truncateTo(verifiedEnd);
