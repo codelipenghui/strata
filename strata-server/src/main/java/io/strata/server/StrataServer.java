@@ -34,16 +34,18 @@ public final class StrataServer {
     public static void main(String[] args) throws Exception {
         String role = args.length > 0 ? args[0] : env("STRATA_ROLE", null);
         if (role == null) {
-            System.err.println("usage: strata <node|meta>   (or set STRATA_ROLE=node|meta)");
+            System.err.println("usage: strata <node|meta|combined>   (or set STRATA_ROLE=node|meta|combined)");
             System.exit(2);
             return;
         }
         switch (role) {
             case "node" -> runNode();
             case "meta" -> runMeta();
+            case "combined", "node,meta" -> runCombined();
             case "perf" -> StrataPerf.run(args);
             default -> {
-                System.err.println("unknown role '" + role + "': expected 'node', 'meta', or 'perf'");
+                System.err.println("unknown role '" + role
+                        + "': expected 'node', 'meta', 'combined', or 'perf'");
                 System.exit(2);
             }
         }
@@ -93,6 +95,105 @@ public final class StrataServer {
             node.setRequestObserver(ServerMetrics.requestObserver(reg));
         });
         awaitShutdown("storage node", metrics, node);
+    }
+
+    /**
+     * Co-resident mode: runs a {@link MetadataService} and a {@link StorageNode} in one JVM, so the
+     * metadata plane scales with the data fleet and there is no separate {@code strata-meta} to
+     * deploy. Every combined node hosts a meta instance; one is elected leader (the rest are warm
+     * standbys) and serves all metadata RPCs — clients reach it via the {@code NOT_LEADER} redirect.
+     * The meta listens on {@code STRATA_META_LISTEN_PORT} (default 9200), the node on
+     * {@code STRATA_LISTEN_PORT} (9100); {@code STRATA_META_ENDPOINTS} lists the meta-eligible nodes
+     * (including this one).
+     */
+    private static void runCombined() throws Exception {
+        String hostname = hostname();
+        String advertisedHost = env("STRATA_ADVERTISED_HOST", hostname);
+        MetaConfig metaConfig = new MetaConfig(
+                required("STRATA_ZK_CONNECT"),
+                intEnv("STRATA_META_LISTEN_PORT", 9_200),
+                intEnv("STRATA_HEARTBEAT_INTERVAL_MS", 3_000),
+                intEnv("STRATA_LEASE_MS", 10_000),
+                intEnv("STRATA_DEAD_GRACE_MS", 30_000),
+                intEnv("STRATA_REPAIR_SCAN_INTERVAL_MS", 5_000),
+                intEnv("STRATA_REPAIR_COMMAND_TIMEOUT_MS", 30_000))
+                .withAdvertisedHost(advertisedHost);
+        NodeConfig nodeConfig = new NodeConfig(
+                Path.of(env("STRATA_DATA_DIR", "/data")),
+                intEnv("STRATA_LISTEN_PORT", 9_100),
+                advertisedHost,
+                null,
+                endpoints(required("STRATA_META_ENDPOINTS")),
+                env("STRATA_ZONE", "z0"),
+                env("STRATA_RACK", "r0"),
+                env("STRATA_HOST", hostname),
+                longEnv("STRATA_CAPACITY_BYTES", 1L << 40),  // 1 TiB
+                intEnv("STRATA_INVENTORY_INTERVAL_MS", 30_000));
+        Combined combined = startCombined(metaConfig, nodeConfig);
+        log.info("combined node started: meta={} node={} zk={}",
+                combined.meta().endpoint(), combined.node().endpoint(), metaConfig.zkConnect());
+        awaitShutdown("combined node", combined);
+    }
+
+    /**
+     * Builds and starts a co-resident metadata service + storage node behind a single combined
+     * metrics endpoint, and returns a handle that closes both (node first, then meta). The meta is
+     * built first so it can join the leader latch before the node tries to register.
+     */
+    static Combined startCombined(MetaConfig metaConfig, NodeConfig nodeConfig) throws Exception {
+        MetadataService meta = null;
+        StorageNode node = null;
+        try {
+            meta = new MetadataService(metaConfig);
+            node = new StorageNode(nodeConfig);
+            MetadataService startedMeta = meta;
+            StorageNode startedNode = node;
+            AutoCloseable metrics = startMetrics("combined", reg -> {
+                ServerMetrics.registerMeta(reg, startedMeta);
+                ServerMetrics.registerNode(reg, startedNode);
+                var observer = ServerMetrics.requestObserver(reg);
+                startedMeta.setRequestObserver(observer);
+                startedNode.setRequestObserver(observer);
+            });
+            return new Combined(meta, node, metrics);
+        } catch (Exception e) {
+            // a partial start must not leak the meta's ZK session or the node's listener
+            closeQuietly(node);
+            closeQuietly(meta);
+            throw e;
+        }
+    }
+
+    /** Co-resident meta + node + their shared metrics endpoint; closes node before meta on shutdown. */
+    record Combined(MetadataService meta, StorageNode node, AutoCloseable metrics) implements AutoCloseable {
+        @Override
+        public void close() throws Exception {
+            Exception failure = null;
+            for (AutoCloseable c : new AutoCloseable[]{metrics, node, meta}) {
+                try {
+                    c.close();
+                } catch (Exception e) {
+                    if (failure == null) {
+                        failure = e;
+                    } else {
+                        failure.addSuppressed(e);
+                    }
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+    }
+
+    private static void closeQuietly(AutoCloseable c) {
+        if (c != null) {
+            try {
+                c.close();
+            } catch (Exception ignored) {
+                // best-effort cleanup on a partial start
+            }
+        }
     }
 
     /**
