@@ -503,7 +503,9 @@ public final class ChunkStore implements AutoCloseable {
             // failures must leave an OPEN ack-on-fsync chunk with its committer still running.
             // Common path: seal at the live end — emit the CRCs accumulated during append, no re-read.
             // A truncating seal (dataLength < end, e.g. after recovery) can't use the running state.
+            long t0 = System.nanoTime();
             CrcScan scan = dataLength == h.end ? h.snapshotRunningCrcs() : scanDataCrcs(h, dataLength);
+            long tCrc = System.nanoTime();
             int ledgerEntryCount = ledgerEntriesThrough(h.ledger, dataLength);
 
             // stop the group committer BEFORE truncating: its flusher must not race the truncate,
@@ -537,7 +539,9 @@ public final class ChunkStore implements AutoCloseable {
             writeFully(h.data, footer.duplicate(), footerStart);
             writeFully(h.data, ByteBuffer.wrap(trailer.encode()),
                     checkedAdd(footerStart, footerLen, "trailer offset"));
+            long tWrite = System.nanoTime();
             h.data.force(false);
+            long tForce = System.nanoTime();
 
             h.state = ChunkState.SEALED;
             h.sealedLength = dataLength;
@@ -545,11 +549,23 @@ public final class ChunkStore implements AutoCloseable {
             h.sealedRangeCrcs = List.copyOf(scan.rangeCrcs);
             h.lastKnownDO = dataLength;
             h.persistSidecar();
+            // seal-phase timing (diagnostic): attribute seal latency to CRC vs footer write vs the data
+            // fsync vs the sidecar fsync. Log only slow seals so the tail shows up without spamming.
+            long tSidecar = System.nanoTime();
+            if (tSidecar - t0 > 100_000_000L) {
+                log.info("slow seal {} len={}MiB phases(ms): crc={} footerWrite={} dataFsync={} sidecarFsync={} total={}",
+                        id, dataLength >> 20, msBetween(t0, tCrc), msBetween(tCrc, tWrite),
+                        msBetween(tWrite, tForce), msBetween(tForce, tSidecar), msBetween(t0, tSidecar));
+            }
             h.ledger.close();
             Files.deleteIfExists(h.ledgerPath);
             h.ledger = null;
             return new SealResult(dataLength, scan.dataCrc);
         }
+    }
+
+    private static String msBetween(long fromNs, long toNs) {
+        return String.format("%.1f", (toNs - fromNs) / 1_000_000.0);
     }
 
     private record CrcScan(int dataCrc, List<Integer> rangeCrcs) {}
