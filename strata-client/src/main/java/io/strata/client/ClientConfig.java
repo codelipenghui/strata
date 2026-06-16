@@ -6,7 +6,7 @@ import io.strata.common.Endpoint;
 import java.util.List;
 import java.util.Objects;
 
-/** Client configuration. chunkRollBytes is ~1 GB nominal in production; tests use small values. */
+/** Client configuration. chunkRollBytes is ~2 GB nominal in production; tests use small values. */
 public record ClientConfig(List<String> metadataEndpoints, long chunkRollBytes, long callTimeoutMs,
                            ConnectionPolicy connectionPolicy, int storageConnectionsPerEndpoint) {
     public ClientConfig(List<String> metadataEndpoints, long chunkRollBytes, long callTimeoutMs) {
@@ -39,7 +39,7 @@ public record ClientConfig(List<String> metadataEndpoints, long chunkRollBytes, 
     }
 
     public static ClientConfig of(String metadataEndpoint) {
-        return new ClientConfig(List.of(metadataEndpoint), 1L << 30, 10_000);
+        return new ClientConfig(List.of(metadataEndpoint), 2L << 30, 10_000); // 2 GiB nominal chunk roll
     }
 
     public ClientConfig withChunkRollBytes(long bytes) {
