@@ -31,6 +31,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * SCP server over Netty. Handler invocation is serialized per connection on a virtual-thread
@@ -38,6 +40,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class ScpServer implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ScpServer.class);
+    private static final int DEFAULT_MAX_INFLIGHT_REQUESTS =
+            Integer.getInteger("strata.scp.server.maxInflightRequests", 1024);
+    private static final long DEFAULT_MAX_INFLIGHT_BYTES =
+            Long.getLong("strata.scp.server.maxInflightBytes", 1L << 30);
 
     /**
      * Handles one request frame; returns the response frame. Throw ScpException for protocol errors.
@@ -89,6 +95,8 @@ public final class ScpServer implements AutoCloseable {
     private volatile int nodeId; // updatable: a fresh storage node learns its id at registration
     private final long incMsb;
     private final long incLsb;
+    private final int maxInflightRequests;
+    private final long maxInflightBytes;
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private volatile RequestObserver requestObserver; // optional; set by the metrics layer
 
@@ -98,10 +106,18 @@ public final class ScpServer implements AutoCloseable {
     }
 
     public ScpServer(int port, int nodeId, long incMsb, long incLsb, Handler handler) throws IOException {
+        this(port, nodeId, incMsb, incLsb, handler,
+                DEFAULT_MAX_INFLIGHT_REQUESTS, DEFAULT_MAX_INFLIGHT_BYTES);
+    }
+
+    ScpServer(int port, int nodeId, long incMsb, long incLsb, Handler handler,
+              int maxInflightRequests, long maxInflightBytes) throws IOException {
         this.handler = handler;
         this.nodeId = nodeId;
         this.incMsb = incMsb;
         this.incLsb = incLsb;
+        this.maxInflightRequests = Math.max(1, maxInflightRequests);
+        this.maxInflightBytes = Math.max(Frame.PREAMBLE_AFTER_LEN, maxInflightBytes);
 
         ServerBootstrap bootstrap = new ServerBootstrap()
                 .group(NettyEventLoops.SERVER_BOSS_GROUP, NettyEventLoops.SERVER_WORKER_GROUP)
@@ -144,6 +160,9 @@ public final class ScpServer implements AutoCloseable {
     private final class ConnectionHandler extends SimpleChannelInboundHandler<Frame> {
         private final ExecutorService requestExecutor;
         private final Set<Frame> inFlightAsyncRequests = ConcurrentHashMap.newKeySet();
+        private final ConcurrentHashMap<Frame, Integer> reservedBytesByFrame = new ConcurrentHashMap<>();
+        private final AtomicInteger inflightRequests = new AtomicInteger();
+        private final AtomicLong inflightBytes = new AtomicLong();
         private final AtomicBoolean connectionOpen = new AtomicBoolean(true);
         private boolean helloComplete;
 
@@ -159,12 +178,39 @@ public final class ScpServer implements AutoCloseable {
 
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, Frame frame) {
+            if (!reserveInbound(frame)) {
+                writeResponse(ctx, Frame.response(frame,
+                        Resp.error(ErrorCode.THROTTLED, "too many in-flight requests", maxInflightRequests),
+                        null), true, frame);
+                return;
+            }
             FrameTask task = new FrameTask(ctx, frame);
             try {
                 requestExecutor.execute(task);
             } catch (RuntimeException | Error e) {
                 task.closeIfPending();
                 throw e;
+            }
+        }
+
+        private boolean reserveInbound(Frame frame) {
+            int frameBytes = Frame.PREAMBLE_AFTER_LEN + frame.headerSlice().remaining() + frame.payloadLength();
+            int requests = inflightRequests.incrementAndGet();
+            long bytes = inflightBytes.addAndGet(frameBytes);
+            if (requests <= maxInflightRequests && bytes <= maxInflightBytes) {
+                reservedBytesByFrame.put(frame, frameBytes);
+                return true;
+            }
+            inflightRequests.decrementAndGet();
+            inflightBytes.addAndGet(-frameBytes);
+            return false;
+        }
+
+        private void releaseInbound(Frame frame) {
+            Integer bytes = reservedBytesByFrame.remove(frame);
+            if (bytes != null) {
+                inflightRequests.decrementAndGet();
+                inflightBytes.addAndGet(-bytes);
             }
         }
 
@@ -184,6 +230,7 @@ public final class ScpServer implements AutoCloseable {
                 try {
                     processFrame(ctx, frame);
                 } catch (RuntimeException | Error e) {
+                    releaseInbound(frame);
                     frame.close();
                     throw e;
                 }
@@ -191,6 +238,7 @@ public final class ScpServer implements AutoCloseable {
 
             private void closeIfPending() {
                 if (started.compareAndSet(false, true)) {
+                    releaseInbound(frame);
                     frame.close();
                 }
             }
@@ -198,6 +246,7 @@ public final class ScpServer implements AutoCloseable {
 
         private void processFrame(ChannelHandlerContext ctx, Frame frame) {
             if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
+                releaseInbound(frame);
                 frame.close();
                 return;
             }
@@ -226,7 +275,8 @@ public final class ScpServer implements AutoCloseable {
             }
             helloComplete = true;
             writeResponse(ctx, Frame.response(hello,
-                    new Messages.HelloResp(0, nodeId, incMsb, incLsb, FrameIO.MAX_FRAME_BYTES, 1L << 30).encode(),
+                    new Messages.HelloResp(0, nodeId, incMsb, incLsb, FrameIO.MAX_FRAME_BYTES,
+                            maxInflightBytes).encode(),
                     null), false, hello);
         }
 
@@ -351,7 +401,10 @@ public final class ScpServer implements AutoCloseable {
         private void closeFrames(Frame frame, Frame releaseAfterWrite) {
             frame.close();
             if (releaseAfterWrite != frame) {
+                releaseInbound(releaseAfterWrite);
                 releaseAfterWrite.close();
+            } else {
+                releaseInbound(frame);
             }
         }
 
@@ -361,6 +414,7 @@ public final class ScpServer implements AutoCloseable {
             connections.remove(ctx.channel());
             for (Frame frame : inFlightAsyncRequests) {
                 if (inFlightAsyncRequests.remove(frame)) {
+                    releaseInbound(frame);
                     frame.close();
                 }
             }

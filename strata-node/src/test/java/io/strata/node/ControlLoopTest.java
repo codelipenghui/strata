@@ -20,6 +20,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -667,21 +668,42 @@ class ControlLoopTest {
         try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             ChunkId chunkId = new ChunkId(FileId.random(), 0);
+            Path output = dir.resolve("invalid-repair-fetch.chunk");
 
             ScpException negative = assertThrows(ScpException.class,
                     () -> loop.fetchWholeFile(null, new Messages.ReplicateCmd(20, chunkId, List.of(),
-                            (byte) 0, 0, -1)));
+                            (byte) 0, 0, -1), output));
             assertEquals(ErrorCode.CORRUPT_CHUNK, negative.code());
-
-            ScpException tooLarge = assertThrows(ScpException.class,
-                    () -> loop.fetchWholeFile(null, new Messages.ReplicateCmd(21, chunkId, List.of(),
-                            (byte) 0, 0, Integer.MAX_VALUE)));
-            assertEquals(ErrorCode.INTERNAL, tooLarge.code());
 
             ScpException overflow = assertThrows(ScpException.class,
                     () -> loop.fetchWholeFile(null, new Messages.ReplicateCmd(22, chunkId, List.of(),
-                            (byte) 0, 0, Long.MAX_VALUE)));
+                            (byte) 0, 0, Long.MAX_VALUE), output));
             assertEquals(ErrorCode.CORRUPT_CHUNK, overflow.code());
+        }
+    }
+
+    @Test
+    void fetchWholeFileDoesNotRejectLargeValidRepairLengthBeforeReadingSource() throws Exception {
+        long minLength = ChunkFormats.HEADER_SIZE + ChunkFormats.TRAILER_SIZE;
+        AtomicInteger calls = new AtomicInteger();
+        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+             ScpServer source = new ScpServer(0, 77, 0, 0, req -> {
+                 calls.incrementAndGet();
+                 return ScpServer.ok(req, new Messages.FetchResp(minLength, ChunkState.SEALED).encode(),
+                         ByteBuffer.wrap(new byte[0]));
+             });
+             ScpClient client = new ScpClient("127.0.0.1", source.port(),
+                     ScpClient.KIND_STORAGE_NODE, "fetch-large-length-test")) {
+            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            Path output = dir.resolve("large-repair-fetch.chunk");
+
+            ScpException e = assertThrows(ScpException.class,
+                    () -> loop.fetchWholeFile(client, new Messages.ReplicateCmd(21, new ChunkId(FileId.random(), 0),
+                            List.of(), (byte) 0, 0, Integer.MAX_VALUE), output));
+
+            assertEquals(ErrorCode.INTERNAL, e.code());
+            assertEquals(1, calls.get(),
+                    "large valid repair lengths must be streamed from the source, not rejected as in-memory imports");
         }
     }
 
@@ -734,10 +756,13 @@ class ControlLoopTest {
              ScpClient client = new ScpClient("127.0.0.1", source.port(),
                      ScpClient.KIND_STORAGE_NODE, "fetch-multipart-test")) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            Path output = dir.resolve("fetch-multipart.chunk");
 
-            byte[] fetched = loop.fetchWholeFile(client, new Messages.ReplicateCmd(23, chunkId,
-                    List.of(), (byte) 0, 0, 1));
+            long fetchedLength = loop.fetchWholeFile(client, new Messages.ReplicateCmd(23, chunkId,
+                    List.of(), (byte) 0, 0, 1), output);
+            byte[] fetched = Files.readAllBytes(output);
 
+            assertEquals(file.length, fetchedLength);
             assertEquals(file.length, fetched.length);
             assertEquals(file[0], fetched[0]);
             assertEquals(file[file.length - 1], fetched[fetched.length - 1]);
@@ -893,10 +918,12 @@ class ControlLoopTest {
              ScpClient client = new ScpClient("127.0.0.1", source.port(),
                      ScpClient.KIND_STORAGE_NODE, "fetch-test")) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            Path output = Files.createTempFile(dir, "fetch-failure.", ".chunk");
             ScpException e = assertThrows(ScpException.class,
                     () -> loop.fetchWholeFile(client, new Messages.ReplicateCmd(22,
-                            new ChunkId(FileId.random(), 0), List.of(), (byte) 0, 0, 1)));
+                            new ChunkId(FileId.random(), 0), List.of(), (byte) 0, 0, 1), output));
             assertEquals(expectedCode, e.code());
+            Files.deleteIfExists(output);
         }
     }
 

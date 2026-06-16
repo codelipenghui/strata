@@ -19,6 +19,10 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -226,9 +230,17 @@ final class ControlLoop implements AutoCloseable {
                 Endpoint hp = Endpoint.parse(source.endpoint(), "endpoint", ErrorCode.INTERNAL);
                 try (ScpClient src = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_STORAGE_NODE,
                         "repair-" + node.nodeId())) {
-                    byte[] file = fetchWholeFile(src, cmd);
-                    store.importSealed(cmd.chunkId(), file, cmd.expectedLength(), cmd.expectedCrc());
-                    log.info("replicated {} from node {} ({} bytes)", cmd.chunkId(), source.nodeId(), file.length);
+                    Path tmp = store.createImportTemp(cmd.chunkId());
+                    try {
+                        long fileLength = fetchWholeFile(src, cmd, tmp);
+                        store.importSealed(cmd.chunkId(), tmp, cmd.expectedLength(), cmd.expectedCrc());
+                        tmp = null; // importSealed consumes the temp file by moving it into place.
+                        log.info("replicated {} from node {} ({} bytes)", cmd.chunkId(), source.nodeId(), fileLength);
+                    } finally {
+                        if (tmp != null) {
+                            Files.deleteIfExists(tmp);
+                        }
+                    }
                     return;
                 }
             } catch (ScpException e) {
@@ -242,56 +254,69 @@ final class ControlLoop implements AutoCloseable {
         throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no usable source");
     }
 
-    byte[] fetchWholeFile(ScpClient src, Messages.ReplicateCmd cmd) throws IOException {
-        byte[] out = null;
+    long fetchWholeFile(ScpClient src, Messages.ReplicateCmd cmd, Path output) throws IOException {
         long offset = 0;
         long fileLength = -1;
         long maxFileLength = maxRepairFileLength(cmd.expectedLength());
-        while (fileLength < 0 || offset < fileLength) {
-            var fetch = new Messages.FetchChunk(cmd.chunkId(), offset, FETCH_CHUNK_BYTES);
-            var frame = src.callFrame(Opcode.FETCH_CHUNK, fetch.encode(), null, CALL_TIMEOUT_MS);
-            Messages.FetchResp resp;
-            try {
-                ByteBuffer hb = frame.headerSlice();
-                io.strata.proto.Resp.check(hb);
-                resp = Messages.FetchResp.decode(hb);
-            } catch (ScpException e) {
-                throw e;
-            } catch (RuntimeException e) {
-                throw new ScpException(ErrorCode.CORRUPT_CHUNK,
-                        "malformed fetch response from repair source: " + e);
+        try (FileChannel out = FileChannel.open(output,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+            while (fileLength < 0 || offset < fileLength) {
+                var fetch = new Messages.FetchChunk(cmd.chunkId(), offset, FETCH_CHUNK_BYTES);
+                var frame = src.callFrame(Opcode.FETCH_CHUNK, fetch.encode(), null, CALL_TIMEOUT_MS);
+                Messages.FetchResp resp;
+                try {
+                    ByteBuffer hb = frame.headerSlice();
+                    io.strata.proto.Resp.check(hb);
+                    resp = Messages.FetchResp.decode(hb);
+                } catch (ScpException e) {
+                    throw e;
+                } catch (RuntimeException e) {
+                    throw new ScpException(ErrorCode.CORRUPT_CHUNK,
+                            "malformed fetch response from repair source: " + e);
+                }
+                if (resp.state() != ChunkState.SEALED) {
+                    throw new ScpException(ErrorCode.INTERNAL, "source chunk not sealed");
+                }
+                long reportedLength = resp.fileLength();
+                if (reportedLength < ChunkFormats.HEADER_SIZE + ChunkFormats.TRAILER_SIZE
+                        || reportedLength > maxFileLength) {
+                    throw new ScpException(ErrorCode.CORRUPT_CHUNK,
+                            "source file length out of bounds: " + reportedLength);
+                }
+                if (fileLength < 0) {
+                    fileLength = reportedLength;
+                } else if (reportedLength != fileLength) {
+                    throw new ScpException(ErrorCode.CORRUPT_CHUNK,
+                            "source file length changed: " + fileLength + " -> " + reportedLength);
+                }
+                int n = frame.payloadLength();
+                if (n > FETCH_CHUNK_BYTES) {
+                    throw new ScpException(ErrorCode.CORRUPT_CHUNK,
+                            "source sent " + n + " bytes for fetch limit " + FETCH_CHUNK_BYTES);
+                }
+                if (n > fileLength - offset) {
+                    throw new ScpException(ErrorCode.CORRUPT_CHUNK, "source sent bytes past EOF");
+                }
+                if (n == 0 && offset < fileLength) {
+                    throw new ScpException(ErrorCode.INTERNAL, "short fetch at " + offset);
+                }
+                ByteBuffer payload = frame.payloadSlice();
+                long written = 0;
+                while (payload.hasRemaining()) {
+                    int w = out.write(payload, offset + written);
+                    if (w <= 0) {
+                        throw new ScpException(ErrorCode.INTERNAL, "repair fetch made no write progress");
+                    }
+                    written += w;
+                }
+                if (written != n) {
+                    throw new ScpException(ErrorCode.INTERNAL, "repair fetch wrote " + written + " != " + n);
+                }
+                offset += n;
             }
-            if (resp.state() != ChunkState.SEALED) {
-                throw new ScpException(ErrorCode.INTERNAL, "source chunk not sealed");
-            }
-            long reportedLength = resp.fileLength();
-            if (reportedLength < ChunkFormats.HEADER_SIZE + ChunkFormats.TRAILER_SIZE
-                    || reportedLength > maxFileLength) {
-                throw new ScpException(ErrorCode.CORRUPT_CHUNK,
-                        "source file length out of bounds: " + reportedLength);
-            }
-            if (fileLength < 0) {
-                fileLength = reportedLength;
-                out = new byte[(int) fileLength]; // bounded by maxFileLength <= Integer.MAX_VALUE
-            } else if (reportedLength != fileLength) {
-                throw new ScpException(ErrorCode.CORRUPT_CHUNK,
-                        "source file length changed: " + fileLength + " -> " + reportedLength);
-            }
-            int n = frame.payloadLength();
-            if (n > FETCH_CHUNK_BYTES) {
-                throw new ScpException(ErrorCode.CORRUPT_CHUNK,
-                        "source sent " + n + " bytes for fetch limit " + FETCH_CHUNK_BYTES);
-            }
-            if (n > fileLength - offset) {
-                throw new ScpException(ErrorCode.CORRUPT_CHUNK, "source sent bytes past EOF");
-            }
-            if (n == 0 && offset < fileLength) {
-                throw new ScpException(ErrorCode.INTERNAL, "short fetch at " + offset);
-            }
-            frame.payloadSlice().get(out, (int) offset, n);
-            offset += n;
+            out.force(true);
         }
-        return out;
+        return fileLength;
     }
 
     private static long maxRepairFileLength(long expectedLength) {
@@ -301,10 +326,6 @@ final class ControlLoop implements AutoCloseable {
         long max = Checks.checkedAdd(ChunkFormats.HEADER_SIZE, expectedLength, "repair length");
         max = Checks.checkedAdd(max, ChunkFormats.TRAILER_SIZE, "repair length");
         max = Checks.checkedAdd(max, MAX_REPAIR_FOOTER_BYTES, "repair length");
-        if (max > Integer.MAX_VALUE) {
-            throw new ScpException(ErrorCode.INTERNAL,
-                    "repair file too large for in-memory import: " + expectedLength);
-        }
         return max;
     }
 
