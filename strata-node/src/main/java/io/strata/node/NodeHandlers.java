@@ -61,11 +61,11 @@ final class NodeHandlers implements ScpServer.Handler {
                 var r = store.readRegion(m.chunkId(), m.offset(), m.maxBytes());
                 byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
                 if (r.channel() != null) {
-                    // Future zero-copy path: readRegion owns and closes this channel via the server.
+                    // Sealed chunks can use zero-copy; readRegion owns and closes this channel via the server.
                     yield ScpServer.okFileRegion(req, header, r.channel(), r.filePosition(), r.length());
                 }
-                // Bytes were materialized under the chunk lock: sealed reads are CRC-verified, and
-                // open reads are stable snapshots immune to concurrent seal-truncate of the live file.
+                // Open reads are bounded to the replica-known durable high watermark and materialized
+                // under the chunk lock so concurrent seal-truncate cannot alter the wire payload.
                 byte[] bytes = r.bytes();
                 yield ScpServer.ok(req, header, bytes != null && bytes.length > 0 ? ByteBuffer.wrap(bytes) : null);
             }

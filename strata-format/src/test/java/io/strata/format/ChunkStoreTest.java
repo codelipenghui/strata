@@ -759,28 +759,32 @@ class ChunkStoreTest {
     @Test
     void readRegionResultIsStableSnapshotAcrossConcurrentSealTruncate() throws Exception {
         // A reader resolves a region on an OPEN chunk; the data plane transfers that region LATER,
-        // off the chunk lock. If a seal truncates the never-acked tail in between, a zero-copy
-        // region over the shared inode would stream the seal footer/trailer (silent corruption) or
-        // short-transfer (frame desync). readRegion must hand back a stable snapshot of an OPEN
-        // chunk so the deferred transfer cannot observe the truncation.
+        // off the chunk lock. readRegion must only expose bytes below the replica-known durable
+        // high watermark, and the exposed bytes must be a stable snapshot if a concurrent seal
+        // truncates the never-acked tail.
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
             store.append(id, 1, 0, 0, bytes("COMMITTED"));      // [0,9) survives the seal
             store.append(id, 1, 9, 9, bytes("TAILTAILTAIL"));   // [9,21) never-acked, will be cut
             assertEquals(21, store.stat(id).localEndOffset());
 
-            // reader resolves the tail region [9,21) of the still-OPEN chunk
-            ChunkStore.ReadRegionResult region = store.readRegion(id, 9, 1024);
-            assertEquals(12, region.length());
+            // The uncommitted tail must not be served at all, even though it is locally present.
+            ChunkStore.ReadRegionResult tail = store.readRegion(id, 9, 1024);
+            assertEquals(0, tail.length());
+            assertEquals(21, tail.localEndOffset());
+            assertEquals(9, tail.lastKnownDO());
+
+            // The committed prefix is served as a materialized snapshot.
+            ChunkStore.ReadRegionResult region = store.readRegion(id, 0, 1024);
+            assertEquals(9, region.length());
             try {
-                // a concurrent seal truncates exactly the bytes this region covers
+                // a concurrent seal truncates the never-acked tail after this region was resolved
                 var sealed = store.seal(id, 1, 9, null);
                 assertEquals(9, sealed.finalLength());
 
-                // the region handed out BEFORE the seal must still yield the original tail bytes —
-                // not the freshly written footer/trailer, and not a short read
+                // the region handed out BEFORE the seal must still yield the original committed bytes
                 byte[] got = consumeRegion(region);
-                assertArrayEquals("TAILTAILTAIL".getBytes(), got,
+                assertArrayEquals("COMMITTED".getBytes(), got,
                         "readRegion result must be a stable snapshot unaffected by a concurrent seal-truncate");
             } finally {
                 region.close();
@@ -793,6 +797,7 @@ class ChunkStoreTest {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
             store.append(id, 1, 0, 0, bytes("verified-open"));
+            store.append(id, 1, 13, 13, ByteBuffer.allocate(0)); // make the full range readable
 
             Path data = dir.resolve(ChunkFormats.baseName(id) + ".chunk");
             try (FileChannel ch = FileChannel.open(data, java.nio.file.StandardOpenOption.WRITE)) {
@@ -1546,6 +1551,7 @@ class ChunkStoreTest {
 
             open(store, id, 1);
             store.append(id, 1, 0, 0, bytes("hello world")); // 11 bytes, chunk still OPEN
+            store.append(id, 1, 11, 11, ByteBuffer.allocate(0)); // durable-offset beacon
 
             // OPEN-chunk read: bytes materialized under the lock, counted by served length
             var r1 = store.readRegion(id, 0, 1024);

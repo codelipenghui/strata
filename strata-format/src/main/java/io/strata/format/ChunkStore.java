@@ -511,10 +511,10 @@ public final class ChunkStore implements AutoCloseable {
 
     /**
      * A read response that is either a zero-copy file region or a heap snapshot of the bytes.
-     * Current client READs materialize bytes under the chunk lock: sealed chunks are range-CRC
-     * verified first, and open chunks are snapshotted before any concurrent seal-truncate can alter
-     * the transferred payload. Exactly one of {@code channel} / {@code bytes} is set for a non-empty
-     * result.
+     * Open chunks are bounded by the replica-known durable high watermark and snapshotted before
+     * any concurrent seal-truncate can alter the transferred payload. Sealed chunks may return a
+     * zero-copy channel region. Exactly one of {@code channel} / {@code bytes} is set for a
+     * non-empty result.
      */
     public record ReadRegionResult(FileChannel channel, long filePosition, int length, byte[] bytes,
                                    long localEndOffset, long lastKnownDO) implements AutoCloseable {
@@ -549,13 +549,14 @@ public final class ChunkStore implements AutoCloseable {
         requireNonNegative(maxBytes, "read maxBytes");
         Handle h = lookup(id);
         synchronized (h) {
-            long end = h.currentEnd();
-            if (offset >= end) {
-                return new ReadRegionResult(null, 0, 0, null, end, h.lastKnownDO);
+            long localEnd = h.currentEnd();
+            long readableEnd = h.state == ChunkState.SEALED ? localEnd : Math.min(localEnd, h.lastKnownDO);
+            if (offset >= readableEnd) {
+                return new ReadRegionResult(null, 0, 0, null, localEnd, h.lastKnownDO);
             }
-            int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), end - offset);
+            int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), readableEnd - offset);
             if (n == 0) {
-                return new ReadRegionResult(null, 0, 0, null, end, h.lastKnownDO);
+                return new ReadRegionResult(null, 0, 0, null, localEnd, h.lastKnownDO);
             }
             // observability: count client READ bytes served (mirrors append counters; drives read throughput)
             readOps.incrementAndGet();
@@ -570,7 +571,7 @@ public final class ChunkStore implements AutoCloseable {
                 // new EOF (silent corruption / SCP frame desync).
                 byte[] out = new byte[n];
                 readOpenVerified(h, offset, out);
-                return new ReadRegionResult(null, 0, n, out, end, h.lastKnownDO);
+                return new ReadRegionResult(null, 0, n, out, localEnd, h.lastKnownDO);
             }
             // SEALED: the data region is immutable (no further append/seal/truncate), so hand back a
             // zero-copy region the transport streams via sendfile — the fast client read path. We do
@@ -581,7 +582,7 @@ public final class ChunkStore implements AutoCloseable {
             // so the deferred transfer is safe.
             FileChannel readChannel = FileChannel.open(h.dataPath, StandardOpenOption.READ);
             try {
-                return new ReadRegionResult(readChannel, filePos, n, null, end, h.lastKnownDO);
+                return new ReadRegionResult(readChannel, filePos, n, null, localEnd, h.lastKnownDO);
             } catch (RuntimeException e) {
                 try {
                     readChannel.close();

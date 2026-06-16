@@ -140,6 +140,10 @@ class StorageNodeWireTest {
             ByteBuffer h2 = f2.get().headerSlice();
             Resp.check(h2);
             assertEquals(a.length + b.length, Messages.AppendResp.decode(h2).endOffset());
+            ByteBuffer h3 = client.call(Opcode.APPEND,
+                    new Messages.Append(id, 1, a.length + b.length, a.length + b.length).encode(),
+                    ByteBuffer.allocate(0), 5000);
+            assertEquals(a.length + b.length, Messages.AppendResp.decode(h3).endOffset());
 
             // read with payload
             Frame readFrame = client.callFrame(Opcode.READ,
@@ -189,6 +193,39 @@ class StorageNodeWireTest {
                     new Messages.DeleteChunks(List.of(id)).encode(), null, 5000);
             var del = Messages.DeleteChunksResp.decode(dh);
             assertEquals((short) 0, del.codes().get(0));
+        }
+    }
+
+    @Test
+    void openReadIsClampedToReplicaDurableHighWatermark() throws Exception {
+        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+             ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
+                    1 << 20, 1718000000000L).encode(), null, 5000);
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0).encode(),
+                    ByteBuffer.wrap("SAFE".getBytes()), 5000);
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 4, 4).encode(),
+                    ByteBuffer.wrap("TAIL".getBytes()), 5000);
+
+            Frame prefix = client.callFrame(Opcode.READ,
+                    new Messages.Read(id, 0, 1024).encode(), null, 5000);
+            ByteBuffer header = prefix.headerSlice();
+            Resp.check(header);
+            var resp = Messages.ReadResp.decode(header);
+            assertEquals(8, resp.localEndOffset());
+            assertEquals(4, resp.durableOffset());
+            byte[] got = new byte[prefix.payloadLength()];
+            prefix.payloadSlice().get(got);
+            assertArrayEquals("SAFE".getBytes(), got);
+
+            Frame tail = client.callFrame(Opcode.READ,
+                    new Messages.Read(id, 4, 1024).encode(), null, 5000);
+            ByteBuffer tailHeader = tail.headerSlice();
+            Resp.check(tailHeader);
+            var tailResp = Messages.ReadResp.decode(tailHeader);
+            assertEquals(8, tailResp.localEndOffset());
+            assertEquals(4, tailResp.durableOffset());
+            assertEquals(0, tail.payloadLength());
         }
     }
 
