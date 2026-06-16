@@ -66,9 +66,32 @@ public final class ChunkStore implements AutoCloseable {
     // Background writeback: a daemon periodically fsyncs OPEN, non-ack-on-fsync chunks that have
     // accumulated enough new data since their last flush, so the dirty-page backlog never grows to a
     // whole chunk and the seal-time fsync stays small. Best-effort, decoupled from the append/ack path.
-    private static final long BG_FLUSH_INTERVAL_MS = 500;
-    private static final long BG_FLUSH_THRESHOLD_BYTES = 4L << 20; // 4 MiB
+    //
+    // Both knobs are tunable (system property, then env, else default) so a deployment can trade fsync
+    // syscall rate against seal-time fsync size: a shorter interval / smaller threshold keeps less dirty
+    // data per open chunk, so a seal forces only its footer and a synchronized roll does not stampede
+    // the disk's fsync queue with many large concurrent forces. Defaults reproduce the original 500ms /
+    // 4 MiB behavior, so existing callers and tests are unchanged.
+    private static final long BG_FLUSH_INTERVAL_MS =
+            longConf("strata.bgFlush.intervalMs", "STRATA_BG_FLUSH_INTERVAL_MS", 500);
+    private static final long BG_FLUSH_THRESHOLD_BYTES =
+            longConf("strata.bgFlush.thresholdBytes", "STRATA_BG_FLUSH_THRESHOLD_BYTES", 4L << 20); // 4 MiB
     private final ScheduledExecutorService flusher;
+
+    /** System property (preferred, for tests) → environment variable → default; malformed values fall
+     *  back to the default rather than failing node startup. */
+    static long longConf(String property, String env, long def) {
+        String raw = System.getProperty(property);
+        if (raw == null) raw = System.getenv(env);
+        if (raw == null || raw.isBlank()) return def;
+        try {
+            long v = Long.parseLong(raw.trim());
+            return v > 0 ? v : def;
+        } catch (NumberFormatException e) {
+            log.warn("ignoring non-numeric {}/{}='{}', using default {}", property, env, raw, def);
+            return def;
+        }
+    }
 
     public ChunkStore(Path dir) throws IOException {
         this.dir = dir;

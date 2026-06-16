@@ -95,4 +95,22 @@ class ChunkStoreWritebackTest {
             assertEquals(0, store.backgroundFlushes(), "a chunk below the threshold should not be flushed");
         }
     }
+
+    @Test
+    void writebackConfPrefersPropertyAndFallsBackSafely() {
+        String prop = "strata.test.bgFlush.cfg";
+        String env = "STRATA_NONEXISTENT_ENV_XYZ"; // unset in the test JVM
+        System.clearProperty(prop);
+        try {
+            assertEquals(500L, ChunkStore.longConf(prop, env, 500L), "unset → default");
+            System.setProperty(prop, "150");
+            assertEquals(150L, ChunkStore.longConf(prop, env, 500L), "system property wins");
+            System.setProperty(prop, "not-a-number");
+            assertEquals(500L, ChunkStore.longConf(prop, env, 500L), "malformed → default");
+            System.setProperty(prop, "0");
+            assertEquals(500L, ChunkStore.longConf(prop, env, 500L), "non-positive → default");
+        } finally {
+            System.clearProperty(prop);
+        }
+    }
 }
