@@ -47,6 +47,8 @@ public final class ChunkStore implements AutoCloseable {
     /** Per-request read/fetch cap: callers loop; the frame layer tops out at 64 MB anyway. */
     public static final int MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 
+    private static final int RECOVERY_FENCE_REQUIRED = Integer.MAX_VALUE;
+
     private final Path dir;
     private final Map<ChunkId, Handle> chunks = new ConcurrentHashMap<>();
     private final Set<ChunkId> creating = ConcurrentHashMap.newKeySet();
@@ -278,9 +280,13 @@ public final class ChunkStore implements AutoCloseable {
 
         void persistSidecar() throws IOException {
             byte[] bytes = new ChunkFormats.Sidecar(writeEpoch, fenceEpoch, lastKnownDO, state).encode();
+            boolean existed = Files.exists(metaPath);
             try (FileChannel ch = FileChannel.open(metaPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
                 writeFully(ch, ByteBuffer.wrap(bytes), 0);
                 ch.force(true);
+            }
+            if (!existed) {
+                forceDirectory();
             }
         }
 
@@ -340,10 +346,18 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     private static void checkEpoch(Handle h, int epoch) {
+        if (h.fenceEpoch == RECOVERY_FENCE_REQUIRED) {
+            throw new ScpException(ErrorCode.FENCED_EPOCH,
+                    "fresh recovery fence required for " + h.id, nextEpochAfter(h.writeEpoch));
+        }
         int floor = Math.max(h.fenceEpoch, h.writeEpoch);
         if (epoch < floor) {
             throw new ScpException(ErrorCode.FENCED_EPOCH, "epoch " + epoch + " < " + floor, floor);
         }
+    }
+
+    private static int nextEpochAfter(int epoch) {
+        return epoch == Integer.MAX_VALUE ? Integer.MAX_VALUE : epoch + 1;
     }
 
     /* ---------------- operations ---------------- */
@@ -366,8 +380,10 @@ public final class ChunkStore implements AutoCloseable {
             dataCreated = true;
             writeFully(h.data, ByteBuffer.wrap(header.encode()), 0);
             h.data.force(true);
+            forceDirectory();
             ledgerOwned = !ledgerPreexisted;
             h.ledger = IntegrityLedger.create(h.ledgerPath);
+            forceDirectory();
             h.state = ChunkState.OPEN;
             h.end = 0;
             h.writeEpoch = writeEpoch;
@@ -413,8 +429,15 @@ public final class ChunkStore implements AutoCloseable {
         if (!owned) return;
         try {
             Files.deleteIfExists(path);
+            forceDirectory();
         } catch (IOException e) {
             log.warn("failed to delete {} {}", description, path, e);
+        }
+    }
+
+    private void forceDirectory() throws IOException {
+        try (FileChannel ch = FileChannel.open(dir, StandardOpenOption.READ)) {
+            ch.force(true);
         }
     }
 
@@ -484,10 +507,9 @@ public final class ChunkStore implements AutoCloseable {
     public record ReadResult(byte[] bytes, long localEndOffset, long lastKnownDO) {}
 
     /**
-     * A read response that is EITHER a zero-copy file region (sealed chunks, whose data is
-     * immutable) OR a heap snapshot of the bytes (open chunks, materialized under the chunk lock
-     * so a concurrent seal-truncate cannot corrupt a deferred transfer). Exactly one of
-     * {@code channel} / {@code bytes} is set for a non-empty result.
+     * A read response that is either a file region or a heap snapshot. Open chunks are materialized
+     * under the chunk lock so a concurrent seal-truncate cannot corrupt a deferred transfer; sealed
+     * chunks are also materialized after range-CRC verification so rotted bytes are never streamed.
      */
     public record ReadRegionResult(FileChannel channel, long filePosition, int length, byte[] bytes,
                                    long localEndOffset, long lastKnownDO) implements AutoCloseable {
@@ -511,7 +533,7 @@ public final class ChunkStore implements AutoCloseable {
             if (h.state == ChunkState.SEALED) {
                 readSealedVerified(h, offset, out);
             } else {
-                readFully(h.data, ByteBuffer.wrap(out), checkedAdd(DATA_START, offset, "chunk file offset"));
+                readOpenVerified(h, offset, out);
             }
             return new ReadResult(out, end, h.lastKnownDO);
         }
@@ -533,7 +555,6 @@ public final class ChunkStore implements AutoCloseable {
             // observability: count client READ bytes served (mirrors append counters; drives read throughput)
             readOps.incrementAndGet();
             readBytes.addAndGet(n);
-            long filePos = checkedAdd(DATA_START, offset, "chunk file offset");
             if (h.state != ChunkState.SEALED) {
                 // OPEN chunk: a concurrent seal can truncate the never-acked tail of this shared
                 // inode. A zero-copy region resolved LATER (the data-plane transfers the file
@@ -542,23 +563,12 @@ public final class ChunkStore implements AutoCloseable {
                 // corruption / SCP frame desync. Materialize a stable snapshot HERE under the lock
                 // (as read() does) so the wire payload is fixed before the lock is released.
                 byte[] out = new byte[n];
-                readFully(h.data, ByteBuffer.wrap(out), filePos);
+                readOpenVerified(h, offset, out);
                 return new ReadRegionResult(null, 0, n, out, end, h.lastKnownDO);
             }
-            // SEALED: the data region is immutable (no further append/seal/truncate); a concurrent
-            // delete only unlinks the path while this independent FD keeps the inode alive, so the
-            // deferred zero-copy transfer is safe.
-            FileChannel readChannel = FileChannel.open(h.dataPath, StandardOpenOption.READ);
-            try {
-                return new ReadRegionResult(readChannel, filePos, n, null, end, h.lastKnownDO);
-            } catch (RuntimeException e) {
-                try {
-                    readChannel.close();
-                } catch (IOException closeFailure) {
-                    e.addSuppressed(closeFailure);
-                }
-                throw e;
-            }
+            byte[] out = new byte[n];
+            readSealedVerified(h, offset, out);
+            return new ReadRegionResult(null, 0, n, out, end, h.lastKnownDO);
         }
     }
 
@@ -567,7 +577,14 @@ public final class ChunkStore implements AutoCloseable {
     public FenceResult fence(ChunkId id, int fenceEpoch) throws IOException {
         Handle h = lookup(id);
         synchronized (h) {
-            if (fenceEpoch > h.fenceEpoch) {
+            if (h.fenceEpoch == RECOVERY_FENCE_REQUIRED) {
+                if (fenceEpoch <= h.writeEpoch) {
+                    throw new ScpException(ErrorCode.FENCED_EPOCH,
+                            "fresh recovery fence must exceed " + h.writeEpoch, nextEpochAfter(h.writeEpoch));
+                }
+                h.fenceEpoch = fenceEpoch;
+                h.persistSidecar();
+            } else if (fenceEpoch > h.fenceEpoch) {
                 h.fenceEpoch = fenceEpoch;
                 h.persistSidecar();
             }
@@ -671,6 +688,7 @@ public final class ChunkStore implements AutoCloseable {
             }
             h.ledger.close();
             Files.deleteIfExists(h.ledgerPath);
+            forceDirectory();
             h.ledger = null;
             return new SealResult(dataLength, scan.dataCrc);
         }
@@ -843,6 +861,7 @@ public final class ChunkStore implements AutoCloseable {
                     ch.force(true);
                 }
                 Files.move(tmp, h.dataPath, StandardCopyOption.ATOMIC_MOVE);
+                forceDirectory();
                 movedData = true;
                 h.data = FileChannel.open(h.dataPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
                 h.state = ChunkState.SEALED;
@@ -856,6 +875,7 @@ public final class ChunkStore implements AutoCloseable {
                 sidecarStarted = true;
                 h.persistSidecar();
                 Files.deleteIfExists(h.ledgerPath);
+                forceDirectory();
                 chunks.put(id, h);
                 installed = true;
             } finally {
@@ -878,12 +898,14 @@ public final class ChunkStore implements AutoCloseable {
         }
         try {
             Files.deleteIfExists(tmp);
+            forceDirectory();
         } catch (IOException e) {
             log.warn("failed to delete incomplete import temp file {}", tmp, e);
         }
         if (movedData) {
             try {
                 Files.deleteIfExists(h.dataPath);
+                forceDirectory();
             } catch (IOException e) {
                 log.warn("failed to delete incomplete import data file {}", h.dataPath, e);
             }
@@ -891,6 +913,7 @@ public final class ChunkStore implements AutoCloseable {
         if (sidecarStarted) {
             try {
                 Files.deleteIfExists(h.metaPath);
+                forceDirectory();
             } catch (IOException e) {
                 log.warn("failed to delete incomplete import sidecar {}", h.metaPath, e);
             }
@@ -909,6 +932,7 @@ public final class ChunkStore implements AutoCloseable {
                 Files.deleteIfExists(h.dataPath);
                 Files.deleteIfExists(h.metaPath);
                 Files.deleteIfExists(h.ledgerPath);
+                forceDirectory();
                 chunks.remove(id, h);
             } catch (IOException e) {
                 log.warn("delete {} failed", id, e);
@@ -980,93 +1004,234 @@ public final class ChunkStore implements AutoCloseable {
                             recoverOne(ChunkFormats.parseBaseName(base));
                         } catch (Exception e) {
                             log.error("failed to recover chunk {} — quarantined", base, e);
+                            quarantineRecoveredFiles(base);
                         }
                     });
         }
     }
 
+    private void quarantineRecoveredFiles(String base) {
+        boolean moved = false;
+        String suffix = ".quarantine-" + System.currentTimeMillis();
+        for (String ext : List.of(".chunk", ".meta", ".j")) {
+            Path source = dir.resolve(base + ext);
+            if (!Files.exists(source)) {
+                continue;
+            }
+            try {
+                Files.move(source, quarantineTarget(source, suffix), StandardCopyOption.ATOMIC_MOVE);
+                moved = true;
+            } catch (IOException e) {
+                log.warn("failed to quarantine {}", source, e);
+            }
+        }
+        if (moved) {
+            try {
+                forceDirectory();
+            } catch (IOException e) {
+                log.warn("failed to fsync quarantine directory {}", dir, e);
+            }
+        }
+    }
+
+    private Path quarantineTarget(Path source, String suffix) {
+        String name = source.getFileName().toString();
+        Path target = source.resolveSibling(name + suffix);
+        int attempt = 1;
+        while (Files.exists(target)) {
+            target = source.resolveSibling(name + suffix + "-" + attempt++);
+        }
+        return target;
+    }
+
     private void recoverOne(ChunkId id) throws IOException {
         Handle probe = new Handle(id, null);
-        if (!Files.exists(probe.metaPath)) {
-            // crash between data-file creation and sidecar creation: OPEN_CHUNK was never acked
-            log.warn("chunk {} has no sidecar — removing incomplete remnants", id);
-            Files.deleteIfExists(probe.dataPath);
-            Files.deleteIfExists(probe.ledgerPath);
-            return;
-        }
-        ChunkFormats.Sidecar sidecar = ChunkFormats.Sidecar.decode(Files.readAllBytes(probe.metaPath));
-
+        boolean hasSidecar = Files.exists(probe.metaPath);
         byte[] headerBytes = new byte[HEADER_SIZE];
-        try (FileChannel ch = FileChannel.open(probe.dataPath, StandardOpenOption.READ)) {
-            readFully(ch, ByteBuffer.wrap(headerBytes), 0);
-        }
-        ChunkFormats.Header header = ChunkFormats.Header.decode(headerBytes);
-        Handle h = new Handle(id, header);
-        h.data = FileChannel.open(h.dataPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
-        h.writeEpoch = sidecar.writeEpoch();
-        h.fenceEpoch = sidecar.fenceEpoch();
-        h.lastKnownDO = sidecar.lastKnownDO();
-
-        if (sidecar.state() == ChunkState.SEALED) {
-            long fileLen = h.data.size();
-            byte[] trailerBytes = new byte[TRAILER_SIZE];
-            readFully(h.data, ByteBuffer.wrap(trailerBytes), fileLen - TRAILER_SIZE);
-            ChunkFormats.Trailer trailer = ChunkFormats.Trailer.decode(trailerBytes);
-            // verify the footer sections against the trailer's CRC (cheap — KBs): a sealed chunk
-            // with rotted footer metadata must be quarantined, not served as healthy (full
-            // data-region verification is deferred to scrub; readers have CRC_RANGES + batch CRCs)
-            int footerLen = checkedFooterLength(trailer, fileLen);
-            byte[] footerBytes = new byte[(int) footerLen];
-            readFully(h.data, ByteBuffer.wrap(footerBytes), trailer.footerStart());
-            if (Crc.of(footerBytes) != trailer.footerCrc()) {
-                throw new CorruptChunkException("footer crc mismatch for sealed chunk " + id);
+        ChunkFormats.Header header;
+        try {
+            try (FileChannel ch = FileChannel.open(probe.dataPath, StandardOpenOption.READ)) {
+                readFully(ch, ByteBuffer.wrap(headerBytes), 0);
             }
-            h.state = ChunkState.SEALED;
-            h.end = trailer.dataLength();
-            h.sealedLength = trailer.dataLength();
-            h.dataCrc = trailer.dataCrc();
-            h.sealedRangeCrcs = decodeCrcRanges(footerBytes, trailer.dataLength(), trailer.sectionCount());
-            Files.deleteIfExists(h.ledgerPath); // seal crashed before ledger delete
+            header = ChunkFormats.Header.decode(headerBytes);
+        } catch (IOException | RuntimeException e) {
+            if (!hasSidecar) {
+                removeMissingSidecarRemnants(id, probe, "malformed pre-sidecar");
+                return;
+            }
+            throw e;
+        }
+        if (!header.chunkId().equals(id)) {
+            throw new CorruptChunkException("chunk id mismatch in header: " + header.chunkId() + " != " + id);
+        }
+        boolean reconstructedSidecar = false;
+        ChunkFormats.Sidecar sidecar;
+        if (hasSidecar) {
+            sidecar = ChunkFormats.Sidecar.decode(Files.readAllBytes(probe.metaPath));
         } else {
-            // OPEN: replay ledger, verify tail data CRCs, truncate to the last verified boundary
-            if (!Files.exists(h.ledgerPath) && h.data.size() > HEADER_SIZE) {
-                // the ledger should only ever be absent for SEALED chunks; an open chunk with
-                // data but no ledger means external damage — its bytes are unverifiable and the
-                // truncate below discards them, so say it loudly
-                log.warn("chunk {} is OPEN with {} data bytes but NO integrity ledger — "
-                        + "unverifiable data will be discarded", id, h.data.size() - HEADER_SIZE);
+            sidecar = recoverMissingSidecar(id, probe, header);
+            if (sidecar == null) {
+                return;
             }
-            h.ledger = IntegrityLedger.open(h.ledgerPath);
-            long verifiedEnd = 0;
-            byte[] buf = null;
-            for (ChunkFormats.LedgerEntry e : h.ledger.entries()) {
-                long start = verifiedEnd;
-                long delta = e.endOffset() - start;
-                if (delta <= 0 || delta > Integer.MAX_VALUE) break; // impossible append extent
-                int len = (int) delta;
-                long entryFileEnd;
-                try {
-                    entryFileEnd = checkedAdd(DATA_START, e.endOffset(), "chunk file offset");
-                } catch (ScpException overflow) {
-                    break;
-                }
-                if (entryFileEnd > h.data.size()) break; // torn data tail
-                if (buf == null || buf.length < len) buf = new byte[len];
-                ByteBuffer bb = ByteBuffer.wrap(buf, 0, len);
-                readFully(h.data, bb, checkedAdd(DATA_START, start, "chunk file offset"));
-                if (Crc.of(buf, 0, len) != e.payloadCrc()) break; // corrupt tail
-                h.crcAccumulate(ByteBuffer.wrap(buf, 0, len)); // rebuild running CRCs from the verified prefix
-                verifiedEnd = e.endOffset();
-            }
-            h.ledger.truncateTo(verifiedEnd);
-            h.data.truncate(checkedAdd(DATA_START, verifiedEnd, "chunk file offset"));
-            h.state = ChunkState.OPEN;
-            h.end = verifiedEnd;
-            h.lastKnownDO = Math.min(h.lastKnownDO, verifiedEnd);
-            h.startCommitterIfFsync(forceCount);
+            reconstructedSidecar = true;
         }
-        chunks.put(id, h);
-        log.info("recovered chunk {} state={} end={}", id, h.state, h.end);
+        Handle h = new Handle(id, header);
+        boolean installed = false;
+        try {
+            h.data = FileChannel.open(h.dataPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            h.writeEpoch = sidecar.writeEpoch();
+            h.fenceEpoch = sidecar.fenceEpoch();
+            h.lastKnownDO = sidecar.lastKnownDO();
+
+            if (sidecar.state() == ChunkState.SEALED) {
+                long fileLen = h.data.size();
+                byte[] trailerBytes = new byte[TRAILER_SIZE];
+                readFully(h.data, ByteBuffer.wrap(trailerBytes), fileLen - TRAILER_SIZE);
+                ChunkFormats.Trailer trailer = ChunkFormats.Trailer.decode(trailerBytes);
+                // verify the footer sections against the trailer's CRC (cheap — KBs): a sealed chunk
+                // with rotted footer metadata must be quarantined, not served as healthy (full
+                // data-region verification is deferred to scrub; readers have CRC_RANGES + batch CRCs)
+                int footerLen = checkedFooterLength(trailer, fileLen);
+                byte[] footerBytes = new byte[(int) footerLen];
+                readFully(h.data, ByteBuffer.wrap(footerBytes), trailer.footerStart());
+                if (Crc.of(footerBytes) != trailer.footerCrc()) {
+                    throw new CorruptChunkException("footer crc mismatch for sealed chunk " + id);
+                }
+                h.state = ChunkState.SEALED;
+                h.end = trailer.dataLength();
+                h.sealedLength = trailer.dataLength();
+                h.dataCrc = trailer.dataCrc();
+                h.sealedRangeCrcs = decodeCrcRanges(footerBytes, trailer.dataLength(), trailer.sectionCount());
+                h.lastKnownDO = Math.max(h.lastKnownDO, trailer.dataLength());
+                if (reconstructedSidecar) {
+                    h.persistSidecar();
+                }
+                Files.deleteIfExists(h.ledgerPath); // seal crashed before ledger delete
+                forceDirectory();
+            } else {
+                // OPEN: replay ledger, verify tail data CRCs, truncate to the last verified boundary
+                if (!Files.exists(h.ledgerPath) && h.data.size() > HEADER_SIZE) {
+                    // the ledger should only ever be absent for SEALED chunks; an open chunk with
+                    // data but no ledger means external damage — its bytes are unverifiable and the
+                    // truncate below discards them, so say it loudly
+                    log.warn("chunk {} is OPEN with {} data bytes but NO integrity ledger — "
+                            + "unverifiable data will be discarded", id, h.data.size() - HEADER_SIZE);
+                }
+                h.ledger = IntegrityLedger.open(h.ledgerPath);
+                long verifiedEnd = 0;
+                byte[] buf = null;
+                for (ChunkFormats.LedgerEntry e : h.ledger.entries()) {
+                    long start = verifiedEnd;
+                    long delta = e.endOffset() - start;
+                    if (delta <= 0 || delta > Integer.MAX_VALUE) break; // impossible append extent
+                    int len = (int) delta;
+                    long entryFileEnd;
+                    try {
+                        entryFileEnd = checkedAdd(DATA_START, e.endOffset(), "chunk file offset");
+                    } catch (ScpException overflow) {
+                        break;
+                    }
+                    if (entryFileEnd > h.data.size()) break; // torn data tail
+                    if (buf == null || buf.length < len) buf = new byte[len];
+                    ByteBuffer bb = ByteBuffer.wrap(buf, 0, len);
+                    readFully(h.data, bb, checkedAdd(DATA_START, start, "chunk file offset"));
+                    if (Crc.of(buf, 0, len) != e.payloadCrc()) break; // corrupt tail
+                    h.crcAccumulate(ByteBuffer.wrap(buf, 0, len)); // rebuild running CRCs from the verified prefix
+                    verifiedEnd = e.endOffset();
+                }
+                h.ledger.truncateTo(verifiedEnd);
+                h.data.truncate(checkedAdd(DATA_START, verifiedEnd, "chunk file offset"));
+                h.state = ChunkState.OPEN;
+                h.end = verifiedEnd;
+                h.lastKnownDO = Math.min(h.lastKnownDO, verifiedEnd);
+                if (reconstructedSidecar) {
+                    h.persistSidecar();
+                }
+                h.startCommitterIfFsync(forceCount);
+            }
+            chunks.put(id, h);
+            installed = true;
+            log.info("recovered chunk {} state={} end={}", id, h.state, h.end);
+        } finally {
+            if (!installed) {
+                closeRecoveringHandle(h);
+            }
+        }
+    }
+
+    private void closeRecoveringHandle(Handle h) {
+        if (h.ledger != null) {
+            try {
+                h.ledger.close();
+            } catch (IOException e) {
+                log.warn("failed to close unrecovered ledger {}", h.ledgerPath, e);
+            }
+        }
+        if (h.data != null) {
+            try {
+                h.data.close();
+            } catch (IOException e) {
+                log.warn("failed to close unrecovered chunk {}", h.dataPath, e);
+            }
+        }
+    }
+
+    private ChunkFormats.Sidecar recoverMissingSidecar(ChunkId id, Handle probe,
+                                                       ChunkFormats.Header header) throws IOException {
+        if (Files.exists(probe.ledgerPath)) {
+            if (header.fsyncOnAck()) {
+                log.warn("chunk {} has no sidecar but has a ledger — reconstructing fenced OPEN state", id);
+                return reconstructedOpenSidecar(header);
+            }
+            removeMissingSidecarRemnants(id, probe, "incomplete non-fsync");
+            return null;
+        }
+        if (looksLikeValidSealedChunk(probe.dataPath)) {
+            log.warn("chunk {} has no sidecar but has a valid sealed footer — reconstructing sidecar", id);
+            return new ChunkFormats.Sidecar(header.createWriteEpoch(), -1, 0, ChunkState.SEALED);
+        }
+        if (header.fsyncOnAck()) {
+            log.warn("chunk {} has no sidecar — reconstructing fenced fsync-on-ack OPEN state", id);
+            return reconstructedOpenSidecar(header);
+        }
+        // For ack-on-replicate, file contents may have reached the page cache without any durable
+        // local ack point. Without a sidecar, the node cannot distinguish an acked replica from an
+        // unacked create remnant, so keep the existing conservative cleanup behavior.
+        removeMissingSidecarRemnants(id, probe, "incomplete non-fsync");
+        return null;
+    }
+
+    private ChunkFormats.Sidecar reconstructedOpenSidecar(ChunkFormats.Header header) {
+        return new ChunkFormats.Sidecar(header.createWriteEpoch(), RECOVERY_FENCE_REQUIRED, 0, ChunkState.OPEN);
+    }
+
+    private void removeMissingSidecarRemnants(ChunkId id, Handle probe, String reason) throws IOException {
+        log.warn("chunk {} has no sidecar — removing {} remnants", id, reason);
+        Files.deleteIfExists(probe.dataPath);
+        Files.deleteIfExists(probe.ledgerPath);
+        forceDirectory();
+    }
+
+    private boolean looksLikeValidSealedChunk(Path dataPath) {
+        try (FileChannel ch = FileChannel.open(dataPath, StandardOpenOption.READ)) {
+            long fileLen = ch.size();
+            if (fileLen < DATA_START + TRAILER_SIZE) {
+                return false;
+            }
+            byte[] trailerBytes = new byte[TRAILER_SIZE];
+            readFully(ch, ByteBuffer.wrap(trailerBytes), fileLen - TRAILER_SIZE);
+            ChunkFormats.Trailer trailer = ChunkFormats.Trailer.decode(trailerBytes);
+            int footerLen = checkedFooterLength(trailer, fileLen);
+            byte[] footerBytes = new byte[footerLen];
+            readFully(ch, ByteBuffer.wrap(footerBytes), trailer.footerStart());
+            if (Crc.of(footerBytes) != trailer.footerCrc()) {
+                return false;
+            }
+            decodeCrcRanges(footerBytes, trailer.dataLength(), trailer.sectionCount());
+            return true;
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
     }
 
     private void readSealedVerified(Handle h, long offset, byte[] out) throws IOException {
@@ -1096,6 +1261,60 @@ public final class ChunkStore implements AutoCloseable {
             long copyEnd = Math.min(offset + out.length, rangeStart + rangeLen);
             System.arraycopy(rangeBuf, (int) (copyStart - rangeStart),
                     out, (int) (copyStart - offset), (int) (copyEnd - copyStart));
+        }
+    }
+
+    private void readOpenVerified(Handle h, long offset, byte[] out) throws IOException {
+        if (out.length == 0) {
+            return;
+        }
+        if (h.ledger == null) {
+            throw new ScpException(ErrorCode.CORRUPT_CHUNK, "open chunk missing integrity ledger: " + h.id);
+        }
+        long readEnd = checkedAdd(offset, out.length, "open read end");
+        long entryStart = 0;
+        int copied = 0;
+        for (ChunkFormats.LedgerEntry e : h.ledger.entries()) {
+            long entryEnd = e.endOffset();
+            if (entryEnd <= entryStart) {
+                throw new ScpException(ErrorCode.CORRUPT_CHUNK,
+                        "non-increasing ledger entry for " + h.id + ": " + entryEnd);
+            }
+            if (entryEnd <= offset) {
+                entryStart = entryEnd;
+                continue;
+            }
+            if (entryStart >= readEnd) {
+                break;
+            }
+            long entryLenLong = entryEnd - entryStart;
+            if (entryLenLong > Integer.MAX_VALUE) {
+                throw new ScpException(ErrorCode.CORRUPT_CHUNK,
+                        "oversized ledger entry for " + h.id + ": " + entryLenLong);
+            }
+            int entryLen = (int) entryLenLong;
+            byte[] entryBytes = new byte[entryLen];
+            readFully(h.data, ByteBuffer.wrap(entryBytes),
+                    checkedAdd(DATA_START, entryStart, "chunk file offset"));
+            int actual = Crc.of(entryBytes, 0, entryLen);
+            if (actual != e.payloadCrc()) {
+                throw new ScpException(ErrorCode.CRC_MISMATCH,
+                        "open ledger crc mismatch on " + h.id + " range [" + entryStart + ".." + entryEnd + ")");
+            }
+            long copyStart = Math.max(offset, entryStart);
+            long copyEnd = Math.min(readEnd, entryEnd);
+            if (copyEnd > copyStart) {
+                int src = (int) (copyStart - entryStart);
+                int dst = (int) (copyStart - offset);
+                int len = (int) (copyEnd - copyStart);
+                System.arraycopy(entryBytes, src, out, dst, len);
+                copied += len;
+            }
+            entryStart = entryEnd;
+        }
+        if (copied != out.length) {
+            throw new ScpException(ErrorCode.CORRUPT_CHUNK,
+                    "open read is not covered by ledger for " + h.id);
         }
     }
 

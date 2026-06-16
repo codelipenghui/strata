@@ -281,8 +281,8 @@ final class Recovery {
     /**
      * Brings every reachable replica's end up to {@code target} by copying from a replica that
      * already holds the bytes. A replica that cannot be caught up is evicted — it must not be
-     * sealed short. The donor region is below the durable offset (or a sealed copy), so the
-     * bytes are quorum-trusted; wire integrity is covered by frame payload CRCs.
+     * sealed short. If multiple possible donors already disagree on a catch-up range, recovery
+     * must not copy one of them into a lagging replica and manufacture a seal quorum.
      */
     private void catchUp(ChunkId chunkId, int writerEpoch, List<ReplicaState> reachable, long target,
                          int ackQuorum) {
@@ -293,12 +293,7 @@ final class Recovery {
             try {
                 while (rs.end < target) {
                     int want = (int) Math.min(COPY_CHUNK_BYTES, target - rs.end);
-                    byte[] data = null;
-                    for (ReplicaState donor : reachable) {
-                        if (donor == rs || donor.end < target) continue;
-                        data = readRange(chunkId, donor, rs.end, rs.end + want);
-                        if (data != null) break;
-                    }
+                    byte[] data = catchUpBytes(chunkId, reachable, rs, rs.end, rs.end + want, ackQuorum);
                     if (data == null) {
                         throw new ScpException(ErrorCode.INTERNAL, "no donor for catch-up");
                     }
@@ -316,6 +311,36 @@ final class Recovery {
             }
         }
         requireQuorum(chunkId, reachable, ackQuorum);
+    }
+
+    private byte[] catchUpBytes(ChunkId chunkId, List<ReplicaState> reachable, ReplicaState target,
+                                long from, long to, int ackQuorum) {
+        List<CandidateCount> counts = new ArrayList<>();
+        for (ReplicaState donor : reachable) {
+            if (donor == target || donor.end < to) continue;
+            byte[] data = readRange(chunkId, donor, from, to);
+            if (data == null) {
+                continue;
+            }
+            for (CandidateCount candidate : counts) {
+                if (java.util.Arrays.equals(candidate.bytes, data)) {
+                    candidate.count++;
+                    if (candidate.count >= ackQuorum) {
+                        return candidate.bytes;
+                    }
+                    data = null;
+                    break;
+                }
+            }
+            if (data != null) {
+                counts.add(new CandidateCount(data));
+            }
+        }
+        if (counts.size() > 1) {
+            throw new ScpException(ErrorCode.CORRUPT_CHUNK,
+                    "divergent catch-up donors for " + chunkId + " range [" + from + ".." + to + ")");
+        }
+        return counts.isEmpty() ? null : counts.get(0).bytes;
     }
 
     /** Reads [from, to) from one replica; null on failure or short read. */

@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -370,15 +371,9 @@ class ChunkStoreTest {
             assertArrayEquals("world".getBytes(), r2.bytes());
 
             try (var region = store.readRegion(id, 6, 1024)) {
-                assertEquals(ChunkFormats.DATA_START + 6, region.filePosition());
                 assertEquals(5, region.length());
                 assertEquals(11, region.localEndOffset());
-                ByteBuffer out = ByteBuffer.allocate(region.length());
-                readFully(region.channel(), out, region.filePosition());
-                out.flip();
-                byte[] bytes = new byte[out.remaining()];
-                out.get(bytes);
-                assertArrayEquals("world".getBytes(), bytes);
+                assertArrayEquals("world".getBytes(), consumeRegion(region));
             }
 
             var stat = store.stat(id);
@@ -752,6 +747,24 @@ class ChunkStoreTest {
             } finally {
                 region.close();
             }
+        }
+    }
+
+    @Test
+    void openReadsRejectLedgerCoveredDataRot() throws Exception {
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            store.append(id, 1, 0, 0, bytes("verified-open"));
+
+            Path data = dir.resolve(ChunkFormats.baseName(id) + ".chunk");
+            try (FileChannel ch = FileChannel.open(data, java.nio.file.StandardOpenOption.WRITE)) {
+                ch.write(ByteBuffer.wrap(new byte[] {'X'}), ChunkFormats.DATA_START + 4);
+            }
+
+            assertEquals(ErrorCode.CRC_MISMATCH,
+                    assertThrows(ScpException.class, () -> store.read(id, 0, 13)).code());
+            assertEquals(ErrorCode.CRC_MISMATCH,
+                    assertThrows(ScpException.class, () -> store.readRegion(id, 0, 13)).code());
         }
     }
 
@@ -1265,9 +1278,12 @@ class ChunkStoreTest {
 
         try (ChunkStore recovered = newStore()) {
             assertEquals(0, recovered.inventory().size());
-            assertTrue(Files.exists(invalidName));
-            assertTrue(Files.exists(dir.resolve(base + ".chunk")));
-            assertTrue(Files.exists(dir.resolve(base + ".meta")));
+            assertTrue(Files.notExists(invalidName));
+            assertTrue(Files.notExists(dir.resolve(base + ".chunk")));
+            assertTrue(Files.notExists(dir.resolve(base + ".meta")));
+            try (Stream<Path> files = Files.list(dir)) {
+                assertEquals(3, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count());
+            }
         }
     }
 
@@ -1511,7 +1527,7 @@ class ChunkStoreTest {
             assertEquals(2, store.readOps());
             assertEquals(16, store.readBytes());
 
-            // SEALED read path (zero-copy region) also counts
+            // SEALED read path also counts after CRC verification
             store.seal(id, 1, 11, null);
             var r4 = store.readRegion(id, 0, 1024);
             assertEquals(11, r4.length());

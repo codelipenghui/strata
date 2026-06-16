@@ -2,7 +2,10 @@ package io.strata.format;
 
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
+import io.strata.common.Crc;
+import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.ScpException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -12,10 +15,15 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.stream.Stream;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Crash-safety tests (tech design §11.3, §16 "crash safety"): a new ChunkStore over the same
@@ -39,6 +47,10 @@ class CrashRecoveryTest {
 
     private Path ledgerPath() {
         return dir.resolve(ChunkFormats.baseName(id) + ".j");
+    }
+
+    private Path metaPath() {
+        return dir.resolve(ChunkFormats.baseName(id) + ".meta");
     }
 
     @Test
@@ -149,9 +161,9 @@ class CrashRecoveryTest {
         ChunkStore store = new ChunkStore(dir);
         open(store);
         store.append(id, 1, 0, 0, ByteBuffer.wrap("sealed-data".getBytes()));
-        store.seal(id, 1, 11, null);
+        var sealed = store.seal(id, 1, 11, null);
+        byte[] repairImage = store.fetch(id, 0, Integer.MAX_VALUE).bytes();
         // bit-rot inside the footer section area (between data end and the 64B trailer)
-        long fileSize = Files.size(dataPath());
         try (FileChannel ch = FileChannel.open(dataPath(), StandardOpenOption.WRITE)) {
             ch.write(ByteBuffer.wrap(new byte[]{0x7F}), ChunkFormats.DATA_START + 11 + 4);
         }
@@ -159,8 +171,14 @@ class CrashRecoveryTest {
             // a sealed chunk whose footer fails its CRC must be quarantined, not served
             assertEquals(0, recovered.inventory().size(),
                     "corrupt-footer chunk must not be recovered as healthy");
+            assertFalse(Files.exists(dataPath()), "live chunk name must be free for repair import");
+            try (Stream<Path> files = Files.list(dir)) {
+                assertEquals(2, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
+                        "quarantine must preserve the corrupt evidence under a non-live name");
+            }
+            recovered.importSealed(id, repairImage, 11, sealed.dataCrc());
+            assertArrayEquals("sealed-data".getBytes(), recovered.read(id, 0, 100).bytes());
         }
-        assertEquals(fileSize, Files.size(dataPath()), "quarantine must not destroy evidence");
     }
 
     @Test
@@ -173,6 +191,84 @@ class CrashRecoveryTest {
             assertEquals(0, recovered.inventory().size());
             assertFalse(Files.exists(dataPath()));
         }
+    }
+
+    @Test
+    void ackedFsyncChunkSurvivesMissingSidecarNameAfterCrash() throws Exception {
+        byte[] payload = "acked-fsync".getBytes();
+        ChunkStore store = new ChunkStore(dir);
+        store.open(id, true, 1, 1718000000000L);
+        store.appendAsync(id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
+        store.close();
+
+        Files.delete(metaPath());
+
+        assertDoesNotThrow(() -> {
+            try (ChunkStore recovered = new ChunkStore(dir)) {
+                assertEquals(ChunkState.OPEN, recovered.stat(id).state());
+                assertArrayEquals(payload, recovered.read(id, 0, 100).bytes());
+            }
+        });
+    }
+
+    @Test
+    void missingSidecarOpenChunkWithFooterShapedPayloadRecoversFromLedger() throws Exception {
+        byte[] payload = footerShapedPayload("live".getBytes());
+        ChunkStore store = new ChunkStore(dir);
+        store.open(id, true, 1, 1718000000000L);
+        store.appendAsync(id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
+        store.close();
+
+        Files.delete(metaPath());
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            var stat = recovered.stat(id);
+            assertEquals(ChunkState.OPEN, stat.state());
+            assertEquals(payload.length, stat.localEndOffset());
+            assertArrayEquals(payload, recovered.read(id, 0, payload.length).bytes());
+            assertTrue(Files.exists(ledgerPath()), "ledger must not be deleted by false sealed recovery");
+        }
+    }
+
+    @Test
+    void missingSidecarFsyncOpenChunkRequiresFreshFenceBeforeAppend() throws Exception {
+        byte[] payload = "acked-fsync".getBytes();
+        ChunkStore store = new ChunkStore(dir);
+        store.open(id, true, 1, 1718000000000L);
+        store.appendAsync(id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
+        store.close();
+
+        Files.delete(metaPath());
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            assertEquals(ChunkState.OPEN, recovered.stat(id).state());
+            ScpException stale = assertThrows(ScpException.class,
+                    () -> recovered.append(id, 1, payload.length, payload.length, ByteBuffer.wrap("stale".getBytes())));
+            assertEquals(ErrorCode.FENCED_EPOCH, stale.code());
+
+            assertEquals(payload.length, recovered.fence(id, 2).localEndOffset());
+            assertEquals(payload.length + 5,
+                    recovered.append(id, 2, payload.length, payload.length, ByteBuffer.wrap("fresh".getBytes()))
+                            .endOffset());
+        }
+    }
+
+    private static byte[] footerShapedPayload(byte[] livePrefix) {
+        ByteBuffer crcRanges = ByteBuffer.allocate(12);
+        crcRanges.putInt(ChunkFormats.CRC_RANGE_SIZE).putInt(1).putInt(Crc.of(livePrefix));
+        byte[] crcRangeBytes = crcRanges.array();
+
+        ByteBuffer footer = ByteBuffer.allocate(ChunkFormats.sectionSize(crcRangeBytes));
+        ChunkFormats.writeSection(footer, ChunkFormats.SECTION_CRC_RANGES, crcRangeBytes);
+        byte[] footerBytes = footer.array();
+
+        ChunkFormats.Trailer trailer = new ChunkFormats.Trailer(livePrefix.length,
+                ChunkFormats.DATA_START + livePrefix.length, 1, 0,
+                Crc.of(footerBytes), Crc.of(livePrefix));
+
+        ByteBuffer payload = ByteBuffer.allocate(livePrefix.length + footerBytes.length + ChunkFormats.TRAILER_SIZE);
+        payload.put(livePrefix).put(footerBytes).put(trailer.encode());
+        return payload.array();
     }
 
     @Test

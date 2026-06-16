@@ -200,6 +200,8 @@ final class ConsistencyVerifier {
                 "ackQuorum must be positive for " + fileId);
         assertTrue(lookup.writePolicy().ackQuorum() <= lookup.writePolicy().replicationFactor(),
                 "ackQuorum must not exceed replicationFactor for " + fileId);
+        assertTrue(lookup.writePolicy().ackQuorum() > lookup.writePolicy().replicationFactor() / 2,
+                "ackQuorum must intersect any other quorum for " + fileId);
 
         long descriptorLength = 0;
         boolean sawOpen = false;

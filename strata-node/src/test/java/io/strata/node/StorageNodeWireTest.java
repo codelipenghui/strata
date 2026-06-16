@@ -5,6 +5,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.format.ChunkFormats;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -17,8 +18,10 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -105,6 +108,18 @@ class StorageNodeWireTest {
     }
 
     @Test
+    void nodeIdAssignmentDoesNotPublishBeforeIdentityPersistenceSucceeds() throws Exception {
+        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+            Files.createDirectory(dir.resolve("identity.properties.tmp"));
+
+            IOException e = assertThrows(IOException.class, () -> node.nodeIdAssigned(42));
+
+            assertTrue(e.getMessage().contains("identity.properties.tmp"));
+            assertEquals(-1, node.nodeId(), "node id must not change until the volume identity is durable");
+        }
+    }
+
+    @Test
     void fullChunkLifecycleOverTheWire() throws Exception {
         try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
@@ -174,6 +189,37 @@ class StorageNodeWireTest {
                     new Messages.DeleteChunks(List.of(id)).encode(), null, 5000);
             var del = Messages.DeleteChunksResp.decode(dh);
             assertEquals((short) 0, del.codes().get(0));
+        }
+    }
+
+    @Test
+    void sealedReadOverWireRejectsRottedDataRegion() throws Exception {
+        byte[] payload = "sealed-data".getBytes();
+        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+             ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
+                    1 << 20, 1L).encode(), null, 5000);
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0).encode(),
+                    ByteBuffer.wrap(payload), 5000);
+            client.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(id, 1, payload.length).encode(),
+                    null, 5000);
+
+            Path chunkPath = dir.resolve("chunks").resolve(ChunkFormats.baseName(id) + ".chunk");
+            try (FileChannel ch = FileChannel.open(chunkPath, StandardOpenOption.WRITE)) {
+                ch.write(ByteBuffer.wrap(new byte[] {'X'}), ChunkFormats.DATA_START);
+            }
+            assertEquals(ErrorCode.CRC_MISMATCH,
+                    assertThrows(ScpException.class, () -> node.store().read(id, 0, payload.length)).code());
+            assertEquals(ErrorCode.CRC_MISMATCH,
+                    assertThrows(ScpException.class,
+                            () -> node.store().readRegion(id, 0, payload.length)).code());
+
+            ScpException e = assertThrows(ScpException.class, () -> {
+                Frame frame = client.callFrame(Opcode.READ,
+                        new Messages.Read(id, 0, payload.length).encode(), null, 5000);
+                Resp.check(frame.headerSlice());
+            });
+            assertEquals(ErrorCode.CRC_MISMATCH, e.code());
         }
     }
 

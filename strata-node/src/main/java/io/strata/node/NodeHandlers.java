@@ -61,11 +61,10 @@ final class NodeHandlers implements ScpServer.Handler {
                 var r = store.readRegion(m.chunkId(), m.offset(), m.maxBytes());
                 byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
                 if (r.channel() != null) {
-                    // SEALED chunk: zero-copy file-region transfer over an immutable data region
                     yield ScpServer.okFileRegion(req, header, r.channel(), r.filePosition(), r.length());
                 }
-                // OPEN chunk (or empty): bytes were materialized under the chunk lock, so they are a
-                // stable snapshot immune to a concurrent seal-truncate of the live data file
+                // Bytes were materialized by ChunkStore: OPEN chunks need a stable snapshot across
+                // seal-truncate, and SEALED chunks need range-CRC verification before serving.
                 byte[] bytes = r.bytes();
                 yield ScpServer.ok(req, header, bytes != null && bytes.length > 0 ? ByteBuffer.wrap(bytes) : null);
             }

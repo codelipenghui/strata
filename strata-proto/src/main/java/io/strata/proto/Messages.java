@@ -627,6 +627,10 @@ public final class Messages {
             if (ackQuorum <= 0 || ackQuorum > replicationFactor) {
                 throw new IllegalArgumentException("ackQuorum must be in 1..replicationFactor: " + ackQuorum);
             }
+            if (ackQuorum <= replicationFactor / 2) {
+                throw new IllegalArgumentException("ackQuorum must intersect any other quorum: "
+                        + ackQuorum + " for replicationFactor " + replicationFactor);
+            }
         }
 
         private void writeTo(BufWriter w) {

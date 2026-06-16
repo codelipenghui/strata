@@ -7,8 +7,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.Properties;
 import java.util.UUID;
@@ -193,9 +196,9 @@ public final class StorageNode implements AutoCloseable {
     /** Called by the control loop once the metadata plane assigns/confirms our node id. */
     void nodeIdAssigned(int id) throws IOException {
         if (this.nodeId != id) {
+            persistIdentity(config.dataDir(), new Identity(id, incarnation));
             this.nodeId = id;
             server.setNodeId(id); // HELLO responses must announce the real id, not -1
-            persistIdentity(config.dataDir(), new Identity(id, incarnation));
         }
     }
 
@@ -236,11 +239,22 @@ public final class StorageNode implements AutoCloseable {
         p.setProperty("incarnation", id.incarnation.toString());
         Path f = dataDir.resolve("identity.properties");
         Path tmp = dataDir.resolve("identity.properties.tmp");
-        try (var out = Files.newOutputStream(tmp)) {
+        try (FileChannel ch = FileChannel.open(tmp, StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+             var out = Channels.newOutputStream(ch)) {
             p.store(out, "strata storage node identity — bound to this volume");
+            out.flush();
+            ch.force(true);
         }
         Files.move(tmp, f, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
                 java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        forceDirectory(dataDir);
+    }
+
+    private static void forceDirectory(Path dir) throws IOException {
+        try (FileChannel ch = FileChannel.open(dir, StandardOpenOption.READ)) {
+            ch.force(true);
+        }
     }
 
     @Override

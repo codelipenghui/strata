@@ -2,6 +2,7 @@ package io.strata.it;
 
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
+import io.strata.common.ScpException;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -12,6 +13,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Seal recovery must commit only byte-identical sealed replicas (invariant §14.6): one divergent
@@ -66,6 +68,19 @@ class RecoveryDivergenceTest {
         }
     }
 
+    @Test
+    void recoveryDoesNotManufactureQuorumByCatchingUpFromOneDivergentDonor() throws Exception {
+        try (MiniCluster cluster = new MiniCluster(3);
+             StrataClient client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()))) {
+            var setup = createOpenChunkWithReplicaPayloadsAndDurableFloor(cluster, "/floor-split",
+                    List.of("BBBB".getBytes(), "AAAA".getBytes(), new byte[0]));
+
+            assertThrows(ScpException.class, () -> client.openById(setup.fileId()).recoverAndSeal(),
+                    "recovery must not copy one divergent donor into a lagging replica and then "
+                            + "commit that manufactured quorum below the durable floor");
+        }
+    }
+
     private record OpenChunkSetup(io.strata.common.FileId fileId, Messages.CreateChunkResp chunk) {}
 
     private static OpenChunkSetup createOpenChunkWithReplicaPayloads(MiniCluster cluster, String path,
@@ -94,5 +109,42 @@ class RecoveryDivergenceTest {
             }
         }
         return new OpenChunkSetup(fileId, chunk);
+    }
+
+    private static OpenChunkSetup createOpenChunkWithReplicaPayloadsAndDurableFloor(
+            MiniCluster cluster, String path, List<byte[]> payloads) throws Exception {
+        OpenChunkSetup setup = createEmptyOpenChunk(cluster, path);
+        Messages.CreateChunkResp chunk = setup.chunk();
+        assertEquals(payloads.size(), chunk.replicas().size());
+
+        for (int i = 0; i < chunk.replicas().size(); i++) {
+            var replica = chunk.replicas().get(i);
+            String[] nhp = replica.endpoint().split(":");
+            byte[] payload = payloads.get(i);
+            try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
+                    ScpClient.KIND_TOOL, "writer")) {
+                node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1,
+                        false, 1 << 20, 1L).encode(), null, 5000);
+                if (payload.length > 0) {
+                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0).encode(),
+                            ByteBuffer.wrap(payload), 5000);
+                    node.call(Opcode.APPEND,
+                            new Messages.Append(chunk.chunkId(), 1, payload.length, payload.length).encode(),
+                            ByteBuffer.allocate(0), 5000);
+                }
+            }
+        }
+        return setup;
+    }
+
+    private static OpenChunkSetup createEmptyOpenChunk(MiniCluster cluster, String path) throws Exception {
+        String[] hp = cluster.metaEndpoint().split(":");
+        try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
+            var file = Messages.CreateFileResp.decode(meta.call(Opcode.CREATE_FILE,
+                    new Messages.CreateFile("test", path).encode(), null, 5000));
+            var chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
+                    new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+            return new OpenChunkSetup(file.fileId(), chunk);
+        }
     }
 }
