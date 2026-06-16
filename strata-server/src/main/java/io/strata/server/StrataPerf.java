@@ -59,7 +59,7 @@ final class StrataPerf {
         log.info("perf: meta={} workload={} recordSize={}B files={} window={} duration={}s fsync={} connections={}",
                 meta, workload, recordSize, files, window, durationSec, fsync, connections);
 
-        long chunkRoll = longArg(a, "chunk-roll", 64L << 20);
+        long chunkRoll = longArg(a, "chunk-roll", 2L << 30); // 2 GiB, matches ClientConfig default
         try (StrataClient client = StrataClient.connect(ClientConfig.of(meta)
                 .withChunkRollBytes(chunkRoll).withStorageConnectionsPerEndpoint(connections))) {
             if (workload.equals("read")) {
