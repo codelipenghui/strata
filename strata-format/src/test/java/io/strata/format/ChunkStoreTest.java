@@ -410,7 +410,8 @@ class ChunkStoreTest {
             try (var region = store.readRegion(id, 6, 1024)) {
                 assertEquals(5, region.length());
                 assertEquals(11, region.localEndOffset());
-                assertArrayEquals("world".getBytes(), region.bytes());
+                // SEALED reads are zero-copy regions (bytes() == null); read via the channel.
+                assertArrayEquals("world".getBytes(), consumeRegion(region));
             }
 
             var stat = store.stat(id);

@@ -193,7 +193,11 @@ class StorageNodeWireTest {
     }
 
     @Test
-    void sealedReadOverWireRejectsCorruptDataBeforeScrub() throws Exception {
+    void sealedReadRegionIsZeroCopyAndUnverified() throws Exception {
+        // Trade-off (sealed reads reverted to zero-copy for throughput): the fast client read path
+        // (readRegion / wire READ) hands back a zero-copy region and does NOT re-CRC per read — a
+        // corrupt sealed data region is served as-is. Integrity is caught by the verified read() /
+        // fetch() / import paths and background scrub, not at read time.
         byte[] payload = "sealed-payload".getBytes();
         try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
@@ -205,19 +209,20 @@ class StorageNodeWireTest {
 
             corruptChunkDataByte(dir.resolve("chunks"), id, 3);
 
+            // the verified materialize path still rejects corruption at read time
             assertEquals(ErrorCode.CRC_MISMATCH,
                     assertThrows(ScpException.class, () -> node.store().read(id, 0, payload.length)).code());
-            assertEquals(ErrorCode.CRC_MISMATCH,
-                    assertThrows(ScpException.class,
-                            () -> node.store().readRegion(id, 0, payload.length)).code());
 
-            ScpException e = assertThrows(ScpException.class, () -> {
-                Frame frame = client.callFrame(Opcode.READ,
-                        new Messages.Read(id, 0, payload.length).encode(), null, 5000);
-                Resp.check(frame.headerSlice());
-            });
-            assertEquals(ErrorCode.CRC_MISMATCH, e.code(),
-                    "normal client READ must not serve bytes from a corrupted sealed data region");
+            // zero-copy readRegion does NOT verify — it returns a channel region over the bytes
+            try (var region = node.store().readRegion(id, 0, payload.length)) {
+                assertEquals(payload.length, region.length());
+                assertNotNull(region.channel(), "sealed readRegion must be a zero-copy channel region");
+            }
+
+            // the wire READ (zero-copy) succeeds without a read-time CRC error
+            Frame frame = client.callFrame(Opcode.READ,
+                    new Messages.Read(id, 0, payload.length).encode(), null, 5000);
+            Resp.check(frame.headerSlice());
         }
     }
 

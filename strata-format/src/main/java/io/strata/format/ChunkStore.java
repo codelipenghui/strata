@@ -560,22 +560,36 @@ public final class ChunkStore implements AutoCloseable {
             // observability: count client READ bytes served (mirrors append counters; drives read throughput)
             readOps.incrementAndGet();
             readBytes.addAndGet(n);
-            if (h.state == ChunkState.SEALED) {
-                // SEALED chunks carry range CRCs. Verify the requested range before exposing bytes
-                // on the normal client READ path; scrub is a repair signal, not a read-time guard.
+            long filePos = checkedAdd(DATA_START, offset, "chunk file offset");
+            if (h.state != ChunkState.SEALED) {
+                // OPEN chunk: a concurrent seal can truncate the never-acked tail of this shared inode,
+                // and readOpenVerified walks the integrity ledger that concurrent appends mutate.
+                // Materialize a verified stable snapshot HERE under the lock so the wire payload is fixed
+                // before the lock is released — a region resolved later (off-lock, on the event loop)
+                // could otherwise stream the seal footer/trailer as payload or short-transfer past the
+                // new EOF (silent corruption / SCP frame desync).
                 byte[] out = new byte[n];
-                readSealedVerified(h, offset, out);
+                readOpenVerified(h, offset, out);
                 return new ReadRegionResult(null, 0, n, out, end, h.lastKnownDO);
             }
-            // OPEN chunk: a concurrent seal can truncate the never-acked tail of this shared
-            // inode. A zero-copy region resolved LATER (the data-plane transfers the file
-            // region off the chunk lock, on the transport event loop) could then stream the
-            // seal footer/trailer as payload, or short-transfer past the new EOF — silent
-            // corruption / SCP frame desync. Materialize a stable snapshot HERE under the lock
-            // (as read() does) so the wire payload is fixed before the lock is released.
-            byte[] out = new byte[n];
-            readOpenVerified(h, offset, out);
-            return new ReadRegionResult(null, 0, n, out, end, h.lastKnownDO);
+            // SEALED: the data region is immutable (no further append/seal/truncate), so hand back a
+            // zero-copy region the transport streams via sendfile — the fast client read path. We do
+            // NOT re-verify range CRCs per read here: that forced a full CRC-range read + a 4 MiB
+            // allocation per request and serialized readers on the chunk lock (~20x slower, measured);
+            // integrity is covered by background scrub and the verified read()/fetch()/import paths. A
+            // concurrent delete only unlinks the path while this independent FD keeps the inode alive,
+            // so the deferred transfer is safe.
+            FileChannel readChannel = FileChannel.open(h.dataPath, StandardOpenOption.READ);
+            try {
+                return new ReadRegionResult(readChannel, filePos, n, null, end, h.lastKnownDO);
+            } catch (RuntimeException e) {
+                try {
+                    readChannel.close();
+                } catch (IOException closeFailure) {
+                    e.addSuppressed(closeFailure);
+                }
+                throw e;
+            }
         }
     }
 
