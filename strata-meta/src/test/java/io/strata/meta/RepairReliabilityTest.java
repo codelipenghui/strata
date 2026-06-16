@@ -85,6 +85,7 @@ class RepairReliabilityTest {
 
     @BeforeEach
     void setup() throws Exception {
+        RepairCoordinator.replicaMissingGraceMs = 0; // exercise prompt missing-replica drop -> repair
         Exception failure = null;
         for (int attempt = 0; attempt < 3; attempt++) {
             try {

@@ -56,6 +56,14 @@ final class RepairCoordinator implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicLong commandIds = new AtomicLong(System.currentTimeMillis());
     private final Map<Long, Action> inflight = new ConcurrentHashMap<>();
+    // (nodeId:chunkId) -> first time the node's inventory omitted a sealed chunk it should hold. A
+    // just-sealed chunk can miss the in-flight inventory snapshot; only drop the replica if it stays
+    // missing past REPLICA_MISSING_GRACE_MS, so churn can't trigger a false re-replication storm.
+    private final Map<String, Long> replicaMissingSince = new ConcurrentHashMap<>();
+    // Package-private + mutable so tests can set 0 (immediate drop, the pre-grace behavior); production
+    // default 90s. A just-sealed chunk can miss an in-flight inventory snapshot, so wait this long
+    // before treating a still-missing replica as lost (avoids a false re-replication storm under churn).
+    static long replicaMissingGraceMs = 90_000;
     private final Set<ChunkId> chunksBeingRepaired = ConcurrentHashMap.newKeySet();
     private final Map<ReplicaKey, Long> recentlyCommittedReplicas = new ConcurrentHashMap<>();
     private volatile Thread scanThread;
@@ -260,6 +268,22 @@ final class RepairCoordinator implements AutoCloseable {
         log.info("repair: {} dead={} -> target={} (cmd {})", chunkId, deadNode, target.record.nodeId(), cmdId);
     }
 
+    /**
+     * Dispatches a just-deleted file's chunk deletions immediately, instead of waiting for the next
+     * background scan (which is slow under heavy churn), so physical space is reclaimed promptly and the
+     * disk stays bounded under sustained delete load. Synchronized with the scan so they don't race.
+     */
+    synchronized void driveDeletionNow(FileId fileId) {
+        try {
+            Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
+            if (opt.isPresent() && opt.get().value().state() == FileState.DELETING) {
+                driveDeletion(opt.get().value(), opt.get().version());
+            }
+        } catch (Exception e) {
+            log.warn("prompt delete dispatch for {} failed — background scan will retry", fileId, e);
+        }
+    }
+
     private void driveDeletion(Records.FileRecord file, int version) throws Exception {
         for (Records.ChunkRecord chunk : file.chunks()) {
             ChunkId chunkId = file.chunkId(chunk.index());
@@ -427,6 +451,7 @@ final class RepairCoordinator implements AutoCloseable {
                 log.warn("ignoring inventory report from stale or non-live node {}", report.nodeId());
                 return;
             }
+            long now = System.currentTimeMillis();
             Map<ChunkId, Messages.InventoryEntry> reported = new java.util.HashMap<>();
             for (Messages.InventoryEntry e : report.entries()) {
                 reported.put(e.chunkId(), e);
@@ -474,29 +499,42 @@ final class RepairCoordinator implements AutoCloseable {
                     if (isRepairProtected(chunkId, report.nodeId())) {
                         continue;
                     }
+                    String missKey = report.nodeId() + ":" + chunkId;
                     Messages.InventoryEntry entry = reported.get(chunkId);
                     if (entry == null) {
-                        log.warn("node {} lost sealed chunk {} — dropping replica for re-repair",
-                                report.nodeId(), chunkId);
-                        applyDeleteConfirmed(fileId, chunkId, report.nodeId());
-                    } else if (entry.state() != ChunkState.SEALED) {
-                        // A non-SEALED local state under a SEALED descriptor cannot serve reads or
-                        // repair fetches. Drop it like a corrupt copy and delete the local bytes.
-                        log.warn("node {} holds {} copy of sealed chunk {} — dropping replica "
-                                + "for re-repair", report.nodeId(), entry.state(), chunkId);
-                        applyDeleteConfirmed(fileId, chunkId, report.nodeId());
-                        registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
-                                commandIds.incrementAndGet(), List.of(chunkId)));
-                    } else if (entry.length() != c.length() || entry.crc() != c.crc()) {
-                        log.warn("node {} holds corrupt sealed chunk {} (len {}/{} crc {}/{}) — "
-                                        + "dropping replica for re-repair", report.nodeId(), chunkId,
-                                entry.length(), c.length(), entry.crc(), c.crc());
-                        applyDeleteConfirmed(fileId, chunkId, report.nodeId());
-                        // schedule physical deletion NOW: placement may legitimately re-pick this
-                        // node as the add-repair target, and the corrupt bytes must be gone first
-                        // (FIFO command delivery guarantees delete-before-replicate)
-                        registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
-                                commandIds.incrementAndGet(), List.of(chunkId)));
+                        // A node can omit a just-sealed chunk from an in-flight inventory snapshot; under
+                        // churn that race would falsely drop a healthy replica and trigger a re-replication
+                        // storm that steals write bandwidth. Only treat it as lost if it stays missing past
+                        // the grace (genuine loss is still caught, just one or two reports later).
+                        Long firstMissing = replicaMissingSince.putIfAbsent(missKey, now);
+                        long missingForMs = firstMissing == null ? 0 : now - firstMissing;
+                        if (missingForMs >= replicaMissingGraceMs) {
+                            log.warn("node {} lost sealed chunk {} (missing >= {}ms) — dropping replica for re-repair",
+                                    report.nodeId(), chunkId, replicaMissingGraceMs);
+                            replicaMissingSince.remove(missKey);
+                            applyDeleteConfirmed(fileId, chunkId, report.nodeId());
+                        }
+                    } else {
+                        replicaMissingSince.remove(missKey); // reported now — clear any pending miss
+                        if (entry.state() != ChunkState.SEALED) {
+                            // A non-SEALED local state under a SEALED descriptor cannot serve reads or
+                            // repair fetches. Drop it like a corrupt copy and delete the local bytes.
+                            log.warn("node {} holds {} copy of sealed chunk {} — dropping replica "
+                                    + "for re-repair", report.nodeId(), entry.state(), chunkId);
+                            applyDeleteConfirmed(fileId, chunkId, report.nodeId());
+                            registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
+                                    commandIds.incrementAndGet(), List.of(chunkId)));
+                        } else if (entry.length() != c.length() || entry.crc() != c.crc()) {
+                            log.warn("node {} holds corrupt sealed chunk {} (len {}/{} crc {}/{}) — "
+                                            + "dropping replica for re-repair", report.nodeId(), chunkId,
+                                    entry.length(), c.length(), entry.crc(), c.crc());
+                            applyDeleteConfirmed(fileId, chunkId, report.nodeId());
+                            // schedule physical deletion NOW: placement may legitimately re-pick this
+                            // node as the add-repair target, and the corrupt bytes must be gone first
+                            // (FIFO command delivery guarantees delete-before-replicate)
+                            registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
+                                    commandIds.incrementAndGet(), List.of(chunkId)));
+                        }
                     }
                 }
             }

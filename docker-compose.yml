@@ -22,8 +22,11 @@ x-strata: &strata
 services:
   zookeeper:
     image: zookeeper:3.9
+    restart: unless-stopped          # ZK is the metadata plane's SPOF — must auto-recover
     environment:
       ZOO_4LW_COMMANDS_WHITELIST: "ruok,srvr,mntr"
+      ZOO_AUTOPURGE_PURGEINTERVAL: "1"   # purge old snapshots/txnlogs hourly so ZK data can't grow unbounded
+      ZOO_AUTOPURGE_SNAPRETAINCOUNT: "3"
     healthcheck:
       test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
       interval: 5s
@@ -41,11 +44,20 @@ services:
       STRATA_ZK_CONNECT: "zookeeper:2181"
       STRATA_META_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
       STRATA_LISTEN_PORT: "9100"
+      # generous liveness windows: under heavy data load a combined node's heartbeat can be delayed
+      # behind the data flood on its shared SCP listener; don't let that be mistaken for a dead node
+      STRATA_LEASE_MS: "60000"
+      STRATA_DEAD_GRACE_MS: "300000"
       STRATA_ADVERTISED_HOST: "node1"
       STRATA_HOST: "node1"
       STRATA_ZONE: "z0"
       STRATA_RACK: "r0"
       STRATA_DATA_DIR: "/data"
+      # Background-writeback knobs are tunable via STRATA_BG_FLUSH_INTERVAL_MS / _THRESHOLD_BYTES
+      # (ChunkStore defaults: 500ms / 4 MiB). The defaults are near-optimal on a SINGLE shared disk —
+      # measured: flushing more aggressively (e.g. 50ms / 512 KiB) over-subscribes the one disk's fsync
+      # budget, starving delete reclamation (disk fills) and write bandwidth. Only raise aggressiveness
+      # when each node has its own data device.
     volumes:
       - node1-data:/data
     depends_on:
@@ -59,6 +71,8 @@ services:
       STRATA_ZK_CONNECT: "zookeeper:2181"
       STRATA_META_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
       STRATA_LISTEN_PORT: "9100"
+      STRATA_LEASE_MS: "60000"
+      STRATA_DEAD_GRACE_MS: "300000"
       STRATA_ADVERTISED_HOST: "node2"
       STRATA_HOST: "node2"
       STRATA_ZONE: "z0"
@@ -77,6 +91,8 @@ services:
       STRATA_ZK_CONNECT: "zookeeper:2181"
       STRATA_META_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
       STRATA_LISTEN_PORT: "9100"
+      STRATA_LEASE_MS: "60000"
+      STRATA_DEAD_GRACE_MS: "300000"
       STRATA_ADVERTISED_HOST: "node3"
       STRATA_HOST: "node3"
       STRATA_ZONE: "z0"

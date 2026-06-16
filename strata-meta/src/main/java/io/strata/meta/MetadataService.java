@@ -344,6 +344,7 @@ public final class MetadataService implements AutoCloseable {
                 for (FileId id : m.fileIds()) {
                     try {
                         markDeleting(id);
+                        repair.driveDeletionNow(id); // reclaim chunks now, not via the slow background scan
                         codes.add(ErrorCode.OK.code);
                     } catch (ScpException e) {
                         codes.add(e.code().code);

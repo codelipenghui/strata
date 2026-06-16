@@ -134,7 +134,9 @@ class RepairAndRetentionTest {
         assertEquals(ErrorCode.OK, victim.store().delete(chunkId));
         assertFalse(victim.store().contains(chunkId));
 
-        long deadline = System.currentTimeMillis() + 60_000;
+        // allow for the inventory-loss grace (a sealed replica is only dropped once it has stayed
+        // missing from inventory past RepairCoordinator.replicaMissingGraceMs) plus the re-repair
+        long deadline = System.currentTimeMillis() + 140_000;
         boolean repaired = false;
         while (System.currentTimeMillis() < deadline && !repaired) {
             Thread.sleep(250);

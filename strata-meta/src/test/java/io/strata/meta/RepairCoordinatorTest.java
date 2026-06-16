@@ -24,6 +24,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class RepairCoordinatorTest {
     private static final byte MEDIA = 1;
 
+    @org.junit.jupiter.api.BeforeEach
+    void immediateMissingDrop() {
+        RepairCoordinator.replicaMissingGraceMs = 0; // these tests assert prompt missing-replica drops
+    }
+
     @Test
     void scanSkipsMissingRecordsAndCannotRepairZeroLiveChunk() throws Exception {
         FakeStore store = new FakeStore();
