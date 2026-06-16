@@ -33,8 +33,9 @@ import java.util.concurrent.atomic.LongAdder;
  * Must run where the node advertised hosts resolve: inside the compose network
  * (`docker compose run --rm loadgen perf ...` / `scripts/perf.sh`), not from the host.
  *
- * Flags (all optional): --meta host:port  --workload write|read  --record-size BYTES  --files N
+ * Flags (all optional): --meta host:port  --workload write|read|churn  --record-size BYTES  --files N
  *   --window N  --duration SECONDS (0 = until Ctrl-C)  --fsync  --readers N  --read-size BYTES  --keep
+ *   --connections N (storage connections per endpoint, default 8)
  */
 final class StrataPerf {
     private static final Logger log = LoggerFactory.getLogger(StrataPerf.class);
@@ -54,7 +55,10 @@ final class StrataPerf {
         int readSize = intArg(a, "read-size", 64 * 1024);
         boolean keep = a.containsKey("keep");
 
-        int connections = intArg(a, "connections", 1);
+        // storage connections per endpoint: a single connection serializes concurrent reads on one
+        // pipe, capping read throughput; 8 lets the readers spread across the sendfile path (measured
+        // ~10x churn-read throughput vs 1). Override with --connections N.
+        int connections = intArg(a, "connections", 8);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> stop = true, "perf-stop"));
         log.info("perf: meta={} workload={} recordSize={}B files={} window={} duration={}s fsync={} connections={}",
                 meta, workload, recordSize, files, window, durationSec, fsync, connections);
