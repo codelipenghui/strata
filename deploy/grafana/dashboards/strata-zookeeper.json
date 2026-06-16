@@ -1,0 +1,1623 @@
+{
+  "uid": "strata-zookeeper",
+  "title": "Strata — ZooKeeper",
+  "description": "ZooKeeper (metadata store) health. Metrics from ZooKeeper's built-in Prometheus provider (zoo.cfg metricsProvider). Panel/metric selection adapted from the community dashboard \"ZooKeeper by Prometheus\" (grafana.com/grafana/dashboards/10465), rebuilt in Strata's dashboard style. The 'ZK request load' row attributes request rate/throughput to the top-level znode (key label): strata = Strata's metadata plane vs zookeeper = ZK internal housekeeping.",
+  "tags": [
+    "strata",
+    "zookeeper"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "Strata dashboards",
+      "asDropdown": true,
+      "keepTime": true,
+      "includeVars": true,
+      "tags": [
+        "strata"
+      ],
+      "icon": "external link"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "label": "ZK instance",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(znode_count, instance)",
+          "refId": "StandardVariableQuery"
+        },
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Overview",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Alive connections",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "sum(num_alive_connections{instance=~\"$instance\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Outstanding requests",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "sum(outstanding_requests{instance=~\"$instance\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Watches",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "sum(watch_count{instance=~\"$instance\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Global sessions",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "sum(global_sessions{instance=~\"$instance\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Znodes",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "max(znode_count{instance=~\"$instance\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Approx. data size",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "max(approximate_data_size{instance=~\"$instance\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Avg latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "max(avg_latency{instance=~\"$instance\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Open file descriptors",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "max(open_file_descriptor_count{instance=~\"$instance\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Connections & sessions",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "collapsed": false
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Alive connections",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "targets": [
+        {
+          "expr": "num_alive_connections{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Sessions (global / local)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "targets": [
+        {
+          "expr": "global_sessions{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}} global"
+        },
+        {
+          "expr": "local_sessions{instance=~\"$instance\"}",
+          "refId": "B",
+          "legendFormat": "{{instance}} local"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Connection errors",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "targets": [
+        {
+          "expr": "connection_rejected{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}} rejected"
+        },
+        {
+          "expr": "connection_drop_count{instance=~\"$instance\"}",
+          "refId": "B",
+          "legendFormat": "{{instance}} dropped"
+        },
+        {
+          "expr": "sessionless_connections_expired{instance=~\"$instance\"}",
+          "refId": "C",
+          "legendFormat": "{{instance}} sessionless expired"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Connection requests",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "targets": [
+        {
+          "expr": "connection_request_count{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "row",
+      "title": "Requests & latency",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "collapsed": false
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Outstanding requests",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "targets": [
+        {
+          "expr": "outstanding_requests{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Latency (min / avg / max)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      },
+      "targets": [
+        {
+          "expr": "min_latency{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}} min"
+        },
+        {
+          "expr": "avg_latency{instance=~\"$instance\"}",
+          "refId": "B",
+          "legendFormat": "{{instance}} avg"
+        },
+        {
+          "expr": "max_latency{instance=~\"$instance\"}",
+          "refId": "C",
+          "legendFormat": "{{instance}} max"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Packets / sec",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 35
+      },
+      "targets": [
+        {
+          "expr": "rate(packets_received{instance=~\"$instance\"}[$__rate_interval])",
+          "refId": "A",
+          "legendFormat": "{{instance}} received/s"
+        },
+        {
+          "expr": "rate(packets_sent{instance=~\"$instance\"}[$__rate_interval])",
+          "refId": "B",
+          "legendFormat": "{{instance}} sent/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Client response size (min / last / max)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 35
+      },
+      "targets": [
+        {
+          "expr": "min_client_response_size{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}} min"
+        },
+        {
+          "expr": "last_client_response_size{instance=~\"$instance\"}",
+          "refId": "B",
+          "legendFormat": "{{instance}} last"
+        },
+        {
+          "expr": "max_client_response_size{instance=~\"$instance\"}",
+          "refId": "C",
+          "legendFormat": "{{instance}} max"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "ZK request load (Strata vs ZK-internal)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "collapsed": false
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Request rate by top-level znode",
+      "description": "ZK request rate (ops/s) attributed to the top-level znode (key label): strata = Strata's metadata plane (/strata/...), zookeeper = ZK internal housekeeping. ZK keys this counter on the first path segment, so a single-rooted app shows one bucket — for per-operation detail use strata_scp_request_duration{opcode} on the Cluster/Node dashboards.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 44
+      },
+      "targets": [
+        {
+          "expr": "rate(write_per_namespace_count{instance=~\"$instance\"}[$__rate_interval])",
+          "refId": "A",
+          "legendFormat": "{{key}} write"
+        },
+        {
+          "expr": "rate(read_per_namespace_count{instance=~\"$instance\"}[$__rate_interval])",
+          "refId": "B",
+          "legendFormat": "{{key}} read"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Throughput by top-level znode",
+      "description": "ZK request throughput (bytes/s) attributed to the top-level znode (key label): strata = Strata's metadata plane, zookeeper = ZK internal. Coarse by design (keyed on the first path segment); for per-operation detail use Strata's own metadata metrics.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 44
+      },
+      "targets": [
+        {
+          "expr": "rate(write_per_namespace_sum{instance=~\"$instance\"}[$__rate_interval])",
+          "refId": "A",
+          "legendFormat": "{{key}} write"
+        },
+        {
+          "expr": "rate(read_per_namespace_sum{instance=~\"$instance\"}[$__rate_interval])",
+          "refId": "B",
+          "legendFormat": "{{key}} read"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "type": "row",
+      "title": "Data tree & watches",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      },
+      "collapsed": false
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Znodes & ephemerals",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 53
+      },
+      "targets": [
+        {
+          "expr": "znode_count{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}} znodes"
+        },
+        {
+          "expr": "ephemerals_count{instance=~\"$instance\"}",
+          "refId": "B",
+          "legendFormat": "{{instance}} ephemerals"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Approximate data size",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 53
+      },
+      "targets": [
+        {
+          "expr": "approximate_data_size{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Watches",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
+      "targets": [
+        {
+          "expr": "watch_count{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Watch events by type",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "targets": [
+        {
+          "expr": "node_created_watch_count_sum{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}} created"
+        },
+        {
+          "expr": "node_deleted_watch_count_sum{instance=~\"$instance\"}",
+          "refId": "B",
+          "legendFormat": "{{instance}} deleted"
+        },
+        {
+          "expr": "node_changed_watch_count_sum{instance=~\"$instance\"}",
+          "refId": "C",
+          "legendFormat": "{{instance}} changed"
+        },
+        {
+          "expr": "node_children_watch_count_sum{instance=~\"$instance\"}",
+          "refId": "D",
+          "legendFormat": "{{instance}} children"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 28,
+      "type": "row",
+      "title": "Persistence",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 69
+      },
+      "collapsed": false
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "fsync time avg",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 70
+      },
+      "targets": [
+        {
+          "expr": "fsynctime_sum{instance=~\"$instance\"} / clamp_min(fsynctime_count{instance=~\"$instance\"}, 1)",
+          "refId": "A",
+          "legendFormat": "{{instance}} avg"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "fsync rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 70
+      },
+      "targets": [
+        {
+          "expr": "irate(fsynctime_count{instance=~\"$instance\"}[$__rate_interval])",
+          "refId": "A",
+          "legendFormat": "{{instance}} fsyncs/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "snapshot time avg",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 78
+      },
+      "targets": [
+        {
+          "expr": "snapshottime_sum{instance=~\"$instance\"} / clamp_min(snapshottime_count{instance=~\"$instance\"}, 1)",
+          "refId": "A",
+          "legendFormat": "{{instance}} avg"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Open file descriptors",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 78
+      },
+      "targets": [
+        {
+          "expr": "open_file_descriptor_count{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 33,
+      "type": "row",
+      "title": "JVM",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 86
+      },
+      "collapsed": false
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "JVM memory pools used",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 87
+      },
+      "targets": [
+        {
+          "expr": "jvm_memory_pool_bytes_used{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}} {{pool}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "GC time / sec",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 87
+      },
+      "targets": [
+        {
+          "expr": "rate(jvm_gc_collection_seconds_sum{instance=~\"$instance\"}[$__rate_interval])",
+          "refId": "A",
+          "legendFormat": "{{instance}} {{gc}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Threads by state",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 95
+      },
+      "targets": [
+        {
+          "expr": "jvm_threads_state{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}} {{state}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Threads & classes",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 95
+      },
+      "targets": [
+        {
+          "expr": "jvm_threads_current{instance=~\"$instance\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}} threads"
+        },
+        {
+          "expr": "jvm_classes_loaded{instance=~\"$instance\"}",
+          "refId": "B",
+          "legendFormat": "{{instance}} classes loaded"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

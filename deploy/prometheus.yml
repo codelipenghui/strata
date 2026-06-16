@@ -12,3 +12,11 @@ scrape_configs:
           - node1:9300
           - node2:9300
           - node3:9300
+
+  # ZooKeeper's built-in Prometheus metrics provider (enabled via ZOO_CFG_EXTRA in docker-compose.yml).
+  # Feeds the "Strata — ZooKeeper" Grafana dashboard.
+  - job_name: zookeeper
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - zookeeper:7000

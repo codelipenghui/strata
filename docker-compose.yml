@@ -27,6 +27,10 @@ services:
       ZOO_4LW_COMMANDS_WHITELIST: "ruok,srvr,mntr"
       ZOO_AUTOPURGE_PURGEINTERVAL: "1"   # purge old snapshots/txnlogs hourly so ZK data can't grow unbounded
       ZOO_AUTOPURGE_SNAPRETAINCOUNT: "3"
+      # Expose ZooKeeper's built-in Prometheus metrics provider on :7000 (path /metrics) so Prometheus
+      # can scrape it for the "Strata — ZooKeeper" dashboard. ZOO_CFG_EXTRA is split on whitespace and
+      # written one property per line into zoo.cfg, so keep each property space-separated and unbroken.
+      ZOO_CFG_EXTRA: "metricsProvider.className=org.apache.zookeeper.metrics.prometheus.PrometheusMetricsProvider metricsProvider.httpPort=7000 metricsProvider.exportJvmInfo=true"
     healthcheck:
       test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
       interval: 5s
@@ -104,7 +108,8 @@ services:
       zookeeper:
         condition: service_healthy
 
-  # --- observability: scrapes each combined node's /metrics (:9300) and renders the dashboard ---
+  # --- observability: scrapes each combined node's /metrics (:9300) and ZooKeeper's metrics (:7000),
+  #     and renders the dashboards ---
   prometheus:
     image: prom/prometheus:v2.54.1
     command:
@@ -115,6 +120,7 @@ services:
       - "9090:9090"
     depends_on:
       - node1
+      - zookeeper
 
   grafana:
     image: grafana/grafana:11.2.0
@@ -126,7 +132,7 @@ services:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "3000:3000"   # open http://localhost:3000 -> Strata dashboards: Cluster / Node / JVM
+      - "3000:3000"   # open http://localhost:3000 -> Strata dashboards: Cluster / Node / JVM / ZooKeeper
     depends_on:
       - prometheus
 
