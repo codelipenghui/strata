@@ -186,6 +186,9 @@ public final class ManagedScpConnection implements AutoCloseable {
         touchApplication();
         lock.lock();
         try {
+            if (closed.get()) {
+                throw new ScpConnectionException(endpointLabel + " connection manager is closed");
+            }
             maintainConnection = true;
             if (expectedGeneration != null && generation != expectedGeneration) {
                 throw new ScpConnectionException(

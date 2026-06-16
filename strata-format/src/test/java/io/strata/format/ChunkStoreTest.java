@@ -14,6 +14,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
@@ -28,7 +29,10 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -236,6 +240,17 @@ class ChunkStoreTest {
             throw error;
         }
         return new RuntimeException(cause);
+    }
+
+    private static void waitFor(BooleanSupplier condition, String message) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        assertTrue(condition.getAsBoolean(), message);
     }
 
     private static final class ZeroProgressFileChannel extends FileChannel {
@@ -1536,6 +1551,42 @@ class ChunkStoreTest {
             store.fetch(id, 0, Integer.MAX_VALUE);
             assertEquals(0, store.readOps());
             assertEquals(0, store.readBytes());
+        }
+    }
+
+    @Test
+    void chunkStateMetricsUseSynchronizedSnapshotOrVolatileState() throws Exception {
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            Object handle = handle(store, id);
+            Field state = handle.getClass().getDeclaredField("state");
+            if (Modifier.isVolatile(state.getModifiers())) {
+                return;
+            }
+
+            AtomicReference<Integer> openCount = new AtomicReference<>();
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread reader = new Thread(() -> {
+                try {
+                    openCount.set(store.openChunks());
+                } catch (Throwable t) {
+                    failure.set(t);
+                }
+            }, "chunk-state-metric-reader");
+
+            synchronized (handle) {
+                reader.start();
+                waitFor(() -> reader.getState() == Thread.State.BLOCKED || !reader.isAlive(),
+                        "metric reader did not reach the handle state read");
+                assertTrue(reader.isAlive() && reader.getState() == Thread.State.BLOCKED,
+                        "openChunks() must synchronize on each handle or make Handle.state volatile");
+                assertEquals(null, openCount.get());
+            }
+
+            reader.join(TimeUnit.SECONDS.toMillis(3));
+            assertTrue(!reader.isAlive(), "metric reader did not finish");
+            assertEquals(null, failure.get());
+            assertEquals(1, openCount.get());
         }
     }
 

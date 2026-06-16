@@ -149,7 +149,9 @@ public final class ChunkStore implements AutoCloseable {
     private int countByState(ChunkState state) {
         int n = 0;
         for (Handle h : chunks.values()) {
-            if (h.state == state) n++;
+            synchronized (h) {
+                if (h.state == state) n++;
+            }
         }
         return n;
     }
