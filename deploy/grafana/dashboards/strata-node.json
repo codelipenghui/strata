@@ -740,7 +740,112 @@
         "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "mean"] },
         "tooltip": { "mode": "multi", "sort": "desc" }
       }
+    },
+    {
+      "id": 43,
+      "type": "row",
+      "title": "Metadata service — request load",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 93
+      },
+      "collapsed": false
+    },
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "Metadata request rate by subtree",
+      "description": "Metadata-service request load by subtree (files/namespaces/nodes/ids) and op (read/write). Backend-neutral strata_meta_store_* counters tagged backend (currently zk); a future metadata backend surfaces here automatically under its own backend label.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 94
+      },
+      "targets": [
+        {
+          "expr": "sum by (subtree, op) (rate(strata_meta_store_ops_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{subtree}} {{op}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 45,
+      "type": "timeseries",
+      "title": "Metadata throughput by subtree",
+      "description": "Metadata-service request load by subtree (files/namespaces/nodes/ids) and op (read/write). Backend-neutral strata_meta_store_* counters tagged backend (currently zk); a future metadata backend surfaces here automatically under its own backend label.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 94
+      },
+      "targets": [
+        {
+          "expr": "sum by (subtree, op) (rate(strata_meta_store_bytes_total{instance=~\"$node\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{subtree}} {{op}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     }
-
   ]
 }

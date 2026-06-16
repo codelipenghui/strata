@@ -5,6 +5,7 @@ import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import io.strata.meta.MetadataService;
+import io.strata.meta.ZkMetadataStore;
 import io.strata.node.StorageNode;
 import io.strata.proto.RequestObserver;
 
@@ -49,6 +50,23 @@ final class ServerMetrics {
                 .tag("state", "suspect").register(reg);
         Gauge.builder("strata_nodes", s, MetadataService::deadNodes)
                 .tag("state", "dead").register(reg);
+
+        // Per-subtree metadata-store request load: rate(strata_meta_store_ops_total) = requests/s and
+        // rate(strata_meta_store_bytes_total) = throughput, tagged by `backend` (e.g. zk), the /strata
+        // child the op touched (files/namespaces/nodes/ids), and op=read|write. Backend-neutral name +
+        // label so a future non-ZK metadata store surfaces on the same Cluster/Node dashboard panels.
+        String backend = s.metadataBackend();
+        for (String subtree : ZkMetadataStore.SUBTREES) {
+            for (boolean write : new boolean[]{false, true}) {
+                String op = write ? "write" : "read";
+                FunctionCounter.builder("strata_meta_store_ops", s, m -> m.metaStoreOps(subtree, write))
+                        .tag("backend", backend).tag("subtree", subtree).tag("op", op)
+                        .description("metadata-store requests issued, by backend, /strata subtree, and op").register(reg);
+                FunctionCounter.builder("strata_meta_store_bytes", s, m -> m.metaStoreBytes(subtree, write))
+                        .tag("backend", backend).tag("subtree", subtree).tag("op", op)
+                        .description("metadata-store payload bytes read/written, by backend, /strata subtree, and op").register(reg);
+            }
+        }
     }
 
     /** Data plane: capacity, chunk state, write throughput, fsync force rate, registration. */

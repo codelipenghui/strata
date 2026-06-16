@@ -15,8 +15,11 @@ import org.apache.zookeeper.data.Stat;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.LongAdder;
 
 /**
  * ZooKeeper backend (tech design §4.4, v0 only — development/prototype; retired at v1 GA).
@@ -33,9 +36,15 @@ public final class ZkMetadataStore implements MetadataStore {
     private static final String FILE_MARKER = "__file";
     private static final byte[] DELETED_FILE_MARKER = new byte[0];
 
+    /** The next-level znodes under {@code /strata}, used to tag per-subtree ZK request metrics. */
+    public static final List<String> SUBTREES = List.of("files", "namespaces", "nodes", "ids");
+
     private final CuratorFramework curator;
     private final boolean ownsCurator;
     private final int connectionTimeoutMs;
+    // Per-subtree ZK request/byte counters (read vs write), populated on the I/O path and read back
+    // by ServerMetrics as monotonic function-counters — pure accounting, never affects control flow.
+    private final Map<String, Counters> zkStats = newStats();
 
     public ZkMetadataStore(String zkConnect) {
         this(zkConnect, 60_000, 15_000);
@@ -119,16 +128,20 @@ public final class ZkMetadataStore implements MetadataStore {
         if (marker.isPresent() && marker.get().fileId().isPresent()) {
             throw new KeeperException.NodeExistsException(markerPath);
         }
+        byte[] enc = record.encode();
+        byte[] idBytes = fileIdBytes(record.fileId());
         List<CuratorOp> ops = new ArrayList<>();
-        ops.add(curator.transactionOp().create().forPath(FILES + "/" + record.fileId(), record.encode()));
+        ops.add(curator.transactionOp().create().forPath(FILES + "/" + record.fileId(), enc));
         if (marker.isPresent()) {
             ops.add(curator.transactionOp().setData().withVersion(marker.get().version())
-                    .forPath(markerPath, fileIdBytes(record.fileId())));
+                    .forPath(markerPath, idBytes));
         } else {
-            ops.add(curator.transactionOp().create().forPath(markerPath, fileIdBytes(record.fileId())));
+            ops.add(curator.transactionOp().create().forPath(markerPath, idBytes));
         }
         try {
             curator.transaction().forOperations(ops);
+            record(FILES, true, enc.length);
+            record(markerPath, true, idBytes.length);
         } catch (KeeperException.BadVersionException e) {
             throw new KeeperException.NodeExistsException(markerPath);
         }
@@ -139,12 +152,14 @@ public final class ZkMetadataStore implements MetadataStore {
         try {
             Stat stat = new Stat();
             byte[] data = curator.getData().storingStatIn(stat).forPath(FILES + "/" + id);
+            record(FILES, false, data.length);
             Records.FileRecord record = Records.FileRecord.decode(data);
             if (record.state() == FileState.DELETED) {
                 return Optional.empty();  // a swept-pending tombstone is logically gone
             }
             return Optional.of(new Versioned<>(record, stat.getVersion()));
         } catch (KeeperException.NoNodeException e) {
+            record(FILES, false, 0);
             return Optional.empty();
         }
     }
@@ -161,7 +176,9 @@ public final class ZkMetadataStore implements MetadataStore {
     @Override
     public boolean updateFile(Records.FileRecord record, int expectedVersion) throws Exception {
         try {
-            curator.setData().withVersion(expectedVersion).forPath(FILES + "/" + record.fileId(), record.encode());
+            byte[] enc = record.encode();
+            curator.setData().withVersion(expectedVersion).forPath(FILES + "/" + record.fileId(), enc);
+            record(FILES, true, enc.length);
             return true;
         } catch (KeeperException.BadVersionException | KeeperException.NoNodeException e) {
             return false;
@@ -180,6 +197,7 @@ public final class ZkMetadataStore implements MetadataStore {
         try {
             curator.setData().withVersion(marker.get().version())
                     .forPath(fileMarkerPath(namespace, path), DELETED_FILE_MARKER);
+            record(NAMESPACES, true, 0);
             return true;
         } catch (KeeperException.BadVersionException | KeeperException.NoNodeException e) {
             return pathNoLongerBinds(namespace, path, expectedFileId);
@@ -209,8 +227,11 @@ public final class ZkMetadataStore implements MetadataStore {
                                 .forPath(fileMarkerPath(record.namespace(), record.path()), DELETED_FILE_MARKER)
                 );
                 curator.transaction().forOperations(ops);
+                record(FILES, true, tombstone.length);
+                record(NAMESPACES, true, 0);
             } else {
                 curator.setData().withVersion(expectedVersion).forPath(filePath, tombstone);
+                record(FILES, true, tombstone.length);
             }
             return true;
         } catch (KeeperException.BadVersionException e) {
@@ -223,7 +244,9 @@ public final class ZkMetadataStore implements MetadataStore {
     @Override
     public List<FileId> listFiles() throws Exception {
         List<FileId> out = new ArrayList<>();
-        for (String child : curator.getChildren().forPath(FILES)) {
+        List<String> children = curator.getChildren().forPath(FILES);
+        record(FILES, false, 0);
+        for (String child : children) {
             FileId id = FileId.fromString(child);
             if (getFile(id).isPresent()) {  // skip DELETED tombstones awaiting sweep
                 out.add(id);
@@ -240,12 +263,15 @@ public final class ZkMetadataStore implements MetadataStore {
         // must absorb that skew — see DELETED_TOMBSTONE_TTL_MS.
         long now = System.currentTimeMillis();
         int reaped = 0;
-        for (String child : curator.getChildren().forPath(FILES)) {
+        List<String> children = curator.getChildren().forPath(FILES);
+        record(FILES, false, 0);
+        for (String child : children) {
             String path = FILES + "/" + child;
             Stat stat = new Stat();
             byte[] data;
             try {
                 data = curator.getData().storingStatIn(stat).forPath(path);
+                record(FILES, false, data.length);
             } catch (KeeperException.NoNodeException e) {
                 continue;  // reaped concurrently
             }
@@ -255,6 +281,7 @@ public final class ZkMetadataStore implements MetadataStore {
             }
             try {
                 curator.delete().withVersion(stat.getVersion()).forPath(path);
+                record(FILES, true, 0);
                 reaped++;
             } catch (KeeperException.BadVersionException | KeeperException.NoNodeException ignored) {
                 // raced with another mutation/sweeper; leave it for the next pass
@@ -266,6 +293,7 @@ public final class ZkMetadataStore implements MetadataStore {
     private void ensureNamespaceDir(StrataNamespace namespace, StrataPath path) throws Exception {
         try {
             curator.create().creatingParentsIfNeeded().forPath(namespaceDirPath(namespace, path));
+            record(NAMESPACES, true, 0);
         } catch (KeeperException.NodeExistsException ignored) {
             // The directory already exists, possibly because another file is in the same parent.
         }
@@ -299,8 +327,10 @@ public final class ZkMetadataStore implements MetadataStore {
         try {
             Stat stat = new Stat();
             byte[] data = curator.getData().storingStatIn(stat).forPath(fileMarkerPath(namespace, path));
+            record(NAMESPACES, false, data.length);
             return Optional.of(new PathMarker(readFileId(data), stat.getVersion()));
         } catch (KeeperException.NoNodeException e) {
+            record(NAMESPACES, false, 0);
             return Optional.empty();
         }
     }
@@ -319,6 +349,7 @@ public final class ZkMetadataStore implements MetadataStore {
     @Override
     public int nextNodeId() throws Exception {
         String path = curator.create().withMode(CreateMode.PERSISTENT_SEQUENTIAL).forPath(IDS + "/seq-");
+        record(IDS, true, 0);
         String seq = path.substring(path.lastIndexOf('-') + 1);
         return Integer.parseInt(seq) + 1; // node ids start at 1
     }
@@ -327,11 +358,13 @@ public final class ZkMetadataStore implements MetadataStore {
     public boolean putNode(Records.NodeRecord record, int expectedVersion) throws Exception {
         String path = NODES + "/" + record.nodeId();
         try {
+            byte[] enc = record.encode();
             if (expectedVersion < 0) {
-                curator.create().forPath(path, record.encode());
+                curator.create().forPath(path, enc);
             } else {
-                curator.setData().withVersion(expectedVersion).forPath(path, record.encode());
+                curator.setData().withVersion(expectedVersion).forPath(path, enc);
             }
+            record(NODES, true, enc.length);
             return true;
         } catch (KeeperException.NodeExistsException | KeeperException.BadVersionException
                  | KeeperException.NoNodeException e) {
@@ -344,8 +377,10 @@ public final class ZkMetadataStore implements MetadataStore {
         try {
             Stat stat = new Stat();
             byte[] data = curator.getData().storingStatIn(stat).forPath(NODES + "/" + nodeId);
+            record(NODES, false, data.length);
             return Optional.of(new Versioned<>(Records.NodeRecord.decode(data), stat.getVersion()));
         } catch (KeeperException.NoNodeException e) {
+            record(NODES, false, 0);
             return Optional.empty();
         }
     }
@@ -353,10 +388,75 @@ public final class ZkMetadataStore implements MetadataStore {
     @Override
     public List<Versioned<Records.NodeRecord>> listNodes() throws Exception {
         List<Versioned<Records.NodeRecord>> out = new ArrayList<>();
-        for (String child : curator.getChildren().forPath(NODES)) {
+        List<String> children = curator.getChildren().forPath(NODES);
+        record(NODES, false, 0);
+        for (String child : children) {
             getNode(Integer.parseInt(child)).ifPresent(out::add);
         }
         return out;
+    }
+
+    /** Read-only: ZooKeeper requests issued against a {@code /strata} subtree, by op kind. */
+    public long zkOps(String subtree, boolean write) {
+        Counters c = zkStats.get(subtree);
+        return c == null ? 0 : (write ? c.writeOps : c.readOps).sum();
+    }
+
+    /** Read-only: ZooKeeper payload bytes read/written against a {@code /strata} subtree, by op kind. */
+    public long zkBytes(String subtree, boolean write) {
+        Counters c = zkStats.get(subtree);
+        return c == null ? 0 : (write ? c.writeBytes : c.readBytes).sum();
+    }
+
+    /** Attribute one ZK op (and its payload bytes) to the {@code /strata} subtree of {@code path}. */
+    private void record(String path, boolean write, int bytes) {
+        Counters c = zkStats.get(subtreeOf(path));
+        if (c == null) {
+            return;
+        }
+        if (write) {
+            c.writeOps.increment();
+            if (bytes > 0) {
+                c.writeBytes.add(bytes);
+            }
+        } else {
+            c.readOps.increment();
+            if (bytes > 0) {
+                c.readBytes.add(bytes);
+            }
+        }
+    }
+
+    private static String subtreeOf(String path) {
+        if (path.startsWith(FILES)) {
+            return "files";
+        }
+        if (path.startsWith(NAMESPACES)) {
+            return "namespaces";
+        }
+        if (path.startsWith(NODES)) {
+            return "nodes";
+        }
+        if (path.startsWith(IDS)) {
+            return "ids";
+        }
+        return "other";
+    }
+
+    private static Map<String, Counters> newStats() {
+        Map<String, Counters> m = new ConcurrentHashMap<>();
+        for (String s : SUBTREES) {
+            m.put(s, new Counters());
+        }
+        m.put("other", new Counters());
+        return m;
+    }
+
+    private static final class Counters {
+        final LongAdder readOps = new LongAdder();
+        final LongAdder readBytes = new LongAdder();
+        final LongAdder writeOps = new LongAdder();
+        final LongAdder writeBytes = new LongAdder();
     }
 
     @Override

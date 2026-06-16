@@ -157,6 +157,21 @@ public final class MetadataService implements AutoCloseable {
         return !(store instanceof ZkMetadataStore zk) || zk.isConnected();
     }
 
+    /** The metadata-store backend identifier (the {@code backend} metric label), e.g. {@code zk}. */
+    public String metadataBackend() {
+        return store instanceof ZkMetadataStore ? "zk" : "none";
+    }
+
+    /** Metadata-store requests this service has issued against a {@code /strata} subtree, by op kind. */
+    public long metaStoreOps(String subtree, boolean write) {
+        return store instanceof ZkMetadataStore zk ? zk.zkOps(subtree, write) : 0;
+    }
+
+    /** Metadata-store payload bytes this service has read/written against a {@code /strata} subtree. */
+    public long metaStoreBytes(String subtree, boolean write) {
+        return store instanceof ZkMetadataStore zk ? zk.zkBytes(subtree, write) : 0;
+    }
+
     /** SEALED chunks below their replication factor (last reconciliation scan). */
     public int underReplicatedChunks() {
         return repair.underReplicatedChunks();
