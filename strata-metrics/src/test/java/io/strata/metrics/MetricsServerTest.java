@@ -4,11 +4,11 @@ import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
+import java.net.HttpURLConnection;
+import java.net.ServerSocket;
 import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -23,10 +23,7 @@ class MetricsServerTest {
         MetricsServer endpoint = MetricsServer.start(0, metrics);
         try {
             int port = port(endpoint);
-            HttpResponse<String> response = HttpClient.newHttpClient().send(
-                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/healthz")).GET().build(),
-                    HttpResponse.BodyHandlers.ofString());
-            assertEquals(200, response.statusCode());
+            assertEquals(200, status(port, "/healthz"));
             waitFor(() -> metricsThreads() > before, "metrics executor thread never started");
         } finally {
             endpoint.close();
@@ -36,11 +33,58 @@ class MetricsServerTest {
         waitFor(() -> metricsThreads() <= before, "metrics executor thread leaked after close()");
     }
 
+    @Test
+    void readinessEndpointIsSeparateFromLiveness() throws Exception {
+        int port = freePort();
+        try (StrataMetrics metrics = new StrataMetrics("test");
+             MetricsServer ignored = MetricsServer.start(port, metrics)) {
+            assertEquals(200, status(port, "/healthz"));
+            assertEquals(200, status(port, "/readyz"),
+                    "operators need a readiness probe distinct from process liveness");
+        }
+    }
+
+    @Test
+    void readinessEndpointReflectsReadinessSupplier() throws Exception {
+        int port = freePort();
+        AtomicBoolean ready = new AtomicBoolean(false);
+        try (StrataMetrics metrics = new StrataMetrics("test");
+             MetricsServer ignored = MetricsServer.start(port, metrics, ready::get)) {
+            assertEquals(200, status(port, "/healthz"));
+            assertEquals(503, status(port, "/readyz"),
+                    "readiness must stay false while the role cannot safely receive traffic");
+
+            ready.set(true);
+
+            assertEquals(200, status(port, "/readyz"));
+        }
+    }
+
     private static int port(MetricsServer endpoint) throws Exception {
         Field field = MetricsServer.class.getDeclaredField("server");
         field.setAccessible(true);
         HttpServer server = (HttpServer) field.get(endpoint);
         return server.getAddress().getPort();
+    }
+
+    private static int status(int port, String path) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) URI.create("http://127.0.0.1:" + port + path)
+                .toURL()
+                .openConnection();
+        connection.setConnectTimeout(2_000);
+        connection.setReadTimeout(2_000);
+        connection.setRequestMethod("GET");
+        try {
+            return connection.getResponseCode();
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private static int freePort() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0)) {
+            return socket.getLocalPort();
+        }
     }
 
     private static long metricsThreads() {

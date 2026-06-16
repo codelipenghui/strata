@@ -147,6 +147,24 @@ class ChunkStoreTest {
         }
     }
 
+    @Test
+    void usedBytesReflectsPhysicalChunkFootprint() throws Exception {
+        byte[] payload = "capacity-accounting".getBytes(StandardCharsets.UTF_8);
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            store.append(id, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(id, 1, payload.length, null);
+
+            String base = ChunkFormats.baseName(id);
+            long physicalBytes = sizeIfExists(dir.resolve(base + ".chunk"))
+                    + sizeIfExists(dir.resolve(base + ".meta"))
+                    + sizeIfExists(dir.resolve(base + ".j"));
+
+            assertTrue(store.usedBytes() >= physicalBytes,
+                    "capacity reporting must include physical chunk overhead, not only logical data bytes");
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static Object handle(ChunkStore store, ChunkId chunkId) throws Exception {
         Field chunks = ChunkStore.class.getDeclaredField("chunks");
@@ -213,6 +231,10 @@ class ChunkStoreTest {
 
     private static void readFully(FileChannel channel, ByteBuffer buffer, long position) throws Exception {
         ChunkFormats.readFully(channel, buffer, position);
+    }
+
+    private static long sizeIfExists(Path path) throws IOException {
+        return Files.exists(path) ? Files.size(path) : 0;
     }
 
     private static void writeFully(FileChannel channel, ByteBuffer buffer, long position) throws Exception {
@@ -385,15 +407,9 @@ class ChunkStoreTest {
             assertArrayEquals("world".getBytes(), r2.bytes());
 
             try (var region = store.readRegion(id, 6, 1024)) {
-                assertEquals(ChunkFormats.DATA_START + 6, region.filePosition());
                 assertEquals(5, region.length());
                 assertEquals(11, region.localEndOffset());
-                ByteBuffer out = ByteBuffer.allocate(region.length());
-                readFully(region.channel(), out, region.filePosition());
-                out.flip();
-                byte[] bytes = new byte[out.remaining()];
-                out.get(bytes);
-                assertArrayEquals("world".getBytes(), bytes);
+                assertArrayEquals("world".getBytes(), region.bytes());
             }
 
             var stat = store.stat(id);

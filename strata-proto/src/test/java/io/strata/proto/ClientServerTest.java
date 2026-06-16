@@ -1,13 +1,17 @@
 package io.strata.proto;
 
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.embedded.EmbeddedChannel;
 import io.strata.common.ErrorCode;
 import io.strata.common.ConnectionPolicy;
+import io.strata.common.FailureInjector;
 import io.strata.common.ScpException;
 import org.junit.jupiter.api.Test;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
@@ -21,6 +25,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -73,6 +78,50 @@ class ClientServerTest {
                                 new io.strata.common.ChunkId(io.strata.common.FileId.random(), 0), 0, 1).encode(), null, 2000));
                 assertEquals(ErrorCode.UNKNOWN_OPCODE, e.code());
             }
+        }
+    }
+
+    @Test
+    void sendCopiesHeaderAndPayloadBeforeAsyncEncoding() throws Exception {
+        byte[] header = new byte[] {5, 6, 7};
+        byte[] payload = new byte[] {1, 2, 3, 4};
+        byte[] originalHeader = header.clone();
+        byte[] original = payload.clone();
+        java.util.concurrent.CountDownLatch encoderPaused = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch releaseEncoder = new java.util.concurrent.CountDownLatch(1);
+
+        try (ScpServer server = new ScpServer(0, 0, 0, 0,
+                req -> {
+                    ByteBuffer requestHeader = req.headerSlice();
+                    ByteBuffer requestPayload = req.payloadSlice();
+                    ByteBuffer echoed = ByteBuffer.allocate(requestHeader.remaining() + requestPayload.remaining());
+                    echoed.put(requestHeader).put(requestPayload).flip();
+                    return ScpServer.ok(req, Messages.okHeader(), echoed);
+                });
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "copy-test")) {
+            FailureInjector.arm("scp.encoder.beforeHeader", point -> {
+                encoderPaused.countDown();
+                releaseEncoder.await(5, TimeUnit.SECONDS);
+            });
+
+            CompletableFuture<Frame> future = client.send(Opcode.PING, header, ByteBuffer.wrap(payload));
+            assertTrue(encoderPaused.await(5, TimeUnit.SECONDS), "encoder did not reach request write seam");
+            java.util.Arrays.fill(header, (byte) 8);
+            java.util.Arrays.fill(payload, (byte) 9);
+            releaseEncoder.countDown();
+
+            Frame response = future.get(5, TimeUnit.SECONDS);
+            Resp.check(response.headerSlice());
+            byte[] echoed = new byte[response.payloadLength()];
+            response.payloadSlice().get(echoed);
+            byte[] expected = ByteBuffer.allocate(originalHeader.length + original.length)
+                    .put(originalHeader)
+                    .put(original)
+                    .array();
+            assertArrayEquals(expected, echoed,
+                    "send must snapshot header and payload before returning to the caller");
+        } finally {
+            FailureInjector.reset();
         }
     }
 
@@ -266,6 +315,73 @@ class ClientServerTest {
     }
 
     @Test
+    void pipelinedSendAppliesAdmissionControlBeforeTimeoutWindowExplodes() throws Exception {
+        int maxExpectedOutstanding = 1024;
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        ScpServer.Handler blocked = req -> {
+            release.await();
+            return ScpServer.ok(req, Messages.okHeader(), null);
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, blocked);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
+            List<CompletableFuture<Frame>> futures = new ArrayList<>();
+            try {
+                for (int i = 0; i < maxExpectedOutstanding + 1; i++) {
+                    futures.add(client.send(Opcode.PING, emptyHeader(), null));
+                }
+
+                assertTrue(client.pendingCount() <= maxExpectedOutstanding,
+                        "a blackholed peer must not allow unbounded outstanding correlations");
+                assertTrue(futures.stream().anyMatch(CompletableFuture::isCompletedExceptionally),
+                        "requests above the connection window should fail fast or apply backpressure");
+                CompletableFuture<Frame> failed = futures.stream()
+                        .filter(CompletableFuture::isCompletedExceptionally)
+                        .findFirst()
+                        .orElseThrow();
+                CompletionException e = assertThrows(CompletionException.class, failed::join);
+                assertTrue(ScpException.rootCause(e) instanceof ScpException);
+                assertEquals(ErrorCode.THROTTLED, ((ScpException) ScpException.rootCause(e)).code());
+            } finally {
+                release.countDown();
+            }
+        }
+    }
+
+    @Test
+    void serverRejectsRequestsBeyondConnectionAdmissionWindow() throws Exception {
+        CompletableFuture<Frame> firstResponse = new CompletableFuture<>();
+        java.util.concurrent.CountDownLatch firstStarted = new java.util.concurrent.CountDownLatch(1);
+        AtomicReference<Frame> firstRequest = new AtomicReference<>();
+        ScpServer.Handler blocked = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("async path expected");
+            }
+
+            @Override
+            public CompletableFuture<Frame> handleAsync(Frame request) {
+                firstRequest.set(request);
+                firstStarted.countDown();
+                return firstResponse;
+            }
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, blocked, 1, 1 << 20);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "admission")) {
+            CompletableFuture<Frame> first = client.send(Opcode.PING, emptyHeader(), null);
+            assertTrue(firstStarted.await(5, TimeUnit.SECONDS));
+
+            CompletableFuture<Frame> rejected = client.send(Opcode.PING, emptyHeader(), null);
+            Frame rejectedFrame = rejected.get(1, TimeUnit.SECONDS);
+            ScpException e = assertThrows(ScpException.class, () -> Resp.check(rejectedFrame.headerSlice()));
+            assertEquals(ErrorCode.THROTTLED, e.code());
+
+            firstResponse.complete(ScpServer.ok(firstRequest.get(), Messages.okHeader(), null));
+            assertThrows(Exception.class, () -> first.get(1, TimeUnit.SECONDS),
+                    "server closes the over-admitted connection after returning THROTTLED");
+        }
+    }
+
+    @Test
     void nullHandlerResponsesBecomeTypedErrors() throws Exception {
         try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> null);
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
@@ -430,6 +546,23 @@ class ClientServerTest {
             assertEquals(IOException.class, e.getCause().getClass());
             assertTrue(e.getCause().getMessage().contains("header too large"));
             assertEquals(0, client.pendingCount());
+            assertTrue(client.isClosed());
+        }
+    }
+
+    @Test
+    void synchronousWriteFailureReleasesPendingPermit() throws Exception {
+        try (ScpClient client = new ScpClient(new ThrowingWriteChannel(),
+                new Messages.HelloResp(0, 1, 0, 0, FrameIO.MAX_FRAME_BYTES, 1024))) {
+            int permitsBefore = availablePendingPermits(client);
+
+            CompletableFuture<Frame> failed = client.send(Opcode.PING, emptyHeader(), null);
+
+            var e = assertThrows(java.util.concurrent.ExecutionException.class, failed::get);
+            assertEquals(IOException.class, e.getCause().getClass());
+            assertTrue(e.getCause().getMessage().contains("sync write failed"));
+            assertEquals(0, client.pendingCount());
+            assertEquals(permitsBefore, availablePendingPermits(client));
             assertTrue(client.isClosed());
         }
     }
@@ -750,6 +883,19 @@ class ClientServerTest {
                 assertArrayEquals(new byte[] {1, 2, 3}, payload);
             }
             serving.get(3, TimeUnit.SECONDS);
+        }
+    }
+
+    private static int availablePendingPermits(ScpClient client) throws Exception {
+        Field field = ScpClient.class.getDeclaredField("pendingPermits");
+        field.setAccessible(true);
+        return ((Semaphore) field.get(client)).availablePermits();
+    }
+
+    private static final class ThrowingWriteChannel extends EmbeddedChannel {
+        @Override
+        public ChannelFuture writeAndFlush(Object msg) {
+            throw new IllegalStateException("sync write failed");
         }
     }
 

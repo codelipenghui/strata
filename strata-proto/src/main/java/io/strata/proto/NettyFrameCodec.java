@@ -6,6 +6,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.MessageToByteEncoder;
 import io.strata.common.Crc;
+import io.strata.common.FailureInjector;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -20,6 +21,7 @@ final class NettyFrameCodec {
             if (f.hasFilePayload()) {
                 throw new IOException("file payload frames must be written as a frame prefix plus FileRegion");
             }
+            FailureInjector.point("scp.encoder.beforeHeader");
             ByteBuffer header = f.headerSlice();
             ByteBuffer payload = f.payloadSlice();
             int headerLen = header.remaining();
@@ -33,6 +35,7 @@ final class NettyFrameCodec {
             }
 
             writePrefix(out, f, header, payloadLen, payloadCrc, flags);
+            FailureInjector.point("scp.encoder.beforePayload");
             out.writeBytes(payload.duplicate());
         }
     }

@@ -46,6 +46,7 @@ public final class ChunkStore implements AutoCloseable {
 
     /** Per-request read/fetch cap: callers loop; the frame layer tops out at 64 MB anyway. */
     public static final int MAX_REQUEST_BYTES = 8 * 1024 * 1024;
+    private static final long MAX_IMPORT_FOOTER_BYTES = 64L * 1024 * 1024;
 
     private final Path dir;
     private final Map<ChunkId, Handle> chunks = new ConcurrentHashMap<>();
@@ -486,10 +487,11 @@ public final class ChunkStore implements AutoCloseable {
     public record ReadResult(byte[] bytes, long localEndOffset, long lastKnownDO) {}
 
     /**
-     * A read response that is EITHER a zero-copy file region (sealed chunks, whose data is
-     * immutable) OR a heap snapshot of the bytes (open chunks, materialized under the chunk lock
-     * so a concurrent seal-truncate cannot corrupt a deferred transfer). Exactly one of
-     * {@code channel} / {@code bytes} is set for a non-empty result.
+     * A read response that is either a zero-copy file region or a heap snapshot of the bytes.
+     * Current client READs materialize bytes under the chunk lock: sealed chunks are range-CRC
+     * verified first, and open chunks are snapshotted before any concurrent seal-truncate can alter
+     * the transferred payload. Exactly one of {@code channel} / {@code bytes} is set for a non-empty
+     * result.
      */
     public record ReadRegionResult(FileChannel channel, long filePosition, int length, byte[] bytes,
                                    long localEndOffset, long lastKnownDO) implements AutoCloseable {
@@ -536,7 +538,13 @@ public final class ChunkStore implements AutoCloseable {
             readOps.incrementAndGet();
             readBytes.addAndGet(n);
             long filePos = checkedAdd(DATA_START, offset, "chunk file offset");
-            if (h.state != ChunkState.SEALED) {
+            if (h.state == ChunkState.SEALED) {
+                // SEALED chunks carry range CRCs. Verify the requested range before exposing bytes
+                // on the normal client READ path; scrub is a repair signal, not a read-time guard.
+                byte[] out = new byte[n];
+                readSealedVerified(h, offset, out);
+                return new ReadRegionResult(null, 0, n, out, end, h.lastKnownDO);
+            } else {
                 // OPEN chunk: a concurrent seal can truncate the never-acked tail of this shared
                 // inode. A zero-copy region resolved LATER (the data-plane transfers the file
                 // region off the chunk lock, on the transport event loop) could then stream the
@@ -546,20 +554,6 @@ public final class ChunkStore implements AutoCloseable {
                 byte[] out = new byte[n];
                 readFully(h.data, ByteBuffer.wrap(out), filePos);
                 return new ReadRegionResult(null, 0, n, out, end, h.lastKnownDO);
-            }
-            // SEALED: the data region is immutable (no further append/seal/truncate); a concurrent
-            // delete only unlinks the path while this independent FD keeps the inode alive, so the
-            // deferred zero-copy transfer is safe.
-            FileChannel readChannel = FileChannel.open(h.dataPath, StandardOpenOption.READ);
-            try {
-                return new ReadRegionResult(readChannel, filePos, n, null, end, h.lastKnownDO);
-            } catch (RuntimeException e) {
-                try {
-                    readChannel.close();
-                } catch (IOException closeFailure) {
-                    e.addSuppressed(closeFailure);
-                }
-                throw e;
             }
         }
     }
@@ -796,55 +790,76 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    /** Imports a sealed chunk from raw file bytes (repair pull target side). Validates everything. */
+    /** Creates a temp file in the chunk directory for a streaming sealed-chunk import. */
+    public Path createImportTemp(ChunkId id) throws IOException {
+        Files.createDirectories(dir);
+        return Files.createTempFile(dir, ChunkFormats.baseName(id) + ".", ".import");
+    }
+
+    /** Imports a sealed chunk from raw file bytes (tests/simple callers). Validates everything. */
     public void importSealed(ChunkId id, byte[] fileBytes, long expectedLength, int expectedCrc) throws IOException {
+        Path tmp = createImportTemp(id);
+        try {
+            Files.write(tmp, fileBytes);
+            importSealed(id, tmp, expectedLength, expectedCrc);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    /**
+     * Imports a sealed chunk from a raw chunk-file image already written to {@code sourceFile}.
+     * The source file is consumed: on success it is atomically moved into place; on failure the
+     * caller should delete it.
+     */
+    public void importSealed(ChunkId id, Path sourceFile, long expectedLength, int expectedCrc) throws IOException {
         reserveNewChunk(id);
         try {
-            if (fileBytes.length < HEADER_SIZE + TRAILER_SIZE) {
+            long fileLen = Files.size(sourceFile);
+            if (fileLen < HEADER_SIZE + TRAILER_SIZE) {
                 throw new ScpException(ErrorCode.CORRUPT_CHUNK, "file too short");
             }
-            // fileBytes is int-indexed, so anything that fit arrived < 2 GB — but the trailer's
-            // claimed dataLength must still be range-checked before the (int) narrowing below
-            long maxData = fileBytes.length - HEADER_SIZE - TRAILER_SIZE;
-            byte[] headerBytes = new byte[HEADER_SIZE];
-            System.arraycopy(fileBytes, 0, headerBytes, 0, HEADER_SIZE);
-            ChunkFormats.Header header = ChunkFormats.Header.decode(headerBytes);
-            if (!header.chunkId().equals(id)) {
-                throw new ScpException(ErrorCode.CORRUPT_CHUNK, "chunk id mismatch: " + header.chunkId());
+            ChunkFormats.Header header;
+            ChunkFormats.Trailer trailer;
+            List<Integer> rangeCrcs;
+            try (FileChannel input = FileChannel.open(sourceFile, StandardOpenOption.READ)) {
+                header = ChunkFormats.Header.decode(readBytes(input, HEADER_SIZE, 0));
+                if (!header.chunkId().equals(id)) {
+                    throw new ScpException(ErrorCode.CORRUPT_CHUNK, "chunk id mismatch: " + header.chunkId());
+                }
+                trailer = ChunkFormats.Trailer.decode(readBytes(input, TRAILER_SIZE, fileLen - TRAILER_SIZE));
+                if (expectedLength >= 0 && trailer.dataLength() != expectedLength) {
+                    throw new ScpException(ErrorCode.CORRUPT_CHUNK, "length mismatch: " + trailer.dataLength());
+                }
+                long maxData = fileLen - HEADER_SIZE - TRAILER_SIZE;
+                if (trailer.dataLength() < 0 || trailer.dataLength() > maxData) {
+                    throw new ScpException(ErrorCode.CORRUPT_CHUNK, "bad dataLength " + trailer.dataLength());
+                }
+                int dataCrc = crcOfFileRange(input, HEADER_SIZE, trailer.dataLength());
+                if (dataCrc != trailer.dataCrc() || dataCrc != expectedCrc) {
+                    throw new ScpException(ErrorCode.CRC_MISMATCH, "data crc mismatch on import");
+                }
+                int footerLen = checkedFooterLength(trailer, fileLen);
+                if (footerLen > MAX_IMPORT_FOOTER_BYTES) {
+                    throw new ScpException(ErrorCode.CORRUPT_CHUNK, "footer too large: " + footerLen);
+                }
+                byte[] footerBytes = readBytes(input, footerLen, trailer.footerStart());
+                if (Crc.of(footerBytes) != trailer.footerCrc()) {
+                    throw new ScpException(ErrorCode.CORRUPT_CHUNK, "footer crc mismatch on import");
+                }
+                rangeCrcs = decodeCrcRanges(footerBytes, trailer.dataLength(), trailer.sectionCount());
             }
-            byte[] trailerBytes = new byte[TRAILER_SIZE];
-            System.arraycopy(fileBytes, fileBytes.length - TRAILER_SIZE, trailerBytes, 0, TRAILER_SIZE);
-            ChunkFormats.Trailer trailer = ChunkFormats.Trailer.decode(trailerBytes);
-            if (expectedLength >= 0 && trailer.dataLength() != expectedLength) {
-                throw new ScpException(ErrorCode.CORRUPT_CHUNK, "length mismatch: " + trailer.dataLength());
-            }
-            if (trailer.dataLength() < 0 || trailer.dataLength() > maxData) {
-                throw new ScpException(ErrorCode.CORRUPT_CHUNK, "bad dataLength " + trailer.dataLength());
-            }
-            int dataCrc = Crc.of(fileBytes, HEADER_SIZE, (int) trailer.dataLength());
-            if (dataCrc != trailer.dataCrc() || dataCrc != expectedCrc) {
-                throw new ScpException(ErrorCode.CRC_MISMATCH, "data crc mismatch on import");
-            }
-            int footerLen = checkedFooterLength(trailer, fileBytes.length);
-            byte[] footerBytes = new byte[(int) footerLen];
-            System.arraycopy(fileBytes, (int) trailer.footerStart(), footerBytes, 0, footerBytes.length);
-            if (Crc.of(footerBytes) != trailer.footerCrc()) {
-                throw new ScpException(ErrorCode.CORRUPT_CHUNK, "footer crc mismatch on import");
-            }
-            List<Integer> rangeCrcs = decodeCrcRanges(footerBytes, trailer.dataLength(), trailer.sectionCount());
 
             Handle h = new Handle(id, header);
             if (Files.exists(h.dataPath)) throw chunkAlreadyExists(id);
-            Path tmp = h.dataPath.resolveSibling(h.dataPath.getFileName() + ".tmp");
             boolean movedData = false;
             boolean sidecarStarted = false;
             boolean installed = false;
             try {
-                Files.write(tmp, fileBytes);
-                try (FileChannel ch = FileChannel.open(tmp, StandardOpenOption.WRITE)) {
+                try (FileChannel ch = FileChannel.open(sourceFile, StandardOpenOption.WRITE)) {
                     ch.force(true);
                 }
-                Files.move(tmp, h.dataPath, StandardCopyOption.ATOMIC_MOVE);
+                Files.move(sourceFile, h.dataPath, StandardCopyOption.ATOMIC_MOVE);
                 movedData = true;
                 h.data = FileChannel.open(h.dataPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
                 h.state = ChunkState.SEALED;
@@ -862,12 +877,31 @@ public final class ChunkStore implements AutoCloseable {
                 installed = true;
             } finally {
                 if (!installed) {
-                    cleanupFailedImport(h, tmp, movedData, sidecarStarted);
+                    cleanupFailedImport(h, sourceFile, movedData, sidecarStarted);
                 }
             }
         } finally {
             releaseReservation(id);
         }
+    }
+
+    private static byte[] readBytes(FileChannel channel, int length, long position) throws IOException {
+        byte[] bytes = new byte[length];
+        readFully(channel, ByteBuffer.wrap(bytes), position);
+        return bytes;
+    }
+
+    private static int crcOfFileRange(FileChannel channel, long position, long length) throws IOException {
+        CRC32C crc = new CRC32C();
+        byte[] buf = new byte[1 << 20];
+        long read = 0;
+        while (read < length) {
+            int n = (int) Math.min(buf.length, length - read);
+            readFully(channel, ByteBuffer.wrap(buf, 0, n), position + read);
+            crc.update(buf, 0, n);
+            read += n;
+        }
+        return (int) crc.getValue();
     }
 
     private void cleanupFailedImport(Handle h, Path tmp, boolean movedData, boolean sidecarStarted) {
@@ -936,10 +970,20 @@ public final class ChunkStore implements AutoCloseable {
         long total = 0;
         for (Handle h : chunks.values()) {
             synchronized (h) {
-                total += h.end;
+                total += sizeIfExists(h.dataPath);
+                total += sizeIfExists(h.metaPath);
+                total += sizeIfExists(h.ledgerPath);
             }
         }
         return total;
+    }
+
+    private static long sizeIfExists(Path path) {
+        try {
+            return Files.exists(path) ? Files.size(path) : 0;
+        } catch (IOException e) {
+            return 0;
+        }
     }
 
     public boolean contains(ChunkId id) {

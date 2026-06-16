@@ -72,6 +72,31 @@ class RecoveryTest {
     }
 
     @Test
+    void unreachableOpenTailDoesNotSealZeroWithoutQuorumEvidence() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId sealedChunk = new ChunkId(fileId, 0);
+        ChunkId abandonedTail = new ChunkId(fileId, 1);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>(
+                lookup(
+                        chunk(sealedChunk, ChunkState.SEALED, 4, 1),
+                        chunk(abandonedTail, ChunkState.OPEN, 0, 1,
+                                new Messages.Replica(1, ""),
+                                new Messages.Replica(2, ""))));
+
+        try (ScpServer metaServer = metadataServer(lookup, sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
+                assertEquals(ErrorCode.INTERNAL, e.code(),
+                        "open chunk metadata length is not proof that the tail never held acked bytes");
+                assertEquals(null, sealedFileLength.get());
+            }
+        }
+    }
+
+    @Test
     void deletingFileRecoveryFailsBeforeFencingReplicas() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);

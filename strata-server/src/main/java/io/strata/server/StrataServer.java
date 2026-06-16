@@ -16,6 +16,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
 /**
@@ -67,11 +68,18 @@ public final class StrataServer {
         MetadataService service = new MetadataService(config);
         log.info("metadata service started: endpoint={} zk={} leader={}",
                 service.endpoint(), config.zkConnect(), service.isLeader());
-        AutoCloseable metrics = startMetrics("meta", reg -> {
-            ServerMetrics.registerMeta(reg, service);
-            service.setRequestObserver(ServerMetrics.requestObserver(reg));
-        });
-        awaitShutdown("metadata service", metrics, service);
+        AutoCloseable metrics = null;
+        try {
+            metrics = startMetrics("meta", reg -> {
+                ServerMetrics.registerMeta(reg, service);
+                service.setRequestObserver(ServerMetrics.requestObserver(reg));
+            }, () -> service.isLeader() && service.zkConnected());
+            awaitShutdown("metadata service", metrics, service);
+        } catch (Exception e) {
+            closeQuietly(metrics);
+            closeQuietly(service);
+            throw e;
+        }
     }
 
     private static void runNode() throws Exception {
@@ -90,11 +98,18 @@ public final class StrataServer {
         StorageNode node = new StorageNode(config);
         log.info("storage node started: endpoint={} dataDir={} meta={}",
                 node.endpoint(), config.dataDir(), config.metadataEndpoints());
-        AutoCloseable metrics = startMetrics("node", reg -> {
-            ServerMetrics.registerNode(reg, node);
-            node.setRequestObserver(ServerMetrics.requestObserver(reg));
-        });
-        awaitShutdown("storage node", metrics, node);
+        AutoCloseable metrics = null;
+        try {
+            metrics = startMetrics("node", reg -> {
+                ServerMetrics.registerNode(reg, node);
+                node.setRequestObserver(ServerMetrics.requestObserver(reg));
+            }, node::registered);
+            awaitShutdown("storage node", metrics, node);
+        } catch (Exception e) {
+            closeQuietly(metrics);
+            closeQuietly(node);
+            throw e;
+        }
     }
 
     /**
@@ -164,7 +179,7 @@ public final class StrataServer {
                 // The single (node) listener serves both planes, so observe there; the embedded meta
                 // has no server of its own.
                 startedNode.setRequestObserver(ServerMetrics.requestObserver(reg));
-            });
+            }, () -> startedMeta.isLeader() && startedMeta.zkConnected() && startedNode.registered());
             return new Combined(meta, node, metrics);
         } catch (Exception e) {
             // a partial start must not leak the meta's ZK session or the node's listener
@@ -212,17 +227,27 @@ public final class StrataServer {
      * when metrics are disabled.
      */
     private static AutoCloseable startMetrics(String role, Consumer<MeterRegistry> registrar) throws IOException {
+        return startMetrics(role, registrar, () -> true);
+    }
+
+    private static AutoCloseable startMetrics(String role, Consumer<MeterRegistry> registrar,
+                                              BooleanSupplier ready) throws IOException {
         if (!boolEnv("STRATA_METRICS_ENABLED", true)) {
             log.info("metrics endpoint disabled (STRATA_METRICS_ENABLED=false)");
             return () -> { };
         }
         StrataMetrics metrics = new StrataMetrics(role);
-        registrar.accept(metrics.registry());
-        MetricsServer endpoint = MetricsServer.start(intEnv("STRATA_METRICS_PORT", 9_300), metrics);
-        return () -> {
-            endpoint.close();
+        try {
+            registrar.accept(metrics.registry());
+            MetricsServer endpoint = MetricsServer.start(intEnv("STRATA_METRICS_PORT", 9_300), metrics, ready);
+            return () -> {
+                endpoint.close();
+                metrics.close();
+            };
+        } catch (IOException | RuntimeException e) {
             metrics.close();
-        };
+            throw e;
+        }
     }
 
     /** Blocks until the JVM is asked to stop, then closes {@code resources} (in order) from a hook. */

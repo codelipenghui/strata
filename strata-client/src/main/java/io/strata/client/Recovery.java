@@ -88,21 +88,26 @@ final class Recovery {
             throw new ScpException(ErrorCode.INTERNAL, "unknown file state " + file.fileState());
         }
         long total = 0;
-        for (Messages.ChunkInfo chunk : file.chunks()) {
+        List<Messages.ChunkInfo> chunks = file.chunks();
+        for (int i = 0; i < chunks.size(); i++) {
+            Messages.ChunkInfo chunk = chunks.get(i);
             if (chunk.state() == ChunkState.SEALED) {
                 total = addChunkLength(total, chunk.length());
             } else {
                 if (writerEpoch <= 0) {
                     throw new ScpException(ErrorCode.INTERNAL, "missing writer epoch for open chunk recovery");
                 }
-                total = addChunkLength(total, recoverChunk(chunk, writerEpoch, file.writePolicy().ackQuorum()));
+                boolean maySealAbandonedEmptyTail = i > 0 && i == chunks.size() - 1;
+                total = addChunkLength(total, recoverChunk(chunk, writerEpoch, file.writePolicy().ackQuorum(),
+                        maySealAbandonedEmptyTail));
             }
         }
         meta.sealFile(fileId, total);
         return new StrataFile.SealInfo(total);
     }
 
-    private long recoverChunk(Messages.ChunkInfo chunk, int writerEpoch, int ackQuorum) {
+    private long recoverChunk(Messages.ChunkInfo chunk, int writerEpoch, int ackQuorum,
+                              boolean maySealAbandonedEmptyTail) {
         ChunkId chunkId = chunk.chunkId();
 
         // 1. fence all reachable replicas; collect their state
@@ -123,6 +128,11 @@ final class Recovery {
             } catch (RuntimeException e) {
                 log.warn("fence {} on {} returned malformed response: {}", chunkId, r.endpoint(), e.toString());
             }
+        }
+        if (maySealAbandonedEmptyTail && reachable.size() < ackQuorum) {
+            log.warn("seal-recovery: final tail {} has only {} reachable replica(s), below quorum {}; "
+                            + "refusing to infer an empty tail from open-chunk metadata",
+                    chunkId, reachable.size(), ackQuorum);
         }
         requireQuorum(chunkId, reachable, ackQuorum);
 

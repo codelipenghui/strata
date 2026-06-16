@@ -37,11 +37,8 @@ public interface StrataFile {
         /**
          * Pipelined; completes on the file's ack quorum. Offsets are file-logical.
          *
-         * <p>The bytes of {@code data} are NOT copied: the appender serializes them asynchronously
-         * on the transport thread after this method returns. The caller must not mutate or reuse
-         * {@code data} until the returned future completes, and must not hand the same buffer to
-         * two concurrent {@code append} calls — either races the serializer and corrupts the
-         * written bytes.
+         * <p>The appender snapshots the remaining bytes before returning, so callers may reuse or
+         * mutate {@code data} after this method returns.
          */
         CompletableFuture<AppendAck> append(ByteBuffer data);
 
