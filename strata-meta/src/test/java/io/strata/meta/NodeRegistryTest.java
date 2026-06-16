@@ -2,9 +2,11 @@ package io.strata.meta;
 
 import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
+import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.proto.Messages;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
@@ -13,13 +15,24 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class NodeRegistryTest {
+
+    @AfterEach
+    void clearInjector() {
+        FailureInjector.reset();
+    }
 
     @Test
     void constructorWarmsPersistedNodesAndCasLossAdoptsStoreState() throws Exception {
@@ -165,6 +178,189 @@ class NodeRegistryTest {
     }
 
     @Test
+    void heartbeatCompletionCallbackRunsOutsideNodeLock() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
+                33, 34, List.of("node:9000"), "z", "r", "h",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
+        AtomicReference<Boolean> callbackHeldNodeLock = new AtomicReference<>();
+
+        registry.heartbeat(new Messages.NodeHeartbeat(
+                        registered.nodeId(), 33, 34, registered.sessionEpoch(), List.of(), 0,
+                        List.of(new Messages.CompletedCommand(99, ErrorCode.OK.code))),
+                (nodeId, ignored) -> callbackHeldNodeLock.set(live.lock.isHeldByCurrentThread()));
+
+        assertEquals(Boolean.FALSE, callbackHeldNodeLock.get(),
+                "completion callbacks can do metadata I/O and must not run under the node lock");
+    }
+
+    @Test
+    void heartbeatLeaseIsComputedAfterWaitingForNodeLock() throws Exception {
+        FakeStore store = new FakeStore();
+        MetaConfig config = config();
+        NodeRegistry registry = new NodeRegistry(store, config);
+        Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
+                35, 36, List.of("node:9000"), "z", "r", "h",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
+        AtomicReference<Messages.HeartbeatResp> heartbeat = new AtomicReference<>();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread heartbeatThread = new Thread(() -> {
+            try {
+                heartbeat.set(registry.heartbeat(new Messages.NodeHeartbeat(
+                        registered.nodeId(), 35, 36, registered.sessionEpoch(),
+                        List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), (nodeId, ignored) -> {}));
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        }, "lease-heartbeat");
+
+        long beforeUnlock;
+        live.lock.lock();
+        try {
+            heartbeatThread.start();
+            waitFor(() -> live.lock.hasQueuedThread(heartbeatThread),
+                    "heartbeat did not queue behind the per-node lock");
+            Thread.sleep(100);
+            beforeUnlock = System.currentTimeMillis();
+        } finally {
+            live.lock.unlock();
+        }
+
+        heartbeatThread.join(TimeUnit.SECONDS.toMillis(3));
+        assertFalse(heartbeatThread.isAlive(), "heartbeat did not finish");
+        assertEquals(null, failure.get());
+        assertNotNull(heartbeat.get());
+        assertTrue(heartbeat.get().leaseValidUntilMs() >= beforeUnlock + config.leaseMs(),
+                "heartbeat returned a lease timestamp computed before it waited for the node lock");
+    }
+
+    @Test
+    void heartbeatCompletionProcessingIsSerializedAgainstReregister() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        long incMsb = 37;
+        long incLsb = 38;
+        Messages.RegisterResp first = registry.register(new Messages.RegisterNode(
+                incMsb, incLsb, List.of("node:9000"), "z", "r", "h",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        NodeRegistry.LiveNode live = liveNodes(registry).get(first.nodeId());
+        CountDownLatch heartbeatBeforeCompletions = new CountDownLatch(1);
+        CountDownLatch releaseHeartbeat = new CountDownLatch(1);
+        AtomicReference<Throwable> heartbeatFailure = new AtomicReference<>();
+        AtomicReference<Throwable> registerFailure = new AtomicReference<>();
+        AtomicBoolean registerStarted = new AtomicBoolean();
+        AtomicBoolean registerFinished = new AtomicBoolean();
+        AtomicReference<Long> callbackSession = new AtomicReference<>();
+
+        FailureInjector.arm("meta.heartbeat.beforeCompletions", p -> {
+            heartbeatBeforeCompletions.countDown();
+            releaseHeartbeat.await();
+        });
+
+        Thread heartbeatThread = new Thread(() -> {
+            try {
+                registry.heartbeat(new Messages.NodeHeartbeat(
+                                first.nodeId(), incMsb, incLsb, first.sessionEpoch(), List.of(), 0,
+                                List.of(new Messages.CompletedCommand(99, ErrorCode.OK.code))),
+                        (nodeId, ignored) -> callbackSession.set(live.sessionEpoch));
+            } catch (Throwable t) {
+                heartbeatFailure.set(t);
+            }
+        }, "completion-heartbeat");
+        heartbeatThread.start();
+        assertTrue(heartbeatBeforeCompletions.await(3, TimeUnit.SECONDS),
+                "heartbeat did not reach the completion window");
+
+        Thread registerThread = new Thread(() -> {
+            try {
+                registerStarted.set(true);
+                registry.register(new Messages.RegisterNode(
+                        incMsb, incLsb, List.of("node-new:9000"), "z", "r", "h",
+                        List.of(new Messages.StorageCapacity(10)), 1, 0));
+                registerFinished.set(true);
+            } catch (Throwable t) {
+                registerFailure.set(t);
+            }
+        }, "reregister-during-completion");
+        registerThread.start();
+        waitFor(() -> registerFinished.get() || isWaiting(registerThread),
+                "re-register did not attempt to publish while heartbeat was parked");
+        assertTrue(registerStarted.get());
+        assertFalse(registerFinished.get(), "re-register published a new session while heartbeat was processing completions");
+
+        releaseHeartbeat.countDown();
+        heartbeatThread.join(TimeUnit.SECONDS.toMillis(3));
+        registerThread.join(TimeUnit.SECONDS.toMillis(3));
+        assertFalse(heartbeatThread.isAlive(), "heartbeat did not finish");
+        assertFalse(registerThread.isAlive(), "re-register did not finish");
+        assertEquals(null, heartbeatFailure.get());
+        assertEquals(null, registerFailure.get());
+        assertEquals(first.sessionEpoch(), callbackSession.get(),
+                "completion callback did not run under the session it had validated");
+        assertTrue(registerFinished.get());
+        assertTrue(live.sessionEpoch != first.sessionEpoch(), "re-register must publish a new session after heartbeat finishes");
+    }
+
+    @Test
+    void heartbeatCompletionProcessingPreventsExpireScanFromDeclaringNodeDead() throws Exception {
+        FakeStore store = new FakeStore();
+        MetaConfig config = new MetaConfig("unused", 0, 1, 50, 0, 1, 1);
+        NodeRegistry registry = new NodeRegistry(store, config);
+        Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
+                39, 40, List.of("node:9000"), "z", "r", "h",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        CountDownLatch heartbeatBeforeCompletions = new CountDownLatch(1);
+        CountDownLatch releaseHeartbeat = new CountDownLatch(1);
+        AtomicReference<Throwable> heartbeatFailure = new AtomicReference<>();
+        AtomicReference<List<Integer>> expired = new AtomicReference<>();
+        AtomicReference<Throwable> expireFailure = new AtomicReference<>();
+
+        FailureInjector.arm("meta.heartbeat.beforeCompletions", p -> {
+            heartbeatBeforeCompletions.countDown();
+            releaseHeartbeat.await();
+        });
+
+        Thread heartbeatThread = new Thread(() -> {
+            try {
+                registry.heartbeat(new Messages.NodeHeartbeat(
+                        registered.nodeId(), 39, 40, registered.sessionEpoch(), List.of(), 0,
+                        List.of(new Messages.CompletedCommand(99, ErrorCode.OK.code))), (nodeId, ignored) -> {});
+            } catch (Throwable t) {
+                heartbeatFailure.set(t);
+            }
+        }, "slow-completion-heartbeat");
+        heartbeatThread.start();
+        assertTrue(heartbeatBeforeCompletions.await(3, TimeUnit.SECONDS),
+                "heartbeat did not reach the completion window");
+        Thread.sleep(config.leaseMs() + 25L);
+
+        Thread expireThread = new Thread(() -> {
+            try {
+                expired.set(registry.expireScan());
+            } catch (Throwable t) {
+                expireFailure.set(t);
+            }
+        }, "expire-during-completion");
+        expireThread.start();
+        waitFor(() -> expired.get() != null || isWaiting(expireThread),
+                "expireScan did not attempt to inspect the node while heartbeat was parked");
+        assertEquals(null, expired.get(), "expireScan declared a node dead while its heartbeat was still processing");
+
+        releaseHeartbeat.countDown();
+        heartbeatThread.join(TimeUnit.SECONDS.toMillis(3));
+        expireThread.join(TimeUnit.SECONDS.toMillis(3));
+        assertFalse(heartbeatThread.isAlive(), "heartbeat did not finish");
+        assertFalse(expireThread.isAlive(), "expireScan did not finish");
+        assertEquals(null, heartbeatFailure.get());
+        assertEquals(null, expireFailure.get());
+        assertEquals(List.of(), expired.get());
+        assertTrue(registry.isAlive(registered.nodeId()));
+    }
+
+    @Test
     void heartbeatResurrectsDeadNodeWhenCasSucceeds() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
@@ -237,6 +433,109 @@ class NodeRegistryTest {
                         List.of(), 0, List.of()), (nodeId, ignored) -> {})).code());
     }
 
+    @Test
+    void staleHeartbeatCannotRenewLeaseAfterSameIncarnationReregisters() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        long incMsb = 71;
+        long incLsb = 72;
+        Messages.RegisterResp first = registry.register(new Messages.RegisterNode(
+                incMsb, incLsb, List.of("node:9000"), "z", "r", "h",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        registry.enqueue(first.nodeId(), new Messages.DeleteCmd(99, List.of(new ChunkId(FileId.random(), 0))));
+
+        Messages.RegisterResp second = registry.register(new Messages.RegisterNode(
+                incMsb, incLsb, List.of("node-new:9000"), "z", "r", "h",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        assertTrue(second.sessionEpoch() != first.sessionEpoch(), "re-register must create a new session");
+        ScpException stale = assertThrows(ScpException.class, () -> registry.heartbeat(new Messages.NodeHeartbeat(
+                first.nodeId(), incMsb, incLsb, first.sessionEpoch(),
+                List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), (nodeId, ignored) -> {}));
+        assertEquals(ErrorCode.LEASE_EXPIRED, stale.code());
+
+        Messages.HeartbeatResp current = registry.heartbeat(new Messages.NodeHeartbeat(
+                second.nodeId(), incMsb, incLsb, second.sessionEpoch(),
+                List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), (nodeId, ignored) -> {});
+        assertEquals(1, current.commands().size(), "stale heartbeat must not drain commands for the new session");
+    }
+
+    @Test
+    void currentSessionCheckUsesPerNodeLockForConsistentSnapshot() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
+                81, 82, List.of("node:9000"), "z", "r", "h",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
+
+        AtomicReference<Boolean> result = new AtomicReference<>();
+        Thread checker = new Thread(() -> result.set(registry.isCurrentSession(
+                registered.nodeId(), 81, 82, registered.sessionEpoch())), "session-checker");
+
+        live.lock.lock();
+        try {
+            checker.start();
+            waitFor(() -> live.lock.hasQueuedThread(checker),
+                    "isCurrentSession did not queue behind the per-node lock");
+            assertEquals(null, result.get());
+        } finally {
+            live.lock.unlock();
+        }
+
+        checker.join(TimeUnit.SECONDS.toMillis(3));
+        assertFalse(checker.isAlive(), "session checker did not finish");
+        assertEquals(Boolean.TRUE, result.get());
+    }
+
+    @Test
+    void currentSessionCheckWaitsForReregisterSessionPublish() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        long incMsb = 91;
+        long incLsb = 92;
+        Messages.RegisterResp first = registry.register(new Messages.RegisterNode(
+                incMsb, incLsb, List.of("node:9000"), "z", "r", "h",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        CountDownLatch registerPersisted = new CountDownLatch(1);
+        CountDownLatch publishSession = new CountDownLatch(1);
+        AtomicReference<Throwable> registerFailure = new AtomicReference<>();
+        AtomicReference<Boolean> currentSession = new AtomicReference<>();
+
+        FailureInjector.arm("meta.register.afterPersistBeforePublish", p -> {
+            registerPersisted.countDown();
+            publishSession.await();
+        });
+
+        Thread registerThread = new Thread(() -> {
+            try {
+                registry.register(new Messages.RegisterNode(
+                        incMsb, incLsb, List.of("node-new:9000"), "z", "r", "h",
+                        List.of(new Messages.StorageCapacity(10)), 1, 0));
+            } catch (Throwable t) {
+                registerFailure.set(t);
+            }
+        }, "reregister-before-session-publish");
+        registerThread.start();
+        assertTrue(registerPersisted.await(3, TimeUnit.SECONDS),
+                "re-register did not reach the persistent-write window");
+
+        Thread checker = new Thread(() -> currentSession.set(registry.isCurrentSession(
+                first.nodeId(), incMsb, incLsb, first.sessionEpoch())), "session-check-during-reregister");
+        checker.start();
+        waitFor(() -> currentSession.get() != null || isWaiting(checker),
+                "isCurrentSession did not attempt to inspect the node while re-register was parked");
+        assertEquals(null, currentSession.get(),
+                "old session was accepted while re-register had persisted but not published its new session");
+
+        publishSession.countDown();
+        registerThread.join(TimeUnit.SECONDS.toMillis(3));
+        checker.join(TimeUnit.SECONDS.toMillis(3));
+        assertFalse(registerThread.isAlive(), "re-register did not finish");
+        assertFalse(checker.isAlive(), "session checker did not finish");
+        assertEquals(null, registerFailure.get());
+        assertEquals(Boolean.FALSE, currentSession.get());
+    }
+
     private static MetaConfig config() {
         return new MetaConfig("unused", 0, 1, 1_000, 0, 1, 1);
     }
@@ -250,6 +549,24 @@ class NodeRegistryTest {
         Field live = NodeRegistry.class.getDeclaredField("live");
         live.setAccessible(true);
         return (Map<Integer, NodeRegistry.LiveNode>) live.get(registry);
+    }
+
+    private static void waitFor(BooleanSupplier condition, String message) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        assertTrue(condition.getAsBoolean(), message);
+    }
+
+    private static boolean isWaiting(Thread thread) {
+        Thread.State state = thread.getState();
+        return state == Thread.State.BLOCKED
+                || state == Thread.State.WAITING
+                || state == Thread.State.TIMED_WAITING;
     }
 
     private static final class FakeStore implements MetadataStore {

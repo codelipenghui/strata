@@ -7,15 +7,19 @@ import io.strata.common.ScpException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -150,6 +154,54 @@ class ConnectionRaceInjectionTest {
         }
     }
 
+    @Test
+    void acquireDoesNotReconnectAfterCloseWinsRacePastInitialClosedCheck() throws Exception {
+        CountDownLatch serverSawPing = new CountDownLatch(1);
+        ScpServer.Handler handler = req -> {
+            if (Opcode.fromCode(req.opcode()) == Opcode.PING) {
+                serverSawPing.countDown();
+                return ScpServer.ok(req, Messages.okHeader(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+        };
+
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ManagedScpConnection conn = new ManagedScpConnection(
+                     List.of("127.0.0.1:" + server.port()),
+                     new ConnectionPolicy(500, 5_000, 1_000, 60_000, 1_000, 1_000),
+                     ScpClient.KIND_TOOL, "close-race-test", "test endpoint", false, true)) {
+            ReentrantLock lock = connectionLock(conn);
+            AtomicReference<Throwable> callFailure = new AtomicReference<>();
+            Thread caller = new Thread(() -> {
+                try {
+                    conn.call(Opcode.PING, emptyHeader(), null, 2_000);
+                } catch (Throwable t) {
+                    callFailure.set(t);
+                }
+            }, "close-racing-caller");
+
+            lock.lock();
+            try {
+                caller.start();
+                waitFor(() -> lock.hasQueuedThread(caller),
+                        "caller never queued behind the connection lock");
+
+                // close() observes and publishes closed=true while the caller has already passed the
+                // unlocked closed check in acquire(). Once this lock is released, acquire() must
+                // re-check closed before it is allowed to reconnect.
+                conn.close();
+            } finally {
+                lock.unlock();
+            }
+
+            caller.join(TimeUnit.SECONDS.toMillis(3));
+            assertFalse(caller.isAlive(), "racing caller did not finish");
+            assertNotNull(callFailure.get(), "call raced past close() and reconnected after shutdown");
+            assertFalse(serverSawPing.await(100, TimeUnit.MILLISECONDS),
+                    "server should not receive traffic from a connection manager that has closed");
+        }
+    }
+
     private static ManagedScpConnection idleEvictingConnection(String endpoint) {
         // tiny idle timeout so the monitor wants to evict almost immediately; heartbeat OFF
         // (genericHeartbeat=false, last arg) so the only PING is the application's racing one
@@ -162,5 +214,22 @@ class ConnectionRaceInjectionTest {
         BufWriter w = new BufWriter(4);
         w.noTags();
         return w.toBytes();
+    }
+
+    private static ReentrantLock connectionLock(ManagedScpConnection conn) throws Exception {
+        Field field = ManagedScpConnection.class.getDeclaredField("lock");
+        field.setAccessible(true);
+        return (ReentrantLock) field.get(conn);
+    }
+
+    private static void waitFor(BooleanSupplier condition, String message) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        assertTrue(condition.getAsBoolean(), message);
     }
 }

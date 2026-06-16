@@ -2,6 +2,7 @@ package io.strata.meta;
 
 import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
+import io.strata.common.FailureInjector;
 import io.strata.common.ScpException;
 import io.strata.proto.Messages;
 import org.slf4j.Logger;
@@ -14,6 +15,8 @@ import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 
@@ -37,6 +40,9 @@ final class NodeRegistry {
         // repair-scan thread, heartbeat handler threads, and register. ReentrantLock (not
         // synchronized) so the ZK I/O inside the critical section does not pin a virtual thread.
         final java.util.concurrent.locks.ReentrantLock lock = new java.util.concurrent.locks.ReentrantLock();
+        // Session gate serializes long heartbeat completion processing against same-node
+        // re-registration without holding the state lock across metadata-store callbacks.
+        final ReentrantReadWriteLock sessionGate = new ReentrantReadWriteLock();
 
         boolean alive(long now) {
             return record.state() == Records.NodeState.REGISTERED && leaseUntil >= now;
@@ -128,36 +134,56 @@ final class NodeRegistry {
         Records.NodeRecord record = new Records.NodeRecord(nodeId, msg.incMsb(), msg.incLsb(),
                 msg.endpoints(), msg.zone(), msg.rack(), msg.host(), capacity, Records.NodeState.REGISTERED);
 
+        LiveNode existing = live.get(nodeId);
+        Lock sessionWrite = existing == null ? null : existing.sessionGate.writeLock();
+        if (sessionWrite != null) {
+            sessionWrite.lock();
+        }
+        LiveNode n = existing;
+        long sessionEpoch;
+        try {
+            int committedVersion = putNodeWithRetry(record, existingVersion);
+            FailureInjector.point("meta.register.afterPersistBeforePublish");
+            if (n == null) {
+                n = live.computeIfAbsent(nodeId, k -> new LiveNode());
+            }
+            n.lock.lock();
+            try {
+                // publish the new session's (record, recordVersion) pair atomically w.r.t. markState
+                n.record = record;
+                n.recordVersion = committedVersion;
+                n.sessionEpoch = sessionCounter.incrementAndGet();
+                n.leaseUntil = System.currentTimeMillis() + config.leaseMs();
+                n.freeBytes = capacity;
+                sessionEpoch = n.sessionEpoch;
+            } finally {
+                n.lock.unlock();
+            }
+        } finally {
+            if (sessionWrite != null) {
+                sessionWrite.unlock();
+            }
+        }
+        log.info("node {} registered ({} @ {}), session {}", nodeId, msg.host(), msg.endpoints(), sessionEpoch);
+        return new Messages.RegisterResp(nodeId, sessionEpoch, config.heartbeatIntervalMs(), config.leaseMs());
+    }
+
+    private int putNodeWithRetry(Records.NodeRecord record, int initialVersion) throws Exception {
         // CAS write; on conflict re-read once and retry — persistent conflict means another
         // leader is mutating this record, so the node should re-register with the real leader
-        int version = existingVersion;
+        int version = initialVersion;
         boolean written = false;
         for (int attempt = 0; attempt < 3 && !written; attempt++) {
             written = store.putNode(record, version);
             if (!written) {
-                var current = store.getNode(nodeId);
+                var current = store.getNode(record.nodeId());
                 version = current.map(MetadataStore.Versioned::version).orElse(-1);
             }
         }
         if (!written) {
             throw new ScpException(ErrorCode.NOT_LEADER, "node record contention — retry registration");
         }
-        int committedVersion = store.getNode(nodeId).map(MetadataStore.Versioned::version).orElse(version + 1);
-
-        LiveNode n = live.computeIfAbsent(nodeId, k -> new LiveNode());
-        n.lock.lock();
-        try {
-            // publish the new session's (record, recordVersion) pair atomically w.r.t. markState
-            n.record = record;
-            n.recordVersion = committedVersion;
-            n.sessionEpoch = sessionCounter.incrementAndGet();
-            n.leaseUntil = System.currentTimeMillis() + config.leaseMs();
-            n.freeBytes = capacity;
-        } finally {
-            n.lock.unlock();
-        }
-        log.info("node {} registered ({} @ {}), session {}", nodeId, msg.host(), msg.endpoints(), n.sessionEpoch);
-        return new Messages.RegisterResp(nodeId, n.sessionEpoch, config.heartbeatIntervalMs(), config.leaseMs());
+        return store.getNode(record.nodeId()).map(MetadataStore.Versioned::version).orElse(version + 1);
     }
 
     private static void validateRegistration(Messages.RegisterNode msg) {
@@ -184,50 +210,73 @@ final class NodeRegistry {
     Messages.HeartbeatResp heartbeat(Messages.NodeHeartbeat msg,
                                      BiConsumer<Integer, Messages.CompletedCommand> onCompleted) {
         LiveNode n = live.get(msg.nodeId());
-        if (n == null || n.record.incMsb() != msg.incMsb() || n.record.incLsb() != msg.incLsb()) {
+        if (n == null) {
+            throw new ScpException(ErrorCode.NOT_REGISTERED, "node " + msg.nodeId());
+        }
+        List<Messages.Command> out = new ArrayList<>();
+        Lock sessionRead = n.sessionGate.readLock();
+        sessionRead.lock();
+        try {
+            // Renew the lease (and, if needed, resurrect) under n.lock so the (state, leaseUntil) pair
+            // is published atomically. Otherwise expireScan could observe a just-resurrected REGISTERED
+            // node still carrying its stale expired lease and immediately re-declare it DEAD.
+            n.lock.lock();
+            try {
+                validateCurrentSessionLocked(n, msg);
+                if (!msg.usages().isEmpty()) {
+                    Messages.StorageUsage usage = msg.usages().get(0);
+                    if (usage.usedBytes() < 0 || usage.freeBytes() < 0) {
+                        throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                                "negative storage usage from node " + msg.nodeId());
+                    }
+                    n.freeBytes = usage.freeBytes();
+                }
+                if (n.record.state() == Records.NodeState.DEAD) {
+                    // it came back within the same incarnation — resurrect (repair may already be
+                    // running; descriptor CAS keeps both sides idempotent)
+                    if (!markState(n, Records.NodeState.REGISTERED) // reentrant on n.lock
+                            && n.record.state() != Records.NodeState.REGISTERED) {
+                        throw new ScpException(ErrorCode.LEASE_EXPIRED,
+                                "node " + msg.nodeId() + " state is " + n.record.state());
+                    }
+                }
+                n.leaseUntil = System.currentTimeMillis() + config.leaseMs();
+            } finally {
+                n.lock.unlock();
+            }
+
+            FailureInjector.point("meta.heartbeat.beforeCompletions");
+            for (Messages.CompletedCommand c : msg.completedCommands()) {
+                onCompleted.accept(msg.nodeId(), c);
+            }
+
+            long newLeaseUntil;
+            n.lock.lock();
+            try {
+                validateCurrentSessionLocked(n, msg);
+                newLeaseUntil = System.currentTimeMillis() + config.leaseMs();
+                n.leaseUntil = newLeaseUntil;
+                for (int i = 0; i < MAX_COMMANDS_PER_HEARTBEAT; i++) {
+                    Messages.Command c = n.pending.poll();
+                    if (c == null) break;
+                    out.add(c);
+                }
+            } finally {
+                n.lock.unlock();
+            }
+            return new Messages.HeartbeatResp(newLeaseUntil, out);
+        } finally {
+            sessionRead.unlock();
+        }
+    }
+
+    private static void validateCurrentSessionLocked(LiveNode n, Messages.NodeHeartbeat msg) {
+        if (n.record.incMsb() != msg.incMsb() || n.record.incLsb() != msg.incLsb()) {
             throw new ScpException(ErrorCode.NOT_REGISTERED, "node " + msg.nodeId());
         }
         if (n.sessionEpoch != msg.sessionEpoch()) {
             throw new ScpException(ErrorCode.LEASE_EXPIRED, "stale session " + msg.sessionEpoch());
         }
-        long now = System.currentTimeMillis();
-        long newLeaseUntil = now + config.leaseMs();
-        if (!msg.usages().isEmpty()) {
-            Messages.StorageUsage usage = msg.usages().get(0);
-            if (usage.usedBytes() < 0 || usage.freeBytes() < 0) {
-                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
-                        "negative storage usage from node " + msg.nodeId());
-            }
-            n.freeBytes = usage.freeBytes();
-        }
-        // Renew the lease (and, if needed, resurrect) under n.lock so the (state, leaseUntil) pair
-        // is published atomically. Otherwise expireScan could observe a just-resurrected REGISTERED
-        // node still carrying its stale expired lease and immediately re-declare it DEAD.
-        n.lock.lock();
-        try {
-            if (n.record.state() == Records.NodeState.DEAD) {
-                // it came back within the same incarnation — resurrect (repair may already be
-                // running; descriptor CAS keeps both sides idempotent)
-                if (!markState(n, Records.NodeState.REGISTERED) // reentrant on n.lock
-                        && n.record.state() != Records.NodeState.REGISTERED) {
-                    throw new ScpException(ErrorCode.LEASE_EXPIRED,
-                            "node " + msg.nodeId() + " state is " + n.record.state());
-                }
-            }
-            n.leaseUntil = newLeaseUntil;
-        } finally {
-            n.lock.unlock();
-        }
-        for (Messages.CompletedCommand c : msg.completedCommands()) {
-            onCompleted.accept(msg.nodeId(), c);
-        }
-        List<Messages.Command> out = new ArrayList<>();
-        for (int i = 0; i < MAX_COMMANDS_PER_HEARTBEAT; i++) {
-            Messages.Command c = n.pending.poll();
-            if (c == null) break;
-            out.add(c);
-        }
-        return new Messages.HeartbeatResp(newLeaseUntil, out);
     }
 
     void enqueue(int nodeId, Messages.Command cmd) {
@@ -271,15 +320,22 @@ final class NodeRegistry {
      * node could be declared DEAD (TOCTOU, same shape as the idle-connection eviction race).
      */
     private boolean declareDeadIfStillExpired(LiveNode n, long now) {
-        n.lock.lock();
+        Lock sessionWrite = n.sessionGate.writeLock();
+        sessionWrite.lock();
         try {
-            if (n.record.state() != Records.NodeState.REGISTERED
-                    || n.leaseUntil + config.deadGraceMs() >= now) {
-                return false;
+            n.lock.lock();
+            try {
+                long recheckNow = System.currentTimeMillis();
+                if (n.record.state() != Records.NodeState.REGISTERED
+                        || n.leaseUntil + config.deadGraceMs() >= recheckNow) {
+                    return false;
+                }
+                return markState(n, Records.NodeState.DEAD);
+            } finally {
+                n.lock.unlock();
             }
-            return markState(n, Records.NodeState.DEAD);
         } finally {
-            n.lock.unlock();
+            sessionWrite.unlock();
         }
     }
 
@@ -337,11 +393,24 @@ final class NodeRegistry {
 
     boolean isCurrentSession(int nodeId, long incMsb, long incLsb, long sessionEpoch) {
         LiveNode n = live.get(nodeId);
-        return n != null
-                && n.record.incMsb() == incMsb
-                && n.record.incLsb() == incLsb
-                && n.sessionEpoch == sessionEpoch
-                && n.alive(System.currentTimeMillis());
+        if (n == null) {
+            return false;
+        }
+        Lock sessionRead = n.sessionGate.readLock();
+        sessionRead.lock();
+        try {
+            n.lock.lock();
+            try {
+                return n.record.incMsb() == incMsb
+                        && n.record.incLsb() == incLsb
+                        && n.sessionEpoch == sessionEpoch
+                        && n.alive(System.currentTimeMillis());
+            } finally {
+                n.lock.unlock();
+            }
+        } finally {
+            sessionRead.unlock();
+        }
     }
 
     String endpointOf(int nodeId) {

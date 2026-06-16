@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
@@ -20,9 +21,11 @@ public final class MetricsServer implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(MetricsServer.class);
 
     private final HttpServer server;
+    private final ExecutorService executor;
 
-    private MetricsServer(HttpServer server) {
+    private MetricsServer(HttpServer server, ExecutorService executor) {
         this.server = server;
+        this.executor = executor;
     }
 
     public static MetricsServer start(int port, StrataMetrics metrics) throws IOException {
@@ -42,18 +45,20 @@ public final class MetricsServer implements AutoCloseable {
                 os.write(body);
             }
         });
-        server.setExecutor(Executors.newSingleThreadExecutor(r -> {
+        ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "strata-metrics-http");
             t.setDaemon(true);
             return t;
-        }));
+        });
+        server.setExecutor(executor);
         server.start();
         log.info("metrics endpoint listening on :{}/metrics", port);
-        return new MetricsServer(server);
+        return new MetricsServer(server, executor);
     }
 
     @Override
     public void close() {
         server.stop(0);
+        executor.shutdownNow();
     }
 }
