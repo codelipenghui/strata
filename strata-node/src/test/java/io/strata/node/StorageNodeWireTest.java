@@ -108,6 +108,18 @@ class StorageNodeWireTest {
     }
 
     @Test
+    void nodeIdAssignmentDoesNotPublishBeforeIdentityPersistenceSucceeds() throws Exception {
+        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+            Files.createDirectory(dir.resolve("identity.properties.tmp"));
+
+            IOException e = assertThrows(IOException.class, () -> node.nodeIdAssigned(42));
+
+            assertTrue(e.getMessage().contains("identity.properties.tmp"));
+            assertEquals(-1, node.nodeId(), "node id must not change until the volume identity is durable");
+        }
+    }
+
+    @Test
     void fullChunkLifecycleOverTheWire() throws Exception {
         try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
@@ -193,8 +205,17 @@ class StorageNodeWireTest {
 
             corruptChunkDataByte(dir.resolve("chunks"), id, 3);
 
-            ScpException e = assertThrows(ScpException.class, () -> client.call(Opcode.READ,
-                    new Messages.Read(id, 0, payload.length).encode(), null, 5000));
+            assertEquals(ErrorCode.CRC_MISMATCH,
+                    assertThrows(ScpException.class, () -> node.store().read(id, 0, payload.length)).code());
+            assertEquals(ErrorCode.CRC_MISMATCH,
+                    assertThrows(ScpException.class,
+                            () -> node.store().readRegion(id, 0, payload.length)).code());
+
+            ScpException e = assertThrows(ScpException.class, () -> {
+                Frame frame = client.callFrame(Opcode.READ,
+                        new Messages.Read(id, 0, payload.length).encode(), null, 5000);
+                Resp.check(frame.headerSlice());
+            });
             assertEquals(ErrorCode.CRC_MISMATCH, e.code(),
                     "normal client READ must not serve bytes from a corrupted sealed data region");
         }

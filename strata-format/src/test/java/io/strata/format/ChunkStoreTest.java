@@ -33,6 +33,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -786,6 +787,24 @@ class ChunkStoreTest {
         }
     }
 
+    @Test
+    void openReadsRejectLedgerCoveredDataRot() throws Exception {
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            store.append(id, 1, 0, 0, bytes("verified-open"));
+
+            Path data = dir.resolve(ChunkFormats.baseName(id) + ".chunk");
+            try (FileChannel ch = FileChannel.open(data, java.nio.file.StandardOpenOption.WRITE)) {
+                ch.write(ByteBuffer.wrap(new byte[] {'X'}), ChunkFormats.DATA_START + 4);
+            }
+
+            assertEquals(ErrorCode.CRC_MISMATCH,
+                    assertThrows(ScpException.class, () -> store.read(id, 0, 13)).code());
+            assertEquals(ErrorCode.CRC_MISMATCH,
+                    assertThrows(ScpException.class, () -> store.readRegion(id, 0, 13)).code());
+        }
+    }
+
     /** Reads a region result whether it is a heap snapshot (open chunks) or a zero-copy channel. */
     private static byte[] consumeRegion(ChunkStore.ReadRegionResult r) throws Exception {
         if (r.bytes() != null) {
@@ -1296,9 +1315,12 @@ class ChunkStoreTest {
 
         try (ChunkStore recovered = newStore()) {
             assertEquals(0, recovered.inventory().size());
-            assertTrue(Files.exists(invalidName));
-            assertTrue(Files.exists(dir.resolve(base + ".chunk")));
-            assertTrue(Files.exists(dir.resolve(base + ".meta")));
+            assertTrue(Files.notExists(invalidName));
+            assertTrue(Files.notExists(dir.resolve(base + ".chunk")));
+            assertTrue(Files.notExists(dir.resolve(base + ".meta")));
+            try (Stream<Path> files = Files.list(dir)) {
+                assertEquals(3, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count());
+            }
         }
     }
 
@@ -1542,7 +1564,7 @@ class ChunkStoreTest {
             assertEquals(2, store.readOps());
             assertEquals(16, store.readBytes());
 
-            // SEALED read path (zero-copy region) also counts
+            // SEALED read path also counts after CRC verification
             store.seal(id, 1, 11, null);
             var r4 = store.readRegion(id, 0, 1024);
             assertEquals(11, r4.length());

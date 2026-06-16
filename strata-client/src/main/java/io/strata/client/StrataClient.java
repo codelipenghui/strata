@@ -27,6 +27,10 @@ public interface StrataClient extends AutoCloseable {
             if (ackQuorum <= 0 || ackQuorum > replicationFactor) {
                 throw new IllegalArgumentException("ackQuorum must be in 1..replicationFactor: " + ackQuorum);
             }
+            if (ackQuorum <= replicationFactor / 2) {
+                throw new IllegalArgumentException("ackQuorum must intersect any other quorum: "
+                        + ackQuorum + " for replicationFactor " + replicationFactor);
+            }
         }
 
         public static WritePolicy replicated(int replicationFactor, int ackQuorum) {

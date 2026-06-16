@@ -86,6 +86,11 @@ class RecordsTest {
                         io.strata.common.StrataPath.of("/bad-stale-writer-epoch"),
                         3, 2, false, 4, FileState.OPEN, 1234,
                         List.of(chunk), 0, 0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new Records.FileRecord(fileId, io.strata.common.StrataNamespace.of("test"),
+                        io.strata.common.StrataPath.of("/bad-non-intersecting-quorum"),
+                        4, 2, false, FileState.OPEN, 1234,
+                        List.of()));
 
         byte[] invalid = record.encode();
         invalid[0] = 99;

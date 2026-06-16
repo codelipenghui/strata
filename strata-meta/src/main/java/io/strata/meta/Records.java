@@ -87,6 +87,10 @@ public final class Records {
             if (ackQuorum <= 0 || ackQuorum > replicationFactor) {
                 throw new IllegalArgumentException("ackQuorum must be in 1..replicationFactor: " + ackQuorum);
             }
+            if (ackQuorum <= replicationFactor / 2) {
+                throw new IllegalArgumentException("ackQuorum must intersect any other quorum: "
+                        + ackQuorum + " for replicationFactor " + replicationFactor);
+            }
             if (writerEpoch < 0) {
                 throw new IllegalArgumentException("writerEpoch must be non-negative: " + writerEpoch);
             }

@@ -599,7 +599,7 @@ class RecoveryTest {
              ScpServer invalidLong = ledgerOrderingReplica(4, 8,
                      List.of(new Messages.LedgerEntry(8, invalidLongerCrc, 1)), longer, null);
              ScpServer metaServer = metadataServer(new AtomicReference<>(new Messages.LookupFileResp(
-                     "test", "/test/file", new Messages.WritePolicy(4, 2, false), (byte) 0, List.of(
+                     "test", "/test/file", new Messages.WritePolicy(4, 3, false), (byte) 0, List.of(
                              chunk(chunkId, ChunkState.OPEN, 0, 1,
                                      new Messages.Replica(1, endpoint(lagging)),
                                      new Messages.Replica(2, endpoint(validShortA)),

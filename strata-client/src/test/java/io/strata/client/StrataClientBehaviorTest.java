@@ -27,6 +27,7 @@ class StrataClientBehaviorTest {
         assertThrows(NullPointerException.class, () -> StrataClient.FileSpec.log("test", null));
         assertThrows(IllegalArgumentException.class, () -> new StrataClient.FileSpec("", "/test-file"));
         assertThrows(IllegalArgumentException.class, () -> new StrataClient.FileSpec("test", "relative"));
+        assertThrows(IllegalArgumentException.class, () -> new StrataClient.WritePolicy(4, 2, false));
 
         StrataClient.FilePath path = new StrataClient.FilePath("test", "/test-file");
         assertEquals("test", path.namespace().toString());

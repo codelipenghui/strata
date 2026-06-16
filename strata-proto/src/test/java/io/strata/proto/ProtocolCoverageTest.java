@@ -30,6 +30,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ProtocolCoverageTest {
 
     @Test
+    void writePolicyRejectsNonIntersectingQuorum() {
+        assertThrows(IllegalArgumentException.class, () -> new Messages.WritePolicy(4, 2, false));
+    }
+
+    @Test
     void frameIoRejectsMalformedLengthsAndVersionFields() throws Exception {
         assertThrows(IOException.class, () -> FrameIO.write(new DataOutputStream(new ByteArrayOutputStream()),
                 Frame.request(Opcode.PING, new byte[0x1_0000], null, 1)));
