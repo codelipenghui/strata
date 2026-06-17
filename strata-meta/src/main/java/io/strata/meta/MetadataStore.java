@@ -40,8 +40,15 @@ public interface MetadataStore extends AutoCloseable {
     /** CAS delete; returns false on version conflict. */
     boolean deleteFile(FileId id, int expectedVersion) throws Exception;
 
-    /** Live file ids (excludes DELETED tombstones awaiting sweep). */
-    List<FileId> listFiles() throws Exception;
+    /** Live file ids within one namespace (excludes DELETED tombstones awaiting sweep). */
+    List<FileId> listFiles(StrataNamespace namespace) throws Exception;
+
+    /**
+     * Namespaces that currently have at least one live file — the roots files are organized under.
+     * A cluster-wide file sweep is {@code listNamespaces()} composed with {@link #listFiles(StrataNamespace)};
+     * there is intentionally no global flat file listing.
+     */
+    List<StrataNamespace> listNamespaces() throws Exception;
 
     /**
      * Reaps DELETED file tombstones whose deletion is older than {@code olderThanMs}. Until reaped,

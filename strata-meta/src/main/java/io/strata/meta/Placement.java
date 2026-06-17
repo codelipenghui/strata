@@ -2,6 +2,7 @@ package io.strata.meta;
 
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -16,11 +17,16 @@ import java.util.concurrent.ThreadLocalRandom;
  */
 final class Placement {
 
-    /** Picks {@code count} distinct nodes; throws NO_CAPACITY when impossible. */
-    static List<NodeRegistry.LiveNode> choose(NodeRegistry registry, int count,
+    /**
+     * Picks {@code count} distinct nodes to hold replicas of a chunk in {@code namespace}; throws
+     * NO_CAPACITY when impossible. The namespace is the per-tenant placement hook: a future policy can
+     * restrict candidates to a namespace's allowed nodes (affinity/isolation) or weight by per-namespace
+     * usage. The current policy is namespace-agnostic — every alive node is a candidate.
+     */
+    static List<NodeRegistry.LiveNode> choose(StrataNamespace namespace, NodeRegistry registry, int count,
                                               Set<Integer> excludeNodes, Set<String> excludeHosts) {
         List<NodeRegistry.LiveNode> candidates = new ArrayList<>();
-        for (NodeRegistry.LiveNode n : registry.aliveNodes()) {
+        for (NodeRegistry.LiveNode n : registry.candidatesFor(namespace)) {
             if (excludeNodes.contains(n.record.nodeId())) continue;
             candidates.add(n);
         }

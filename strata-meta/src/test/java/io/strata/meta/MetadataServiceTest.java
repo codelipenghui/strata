@@ -604,8 +604,13 @@ class MetadataServiceTest {
         }
 
         @Override
-        public List<FileId> listFiles() throws Exception {
-            return delegate.listFiles();
+        public List<FileId> listFiles(io.strata.common.StrataNamespace namespace) throws Exception {
+            return delegate.listFiles(namespace);
+        }
+
+        @Override
+        public List<io.strata.common.StrataNamespace> listNamespaces() throws Exception {
+            return delegate.listNamespaces();
         }
 
         @Override

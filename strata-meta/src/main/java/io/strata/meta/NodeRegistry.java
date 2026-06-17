@@ -4,6 +4,7 @@ import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
 import io.strata.common.FailureInjector;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -379,6 +380,15 @@ final class NodeRegistry {
             if (n.alive(now)) out.add(n);
         }
         return out;
+    }
+
+    /**
+     * Nodes eligible to hold a replica for {@code namespace}. The per-namespace placement hook: today
+     * every alive node is eligible (namespace-agnostic), but this is where a future per-tenant
+     * affinity/isolation policy (e.g. namespace pinned to a node set) would filter candidates.
+     */
+    List<LiveNode> candidatesFor(StrataNamespace namespace) {
+        return aliveNodes();
     }
 
     boolean isDead(int nodeId) {

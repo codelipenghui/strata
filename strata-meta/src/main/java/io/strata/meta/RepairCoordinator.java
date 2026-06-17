@@ -151,6 +151,18 @@ final class RepairCoordinator implements AutoCloseable {
         }
     }
 
+    /**
+     * Live file ids across every namespace. Repair reconciles the whole cluster, not one tenant, so it
+     * composes the per-namespace listing — there is no global flat file enumeration in the store.
+     */
+    private List<FileId> allFileIds() throws Exception {
+        List<FileId> out = new ArrayList<>();
+        for (var ns : store.listNamespaces()) {
+            out.addAll(store.listFiles(ns));
+        }
+        return out;
+    }
+
     /** One reconciliation pass over all files. Idempotent; safe to call while serving. */
     synchronized void scanOnce() throws Exception {
         sweepStuckCommands();
@@ -158,7 +170,7 @@ final class RepairCoordinator implements AutoCloseable {
         List<Repair> repairs = new ArrayList<>();
         int under = 0, unavailable = 0, atMin = 0; // durability census, published to gauges at the end
 
-        for (FileId fileId : store.listFiles()) {
+        for (FileId fileId : allFileIds()) {
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
             if (opt.isEmpty()) continue;
             Records.FileRecord file = opt.get().value();
@@ -247,7 +259,7 @@ final class RepairCoordinator implements AutoCloseable {
 
         List<NodeRegistry.LiveNode> targets;
         try {
-            targets = Placement.choose(registry, 1, existing, usedHosts);
+            targets = Placement.choose(file.namespace(), registry, 1, existing, usedHosts);
         } catch (Exception e) {
             log.warn("no repair target for {}: {}", chunkId, e.getMessage());
             return;
@@ -483,7 +495,7 @@ final class RepairCoordinator implements AutoCloseable {
             // with the descriptor's exact length and crc — right id with wrong bytes is corruption
             // and the replica must stop being a read/repair source (the under-replication scan
             // then re-repairs, and the dropped node's copy becomes an orphan to delete)
-            for (FileId fileId : store.listFiles()) {
+            for (FileId fileId : allFileIds()) {
                 Optional<MetadataStore.Versioned<Records.FileRecord>> opt = cachedFile(records, fileId);
                 if (opt.isEmpty() || opt.get().value().state() == FileState.DELETING) continue;
                 Records.FileRecord file = opt.get().value();

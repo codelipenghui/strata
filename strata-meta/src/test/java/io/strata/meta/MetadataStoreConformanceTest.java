@@ -226,7 +226,7 @@ abstract class MetadataStoreConformanceTest {
             assertTrue(store.deletePath(StrataNamespace.of("tenant-a"), StrataPath.of("/missing"), missing));
             assertFalse(store.putNode(new Records.NodeRecord(99, 1, 2, List.of("missing:9000"),
                     "z1", "r1", "missing", 1000, Records.NodeState.REGISTERED), 0));
-            assertTrue(store.listFiles().isEmpty());
+            assertTrue(fileIds(store).isEmpty());
             assertTrue(store.listNodes().isEmpty());
         }
     }
@@ -383,6 +383,40 @@ abstract class MetadataStoreConformanceTest {
         }
     }
 
+    @Test
+    void namespaceScopedListingReflectsLiveFilesPerNamespace() throws Exception {
+        try (Backend backend = startBackend();
+             MetadataStore store = backend.openStore()) {
+            StrataNamespace a = StrataNamespace.of("tenant-a");
+            StrataNamespace b = StrataNamespace.of("tenant-b");
+            FileId a1 = new FileId(50, 1);
+            FileId a2 = new FileId(50, 2);
+            FileId b1 = new FileId(50, 3);
+            store.createFile(file(a1, "tenant-a", "/logs/a/seg-0", FileState.OPEN));
+            store.createFile(file(a2, "tenant-a", "/logs/a/seg-1", FileState.OPEN));
+            store.createFile(file(b1, "tenant-b", "/logs/b/seg-0", FileState.OPEN));
+
+            assertEquals(Set.of(a1, a2), Set.copyOf(store.listFiles(a)));
+            assertEquals(Set.of(b1), Set.copyOf(store.listFiles(b)));
+            assertTrue(store.listFiles(StrataNamespace.of("tenant-none")).isEmpty(),
+                    "a namespace with no files lists empty");
+            assertEquals(Set.of(a1, a2, b1), fileIds(store), "global listing spans namespaces");
+            assertEquals(Set.of(a, b), Set.copyOf(store.listNamespaces()));
+
+            // Deleting every file in a namespace drops it from both its listing and listNamespaces.
+            int b1Version = store.getFile(b1).orElseThrow().version();
+            assertTrue(store.deleteFile(b1, b1Version));
+            assertTrue(store.listFiles(b).isEmpty(), "namespace listing excludes deleted files");
+            assertEquals(Set.of(a), Set.copyOf(store.listNamespaces()),
+                    "a namespace with no live files is no longer listed");
+            assertEquals(Set.of(a1, a2), fileIds(store));
+
+            // The freed FileId is reusable after a sweep, and per-namespace listing tracks it.
+            assertEquals(1, store.sweepDeletedFiles(0));
+            assertTrue(store.listFiles(b).isEmpty());
+        }
+    }
+
     private static Records.FileRecord file(FileId fileId, String namespace, String path, FileState state) {
         return new Records.FileRecord(fileId, namespace, path, 3, 2, true, state, 1234,
                 List.of(new Records.ChunkRecord(0, ChunkState.OPEN, 0, 0, 1, List.of(1, 2),
@@ -390,7 +424,12 @@ abstract class MetadataStoreConformanceTest {
     }
 
     private static Set<FileId> fileIds(MetadataStore store) throws Exception {
-        return Set.copyOf(store.listFiles());
+        // cluster-wide file set = per-namespace listing composed over all namespaces
+        java.util.Set<FileId> out = new java.util.HashSet<>();
+        for (StrataNamespace ns : store.listNamespaces()) {
+            out.addAll(store.listFiles(ns));
+        }
+        return out;
     }
 
     private static Set<Records.NodeRecord> nodes(MetadataStore store) throws Exception {

@@ -488,8 +488,8 @@ public final class MetadataService implements AutoCloseable {
                             "tail chunk " + tail.index() + " is OPEN — seal or recover it first");
                 }
             }
-            List<NodeRegistry.LiveNode> nodes = Placement.choose(registry, file.replicationFactor(),
-                    Set.copyOf(m.excludedNodeIds()), Set.of());
+            List<NodeRegistry.LiveNode> nodes = Placement.choose(file.namespace(), registry,
+                    file.replicationFactor(), Set.copyOf(m.excludedNodeIds()), Set.of());
             List<Integer> replicaIds = new ArrayList<>(file.replicationFactor());
             List<Messages.Replica> replicas = new ArrayList<>(file.replicationFactor());
             for (NodeRegistry.LiveNode n : nodes) {

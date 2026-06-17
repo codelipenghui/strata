@@ -11,6 +11,8 @@ import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.data.Stat;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -26,9 +28,12 @@ import java.util.concurrent.atomic.LongAdder;
  * Layout: /strata/files/<fileId> (FileRecord, CAS by znode version; a deleted file is left as a
  * DELETED tombstone that fences a replayed CREATE until the sweeper reaps it),
  * /strata/namespaces/<namespace>/paths/<path segments>/__file (FileId binding or empty tombstone),
+ * /strata/namespaces/<namespace>/files/<fileId> (per-namespace file index for namespace-scoped
+ * enumeration without a global /strata/files scan),
  * /strata/nodes/<nodeId>, /strata/ids/seq- (sequential, node-id allocation).
  */
 public final class ZkMetadataStore implements MetadataStore {
+    private static final Logger log = LoggerFactory.getLogger(ZkMetadataStore.class);
     private static final String FILES = "/strata/files";
     private static final String NAMESPACES = "/strata/namespaces";
     private static final String NODES = "/strata/nodes";
@@ -123,6 +128,7 @@ public final class ZkMetadataStore implements MetadataStore {
     @Override
     public void createFile(Records.FileRecord record) throws Exception {
         ensureNamespaceDir(record.namespace(), record.path());
+        ensureNamespaceFilesDir(record.namespace());
         String markerPath = fileMarkerPath(record.namespace(), record.path());
         Optional<PathMarker> marker = readPathMarker(record.namespace(), record.path());
         if (marker.isPresent() && marker.get().fileId().isPresent()) {
@@ -138,10 +144,15 @@ public final class ZkMetadataStore implements MetadataStore {
         } else {
             ops.add(curator.transactionOp().create().forPath(markerPath, idBytes));
         }
+        // Per-namespace file index, atomic with the file create, so files can be enumerated per
+        // namespace without a global /strata/files scan.
+        ops.add(curator.transactionOp().create()
+                .forPath(namespaceFileIndexPath(record.namespace(), record.fileId())));
         try {
             curator.transaction().forOperations(ops);
             record(FILES, true, enc.length);
             record(markerPath, true, idBytes.length);
+            record(NAMESPACES, true, 0);
         } catch (KeeperException.BadVersionException e) {
             throw new KeeperException.NodeExistsException(markerPath);
         }
@@ -233,6 +244,9 @@ public final class ZkMetadataStore implements MetadataStore {
                 curator.setData().withVersion(expectedVersion).forPath(filePath, tombstone);
                 record(FILES, true, tombstone.length);
             }
+            // The file is logically gone; drop its per-namespace index entry so namespace listings
+            // don't have to filter it. The tombstone under /strata/files stays until the sweeper reaps it.
+            dropNamespaceFileIndex(record.namespace(), id);
             return true;
         } catch (KeeperException.BadVersionException e) {
             return false;
@@ -242,14 +256,39 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     @Override
-    public List<FileId> listFiles() throws Exception {
+    public List<FileId> listFiles(StrataNamespace namespace) throws Exception {
         List<FileId> out = new ArrayList<>();
-        List<String> children = curator.getChildren().forPath(FILES);
-        record(FILES, false, 0);
+        List<String> children;
+        try {
+            children = curator.getChildren().forPath(namespaceFilesDir(namespace));
+        } catch (KeeperException.NoNodeException e) {
+            return out;  // namespace never had any files
+        }
+        record(NAMESPACES, false, 0);
         for (String child : children) {
             FileId id = FileId.fromString(child);
-            if (getFile(id).isPresent()) {  // skip DELETED tombstones awaiting sweep
+            if (getFile(id).isPresent()) {  // skip DELETED tombstones (index entry not yet swept)
                 out.add(id);
+            }
+        }
+        return out;
+    }
+
+    @Override
+    public List<StrataNamespace> listNamespaces() throws Exception {
+        List<StrataNamespace> out = new ArrayList<>();
+        List<String> children;
+        try {
+            children = curator.getChildren().forPath(NAMESPACES);
+        } catch (KeeperException.NoNodeException e) {
+            return out;
+        }
+        record(NAMESPACES, false, 0);
+        for (String child : children) {
+            StrataNamespace ns = StrataNamespace.of(child);
+            // a namespace znode persists after its files are gone; only report namespaces with live files
+            if (!listFiles(ns).isEmpty()) {
+                out.add(ns);
             }
         }
         return out;
@@ -275,13 +314,17 @@ public final class ZkMetadataStore implements MetadataStore {
             } catch (KeeperException.NoNodeException e) {
                 continue;  // reaped concurrently
             }
-            if (Records.FileRecord.decode(data).state() != FileState.DELETED
+            Records.FileRecord decoded = Records.FileRecord.decode(data);
+            if (decoded.state() != FileState.DELETED
                     || now - stat.getMtime() < olderThanMs) {
                 continue;  // live/DELETING, or still inside the fencing window
             }
             try {
                 curator.delete().withVersion(stat.getVersion()).forPath(path);
                 record(FILES, true, 0);
+                // also drop any lingering per-namespace index entry (e.g. if deleteFile's best-effort
+                // cleanup didn't run); harmless if already gone
+                dropNamespaceFileIndex(decoded.namespace(), FileId.fromString(child));
                 reaped++;
             } catch (KeeperException.BadVersionException | KeeperException.NoNodeException ignored) {
                 // raced with another mutation/sweeper; leave it for the next pass
@@ -305,6 +348,39 @@ public final class ZkMetadataStore implements MetadataStore {
 
     private static String fileMarkerPath(StrataNamespace namespace, StrataPath path) {
         return namespaceDirPath(namespace, path) + "/" + FILE_MARKER;
+    }
+
+    private static String namespaceFilesDir(StrataNamespace namespace) {
+        return NAMESPACES + "/" + namespace + "/files";
+    }
+
+    private static String namespaceFileIndexPath(StrataNamespace namespace, FileId id) {
+        return namespaceFilesDir(namespace) + "/" + id;
+    }
+
+    private void ensureNamespaceFilesDir(StrataNamespace namespace) throws Exception {
+        try {
+            curator.create().creatingParentsIfNeeded().forPath(namespaceFilesDir(namespace));
+            record(NAMESPACES, true, 0);
+        } catch (KeeperException.NodeExistsException ignored) {
+            // already present (another file in this namespace created it)
+        }
+    }
+
+    /**
+     * Best-effort removal of the per-namespace file index entry. The entry is only an enumeration
+     * optimization — {@link #listFiles(StrataNamespace)} filters tombstones via {@link #getFile} — so a
+     * transient failure self-heals on the next delete/sweep rather than blocking the logical delete.
+     */
+    private void dropNamespaceFileIndex(StrataNamespace namespace, FileId id) {
+        try {
+            curator.delete().forPath(namespaceFileIndexPath(namespace, id));
+            record(NAMESPACES, true, 0);
+        } catch (KeeperException.NoNodeException ignored) {
+            // already gone
+        } catch (Exception e) {
+            log.warn("failed to drop namespace file index {}/{} (will self-heal on sweep)", namespace, id, e);
+        }
     }
 
     private static byte[] fileIdBytes(FileId id) {

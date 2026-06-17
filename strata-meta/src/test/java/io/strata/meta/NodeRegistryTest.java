@@ -614,7 +614,12 @@ class NodeRegistryTest {
         }
 
         @Override
-        public List<FileId> listFiles() {
+        public List<FileId> listFiles(io.strata.common.StrataNamespace namespace) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public List<io.strata.common.StrataNamespace> listNamespaces() {
             throw new UnsupportedOperationException();
         }
 

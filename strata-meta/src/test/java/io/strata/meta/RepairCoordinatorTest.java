@@ -745,6 +745,10 @@ class RepairCoordinatorTest {
         private final Map<Name, FileId> paths = new LinkedHashMap<>();
         private final Map<Integer, Versioned<Records.NodeRecord>> nodes = new LinkedHashMap<>();
         private final List<FileId> extraListedFiles = new ArrayList<>();
+        // a fileId that enumeration surfaces but getFile cannot resolve (orphan/race) lives under this
+        // sentinel namespace, so per-namespace enumeration still exercises repair's skip-on-missing path
+        private static final io.strata.common.StrataNamespace ORPHAN_NS =
+                io.strata.common.StrataNamespace.of("orphan-listed");
         private int nextNodeId = 1;
         private int failUpdateFileAttempts;
         private int failDeleteFileAttempts;
@@ -832,13 +836,35 @@ class RepairCoordinatorTest {
         }
 
         @Override
-        public List<FileId> listFiles() {
+        public List<FileId> listFiles(io.strata.common.StrataNamespace namespace) {
             if (throwOnListFiles) {
                 throw new IllegalStateException("listFiles failure");
             }
-            List<FileId> listed = new ArrayList<>(extraListedFiles);
-            listed.addAll(files.keySet());
+            if (namespace.equals(ORPHAN_NS)) {
+                return new ArrayList<>(extraListedFiles);
+            }
+            List<FileId> listed = new ArrayList<>();
+            for (var e : files.entrySet()) {
+                if (e.getValue().value().namespace().equals(namespace)) {
+                    listed.add(e.getKey());
+                }
+            }
             return listed;
+        }
+
+        @Override
+        public List<io.strata.common.StrataNamespace> listNamespaces() {
+            if (throwOnListFiles) {
+                throw new IllegalStateException("listFiles failure");
+            }
+            java.util.TreeSet<io.strata.common.StrataNamespace> namespaces = new java.util.TreeSet<>();
+            for (var v : files.values()) {
+                namespaces.add(v.value().namespace());
+            }
+            if (!extraListedFiles.isEmpty()) {
+                namespaces.add(ORPHAN_NS);  // surface orphan/recordless ids through enumeration
+            }
+            return new ArrayList<>(namespaces);
         }
 
         @Override

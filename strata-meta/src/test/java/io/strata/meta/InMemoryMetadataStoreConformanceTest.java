@@ -131,17 +131,32 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
         }
 
         @Override
-        public List<FileId> listFiles() {
+        public List<FileId> listFiles(StrataNamespace namespace) {
             synchronized (state) {
                 ensureOpen();
                 ArrayList<FileId> files = new ArrayList<>();
                 for (Map.Entry<FileId, Versioned<Records.FileRecord>> e : state.files.entrySet()) {
-                    if (e.getValue().value().state() != FileState.DELETED) {  // skip tombstones
+                    Records.FileRecord r = e.getValue().value();
+                    if (r.state() != FileState.DELETED && r.namespace().equals(namespace)) {
                         files.add(e.getKey());
                     }
                 }
                 files.sort(FileId::compareTo);
                 return files;
+            }
+        }
+
+        @Override
+        public List<StrataNamespace> listNamespaces() {
+            synchronized (state) {
+                ensureOpen();
+                java.util.TreeSet<StrataNamespace> namespaces = new java.util.TreeSet<>();
+                for (Versioned<Records.FileRecord> v : state.files.values()) {
+                    if (v.value().state() != FileState.DELETED) {  // namespaces with at least one live file
+                        namespaces.add(v.value().namespace());
+                    }
+                }
+                return new ArrayList<>(namespaces);
             }
         }
 
