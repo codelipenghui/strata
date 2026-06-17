@@ -177,7 +177,7 @@ class RecoveryTest {
             if (op == Opcode.FENCE) {
                 return ScpServer.ok(req, new Messages.FenceResp(2, 4, 4, ChunkState.OPEN).encode(), null);
             }
-            if (op == Opcode.READ) {
+            if (isReadOp(op)) {
                 throw new ScpException(ErrorCode.INTERNAL, "read failed");
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
@@ -367,7 +367,7 @@ class RecoveryTest {
             if (op == Opcode.FENCE) {
                 return ScpServer.ok(req, new Messages.FenceResp(2, 4, 4, ChunkState.OPEN).encode(), null);
             }
-            if (op == Opcode.READ) {
+            if (isReadOp(op)) {
                 return ScpServer.ok(req, new Messages.ReadResp(4, 4).encode(),
                         ByteBuffer.wrap(new byte[] {1, 2, 3, 4}));
             }
@@ -420,7 +420,7 @@ class RecoveryTest {
             if (op == Opcode.FENCE) {
                 return ScpServer.ok(req, new Messages.FenceResp(2, 4, 4, ChunkState.OPEN).encode(), null);
             }
-            if (op == Opcode.READ) {
+            if (isReadOp(op)) {
                 return ScpServer.ok(req, new Messages.ReadResp(4, 8).encode(),
                         ByteBuffer.wrap(new byte[] {1, 2, 3, 4}));
             }
@@ -1014,7 +1014,7 @@ class RecoveryTest {
                 return ScpServer.ok(req, new Messages.FenceResp(2, length, length, ChunkState.SEALED).encode(),
                         null);
             }
-            if (op == Opcode.READ) {
+            if (isReadOp(op)) {
                 Messages.Read read = Messages.Read.decode(req.headerSlice());
                 byte[] data = new byte[read.maxBytes()];
                 return ScpServer.ok(req, new Messages.ReadResp(length, length).encode(), ByteBuffer.wrap(data));
@@ -1034,7 +1034,7 @@ class RecoveryTest {
             if (op == Opcode.FENCE) {
                 return ScpServer.ok(req, new Messages.FenceResp(2, end, durable, ChunkState.OPEN).encode(), null);
             }
-            if (op == Opcode.READ) {
+            if (isReadOp(op)) {
                 Messages.Read read = Messages.Read.decode(req.headerSlice());
                 return ScpServer.ok(req, new Messages.ReadResp(sealLength, sealLength).encode(),
                         ByteBuffer.wrap(new byte[read.maxBytes()]));
@@ -1067,7 +1067,7 @@ class RecoveryTest {
             if (op == Opcode.READ_LEDGER) {
                 return ScpServer.ok(req, new Messages.ReadLedgerResp(ledger).encode(), null);
             }
-            if (op == Opcode.READ) {
+            if (isReadOp(op)) {
                 Messages.Read read = Messages.Read.decode(req.headerSlice());
                 byte[] payload = new byte[read.maxBytes()];
                 System.arraycopy(data, (int) read.offset(), payload, 0, payload.length);
@@ -1134,7 +1134,7 @@ class RecoveryTest {
                         new Messages.LedgerEntry(4, 0x12345678, 1),
                         new Messages.LedgerEntry(8, forgedFullRangeCrc, 1))).encode(), null);
             }
-            if (op == Opcode.READ) {
+            if (isReadOp(op)) {
                 Messages.Read read = Messages.Read.decode(req.headerSlice());
                 return ScpServer.ok(req, new Messages.ReadResp(full.length, 0).encode(),
                         ByteBuffer.wrap(full, (int) read.offset(), read.maxBytes()));
@@ -1158,7 +1158,7 @@ class RecoveryTest {
                 return ScpServer.ok(req, new Messages.ReadLedgerResp(List.of(
                         new Messages.LedgerEntry(data.length, crc, 1))).encode(), null);
             }
-            if (op == Opcode.READ) {
+            if (isReadOp(op)) {
                 Messages.Read read = Messages.Read.decode(req.headerSlice());
                 return ScpServer.ok(req, new Messages.ReadResp(data.length, 0).encode(),
                         ByteBuffer.wrap(data, (int) read.offset(), read.maxBytes()));
@@ -1175,7 +1175,7 @@ class RecoveryTest {
                 return ScpServer.ok(req, new Messages.FenceResp(2, data.length, data.length,
                         ChunkState.OPEN).encode(), null);
             }
-            if (op == Opcode.READ) {
+            if (isReadOp(op)) {
                 Messages.Read read = Messages.Read.decode(req.headerSlice());
                 return ScpServer.ok(req, new Messages.ReadResp(data.length, data.length).encode(),
                         ByteBuffer.wrap(data, (int) read.offset(), read.maxBytes()));
@@ -1201,7 +1201,7 @@ class RecoveryTest {
                 return ScpServer.ok(req, new Messages.ReadLedgerResp(List.of(
                         new Messages.LedgerEntry(oversizedEnd, 123, 1))).encode(), null);
             }
-            if (op == Opcode.READ) {
+            if (isReadOp(op)) {
                 readCalled.set(true);
                 throw new ScpException(ErrorCode.INTERNAL, "read should not be called");
             }
@@ -1222,7 +1222,7 @@ class RecoveryTest {
                 return ScpServer.ok(req, new Messages.ReadLedgerResp(List.of(
                         new Messages.LedgerEntry(end, crc, 1))).encode(), null);
             }
-            if (op == Opcode.READ) {
+            if (isReadOp(op)) {
                 return ScpServer.ok(req, new byte[] {0}, ByteBuffer.wrap(new byte[(int) end]));
             }
             if (op == Opcode.SEAL_CHUNK) {
@@ -1280,9 +1280,14 @@ class RecoveryTest {
         });
     }
 
+    /** Recovery byte reads arrive as READ_RECOVERY; plain READ is accepted too so fakes stay opcode-agnostic. */
+    private static boolean isReadOp(Opcode op) {
+        return op == Opcode.READ || op == Opcode.READ_RECOVERY;
+    }
+
     private static byte[] readRangeFromServer(Messages.ReadResp response, int payloadLength) throws Exception {
         try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
-            if (Opcode.fromCode(req.opcode()) == Opcode.READ) {
+            if (isReadOp(Opcode.fromCode(req.opcode()))) {
                 return ScpServer.ok(req, response.encode(), ByteBuffer.wrap(new byte[payloadLength]));
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");

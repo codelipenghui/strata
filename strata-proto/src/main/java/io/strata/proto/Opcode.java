@@ -14,6 +14,9 @@ public enum Opcode {
     FETCH_CHUNK(0x0017),
     PING(0x0018),
     READ_LEDGER(0x0019),
+    // recovery-scoped ranged read: serves locally-present bytes up to localEndOffset, including the
+    // never-acked tail above the durable high watermark that the client READ path clamps away.
+    READ_RECOVERY(0x001A),
     // control plane (storage node -> metadata)
     REGISTER_NODE(0x0101),
     NODE_HEARTBEAT(0x0102),

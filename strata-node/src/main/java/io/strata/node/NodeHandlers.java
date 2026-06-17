@@ -57,17 +57,18 @@ final class NodeHandlers implements ScpServer.Handler {
             // APPEND is served by handleAsync (deferred ack for group commit)
 
             case READ -> {
+                // Client read: open reads are bounded to the replica-known durable high watermark and
+                // materialized under the chunk lock so a concurrent seal-truncate cannot alter the wire
+                // payload. Sealed chunks can use the zero-copy region.
                 var m = Messages.Read.decode(h);
-                var r = store.readRegion(m.chunkId(), m.offset(), m.maxBytes());
-                byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
-                if (r.channel() != null) {
-                    // Sealed chunks can use zero-copy; readRegion owns and closes this channel via the server.
-                    yield ScpServer.okFileRegion(req, header, r.channel(), r.filePosition(), r.length());
-                }
-                // Open reads are bounded to the replica-known durable high watermark and materialized
-                // under the chunk lock so concurrent seal-truncate cannot alter the wire payload.
-                byte[] bytes = r.bytes();
-                yield ScpServer.ok(req, header, bytes != null && bytes.length > 0 ? ByteBuffer.wrap(bytes) : null);
+                yield readRegionResponse(req, store.readRegion(m.chunkId(), m.offset(), m.maxBytes()));
+            }
+
+            case READ_RECOVERY -> {
+                // Seal recovery reads the never-acked tail above the durable watermark (clamped away
+                // from client READs) to re-prove and re-replicate bytes a quorum still holds.
+                var m = Messages.Read.decode(h);
+                yield readRegionResponse(req, store.readRegionForRecovery(m.chunkId(), m.offset(), m.maxBytes()));
             }
 
             case FENCE -> {
@@ -115,5 +116,16 @@ final class NodeHandlers implements ScpServer.Handler {
 
             default -> throw new ScpException(ErrorCode.UNKNOWN_OPCODE, op + " not served by storage node");
         };
+    }
+
+    /** Wire-encodes a {@link ChunkStore.ReadRegionResult}: a zero-copy region (sealed) or materialized
+     * bytes (open). readRegion owns and closes any returned channel via the server. */
+    private static Frame readRegionResponse(Frame req, ChunkStore.ReadRegionResult r) {
+        byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
+        if (r.channel() != null) {
+            return ScpServer.okFileRegion(req, header, r.channel(), r.filePosition(), r.length());
+        }
+        byte[] bytes = r.bytes();
+        return ScpServer.ok(req, header, bytes != null && bytes.length > 0 ? ByteBuffer.wrap(bytes) : null);
     }
 }

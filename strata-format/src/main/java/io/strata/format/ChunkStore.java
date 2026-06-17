@@ -129,12 +129,12 @@ public final class ChunkStore implements AutoCloseable {
         return appendBytes.get();
     }
 
-    /** Total client READ operations that served data since start (drives read-ops/sec via rate()). Only {@link #readRegion} updates this; {@code read()} and {@code fetch()} do not. */
+    /** Total client READ operations that served data since start (drives read-ops/sec via rate()). Only {@link #readRegion} updates this; {@link #readRegionForRecovery}, {@code read()}, and {@code fetch()} do not. */
     public long readOps() {
         return readOps.get();
     }
 
-    /** Total client READ payload bytes served since start (drives read throughput via rate()). Only {@link #readRegion} updates this; {@code read()} and {@code fetch()} do not. */
+    /** Total client READ payload bytes served since start (drives read throughput via rate()). Only {@link #readRegion} updates this; {@link #readRegionForRecovery}, {@code read()}, and {@code fetch()} do not. */
     public long readBytes() {
         return readBytes.get();
     }
@@ -545,12 +545,30 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     public ReadRegionResult readRegion(ChunkId id, long offset, int maxBytes) throws IOException {
+        return readRegion(id, offset, maxBytes, false);
+    }
+
+    /**
+     * Seal-recovery variant of {@link #readRegion}: serves locally-present bytes up to the chunk's
+     * local end, INCLUDING the never-acked tail above the durable high watermark. Recovery must see
+     * that tail to decide whether a quorum still holds it (tech design §7.3); clamping it away — as
+     * the client read path does — makes recovery seal short and drop quorum-durable bytes. Reads are
+     * still integrity-ledger verified, and the recovery path does not count toward client read
+     * throughput metrics.
+     */
+    public ReadRegionResult readRegionForRecovery(ChunkId id, long offset, int maxBytes) throws IOException {
+        return readRegion(id, offset, maxBytes, true);
+    }
+
+    private ReadRegionResult readRegion(ChunkId id, long offset, int maxBytes,
+                                        boolean includeUndurableTail) throws IOException {
         requireNonNegative(offset, "read offset");
         requireNonNegative(maxBytes, "read maxBytes");
         Handle h = lookup(id);
         synchronized (h) {
             long localEnd = h.currentEnd();
-            long readableEnd = h.state == ChunkState.SEALED ? localEnd : Math.min(localEnd, h.lastKnownDO);
+            long readableEnd = (h.state == ChunkState.SEALED || includeUndurableTail)
+                    ? localEnd : Math.min(localEnd, h.lastKnownDO);
             if (offset >= readableEnd) {
                 return new ReadRegionResult(null, 0, 0, null, localEnd, h.lastKnownDO);
             }
@@ -558,9 +576,12 @@ public final class ChunkStore implements AutoCloseable {
             if (n == 0) {
                 return new ReadRegionResult(null, 0, 0, null, localEnd, h.lastKnownDO);
             }
-            // observability: count client READ bytes served (mirrors append counters; drives read throughput)
-            readOps.incrementAndGet();
-            readBytes.addAndGet(n);
+            if (!includeUndurableTail) {
+                // observability: count client READ bytes served (mirrors append counters; drives read
+                // throughput). Recovery reads are internal control-plane traffic, not client reads.
+                readOps.incrementAndGet();
+                readBytes.addAndGet(n);
+            }
             long filePos = checkedAdd(DATA_START, offset, "chunk file offset");
             if (h.state != ChunkState.SEALED) {
                 // OPEN chunk: a concurrent seal can truncate the never-acked tail of this shared inode,

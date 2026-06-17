@@ -362,7 +362,9 @@ final class Recovery {
             return null;
         }
         try {
-            Frame frame = pool.get(source.replica.endpoint()).callFrame(Opcode.READ,
+            // READ_RECOVERY (not client READ): recovery must see the never-acked tail above the
+            // donor's durable high watermark — that is exactly the range it is re-proving for seal.
+            Frame frame = pool.get(source.replica.endpoint()).callFrame(Opcode.READ_RECOVERY,
                     new Messages.Read(chunkId, from, (int) len).encode(), null,
                     config.callTimeoutMs());
             ByteBuffer h = frame.headerSlice();

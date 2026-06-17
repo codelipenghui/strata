@@ -230,6 +230,42 @@ class StorageNodeWireTest {
     }
 
     @Test
+    void recoveryReadServesTheUndurableTailThatClientReadsHide() throws Exception {
+        // Seal recovery must re-read the never-acked tail above the durable high watermark to decide
+        // whether a quorum still holds it (tech design §7.3). The client READ path clamps that tail
+        // away; READ_RECOVERY must expose it (up to localEnd) so recovery does not seal short.
+        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+             ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_TOOL, "recovery")) {
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
+                    1 << 20, 1718000000000L).encode(), null, 5000);
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0).encode(),
+                    ByteBuffer.wrap("SAFE".getBytes()), 5000);
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 4, 4).encode(),
+                    ByteBuffer.wrap("TAIL".getBytes()), 5000);
+
+            // recovery reads the un-acked tail [4,8) that the clamped client READ refuses to serve
+            Frame tail = client.callFrame(Opcode.READ_RECOVERY,
+                    new Messages.Read(id, 4, 1024).encode(), null, 5000);
+            ByteBuffer tailHeader = tail.headerSlice();
+            Resp.check(tailHeader);
+            var tailResp = Messages.ReadResp.decode(tailHeader);
+            assertEquals(8, tailResp.localEndOffset());
+            assertEquals(4, tailResp.durableOffset());
+            byte[] got = new byte[tail.payloadLength()];
+            tail.payloadSlice().get(got);
+            assertArrayEquals("TAIL".getBytes(), got);
+
+            // and the full range is served from offset 0, verified against the integrity ledger
+            Frame full = client.callFrame(Opcode.READ_RECOVERY,
+                    new Messages.Read(id, 0, 1024).encode(), null, 5000);
+            Resp.check(full.headerSlice());
+            byte[] all = new byte[full.payloadLength()];
+            full.payloadSlice().get(all);
+            assertArrayEquals("SAFETAIL".getBytes(), all);
+        }
+    }
+
+    @Test
     void sealedReadRegionIsZeroCopyAndUnverified() throws Exception {
         // Trade-off (sealed reads reverted to zero-copy for throughput): the fast client read path
         // (readRegion / wire READ) hands back a zero-copy region and does NOT re-CRC per read — a
