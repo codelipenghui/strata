@@ -58,12 +58,8 @@ final class RepairCoordinator implements AutoCloseable {
     private final Map<Long, Action> inflight = new ConcurrentHashMap<>();
     // (nodeId:chunkId) -> first time the node's inventory omitted a sealed chunk it should hold. A
     // just-sealed chunk can miss the in-flight inventory snapshot; only drop the replica if it stays
-    // missing past REPLICA_MISSING_GRACE_MS, so churn can't trigger a false re-replication storm.
+    // missing past config.replicaMissingGraceMs(), so churn can't trigger a false re-replication storm.
     private final Map<String, Long> replicaMissingSince = new ConcurrentHashMap<>();
-    // Package-private + mutable so tests can set 0 (immediate drop, the pre-grace behavior); production
-    // default 90s. A just-sealed chunk can miss an in-flight inventory snapshot, so wait this long
-    // before treating a still-missing replica as lost (avoids a false re-replication storm under churn).
-    static long replicaMissingGraceMs = 90_000;
     private final Set<ChunkId> chunksBeingRepaired = ConcurrentHashMap.newKeySet();
     private final Map<ReplicaKey, Long> recentlyCommittedReplicas = new ConcurrentHashMap<>();
     private volatile Thread scanThread;
@@ -508,9 +504,9 @@ final class RepairCoordinator implements AutoCloseable {
                         // the grace (genuine loss is still caught, just one or two reports later).
                         Long firstMissing = replicaMissingSince.putIfAbsent(missKey, now);
                         long missingForMs = firstMissing == null ? 0 : now - firstMissing;
-                        if (missingForMs >= replicaMissingGraceMs) {
+                        if (missingForMs >= config.replicaMissingGraceMs()) {
                             log.warn("node {} lost sealed chunk {} (missing >= {}ms) — dropping replica for re-repair",
-                                    report.nodeId(), chunkId, replicaMissingGraceMs);
+                                    report.nodeId(), chunkId, config.replicaMissingGraceMs());
                             replicaMissingSince.remove(missKey);
                             applyDeleteConfirmed(fileId, chunkId, report.nodeId());
                         }

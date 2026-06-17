@@ -24,11 +24,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class RepairCoordinatorTest {
     private static final byte MEDIA = 1;
 
-    @org.junit.jupiter.api.BeforeEach
-    void immediateMissingDrop() {
-        RepairCoordinator.replicaMissingGraceMs = 0; // these tests assert prompt missing-replica drops
-    }
-
     @Test
     void scanSkipsMissingRecordsAndCannotRepairZeroLiveChunk() throws Exception {
         FakeStore store = new FakeStore();
@@ -656,8 +651,9 @@ class RepairCoordinatorTest {
     }
 
     private static MetaConfig config(int repairCommandTimeoutMs) {
+        // grace 0: these tests assert prompt missing-replica drops
         return new MetaConfig("unused", 0, 1, 60_000, 0, 1,
-                repairCommandTimeoutMs);
+                repairCommandTimeoutMs).withReplicaMissingGraceMs(0);
     }
 
     private static Registered register(NodeRegistry registry, long incMsb, String host) throws Exception {

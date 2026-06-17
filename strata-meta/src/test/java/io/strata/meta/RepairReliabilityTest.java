@@ -85,12 +85,13 @@ class RepairReliabilityTest {
 
     @BeforeEach
     void setup() throws Exception {
-        RepairCoordinator.replicaMissingGraceMs = 0; // exercise prompt missing-replica drop -> repair
         Exception failure = null;
         for (int attempt = 0; attempt < 3; attempt++) {
             try {
                 zk = new TestingServer(true);
-                service = new MetadataService(MetaConfig.forTests(zk.getConnectString()));
+                // grace 0: exercise prompt missing-replica drop -> repair
+                service = new MetadataService(
+                        MetaConfig.forTests(zk.getConnectString()).withReplicaMissingGraceMs(0));
                 long deadline = System.currentTimeMillis() + 10_000;
                 while (!service.isLeader() && System.currentTimeMillis() < deadline) {
                     Thread.sleep(20);

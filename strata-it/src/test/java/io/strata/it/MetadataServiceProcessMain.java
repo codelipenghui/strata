@@ -24,7 +24,7 @@ final class MetadataServiceProcessMain {
         Path readyFile = Path.of(args[2]);
 
         MetaConfig config = new MetaConfig(zkConnect, listenPort, 200, 1_000, 1_500, 300, 3_000,
-                2_000, 2_000, "127.0.0.1");
+                2_000, 2_000, "127.0.0.1", 90_000);
         try (MetadataService service = new MetadataService(config)) {
             Files.createDirectories(readyFile.getParent());
             Files.writeString(readyFile, service.endpoint() + System.lineSeparator());
