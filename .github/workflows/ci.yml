@@ -90,6 +90,59 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  chaos:
+    name: Docker chaos verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Run Docker/Toxiproxy chaos suite
+        run: ./scripts/verify.sh --skip-default --chaos
+      - name: Upload test reports and replay artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-surefire-chaos
+          path: |
+            **/target/surefire-reports/**
+            strata-it/target/correctness-artifacts/**
+            strata-it/target/chaos-process-logs/**
+            strata-it/target/external-nemesis-process-logs/**
+            strata-it/target/external-control-nemesis-process-logs/**
+            strata-it/target/process-crash-logs/**
+            strata-it/target/metadata-process-logs/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  soak:
+    name: bounded soak verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Run bounded stress/fault soak
+        run: ./scripts/verify.sh --skip-default --soak
+      - name: Upload test reports and replay artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-surefire-soak
+          path: |
+            **/target/surefire-reports/**
+            strata-it/target/correctness-artifacts/**
+          if-no-files-found: ignore
+          retention-days: 14
+
   model-check:
     name: TLA+ model checking
     runs-on: ubuntu-latest
