@@ -63,6 +63,10 @@ final class ReaderImpl implements StrataFile.Reader {
                     long chunkOffset = fileOffset - base;
                     int want = (int) Math.min(maxBytes, chunk.length() - chunkOffset);
                     Borrowed b = readFromReplicas(chunk, chunkOffset, want, false);
+                    // Ownership of b.owner() has transferred to us here; everything between this
+                    // point and wrapping it in the (AutoCloseable) ReadResult must stay
+                    // allocation/throw-free, or the borrowed pooled buffer leaks before any caller
+                    // can close it.
                     boolean eof = f.fileState() == FileState.SEALED.value && last
                             && fileOffset + b.view().remaining() == chunkEnd;
                     return new StrataFile.ReadResult(b.view(), eof, b.owner());

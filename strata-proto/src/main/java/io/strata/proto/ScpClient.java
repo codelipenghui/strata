@@ -349,7 +349,11 @@ public final class ScpClient implements AutoCloseable {
         }
     }
 
-    /** Synchronous call returning a response frame whose pooled buffer is retained; caller MUST close it. */
+    /**
+     * Synchronous call returning a response frame whose pooled buffer is retained; the caller MUST
+     * close it (try-with-resources). Until it is closed the frame pins a pooled direct buffer (up to
+     * the 64 MiB max frame), so a slow consumer raises direct-pool residency — close promptly.
+     */
     public Frame callFrameBorrowed(Opcode op, byte[] header, ByteBuffer payload, long timeoutMs) {
         CompletableFuture<Frame> fut = send(op, header, payload, true);
         try {
