@@ -54,6 +54,7 @@ public final class ChunkStore implements AutoCloseable {
 
     private final Path dir;
     private final Map<ChunkId, Handle> chunks = new ConcurrentHashMap<>();
+    private final ChannelCache channelCache;
     private final Set<ChunkId> creating = ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.atomic.AtomicLong forceCount =
             new java.util.concurrent.atomic.AtomicLong();
@@ -169,6 +170,7 @@ public final class ChunkStore implements AutoCloseable {
     ChunkStore(Path dir, boolean sealFsync) throws IOException {
         this.dir = dir;
         this.sealFsync = sealFsync;
+        this.channelCache = new ChannelCache((int) CHANNEL_CACHE_MAX_SIZE);
         Files.createDirectories(dir);
         recoverAll();
         this.flusher = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -232,6 +234,21 @@ public final class ChunkStore implements AutoCloseable {
     public int sealedChunks() {
         return countByState(ChunkState.SEALED);
     }
+
+    /** Sealed-chunk channel-cache hits (served an already-open FD) — observability. */
+    public long channelCacheHits() { return channelCache.hits(); }
+
+    /** Sealed-chunk channel-cache misses (opened a new FD) — observability. */
+    public long channelCacheMisses() { return channelCache.misses(); }
+
+    /** Sealed-chunk channel-cache evictions (closed an idle FD over capacity) — observability. */
+    public long channelCacheEvictions() { return channelCache.evictions(); }
+
+    /** Currently-open cached sealed-chunk channels — observability. */
+    public int cachedChannels() { return channelCache.size(); }
+
+    /** Configured channel-cache capacity — observability. */
+    public int channelCacheCapacity() { return channelCache.capacity(); }
 
     private int countByState(ChunkState state) {
         int n = 0;
@@ -1879,6 +1896,7 @@ public final class ChunkStore implements AutoCloseable {
                 }
             }
         }
+        channelCache.close();
         if (failure == null) {
             chunks.clear();
         } else {

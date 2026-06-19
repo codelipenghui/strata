@@ -1823,4 +1823,15 @@ class ChunkStoreTest {
             assertEquals(ErrorCode.CHUNK_NOT_FOUND, store.delete(id));
         }
     }
+
+    @Test
+    void exposesChannelCacheAccessorsAndClosesCleanly() throws Exception {
+        try (ChunkStore store = newStore()) {
+            assertEquals(0, store.cachedChannels());
+            assertEquals(0, store.channelCacheHits());
+            assertEquals(0, store.channelCacheMisses());
+            assertEquals(0, store.channelCacheEvictions());
+            assertTrue(store.channelCacheCapacity() >= 128);
+        }
+    }
 }
