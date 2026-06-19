@@ -1914,6 +1914,8 @@ class ChunkStoreTest {
         }
         try (ChunkStore recovered = new ChunkStore(dir, true)) {
             assertEquals(2, recovered.sealedChunks());
+            assertNull(handleData(recovered, a), "recovery must keep no persistent data FD for a sealed chunk");
+            assertNull(handleData(recovered, b), "recovery must keep no persistent data FD for a sealed chunk");
             assertEquals(0, recovered.cachedChannels(),
                     "recovery must not open a persistent data FD per sealed chunk");
             // a read lazily opens (and caches) exactly one channel
