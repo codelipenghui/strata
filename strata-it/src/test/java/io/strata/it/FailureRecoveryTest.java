@@ -101,10 +101,11 @@ class FailureRecoveryTest {
             workload.appendAcked(zombie, 75, 100);
 
             try (StrataFile.Reader reader = pooled.openById(fileId).openForRead()) {
-                StrataFile.ReadResult tail = reader.read(0, 1 << 20);
-                assertTrue(tail.data().length <= workload.ackedBytes(),
-                        "open read exposed " + tail.data().length + " bytes above acked "
-                                + workload.ackedBytes());
+                try (StrataFile.ReadResult tail = reader.read(0, 1 << 20)) {
+                    assertTrue(tail.length() <= workload.ackedBytes(),
+                            "open read exposed " + tail.length() + " bytes above acked "
+                                    + workload.ackedBytes());
+                }
             }
 
             StrataFile.SealInfo sealed = pooled.openById(fileId).recoverAndSeal();
@@ -192,13 +193,16 @@ class FailureRecoveryTest {
             }
 
             try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
-                StrataFile.ReadResult full = reader.read(0, 1 << 20);
-                assertArrayEquals(acked, full.data(),
-                        "open read exposed bytes that were only present on one replica");
-
-                StrataFile.ReadResult tail = reader.read(acked.length, 1024);
-                assertEquals(0, tail.data().length,
-                        "open read exposed the single-replica tail past durable offset");
+                try (StrataFile.ReadResult full = reader.read(0, 1 << 20)) {
+                    byte[] got = new byte[full.length()];
+                    full.buffer().get(got);
+                    assertArrayEquals(acked, got,
+                            "open read exposed bytes that were only present on one replica");
+                }
+                try (StrataFile.ReadResult tail = reader.read(acked.length, 1024)) {
+                    assertEquals(0, tail.length(),
+                            "open read exposed the single-replica tail past durable offset");
+                }
             }
         } finally {
             appender.close();
@@ -227,10 +231,13 @@ class FailureRecoveryTest {
                     "recovery committed bytes that were only present on one replica");
 
             try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
-                StrataFile.ReadResult full = reader.read(0, 1 << 20);
-                assertArrayEquals(acked, full.data(),
-                        "sealed read exposed bytes that were only present on one replica");
-                assertTrue(full.endOfFile(), "sealed read should end at acknowledged prefix");
+                try (StrataFile.ReadResult full = reader.read(0, 1 << 20)) {
+                    byte[] got = new byte[full.length()];
+                    full.buffer().get(got);
+                    assertArrayEquals(acked, got,
+                            "sealed read exposed bytes that were only present on one replica");
+                    assertTrue(full.endOfFile(), "sealed read should end at acknowledged prefix");
+                }
             }
             ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
         } finally {

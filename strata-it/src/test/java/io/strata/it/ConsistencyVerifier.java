@@ -281,16 +281,20 @@ final class ConsistencyVerifier {
         try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
             long offset = 0;
             for (int idle = 0; idle < 3; ) {
-                StrataFile.ReadResult result = reader.read(offset, 1 << 20);
-                if (result.data().length > 0) {
-                    out.write(result.data(), 0, result.data().length);
-                    offset += result.data().length;
-                    idle = 0;
-                } else if (result.endOfFile()) {
-                    break;
-                } else {
-                    idle++;
-                    reader.refresh();
+                try (StrataFile.ReadResult result = reader.read(offset, 1 << 20)) {
+                    int n = result.length();
+                    if (n > 0) {
+                        byte[] tmp = new byte[n];
+                        result.buffer().get(tmp);
+                        out.write(tmp, 0, n);
+                        offset += n;
+                        idle = 0;
+                    } else if (result.endOfFile()) {
+                        break;
+                    } else {
+                        idle++;
+                        reader.refresh();
+                    }
                 }
             }
         }
