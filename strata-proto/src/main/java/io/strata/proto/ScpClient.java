@@ -41,7 +41,9 @@ public final class ScpClient implements AutoCloseable {
 
     private final Channel channel;
     private final AtomicLong correlation = new AtomicLong(1);
-    private final Map<Long, CompletableFuture<Frame>> pending = new ConcurrentHashMap<>();
+    private record Pending(CompletableFuture<Frame> future, boolean borrow) {}
+
+    private final Map<Long, Pending> pending = new ConcurrentHashMap<>();
     private final Semaphore pendingPermits = new Semaphore(MAX_PENDING_REQUESTS);
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final CompletableFuture<Frame> handshake = new CompletableFuture<>();
@@ -147,20 +149,32 @@ public final class ScpClient implements AutoCloseable {
     private final class ClientHandler extends SimpleChannelInboundHandler<Frame> {
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, Frame frame) {
-            Frame response;
-            try {
-                response = frame.copyToHeap();
-            } finally {
-                frame.close();
-            }
             if (!handshake.isDone()) {
+                Frame response;
+                try {
+                    response = frame.copyToHeap();
+                } finally {
+                    frame.close();
+                }
                 handshake.complete(response);
                 return;
             }
-            CompletableFuture<Frame> fut = pending.remove(response.correlationId());
-            if (fut != null) {
-                pendingPermits.release();
-                fut.complete(response);
+            Pending holder = pending.remove(frame.correlationId());
+            if (holder == null) {
+                frame.close();   // abandoned/timed-out: release the retained pooled buffer
+                return;
+            }
+            pendingPermits.release();
+            if (holder.borrow()) {
+                holder.future().complete(frame);  // ownership transfers to caller; no copy, no close
+            } else {
+                Frame response;
+                try {
+                    response = frame.copyToHeap();
+                } finally {
+                    frame.close();
+                }
+                holder.future().complete(response);
             }
         }
 
@@ -180,15 +194,19 @@ public final class ScpClient implements AutoCloseable {
         closed.set(true);
         handshake.completeExceptionally(e);
         pending.keySet().forEach(id -> {
-            CompletableFuture<Frame> fut = pending.remove(id);
-            if (fut != null) {
+            Pending holder = pending.remove(id);
+            if (holder != null) {
                 pendingPermits.release();
-                fut.completeExceptionally(e);
+                holder.future().completeExceptionally(e);
             }
         });
     }
 
     public CompletableFuture<Frame> send(Opcode op, byte[] header, ByteBuffer payload) {
+        return send(op, header, payload, false);
+    }
+
+    public CompletableFuture<Frame> send(Opcode op, byte[] header, ByteBuffer payload, boolean borrow) {
         if (closed.get()) {
             return CompletableFuture.failedFuture(new IOException("connection closed"));
         }
@@ -210,38 +228,36 @@ public final class ScpClient implements AutoCloseable {
         }
 
         CompletableFuture<Frame> fut = new CompletableFuture<>();
-        pending.put(id, fut);
-        // whatever completes this future — response, connection failure, caller-side timeout or
-        // orTimeout/cancel — the correlation entry must go with it, or long-lived pipelined
-        // connections leak one entry per unanswered request
-        fut.whenComplete((r, e) -> removePending(id, fut));
+        Pending holder = new Pending(fut, borrow);
+        pending.put(id, holder);
+        fut.whenComplete((r, e) -> removePending(id, holder));
 
         ChannelFuture write;
         try {
             write = channel.writeAndFlush(request);
         } catch (RuntimeException e) {
             IOException failure = asIOException(e);
-            removePending(id, fut);
+            removePending(id, holder);
             failAll(failure);
             fut.completeExceptionally(failure);
             return fut;
         }
         write.addListener(f -> {
             if (!f.isSuccess()) {
-                removePending(id, fut);
+                removePending(id, holder);
                 IOException failure = asIOException(f.cause());
                 failAll(failure);
                 fut.completeExceptionally(failure);
             }
         });
-        if (closed.get() && removePending(id, fut)) {
+        if (closed.get() && removePending(id, holder)) {
             fut.completeExceptionally(new IOException("connection closed"));
         }
         return fut;
     }
 
-    private boolean removePending(long id, CompletableFuture<Frame> fut) {
-        boolean removed = pending.remove(id, fut);
+    private boolean removePending(long id, Pending holder) {
+        boolean removed = pending.remove(id, holder);
         if (removed) {
             pendingPermits.release();
         }
@@ -318,6 +334,28 @@ public final class ScpClient implements AutoCloseable {
             ScpException timeout = new ScpException(ErrorCode.INTERNAL,
                     "timeout after " + timeoutMs + "ms for " + op);
             fut.completeExceptionally(timeout); // releases the correlation entry (cleanup hook)
+            close();
+            throw timeout;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            ScpException interrupted = new ScpException(ErrorCode.INTERNAL, "interrupted");
+            fut.completeExceptionally(interrupted);
+            throw interrupted;
+        }
+    }
+
+    /** Synchronous call returning a response frame whose pooled buffer is retained; caller MUST close it. */
+    public Frame callFrameBorrowed(Opcode op, byte[] header, ByteBuffer payload, long timeoutMs) {
+        CompletableFuture<Frame> fut = send(op, header, payload, true);
+        try {
+            return fut.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof ScpException se) throw se;
+            throw new ScpException(ErrorCode.INTERNAL, String.valueOf(e.getCause()));
+        } catch (TimeoutException e) {
+            ScpException timeout = new ScpException(ErrorCode.INTERNAL,
+                    "timeout after " + timeoutMs + "ms for " + op);
+            fut.completeExceptionally(timeout);
             close();
             throw timeout;
         } catch (InterruptedException e) {
