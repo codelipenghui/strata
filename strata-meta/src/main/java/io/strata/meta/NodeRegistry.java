@@ -44,9 +44,6 @@ final class NodeRegistry {
         // Session gate serializes heartbeat validation/completion staging against same-node
         // re-registration without holding the state lock across metadata-store callbacks.
         final ReentrantReadWriteLock sessionGate = new ReentrantReadWriteLock();
-        // Guarded by lock. Completion work runs off the heartbeat thread, but commands reported in a
-        // heartbeat must take effect before later commands are delivered to the same node.
-        CompletableFuture<Void> completionBarrier = CompletableFuture.completedFuture(null);
 
         boolean alive(long now) {
             return record.state() == Records.NodeState.REGISTERED && leaseUntil >= now;
@@ -259,11 +256,15 @@ final class NodeRegistry {
             }
 
             FailureInjector.point("meta.heartbeat.beforeCompletions");
-            List<CompletableFuture<Void>> completions = new ArrayList<>(msg.completedCommands().size());
+            // Apply reported completions asynchronously so their blocking metadata-store CAS never runs
+            // on the heartbeat thread. Command delivery below is intentionally NOT gated on these
+            // completing: RepairCoordinator already makes redelivery safe (inflight/chunksBeingRepaired
+            // suppress duplicate issue, applies are CAS-with-retry, and sweepStuckCommands reaps
+            // stragglers), so gating delivery on a single serial completion chain only stalled
+            // post-failover convergence (a re-driven Delete/Replicate command could be withheld across
+            // many heartbeats behind one slow completion) without adding any real ordering safety.
             for (Messages.CompletedCommand c : msg.completedCommands()) {
-                CompletableFuture<Void> done = onCompleted.accept(
-                        msg.nodeId(), msg.incMsb(), msg.incLsb(), msg.sessionEpoch(), c);
-                completions.add(done == null ? CompletableFuture.completedFuture(null) : done);
+                onCompleted.accept(msg.nodeId(), msg.incMsb(), msg.incLsb(), msg.sessionEpoch(), c);
             }
 
             long newLeaseUntil;
@@ -272,13 +273,10 @@ final class NodeRegistry {
                 validateCurrentSessionLocked(n, msg);
                 newLeaseUntil = System.currentTimeMillis() + config.leaseMs();
                 n.leaseUntil = newLeaseUntil;
-                CompletableFuture<Void> commandBarrier = commandDeliveryBarrierLocked(n, completions);
-                if (commandBarrier.isDone()) {
-                    for (int i = 0; i < MAX_COMMANDS_PER_HEARTBEAT; i++) {
-                        Messages.Command c = n.pending.poll();
-                        if (c == null) break;
-                        out.add(c);
-                    }
+                for (int i = 0; i < MAX_COMMANDS_PER_HEARTBEAT; i++) {
+                    Messages.Command c = n.pending.poll();
+                    if (c == null) break;
+                    out.add(c);
                 }
             } finally {
                 n.lock.unlock();
@@ -289,20 +287,6 @@ final class NodeRegistry {
         }
     }
 
-    private static CompletableFuture<Void> commandDeliveryBarrierLocked(
-            LiveNode n, List<CompletableFuture<Void>> completions) {
-        if (!completions.isEmpty()) {
-            CompletableFuture<?>[] batch = completions.stream()
-                    .map(future -> future.exceptionally(t -> null))
-                    .toArray(CompletableFuture[]::new);
-            CompletableFuture<Void> currentBatch = CompletableFuture.allOf(batch)
-                    .exceptionally(t -> null);
-            n.completionBarrier = n.completionBarrier
-                    .thenCompose(ignored -> currentBatch)
-                    .exceptionally(t -> null);
-        }
-        return n.completionBarrier;
-    }
 
     private static void validateCurrentSessionLocked(LiveNode n, Messages.NodeHeartbeat msg) {
         if (n.record.incMsb() != msg.incMsb() || n.record.incLsb() != msg.incLsb()) {

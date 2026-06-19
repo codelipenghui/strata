@@ -241,29 +241,32 @@ class NodeRegistryTest {
     }
 
     @Test
-    void heartbeatDefersCommandDeliveryUntilAsyncCompletionsFinish() throws Exception {
+    void heartbeatDeliversCommandsWithoutWaitingForAsyncCompletions() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
                 37, 38, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
-        CompletableFuture<Void> completion = new CompletableFuture<>();
+        AtomicReference<Messages.CompletedCommand> dispatched = new AtomicReference<>();
+        CompletableFuture<Void> neverApplies = new CompletableFuture<>();
         registry.enqueue(registered.nodeId(), new Messages.DrainCmd(123));
 
-        Messages.HeartbeatResp blocked = registry.heartbeat(new Messages.NodeHeartbeat(
+        // A heartbeat that reports a completion whose async apply is still in flight must STILL deliver
+        // pending commands. Gating delivery on the completion applying (the removed completionBarrier)
+        // stalled post-failover convergence: a re-driven command could be withheld across many
+        // heartbeats behind one slow completion. RepairCoordinator's guards make redelivery safe.
+        Messages.HeartbeatResp resp = registry.heartbeat(new Messages.NodeHeartbeat(
                         registered.nodeId(), 37, 38, registered.sessionEpoch(), List.of(), 0,
                         List.of(new Messages.CompletedCommand(99, ErrorCode.OK.code))),
-                (nodeId, incMsb, incLsb, sessionEpoch, ignored) -> completion);
+                (nodeId, incMsb, incLsb, sessionEpoch, completion) -> {
+                    dispatched.set(completion);
+                    return neverApplies;
+                });
 
-        assertTrue(blocked.commands().isEmpty(),
-                "pending commands must not be delivered before reported completions apply");
-
-        completion.complete(null);
-        Messages.HeartbeatResp unblocked = registry.heartbeat(new Messages.NodeHeartbeat(
-                        registered.nodeId(), 37, 38, registered.sessionEpoch(), List.of(), 0, List.of()),
-                ignoreCompletions());
-
-        assertEquals(List.of(new Messages.DrainCmd(123)), unblocked.commands());
+        assertEquals(List.of(new Messages.DrainCmd(123)), resp.commands(),
+                "pending commands must be delivered without waiting for reported completions to apply");
+        assertEquals(99, dispatched.get().commandId(),
+                "the reported completion must still be dispatched to the async sink");
     }
 
     @Test
