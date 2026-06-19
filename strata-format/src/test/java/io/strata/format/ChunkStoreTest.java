@@ -1331,6 +1331,67 @@ class ChunkStoreTest {
     }
 
     @Test
+    void sealedChunkRecoversFullDataWhenSealedSidecarLost() throws Exception {
+        // C1 regression: with STRATA_SEAL_FSYNC=false (the default), seal() leaves the SEALED sidecar
+        // (and footer/trailer) only in the page cache. If a crash loses that unforced SEALED state, the
+        // on-disk sidecar still reads OPEN and recovery takes the OPEN branch, which rebuilds the chunk
+        // by REPLAYING THE INTEGRITY LEDGER. So seal() must not remove the ledger until the SEALED state
+        // is durable — otherwise recovery finds no ledger and truncates acknowledged data to zero.
+        assumeTrue(!ChunkStore.booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false),
+                "guarantee under test is specific to the no-seal-fsync durability path");
+
+        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        String base = ChunkFormats.baseName(chunkId);
+        Path metaPath = dir.resolve(base + ".meta");
+        byte[] payload = "important-acknowledged-data".getBytes(StandardCharsets.UTF_8);
+        int len = payload.length;
+
+        try (ChunkStore store = newStore()) {
+            open(store, chunkId, 1);
+            store.append(chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(chunkId, 1, len, null);
+        }
+
+        // Simulate the crash window: the unforced SEALED sidecar write never reached disk, so on
+        // restart the sidecar still reads OPEN — with the chunk's data fully durable (lastKnownDO=len).
+        Files.write(metaPath, new ChunkFormats.Sidecar(1, -1, len, ChunkState.OPEN).encode());
+
+        try (ChunkStore recovered = newStore()) {
+            assertTrue(recovered.contains(chunkId), "sealed chunk must survive recovery");
+            assertArrayEquals(payload, recovered.read(chunkId, 0, len).bytes(),
+                    "acknowledged data must be recovered from the retained ledger, not truncated to zero");
+        }
+    }
+
+    @Test
+    void sealRetainsLedgerUntilReclaimedWhenSealFsyncDisabled() throws Exception {
+        assumeTrue(!ChunkStore.booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false),
+                "ledger retention is specific to the no-seal-fsync durability path");
+        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        Path ledgerPath = dir.resolve(ChunkFormats.baseName(chunkId) + ".j");
+        byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
+        try (ChunkStore store = newStore()) {
+            open(store, chunkId, 1);
+            store.append(chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(chunkId, 1, payload.length, null);
+
+            assertTrue(Files.exists(ledgerPath),
+                    "seal must retain the integrity ledger until the SEALED state is durable");
+
+            store.reclaimSealedLedgersOnce(); // forces the SEALED state durable, then unlinks the ledger
+
+            assertTrue(Files.notExists(ledgerPath),
+                    "reclaim must drop the ledger once the SEALED state is forced durable");
+            assertEquals(1, store.sealedLedgerReclaims());
+            assertArrayEquals(payload, store.read(chunkId, 0, payload.length).bytes(),
+                    "chunk must stay readable from its durable trailer after reclaim");
+
+            store.reclaimSealedLedgersOnce(); // idempotent: nothing left pending
+            assertEquals(1, store.sealedLedgerReclaims());
+        }
+    }
+
+    @Test
     void recoverySkipsUnparseableAndTruncatedChunkFiles() throws Exception {
         Path invalidName = dir.resolve("not-a-valid-chunk-name.chunk");
         Files.write(invalidName, new byte[] {1});

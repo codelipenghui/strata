@@ -66,6 +66,8 @@ public final class ChunkStore implements AutoCloseable {
             new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong backgroundFlushes =
             new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong sealedLedgerReclaims =
+            new java.util.concurrent.atomic.AtomicLong();
 
     // Background writeback: a daemon periodically fsyncs OPEN, non-ack-on-fsync chunks that have
     // accumulated enough new data since their last flush, so the dirty-page backlog never grows to a
@@ -150,6 +152,12 @@ public final class ChunkStore implements AutoCloseable {
         return backgroundFlushes.get();
     }
 
+    /** Number of sealed chunks whose integrity ledger was reclaimed after the SEALED state was forced
+     *  durable (SEAL_FSYNC=false path) — observability. */
+    public long sealedLedgerReclaims() {
+        return sealedLedgerReclaims.get();
+    }
+
     /** Total appended records since start (observability; drives write-ops/sec via rate()). */
     public long appendOps() {
         return appendOps.get();
@@ -195,6 +203,65 @@ public final class ChunkStore implements AutoCloseable {
             backgroundFlushOnce();
         } catch (Throwable t) {
             log.warn("background chunk-writeback round failed", t);
+        }
+        try {
+            reclaimSealedLedgersOnce();
+        } catch (Throwable t) {
+            log.warn("sealed-ledger reclaim round failed", t);
+        }
+    }
+
+    /**
+     * Reclaims the integrity ledger of chunks sealed under {@code STRATA_SEAL_FSYNC=false}. seal()
+     * deliberately retains that ledger because the SEALED footer/sidecar are left in the page cache:
+     * a crash before they reach disk leaves a stale OPEN sidecar, and recovery's OPEN branch rebuilds
+     * the chunk by replaying the ledger. Removing the ledger before the SEALED state is durable would
+     * make recovery truncate acknowledged data to zero (C1). So this re-establishes the seal-time
+     * durability ordering off the seal hot path: force the data (footer/trailer), then force the
+     * SEALED sidecar, and only THEN unlink the ledger. The data force runs outside the chunk monitor
+     * (it is slow); the monitor is held only to snapshot and to finish. Package-private so tests can
+     * drive a round deterministically.
+     */
+    void reclaimSealedLedgersOnce() {
+        for (Handle h : chunks.values()) {
+            FileChannel data;
+            synchronized (h) {
+                if (h.state != ChunkState.SEALED || !h.sealedLedgerPending) {
+                    continue;
+                }
+                data = h.data;
+            }
+            try {
+                data.force(false); // footer/trailer durable before the sidecar may claim SEALED on disk
+            } catch (IOException | RuntimeException e) {
+                synchronized (h) {
+                    if (chunks.get(h.id) != h || h.data != data || !h.sealedLedgerPending) {
+                        continue; // delete()/close() won the race after we snapshotted — not ours to log
+                    }
+                }
+                log.warn("sealed-ledger reclaim of {} failed to force data (will retry)", h.id, e);
+                continue;
+            }
+            boolean reclaimed = false;
+            try {
+                synchronized (h) {
+                    if (chunks.get(h.id) != h || h.data != data
+                            || h.state != ChunkState.SEALED || !h.sealedLedgerPending) {
+                        continue; // superseded after the force — leave it to the winner
+                    }
+                    h.persistSidecar(true);             // SEALED sidecar (+ directory) durable
+                    Files.deleteIfExists(h.ledgerPath); // safe now: SEALED state recoverable without it
+                    h.sealedLedgerPending = false;
+                    reclaimed = true;
+                }
+                forceDirectory(); // make the unlink durable (recovery's SEALED branch re-deletes otherwise)
+            } catch (IOException | RuntimeException e) {
+                log.warn("sealed-ledger reclaim of {} failed (will retry)", h.id, e);
+                continue;
+            }
+            if (reclaimed) {
+                sealedLedgerReclaims.incrementAndGet();
+            }
         }
     }
 
@@ -260,6 +327,9 @@ public final class ChunkStore implements AutoCloseable {
         FileChannel data;
         IntegrityLedger ledger; // null once sealed
         GroupCommitter committer; // non-null only for OPEN ack-on-fsync chunks
+        // SEAL_FSYNC=false leaves a sealed chunk's footer/sidecar unforced, so its ledger is retained
+        // as the recovery safety net until reclaimSealedLedgersOnce() forces the SEALED state durable.
+        boolean sealedLedgerPending;
         ChunkState state;
         long end;               // logical data length
         long bgFlushedOffset;   // end offset already pushed to disk by background writeback
@@ -877,7 +947,17 @@ public final class ChunkStore implements AutoCloseable {
             long tLedgerClose = System.nanoTime();
             Path ledgerPath = h.ledgerPath;
             h.ledger = null;
-            deleteLedgerAsync(id, ledgerPath);
+            if (SEAL_FSYNC) {
+                // data + sidecar were just forced durable above, so the SEALED state is recoverable
+                // from the trailer without the ledger — drop it now.
+                deleteLedgerAsync(id, ledgerPath);
+            } else {
+                // SEAL_FSYNC=false left the footer/sidecar only in the page cache, so a crash can leave
+                // a stale OPEN sidecar on disk. Recovery's OPEN branch rebuilds from the ledger, so the
+                // ledger must outlive the unforced SEALED state: retain it until reclaimSealedLedgersOnce()
+                // has forced the SEALED state durable. Deleting it here loses acknowledged data (C1).
+                h.sealedLedgerPending = true;
+            }
             long tLedgerDeleteEnqueue = System.nanoTime();
             if (tLedgerDeleteEnqueue - t0 > SLOW_MUTATION_LOG_NANOS) {
                 log.info("slow seal {} len={}MiB phases(ms): crc={} ledgerCount={} stopCommitter={} "
