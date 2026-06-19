@@ -122,6 +122,17 @@ public final class ManagedScpConnection implements AutoCloseable {
         }
     }
 
+    public Frame callFrameBorrowed(Opcode op, byte[] header, ByteBuffer payload, long timeoutMs) {
+        Ref ref = acquire(null);
+        try {
+            return ref.client().callFrameBorrowed(op, header, payload, timeoutMs);
+        } catch (RuntimeException e) {
+            throw classifyFailure(ref.client(), e);
+        } finally {
+            release();
+        }
+    }
+
     public CompletableFuture<Frame> sendWithTimeout(Opcode op, byte[] header, ByteBuffer payload,
                                                     long timeoutMs, long expectedGeneration) {
         Ref ref = acquire(expectedGeneration);

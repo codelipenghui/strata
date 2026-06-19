@@ -944,6 +944,29 @@ class ClientServerTest {
     }
 
     @Test
+    void managedCallFrameBorrowedRetainsBufferUntilClosed() throws Exception {
+        byte[] body = "managed-borrow".getBytes();
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
+                if (Opcode.fromCode(req.opcode()) == Opcode.PING) {
+                    return ScpServer.ok(req, Messages.okHeader(), ByteBuffer.wrap(body));
+                }
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+             });
+             ManagedScpConnection conn = managed(endpoint(server), 1_000, 1_000, 10_000)) {
+            Frame borrowed = conn.callFrameBorrowed(Opcode.PING, emptyHeader(), ByteBuffer.wrap(body), 2000);
+            try {
+                assertTrue(borrowed.ownsBuffer());
+                byte[] got = new byte[borrowed.payloadLength()];
+                borrowed.payloadSlice().get(got);
+                assertArrayEquals(body, got);
+            } finally {
+                borrowed.close();
+            }
+            assertEquals(0, borrowed.ownerRefCnt());
+        }
+    }
+
+    @Test
     void nonBorrowResponsesStillCopyToHeap() throws Exception {
         try (ScpServer server = new ScpServer(0, 1, 0xA, 0xB, req -> {
                 if (Opcode.fromCode(req.opcode()) == Opcode.PING) {
