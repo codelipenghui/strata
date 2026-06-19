@@ -206,7 +206,12 @@ public final class ScpClient implements AutoCloseable {
         return send(op, header, payload, false);
     }
 
-    public CompletableFuture<Frame> send(Opcode op, byte[] header, ByteBuffer payload, boolean borrow) {
+    /**
+     * Package-private: callers outside this package should use {@link #send(Opcode, byte[], ByteBuffer)}
+     * or {@link #callFrameBorrowed}. When {@code borrow=true} the returned future yields a retained
+     * Netty frame whose pooled buffer the caller is responsible for releasing via {@link Frame#close()}.
+     */
+    CompletableFuture<Frame> send(Opcode op, byte[] header, ByteBuffer payload, boolean borrow) {
         if (closed.get()) {
             return CompletableFuture.failedFuture(new IOException("connection closed"));
         }
