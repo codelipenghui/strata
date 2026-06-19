@@ -134,11 +134,11 @@ public final class Frame implements AutoCloseable {
         return new Frame(opcode, apiVersion, flags, correlationId, copy(header), copy(payload));
     }
 
-    boolean ownsBuffer() {
+    public boolean ownsBuffer() {
         return owner != null;
     }
 
-    int ownerRefCnt() {
+    public int ownerRefCnt() {
         return owner == null ? -1 : owner.refCnt();
     }
 

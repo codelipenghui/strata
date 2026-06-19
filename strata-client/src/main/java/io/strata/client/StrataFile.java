@@ -31,7 +31,56 @@ public interface StrataFile {
 
     record SealInfo(long sealedLength) {}
 
-    record ReadResult(byte[] data, boolean endOfFile) {}
+    final class ReadResult implements AutoCloseable {
+        private static final ByteBuffer EMPTY = ByteBuffer.allocate(0).asReadOnlyBuffer();
+
+        private final ByteBuffer buffer;
+        private final boolean endOfFile;
+        private final AutoCloseable release;
+
+        ReadResult(ByteBuffer buffer, boolean endOfFile, AutoCloseable release) {
+            this.buffer = buffer;
+            this.endOfFile = endOfFile;
+            this.release = release;
+        }
+
+        /** Empty result (no bytes, nothing to release). */
+        public static ReadResult empty(boolean endOfFile) {
+            return new ReadResult(EMPTY.duplicate(), endOfFile, null);
+        }
+
+        /** Read-only view of the read bytes. VALID ONLY until {@link #close()}. */
+        public ByteBuffer buffer() {
+            return buffer.duplicate();
+        }
+
+        public boolean endOfFile() {
+            return endOfFile;
+        }
+
+        public int length() {
+            return buffer.remaining();
+        }
+
+        @Override
+        public void close() {
+            if (release != null) {
+                try {
+                    release.close();
+                } catch (RuntimeException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new io.strata.common.ScpException(
+                            io.strata.common.ErrorCode.INTERNAL, "failed to release read buffer: " + e);
+                }
+            }
+        }
+
+        /** Test-only: the underlying release handle (a Frame in production), for leak assertions. */
+        AutoCloseable releaseHandleForTest() {
+            return release;
+        }
+    }
 
     interface Appender extends AutoCloseable {
         /**
@@ -55,6 +104,9 @@ public interface StrataFile {
         /**
          * Reads up to maxBytes from fileOffset (may return fewer — at most to a chunk boundary,
          * and never beyond the durable offset of an open chunk).
+         *
+         * <p>The returned result is {@link AutoCloseable}; the caller owns it and MUST close it
+         * (try-with-resources). The buffer it exposes is valid only until close.
          */
         ReadResult read(long fileOffset, int maxBytes);
 
