@@ -10,6 +10,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -94,6 +95,9 @@ public final class ChunkStore implements AutoCloseable {
             longConf("strata.slowAppendLogMs", "STRATA_SLOW_APPEND_LOG_MS", 1_000));
     private static final long SLOW_MUTATION_LOG_NANOS = TimeUnit.MILLISECONDS.toNanos(
             longConf("strata.slowMutationLogMs", "STRATA_SLOW_MUTATION_LOG_MS", 500));
+    private static final long CHANNEL_CACHE_MAX_SIZE =
+            longConf("strata.fileChannelCache.maxSize", "STRATA_FILE_CHANNEL_CACHE_MAX_SIZE",
+                    defaultChannelCacheCapacity());
     /** Whether seal/open/delete force their metadata + data to disk synchronously. Defaults from
      *  STRATA_SEAL_FSYNC; overridable per instance so tests can exercise both durability paths. */
     private final boolean sealFsync;
@@ -127,6 +131,34 @@ public final class ChunkStore implements AutoCloseable {
                 yield def;
             }
         };
+    }
+
+    /**
+     * Default sealed-chunk channel-cache capacity: derived from the soft RLIMIT_NOFILE minus headroom
+     * for pinned OPEN channels, ledgers, sockets, and in-flight transient FDs. Falls back to a fixed
+     * default on non-Unix / non-HotSpot JVMs where the FD limit is not introspectable.
+     */
+    static int defaultChannelCacheCapacity() {
+        long max = -1;
+        java.lang.management.OperatingSystemMXBean os = ManagementFactory.getOperatingSystemMXBean();
+        if (os instanceof com.sun.management.UnixOperatingSystemMXBean unix) {
+            max = unix.getMaxFileDescriptorCount();
+        }
+        if (max <= 0) {
+            return 1024; // non-Unix fallback
+        }
+        long headroom = Math.max(256, max / 4);
+        long cap = max - headroom;
+        return (int) Math.max(128, Math.min(cap, Integer.MAX_VALUE));
+    }
+
+    /** Live process open file-descriptor count for observability; {@code -1} when unavailable. */
+    public long openFds() {
+        java.lang.management.OperatingSystemMXBean os = ManagementFactory.getOperatingSystemMXBean();
+        if (os instanceof com.sun.management.UnixOperatingSystemMXBean unix) {
+            return unix.getOpenFileDescriptorCount();
+        }
+        return -1;
     }
 
     public ChunkStore(Path dir) throws IOException {

@@ -125,6 +125,20 @@ class ChunkStoreTest {
     }
 
     @Test
+    void defaultChannelCacheCapacityIsPositive() {
+        assertTrue(ChunkStore.defaultChannelCacheCapacity() >= 128,
+                "auto-sized cache capacity must be a sane floor");
+    }
+
+    @Test
+    void openFdsIsNonNegativeOnUnixOrMinusOne() throws Exception {
+        try (ChunkStore store = newStore()) {
+            long fds = store.openFds();
+            assertTrue(fds >= 0 || fds == -1, "openFds() is the live count or -1 when unavailable");
+        }
+    }
+
+    @Test
     void failedOpenCleansOwnedFilesAndReservation() throws Exception {
         ChunkId chunk = new ChunkId(FileId.random(), 0);
         Path dataPath = dir.resolve(ChunkFormats.baseName(chunk) + ".chunk");
