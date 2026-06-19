@@ -314,6 +314,7 @@ public final class ChunkStore implements AutoCloseable {
                     h.persistSidecar(true);             // SEALED sidecar (+ directory) durable
                     Files.deleteIfExists(h.ledgerPath); // safe now: SEALED state recoverable without it
                     h.sealedLedgerPending = false;
+                    closeAndNullData(h);                // release the writable FD; reads use the cache
                     reclaimed = true;
                 }
                 forceDirectory(); // make the unlink durable (recovery's SEALED branch re-deletes otherwise)
@@ -666,6 +667,18 @@ public final class ChunkStore implements AutoCloseable {
             ch.close();
         } catch (IOException e) {
             log.warn("failed to close transient read channel", e);
+        }
+    }
+
+    /** Closes and nulls a sealed Handle's writable data channel under its monitor. Caller holds the monitor. */
+    private void closeAndNullData(Handle h) {
+        if (h.data != null) {
+            try {
+                h.data.close();
+            } catch (IOException e) {
+                log.warn("failed to close writable data channel for sealed chunk {}", h.id, e);
+            }
+            h.data = null;
         }
     }
 
@@ -1038,6 +1051,8 @@ public final class ChunkStore implements AutoCloseable {
                 // data + sidecar were just forced durable above, so the SEALED state is recoverable
                 // from the trailer without the ledger — drop it now.
                 deleteLedgerAsync(id, ledgerPath);
+                // sealed + durable: release the writable FD; reads now go through the channel cache.
+                closeAndNullData(h);
             } else {
                 // SEAL_FSYNC=false left the footer/sidecar only in the page cache, so a crash can leave
                 // a stale OPEN sidecar on disk. Recovery's OPEN branch rebuilds from the ledger, so the
@@ -1259,7 +1274,7 @@ public final class ChunkStore implements AutoCloseable {
                 Files.move(sourceFile, h.dataPath, StandardCopyOption.ATOMIC_MOVE);
                 forceDirectory();
                 movedData = true;
-                h.data = FileChannel.open(h.dataPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
+                h.data = null; // sealed + durable on import: reads go through the channel cache
                 h.state = ChunkState.SEALED;
                 h.end = trailer.dataLength();
                 h.sealedLength = trailer.dataLength();
@@ -1544,37 +1559,45 @@ public final class ChunkStore implements AutoCloseable {
         Handle h = new Handle(id, header);
         boolean installed = false;
         try {
-            h.data = FileChannel.open(h.dataPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
-            h.writeEpoch = sidecar.writeEpoch();
-            h.fenceEpoch = sidecar.fenceEpoch();
-            h.lastKnownDO = sidecar.lastKnownDO();
-
             if (sidecar.state() == ChunkState.SEALED) {
-                long fileLen = h.data.size();
-                byte[] trailerBytes = new byte[TRAILER_SIZE];
-                readFully(h.data, ByteBuffer.wrap(trailerBytes), fileLen - TRAILER_SIZE);
-                ChunkFormats.Trailer trailer = ChunkFormats.Trailer.decode(trailerBytes);
+                // Sealed chunks are durable + immutable: validate the trailer/footer with a transient
+                // channel and DO NOT keep a persistent data FD — reads open via the channel cache.
                 // verify the footer sections against the trailer's CRC (cheap — KBs): a sealed chunk
                 // with rotted footer metadata must be quarantined, not served as healthy (full
                 // data-region verification is deferred to scrub; readers have CRC_RANGES + batch CRCs)
-                int footerLen = checkedFooterLength(trailer, fileLen);
-                byte[] footerBytes = new byte[(int) footerLen];
-                readFully(h.data, ByteBuffer.wrap(footerBytes), trailer.footerStart());
-                if (Crc.of(footerBytes) != trailer.footerCrc()) {
-                    throw new CorruptChunkException("footer crc mismatch for sealed chunk " + id);
+                try (FileChannel data = FileChannel.open(h.dataPath, StandardOpenOption.READ)) {
+                    long fileLen = data.size();
+                    byte[] trailerBytes = new byte[TRAILER_SIZE];
+                    readFully(data, ByteBuffer.wrap(trailerBytes), fileLen - TRAILER_SIZE);
+                    ChunkFormats.Trailer trailer = ChunkFormats.Trailer.decode(trailerBytes);
+                    int footerLen = checkedFooterLength(trailer, fileLen);
+                    byte[] footerBytes = new byte[(int) footerLen];
+                    readFully(data, ByteBuffer.wrap(footerBytes), trailer.footerStart());
+                    if (Crc.of(footerBytes) != trailer.footerCrc()) {
+                        throw new CorruptChunkException("footer crc mismatch for sealed chunk " + id);
+                    }
+                    h.writeEpoch = sidecar.writeEpoch();
+                    h.fenceEpoch = sidecar.fenceEpoch();
+                    h.lastKnownDO = sidecar.lastKnownDO();
+                    h.data = null;
+                    h.state = ChunkState.SEALED;
+                    h.end = trailer.dataLength();
+                    h.sealedLength = trailer.dataLength();
+                    h.dataCrc = trailer.dataCrc();
+                    h.sealedRangeCrcs = decodeCrcRanges(footerBytes, trailer.dataLength(), trailer.sectionCount());
+                    h.lastKnownDO = Math.max(h.lastKnownDO, trailer.dataLength());
                 }
-                h.state = ChunkState.SEALED;
-                h.end = trailer.dataLength();
-                h.sealedLength = trailer.dataLength();
-                h.dataCrc = trailer.dataCrc();
-                h.sealedRangeCrcs = decodeCrcRanges(footerBytes, trailer.dataLength(), trailer.sectionCount());
-                h.lastKnownDO = Math.max(h.lastKnownDO, trailer.dataLength());
                 if (reconstructedSidecar) {
                     h.persistSidecar();
                 }
                 Files.deleteIfExists(h.ledgerPath); // seal crashed before ledger delete
                 forceDirectory();
             } else {
+                // OPEN: keep a persistent writable channel + ledger (pinned, as before).
+                h.data = FileChannel.open(h.dataPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
+                h.writeEpoch = sidecar.writeEpoch();
+                h.fenceEpoch = sidecar.fenceEpoch();
+                h.lastKnownDO = sidecar.lastKnownDO();
                 // OPEN: replay ledger, verify tail data CRCs, truncate to the last verified boundary
                 if (!Files.exists(h.ledgerPath) && h.data.size() > HEADER_SIZE) {
                     // the ledger should only ever be absent for SEALED chunks; an open chunk with

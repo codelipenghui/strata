@@ -38,6 +38,8 @@ import java.util.stream.Stream;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -1900,5 +1902,56 @@ class ChunkStoreTest {
             r.close(); // releases the lease; channel stays cached/open
             assertTrue(ch.isOpen(), "release returns the FD to the cache, does not close it");
         }
+    }
+
+    @Test
+    void recoveryOpensNoPersistentFdPerSealedChunk() throws Exception {
+        ChunkId a = new ChunkId(FileId.random(), 0);
+        ChunkId b = new ChunkId(FileId.random(), 0);
+        try (ChunkStore store = new ChunkStore(dir, true)) { // seal-fsync on: sealed + durable immediately
+            sealedBytes(store, a, "alpha");
+            sealedBytes(store, b, "bravo");
+        }
+        try (ChunkStore recovered = new ChunkStore(dir, true)) {
+            assertEquals(2, recovered.sealedChunks());
+            assertEquals(0, recovered.cachedChannels(),
+                    "recovery must not open a persistent data FD per sealed chunk");
+            // a read lazily opens (and caches) exactly one channel
+            assertArrayEquals("alpha".getBytes(), recovered.read(a, 0, 5).bytes());
+            assertEquals(1, recovered.cachedChannels());
+        }
+    }
+
+    @Test
+    void sealClosesPersistentDataFdWhenSealFsyncOn() throws Exception {
+        try (ChunkStore store = new ChunkStore(dir, true)) {
+            open(store, id, 1);
+            store.append(id, 1, 0, 0, bytes("durable-seal"));
+            store.seal(id, 1, "durable-seal".length(), null);
+            assertNull(handleData(store, id), "seal-fsync=on must drop the writable FD at seal");
+            assertArrayEquals("durable-seal".getBytes(), store.read(id, 0, 12).bytes());
+        }
+    }
+
+    @Test
+    void reclaimClosesPersistentDataFdWhenSealFsyncOff() throws Exception {
+        try (ChunkStore store = newStore()) { // seal-fsync off
+            open(store, id, 1);
+            store.append(id, 1, 0, 0, bytes("reclaim-me"));
+            store.seal(id, 1, "reclaim-me".length(), null);
+            assertNotNull(handleData(store, id), "seal-fsync=off keeps the FD until reclaim");
+            store.reclaimSealedLedgersOnce();
+            assertNull(handleData(store, id), "reclaim drops the writable FD once durable");
+            assertArrayEquals("reclaim-me".getBytes(), store.read(id, 0, 10).bytes());
+        }
+    }
+
+    /** Reflectively reads the private Handle.data field for the given chunk (test-only). */
+    private static FileChannel handleData(ChunkStore store, ChunkId chunkId) throws Exception {
+        Object handle = handle(store, chunkId);
+        if (handle == null) return null;
+        Field dataField = handle.getClass().getDeclaredField("data");
+        dataField.setAccessible(true);
+        return (FileChannel) dataField.get(handle);
     }
 }
