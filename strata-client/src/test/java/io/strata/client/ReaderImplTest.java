@@ -313,6 +313,39 @@ class ReaderImplTest {
         }
     }
 
+    @Test
+    void readFailsOverToHealthyReplicaWhenAnotherIsUnreachable() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        String deadEndpoint = unusedEndpoint(); // nothing listening -> Connection refused
+        try (ScpServer replica = readReplica(new Messages.ReadResp(3, 3), new byte[] {1, 2, 3});
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 0,
+                             List.of(chunk(chunkId, ChunkState.SEALED, 3,
+                                     new Messages.Replica(1, deadEndpoint),
+                                     new Messages.Replica(2, endpoint(replica)))))))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+                ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
+                // readFromReplicas picks a random start replica, so repeat enough that the
+                // unreachable replica is tried first at least once; every read must still
+                // succeed by failing over to the healthy replica.
+                for (int i = 0; i < 24; i++) {
+                    try (StrataFile.ReadResult result = reader.read(0, 3)) {
+                        assertArrayEquals(new byte[] {1, 2, 3}, drain(result.buffer()),
+                                "read must fail over to the healthy replica (iteration " + i + ")");
+                    }
+                }
+            }
+        }
+    }
+
+    private static String unusedEndpoint() throws java.io.IOException {
+        try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
+            return "127.0.0.1:" + s.getLocalPort(); // closed on return -> port refuses connections
+        }
+    }
+
     private static String endpoint(ScpServer server) {
         return "127.0.0.1:" + server.port();
     }

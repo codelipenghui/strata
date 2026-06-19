@@ -95,10 +95,15 @@ final class ReaderImpl implements StrataFile.Reader {
         for (int i = 0; i < replicas.size(); i++) {
             Messages.Replica r = replicas.get((start + i) % replicas.size());
             if (r.endpoint().isEmpty()) continue;
-            Frame frame = connectionFor(r.endpoint()).callFrameBorrowed(Opcode.READ,
-                    readHeader, null, config.callTimeoutMs());
+            // The borrowed call stays INSIDE the try so a per-replica connection/RPC failure is
+            // caught below (last = e) and the loop fails over to the next replica — matching the
+            // pre-borrow read path. Hoisting it out would abort the whole read on the first
+            // unreachable replica instead of failing over.
+            Frame frame = null;
             boolean transferred = false;
             try {
+                frame = connectionFor(r.endpoint()).callFrameBorrowed(Opcode.READ,
+                        readHeader, null, config.callTimeoutMs());
                 ByteBuffer h = frame.headerSlice();
                 Resp.check(h);
                 var resp = Messages.ReadResp.decode(h);
@@ -143,7 +148,9 @@ final class ReaderImpl implements StrataFile.Reader {
                 last = new ScpException(ErrorCode.CORRUPT_CHUNK,
                         "malformed read response from replica " + r.nodeId() + ": " + e);
             } finally {
-                if (!transferred) frame.close();  // release on validation failure / exception / continue
+                // frame is null when callFrameBorrowed itself threw (nothing to release); otherwise
+                // release on validation failure / exception / continue. Success sets transferred.
+                if (!transferred && frame != null) frame.close();
             }
         }
         throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no readable replica");
