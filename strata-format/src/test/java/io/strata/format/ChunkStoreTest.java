@@ -1834,4 +1834,38 @@ class ChunkStoreTest {
             assertTrue(store.channelCacheCapacity() >= 128);
         }
     }
+
+    @Test
+    void sealedVerifiedReadGoesThroughChannelCache() throws Exception {
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, id, "cache-me-please");
+            store.reclaimSealedLedgersOnce(); // become evictable (h.data nulled in Task 8; harmless here)
+            assertArrayEquals("cache".getBytes(),
+                    store.read(id, 0, 5).bytes());
+            assertTrue(store.channelCacheMisses() + store.channelCacheHits() >= 1,
+                    "a sealed read must consult the channel cache");
+            assertTrue(store.cachedChannels() >= 1, "the sealed channel is cached after a read");
+        }
+    }
+
+    @Test
+    void sealedFetchGoesThroughChannelCache() throws Exception {
+        try (ChunkStore store = newStore()) {
+            byte[] full = sealedBytes(store, id, "fetch-via-cache");
+            long missesBefore = store.channelCacheMisses() + store.channelCacheHits();
+            byte[] got = store.fetch(id, 0, Integer.MAX_VALUE).bytes();
+            assertArrayEquals(full, got);
+            assertTrue(store.channelCacheMisses() + store.channelCacheHits() > missesBefore,
+                    "fetch of a sealed chunk must consult the channel cache");
+        }
+    }
+
+    @Test
+    void scrubReadsSealedDataThroughCache() throws Exception {
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, id, "scrub-me");
+            assertEquals(0, store.scrubOnce(), "clean chunk has no corruption");
+            assertTrue(store.cachedChannels() >= 1);
+        }
+    }
 }

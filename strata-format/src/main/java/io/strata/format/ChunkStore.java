@@ -788,18 +788,31 @@ public final class ChunkStore implements AutoCloseable {
         requireNonNegative(offset, "read offset");
         requireNonNegative(maxBytes, "read maxBytes");
         Handle h = lookup(id);
+        long sealedLength;
+        List<Integer> rangeCrcs;
+        long lastKnownDO;
+        Path dataPath;
         synchronized (h) {
-            long end = h.currentEnd();
-            if (offset >= end) return new ReadResult(new byte[0], end, h.lastKnownDO);
-            int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), end - offset);
-            byte[] out = new byte[n];
-            if (h.state == ChunkState.SEALED) {
-                readSealedVerified(h.data, h.sealedLength, h.sealedRangeCrcs, h.id, offset, out);
-            } else {
+            if (h.state != ChunkState.SEALED) {
+                long end = h.currentEnd();
+                if (offset >= end) return new ReadResult(new byte[0], end, h.lastKnownDO);
+                int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), end - offset);
+                byte[] out = new byte[n];
                 readOpenVerified(h, offset, out);
+                return new ReadResult(out, end, h.lastKnownDO);
             }
-            return new ReadResult(out, end, h.lastKnownDO);
+            sealedLength = h.sealedLength;
+            rangeCrcs = h.sealedRangeCrcs;
+            lastKnownDO = h.lastKnownDO;
+            dataPath = h.dataPath;
         }
+        if (offset >= sealedLength) return new ReadResult(new byte[0], sealedLength, lastKnownDO);
+        int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), sealedLength - offset);
+        byte[] out = new byte[n];
+        try (ChannelCache.Lease lease = channelCache.acquire(id, dataPath)) {
+            readSealedVerified(lease.channel(), sealedLength, rangeCrcs, id, offset, out);
+        }
+        return new ReadResult(out, sealedLength, lastKnownDO);
     }
 
     public ReadRegionResult readRegion(ChunkId id, long offset, int maxBytes) throws IOException {
@@ -1147,16 +1160,23 @@ public final class ChunkStore implements AutoCloseable {
         requireNonNegative(offset, "fetch offset");
         requireNonNegative(maxBytes, "fetch maxBytes");
         Handle h = lookup(id);
+        ChunkState state;
+        Path dataPath;
         synchronized (h) {
             if (h.state != ChunkState.SEALED) {
                 throw new ScpException(ErrorCode.INTERNAL, "fetch of non-sealed chunk " + id);
             }
-            long fileLen = h.data.size();
-            if (offset >= fileLen) return new FetchResult(fileLen, h.state, new byte[0]);
+            state = h.state;
+            dataPath = h.dataPath;
+        }
+        try (ChannelCache.Lease lease = channelCache.acquire(id, dataPath)) {
+            FileChannel data = lease.channel();
+            long fileLen = data.size();
+            if (offset >= fileLen) return new FetchResult(fileLen, state, new byte[0]);
             int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), fileLen - offset);
             byte[] out = new byte[n];
-            readFully(h.data, ByteBuffer.wrap(out), offset);
-            return new FetchResult(fileLen, h.state, out);
+            readFully(data, ByteBuffer.wrap(out), offset);
+            return new FetchResult(fileLen, state, out);
         }
     }
 
@@ -1404,14 +1424,27 @@ public final class ChunkStore implements AutoCloseable {
     public int scrubOnce() throws IOException {
         int corrupt = 0;
         for (Handle h : chunks.values()) {
+            long sealedLength;
+            int storedCrc;
+            Path dataPath;
             synchronized (h) {
                 if (h.state != ChunkState.SEALED) continue;
-                int actual = scanDataCrcs(h.data, h.sealedLength).dataCrc();
-                if (actual != h.dataCrc) {
-                    log.error("scrub: sealed chunk {} data rot — stored crc {} actual {}; "
-                            + "exposing via inventory for re-repair", h.id, h.dataCrc, actual);
-                    h.dataCrc = actual;
-                    corrupt++;
+                sealedLength = h.sealedLength;
+                storedCrc = h.dataCrc;
+                dataPath = h.dataPath;
+            }
+            int actual;
+            try (ChannelCache.Lease lease = channelCache.acquire(h.id, dataPath)) {
+                actual = scanDataCrcs(lease.channel(), sealedLength).dataCrc();
+            }
+            if (actual != storedCrc) {
+                synchronized (h) {
+                    if (h.state == ChunkState.SEALED && h.dataCrc == storedCrc) {
+                        log.error("scrub: sealed chunk {} data rot — stored crc {} actual {}; "
+                                + "exposing via inventory for re-repair", h.id, storedCrc, actual);
+                        h.dataCrc = actual;
+                        corrupt++;
+                    }
                 }
             }
         }
