@@ -430,8 +430,9 @@ final class StrataPerf {
             }
             long t0 = System.nanoTime();
             int n;
+            long elapsedNanos;
             try (StrataFile.ReadResult result = reader.read(offset, remaining)) {
-                readStats.record(System.nanoTime() - t0);
+                elapsedNanos = System.nanoTime() - t0;
                 n = result.length();
             } catch (RuntimeException e) {
                 if (isTransientReadUnavailable(e) && retries++ < 20) {
@@ -443,6 +444,7 @@ final class StrataPerf {
                 file.abort();
                 return reads;
             }
+            readStats.record(elapsedNanos);
             if (n == 0) {
                 reader.refresh();
                 sleepInterruptibly(5);

@@ -463,13 +463,14 @@ class PerfSmokeTest {
             long t0 = System.nanoTime();
             int n;
             boolean eof;
+            long elapsedNanos;
             try (StrataFile.ReadResult rr = reader.read(offset, READ_SIZE)) {
-                long elapsed = System.nanoTime() - t0;
+                elapsedNanos = System.nanoTime() - t0;
                 n = rr.length();
                 eof = rr.endOfFile();
-                if (i < latOut.length) latOut[i++] = elapsed;
             }
             if (n == 0) break;
+            if (i < latOut.length) latOut[i++] = elapsedNanos;
             bytes += n;
             offset += n;
             if (eof) break;
