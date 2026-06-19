@@ -1388,6 +1388,7 @@ public final class ChunkStore implements AutoCloseable {
                 return ErrorCode.INTERNAL;
             }
         }
+        channelCache.invalidate(id);
         if (tRemove - t0 > SLOW_MUTATION_LOG_NANOS) {
             log.info("slow delete {} phases(ms): preLookup={} lockWait={} stopCommitter={} dataClose={} "
                             + "ledgerClose={} fileDelete={} dirFsync={} lockHeld={} total={}",

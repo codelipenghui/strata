@@ -1948,6 +1948,32 @@ class ChunkStoreTest {
         }
     }
 
+    @Test
+    void deleteInvalidatesCachedChannel() throws Exception {
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, id, "delete-me");
+            store.read(id, 0, 4); // caches the channel
+            assertEquals(1, store.cachedChannels());
+            assertEquals(ErrorCode.OK, store.delete(id));
+            assertEquals(0, store.cachedChannels(), "delete must invalidate the cached channel");
+        }
+    }
+
+    @Test
+    void readRegionLeaseSurvivesConcurrentDelete() throws Exception {
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, id, "inode-alive");
+            ChunkStore.ReadRegionResult region = store.readRegion(id, 0, 5);
+            try {
+                assertEquals(ErrorCode.OK, store.delete(id)); // unlinks file; leased FD keeps inode alive
+                assertArrayEquals("inode".getBytes(), consumeRegion(region),
+                        "an in-flight leased transfer still reads correct bytes after delete");
+            } finally {
+                region.close();
+            }
+        }
+    }
+
     /** Reflectively reads the private Handle.data field for the given chunk (test-only). */
     private static FileChannel handleData(ChunkStore store, ChunkId chunkId) throws Exception {
         Object handle = handle(store, chunkId);
