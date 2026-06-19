@@ -418,11 +418,12 @@ public final class ScpServer implements AutoCloseable {
                     frame.close();
                 }
             }
-            for (Runnable task : requestExecutor.shutdownNow()) {
-                if (task instanceof FrameTask frameTask) {
-                    frameTask.closeIfPending();
-                }
-            }
+            // Do not shutdownNow(): interrupting the active request thread while it is in a
+            // FileChannel operation can close the shared chunk channel (InterruptibleChannel),
+            // corrupting the in-process storage handle for unrelated future requests. Let the
+            // running request finish; queued tasks will observe connectionOpen=false and release
+            // their frames without invoking the handler.
+            requestExecutor.shutdown();
         }
 
         @Override

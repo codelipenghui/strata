@@ -158,11 +158,14 @@ class CrashRecoveryTest {
 
     @Test
     void corruptFooterIsDetectedAtRecoveryAndChunkQuarantined() throws Exception {
-        ChunkStore store = new ChunkStore(dir);
-        open(store);
-        store.append(id, 1, 0, 0, ByteBuffer.wrap("sealed-data".getBytes()));
-        var sealed = store.seal(id, 1, 11, null);
-        byte[] repairImage = store.fetch(id, 0, Integer.MAX_VALUE).bytes();
+        byte[] repairImage;
+        int dataCrc;
+        try (ChunkStore store = new ChunkStore(dir)) {
+            open(store);
+            store.append(id, 1, 0, 0, ByteBuffer.wrap("sealed-data".getBytes()));
+            dataCrc = store.seal(id, 1, 11, null).dataCrc();
+            repairImage = store.fetch(id, 0, Integer.MAX_VALUE).bytes();
+        }
         // bit-rot inside the footer section area (between data end and the 64B trailer)
         try (FileChannel ch = FileChannel.open(dataPath(), StandardOpenOption.WRITE)) {
             ch.write(ByteBuffer.wrap(new byte[]{0x7F}), ChunkFormats.DATA_START + 11 + 4);
@@ -173,10 +176,13 @@ class CrashRecoveryTest {
                     "corrupt-footer chunk must not be recovered as healthy");
             assertFalse(Files.exists(dataPath()), "live chunk name must be free for repair import");
             try (Stream<Path> files = Files.list(dir)) {
-                assertEquals(2, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
+                // .chunk + .meta + the retained integrity ledger (.j) — under STRATA_SEAL_FSYNC=false
+                // seal keeps the ledger until the SEALED state is forced durable, so it is still present
+                // at recovery and quarantined alongside the chunk as corrupt evidence.
+                assertEquals(3, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
                         "quarantine must preserve the corrupt evidence under a non-live name");
             }
-            recovered.importSealed(id, repairImage, 11, sealed.dataCrc());
+            recovered.importSealed(id, repairImage, 11, dataCrc);
             assertArrayEquals("sealed-data".getBytes(), recovered.read(id, 0, 100).bytes());
         }
     }

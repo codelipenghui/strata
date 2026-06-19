@@ -12,8 +12,10 @@ import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Capacity-weighted random placement with anti-affinity (tech design §8):
- * weights derive from free capacity; no two replicas share a host; SUSPECT/DRAINING/DEAD excluded
- * (only lease-valid REGISTERED nodes are candidates).
+ * weights derive from free capacity; no two replicas share a host; only REGISTERED nodes are eligible,
+ * so DEAD and DRAINING nodes are excluded. Suspect REGISTERED nodes inside dead-grace remain candidates
+ * so metadata failover or heartbeat stalls do not remove otherwise reachable storage nodes before node
+ * RPCs can probe them.
  */
 final class Placement {
 
@@ -21,7 +23,7 @@ final class Placement {
      * Picks {@code count} distinct nodes to hold replicas of a chunk in {@code namespace}; throws
      * NO_CAPACITY when impossible. The namespace is the per-tenant placement hook: a future policy can
      * restrict candidates to a namespace's allowed nodes (affinity/isolation) or weight by per-namespace
-     * usage. The current policy is namespace-agnostic — every alive node is a candidate.
+     * usage. The current policy is namespace-agnostic.
      */
     static List<NodeRegistry.LiveNode> choose(StrataNamespace namespace, NodeRegistry registry, int count,
                                               Set<Integer> excludeNodes, Set<String> excludeHosts) {

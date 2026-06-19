@@ -1599,6 +1599,32 @@ class AppenderImplTest {
         }
     }
 
+    @Test
+    void appendAdmissionToleratesOneSlowReplicaButBlocksWhenQuorumLacksCapacity() throws Exception {
+        AppenderImpl appender = appender();   // WritePolicy.DEFAULT: replicationFactor=3, ackQuorum=2
+        Object session = chunkSession();      // 3 replicas, no connections established yet
+
+        Field wmField = AppenderImpl.class.getDeclaredField("APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK");
+        wmField.setAccessible(true);
+        int watermark = wmField.getInt(null);
+        Field inFlightField = session.getClass().getDeclaredField("inFlight");
+        inFlightField.setAccessible(true);
+        int[] inFlight = (int[]) inFlightField.get(session);
+        Method hasCapacity = AppenderImpl.class.getDeclaredMethod(
+                "hasAppendConnectionCapacity", session.getClass());
+        hasCapacity.setAccessible(true);
+
+        // One saturated (slow) replica must NOT gate produce: the other two still meet ackQuorum.
+        inFlight[0] = watermark;
+        assertTrue((boolean) hasCapacity.invoke(appender, session),
+                "a single saturated replica must not block appends while ackQuorum replicas have capacity");
+
+        // Two saturated replicas: only one has capacity, below ackQuorum=2 -> appends must throttle.
+        inFlight[1] = watermark;
+        assertFalse((boolean) hasCapacity.invoke(appender, session),
+                "appends must block when fewer than ackQuorum replicas have capacity");
+    }
+
     private static AppenderImpl appender() {
         return new AppenderImpl(null, null, new ClientConfig(List.of("127.0.0.1:1"), 1024, 100),
                 FileId.random(), 1, Messages.WritePolicy.DEFAULT, 0);

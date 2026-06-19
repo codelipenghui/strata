@@ -315,6 +315,38 @@ class ClientServerTest {
     }
 
     @Test
+    void closingConnectionDoesNotInterruptActiveServerRequest() throws Exception {
+        java.util.concurrent.CountDownLatch started = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        AtomicBoolean interrupted = new AtomicBoolean(false);
+        ScpServer.Handler blocked = req -> {
+            started.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                interrupted.set(true);
+                Thread.currentThread().interrupt();
+            }
+            return ScpServer.ok(req, Messages.okHeader(), null);
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, blocked);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
+            CompletableFuture<Frame> pending = client.send(Opcode.PING, emptyHeader(), null);
+            assertTrue(started.await(3, TimeUnit.SECONDS), "server request did not start");
+
+            client.close();
+            Thread.sleep(200);
+            assertFalse(interrupted.get(), "connection close must not interrupt active server storage work");
+
+            release.countDown();
+            assertThrows(java.util.concurrent.ExecutionException.class,
+                    () -> pending.get(3, TimeUnit.SECONDS));
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
     void pipelinedSendAppliesAdmissionControlBeforeTimeoutWindowExplodes() throws Exception {
         int maxExpectedOutstanding = 1024;
         java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);

@@ -57,9 +57,8 @@ final class NodeHandlers implements ScpServer.Handler {
             // APPEND is served by handleAsync (deferred ack for group commit)
 
             case READ -> {
-                // Client read: open reads are bounded to the replica-known durable high watermark and
-                // materialized under the chunk lock so a concurrent seal-truncate cannot alter the wire
-                // payload. Sealed chunks can use the zero-copy region.
+                // Client read: open reads are bounded to the replica-known durable high watermark, so
+                // both open durable-prefix reads and sealed reads can use a zero-copy file region.
                 var m = Messages.Read.decode(h);
                 yield readRegionResponse(req, store.readRegion(m.chunkId(), m.offset(), m.maxBytes()));
             }
@@ -118,8 +117,8 @@ final class NodeHandlers implements ScpServer.Handler {
         };
     }
 
-    /** Wire-encodes a {@link ChunkStore.ReadRegionResult}: a zero-copy region (sealed) or materialized
-     * bytes (open). readRegion owns and closes any returned channel via the server. */
+    /** Wire-encodes a {@link ChunkStore.ReadRegionResult}: a zero-copy region or materialized
+     * bytes. readRegion owns and closes any returned channel via the server. */
     private static Frame readRegionResponse(Frame req, ChunkStore.ReadRegionResult r) {
         byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
         if (r.channel() != null) {

@@ -38,12 +38,18 @@ final class Recovery {
     private static final int COPY_CHUNK_BYTES = 4 * 1024 * 1024;
 
     private final MetaClient meta;
-    private final NodePool pool;
+    private final NodePool appendPool;
+    private final NodePool readPool;
     private final ClientConfig config;
 
     Recovery(MetaClient meta, NodePool pool, ClientConfig config) {
+        this(meta, pool, pool, config);
+    }
+
+    Recovery(MetaClient meta, NodePool appendPool, NodePool readPool, ClientConfig config) {
         this.meta = meta;
-        this.pool = pool;
+        this.appendPool = appendPool;
+        this.readPool = readPool;
         this.config = config;
     }
 
@@ -115,7 +121,7 @@ final class Recovery {
         for (Messages.Replica r : chunk.replicas()) {
             if (r.endpoint().isEmpty()) continue;
             try {
-                ByteBuffer h = pool.get(r.endpoint()).call(Opcode.FENCE,
+                ByteBuffer h = appendPool.get(r.endpoint()).call(Opcode.FENCE,
                         new Messages.Fence(chunkId, writerEpoch).encode(), null, config.callTimeoutMs());
                 Messages.FenceResp fence = Messages.FenceResp.decode(h);
                 validateFenceResp(chunkId, r, fence);
@@ -173,7 +179,7 @@ final class Recovery {
         TreeMap<Long, List<LedgerCandidate>> boundaries = new TreeMap<>();
         for (ReplicaState rs : reachable) {
             try {
-                ByteBuffer h = pool.get(rs.replica.endpoint()).call(Opcode.READ_LEDGER,
+                ByteBuffer h = readPool.get(rs.replica.endpoint()).call(Opcode.READ_LEDGER,
                         new Messages.ReadLedger(chunkId, p).encode(), null, config.callTimeoutMs());
                 long previousEnd = p;
                 for (Messages.LedgerEntry e : Messages.ReadLedgerResp.decode(h).entries()) {
@@ -364,7 +370,7 @@ final class Recovery {
         try {
             // READ_RECOVERY (not client READ): recovery must see the never-acked tail above the
             // donor's durable high watermark — that is exactly the range it is re-proving for seal.
-            Frame frame = pool.get(source.replica.endpoint()).callFrame(Opcode.READ_RECOVERY,
+            Frame frame = readPool.get(source.replica.endpoint()).callFrame(Opcode.READ_RECOVERY,
                     new Messages.Read(chunkId, from, (int) len).encode(), null,
                     config.callTimeoutMs());
             ByteBuffer h = frame.headerSlice();
@@ -398,7 +404,7 @@ final class Recovery {
 
     private void appendAndVerify(ChunkId chunkId, int epoch, ReplicaState target, long durableOffset,
                                  ByteBuffer payload, long expectedEnd) {
-        ByteBuffer h = pool.get(target.replica.endpoint()).call(Opcode.APPEND,
+        ByteBuffer h = appendPool.get(target.replica.endpoint()).call(Opcode.APPEND,
                 new Messages.Append(chunkId, epoch, target.end, durableOffset).encode(),
                 payload, config.callTimeoutMs());
         long actualEnd;
@@ -434,7 +440,7 @@ final class Recovery {
         for (ReplicaState rs : replicas) {
             Messages.SealResp resp;
             try {
-                ByteBuffer h = pool.get(rs.replica.endpoint()).call(Opcode.SEAL_CHUNK,
+                ByteBuffer h = appendPool.get(rs.replica.endpoint()).call(Opcode.SEAL_CHUNK,
                         new Messages.SealChunk(chunkId, epoch, dataLength).encode(), null,
                         config.callTimeoutMs());
                 resp = Messages.SealResp.decode(h);

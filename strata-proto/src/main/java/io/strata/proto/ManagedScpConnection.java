@@ -72,6 +72,16 @@ public final class ManagedScpConnection implements AutoCloseable {
         return generation;
     }
 
+    public int pendingCount() {
+        ScpClient current = client;
+        return current == null ? 0 : current.pendingCount();
+    }
+
+    public int pendingCapacity() {
+        ScpClient current = client;
+        return current == null ? ScpClient.maxPendingRequests() : current.pendingCapacity();
+    }
+
     boolean monitorAliveForTests() {
         return monitorThread.isAlive();
     }

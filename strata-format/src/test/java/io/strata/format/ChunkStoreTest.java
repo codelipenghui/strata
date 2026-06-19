@@ -757,10 +757,10 @@ class ChunkStoreTest {
     }
 
     @Test
-    void readRegionResultIsStableSnapshotAcrossConcurrentSealTruncate() throws Exception {
+    void openReadRegionDurablePrefixIsZeroCopyAcrossConcurrentSealTruncate() throws Exception {
         // A reader resolves a region on an OPEN chunk; the data plane transfers that region LATER,
-        // off the chunk lock. readRegion must only expose bytes below the replica-known durable
-        // high watermark, and the exposed bytes must be a stable snapshot if a concurrent seal
+        // off the chunk lock. readRegion must only expose bytes below the replica-known durable high
+        // watermark, and an independent read FD must keep those bytes stable if a concurrent seal
         // truncates the never-acked tail.
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
@@ -774,9 +774,11 @@ class ChunkStoreTest {
             assertEquals(21, tail.localEndOffset());
             assertEquals(9, tail.lastKnownDO());
 
-            // The committed prefix is served as a materialized snapshot.
+            // The committed prefix is served as a zero-copy channel region over an independent FD.
             ChunkStore.ReadRegionResult region = store.readRegion(id, 0, 1024);
             assertEquals(9, region.length());
+            assertTrue(region.channel() != null, "durable open read should use a zero-copy channel");
+            assertEquals(null, region.bytes());
             try {
                 // a concurrent seal truncates the never-acked tail after this region was resolved
                 var sealed = store.seal(id, 1, 9, null);
@@ -793,7 +795,23 @@ class ChunkStoreTest {
     }
 
     @Test
-    void openReadsRejectLedgerCoveredDataRot() throws Exception {
+    void sealCannotTruncateBelowDurableWatermark() throws Exception {
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            store.append(id, 1, 0, 0, bytes("SAFE"));
+            store.append(id, 1, 4, 4, bytes("TAIL"));
+            assertEquals(4, store.stat(id).lastKnownDO());
+
+            ScpException e = assertThrows(ScpException.class, () -> store.seal(id, 1, 3, null));
+            assertEquals(ErrorCode.INTERNAL, e.code());
+            assertEquals(4, e.detail());
+
+            assertEquals(4, store.seal(id, 1, 4, null).finalLength());
+        }
+    }
+
+    @Test
+    void openReadRejectsLedgerCoveredDataRotButReadRegionIsZeroCopyUnverified() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
             store.append(id, 1, 0, 0, bytes("verified-open"));
@@ -806,12 +824,16 @@ class ChunkStoreTest {
 
             assertEquals(ErrorCode.CRC_MISMATCH,
                     assertThrows(ScpException.class, () -> store.read(id, 0, 13)).code());
-            assertEquals(ErrorCode.CRC_MISMATCH,
-                    assertThrows(ScpException.class, () -> store.readRegion(id, 0, 13)).code());
+            try (var region = store.readRegion(id, 0, 13)) {
+                assertEquals(13, region.length());
+                assertTrue(region.channel() != null, "client open readRegion should be zero-copy");
+                byte[] got = consumeRegion(region);
+                assertEquals('X', got[4]);
+            }
         }
     }
 
-    /** Reads a region result whether it is a heap snapshot (open chunks) or a zero-copy channel. */
+    /** Reads a region result whether it is a heap snapshot or a zero-copy channel. */
     private static byte[] consumeRegion(ChunkStore.ReadRegionResult r) throws Exception {
         if (r.bytes() != null) {
             return r.bytes();
@@ -1305,6 +1327,126 @@ class ChunkStoreTest {
             assertTrue(recovered.contains(chunkId));
             assertArrayEquals("sealed".getBytes(), recovered.read(chunkId, 0, 100).bytes());
             assertTrue(Files.notExists(ledgerPath));
+        }
+    }
+
+    @Test
+    void sealedChunkRecoversFullDataWhenSealedSidecarLost() throws Exception {
+        // C1 regression: with STRATA_SEAL_FSYNC=false (the default), seal() leaves the SEALED sidecar
+        // (and footer/trailer) only in the page cache. If a crash loses that unforced SEALED state, the
+        // on-disk sidecar still reads OPEN and recovery takes the OPEN branch, which rebuilds the chunk
+        // by REPLAYING THE INTEGRITY LEDGER. So seal() must not remove the ledger until the SEALED state
+        // is durable — otherwise recovery finds no ledger and truncates acknowledged data to zero.
+        assumeTrue(!ChunkStore.booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false),
+                "guarantee under test is specific to the no-seal-fsync durability path");
+
+        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        String base = ChunkFormats.baseName(chunkId);
+        Path metaPath = dir.resolve(base + ".meta");
+        byte[] payload = "important-acknowledged-data".getBytes(StandardCharsets.UTF_8);
+        int len = payload.length;
+
+        try (ChunkStore store = newStore()) {
+            open(store, chunkId, 1);
+            store.append(chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(chunkId, 1, len, null);
+        }
+
+        // Simulate the crash window: the unforced SEALED sidecar write never reached disk, so on
+        // restart the sidecar still reads OPEN — with the chunk's data fully durable (lastKnownDO=len).
+        Files.write(metaPath, new ChunkFormats.Sidecar(1, -1, len, ChunkState.OPEN).encode());
+
+        try (ChunkStore recovered = newStore()) {
+            assertTrue(recovered.contains(chunkId), "sealed chunk must survive recovery");
+            assertArrayEquals(payload, recovered.read(chunkId, 0, len).bytes(),
+                    "acknowledged data must be recovered from the retained ledger, not truncated to zero");
+        }
+    }
+
+    @Test
+    void sealRetainsLedgerUntilReclaimedWhenSealFsyncDisabled() throws Exception {
+        assumeTrue(!ChunkStore.booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false),
+                "ledger retention is specific to the no-seal-fsync durability path");
+        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        Path ledgerPath = dir.resolve(ChunkFormats.baseName(chunkId) + ".j");
+        byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
+        try (ChunkStore store = newStore()) {
+            open(store, chunkId, 1);
+            store.append(chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(chunkId, 1, payload.length, null);
+
+            assertTrue(Files.exists(ledgerPath),
+                    "seal must retain the integrity ledger until the SEALED state is durable");
+
+            store.reclaimSealedLedgersOnce(); // forces the SEALED state durable, then unlinks the ledger
+
+            assertTrue(Files.notExists(ledgerPath),
+                    "reclaim must drop the ledger once the SEALED state is forced durable");
+            assertEquals(1, store.sealedLedgerReclaims());
+            assertArrayEquals(payload, store.read(chunkId, 0, payload.length).bytes(),
+                    "chunk must stay readable from its durable trailer after reclaim");
+
+            store.reclaimSealedLedgersOnce(); // idempotent: nothing left pending
+            assertEquals(1, store.sealedLedgerReclaims());
+        }
+    }
+
+    @Test
+    void sealWithSealFsyncDropsLedgerImmediatelyWithoutReclaim() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        Path ledgerPath = dir.resolve(ChunkFormats.baseName(chunkId) + ".j");
+        byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
+        try (ChunkStore store = new ChunkStore(dir, true)) { // seal fsync ON
+            open(store, chunkId, 1);
+            store.append(chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(chunkId, 1, payload.length, null);
+
+            // With seal fsync on, the SEALED footer/sidecar are forced durable at seal time, so the
+            // ledger is dropped immediately (async) rather than retained for background reclamation.
+            waitFor(() -> Files.notExists(ledgerPath),
+                    "seal with fsync on should delete the ledger without waiting for reclaim");
+            store.reclaimSealedLedgersOnce();
+            assertEquals(0, store.sealedLedgerReclaims(),
+                    "no ledger should be pending reclaim when seal fsync is on");
+            assertArrayEquals(payload, store.read(chunkId, 0, payload.length).bytes(),
+                    "chunk must remain readable after a seal-fsync seal");
+        }
+    }
+
+    @Test
+    void recoveryReadServesUndurableTailThatClientReadClampsAway() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        byte[] durable = "durable-prefix".getBytes(StandardCharsets.UTF_8);
+        byte[] tail = "undurable-tail".getBytes(StandardCharsets.UTF_8);
+        int d = durable.length;
+        int total = d + tail.length;
+        byte[] all = new byte[total];
+        System.arraycopy(durable, 0, all, 0, d);
+        System.arraycopy(tail, 0, all, d, tail.length);
+
+        try (ChunkStore store = newStore()) {
+            open(store, chunkId, 1);
+            store.append(chunkId, 1, 0, 0, ByteBuffer.wrap(durable)); // below the durable high watermark
+            store.append(chunkId, 1, d, d, ByteBuffer.wrap(tail));    // above it: end=total, lastKnownDO=d
+
+            // Client read is clamped to the durable high watermark and never exposes the never-acked tail.
+            try (ChunkStore.ReadRegionResult clientTail = store.readRegion(chunkId, d, total)) {
+                assertEquals(0, clientTail.length(),
+                        "client read must clamp away the never-acked tail above the durable watermark");
+            }
+            try (ChunkStore.ReadRegionResult clientPrefix = store.readRegion(chunkId, 0, total)) {
+                assertEquals(d, clientPrefix.length(), "client read serves only the durable prefix");
+                assertTrue(clientPrefix.bytes() == null,
+                        "durable-prefix open read is zero-copy (a channel, not materialized bytes)");
+            }
+
+            // Recovery read includes the undurable tail, materialized + integrity-verified (not a
+            // zero-copy channel), so seal recovery sees quorum-durable bytes instead of sealing short.
+            try (ChunkStore.ReadRegionResult recovery = store.readRegionForRecovery(chunkId, 0, total)) {
+                assertEquals(total, recovery.length(), "recovery read must include the undurable tail");
+                assertTrue(recovery.channel() == null, "recovery tail must be materialized, not zero-copy");
+                assertArrayEquals(all, recovery.bytes(), "recovery read must return the full verified bytes");
+            }
         }
     }
 

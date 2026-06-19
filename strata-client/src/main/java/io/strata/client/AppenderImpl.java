@@ -44,6 +44,16 @@ final class AppenderImpl implements StrataFile.Appender {
     /** Replica responses are dispatched off transport event-loop threads. */
     private static final java.util.concurrent.Executor CALLBACKS =
             java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
+    private static final int APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK =
+            intConf("strata.append.replicaInflightHighWatermark",
+                    "STRATA_APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK", 8);
+    private static final long APPEND_BACKPRESSURE_WARN_NANOS = TimeUnit.SECONDS.toNanos(10);
+    private static final int DEFAULT_APPEND_CONNECTION_PENDING_HIGH_WATERMARK =
+            Math.max(1, (io.strata.proto.ScpClient.maxPendingRequests() * 3) / 4);
+    private static final int APPEND_CONNECTION_PENDING_HIGH_WATERMARK =
+            intConf("strata.append.connectionPendingHighWatermark",
+                    "STRATA_APPEND_CONNECTION_PENDING_HIGH_WATERMARK",
+                    DEFAULT_APPEND_CONNECTION_PENDING_HIGH_WATERMARK);
 
     private final MetaClient meta;
     private final NodePool pool;
@@ -72,6 +82,7 @@ final class AppenderImpl implements StrataFile.Appender {
         final long[] acked;
         final long[] connectionGenerations;
         final boolean[] failed;
+        final int[] inFlight;
         long end;                      // chunk-local next append offset
         long durable;                  // chunk-local DO (ack-quorum threshold)
         final ArrayDeque<Pending> pending = new ArrayDeque<>();
@@ -85,6 +96,7 @@ final class AppenderImpl implements StrataFile.Appender {
             this.connectionGenerations = new long[replicas.size()];
             Arrays.fill(this.connectionGenerations, -1);
             this.failed = new boolean[replicas.size()];
+            this.inFlight = new int[replicas.size()];
         }
 
         int failedCount() {
@@ -133,6 +145,8 @@ final class AppenderImpl implements StrataFile.Appender {
                 throwIfDead();
             }
             ChunkSession s = session;
+            awaitAppendConnectionCapacityLocked(s);
+            throwIfDead();
             long base = s.end;
             long newEnd = checkedAdd(base, len, "chunk offset");
             s.end = newEnd;
@@ -148,11 +162,13 @@ final class AppenderImpl implements StrataFile.Appender {
                 try {
                     ManagedScpConnection client = s.connections[i] != null
                             ? s.connections[i] : pool.get(s.replicas.get(i).endpoint());
+                    beginReplicaRequestLocked(s, replicaIndex);
                     f = s.connectionGenerations[i] >= 0
                             ? client.sendWithTimeout(Opcode.APPEND, header, data.duplicate(), config.callTimeoutMs(),
                                     s.connectionGenerations[i])
                             : client.sendWithTimeout(Opcode.APPEND, header, data.duplicate(), config.callTimeoutMs());
                 } catch (ScpException e) {
+                    completeReplicaRequestLocked(s, replicaIndex);
                     onReplicaFailureLocked(s, replicaIndex, e);
                     continue;
                 }
@@ -162,6 +178,7 @@ final class AppenderImpl implements StrataFile.Appender {
             }
             return callerFuture;
         } finally {
+            progress.signalAll();
             lock.unlock();
         }
     }
@@ -169,6 +186,7 @@ final class AppenderImpl implements StrataFile.Appender {
     private void onReplicaResponse(ChunkSession s, int replicaIndex, long expectedEnd, Frame frame, Throwable err) {
         lock.lock();
         try {
+            completeReplicaRequestLocked(s, replicaIndex);
             if (s != session) {
                 handleStaleReplicaResponseLocked(frame, err);
                 return;
@@ -232,6 +250,76 @@ final class AppenderImpl implements StrataFile.Appender {
 
     private static ScpException asScpException(Throwable err) {
         return ScpException.rootCause(err) instanceof ScpException e ? e : null;
+    }
+
+    private static int intConf(String property, String env, int def) {
+        String raw = System.getProperty(property);
+        if (raw == null) raw = System.getenv(env);
+        if (raw == null || raw.isBlank()) return def;
+        try {
+            int value = Integer.parseInt(raw.trim());
+            return value > 0 ? value : def;
+        } catch (NumberFormatException e) {
+            log.warn("ignoring non-numeric {}/{}='{}', using default {}", property, env, raw, def);
+            return def;
+        }
+    }
+
+    private void awaitAppendConnectionCapacityLocked(ChunkSession s) {
+        long waitStart = System.nanoTime();
+        long nextWarn = waitStart + APPEND_BACKPRESSURE_WARN_NANOS;
+        while (!dead && !hasAppendConnectionCapacity(s)) {
+            try {
+                progress.await(1, TimeUnit.SECONDS);
+                long now = System.nanoTime();
+                if (now >= nextWarn && !hasAppendConnectionCapacity(s)) {
+                    log.warn("append pipeline backpressure on {} for {}ms (inFlight={})",
+                            s.chunkId, (now - waitStart) / 1_000_000.0, totalInFlight(s));
+                    nextWarn = now + APPEND_BACKPRESSURE_WARN_NANOS;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                dieLocked(new ScpException(ErrorCode.INTERNAL, "interrupted"));
+                return;
+            }
+        }
+    }
+
+    private static int totalInFlight(ChunkSession s) {
+        int total = 0;
+        for (int n : s.inFlight) {
+            total += n;
+        }
+        return total;
+    }
+
+    private boolean hasAppendConnectionCapacity(ChunkSession s) {
+        // Admit the next append while at least ackQuorum non-failed replicas have capacity. A slow
+        // minority replica (in-flight or connection-pending backed up) must NOT gate produce — the
+        // quorum still acks through the healthy replicas, and a persistently slow replica is dropped by
+        // the per-replica call timeout. Throttle only once fewer than ackQuorum replicas can keep up,
+        // which is the real backpressure case and keeps the in-flight window bounded.
+        int withCapacity = 0;
+        for (int i = 0; i < s.replicas.size(); i++) {
+            if (s.failed[i]) continue;
+            if (s.inFlight[i] >= APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK) continue;
+            ManagedScpConnection connection = s.connections[i];
+            if (connection != null
+                    && connection.pendingCount() >= APPEND_CONNECTION_PENDING_HIGH_WATERMARK) continue;
+            withCapacity++;
+        }
+        return withCapacity >= ackQuorum;
+    }
+
+    private void beginReplicaRequestLocked(ChunkSession s, int replicaIndex) {
+        s.inFlight[replicaIndex]++;
+    }
+
+    private void completeReplicaRequestLocked(ChunkSession s, int replicaIndex) {
+        if (replicaIndex >= 0 && replicaIndex < s.inFlight.length && s.inFlight[replicaIndex] > 0) {
+            s.inFlight[replicaIndex]--;
+            progress.signalAll();
+        }
     }
 
     private void onReplicaFailureLocked(ChunkSession s, int replicaIndex, ScpException cause) {
@@ -304,12 +392,26 @@ final class AppenderImpl implements StrataFile.Appender {
     }
 
     private void drainPendingLocked(ChunkSession s) {
+        long waitStart = System.nanoTime();
+        long deadline = waitStart + TimeUnit.MILLISECONDS.toNanos(config.callTimeoutMs());
+        long nextWarn = waitStart + APPEND_BACKPRESSURE_WARN_NANOS;
         while (!s.pending.isEmpty() && !dead) {
+            long now = System.nanoTime();
+            long remaining = deadline - now;
+            if (remaining <= 0) {
+                dieLocked(new ScpException(ErrorCode.INTERNAL,
+                        "timed out draining append pipeline for " + s.chunkId
+                                + " pending=" + s.pending.size()
+                                + " inFlight=" + totalInFlight(s)));
+                return;
+            }
             try {
-                if (!progress.await(config.callTimeoutMs(), TimeUnit.MILLISECONDS)) {
-                    dieLocked(new ScpException(ErrorCode.INTERNAL,
-                            "timed out draining " + s.pending.size() + " pending appends on " + s.chunkId));
-                    return;
+                progress.await(Math.min(TimeUnit.SECONDS.toNanos(1), remaining), TimeUnit.NANOSECONDS);
+                now = System.nanoTime();
+                if (now >= nextWarn && !s.pending.isEmpty()) {
+                    log.warn("append pipeline drain waiting on {} for {}ms (pending={} inFlight={})",
+                            s.chunkId, (now - waitStart) / 1_000_000.0, s.pending.size(), totalInFlight(s));
+                    nextWarn = now + APPEND_BACKPRESSURE_WARN_NANOS;
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();

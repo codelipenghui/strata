@@ -14,18 +14,21 @@ import java.util.Objects;
 final class StrataClientImpl implements StrataClient {
     private final ClientConfig config;
     private final MetaClient meta;
-    private final NodePool pool;
+    private final NodePool appendPool;
+    private final NodePool readPool;
 
     StrataClientImpl(ClientConfig config) {
         this.config = config;
         this.meta = new MetaClient(config);
-        this.pool = new NodePool(config);
+        this.appendPool = new NodePool(config, "strata-client-append");
+        this.readPool = new NodePool(config, "strata-client-read");
     }
 
     @Override
     public StrataFile create(FileSpec spec) {
         Objects.requireNonNull(spec, "spec");
-        return new StrataFileImpl(meta, pool, config, meta.createFile(spec), spec.namespace(), spec.path());
+        return new StrataFileImpl(meta, appendPool, readPool, config,
+                meta.createFile(spec), spec.namespace(), spec.path());
     }
 
     @Override
@@ -33,14 +36,14 @@ final class StrataClientImpl implements StrataClient {
         Objects.requireNonNull(namespace, "namespace");
         Objects.requireNonNull(path, "path");
         FileId fileId = meta.lookupPath(namespace, path);
-        return new StrataFileImpl(meta, pool, config, fileId, namespace, path);
+        return new StrataFileImpl(meta, appendPool, readPool, config, fileId, namespace, path);
     }
 
     @Override
     public StrataFile openById(FileId fileId) {
         Objects.requireNonNull(fileId, "fileId");
         Messages.LookupFileResp file = meta.lookupFile(fileId);
-        return new StrataFileImpl(meta, pool, config, fileId, file.namespace(), file.path());
+        return new StrataFileImpl(meta, appendPool, readPool, config, fileId, file.namespace(), file.path());
     }
 
     @Override
@@ -73,7 +76,8 @@ final class StrataClientImpl implements StrataClient {
 
     @Override
     public void close() {
-        pool.close();
+        appendPool.close();
+        readPool.close();
         meta.close();
     }
 }

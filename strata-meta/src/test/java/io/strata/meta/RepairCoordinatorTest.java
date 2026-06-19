@@ -15,6 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -536,6 +537,31 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void inventoryGracesStaleOpenReportForJustSealedReplica() throws Exception {
+        FakeStore store = new FakeStore();
+        MetaConfig graceConfig = config().withReplicaMissingGraceMs(60_000);
+        NodeRegistry registry = new NodeRegistry(store, graceConfig);
+        Registered node = register(registry, 151, "node");
+        FileId fileId = fileId(12);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        store.createFile(file(fileId, FileState.SEALED,
+                List.of(sealed(0, 100, 100, List.of(node.nodeId())))));
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, graceConfig, () -> true);
+
+        coordinator.onInventory(inventory(node, List.of(
+                new Messages.InventoryEntry(chunkId, ChunkState.OPEN, 100, 100))));
+
+        assertEquals(List.of(node.nodeId()), store.files.get(fileId).value().chunks().get(0).replicas());
+        assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
+
+        coordinator.onInventory(inventory(node, List.of(
+                new Messages.InventoryEntry(chunkId, ChunkState.SEALED, 100, 100))));
+
+        assertEquals(List.of(node.nodeId()), store.files.get(fileId).value().chunks().get(0).replicas());
+        assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
+    }
+
+    @Test
     void inventoryIgnoresNonLiveNodesAndContinuesAfterStoreFailure() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
@@ -669,7 +695,11 @@ class RepairCoordinatorTest {
                                                     List<Messages.CompletedCommand> completedCommands) {
         return registry.heartbeat(new Messages.NodeHeartbeat(node.nodeId(), node.incMsb(), node.incLsb(),
                 node.sessionEpoch(), List.of(new Messages.StorageUsage(0, 1_000_000)),
-                0, completedCommands), coordinator::onCommandCompleted);
+                0, completedCommands),
+                (nodeId, incMsb, incLsb, sessionEpoch, completion) -> {
+                    coordinator.onCommandCompleted(nodeId, completion);
+                    return CompletableFuture.completedFuture(null);
+                });
     }
 
     private static Messages.InventoryReport inventory(Registered node, List<Messages.InventoryEntry> entries) {
