@@ -2,6 +2,7 @@ package io.strata.it;
 
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
+import io.strata.client.StrataFile;
 import io.strata.common.ScpException;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -42,7 +43,11 @@ class RecoveryDivergenceTest {
             }
 
             try (var reader = client.openById(setup.fileId()).openForRead()) {
-                assertArrayEquals("AAAA".getBytes(), reader.read(0, 4).data());
+                try (StrataFile.ReadResult rr = reader.read(0, 4)) {
+                    byte[] got = new byte[rr.length()];
+                    rr.buffer().get(got);
+                    assertArrayEquals("AAAA".getBytes(), got);
+                }
             }
         }
     }

@@ -2,6 +2,7 @@ package io.strata.it;
 
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
+import io.strata.client.StrataFile;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
 import io.strata.proto.Messages;
@@ -149,7 +150,11 @@ class RecoveryCatchUpTest {
             assertTrue(lookup.chunks().get(0).replicas().stream().noneMatch(r -> r.nodeId() == shortReplica));
 
             try (var reader = client.openById(fileId).openForRead()) {
-                assertEquals("AAAABBBB", new String(reader.read(0, 16).data(), StandardCharsets.UTF_8));
+                try (StrataFile.ReadResult rr = reader.read(0, 16)) {
+                    byte[] got = new byte[rr.length()];
+                    rr.buffer().get(got);
+                    assertEquals("AAAABBBB", new String(got, StandardCharsets.UTF_8));
+                }
             }
         }
     }

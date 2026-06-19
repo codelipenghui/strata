@@ -62,37 +62,47 @@ final class ReaderImpl implements StrataFile.Reader {
                 if (fileOffset < chunkEnd) {
                     long chunkOffset = fileOffset - base;
                     int want = (int) Math.min(maxBytes, chunk.length() - chunkOffset);
-                    byte[] data = readFromReplicas(chunk, chunkOffset, want, false);
+                    Borrowed b = readFromReplicas(chunk, chunkOffset, want, false);
+                    // Ownership of b.owner() has transferred to us here; everything between this
+                    // point and wrapping it in the (AutoCloseable) ReadResult must stay
+                    // allocation/throw-free, or the borrowed pooled buffer leaks before any caller
+                    // can close it.
                     boolean eof = f.fileState() == FileState.SEALED.value && last
-                            && fileOffset + data.length == chunkEnd;
-                    return new StrataFile.ReadResult(data, eof);
+                            && fileOffset + b.view().remaining() == chunkEnd;
+                    return new StrataFile.ReadResult(b.view(), eof, b.owner());
                 }
                 base = chunkEnd;
             } else {
-                // open chunk: serve [fileOffset-base, durableOffset)
                 long chunkOffset = fileOffset - base;
-                byte[] data = readFromReplicas(chunk, chunkOffset, maxBytes, true);
-                return new StrataFile.ReadResult(data, false);
+                Borrowed b = readFromReplicas(chunk, chunkOffset, maxBytes, true);
+                return new StrataFile.ReadResult(b.view(), false, b.owner());
             }
         }
         boolean eof = f.fileState() == FileState.SEALED.value;
-        return new StrataFile.ReadResult(new byte[0], eof);
+        return StrataFile.ReadResult.empty(eof);
     }
 
-    private byte[] readFromReplicas(Messages.ChunkInfo chunk, long offset, int maxBytes, boolean open) {
+    private record Borrowed(Frame owner, ByteBuffer view) {}
+
+    private Borrowed readFromReplicas(Messages.ChunkInfo chunk, long offset, int maxBytes, boolean open) {
         List<Messages.Replica> replicas = chunk.replicas();
         if (replicas.isEmpty()) {
             throw new ScpException(ErrorCode.INTERNAL, "no readable replica");
         }
-        // spread the first attempt across replicas without copying/shuffling the list per read
         int start = ThreadLocalRandom.current().nextInt(replicas.size());
         byte[] readHeader = new Messages.Read(chunk.chunkId(), offset, maxBytes).encode();
         ScpException last = null;
         for (int i = 0; i < replicas.size(); i++) {
             Messages.Replica r = replicas.get((start + i) % replicas.size());
             if (r.endpoint().isEmpty()) continue;
+            // The borrowed call stays INSIDE the try so a per-replica connection/RPC failure is
+            // caught below (last = e) and the loop fails over to the next replica — matching the
+            // pre-borrow read path. Hoisting it out would abort the whole read on the first
+            // unreachable replica instead of failing over.
+            Frame frame = null;
+            boolean transferred = false;
             try {
-                Frame frame = connectionFor(r.endpoint()).callFrame(Opcode.READ,
+                frame = connectionFor(r.endpoint()).callFrameBorrowed(Opcode.READ,
                         readHeader, null, config.callTimeoutMs());
                 ByteBuffer h = frame.headerSlice();
                 Resp.check(h);
@@ -104,8 +114,6 @@ final class ReaderImpl implements StrataFile.Reader {
                     continue;
                 }
                 if (!open && resp.localEndOffset() < chunk.length()) {
-                    // a sealed chunk must be served whole: a replica shorter than the descriptor
-                    // (seal straggler not yet reconciled away) would return truncated data
                     last = new ScpException(io.strata.common.ErrorCode.CORRUPT_CHUNK,
                             "replica " + r.nodeId() + " short for sealed chunk " + chunk.chunkId()
                                     + ": " + resp.localEndOffset() + " < " + chunk.length());
@@ -123,22 +131,26 @@ final class ReaderImpl implements StrataFile.Reader {
                                     + frame.payloadLength() + " != " + maxBytes);
                     continue;
                 }
-                byte[] data = new byte[frame.payloadLength()];
-                frame.payloadSlice().get(data);
+                ByteBuffer view = frame.payloadSlice();
                 if (open) {
-                    // never expose bytes above the replica-known durable offset
+                    // never expose bytes above the replica-known durable offset (limit, not copy)
                     long readable = Math.min(resp.localEndOffset(), resp.durableOffset());
                     long visible = Math.max(0, readable - offset);
-                    if (data.length > visible) {
-                        data = java.util.Arrays.copyOf(data, (int) visible);
+                    if (view.remaining() > visible) {
+                        view.limit(view.position() + (int) visible);
                     }
                 }
-                return data;
+                transferred = true;
+                return new Borrowed(frame, view);
             } catch (ScpException e) {
                 last = e;
             } catch (RuntimeException e) {
                 last = new ScpException(ErrorCode.CORRUPT_CHUNK,
                         "malformed read response from replica " + r.nodeId() + ": " + e);
+            } finally {
+                // frame is null when callFrameBorrowed itself threw (nothing to release); otherwise
+                // release on validation failure / exception / continue. Success sets transferred.
+                if (!transferred && frame != null) frame.close();
             }
         }
         throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no readable replica");

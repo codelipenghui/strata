@@ -70,13 +70,17 @@ class EndToEndTest {
             workload.appendAcked(appender, 0, 50);
 
             try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
-                var r = reader.read(0, 1 << 20);
-                // open-chunk read is clamped to the replica-known DO (may lag by one append round)
-                assertTrue(r.data().length <= workload.ackedBytes(),
-                        "read beyond acked bytes: " + r.data().length + " > " + workload.ackedBytes());
-                byte[] expected = new byte[r.data().length];
-                System.arraycopy(Workload.readAll(client, fileId, 0), 0, expected, 0, r.data().length);
-                assertArrayEquals(expected, r.data());
+                try (StrataFile.ReadResult r = reader.read(0, 1 << 20)) {
+                    int n = r.length();
+                    // open-chunk read is clamped to the replica-known DO (may lag by one append round)
+                    assertTrue(n <= workload.ackedBytes(),
+                            "read beyond acked bytes: " + n + " > " + workload.ackedBytes());
+                    byte[] got = new byte[n];
+                    r.buffer().get(got);
+                    byte[] expected = new byte[n];
+                    System.arraycopy(Workload.readAll(client, fileId, 0), 0, expected, 0, n);
+                    assertArrayEquals(expected, got);
+                }
             }
             appender.seal();
         }

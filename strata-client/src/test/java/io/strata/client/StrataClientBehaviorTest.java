@@ -248,18 +248,20 @@ class StrataClientBehaviorTest {
                     List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
                             new Messages.Replica(1, endpoint(storage))))));
             try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
-                StrataFile.ReadResult result = reader.read(0, 10);
-                assertArrayEquals(new byte[] {1, 2, 3}, result.data());
-                assertEquals(true, result.endOfFile());
+                try (StrataFile.ReadResult result = reader.read(0, 10)) {
+                    assertArrayEquals(new byte[] {1, 2, 3}, drain(result.buffer()));
+                    assertEquals(true, result.endOfFile());
+                }
             }
 
             lookup.set(new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 0,
                     List.of(chunk(chunkId, ChunkState.OPEN, 0, 0, 1,
                             new Messages.Replica(1, endpoint(storage))))));
             try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
-                StrataFile.ReadResult result = reader.read(0, 4);
-                assertArrayEquals(new byte[] {4, 5}, result.data());
-                assertEquals(false, result.endOfFile());
+                try (StrataFile.ReadResult result = reader.read(0, 4)) {
+                    assertArrayEquals(new byte[] {4, 5}, drain(result.buffer()));
+                    assertEquals(false, result.endOfFile());
+                }
             }
 
             lookup.set(new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1,
@@ -354,6 +356,12 @@ class StrataClientBehaviorTest {
                         assertThrows(ScpException.class, () -> reader.read(0, 3)).code());
             }
         }
+    }
+
+    private static byte[] drain(java.nio.ByteBuffer b) {
+        byte[] a = new byte[b.remaining()];
+        b.get(a);
+        return a;
     }
 
     private static ScpServer metadataServer(AtomicReference<Messages.LookupFileResp> lookup) throws Exception {

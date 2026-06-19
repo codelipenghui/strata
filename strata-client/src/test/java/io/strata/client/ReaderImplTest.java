@@ -5,6 +5,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.proto.Frame;
 import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -59,11 +60,15 @@ class ReaderImplTest {
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
 
-                assertTrue(reader.read(0, 1).endOfFile());
+                try (StrataFile.ReadResult r = reader.read(0, 1)) {
+                    assertTrue(r.endOfFile());
+                }
 
                 lookup.set(new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 0, List.of()));
                 reader.refresh();
-                assertFalse(reader.read(0, 1).endOfFile());
+                try (StrataFile.ReadResult r = reader.read(0, 1)) {
+                    assertFalse(r.endOfFile());
+                }
             }
         }
     }
@@ -82,9 +87,10 @@ class ReaderImplTest {
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
 
-                StrataFile.ReadResult result = reader.read(0, 3);
-                assertArrayEquals(new byte[] {1, 2, 3}, result.data());
-                assertFalse(result.endOfFile());
+                try (StrataFile.ReadResult result = reader.read(0, 3)) {
+                    assertArrayEquals(new byte[] {1, 2, 3}, drain(result.buffer()));
+                    assertFalse(result.endOfFile());
+                }
             }
         }
     }
@@ -149,9 +155,10 @@ class ReaderImplTest {
             try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
 
-                StrataFile.ReadResult result = reader.read(0, 4);
-                assertArrayEquals(new byte[] {1, 2, 3, 4}, result.data());
-                assertFalse(result.endOfFile());
+                try (StrataFile.ReadResult result = reader.read(0, 4)) {
+                    assertArrayEquals(new byte[] {1, 2, 3, 4}, drain(result.buffer()));
+                    assertFalse(result.endOfFile());
+                }
             }
         }
     }
@@ -172,12 +179,16 @@ class ReaderImplTest {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
                 String replicaEndpoint = endpoint(replica);
 
-                assertArrayEquals(new byte[] {7}, reader.read(0, 1).data());
+                try (StrataFile.ReadResult rr = reader.read(0, 1)) {
+                    assertArrayEquals(new byte[] {7}, drain(rr.buffer()));
+                }
                 ManagedScpConnection pinned = pinnedConnection(reader, replicaEndpoint);
                 assertNotNull(pinned);
                 assertSame(pinned, pinnedConnection(reader, replicaEndpoint));
 
-                assertArrayEquals(new byte[] {7}, reader.read(0, 1).data());
+                try (StrataFile.ReadResult rr = reader.read(0, 1)) {
+                    assertArrayEquals(new byte[] {7}, drain(rr.buffer()));
+                }
                 assertSame(pinned, pinnedConnection(reader, replicaEndpoint));
                 assertNotSame(pinned, pool.get(replicaEndpoint),
                         "a reader must reuse its pinned connection instead of round-robining per read");
@@ -202,8 +213,12 @@ class ReaderImplTest {
                 ReaderImpl second = new ReaderImpl(meta, pool, config, fileId);
                 String replicaEndpoint = endpoint(replica);
 
-                assertArrayEquals(new byte[] {9}, first.read(0, 1).data());
-                assertArrayEquals(new byte[] {9}, second.read(0, 1).data());
+                try (StrataFile.ReadResult firstRead = first.read(0, 1)) {
+                    assertArrayEquals(new byte[] {9}, drain(firstRead.buffer()));
+                }
+                try (StrataFile.ReadResult secondRead = second.read(0, 1)) {
+                    assertArrayEquals(new byte[] {9}, drain(secondRead.buffer()));
+                }
 
                 assertNotSame(pinnedConnection(first, replicaEndpoint),
                         pinnedConnection(second, replicaEndpoint),
@@ -264,6 +279,70 @@ class ReaderImplTest {
                 ScpException e = assertThrows(ScpException.class, () -> reader.read(0, 3));
                 assertEquals(ErrorCode.CORRUPT_CHUNK, e.code());
             }
+        }
+    }
+
+    private static byte[] drain(java.nio.ByteBuffer b) {
+        byte[] a = new byte[b.remaining()];
+        b.get(a);
+        return a;
+    }
+
+    @Test
+    void borrowedReadReleasesPooledBufferOnClose() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        try (ScpServer replica = readReplica(new Messages.ReadResp(3, 3), new byte[] {1, 2, 3});
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 0,
+                             List.of(chunk(chunkId, ChunkState.SEALED, 3,
+                                     new Messages.Replica(1, endpoint(replica)))))))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+                ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
+                StrataFile.ReadResult result = reader.read(0, 3);
+                Frame owner = (Frame) result.releaseHandleForTest();
+                assertTrue(owner.ownsBuffer());
+                assertTrue(owner.ownerRefCnt() > 0, "buffer live before close");
+                assertArrayEquals(new byte[] {1, 2, 3}, drain(result.buffer()));
+                result.close();
+                assertEquals(0, owner.ownerRefCnt(), "close releases the pooled buffer");
+                result.close(); // idempotent
+                assertEquals(0, owner.ownerRefCnt());
+            }
+        }
+    }
+
+    @Test
+    void readFailsOverToHealthyReplicaWhenAnotherIsUnreachable() throws Exception {
+        FileId fileId = FileId.random();
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        String deadEndpoint = unusedEndpoint(); // nothing listening -> Connection refused
+        try (ScpServer replica = readReplica(new Messages.ReadResp(3, 3), new byte[] {1, 2, 3});
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 0,
+                             List.of(chunk(chunkId, ChunkState.SEALED, 3,
+                                     new Messages.Replica(1, deadEndpoint),
+                                     new Messages.Replica(2, endpoint(replica)))))))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+                ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
+                // readFromReplicas picks a random start replica, so repeat enough that the
+                // unreachable replica is tried first at least once; every read must still
+                // succeed by failing over to the healthy replica.
+                for (int i = 0; i < 24; i++) {
+                    try (StrataFile.ReadResult result = reader.read(0, 3)) {
+                        assertArrayEquals(new byte[] {1, 2, 3}, drain(result.buffer()),
+                                "read must fail over to the healthy replica (iteration " + i + ")");
+                    }
+                }
+            }
+        }
+    }
+
+    private static String unusedEndpoint() throws java.io.IOException {
+        try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
+            return "127.0.0.1:" + s.getLocalPort(); // closed on return -> port refuses connections
         }
     }
 

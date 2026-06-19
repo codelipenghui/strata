@@ -55,11 +55,16 @@ final class BinaryWorkload {
         } catch (RuntimeException e) {
             throw new AssertionError(context + " read failed", e);
         }
-        assertTrue(result.data().length <= expectedBytes.length,
-                context + " read exposed " + result.data().length
-                        + " bytes above acked " + expectedBytes.length);
-        assertArrayEquals(Arrays.copyOf(expectedBytes, result.data().length), result.data(),
-                context + " read returned a non-prefix");
+        try (result) {
+            int n = result.length();
+            assertTrue(n <= expectedBytes.length,
+                    context + " read exposed " + n
+                            + " bytes above acked " + expectedBytes.length);
+            byte[] got = new byte[n];
+            result.buffer().get(got);
+            assertArrayEquals(Arrays.copyOf(expectedBytes, n), got,
+                    context + " read returned a non-prefix");
+        }
     }
 
     void verifySealedAckedPrefix(StrataClient client, FileId fileId, String context) {

@@ -918,6 +918,68 @@ class ClientServerTest {
         }
     }
 
+    @Test
+    void callFrameBorrowedRetainsBufferUntilClosed() throws Exception {
+        byte[] body = "borrowed-payload".getBytes();
+        try (ScpServer server = new ScpServer(0, 1, 0xA, 0xB, req -> {
+                if (Opcode.fromCode(req.opcode()) == Opcode.PING) {
+                    return ScpServer.ok(req, Messages.okHeader(), ByteBuffer.wrap(body));
+                }
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "nope");
+             });
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
+
+            Frame borrowed = client.callFrameBorrowed(Opcode.PING, emptyHeader(), ByteBuffer.wrap(body), 2000);
+            try {
+                assertTrue(borrowed.ownsBuffer(), "borrowed response must retain the pooled buffer");
+                assertTrue(borrowed.ownerRefCnt() > 0, "buffer must be live before close");
+                byte[] got = new byte[borrowed.payloadLength()];
+                borrowed.payloadSlice().get(got);
+                assertArrayEquals(body, got);
+            } finally {
+                borrowed.close();
+            }
+            assertEquals(0, borrowed.ownerRefCnt(), "close() must release the pooled buffer");
+        }
+    }
+
+    @Test
+    void managedCallFrameBorrowedRetainsBufferUntilClosed() throws Exception {
+        byte[] body = "managed-borrow".getBytes();
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
+                if (Opcode.fromCode(req.opcode()) == Opcode.PING) {
+                    return ScpServer.ok(req, Messages.okHeader(), ByteBuffer.wrap(body));
+                }
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+             });
+             ManagedScpConnection conn = managed(endpoint(server), 1_000, 1_000, 10_000)) {
+            Frame borrowed = conn.callFrameBorrowed(Opcode.PING, emptyHeader(), ByteBuffer.wrap(body), 2000);
+            try {
+                assertTrue(borrowed.ownsBuffer());
+                byte[] got = new byte[borrowed.payloadLength()];
+                borrowed.payloadSlice().get(got);
+                assertArrayEquals(body, got);
+            } finally {
+                borrowed.close();
+            }
+            assertEquals(0, borrowed.ownerRefCnt());
+        }
+    }
+
+    @Test
+    void nonBorrowResponsesStillCopyToHeap() throws Exception {
+        try (ScpServer server = new ScpServer(0, 1, 0xA, 0xB, req -> {
+                if (Opcode.fromCode(req.opcode()) == Opcode.PING) {
+                    return ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
+                }
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "nope");
+             });
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
+            Frame resp = client.callFrame(Opcode.PING, emptyHeader(), ByteBuffer.wrap("x".getBytes()), 2000);
+            assertFalse(resp.ownsBuffer(), "non-borrow client responses must not retain Netty buffers");
+        }
+    }
+
     private static int availablePendingPermits(ScpClient client) throws Exception {
         Field field = ScpClient.class.getDeclaredField("pendingPermits");
         field.setAccessible(true);

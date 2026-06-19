@@ -86,16 +86,20 @@ final class Workload {
             long offset = 0;
             int idleRounds = 0;
             while (idleRounds < 3) {
-                StrataFile.ReadResult r = reader.read(offset, 1 << 20);
-                if (r.data().length > 0) {
-                    out.write(r.data(), 0, r.data().length);
-                    offset += r.data().length;
-                    idleRounds = 0;
-                } else if (r.endOfFile() || out.size() >= atLeast) {
-                    break;
-                } else {
-                    idleRounds++;
-                    reader.refresh();
+                try (StrataFile.ReadResult r = reader.read(offset, 1 << 20)) {
+                    int n = r.length();
+                    if (n > 0) {
+                        byte[] tmp = new byte[n];
+                        r.buffer().get(tmp);
+                        out.write(tmp, 0, n);
+                        offset += n;
+                        idleRounds = 0;
+                    } else if (r.endOfFile() || out.size() >= atLeast) {
+                        break;
+                    } else {
+                        idleRounds++;
+                        reader.refresh();
+                    }
                 }
             }
             return out.toByteArray();
