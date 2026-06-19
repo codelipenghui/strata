@@ -13,12 +13,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 
 /**
@@ -41,9 +41,12 @@ final class NodeRegistry {
         // repair-scan thread, heartbeat handler threads, and register. ReentrantLock (not
         // synchronized) so the ZK I/O inside the critical section does not pin a virtual thread.
         final java.util.concurrent.locks.ReentrantLock lock = new java.util.concurrent.locks.ReentrantLock();
-        // Session gate serializes long heartbeat completion processing against same-node
+        // Session gate serializes heartbeat validation/completion staging against same-node
         // re-registration without holding the state lock across metadata-store callbacks.
         final ReentrantReadWriteLock sessionGate = new ReentrantReadWriteLock();
+        // Guarded by lock. Completion work runs off the heartbeat thread, but commands reported in a
+        // heartbeat must take effect before later commands are delivered to the same node.
+        CompletableFuture<Void> completionBarrier = CompletableFuture.completedFuture(null);
 
         boolean alive(long now) {
             return record.state() == Records.NodeState.REGISTERED && leaseUntil >= now;
@@ -55,16 +58,26 @@ final class NodeRegistry {
     private final Map<Integer, LiveNode> live = new ConcurrentHashMap<>();
     private final AtomicLong sessionCounter = new AtomicLong(System.currentTimeMillis());
 
+    @FunctionalInterface
+    interface CompletionSink {
+        CompletableFuture<Void> accept(int nodeId, long incMsb, long incLsb, long sessionEpoch,
+                                       Messages.CompletedCommand completion);
+    }
+
     NodeRegistry(MetadataStore store, MetaConfig config) throws Exception {
         this.store = store;
         this.config = config;
-        // warm the in-memory view from persisted registrations (their leases start expired)
+        // Warm persisted registrations as SUSPECT rather than DEAD. A metadata failover resets
+        // in-memory leases; placement can still probe these nodes during dead-grace while fresh
+        // heartbeats/reregistrations catch up.
+        long warmedLeaseUntil = System.currentTimeMillis() - 1;
         for (MetadataStore.Versioned<Records.NodeRecord> v : store.listNodes()) {
             LiveNode n = new LiveNode();
             n.record = v.value();
             n.recordVersion = v.version();
             n.sessionEpoch = -1;
-            n.leaseUntil = 0;
+            n.leaseUntil = warmedLeaseUntil;
+            n.freeBytes = n.record.capacityBytes();
             live.put(v.value().nodeId(), n);
         }
     }
@@ -208,8 +221,7 @@ final class NodeRegistry {
         }
     }
 
-    Messages.HeartbeatResp heartbeat(Messages.NodeHeartbeat msg,
-                                     BiConsumer<Integer, Messages.CompletedCommand> onCompleted) {
+    Messages.HeartbeatResp heartbeat(Messages.NodeHeartbeat msg, CompletionSink onCompleted) {
         LiveNode n = live.get(msg.nodeId());
         if (n == null) {
             throw new ScpException(ErrorCode.NOT_REGISTERED, "node " + msg.nodeId());
@@ -247,8 +259,11 @@ final class NodeRegistry {
             }
 
             FailureInjector.point("meta.heartbeat.beforeCompletions");
+            List<CompletableFuture<Void>> completions = new ArrayList<>(msg.completedCommands().size());
             for (Messages.CompletedCommand c : msg.completedCommands()) {
-                onCompleted.accept(msg.nodeId(), c);
+                CompletableFuture<Void> done = onCompleted.accept(
+                        msg.nodeId(), msg.incMsb(), msg.incLsb(), msg.sessionEpoch(), c);
+                completions.add(done == null ? CompletableFuture.completedFuture(null) : done);
             }
 
             long newLeaseUntil;
@@ -257,10 +272,13 @@ final class NodeRegistry {
                 validateCurrentSessionLocked(n, msg);
                 newLeaseUntil = System.currentTimeMillis() + config.leaseMs();
                 n.leaseUntil = newLeaseUntil;
-                for (int i = 0; i < MAX_COMMANDS_PER_HEARTBEAT; i++) {
-                    Messages.Command c = n.pending.poll();
-                    if (c == null) break;
-                    out.add(c);
+                CompletableFuture<Void> commandBarrier = commandDeliveryBarrierLocked(n, completions);
+                if (commandBarrier.isDone()) {
+                    for (int i = 0; i < MAX_COMMANDS_PER_HEARTBEAT; i++) {
+                        Messages.Command c = n.pending.poll();
+                        if (c == null) break;
+                        out.add(c);
+                    }
                 }
             } finally {
                 n.lock.unlock();
@@ -269,6 +287,21 @@ final class NodeRegistry {
         } finally {
             sessionRead.unlock();
         }
+    }
+
+    private static CompletableFuture<Void> commandDeliveryBarrierLocked(
+            LiveNode n, List<CompletableFuture<Void>> completions) {
+        if (!completions.isEmpty()) {
+            CompletableFuture<?>[] batch = completions.stream()
+                    .map(future -> future.exceptionally(t -> null))
+                    .toArray(CompletableFuture[]::new);
+            CompletableFuture<Void> currentBatch = CompletableFuture.allOf(batch)
+                    .exceptionally(t -> null);
+            n.completionBarrier = n.completionBarrier
+                    .thenCompose(ignored -> currentBatch)
+                    .exceptionally(t -> null);
+        }
+        return n.completionBarrier;
     }
 
     private static void validateCurrentSessionLocked(LiveNode n, Messages.NodeHeartbeat msg) {
@@ -384,11 +417,29 @@ final class NodeRegistry {
 
     /**
      * Nodes eligible to hold a replica for {@code namespace}. The per-namespace placement hook: today
-     * every alive node is eligible (namespace-agnostic), but this is where a future per-tenant
-     * affinity/isolation policy (e.g. namespace pinned to a node set) would filter candidates.
+     * every REGISTERED node still inside dead-grace is eligible (namespace-agnostic), but this is
+     * where a future per-tenant affinity/isolation policy would filter candidates. Placement includes
+     * suspect nodes because metadata heartbeat stalls and leader failover should not make storage
+     * nodes disappear before the dead-grace window; the subsequent node RPC is the real liveness
+     * probe for creating the replica.
      */
     List<LiveNode> candidatesFor(StrataNamespace namespace) {
-        return aliveNodes();
+        long now = System.currentTimeMillis();
+        List<LiveNode> out = new ArrayList<>();
+        for (LiveNode n : live.values()) {
+            if (placementEligible(n, now)) {
+                out.add(n);
+            }
+        }
+        return out;
+    }
+
+    private boolean placementEligible(LiveNode n, long now) {
+        if (n.record.state() != Records.NodeState.REGISTERED) {
+            return false;
+        }
+        long graceDeadline = n.leaseUntil + config.deadGraceMs();
+        return graceDeadline >= now || graceDeadline < n.leaseUntil;
     }
 
     boolean isDead(int nodeId) {
@@ -451,7 +502,7 @@ final class NodeRegistry {
             loaded.record = persisted.get().value();
             loaded.recordVersion = persisted.get().version();
             loaded.sessionEpoch = -1;
-            loaded.leaseUntil = 0;
+            loaded.leaseUntil = System.currentTimeMillis() - 1;
             loaded.freeBytes = loaded.record.capacityBytes();
             LiveNode raced = live.putIfAbsent(nodeId, loaded);
             return raced != null ? raced : loaded;

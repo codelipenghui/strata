@@ -1,18 +1,21 @@
 package io.strata.format;
 
 import io.strata.common.ChunkId;
+import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Random;
 import java.util.zip.CRC32C;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -93,6 +96,31 @@ class ChunkStoreWritebackTest {
             store.append(id, 1, 0, 0, ByteBuffer.wrap(new byte[1 * MIB])); // < 4 MiB threshold
             store.backgroundFlushOnce();
             assertEquals(0, store.backgroundFlushes(), "a chunk below the threshold should not be flushed");
+        }
+    }
+
+    @Test
+    void deleteDoesNotLeaveClosedOpenHandleEligibleForWriteback() throws IOException {
+        ChunkStore store = new ChunkStore(dir);
+        try {
+            store.open(id, false, 1, 1718000000000L);
+            store.append(id, 1, 0, 0, ByteBuffer.wrap(new byte[6 * MIB]));
+
+            String base = ChunkFormats.baseName(id);
+            Files.delete(dir.resolve(base + ".chunk"));
+            Files.delete(dir.resolve(base + ".meta"));
+            Files.delete(dir.resolve(base + ".j"));
+            Files.delete(dir);
+
+            assertEquals(ErrorCode.OK, store.delete(id),
+                    "delete should remove the closed handle even when files disappeared first");
+            assertEquals(0, store.backgroundFlushes());
+            assertDoesNotThrow(store::backgroundFlushOnce,
+                    "delete must not leave a closed channel in the OPEN writeback set");
+            assertEquals(0, store.backgroundFlushes());
+        } finally {
+            Files.createDirectories(dir);
+            store.close();
         }
     }
 

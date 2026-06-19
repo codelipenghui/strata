@@ -14,7 +14,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -56,9 +60,14 @@ final class RepairCoordinator implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicLong commandIds = new AtomicLong(System.currentTimeMillis());
     private final Map<Long, Action> inflight = new ConcurrentHashMap<>();
-    // (nodeId:chunkId) -> first time the node's inventory omitted a sealed chunk it should hold. A
-    // just-sealed chunk can miss the in-flight inventory snapshot; only drop the replica if it stays
-    // missing past config.replicaMissingGraceMs(), so churn can't trigger a false re-replication storm.
+    private final ExecutorService deleteDispatchExecutor = Executors.newSingleThreadExecutor(
+            Thread.ofVirtual().name("meta-delete-dispatch-", 0).factory());
+    private final ExecutorService completionExecutor = Executors.newSingleThreadExecutor(
+            Thread.ofVirtual().name("meta-command-completion-", 0).factory());
+    // (nodeId:chunkId) -> first time the node's inventory reported a sealed replica unhealthy
+    // (missing or still locally OPEN/DELETING). A just-sealed chunk can race with an in-flight
+    // inventory snapshot; only drop the replica if it stays unhealthy past the grace, so churn can't
+    // falsely remove every good replica and trigger a re-replication storm.
     private final Map<String, Long> replicaMissingSince = new ConcurrentHashMap<>();
     private final Set<ChunkId> chunksBeingRepaired = ConcurrentHashMap.newKeySet();
     private final Map<ReplicaKey, Long> recentlyCommittedReplicas = new ConcurrentHashMap<>();
@@ -292,6 +301,14 @@ final class RepairCoordinator implements AutoCloseable {
         }
     }
 
+    void driveDeletionSoon(FileId fileId) {
+        try {
+            deleteDispatchExecutor.execute(() -> driveDeletionNow(fileId));
+        } catch (RuntimeException e) {
+            log.warn("prompt delete dispatch for {} was not scheduled — background scan will retry", fileId, e);
+        }
+    }
+
     private void driveDeletion(Records.FileRecord file, int version) throws Exception {
         for (Records.ChunkRecord chunk : file.chunks()) {
             ChunkId chunkId = file.chunkId(chunk.index());
@@ -330,7 +347,42 @@ final class RepairCoordinator implements AutoCloseable {
         }
     }
 
-    /** Called from heartbeat handling with each node-reported command completion. */
+    /**
+     * Called from heartbeat handling with each node-reported command completion. The heartbeat request
+     * thread only enqueues the work; descriptor CAS/delete-confirmation I/O runs on the completion worker.
+     */
+    CompletableFuture<Void> onCommandCompletedAsync(int reportingNode, long incMsb, long incLsb, long sessionEpoch,
+                                                    Messages.CompletedCommand completion) {
+        if (closed.get()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        CompletableFuture<Void> done = new CompletableFuture<>();
+        try {
+            completionExecutor.execute(() -> {
+                try {
+                    if (closed.get()) {
+                        return;
+                    }
+                    if (!registry.isCurrentSession(reportingNode, incMsb, incLsb, sessionEpoch)) {
+                        log.debug("ignoring cmd {} completion from stale or non-live node {}",
+                                completion.commandId(), reportingNode);
+                        return;
+                    }
+                    onCommandCompleted(reportingNode, completion);
+                } finally {
+                    done.complete(null);
+                }
+            });
+        } catch (RuntimeException e) {
+            if (!closed.get()) {
+                log.warn("scheduling completion {} failed — next scan reconciles", completion.commandId(), e);
+            }
+            return CompletableFuture.completedFuture(null);
+        }
+        return done;
+    }
+
+    /** Applies a validated node-reported command completion. */
     void onCommandCompleted(int reportingNode, Messages.CompletedCommand completion) {
         Action action = inflight.get(completion.commandId());
         if (action == null) return;
@@ -510,29 +562,29 @@ final class RepairCoordinator implements AutoCloseable {
                     String missKey = report.nodeId() + ":" + chunkId;
                     Messages.InventoryEntry entry = reported.get(chunkId);
                     if (entry == null) {
-                        // A node can omit a just-sealed chunk from an in-flight inventory snapshot; under
-                        // churn that race would falsely drop a healthy replica and trigger a re-replication
-                        // storm that steals write bandwidth. Only treat it as lost if it stays missing past
-                        // the grace (genuine loss is still caught, just one or two reports later).
-                        Long firstMissing = replicaMissingSince.putIfAbsent(missKey, now);
-                        long missingForMs = firstMissing == null ? 0 : now - firstMissing;
-                        if (missingForMs >= config.replicaMissingGraceMs()) {
+                        // A node can omit a just-sealed chunk from an in-flight inventory snapshot.
+                        if (replicaUnhealthyPastGrace(missKey, now)) {
                             log.warn("node {} lost sealed chunk {} (missing >= {}ms) — dropping replica for re-repair",
                                     report.nodeId(), chunkId, config.replicaMissingGraceMs());
                             replicaMissingSince.remove(missKey);
                             applyDeleteConfirmed(fileId, chunkId, report.nodeId());
                         }
                     } else {
-                        replicaMissingSince.remove(missKey); // reported now — clear any pending miss
                         if (entry.state() != ChunkState.SEALED) {
-                            // A non-SEALED local state under a SEALED descriptor cannot serve reads or
-                            // repair fetches. Drop it like a corrupt copy and delete the local bytes.
-                            log.warn("node {} holds {} copy of sealed chunk {} — dropping replica "
-                                    + "for re-repair", report.nodeId(), entry.state(), chunkId);
-                            applyDeleteConfirmed(fileId, chunkId, report.nodeId());
-                            registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
-                                    commandIds.incrementAndGet(), List.of(chunkId)));
+                            // A just-sealed chunk can still appear OPEN in an inventory snapshot that
+                            // started before local seal completed. Give it the same grace as a missing
+                            // report; persistent non-SEALED state is then treated like corruption.
+                            if (replicaUnhealthyPastGrace(missKey, now)) {
+                                log.warn("node {} holds {} copy of sealed chunk {} for >= {}ms — dropping replica "
+                                                + "for re-repair", report.nodeId(), entry.state(), chunkId,
+                                        config.replicaMissingGraceMs());
+                                replicaMissingSince.remove(missKey);
+                                applyDeleteConfirmed(fileId, chunkId, report.nodeId());
+                                registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
+                                        commandIds.incrementAndGet(), List.of(chunkId)));
+                            }
                         } else if (entry.length() != c.length() || entry.crc() != c.crc()) {
+                            replicaMissingSince.remove(missKey); // definitely reported; this copy is corrupt
                             log.warn("node {} holds corrupt sealed chunk {} (len {}/{} crc {}/{}) — "
                                             + "dropping replica for re-repair", report.nodeId(), chunkId,
                                     entry.length(), c.length(), entry.crc(), c.crc());
@@ -542,6 +594,8 @@ final class RepairCoordinator implements AutoCloseable {
                             // (FIFO command delivery guarantees delete-before-replicate)
                             registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
                                     commandIds.incrementAndGet(), List.of(chunkId)));
+                        } else {
+                            replicaMissingSince.remove(missKey); // healthy report — clear any pending anomaly
                         }
                     }
                 }
@@ -549,6 +603,12 @@ final class RepairCoordinator implements AutoCloseable {
         } catch (Exception e) {
             log.warn("inventory reconciliation for node {} failed", report.nodeId(), e);
         }
+    }
+
+    private boolean replicaUnhealthyPastGrace(String key, long now) {
+        Long firstUnhealthy = replicaMissingSince.putIfAbsent(key, now);
+        long unhealthyForMs = firstUnhealthy == null ? 0 : now - firstUnhealthy;
+        return unhealthyForMs >= config.replicaMissingGraceMs();
     }
 
     private boolean isRepairProtected(ChunkId chunkId, int nodeId) {
@@ -604,6 +664,21 @@ final class RepairCoordinator implements AutoCloseable {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+        deleteDispatchExecutor.shutdown();
+        completionExecutor.shutdown();
+        awaitTermination(deleteDispatchExecutor);
+        awaitTermination(completionExecutor);
+    }
+
+    private static void awaitTermination(ExecutorService executor) {
+        try {
+            if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
         }
     }
 }

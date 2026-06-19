@@ -265,7 +265,7 @@ public final class MetadataService implements AutoCloseable {
 
             case NODE_HEARTBEAT -> {
                 var m = Messages.NodeHeartbeat.decode(h);
-                yield ScpServer.ok(req, registry.heartbeat(m, repair::onCommandCompleted).encode(), null);
+                yield ScpServer.ok(req, registry.heartbeat(m, repair::onCommandCompletedAsync).encode(), null);
             }
 
             case INVENTORY_REPORT -> {
@@ -359,7 +359,7 @@ public final class MetadataService implements AutoCloseable {
                 for (FileId id : m.fileIds()) {
                     try {
                         markDeleting(id);
-                        repair.driveDeletionNow(id); // reclaim chunks now, not via the slow background scan
+                        repair.driveDeletionSoon(id); // prompt reclaim, but don't block metadata delete responses
                         codes.add(ErrorCode.OK.code);
                     } catch (ScpException e) {
                         codes.add(e.code().code);

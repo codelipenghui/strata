@@ -30,7 +30,8 @@ services:
       # Expose ZooKeeper's built-in Prometheus metrics provider on :7000 (path /metrics) so Prometheus
       # can scrape it for the "Strata — ZooKeeper" dashboard. ZOO_CFG_EXTRA is split on whitespace and
       # written one property per line into zoo.cfg, so keep each property space-separated and unbroken.
-      ZOO_CFG_EXTRA: "metricsProvider.className=org.apache.zookeeper.metrics.prometheus.PrometheusMetricsProvider metricsProvider.httpPort=7000 metricsProvider.exportJvmInfo=true"
+      # STRATA_ZK_FORCE_SYNC=no is an experimental single-host perf knob; it weakens ZK crash durability.
+      ZOO_CFG_EXTRA: "metricsProvider.className=org.apache.zookeeper.metrics.prometheus.PrometheusMetricsProvider metricsProvider.httpPort=7000 metricsProvider.exportJvmInfo=true forceSync=${STRATA_ZK_FORCE_SYNC:-yes}"
     healthcheck:
       test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
       interval: 5s
@@ -48,6 +49,9 @@ services:
       STRATA_ZK_CONNECT: "zookeeper:2181"
       STRATA_META_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
       STRATA_LISTEN_PORT: "9100"
+      STRATA_HEARTBEAT_INTERVAL_MS: "${STRATA_HEARTBEAT_INTERVAL_MS:-3000}"
+      STRATA_REPAIR_SCAN_INTERVAL_MS: "${STRATA_REPAIR_SCAN_INTERVAL_MS:-5000}"
+      STRATA_REPAIR_COMMAND_TIMEOUT_MS: "${STRATA_REPAIR_COMMAND_TIMEOUT_MS:-30000}"
       # generous liveness windows: under heavy data load a combined node's heartbeat can be delayed
       # behind the data flood on its shared SCP listener; don't let that be mistaken for a dead node
       STRATA_LEASE_MS: "60000"
@@ -57,11 +61,13 @@ services:
       STRATA_ZONE: "z0"
       STRATA_RACK: "r0"
       STRATA_DATA_DIR: "/data"
+      STRATA_SEAL_FSYNC: "${STRATA_SEAL_FSYNC:-false}"
+      STRATA_BG_FLUSH_INTERVAL_MS: "${STRATA_BG_FLUSH_INTERVAL_MS:-500}"
+      STRATA_BG_FLUSH_THRESHOLD_BYTES: "${STRATA_BG_FLUSH_THRESHOLD_BYTES:-4194304}"
       # Background-writeback knobs are tunable via STRATA_BG_FLUSH_INTERVAL_MS / _THRESHOLD_BYTES
-      # (ChunkStore defaults: 500ms / 4 MiB). The defaults are near-optimal on a SINGLE shared disk —
-      # measured: flushing more aggressively (e.g. 50ms / 512 KiB) over-subscribes the one disk's fsync
-      # budget, starving delete reclamation (disk fills) and write bandwidth. Only raise aggressiveness
-      # when each node has its own data device.
+      # (ChunkStore default: 500ms / 4 MiB). The default keeps dirty-page backlog bounded; making it
+      # much laxer can hand control to kernel dirty throttling and worsen perf write stability.
+      # Set STRATA_SEAL_FSYNC=true when sealed chunks must be forced to local disk before seal returns.
     volumes:
       - node1-data:/data
     depends_on:
@@ -75,6 +81,9 @@ services:
       STRATA_ZK_CONNECT: "zookeeper:2181"
       STRATA_META_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
       STRATA_LISTEN_PORT: "9100"
+      STRATA_HEARTBEAT_INTERVAL_MS: "${STRATA_HEARTBEAT_INTERVAL_MS:-3000}"
+      STRATA_REPAIR_SCAN_INTERVAL_MS: "${STRATA_REPAIR_SCAN_INTERVAL_MS:-5000}"
+      STRATA_REPAIR_COMMAND_TIMEOUT_MS: "${STRATA_REPAIR_COMMAND_TIMEOUT_MS:-30000}"
       STRATA_LEASE_MS: "60000"
       STRATA_DEAD_GRACE_MS: "300000"
       STRATA_ADVERTISED_HOST: "node2"
@@ -82,6 +91,9 @@ services:
       STRATA_ZONE: "z0"
       STRATA_RACK: "r1"
       STRATA_DATA_DIR: "/data"
+      STRATA_SEAL_FSYNC: "${STRATA_SEAL_FSYNC:-false}"
+      STRATA_BG_FLUSH_INTERVAL_MS: "${STRATA_BG_FLUSH_INTERVAL_MS:-500}"
+      STRATA_BG_FLUSH_THRESHOLD_BYTES: "${STRATA_BG_FLUSH_THRESHOLD_BYTES:-4194304}"
     volumes:
       - node2-data:/data
     depends_on:
@@ -95,6 +107,9 @@ services:
       STRATA_ZK_CONNECT: "zookeeper:2181"
       STRATA_META_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
       STRATA_LISTEN_PORT: "9100"
+      STRATA_HEARTBEAT_INTERVAL_MS: "${STRATA_HEARTBEAT_INTERVAL_MS:-3000}"
+      STRATA_REPAIR_SCAN_INTERVAL_MS: "${STRATA_REPAIR_SCAN_INTERVAL_MS:-5000}"
+      STRATA_REPAIR_COMMAND_TIMEOUT_MS: "${STRATA_REPAIR_COMMAND_TIMEOUT_MS:-30000}"
       STRATA_LEASE_MS: "60000"
       STRATA_DEAD_GRACE_MS: "300000"
       STRATA_ADVERTISED_HOST: "node3"
@@ -102,6 +117,9 @@ services:
       STRATA_ZONE: "z0"
       STRATA_RACK: "r2"
       STRATA_DATA_DIR: "/data"
+      STRATA_SEAL_FSYNC: "${STRATA_SEAL_FSYNC:-false}"
+      STRATA_BG_FLUSH_INTERVAL_MS: "${STRATA_BG_FLUSH_INTERVAL_MS:-500}"
+      STRATA_BG_FLUSH_THRESHOLD_BYTES: "${STRATA_BG_FLUSH_THRESHOLD_BYTES:-4194304}"
     volumes:
       - node3-data:/data
     depends_on:
@@ -138,12 +156,12 @@ services:
 
   # One-off load generator — does NOT start with `up` (profile-gated). Runs on the cluster network so
   # it resolves node names and follows leader redirects. Use scripts/perf.sh, or:
-  #   docker compose run --rm --no-deps loadgen perf --meta node1:9100 --workload write --duration 120
+  #   docker compose run --rm --no-deps loadgen perf --meta node1:9100 --duration 300
   loadgen:
     <<: *strata
     profiles: ["tools"]
     restart: "no"
-    command: ["perf", "--meta", "node1:9100", "--workload", "write", "--duration", "120"]
+    command: ["perf", "--meta", "node1:9100"]
 
 volumes:
   node1-data:

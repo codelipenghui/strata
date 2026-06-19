@@ -156,6 +156,19 @@ class RepairReliabilityTest {
                 new Messages.LookupFile(fileId).encode(), null, 5000));
     }
 
+    private void waitForReplicaCount(FileId fileId, int expected, long windowMs) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + windowMs;
+        int last = -1;
+        while (System.currentTimeMillis() < deadline) {
+            last = lookup(fileId).chunks().get(0).replicas().size();
+            if (last == expected) {
+                return;
+            }
+            Thread.sleep(50);
+        }
+        assertEquals(expected, last, "replica count did not converge");
+    }
+
     private Messages.InventoryReport inventory(FakeNode node, List<Messages.InventoryEntry> entries) {
         return new Messages.InventoryReport(node.nodeId, node.inc.getMostSignificantBits(),
                 node.inc.getLeastSignificantBits(), node.session, 0, 1, entries);
@@ -478,6 +491,7 @@ class RepairReliabilityTest {
         assertTrue(afterWrongCompletion.stream().noneMatch(r -> r.nodeId() == target.nodeId));
 
         target.heartbeat();
+        waitForReplicaCount(file.fileId(), 3, 5_000);
         var afterAssignedCompletion = lookup(file.fileId()).chunks().get(0).replicas();
         assertEquals(3, afterAssignedCompletion.size(), "assigned target completion should commit repair");
         assertTrue(afterAssignedCompletion.stream().anyMatch(r -> r.nodeId() == target.nodeId));

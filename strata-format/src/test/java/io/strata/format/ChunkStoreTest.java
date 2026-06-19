@@ -757,10 +757,10 @@ class ChunkStoreTest {
     }
 
     @Test
-    void readRegionResultIsStableSnapshotAcrossConcurrentSealTruncate() throws Exception {
+    void openReadRegionDurablePrefixIsZeroCopyAcrossConcurrentSealTruncate() throws Exception {
         // A reader resolves a region on an OPEN chunk; the data plane transfers that region LATER,
-        // off the chunk lock. readRegion must only expose bytes below the replica-known durable
-        // high watermark, and the exposed bytes must be a stable snapshot if a concurrent seal
+        // off the chunk lock. readRegion must only expose bytes below the replica-known durable high
+        // watermark, and an independent read FD must keep those bytes stable if a concurrent seal
         // truncates the never-acked tail.
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
@@ -774,9 +774,11 @@ class ChunkStoreTest {
             assertEquals(21, tail.localEndOffset());
             assertEquals(9, tail.lastKnownDO());
 
-            // The committed prefix is served as a materialized snapshot.
+            // The committed prefix is served as a zero-copy channel region over an independent FD.
             ChunkStore.ReadRegionResult region = store.readRegion(id, 0, 1024);
             assertEquals(9, region.length());
+            assertTrue(region.channel() != null, "durable open read should use a zero-copy channel");
+            assertEquals(null, region.bytes());
             try {
                 // a concurrent seal truncates the never-acked tail after this region was resolved
                 var sealed = store.seal(id, 1, 9, null);
@@ -793,7 +795,23 @@ class ChunkStoreTest {
     }
 
     @Test
-    void openReadsRejectLedgerCoveredDataRot() throws Exception {
+    void sealCannotTruncateBelowDurableWatermark() throws Exception {
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            store.append(id, 1, 0, 0, bytes("SAFE"));
+            store.append(id, 1, 4, 4, bytes("TAIL"));
+            assertEquals(4, store.stat(id).lastKnownDO());
+
+            ScpException e = assertThrows(ScpException.class, () -> store.seal(id, 1, 3, null));
+            assertEquals(ErrorCode.INTERNAL, e.code());
+            assertEquals(4, e.detail());
+
+            assertEquals(4, store.seal(id, 1, 4, null).finalLength());
+        }
+    }
+
+    @Test
+    void openReadRejectsLedgerCoveredDataRotButReadRegionIsZeroCopyUnverified() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
             store.append(id, 1, 0, 0, bytes("verified-open"));
@@ -806,12 +824,16 @@ class ChunkStoreTest {
 
             assertEquals(ErrorCode.CRC_MISMATCH,
                     assertThrows(ScpException.class, () -> store.read(id, 0, 13)).code());
-            assertEquals(ErrorCode.CRC_MISMATCH,
-                    assertThrows(ScpException.class, () -> store.readRegion(id, 0, 13)).code());
+            try (var region = store.readRegion(id, 0, 13)) {
+                assertEquals(13, region.length());
+                assertTrue(region.channel() != null, "client open readRegion should be zero-copy");
+                byte[] got = consumeRegion(region);
+                assertEquals('X', got[4]);
+            }
         }
     }
 
-    /** Reads a region result whether it is a heap snapshot (open chunks) or a zero-copy channel. */
+    /** Reads a region result whether it is a heap snapshot or a zero-copy channel. */
     private static byte[] consumeRegion(ChunkStore.ReadRegionResult r) throws Exception {
         if (r.bytes() != null) {
             return r.bytes();

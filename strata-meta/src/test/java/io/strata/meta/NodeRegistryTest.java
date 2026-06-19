@@ -5,6 +5,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -15,6 +16,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -52,6 +54,41 @@ class NodeRegistryTest {
         NodeRegistry.LiveNode adopted = liveNodes(registry).get(7);
         assertEquals(5, adopted.recordVersion);
         assertEquals(Records.NodeState.REGISTERED, adopted.record.state());
+    }
+
+    @Test
+    void placementCandidatesIncludePersistedSuspectNodesDuringDeadGrace() throws Exception {
+        FakeStore store = new FakeStore();
+        store.nodes.put(1, new MetadataStore.Versioned<>(node(1, Records.NodeState.REGISTERED), 1));
+        store.nodes.put(2, new MetadataStore.Versioned<>(node(2, Records.NodeState.REGISTERED), 1));
+        store.nodes.put(3, new MetadataStore.Versioned<>(node(3, Records.NodeState.REGISTERED), 1));
+        MetaConfig config = new MetaConfig("unused", 0, 1, 1_000, 60_000, 1, 1);
+
+        NodeRegistry registry = new NodeRegistry(store, config);
+
+        assertEquals(0, registry.aliveNodes().size(), "warmed nodes should start as SUSPECT, not ALIVE");
+        List<NodeRegistry.LiveNode> candidates = registry.candidatesFor(StrataNamespace.of("test"));
+        assertEquals(List.of(1, 2, 3), candidates.stream()
+                .map(n -> n.record.nodeId())
+                .sorted()
+                .toList());
+        assertTrue(candidates.stream().allMatch(n -> n.freeBytes == n.record.capacityBytes()),
+                "warmed placement candidates need non-zero capacity for weighted placement");
+    }
+
+    @Test
+    void placementCandidatesExcludeNodesPastDeadGrace() throws Exception {
+        FakeStore store = new FakeStore();
+        MetaConfig config = new MetaConfig("unused", 0, 1, 1_000, 50, 1, 1);
+        NodeRegistry registry = new NodeRegistry(store, config);
+        Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
+                101, 102, List.of("node:9000"), "z", "r", "h",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
+
+        live.leaseUntil = System.currentTimeMillis() - config.deadGraceMs() - 10;
+
+        assertEquals(List.of(), registry.candidatesFor(StrataNamespace.of("test")));
     }
 
     @Test
@@ -127,10 +164,10 @@ class NodeRegistryTest {
         }
         Messages.HeartbeatResp first = registry.heartbeat(new Messages.NodeHeartbeat(
                 9, 11, 12, registered.sessionEpoch(),
-                List.of(new Messages.StorageUsage(1, 98)), 0, List.of()), (nodeId, ignored) -> {});
+                List.of(new Messages.StorageUsage(1, 98)), 0, List.of()), ignoreCompletions());
         Messages.HeartbeatResp second = registry.heartbeat(new Messages.NodeHeartbeat(
                 9, 11, 12, registered.sessionEpoch(),
-                List.of(new Messages.StorageUsage(1, 98)), 0, List.of()), (nodeId, ignored) -> {});
+                List.of(new Messages.StorageUsage(1, 98)), 0, List.of()), ignoreCompletions());
 
         assertEquals(16, first.commands().size());
         assertEquals(2, second.commands().size());
@@ -152,7 +189,8 @@ class NodeRegistryTest {
 
         NodeRegistry.LiveNode cached = liveNodes(standbyRegistry).get(17);
         assertEquals(4, cached.recordVersion);
-        assertEquals(0, cached.leaseUntil);
+        assertTrue(cached.leaseUntil > 0);
+        assertFalse(cached.alive(System.currentTimeMillis()));
     }
 
     @Test
@@ -167,7 +205,10 @@ class NodeRegistryTest {
         Messages.HeartbeatResp heartbeat = registry.heartbeat(new Messages.NodeHeartbeat(
                 registered.nodeId(), 31, 32, registered.sessionEpoch(), List.of(), 0,
                 List.of(new Messages.CompletedCommand(99, ErrorCode.OK.code))),
-                (nodeId, ignored) -> completedBy.add(nodeId));
+                (nodeId, incMsb, incLsb, sessionEpoch, ignored) -> {
+                    completedBy.add(nodeId);
+                    return CompletableFuture.completedFuture(null);
+                });
 
         assertEquals(registered.nodeId(), completedBy.get(0));
         assertTrue(heartbeat.commands().isEmpty());
@@ -190,10 +231,39 @@ class NodeRegistryTest {
         registry.heartbeat(new Messages.NodeHeartbeat(
                         registered.nodeId(), 33, 34, registered.sessionEpoch(), List.of(), 0,
                         List.of(new Messages.CompletedCommand(99, ErrorCode.OK.code))),
-                (nodeId, ignored) -> callbackHeldNodeLock.set(live.lock.isHeldByCurrentThread()));
+                (nodeId, incMsb, incLsb, sessionEpoch, ignored) -> {
+                    callbackHeldNodeLock.set(live.lock.isHeldByCurrentThread());
+                    return CompletableFuture.completedFuture(null);
+                });
 
         assertEquals(Boolean.FALSE, callbackHeldNodeLock.get(),
                 "completion callbacks can do metadata I/O and must not run under the node lock");
+    }
+
+    @Test
+    void heartbeatDefersCommandDeliveryUntilAsyncCompletionsFinish() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
+                37, 38, List.of("node:9000"), "z", "r", "h",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        CompletableFuture<Void> completion = new CompletableFuture<>();
+        registry.enqueue(registered.nodeId(), new Messages.DrainCmd(123));
+
+        Messages.HeartbeatResp blocked = registry.heartbeat(new Messages.NodeHeartbeat(
+                        registered.nodeId(), 37, 38, registered.sessionEpoch(), List.of(), 0,
+                        List.of(new Messages.CompletedCommand(99, ErrorCode.OK.code))),
+                (nodeId, incMsb, incLsb, sessionEpoch, ignored) -> completion);
+
+        assertTrue(blocked.commands().isEmpty(),
+                "pending commands must not be delivered before reported completions apply");
+
+        completion.complete(null);
+        Messages.HeartbeatResp unblocked = registry.heartbeat(new Messages.NodeHeartbeat(
+                        registered.nodeId(), 37, 38, registered.sessionEpoch(), List.of(), 0, List.of()),
+                ignoreCompletions());
+
+        assertEquals(List.of(new Messages.DrainCmd(123)), unblocked.commands());
     }
 
     @Test
@@ -211,7 +281,7 @@ class NodeRegistryTest {
             try {
                 heartbeat.set(registry.heartbeat(new Messages.NodeHeartbeat(
                         registered.nodeId(), 35, 36, registered.sessionEpoch(),
-                        List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), (nodeId, ignored) -> {}));
+                        List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), ignoreCompletions()));
             } catch (Throwable t) {
                 failure.set(t);
             }
@@ -265,7 +335,10 @@ class NodeRegistryTest {
                 registry.heartbeat(new Messages.NodeHeartbeat(
                                 first.nodeId(), incMsb, incLsb, first.sessionEpoch(), List.of(), 0,
                                 List.of(new Messages.CompletedCommand(99, ErrorCode.OK.code))),
-                        (nodeId, ignored) -> callbackSession.set(live.sessionEpoch));
+                        (nodeId, seenIncMsb, seenIncLsb, sessionEpoch, ignored) -> {
+                            callbackSession.set(sessionEpoch);
+                            return CompletableFuture.completedFuture(null);
+                        });
             } catch (Throwable t) {
                 heartbeatFailure.set(t);
             }
@@ -327,7 +400,7 @@ class NodeRegistryTest {
             try {
                 registry.heartbeat(new Messages.NodeHeartbeat(
                         registered.nodeId(), 39, 40, registered.sessionEpoch(), List.of(), 0,
-                        List.of(new Messages.CompletedCommand(99, ErrorCode.OK.code))), (nodeId, ignored) -> {});
+                        List.of(new Messages.CompletedCommand(99, ErrorCode.OK.code))), ignoreCompletions());
             } catch (Throwable t) {
                 heartbeatFailure.set(t);
             }
@@ -373,7 +446,7 @@ class NodeRegistryTest {
         store.nodes.put(registered.nodeId(), new MetadataStore.Versioned<>(dead, live.recordVersion));
 
         registry.heartbeat(new Messages.NodeHeartbeat(registered.nodeId(), 41, 42, registered.sessionEpoch(),
-                List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), (nodeId, ignored) -> {});
+                List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), ignoreCompletions());
 
         assertTrue(registry.isAlive(registered.nodeId()));
         assertEquals(Records.NodeState.REGISTERED, live.record.state());
@@ -396,7 +469,7 @@ class NodeRegistryTest {
         ScpException e = assertThrows(ScpException.class, () -> registry.heartbeat(
                 new Messages.NodeHeartbeat(registered.nodeId(), 21, 22, registered.sessionEpoch(),
                         List.of(new Messages.StorageUsage(1, 9)), 0, List.of()),
-                (nodeId, ignored) -> {}));
+                ignoreCompletions()));
 
         assertEquals(ErrorCode.LEASE_EXPIRED, e.code());
         assertTrue(registry.isDead(registered.nodeId()));
@@ -427,10 +500,10 @@ class NodeRegistryTest {
 
         assertEquals(ErrorCode.NOT_REGISTERED, assertThrows(ScpException.class, () -> registry.heartbeat(
                 new Messages.NodeHeartbeat(999, 61, 62, registered.sessionEpoch(), List.of(), 0, List.of()),
-                (nodeId, ignored) -> {})).code());
+                ignoreCompletions())).code());
         assertEquals(ErrorCode.NOT_REGISTERED, assertThrows(ScpException.class, () -> registry.heartbeat(
                 new Messages.NodeHeartbeat(registered.nodeId(), 61, 999, registered.sessionEpoch(),
-                        List.of(), 0, List.of()), (nodeId, ignored) -> {})).code());
+                        List.of(), 0, List.of()), ignoreCompletions())).code());
     }
 
     @Test
@@ -450,12 +523,12 @@ class NodeRegistryTest {
         assertTrue(second.sessionEpoch() != first.sessionEpoch(), "re-register must create a new session");
         ScpException stale = assertThrows(ScpException.class, () -> registry.heartbeat(new Messages.NodeHeartbeat(
                 first.nodeId(), incMsb, incLsb, first.sessionEpoch(),
-                List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), (nodeId, ignored) -> {}));
+                List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), ignoreCompletions()));
         assertEquals(ErrorCode.LEASE_EXPIRED, stale.code());
 
         Messages.HeartbeatResp current = registry.heartbeat(new Messages.NodeHeartbeat(
                 second.nodeId(), incMsb, incLsb, second.sessionEpoch(),
-                List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), (nodeId, ignored) -> {});
+                List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), ignoreCompletions());
         assertEquals(1, current.commands().size(), "stale heartbeat must not drain commands for the new session");
     }
 
@@ -560,6 +633,10 @@ class NodeRegistryTest {
             Thread.sleep(10);
         }
         assertTrue(condition.getAsBoolean(), message);
+    }
+
+    private static NodeRegistry.CompletionSink ignoreCompletions() {
+        return (nodeId, incMsb, incLsb, sessionEpoch, ignored) -> CompletableFuture.completedFuture(null);
     }
 
     private static boolean isWaiting(Thread thread) {

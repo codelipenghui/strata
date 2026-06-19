@@ -34,6 +34,10 @@ public final class IntegrityLedger implements AutoCloseable {
         return new IntegrityLedger(ch, new ArrayList<>());
     }
 
+    public static IntegrityLedger memory() {
+        return new IntegrityLedger(null, new ArrayList<>());
+    }
+
     /**
      * Opens an existing ledger, keeping only the prefix of CRC-valid entries with strictly
      * increasing endOffset; the file is truncated to that prefix (torn tail discarded).
@@ -57,15 +61,19 @@ public final class IntegrityLedger implements AutoCloseable {
     }
 
     public void append(ChunkFormats.LedgerEntry entry) throws IOException {
-        scratch.clear();
-        entry.encodeInto(scratch);
-        scratch.flip();
-        ChunkFormats.writeFully(channel, scratch, (long) entries.size() * LEDGER_ENTRY_SIZE);
+        if (channel != null) {
+            scratch.clear();
+            entry.encodeInto(scratch);
+            scratch.flip();
+            ChunkFormats.writeFully(channel, scratch, (long) entries.size() * LEDGER_ENTRY_SIZE);
+        }
         entries.add(entry);
     }
 
     public void force() throws IOException {
-        channel.force(false);
+        if (channel != null) {
+            channel.force(false);
+        }
     }
 
     public List<ChunkFormats.LedgerEntry> entries() {
@@ -89,11 +97,15 @@ public final class IntegrityLedger implements AutoCloseable {
             else break;
         }
         while (entries.size() > keep) entries.remove(entries.size() - 1);
-        channel.truncate((long) keep * LEDGER_ENTRY_SIZE);
+        if (channel != null) {
+            channel.truncate((long) keep * LEDGER_ENTRY_SIZE);
+        }
     }
 
     @Override
     public void close() throws IOException {
-        channel.close();
+        if (channel != null) {
+            channel.close();
+        }
     }
 }

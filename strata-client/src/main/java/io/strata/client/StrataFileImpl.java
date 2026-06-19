@@ -16,16 +16,18 @@ import static io.strata.common.Checks.addChunkLength;
 /** SCP-backed StrataFile handle over one logical file id. */
 final class StrataFileImpl implements StrataFile {
     private final MetaClient meta;
-    private final NodePool pool;
+    private final NodePool appendPool;
+    private final NodePool readPool;
     private final ClientConfig config;
     private final FileId fileId;
     private final StrataNamespace namespace;
     private final StrataPath path;
 
-    StrataFileImpl(MetaClient meta, NodePool pool, ClientConfig config, FileId fileId,
-                   StrataNamespace namespace, StrataPath path) {
+    StrataFileImpl(MetaClient meta, NodePool appendPool, NodePool readPool, ClientConfig config,
+                   FileId fileId, StrataNamespace namespace, StrataPath path) {
         this.meta = Objects.requireNonNull(meta, "meta");
-        this.pool = Objects.requireNonNull(pool, "pool");
+        this.appendPool = Objects.requireNonNull(appendPool, "appendPool");
+        this.readPool = Objects.requireNonNull(readPool, "readPool");
         this.config = Objects.requireNonNull(config, "config");
         this.fileId = Objects.requireNonNull(fileId, "fileId");
         this.namespace = Objects.requireNonNull(namespace, "namespace");
@@ -62,16 +64,16 @@ final class StrataFileImpl implements StrataFile {
             length = addChunkLength(length, c.length());
         }
         int writeEpoch = meta.allocateWriterEpochForAppend(fileId);
-        return new AppenderImpl(meta, pool, config, fileId, writeEpoch, file.writePolicy(), length);
+        return new AppenderImpl(meta, appendPool, config, fileId, writeEpoch, file.writePolicy(), length);
     }
 
     @Override
     public Reader openForRead() {
-        return new ReaderImpl(meta, pool, config, fileId);
+        return new ReaderImpl(meta, readPool, config, fileId);
     }
 
     @Override
     public SealInfo recoverAndSeal() {
-        return new Recovery(meta, pool, config).recoverAndSeal(fileId);
+        return new Recovery(meta, appendPool, readPool, config).recoverAndSeal(fileId);
     }
 }

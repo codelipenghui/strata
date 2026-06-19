@@ -337,6 +337,16 @@ public final class ScpClient implements AutoCloseable {
         return pending.size();
     }
 
+    /** Maximum outstanding requests admitted on one connection. */
+    public static int maxPendingRequests() {
+        return MAX_PENDING_REQUESTS;
+    }
+
+    /** Available request slots on this connection. */
+    public int pendingCapacity() {
+        return pendingPermits.availablePermits();
+    }
+
     @Override
     public void close() {
         failAll(new IOException("connection closed"));

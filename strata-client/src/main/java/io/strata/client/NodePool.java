@@ -9,6 +9,7 @@ import io.strata.proto.ScpClient;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -20,11 +21,17 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 final class NodePool implements AutoCloseable {
     private final ClientConfig config;
+    private final String clientIdPrefix;
     private final Map<String, EndpointPool> conns = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     NodePool(ClientConfig config) {
+        this(config, "strata-client-storage");
+    }
+
+    NodePool(ClientConfig config, String clientIdPrefix) {
         this.config = config;
+        this.clientIdPrefix = Objects.requireNonNull(clientIdPrefix, "clientIdPrefix");
     }
 
     NodePool() {
@@ -78,7 +85,7 @@ final class NodePool implements AutoCloseable {
             for (int i = 0; i < connections.length; i++) {
                 connections[i] = new ManagedScpConnection(
                         List.of(endpoint), config.connectionPolicy(), ScpClient.KIND_BROKER,
-                        "strata-client-storage-" + i, "storage endpoint", false, true);
+                        clientIdPrefix + "-" + i, "storage endpoint", false, true);
             }
         }
 
