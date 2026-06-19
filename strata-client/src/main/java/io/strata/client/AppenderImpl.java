@@ -294,18 +294,21 @@ final class AppenderImpl implements StrataFile.Appender {
     }
 
     private boolean hasAppendConnectionCapacity(ChunkSession s) {
+        // Admit the next append while at least ackQuorum non-failed replicas have capacity. A slow
+        // minority replica (in-flight or connection-pending backed up) must NOT gate produce — the
+        // quorum still acks through the healthy replicas, and a persistently slow replica is dropped by
+        // the per-replica call timeout. Throttle only once fewer than ackQuorum replicas can keep up,
+        // which is the real backpressure case and keeps the in-flight window bounded.
+        int withCapacity = 0;
         for (int i = 0; i < s.replicas.size(); i++) {
             if (s.failed[i]) continue;
-            if (s.inFlight[i] >= APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK) {
-                return false;
-            }
+            if (s.inFlight[i] >= APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK) continue;
             ManagedScpConnection connection = s.connections[i];
             if (connection != null
-                    && connection.pendingCount() >= APPEND_CONNECTION_PENDING_HIGH_WATERMARK) {
-                return false;
-            }
+                    && connection.pendingCount() >= APPEND_CONNECTION_PENDING_HIGH_WATERMARK) continue;
+            withCapacity++;
         }
-        return true;
+        return withCapacity >= ackQuorum;
     }
 
     private void beginReplicaRequestLocked(ChunkSession s, int replicaIndex) {
