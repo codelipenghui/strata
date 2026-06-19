@@ -660,6 +660,15 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
+    private static void closeQuietly(FileChannel ch) {
+        if (ch == null) return;
+        try {
+            ch.close();
+        } catch (IOException e) {
+            log.warn("failed to close transient read channel", e);
+        }
+    }
+
     private void deleteLedgerAsync(ChunkId id, Path ledgerPath) {
         try {
             cleanupExecutor.execute(() -> {
@@ -775,11 +784,13 @@ public final class ChunkStore implements AutoCloseable {
      * Exactly one of {@code channel} / {@code bytes} is set for a non-empty result.
      */
     public record ReadRegionResult(FileChannel channel, long filePosition, int length, byte[] bytes,
-                                   long localEndOffset, long lastKnownDO) implements AutoCloseable {
+                                   long localEndOffset, long lastKnownDO, Runnable releaser)
+            implements AutoCloseable {
+        /** Releases the underlying read resource: a cache lease (sealed) or the transient FD (open). */
         @Override
-        public void close() throws IOException {
-            if (channel != null) {
-                channel.close();
+        public void close() {
+            if (releaser != null) {
+                releaser.run();
             }
         }
     }
@@ -841,11 +852,11 @@ public final class ChunkStore implements AutoCloseable {
             long readableEnd = (h.state == ChunkState.SEALED || includeUndurableTail)
                     ? localEnd : Math.min(localEnd, h.lastKnownDO);
             if (offset >= readableEnd) {
-                return new ReadRegionResult(null, 0, 0, null, localEnd, h.lastKnownDO);
+                return new ReadRegionResult(null, 0, 0, null, localEnd, h.lastKnownDO, null);
             }
             int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), readableEnd - offset);
             if (n == 0) {
-                return new ReadRegionResult(null, 0, 0, null, localEnd, h.lastKnownDO);
+                return new ReadRegionResult(null, 0, 0, null, localEnd, h.lastKnownDO, null);
             }
             if (!includeUndurableTail) {
                 // observability: count client READ bytes served (mirrors append counters; drives read
@@ -860,7 +871,7 @@ public final class ChunkStore implements AutoCloseable {
                     // verified under the chunk lock because that tail can be truncated by a later seal.
                     byte[] out = new byte[n];
                     readOpenVerified(h, offset, out);
-                    return new ReadRegionResult(null, 0, n, out, localEnd, h.lastKnownDO);
+                    return new ReadRegionResult(null, 0, n, out, localEnd, h.lastKnownDO, null);
                 }
                 // Intentional fast client-read path: client READs are already clamped to lastKnownDO
                 // above, so they never expose the undurable tail that a concurrent seal may truncate.
@@ -868,15 +879,13 @@ public final class ChunkStore implements AutoCloseable {
                 // under the chunk lock before sendfile, removing the throughput benefit for actively
                 // written segments. This means read-time detection of local rot in the durable prefix is
                 // deferred to verified read()/READ_RECOVERY paths, crash recovery, and sealed scrub.
+                // OPEN client fast path: independent transient READ FD, released by closing it.
                 FileChannel readChannel = FileChannel.open(h.dataPath, StandardOpenOption.READ);
                 try {
-                    return new ReadRegionResult(readChannel, filePos, n, null, localEnd, h.lastKnownDO);
+                    return new ReadRegionResult(readChannel, filePos, n, null, localEnd, h.lastKnownDO,
+                            () -> closeQuietly(readChannel));
                 } catch (RuntimeException e) {
-                    try {
-                        readChannel.close();
-                    } catch (IOException closeFailure) {
-                        e.addSuppressed(closeFailure);
-                    }
+                    closeQuietly(readChannel);
                     throw e;
                 }
             }
@@ -887,15 +896,13 @@ public final class ChunkStore implements AutoCloseable {
             // integrity is covered by background scrub and the verified read()/fetch()/import paths. A
             // concurrent delete only unlinks the path while this independent FD keeps the inode alive,
             // so the deferred transfer is safe.
-            FileChannel readChannel = FileChannel.open(h.dataPath, StandardOpenOption.READ);
+            // SEALED: zero-copy region over a ref-counted cached FD shared across concurrent readers.
+            ChannelCache.Lease lease = channelCache.acquire(id, h.dataPath);
             try {
-                return new ReadRegionResult(readChannel, filePos, n, null, localEnd, h.lastKnownDO);
+                return new ReadRegionResult(lease.channel(), filePos, n, null, localEnd, h.lastKnownDO,
+                        lease::release);
             } catch (RuntimeException e) {
-                try {
-                    readChannel.close();
-                } catch (IOException closeFailure) {
-                    e.addSuppressed(closeFailure);
-                }
+                lease.release();
                 throw e;
             }
         }

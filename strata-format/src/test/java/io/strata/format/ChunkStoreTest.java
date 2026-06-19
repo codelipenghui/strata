@@ -38,6 +38,7 @@ import java.util.stream.Stream;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -1866,6 +1867,38 @@ class ChunkStoreTest {
             sealedBytes(store, id, "scrub-me");
             assertEquals(0, store.scrubOnce(), "clean chunk has no corruption");
             assertTrue(store.cachedChannels() >= 1);
+        }
+    }
+
+    @Test
+    void sealedReadRegionSharesOneCachedFdAcrossConcurrentReaders() throws Exception {
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, id, "shared-zero-copy");
+            ChunkStore.ReadRegionResult r1 = store.readRegion(id, 0, 6);
+            ChunkStore.ReadRegionResult r2 = store.readRegion(id, 6, 4);
+            try {
+                assertTrue(r1.channel() != null && r2.channel() != null, "sealed reads are zero-copy");
+                assertSame(r1.channel(), r2.channel(), "concurrent sealed readers share one cached FD");
+                assertEquals(1, store.cachedChannels());
+                assertArrayEquals("shared".getBytes(), consumeRegion(r1));
+            } finally {
+                r1.close();
+                r2.close();
+            }
+            // releasing the leases leaves the channel cached (idle), not closed
+            assertEquals(1, store.cachedChannels());
+        }
+    }
+
+    @Test
+    void sealedReadRegionLeaseKeepsFdOpenUntilReleased() throws Exception {
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, id, "lease-lifetime");
+            ChunkStore.ReadRegionResult r = store.readRegion(id, 0, 5);
+            FileChannel ch = r.channel();
+            assertTrue(ch.isOpen());
+            r.close(); // releases the lease; channel stays cached/open
+            assertTrue(ch.isOpen(), "release returns the FD to the cache, does not close it");
         }
     }
 }
