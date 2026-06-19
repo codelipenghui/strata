@@ -168,9 +168,17 @@ public final class ChunkStore implements AutoCloseable {
 
     /** Package-private: lets tests exercise both the seal-fsync-on and -off durability paths. */
     ChunkStore(Path dir, boolean sealFsync) throws IOException {
+        this(dir, sealFsync, (int) CHANNEL_CACHE_MAX_SIZE);
+    }
+
+    /**
+     * Package-private: lets tests specify a small channel cache capacity to exercise eviction
+     * without creating thousands of files (avoids static-final class-load timing coupling).
+     */
+    ChunkStore(Path dir, boolean sealFsync, int channelCacheCapacity) throws IOException {
         this.dir = dir;
         this.sealFsync = sealFsync;
-        this.channelCache = new ChannelCache((int) CHANNEL_CACHE_MAX_SIZE);
+        this.channelCache = new ChannelCache(channelCacheCapacity);
         Files.createDirectories(dir);
         recoverAll();
         this.flusher = Executors.newSingleThreadScheduledExecutor(r -> {

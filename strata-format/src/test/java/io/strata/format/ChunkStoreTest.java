@@ -25,6 +25,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -1981,5 +1982,30 @@ class ChunkStoreTest {
         Field dataField = handle.getClass().getDeclaredField("data");
         dataField.setAccessible(true);
         return (FileChannel) dataField.get(handle);
+    }
+
+    @Test
+    void cachedChannelsStayBoundedAsSealedCountExceedsCapacity() throws Exception {
+        // Use a tiny explicit capacity so the bound is observable without thousands of files.
+        // CHANNEL_CACHE_MAX_SIZE is static-final (read once at class load), so setting a system
+        // property inside a test is unreliable once the class is already loaded by earlier tests.
+        // The package-private ChunkStore(dir, sealFsync, capacity) constructor sidesteps that.
+        int tinyCapacity = 4;
+        int n = 32; // >> tinyCapacity, guarantees eviction
+        try (ChunkStore store = new ChunkStore(dir, true, tinyCapacity)) {
+            List<ChunkId> ids = new ArrayList<>();
+            for (int i = 0; i < n; i++) {
+                ChunkId c = new ChunkId(FileId.random(), 0);
+                ids.add(c);
+                sealedBytes(store, c, "payload-" + i);
+            }
+            // read every chunk once: misses open channels, eviction keeps the open set bounded
+            for (ChunkId c : ids) {
+                store.read(c, 0, 3);
+            }
+            assertTrue(store.cachedChannels() <= store.channelCacheCapacity(),
+                    "open cached channels must not exceed capacity when no leases are held");
+            assertTrue(store.channelCacheEvictions() > 0, "eviction must have fired");
+        }
     }
 }
