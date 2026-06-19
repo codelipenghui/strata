@@ -12,9 +12,10 @@ import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Capacity-weighted random placement with anti-affinity (tech design §8):
- * weights derive from free capacity; no two replicas share a host; DEAD nodes are excluded. Suspect
- * REGISTERED nodes inside dead-grace remain candidates so metadata failover or heartbeat stalls do
- * not remove otherwise reachable storage nodes before node RPCs can probe them.
+ * weights derive from free capacity; no two replicas share a host; only REGISTERED nodes are eligible,
+ * so DEAD and DRAINING nodes are excluded. Suspect REGISTERED nodes inside dead-grace remain candidates
+ * so metadata failover or heartbeat stalls do not remove otherwise reachable storage nodes before node
+ * RPCs can probe them.
  */
 final class Placement {
 

@@ -1392,6 +1392,43 @@ class ChunkStoreTest {
     }
 
     @Test
+    void recoveryReadServesUndurableTailThatClientReadClampsAway() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        byte[] durable = "durable-prefix".getBytes(StandardCharsets.UTF_8);
+        byte[] tail = "undurable-tail".getBytes(StandardCharsets.UTF_8);
+        int d = durable.length;
+        int total = d + tail.length;
+        byte[] all = new byte[total];
+        System.arraycopy(durable, 0, all, 0, d);
+        System.arraycopy(tail, 0, all, d, tail.length);
+
+        try (ChunkStore store = newStore()) {
+            open(store, chunkId, 1);
+            store.append(chunkId, 1, 0, 0, ByteBuffer.wrap(durable)); // below the durable high watermark
+            store.append(chunkId, 1, d, d, ByteBuffer.wrap(tail));    // above it: end=total, lastKnownDO=d
+
+            // Client read is clamped to the durable high watermark and never exposes the never-acked tail.
+            try (ChunkStore.ReadRegionResult clientTail = store.readRegion(chunkId, d, total)) {
+                assertEquals(0, clientTail.length(),
+                        "client read must clamp away the never-acked tail above the durable watermark");
+            }
+            try (ChunkStore.ReadRegionResult clientPrefix = store.readRegion(chunkId, 0, total)) {
+                assertEquals(d, clientPrefix.length(), "client read serves only the durable prefix");
+                assertTrue(clientPrefix.bytes() == null,
+                        "durable-prefix open read is zero-copy (a channel, not materialized bytes)");
+            }
+
+            // Recovery read includes the undurable tail, materialized + integrity-verified (not a
+            // zero-copy channel), so seal recovery sees quorum-durable bytes instead of sealing short.
+            try (ChunkStore.ReadRegionResult recovery = store.readRegionForRecovery(chunkId, 0, total)) {
+                assertEquals(total, recovery.length(), "recovery read must include the undurable tail");
+                assertTrue(recovery.channel() == null, "recovery tail must be materialized, not zero-copy");
+                assertArrayEquals(all, recovery.bytes(), "recovery read must return the full verified bytes");
+            }
+        }
+    }
+
+    @Test
     void recoverySkipsUnparseableAndTruncatedChunkFiles() throws Exception {
         Path invalidName = dir.resolve("not-a-valid-chunk-name.chunk");
         Files.write(invalidName, new byte[] {1});

@@ -67,7 +67,10 @@ services:
       # Background-writeback knobs are tunable via STRATA_BG_FLUSH_INTERVAL_MS / _THRESHOLD_BYTES
       # (ChunkStore default: 500ms / 4 MiB). The default keeps dirty-page backlog bounded; making it
       # much laxer can hand control to kernel dirty throttling and worsen perf write stability.
-      # Set STRATA_SEAL_FSYNC=true when sealed chunks must be forced to local disk before seal returns.
+      # STRATA_SEAL_FSYNC=true forces seal/open/delete metadata+data to local disk synchronously
+      # (default false trades that local-crash durability for throughput). Even with it false,
+      # recovery never loses acknowledged data: a sealed chunk's integrity ledger is retained until
+      # the SEALED state is forced durable in the background.
     volumes:
       - node1-data:/data
     depends_on:

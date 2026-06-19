@@ -34,6 +34,11 @@ public final class IntegrityLedger implements AutoCloseable {
         return new IntegrityLedger(ch, new ArrayList<>());
     }
 
+    /**
+     * In-memory ledger with no on-disk backing: append/force/truncateTo/close are no-ops against disk,
+     * so entries do NOT survive a restart. For tests and transient in-memory verification only — never
+     * for a chunk that must recover its integrity ledger after a crash.
+     */
     public static IntegrityLedger memory() {
         return new IntegrityLedger(null, new ArrayList<>());
     }

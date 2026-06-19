@@ -369,6 +369,12 @@ final class RepairCoordinator implements AutoCloseable {
                         return;
                     }
                     onCommandCompleted(reportingNode, completion);
+                } catch (RuntimeException e) {
+                    // onCommandCompleted guards its own apply logic, but an unchecked failure in the
+                    // session check (or anywhere else here) would otherwise vanish into the executor's
+                    // default handler. Log it instead; the barrier still releases via finally and the
+                    // next background scan reconciles.
+                    log.warn("completion {} failed — next scan reconciles", completion.commandId(), e);
                 } finally {
                     done.complete(null);
                 }

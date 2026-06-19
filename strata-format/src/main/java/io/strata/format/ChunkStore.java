@@ -78,8 +78,12 @@ public final class ChunkStore implements AutoCloseable {
     // Both knobs are tunable (system property, then env, else default) so a deployment can trade fsync
     // syscall rate against seal-time fsync size: a shorter interval / smaller threshold keeps less dirty
     // data per open chunk, so a synchronized roll does not stampede the disk's fsync queue with many
-    // large concurrent forces. Background writeback keeps the original 500ms / 4 MiB default; seal
-    // fsync is opt-in for deployments that require sealed-chunk local crash durability.
+    // large concurrent forces. Background writeback keeps the original 500ms / 4 MiB default.
+    // STRATA_SEAL_FSYNC (default false) gates the best-effort, off-the-ack-path fsyncs at open, seal,
+    // and delete (header/sidecar/dir plus the seal-time data force) — NOT just seal. It does not affect
+    // ack durability (the group committer always forces data+ledger before acking on fsyncOnAck files),
+    // and even with it off a sealed chunk's ledger is retained until reclaimSealedLedgersOnce() forces
+    // the SEALED state durable, so recovery never discards acknowledged data.
     private static final boolean SEAL_FSYNC =
             booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false);
     private static final long BG_FLUSH_INTERVAL_MS =
@@ -877,6 +881,11 @@ public final class ChunkStore implements AutoCloseable {
             if (dataLength > h.end) {
                 throw new ScpException(ErrorCode.INTERNAL, "seal beyond end: " + dataLength + " > " + h.end);
             }
+            // Load-bearing invariant: a seal may never floor below the durable high watermark. The
+            // zero-copy open-read fast path (readRegion) hands back a bare file region clamped to
+            // lastKnownDO without re-snapshotting under the lock; that is only safe because a concurrent
+            // seal can never truncate the data out from under [0, lastKnownDO). Recovery relies on it too
+            // (it must not drop quorum-durable bytes). Do not relax without revisiting both.
             if (dataLength < h.lastKnownDO) {
                 throw new ScpException(ErrorCode.INTERNAL,
                         "seal below durable watermark: " + dataLength + " < " + h.lastKnownDO, h.lastKnownDO);
