@@ -96,11 +96,12 @@ final class ChannelCache implements AutoCloseable {
     }
 
     /**
-     * Caller holds the lock. Evicts LRU-first until size <= capacity. An idle entry
-     * (refCount==0) is removed and its channel scheduled for close. A pinned entry
-     * (refCount>0) is also removed and marked evicted, but its physical close is DEFERRED
-     * to the last {@link LeaseImpl#release()} — capacity is a soft cap on open FDs (a leased
-     * channel is never closed while leased), but the resident map never exceeds capacity.
+     * Caller holds the lock. Removes least-recently-used, idle (refCount==0) entries and schedules
+     * their channels for close until size <= capacity. Pinned (refCount>0) entries are SKIPPED and
+     * left in the map: capacity is a SOFT cap — a leased channel is never closed by eviction, so the
+     * resident map may temporarily exceed capacity while many distinct chunks are concurrently leased
+     * (bounded by the number of concurrent distinct reads). Such over-capacity idle entries are
+     * reclaimed on a later eviction once their leases release.
      */
     private void evictDownToCapacity(List<FileChannel> toClose) {
         if (map.size() <= capacity) return;
@@ -108,13 +109,13 @@ final class ChannelCache implements AutoCloseable {
         while (map.size() > capacity && it.hasNext()) {
             Map.Entry<ChunkId, Entry> me = it.next();
             Entry e = me.getValue();
-            it.remove();
-            e.evicted = true;
-            evictions.incrementAndGet();
             if (e.refCount == 0) {
-                toClose.add(e.channel); // idle: close now
+                it.remove();
+                e.evicted = true;
+                toClose.add(e.channel);
+                evictions.incrementAndGet();
             }
-            // pinned: deferred close happens on last release()
+            // pinned entries are skipped; capacity is a soft cap
         }
     }
 

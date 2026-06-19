@@ -87,19 +87,25 @@ class ChannelCacheTest {
     }
 
     @Test
-    void leasedChannelIsNotEvictedAndClosesOnLastRelease() throws Exception {
+    void leasedChannelIsNeverEvictedAndReclaimedAfterRelease() throws Exception {
         Path p1 = file(1, "a");
         Path p2 = file(2, "b");
         Path p3 = file(3, "c");
+        Path p4 = file(4, "d");
         try (ChannelCache cache = new ChannelCache(2)) {
-            ChannelCache.Lease held = cache.acquire(id(1), p1); // keep leased
+            ChannelCache.Lease held = cache.acquire(id(1), p1); // keep id(1) leased
             FileChannel c1 = held.channel();
             try (ChannelCache.Lease l = cache.acquire(id(2), p2)) { l.channel(); }
             try (ChannelCache.Lease l = cache.acquire(id(3), p3)) { l.channel(); }
-            // id(1) is over-capacity but pinned: must NOT be closed
-            assertTrue(c1.isOpen(), "a leased channel must not be closed by eviction");
+            // id(1) is the LRU but pinned: the soft cap keeps it open AND cached
+            assertTrue(c1.isOpen(), "a leased channel is never closed by eviction");
+            assertTrue(cache.size() >= 2, "pinned over-capacity entry stays resident");
             held.release();
-            assertFalse(c1.isOpen(), "evicted+unleased channel closes on last release");
+            // release alone does not close a soft-cap-retained channel
+            assertTrue(c1.isOpen(), "release returns the FD to the cache, does not close it");
+            // the now-idle, over-capacity channel is reclaimed on the next eviction
+            try (ChannelCache.Lease l = cache.acquire(id(4), p4)) { l.channel(); }
+            assertFalse(c1.isOpen(), "the now-idle over-capacity channel is reclaimed on the next miss");
         }
     }
 
