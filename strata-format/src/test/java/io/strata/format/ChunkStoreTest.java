@@ -1392,6 +1392,28 @@ class ChunkStoreTest {
     }
 
     @Test
+    void sealWithSealFsyncDropsLedgerImmediatelyWithoutReclaim() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        Path ledgerPath = dir.resolve(ChunkFormats.baseName(chunkId) + ".j");
+        byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
+        try (ChunkStore store = new ChunkStore(dir, true)) { // seal fsync ON
+            open(store, chunkId, 1);
+            store.append(chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(chunkId, 1, payload.length, null);
+
+            // With seal fsync on, the SEALED footer/sidecar are forced durable at seal time, so the
+            // ledger is dropped immediately (async) rather than retained for background reclamation.
+            waitFor(() -> Files.notExists(ledgerPath),
+                    "seal with fsync on should delete the ledger without waiting for reclaim");
+            store.reclaimSealedLedgersOnce();
+            assertEquals(0, store.sealedLedgerReclaims(),
+                    "no ledger should be pending reclaim when seal fsync is on");
+            assertArrayEquals(payload, store.read(chunkId, 0, payload.length).bytes(),
+                    "chunk must remain readable after a seal-fsync seal");
+        }
+    }
+
+    @Test
     void recoveryReadServesUndurableTailThatClientReadClampsAway() throws Exception {
         ChunkId chunkId = new ChunkId(FileId.random(), 0);
         byte[] durable = "durable-prefix".getBytes(StandardCharsets.UTF_8);

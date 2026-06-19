@@ -84,7 +84,7 @@ public final class ChunkStore implements AutoCloseable {
     // ack durability (the group committer always forces data+ledger before acking on fsyncOnAck files),
     // and even with it off a sealed chunk's ledger is retained until reclaimSealedLedgersOnce() forces
     // the SEALED state durable, so recovery never discards acknowledged data.
-    private static final boolean SEAL_FSYNC =
+    private static final boolean SEAL_FSYNC_DEFAULT =
             booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false);
     private static final long BG_FLUSH_INTERVAL_MS =
             longConf("strata.bgFlush.intervalMs", "STRATA_BG_FLUSH_INTERVAL_MS", 500);
@@ -94,6 +94,9 @@ public final class ChunkStore implements AutoCloseable {
             longConf("strata.slowAppendLogMs", "STRATA_SLOW_APPEND_LOG_MS", 1_000));
     private static final long SLOW_MUTATION_LOG_NANOS = TimeUnit.MILLISECONDS.toNanos(
             longConf("strata.slowMutationLogMs", "STRATA_SLOW_MUTATION_LOG_MS", 500));
+    /** Whether seal/open/delete force their metadata + data to disk synchronously. Defaults from
+     *  STRATA_SEAL_FSYNC; overridable per instance so tests can exercise both durability paths. */
+    private final boolean sealFsync;
     private final ScheduledExecutorService flusher;
     private final ExecutorService cleanupExecutor;
 
@@ -127,7 +130,13 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     public ChunkStore(Path dir) throws IOException {
+        this(dir, SEAL_FSYNC_DEFAULT);
+    }
+
+    /** Package-private: lets tests exercise both the seal-fsync-on and -off durability paths. */
+    ChunkStore(Path dir, boolean sealFsync) throws IOException {
         this.dir = dir;
+        this.sealFsync = sealFsync;
         Files.createDirectories(dir);
         recoverAll();
         this.flusher = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -141,7 +150,7 @@ public final class ChunkStore implements AutoCloseable {
             return t;
         });
         log.info("chunk store writeback configured: intervalMs={} thresholdBytes={} sealFsync={}",
-                BG_FLUSH_INTERVAL_MS, BG_FLUSH_THRESHOLD_BYTES, SEAL_FSYNC);
+                BG_FLUSH_INTERVAL_MS, BG_FLUSH_THRESHOLD_BYTES, sealFsync);
         flusher.scheduleWithFixedDelay(this::backgroundFlushSafely,
                 BG_FLUSH_INTERVAL_MS, BG_FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
@@ -516,18 +525,18 @@ public final class ChunkStore implements AutoCloseable {
             dataCreated = true;
             writeFully(h.data, ByteBuffer.wrap(header.encode()), 0);
             tHeaderWrite = System.nanoTime();
-            if (SEAL_FSYNC) {
+            if (sealFsync) {
                 h.data.force(true);
             }
             tDataForce = System.nanoTime();
-            if (SEAL_FSYNC) {
+            if (sealFsync) {
                 forceDirectory();
             }
             tDataDirForce = System.nanoTime();
             ledgerOwned = !ledgerPreexisted;
             h.ledger = IntegrityLedger.create(h.ledgerPath);
             tLedgerCreate = System.nanoTime();
-            if (SEAL_FSYNC) {
+            if (sealFsync) {
                 forceDirectory();
             }
             tLedgerDirForce = System.nanoTime();
@@ -537,7 +546,7 @@ public final class ChunkStore implements AutoCloseable {
             h.fenceEpoch = -1;
             h.lastKnownDO = 0;
             metaOwned = !metaPreexisted;
-            h.persistSidecar(SEAL_FSYNC);
+            h.persistSidecar(sealFsync);
             tSidecar = System.nanoTime();
             h.startCommitterIfFsync(forceCount);
             chunks.put(id, h);
@@ -546,10 +555,10 @@ public final class ChunkStore implements AutoCloseable {
                 log.info("slow open {} fsyncOnAck={} phases(ms): dataOpen={} headerWrite={} dataFsync={} "
                                 + "dataDirFsync={} ledgerCreate={} ledgerDirFsync={} sidecarPersist={} total={}",
                         id, fsyncOnAck, msBetween(t0, tChannelOpen), msBetween(tChannelOpen, tHeaderWrite),
-                        SEAL_FSYNC ? msBetween(tHeaderWrite, tDataForce) : "-1.0",
-                        SEAL_FSYNC ? msBetween(tDataForce, tDataDirForce) : "-1.0",
+                        sealFsync ? msBetween(tHeaderWrite, tDataForce) : "-1.0",
+                        sealFsync ? msBetween(tDataForce, tDataDirForce) : "-1.0",
                         msBetween(tDataDirForce, tLedgerCreate),
-                        SEAL_FSYNC ? msBetween(tLedgerCreate, tLedgerDirForce) : "-1.0",
+                        sealFsync ? msBetween(tLedgerCreate, tLedgerDirForce) : "-1.0",
                         msBetween(tLedgerDirForce, tSidecar), msBetween(t0, tInstall));
             }
             installed = true;
@@ -588,7 +597,7 @@ public final class ChunkStore implements AutoCloseable {
         if (!owned) return;
         try {
             Files.deleteIfExists(path);
-            if (SEAL_FSYNC) {
+            if (sealFsync) {
                 forceDirectory();
             }
         } catch (IOException e) {
@@ -940,7 +949,7 @@ public final class ChunkStore implements AutoCloseable {
             writeFully(h.data, ByteBuffer.wrap(trailer.encode()),
                     checkedAdd(footerStart, footerLen, "trailer offset"));
             long tWrite = System.nanoTime();
-            if (SEAL_FSYNC) {
+            if (sealFsync) {
                 h.data.force(false);
             }
             long tForce = System.nanoTime();
@@ -950,13 +959,13 @@ public final class ChunkStore implements AutoCloseable {
             h.dataCrc = scan.dataCrc;
             h.sealedRangeCrcs = List.copyOf(scan.rangeCrcs);
             h.lastKnownDO = dataLength;
-            h.persistSidecar(SEAL_FSYNC);
+            h.persistSidecar(sealFsync);
             long tSidecar = System.nanoTime();
             h.ledger.close();
             long tLedgerClose = System.nanoTime();
             Path ledgerPath = h.ledgerPath;
             h.ledger = null;
-            if (SEAL_FSYNC) {
+            if (sealFsync) {
                 // data + sidecar were just forced durable above, so the SEALED state is recoverable
                 // from the trailer without the ledger — drop it now.
                 deleteLedgerAsync(id, ledgerPath);
@@ -975,8 +984,8 @@ public final class ChunkStore implements AutoCloseable {
                         id, dataLength >> 20, msBetween(t0, tCrc), msBetween(tCrc, tLedgerCount),
                         msBetween(tLedgerCount, tCommitter), msBetween(tCommitter, tTruncate),
                         msBetween(tTruncate, tFooterBuild), msBetween(tFooterBuild, tWrite),
-                        SEAL_FSYNC ? msBetween(tWrite, tForce) : "-1.0",
-                        SEAL_FSYNC ? msBetween(tForce, tSidecar) : "-1.0",
+                        sealFsync ? msBetween(tWrite, tForce) : "-1.0",
+                        sealFsync ? msBetween(tForce, tSidecar) : "-1.0",
                         msBetween(tSidecar, tLedgerClose), msBetween(tLedgerClose, tLedgerDeleteEnqueue),
                         msBetween(t0, tLedgerDeleteEnqueue));
             }
@@ -1277,7 +1286,7 @@ public final class ChunkStore implements AutoCloseable {
                 Files.deleteIfExists(h.metaPath);
                 Files.deleteIfExists(h.ledgerPath);
                 tFileDelete = System.nanoTime();
-                if (SEAL_FSYNC) {
+                if (sealFsync) {
                     forceDirectory();
                 }
                 tDirForce = System.nanoTime();
@@ -1294,7 +1303,7 @@ public final class ChunkStore implements AutoCloseable {
                     id, msBetween(t0, tBeforeLock), msBetween(tBeforeLock, tLock),
                     msBetween(tLock, tStopCommitter), msBetween(tStopCommitter, tDataClose),
                     msBetween(tDataClose, tLedgerClose), msBetween(tLedgerClose, tFileDelete),
-                    SEAL_FSYNC ? msBetween(tFileDelete, tDirForce) : "-1.0",
+                    sealFsync ? msBetween(tFileDelete, tDirForce) : "-1.0",
                     msBetween(tLock, tRemove), msBetween(t0, tRemove));
         }
         return ErrorCode.OK;
