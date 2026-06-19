@@ -122,7 +122,8 @@ final class NodeHandlers implements ScpServer.Handler {
     private static Frame readRegionResponse(Frame req, ChunkStore.ReadRegionResult r) {
         byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
         if (r.channel() != null) {
-            return ScpServer.okFileRegion(req, header, r.channel(), r.filePosition(), r.length());
+            return ScpServer.okFileRegion(req, header, r.channel(), r.filePosition(), r.length(),
+                    r.releaser());
         }
         byte[] bytes = r.bytes();
         return ScpServer.ok(req, header, bytes != null && bytes.length > 0 ? ByteBuffer.wrap(bytes) : null);

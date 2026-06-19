@@ -58,7 +58,8 @@ public final class Frame implements AutoCloseable {
         return new Frame(opcode, apiVersion, flags, correlationId, header, payload, null, owner);
     }
 
-    public record FilePayload(FileChannel channel, long position, int length) implements AutoCloseable {
+    public record FilePayload(FileChannel channel, long position, int length, Runnable releaser)
+            implements AutoCloseable {
         public FilePayload {
             if (channel == null) {
                 throw new IllegalArgumentException("channel must not be null");
@@ -69,15 +70,15 @@ public final class Frame implements AutoCloseable {
             if (length < 0) {
                 throw new IllegalArgumentException("length must be non-negative: " + length);
             }
+            if (releaser == null) {
+                throw new IllegalArgumentException("releaser must not be null");
+            }
         }
 
         @Override
         public void close() {
-            try {
-                channel.close();
-            } catch (java.io.IOException ignored) {
-                // Closing a response frame is best-effort cleanup.
-            }
+            // Releases the read resource: a channel-cache lease (sealed) or the transient FD (open).
+            releaser.run();
         }
     }
 

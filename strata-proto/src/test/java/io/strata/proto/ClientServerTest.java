@@ -241,7 +241,9 @@ class ClientServerTest {
         ScpServer.Handler handler = req -> {
             FileChannel channel = FileChannel.open(file, StandardOpenOption.READ);
             sentChannel.set(channel);
-            return ScpServer.okFileRegion(req, Messages.okHeader(), channel, 2, 5);
+            return ScpServer.okFileRegion(req, Messages.okHeader(), channel, 2, 5, () -> {
+                try { channel.close(); } catch (java.io.IOException ignored) {}
+            });
         };
 
         try (ScpServer server = new ScpServer(0, 1, 0xA, 0xB, handler);
