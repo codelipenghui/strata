@@ -71,7 +71,8 @@ class ServerWriteRaceInjectionTest {
                 if (op == Opcode.READ) {
                     FileChannel channel = FileChannel.open(file, StandardOpenOption.READ);
                     return CompletableFuture.completedFuture(
-                            ScpServer.okFileRegion(req, Messages.okHeader(), channel, 0, fileContent.length));
+                            ScpServer.okFileRegion(req, Messages.okHeader(), channel, 0, fileContent.length,
+                                    () -> { try { channel.close(); } catch (java.io.IOException ignored) {} }));
                 }
                 if (op == Opcode.PING) {
                     // an async response the test completes on its own thread while the file-region
