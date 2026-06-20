@@ -8,7 +8,9 @@ import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -17,15 +19,19 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Bounded, reference-counted LRU cache of READ-only {@link FileChannel}s for SEALED chunk data.
+ * Bounded LRU pool of READ-only {@link FileChannel}s for SEALED chunk data.
  *
- * Caps the number of simultaneously-open sealed-chunk descriptors regardless of resident chunk
- * count. A channel with an outstanding lease is never closed by eviction (capacity is a soft cap);
- * over-capacity due to pinning is bounded by the number of concurrent distinct reads. Eviction and
- * close always run OUTSIDE the cache lock so a blocking close never pins a virtual-thread carrier.
+ * Each acquire hands out an EXCLUSIVE channel — a channel is never shared by two concurrent leases.
+ * This matters because {@link FileChannel} is an {@link java.nio.channels.InterruptibleChannel}: if a
+ * thread blocked on I/O is interrupted (connection cancel, replica fault, pool shutdown), the JVM
+ * closes that channel. A shared channel would then be closed out from under every other concurrent
+ * reader; exclusive channels confine that damage to the interrupted operation.
  *
- * fsync is per-inode, so evicting an idle channel is safe — but this cache only serves SEALED,
- * durable, immutable chunks, so eviction never races a write, truncate, or force.
+ * Released channels return to a per-chunk idle pool bounded by {@code capacity} (LRU-evicted across
+ * chunks); a channel that comes back closed (interrupted) is discarded, not pooled. Open/close run
+ * OUTSIDE the cache lock so a blocking close never pins a virtual-thread carrier. fsync is per-inode,
+ * and this pool only serves SEALED, durable, immutable chunks, so reopening a chunk's channel later
+ * is always safe.
  */
 final class ChannelCache implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ChannelCache.class);
@@ -36,17 +42,12 @@ final class ChannelCache implements AutoCloseable {
         @Override default void close() { release(); }
     }
 
-    private static final class Entry {
-        final FileChannel channel;
-        int refCount;
-        boolean evicted;
-        Entry(FileChannel channel) { this.channel = channel; }
-    }
-
     private final int capacity;
     private final ReentrantLock lock = new ReentrantLock();
-    /** access-order: iteration yields least-recently-used first. */
-    private final LinkedHashMap<ChunkId, Entry> map = new LinkedHashMap<>(16, 0.75f, true);
+    /** Idle (not-leased) channels per chunk; access-order so iteration yields least-recently-used chunks first. */
+    private final LinkedHashMap<ChunkId, Deque<FileChannel>> idle = new LinkedHashMap<>(16, 0.75f, true);
+    private int idleCount;
+    private boolean closed;
 
     private final AtomicLong hits = new AtomicLong();
     private final AtomicLong misses = new AtomicLong();
@@ -56,82 +57,55 @@ final class ChannelCache implements AutoCloseable {
         this.capacity = Math.max(1, capacity);
     }
 
+    /** Borrow an exclusive READ channel for {@code id}, reusing a pooled idle one or opening a new one. */
     Lease acquire(ChunkId id, Path dataPath) throws IOException {
         lock.lock();
         try {
-            Entry e = map.get(id);
-            if (e != null) {
-                e.refCount++;
-                hits.incrementAndGet();
-                return new LeaseImpl(e);
+            if (!closed) {
+                Deque<FileChannel> dq = idle.get(id); // access-order touch -> MRU
+                if (dq != null) {
+                    while (!dq.isEmpty()) {
+                        FileChannel ch = dq.pollFirst();
+                        idleCount--;
+                        if (dq.isEmpty()) {
+                            idle.remove(id);
+                        }
+                        if (ch.isOpen()) {
+                            hits.incrementAndGet();
+                            return new LeaseImpl(id, ch);
+                        }
+                        closeQuietly(ch); // a pooled channel should never be closed; never hand one out
+                    }
+                }
             }
         } finally {
             lock.unlock();
         }
-        // miss: open outside the lock
-        FileChannel opened = FileChannel.open(dataPath, StandardOpenOption.READ);
-        List<FileChannel> toClose = new ArrayList<>();
-        Entry leased;
+        // miss (or cache closed): open a fresh exclusive channel outside the lock
+        FileChannel ch = FileChannel.open(dataPath, StandardOpenOption.READ);
+        misses.incrementAndGet();
+        return new LeaseImpl(id, ch);
+    }
+
+    /**
+     * Drop a chunk's pooled idle channels (on delete/quarantine). Leased channels are exclusive and
+     * unaffected — a read in flight keeps the unlinked inode alive and completes; when released the
+     * channel pools again under a fresh entry and is reclaimed later by capacity eviction or close().
+     */
+    void invalidate(ChunkId id) {
+        List<FileChannel> toClose;
         lock.lock();
         try {
-            Entry existing = map.get(id);
-            if (existing != null) {
-                existing.refCount++;
-                hits.incrementAndGet();
-                toClose.add(opened); // we lost the open race; discard our channel
-                leased = existing;
-            } else {
-                Entry ne = new Entry(opened);
-                ne.refCount = 1;
-                map.put(id, ne);
-                misses.incrementAndGet();
-                evictDownToCapacity(toClose);
-                leased = ne;
+            Deque<FileChannel> dq = idle.remove(id);
+            if (dq == null || dq.isEmpty()) {
+                return;
             }
+            idleCount -= dq.size();
+            toClose = new ArrayList<>(dq);
         } finally {
             lock.unlock();
         }
         closeAllQuietly(toClose);
-        return new LeaseImpl(leased);
-    }
-
-    /**
-     * Caller holds the lock. Removes least-recently-used, idle (refCount==0) entries and schedules
-     * their channels for close until size <= capacity. Pinned (refCount>0) entries are SKIPPED and
-     * left in the map: capacity is a SOFT cap — a leased channel is never closed by eviction, so the
-     * resident map may temporarily exceed capacity while many distinct chunks are concurrently leased
-     * (bounded by the number of concurrent distinct reads). Such over-capacity idle entries are
-     * reclaimed on a later eviction once their leases release.
-     */
-    private void evictDownToCapacity(List<FileChannel> toClose) {
-        if (map.size() <= capacity) return;
-        Iterator<Map.Entry<ChunkId, Entry>> it = map.entrySet().iterator();
-        while (map.size() > capacity && it.hasNext()) {
-            Map.Entry<ChunkId, Entry> me = it.next();
-            Entry e = me.getValue();
-            if (e.refCount == 0) {
-                it.remove();
-                e.evicted = true;
-                toClose.add(e.channel);
-                evictions.incrementAndGet();
-            }
-            // pinned entries are skipped; capacity is a soft cap
-        }
-    }
-
-    void invalidate(ChunkId id) {
-        FileChannel toClose = null;
-        lock.lock();
-        try {
-            Entry e = map.remove(id);
-            if (e != null) {
-                e.evicted = true;
-                if (e.refCount == 0) toClose = e.channel;
-            }
-        } finally {
-            lock.unlock();
-        }
-        closeQuietly(toClose);
     }
 
     @Override
@@ -139,11 +113,12 @@ final class ChannelCache implements AutoCloseable {
         List<FileChannel> toClose = new ArrayList<>();
         lock.lock();
         try {
-            for (Entry e : map.values()) {
-                e.evicted = true;
-                if (e.refCount == 0) toClose.add(e.channel);
+            closed = true;
+            for (Deque<FileChannel> dq : idle.values()) {
+                toClose.addAll(dq);
             }
-            map.clear();
+            idle.clear();
+            idleCount = 0;
         } finally {
             lock.unlock();
         }
@@ -155,43 +130,90 @@ final class ChannelCache implements AutoCloseable {
     long evictions() { return evictions.get(); }
     int capacity() { return capacity; }
 
+    /** Number of pooled idle channels currently held (bounded by capacity). */
     int size() {
         lock.lock();
         try {
-            return map.size();
+            return idleCount;
         } finally {
             lock.unlock();
         }
     }
 
-    private final class LeaseImpl implements Lease {
-        private final Entry entry;
-        private boolean released;
-        LeaseImpl(Entry entry) { this.entry = entry; }
+    /** Caller holds the lock. Evicts least-recently-used idle channels until idleCount <= capacity. */
+    private List<FileChannel> evictDownToCapacity() {
+        if (idleCount <= capacity) {
+            return null;
+        }
+        List<FileChannel> evicted = new ArrayList<>();
+        Iterator<Map.Entry<ChunkId, Deque<FileChannel>>> it = idle.entrySet().iterator();
+        while (idleCount > capacity && it.hasNext()) {
+            Map.Entry<ChunkId, Deque<FileChannel>> e = it.next();
+            Deque<FileChannel> dq = e.getValue();
+            while (idleCount > capacity && !dq.isEmpty()) {
+                evicted.add(dq.pollFirst());
+                idleCount--;
+                evictions.incrementAndGet();
+            }
+            if (dq.isEmpty()) {
+                it.remove();
+            }
+        }
+        return evicted;
+    }
 
-        @Override public FileChannel channel() { return entry.channel; }
+    private final class LeaseImpl implements Lease {
+        private final ChunkId id;
+        private final FileChannel channel;
+        private boolean released;
+        LeaseImpl(ChunkId id, FileChannel channel) {
+            this.id = id;
+            this.channel = channel;
+        }
+
+        @Override public FileChannel channel() { return channel; }
 
         @Override public void release() {
-            FileChannel toClose = null;
+            FileChannel closeNow = null;
+            List<FileChannel> evicted = null;
             lock.lock();
             try {
-                if (released) return;
+                if (released) {
+                    return;
+                }
                 released = true;
-                entry.refCount--;
-                if (entry.evicted && entry.refCount == 0) toClose = entry.channel;
+                if (closed || !channel.isOpen()) {
+                    closeNow = channel; // shutting down, or interrupted/closed mid-use: do not pool
+                } else {
+                    Deque<FileChannel> dq = idle.get(id); // access-order touch -> MRU
+                    if (dq == null) {
+                        dq = new ArrayDeque<>();
+                        idle.put(id, dq);
+                    }
+                    dq.addLast(channel);
+                    idleCount++;
+                    evicted = evictDownToCapacity();
+                }
             } finally {
                 lock.unlock();
             }
-            closeQuietly(toClose);
+            closeQuietly(closeNow);
+            if (evicted != null) {
+                closeAllQuietly(evicted);
+            }
         }
     }
 
     private static void closeAllQuietly(List<FileChannel> channels) {
-        for (FileChannel c : channels) closeQuietly(c);
+        for (FileChannel c : channels) {
+            closeQuietly(c);
+        }
     }
 
     private static void closeQuietly(FileChannel c) {
-        if (c == null) return;
+        if (c == null) {
+            return;
+        }
         try {
             c.close();
         } catch (IOException e) {

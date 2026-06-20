@@ -40,8 +40,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -1874,22 +1874,23 @@ class ChunkStoreTest {
     }
 
     @Test
-    void sealedReadRegionSharesOneCachedFdAcrossConcurrentReaders() throws Exception {
+    void sealedConcurrentReadRegionsUseExclusiveFds() throws Exception {
         try (ChunkStore store = newStore()) {
             sealedBytes(store, id, "shared-zero-copy");
             ChunkStore.ReadRegionResult r1 = store.readRegion(id, 0, 6);
             ChunkStore.ReadRegionResult r2 = store.readRegion(id, 6, 4);
             try {
                 assertTrue(r1.channel() != null && r2.channel() != null, "sealed reads are zero-copy");
-                assertSame(r1.channel(), r2.channel(), "concurrent sealed readers share one cached FD");
-                assertEquals(1, store.cachedChannels());
+                assertNotSame(r1.channel(), r2.channel(),
+                        "concurrent sealed readers must get exclusive FDs (interrupt-safety), not one shared FD");
                 assertArrayEquals("shared".getBytes(), consumeRegion(r1));
+                assertArrayEquals("-zer".getBytes(), consumeRegion(r2));
             } finally {
                 r1.close();
                 r2.close();
             }
-            // releasing the leases leaves the channel cached (idle), not closed
-            assertEquals(1, store.cachedChannels());
+            // after both leases return, the channels are pooled for reuse, bounded by capacity
+            assertTrue(store.cachedChannels() >= 1 && store.cachedChannels() <= store.channelCacheCapacity());
         }
     }
 
