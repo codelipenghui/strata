@@ -917,7 +917,9 @@ public final class ChunkStore implements AutoCloseable {
             // integrity is covered by background scrub and the verified read()/fetch()/import paths. A
             // concurrent delete only unlinks the path while this independent FD keeps the inode alive,
             // so the deferred transfer is safe.
-            // SEALED: zero-copy region over a ref-counted cached FD shared across concurrent readers.
+            // SEALED: zero-copy region over an exclusive leased cache channel (never shared across readers —
+            // FileChannel is interruptible, so a shared FD would close for all on any reader's interrupt). The
+            // lease is released (returning the channel to the idle pool) when the response Frame closes.
             ChannelCache.Lease lease = channelCache.acquire(id, h.dataPath);
             try {
                 return new ReadRegionResult(lease.channel(), filePos, n, null, localEnd, h.lastKnownDO,

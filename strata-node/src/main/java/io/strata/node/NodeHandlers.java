@@ -118,7 +118,8 @@ final class NodeHandlers implements ScpServer.Handler {
     }
 
     /** Wire-encodes a {@link ChunkStore.ReadRegionResult}: a zero-copy region or materialized
-     * bytes. readRegion owns and closes any returned channel via the server. */
+     * bytes. The server releases the read resource via Frame.close() — a channel-cache lease for
+     * sealed chunks, or the transient FD for open chunks. */
     private static Frame readRegionResponse(Frame req, ChunkStore.ReadRegionResult r) {
         byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
         if (r.channel() != null) {
