@@ -455,9 +455,8 @@ final class NodeRegistry {
         Records.ClusterLiveNodes published = new Records.ClusterLiveNodes(now, entries);
         try {
             store.putClusterLiveNodes(published.encode());
-            // Refresh the local cache from what we just wrote so a same-process reader (the owner
-            // event-repair delta over snapshotNodeIds()) sees this publish immediately, not the
-            // up-to-SNAPSHOT_RELOAD_MS-stale prior snapshot.
+            // Refresh the local cache from what we just wrote so candidatesFor() on a non-controller
+            // owner sees this publish immediately, not the up-to-SNAPSHOT_RELOAD_MS-stale prior snapshot.
             cachedSnapshot = published;
             cachedSnapshotAtMs = now;
         } catch (Exception e) {
@@ -483,26 +482,6 @@ final class NodeRegistry {
             }
         }
         return snap;
-    }
-
-    /**
-     * The node ids in the current published live-node snapshot (alive-only — {@code
-     * publishClusterLiveNodes} only emits {@code n.alive(now)} entries), or an empty set if none has
-     * been published. A non-leader namespace owner has no heartbeat channel, so this is its sole
-     * cluster-liveness view: a node's disappearance from one snapshot to the next is how it detects a
-     * death (the owner event-repair delta). Owner liveness MUST come from here, never {@code isDead()}
-     * — the owner receives no heartbeats, so its in-memory {@code live} map would report every node dead.
-     */
-    Set<Integer> snapshotNodeIds() {
-        Records.ClusterLiveNodes snapshot = currentSnapshot(System.currentTimeMillis());
-        if (snapshot == null) {
-            return Set.of();
-        }
-        Set<Integer> ids = new HashSet<>();
-        for (Records.ClusterLiveNodes.LiveEntry e : snapshot.entries()) {
-            ids.add(e.record().nodeId());
-        }
-        return ids;
     }
 
     private static LiveNode snapshotLiveNode(Records.ClusterLiveNodes.LiveEntry e, long now) {

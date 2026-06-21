@@ -44,7 +44,7 @@ class RepairCoordinator implements AutoCloseable {
      * Observational only — the trigger never changes placement, dedup, or whether a repair is issued.
      */
     enum RepairTrigger {
-        /** Lane B: a node-death event ({@code repairForDeadNode} / {@code repairForDeadNodeOwned}). */
+        /** Lane B: a node-death event ({@code repairForDeadNode}). */
         EVENT,
         /** Lane C: the periodic backstop reconcile ({@code scanOnce} / {@code ownerRepairPass}). */
         RECONCILE
@@ -192,12 +192,6 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     private long leaderSince;
-    // Owner event-repair baseline: the node-id set seen in the previous non-leader tick's snapshot.
-    // A node present last tick but absent now is a death this owner must repair. volatile: written by
-    // the tick() thread, and read only there, but kept volatile for visibility across leadership flips.
-    // Reset to null on becoming leader so the first non-leader tick after a demotion seeds a fresh
-    // baseline (no spurious "everyone died" delta against a stale set).
-    private volatile Set<Integer> prevSnapshotIds;
 
     private void scanLoop() {
         long lastReconcile = 0;
@@ -236,25 +230,8 @@ class RepairCoordinator implements AutoCloseable {
     void tick() {
         if (!isLeader.getAsBoolean()) {
             leaderSince = 0;
-            // Lane B (owner path): a non-leader namespace owner has no heartbeat channel, so it detects a
-            // node death by that node DISAPPEARING from the published cluster-live-nodes snapshot (which
-            // is alive-only). On that delta, repair the owned chunks that had a replica on the departed
-            // node — owner-correct liveness (the snapshot alive set), NOT registry.isDead() (which an
-            // owner can't trust: it receives no heartbeats, so its in-memory live map is empty). The slow
-            // ownerRepairPass() reconcile remains the correctness backstop, and both go through the shared
-            // chunksBeingRepaired dedup so they cannot double-issue.
-            Set<Integer> nowIds = registry.snapshotNodeIds();
-            if (prevSnapshotIds != null) {
-                for (int gone : prevSnapshotIds) {
-                    if (!nowIds.contains(gone)) {
-                        repairEventExecutor.submit(() -> repairForDeadNodeOwnedSafe(gone));
-                    }
-                }
-            }
-            prevSnapshotIds = nowIds;
             return;
         }
-        prevSnapshotIds = null; // reset the owner delta baseline when we become/stay leader
         if (leaderSince == 0) {
             leaderSince = System.currentTimeMillis();
         }
@@ -344,62 +321,6 @@ class RepairCoordinator implements AutoCloseable {
             }
             if (live < file.replicationFactor() && live > 0) {
                 issueReplicate(fileId, file, chunk, RepairTrigger.EVENT);
-            }
-        }
-    }
-
-    /**
-     * Wraps {@link #repairForDeadNodeOwned} so a failure on the owner event path never escapes the
-     * executor: {@link #ownerRepairPass()} is the correctness backstop, so a missed event-driven owner
-     * repair only delays healing.
-     */
-    private void repairForDeadNodeOwnedSafe(int deadNodeId) {
-        try {
-            repairForDeadNodeOwned(deadNodeId);
-        } catch (Exception e) {
-            log.warn("owner event repair for dead node {} failed — reconcile backstops", deadNodeId, e);
-        }
-    }
-
-    /**
-     * Lane B owner-path targeted repair: a non-leader namespace owner saw {@code deadNodeId} disappear
-     * from the published live-node snapshot. Re-replicate exactly the owned sealed chunks that had a
-     * replica there, using the SAME owner per-chunk repair the reconcile uses ({@link #ownerRepairChunk}
-     * → EXEC_REPLICATE + {@link #applyOwnerRepair}), so it dedups against {@code chunksBeingRepaired}
-     * with any concurrent {@link #ownerRepairPass()}.
-     *
-     * <p>Liveness is OWNER-correct: a replica is dead iff its node is NOT in the current snapshot alive
-     * set ({@link NodeRegistry#snapshotNodeIds()}). It must NOT consult {@code registry.isDead()} — an
-     * owner receives no heartbeats, so its in-memory liveness reports essentially every node dead.
-     * Scoped to namespaces this owner owns and EXCLUDING the system meta-log namespace (owners never
-     * repair system files; those stay with the controller).
-     */
-    void repairForDeadNodeOwned(int deadNodeId) throws Exception {
-        Set<Integer> aliveSnapshot = registry.snapshotNodeIds();
-        for (StrataNamespace ns : store.listNamespaces()) {
-            if (!ownsNamespace.test(ns) || NamespaceLogBackend.isSystem(ns)) {
-                continue;
-            }
-            for (FileId fileId : store.listFiles(ns)) {
-                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
-                if (opt.isEmpty() || opt.get().value().state() == FileState.DELETING) {
-                    continue;
-                }
-                Records.FileRecord file = opt.get().value();
-                for (Records.ChunkRecord chunk : file.chunks()) {
-                    if (chunk.state() != ChunkState.SEALED || !chunk.replicas().contains(deadNodeId)) {
-                        continue;
-                    }
-                    // Owner liveness: every replica node absent from the snapshot alive set is dead. The
-                    // departed node is dead by construction; co-located deaths are healed in the same pass.
-                    Set<Integer> dead = new HashSet<>();
-                    for (int nodeId : chunk.replicas()) {
-                        if (!aliveSnapshot.contains(nodeId)) {
-                            dead.add(nodeId);
-                        }
-                    }
-                    ownerRepairChunk(ns, file, chunk, dead, RepairTrigger.EVENT);
-                }
             }
         }
     }
