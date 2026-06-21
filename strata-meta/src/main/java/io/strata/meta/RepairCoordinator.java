@@ -39,6 +39,17 @@ import java.util.concurrent.atomic.AtomicLong;
 class RepairCoordinator implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(RepairCoordinator.class);
 
+    /**
+     * Which repair lane issued a repair, for the {@code strata_repair_actions} trigger-tagged counter.
+     * Observational only — the trigger never changes placement, dedup, or whether a repair is issued.
+     */
+    enum RepairTrigger {
+        /** Lane B: a node-death event ({@code repairForDeadNode} / {@code repairForDeadNodeOwned}). */
+        EVENT,
+        /** Lane C: the periodic backstop reconcile ({@code scanOnce} / {@code ownerRepairPass}). */
+        RECONCILE
+    }
+
     private sealed interface Action permits ReplicateAction, DeleteAction {
         int executingNode();
 
@@ -90,6 +101,11 @@ class RepairCoordinator implements AutoCloseable {
     private final Map<String, Long> replicaMissingSince = new ConcurrentHashMap<>();
     private final Set<ChunkId> chunksBeingRepaired = ConcurrentHashMap.newKeySet();
     private final Map<ReplicaKey, Long> recentlyCommittedReplicas = new ConcurrentHashMap<>();
+    // Monotonic count of repairs actually issued, split by trigger lane (event vs reconcile). Bumped
+    // exactly once at the point a REPLICATE is enqueued / an owner EXEC_REPLICATE is committed, after
+    // the chunksBeingRepaired dedup add succeeds — never on a dedup-skip, placement miss, or failure.
+    private final AtomicLong eventRepairs = new AtomicLong();
+    private final AtomicLong reconcileRepairs = new AtomicLong();
     private volatile Thread scanThread;
 
     // A deleted file's record is kept as a DELETED tombstone (fencing a delayed CREATE replay from
@@ -129,6 +145,21 @@ class RepairCoordinator implements AutoCloseable {
     /** Distinct chunks currently being repaired (working-set / backlog depth). */
     public int repairBacklog() {
         return chunksBeingRepaired.size();
+    }
+
+    /** Repairs issued by the event lane (node-death driven) since start — monotonic. */
+    long eventRepairs() {
+        return eventRepairs.get();
+    }
+
+    /** Repairs issued by the reconcile backstop lane since start — monotonic. */
+    long reconcileRepairs() {
+        return reconcileRepairs.get();
+    }
+
+    /** Bumps the counter for {@code trigger}'s lane — called once per repair actually issued. */
+    private void recordRepairIssued(RepairTrigger trigger) {
+        (trigger == RepairTrigger.EVENT ? eventRepairs : reconcileRepairs).incrementAndGet();
     }
 
     private record ReplicaKey(ChunkId chunkId, int nodeId) {}
@@ -312,7 +343,7 @@ class RepairCoordinator implements AutoCloseable {
                 if (!registry.isDead(nodeId)) live++;
             }
             if (live < file.replicationFactor() && live > 0) {
-                issueReplicate(fileId, file, chunk);
+                issueReplicate(fileId, file, chunk, RepairTrigger.EVENT);
             }
         }
     }
@@ -367,7 +398,7 @@ class RepairCoordinator implements AutoCloseable {
                             dead.add(nodeId);
                         }
                     }
-                    ownerRepairChunk(ns, file, chunk, dead);
+                    ownerRepairChunk(ns, file, chunk, dead, RepairTrigger.EVENT);
                 }
             }
         }
@@ -456,7 +487,7 @@ class RepairCoordinator implements AutoCloseable {
         // exposure priority: fewest live replicas first (tech design §7.2)
         repairs.sort(java.util.Comparator.comparingInt(Repair::liveReplicas));
         for (Repair r : repairs) {
-            issueReplicate(r.fileId(), r.file(), r.chunk());
+            issueReplicate(r.fileId(), r.file(), r.chunk(), RepairTrigger.RECONCILE);
         }
     }
 
@@ -481,7 +512,8 @@ class RepairCoordinator implements AutoCloseable {
         }
     }
 
-    private void issueReplicate(FileId fileId, Records.FileRecord file, Records.ChunkRecord chunk) {
+    private void issueReplicate(FileId fileId, Records.FileRecord file, Records.ChunkRecord chunk,
+                                RepairTrigger trigger) {
         ChunkId chunkId = file.chunkId(chunk.index());
         int deadNode = -1;
         List<Messages.Replica> sources = new ArrayList<>();
@@ -521,6 +553,7 @@ class RepairCoordinator implements AutoCloseable {
                 System.currentTimeMillis()));
         registry.enqueue(target.record.nodeId(),
                 new Messages.ReplicateCmd(cmdId, chunkId, sources, (byte) 1, chunk.crc(), chunk.length()));
+        recordRepairIssued(trigger);
         log.info("repair: {} dead={} -> target={} (cmd {})", chunkId, deadNode, target.record.nodeId(), cmdId);
     }
 
@@ -554,7 +587,7 @@ class RepairCoordinator implements AutoCloseable {
                 Records.FileRecord file = opt.get().value();
                 for (Records.ChunkRecord chunk : file.chunks()) {
                     if (chunk.state() == ChunkState.SEALED) {
-                        ownerRepairChunk(ns, file, chunk, dead);
+                        ownerRepairChunk(ns, file, chunk, dead, RepairTrigger.RECONCILE);
                     }
                 }
             }
@@ -562,7 +595,7 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     private void ownerRepairChunk(StrataNamespace ns, Records.FileRecord file, Records.ChunkRecord chunk,
-                                  Set<Integer> dead) {
+                                  Set<Integer> dead, RepairTrigger trigger) {
         ChunkId chunkId = file.chunkId(chunk.index());
         if (chunksBeingRepaired.contains(chunkId)) {
             return;
@@ -604,6 +637,7 @@ class RepairCoordinator implements AutoCloseable {
                     (byte) 1, chunk.crc(), chunk.length());
             if (execReplicate(target, cmd)) {
                 applyOwnerRepair(file.fileId(), chunkId, deadNode, target.record.nodeId());
+                recordRepairIssued(trigger);
                 log.info("owner repair: {} dead={} -> target={} (cmd {})", chunkId, deadNode,
                         target.record.nodeId(), cmdId);
             }

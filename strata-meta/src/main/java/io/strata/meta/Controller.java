@@ -335,6 +335,16 @@ public final class Controller implements AutoCloseable {
         return repair.repairBacklog();
     }
 
+    /** Repairs issued by the event lane (node-death driven) since start — monotonic. */
+    public long eventRepairs() {
+        return repair.eventRepairs();
+    }
+
+    /** Repairs issued by the reconcile backstop lane since start — monotonic. */
+    public long reconcileRepairs() {
+        return repair.reconcileRepairs();
+    }
+
     public int aliveNodes() {
         return registry.livenessCounts().alive();
     }

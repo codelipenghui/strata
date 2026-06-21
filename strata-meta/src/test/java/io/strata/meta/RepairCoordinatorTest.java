@@ -806,9 +806,10 @@ class RepairCoordinatorTest {
     private static void issueReplicate(RepairCoordinator coordinator, FileId fileId,
                                        Records.FileRecord file, Records.ChunkRecord chunk) throws Exception {
         Method method = RepairCoordinator.class.getDeclaredMethod(
-                "issueReplicate", FileId.class, Records.FileRecord.class, Records.ChunkRecord.class);
+                "issueReplicate", FileId.class, Records.FileRecord.class, Records.ChunkRecord.class,
+                RepairCoordinator.RepairTrigger.class);
         method.setAccessible(true);
-        method.invoke(coordinator, fileId, file, chunk);
+        method.invoke(coordinator, fileId, file, chunk, RepairCoordinator.RepairTrigger.RECONCILE);
     }
 
     private static Object replicateAction(FileId fileId, ChunkId chunkId, int deadNode, int targetNode)

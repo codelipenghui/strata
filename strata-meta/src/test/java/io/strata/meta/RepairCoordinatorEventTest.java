@@ -82,6 +82,63 @@ class RepairCoordinatorEventTest {
         assertEquals(new ChunkId(fileId, 0), replicate.chunkId());
     }
 
+    /**
+     * Trigger metrics: an event-lane repair (leader {@code repairForDeadNode}) increments
+     * {@code eventRepairs()} and leaves {@code reconcileRepairs()} at zero — the counters distinguish
+     * the two repair lanes that share the same dedup'd issuance path.
+     */
+    @Test
+    void eventRepairIncrementsEventCounterNotReconcileCounter() throws Exception {
+        FakeStore store = new FakeStore();
+        ControllerConfig config = config();
+        NodeRegistry registry = new NodeRegistry(store, config);
+        Registered source = register(registry, 2510, "source");
+        Registered target = register(registry, 2511, "target");
+        int deadNode = 707_070; // never registered -> isDead == true
+        FileId fileId = fileId(2500);
+        store.createFile(file(fileId, FileState.SEALED,
+                List.of(sealed(0, 1024, 0xCAFE, List.of(source.nodeId(), deadNode)))));
+
+        RepairCoordinator coord = new RepairCoordinator(store, registry, config, () -> true);
+        coord.becomeLeaderForTest();
+
+        long beforeEvent = coord.eventRepairs();
+        long beforeReconcile = coord.reconcileRepairs();
+        coord.repairForDeadNode(deadNode);
+
+        onlyReplicate(registry, coord, target); // a REPLICATE was actually issued
+        assertTrue(coord.eventRepairs() > beforeEvent, "event repair must bump the event counter");
+        assertEquals(beforeReconcile, coord.reconcileRepairs(), "event repair must not touch the reconcile counter");
+    }
+
+    /**
+     * Trigger metrics (reconcile lane): a backstop {@code scanOnce()} repair increments
+     * {@code reconcileRepairs()} and leaves {@code eventRepairs()} at zero.
+     */
+    @Test
+    void reconcileRepairIncrementsReconcileCounterNotEventCounter() throws Exception {
+        FakeStore store = new FakeStore();
+        ControllerConfig config = config();
+        NodeRegistry registry = new NodeRegistry(store, config);
+        Registered source = register(registry, 2610, "source");
+        Registered target = register(registry, 2611, "target");
+        int deadNode = 606_060; // never registered -> isDead == true
+        FileId fileId = fileId(2600);
+        store.createFile(file(fileId, FileState.SEALED,
+                List.of(sealed(0, 1024, 0xD00D, List.of(source.nodeId(), deadNode)))));
+
+        RepairCoordinator coord = new RepairCoordinator(store, registry, config, () -> true);
+        coord.becomeLeaderForTest();
+
+        long beforeEvent = coord.eventRepairs();
+        long beforeReconcile = coord.reconcileRepairs();
+        coord.scanOnce();
+
+        onlyReplicate(registry, coord, target); // a REPLICATE was actually issued
+        assertTrue(coord.reconcileRepairs() > beforeReconcile, "reconcile repair must bump the reconcile counter");
+        assertEquals(beforeEvent, coord.eventRepairs(), "reconcile repair must not touch the event counter");
+    }
+
     @Test
     void repairForDeadNodeIsNoopWhenNotLeader() throws Exception {
         FakeStore store = new FakeStore();

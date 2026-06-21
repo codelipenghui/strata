@@ -46,6 +46,12 @@ final class ServerMetrics {
                 .description("outstanding repair/delete commands").register(reg);
         Gauge.builder("strata_repair_backlog", s, Controller::repairBacklog)
                 .description("distinct chunks currently being repaired").register(reg);
+        FunctionCounter.builder("strata_repair_actions", s, Controller::eventRepairs)
+                .tag("trigger", "event")
+                .description("repairs issued, by trigger lane (event = node-death driven, reconcile = backstop scan)").register(reg);
+        FunctionCounter.builder("strata_repair_actions", s, Controller::reconcileRepairs)
+                .tag("trigger", "reconcile")
+                .description("repairs issued, by trigger lane (event = node-death driven, reconcile = backstop scan)").register(reg);
 
         Gauge.builder("strata_data_nodes", s, Controller::aliveNodes)
                 .tag("state", "alive").description("data nodes by liveness state").register(reg);
