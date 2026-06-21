@@ -422,9 +422,11 @@ git commit -m "feat(repair): owner event repair from live-nodes snapshot delta"
 
 ---
 
-### Task 6: Unify `scanOnce`/`ownerRepairPass` into `repairOwned()` + `repairSystem()`
+### Task 6: Unify `scanOnce`/`ownerRepairPass` into `repairOwned()` + `repairSystem()` — DROPPED (unsound)
 
-Collapse the two reconcile bodies so each controller reconciles only the namespaces it owns (in-memory), and the leader additionally reconciles the system meta-log files (ZK). Removes the leader's redundant re-scan of its own user namespaces.
+**Status: dropped during execution (user-approved).** The premise was wrong: the leader and owner repair via architecturally different mechanisms and cannot share one path. The leader (`scanOnce` → `issueReplicate`, `:484`) issues `REPLICATE` over the **heartbeat command channel** it alone owns; a non-leader owner (`ownerRepairPass` → `ownerRepairChunk` → `EXEC_REPLICATE`, `:564`/`:630`) has **no heartbeat channel** and instead pulls the chunk via direct synchronous `EXEC_REPLICATE` and self-writes the replica change. There is also no redundant double-scan — the loop runs `scanOnce` XOR `ownerRepairPass` by role, and each namespace has exactly one owner. Owner-local repair and the ZK-read reduction were already delivered by Tasks 3–5. Skipped; proceed to Task 7.
+
+_Original (no longer applicable):_ Collapse the two reconcile bodies so each controller reconciles only the namespaces it owns (in-memory), and the leader additionally reconciles the system meta-log files (ZK).
 
 **Files:**
 - Modify: `strata-meta/src/main/java/io/strata/meta/RepairCoordinator.java` (`reconcile` from Task 3, `scanOnce` `:209`, `ownerRepairPass` `:334`)
