@@ -50,7 +50,9 @@ final class NamespaceLogBackend implements AutoCloseable {
     private final boolean ownsRoot;
     private final NamespaceLogMetrics metrics = new NamespaceLogMetrics();
     private final ReentrantLock lock = new ReentrantLock();
-    private final Map<StrataNamespace, NamespaceMetadataLogRepository> repos = new HashMap<>();
+    private final ConcurrentHashMap<StrataNamespace, NamespaceMetadataLogRepository> repos =
+            new ConcurrentHashMap<>();
+    private final ReentrantLock repoCreateLock = new ReentrantLock();
     private final Map<FileId, StrataNamespace> fileIndex = new ConcurrentHashMap<>();
     // Only namespaces this node OWNS may be opened here — opening another owner's namespace would
     // republish its manifest and fence the real owner. Default ns->true for single-node / tests.
@@ -103,16 +105,25 @@ final class NamespaceLogBackend implements AutoCloseable {
     }
 
     private NamespaceMetadataLogRepository repo(StrataNamespace namespace) throws Exception {
-        NamespaceMetadataLogRepository r = repos.get(namespace);
-        if (r == null) {
-            long epoch = root.allocateMetadataEpoch();
-            r = NamespaceMetadataLogRepository.open(namespace, fileStore, root, epoch, metrics);
-            repos.put(namespace, r);
-            for (FileId id : r.state().liveFiles()) {
-                fileIndex.put(id, namespace);
-            }
+        NamespaceMetadataLogRepository r = repos.get(namespace);   // fast path, lock-free
+        if (r != null) {
+            return r;
         }
-        return r;
+        repoCreateLock.lock();
+        try {
+            r = repos.get(namespace);
+            if (r == null) {
+                long epoch = root.allocateMetadataEpoch();
+                r = NamespaceMetadataLogRepository.open(namespace, fileStore, root, epoch, metrics);
+                for (FileId id : r.state().liveFiles()) {
+                    fileIndex.put(id, namespace);
+                }
+                repos.put(namespace, r);   // publish only after recovery + fileIndex populated
+            }
+            return r;
+        } finally {
+            repoCreateLock.unlock();
+        }
     }
 
     void createFile(Records.FileRecord record) throws Exception {
@@ -184,7 +195,7 @@ final class NamespaceLogBackend implements AutoCloseable {
      * Ownership-scoped: opening a non-owned namespace would republish its manifest and fence the owner.
      */
     private void warmOwnedNamespaces() throws Exception {
-        lock.lock();
+        repoCreateLock.lock();
         try {
             if (ownedNamespacesWarmed) {
                 return;
@@ -196,7 +207,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             }
             ownedNamespacesWarmed = true;
         } finally {
-            lock.unlock();
+            repoCreateLock.unlock();
         }
     }
 
