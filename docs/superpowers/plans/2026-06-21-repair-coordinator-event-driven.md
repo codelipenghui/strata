@@ -82,9 +82,11 @@ git commit -m "feat(repair): add STRATA_REPAIR_RECONCILE_INTERVAL_MS config (def
 
 ---
 
-### Task 2: Leader repairs from in-memory liveness; cache `listNamespaces` per pass
+### Task 2: Leader repairs from in-memory liveness; cache `listNamespaces` per pass — SUPERSEDED (no-op)
 
-Removes the per-pass ZK `listNodes` read from the leader's repair decision and the repeated `listNamespaces` ZK call. Behavior-preserving.
+**Status: verified already-satisfied during execution; no code change.** The leader's `scanOnce` already decides liveness via in-memory `registry.isDead()` (`RepairCoordinator.java:234`), never `store.listNodes()`, and `listNamespaces()` is already called once per pass (`:202`, `:344`). The only `store.listNodes()` (ZK) is in `ownerRepairPass` (`:339`), where it builds the **DEAD** set — which the published cluster-live-nodes snapshot is alive-only and structurally cannot supply, so it cannot be removed standalone. The owner-liveness ZK win is realized instead by Task 3 (the owner reconcile drops 5s→60s, 12× fewer reads) and Task 5 (event-driven owner repair via the alive-snapshot delta — a node leaving the alive set is the death signal — removing the per-pass DEAD-set read for the common case). Skipped; proceed to Task 3.
+
+_Original (no longer applicable):_ Removes the per-pass ZK `listNodes` read from the leader's repair decision and the repeated `listNamespaces` ZK call. Behavior-preserving.
 
 **Files:**
 - Modify: `strata-meta/src/main/java/io/strata/meta/RepairCoordinator.java` (`ownerRepairPass` `:334-360`, `allFileIds` `:200-206`)
