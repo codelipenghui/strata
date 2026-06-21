@@ -34,7 +34,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * command failures are simply forgotten and rediscovered by the next scan. Exposure-prioritized:
  * chunks with fewer live replicas are commanded first.
  */
-final class RepairCoordinator implements AutoCloseable {
+// Non-final so RepairCoordinatorLoopTest can subclass and count tick()/reconcile() dispatches —
+// a deterministic seam over the loop's cadence (no injectable clock to fake otherwise).
+class RepairCoordinator implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(RepairCoordinator.class);
 
     private sealed interface Action permits ReplicateAction, DeleteAction {
@@ -156,33 +158,22 @@ final class RepairCoordinator implements AutoCloseable {
     private long leaderSince;
 
     private void scanLoop() {
+        long lastReconcile = 0;
         while (!closed.get()) {
             try {
                 Thread.sleep(config.repairScanIntervalMs());
-                if (!isLeader.getAsBoolean()) {
-                    // a standby must never run cluster-wide failure detection (no heartbeats are routed
-                    // to it). But a sharded non-controller OWNER still heals under-replication in the
-                    // namespaces it owns, directly via EXEC_REPLICATE (design §11).
-                    leaderSince = 0;
-                    ownerRepairPass();
-                    continue;
+                // Lane A — cheap in-memory housekeeping every fast interval (leader-gated inside).
+                tick();
+                // Lane C — full backstop pass on the slow cadence. Until the event path lands, repair
+                // correctness still rests entirely on this (now slower) reconcile.
+                long now = System.currentTimeMillis();
+                if (now - lastReconcile >= config.reconcileIntervalMs()) {
+                    reconcile();
+                    // Advance the cadence clock only after a reconcile that actually ran to completion:
+                    // if reconcile() throws (e.g. a transient store outage), the backstop did no work, so
+                    // the next fast tick retries it promptly instead of waiting a whole reconcile interval.
+                    lastReconcile = now;
                 }
-                if (leaderSince == 0) {
-                    leaderSince = System.currentTimeMillis();
-                }
-                // Publish the shared live-node snapshot every pass — NOT gated by the settle period.
-                // Sharded non-controller owners need a placement view immediately (to place their own
-                // metadata-log chunks); without it they see zero nodes and every forwarded op stalls.
-                registry.publishClusterLiveNodes();
-                // settle period after acquiring leadership: nodes registered with the previous
-                // leader need a lease cycle to re-register here, or every chunk looks
-                // under-replicated and the scan issues spurious repairs. Gates REPAIR actions only.
-                if (System.currentTimeMillis() - leaderSince < config.leaseMs() + config.deadGraceMs()) {
-                    continue;
-                }
-                registry.expireScan();
-                scanOnce();
-                store.sweepDeletedFiles(DELETED_TOMBSTONE_TTL_MS);
             } catch (InterruptedException e) {
                 return;
             } catch (Exception e) {
@@ -191,6 +182,52 @@ final class RepairCoordinator implements AutoCloseable {
                 }
             }
         }
+    }
+
+    /**
+     * Lane A: light in-memory housekeeping run every {@code repairScanIntervalMs}. Leader-gated — a
+     * standby must never run failure detection (no heartbeats are routed to it, so it would declare
+     * every node DEAD). Publishes the shared live-node snapshot every pass (NOT gated by the settle
+     * period: sharded non-controller owners need a placement view immediately or every forwarded op
+     * stalls), then — past the settle period — expires leases and releases stuck repair commands.
+     */
+    void tick() {
+        if (!isLeader.getAsBoolean()) {
+            leaderSince = 0;
+            return;
+        }
+        if (leaderSince == 0) {
+            leaderSince = System.currentTimeMillis();
+        }
+        registry.publishClusterLiveNodes();
+        // settle period after acquiring leadership: nodes registered with the previous leader need a
+        // lease cycle to re-register here, or expireScan() would mark them DEAD spuriously.
+        if (System.currentTimeMillis() - leaderSince < config.leaseMs() + config.deadGraceMs()) {
+            return;
+        }
+        registry.expireScan();
+        sweepStuckCommands();
+    }
+
+    /**
+     * Lane C: the full backstop reconciliation, run every {@code reconcileIntervalMs}. The controller
+     * scans every file for under-replication and drives deletions; a sharded non-controller owner heals
+     * only the namespaces it owns directly via EXEC_REPLICATE. Leader path is settle-gated so a freshly
+     * elected leader does not issue spurious repairs before nodes re-register.
+     */
+    void reconcile() throws Exception {
+        if (!isLeader.getAsBoolean()) {
+            ownerRepairPass();
+            return;
+        }
+        if (leaderSince == 0) {
+            leaderSince = System.currentTimeMillis();
+        }
+        if (System.currentTimeMillis() - leaderSince < config.leaseMs() + config.deadGraceMs()) {
+            return;
+        }
+        scanOnce();
+        store.sweepDeletedFiles(DELETED_TOMBSTONE_TTL_MS);
     }
 
     /**
