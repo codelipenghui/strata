@@ -397,7 +397,7 @@ public final class Messages {
         }
     }
 
-    /* ---------- control plane: storage node <-> metadata ---------- */
+    /* ---------- control plane: data node <-> metadata ---------- */
 
     public record StorageCapacity(long capacityBytes) {}
 

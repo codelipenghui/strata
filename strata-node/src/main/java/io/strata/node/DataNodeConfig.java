@@ -8,15 +8,15 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Storage node configuration. metadataEndpoints empty = standalone mode (no registration loop) —
+ * Data node configuration. controllerEndpoints empty = standalone mode (no registration loop) —
  * used by data-plane tests; production always registers.
  */
-public record NodeConfig(
+public record DataNodeConfig(
         Path dataDir,
         int listenPort,                 // 0 = ephemeral
         String advertisedHost,
         String advertisedEndpointOverride, // non-null: register THIS endpoint (chaos proxying)
-        List<String> metadataEndpoints, // "host:port"
+        List<String> controllerEndpoints, // "host:port"
         String zone,
         String rack,
         String host,
@@ -24,19 +24,19 @@ public record NodeConfig(
         int inventoryIntervalMs,
         ConnectionPolicy connectionPolicy
 ) {
-    public NodeConfig(Path dataDir, int listenPort, String advertisedHost, String advertisedEndpointOverride,
-                      List<String> metadataEndpoints, String zone, String rack, String host,
+    public DataNodeConfig(Path dataDir, int listenPort, String advertisedHost, String advertisedEndpointOverride,
+                      List<String> controllerEndpoints, String zone, String rack, String host,
                       long capacityBytes, int inventoryIntervalMs) {
-        this(dataDir, listenPort, advertisedHost, advertisedEndpointOverride, metadataEndpoints,
+        this(dataDir, listenPort, advertisedHost, advertisedEndpointOverride, controllerEndpoints,
                 zone, rack, host, capacityBytes, inventoryIntervalMs, ConnectionPolicy.DEFAULT);
     }
 
-    public NodeConfig {
+    public DataNodeConfig {
         if (dataDir == null) {
             throw new IllegalArgumentException("dataDir must be non-null");
         }
-        if (metadataEndpoints == null) {
-            throw new IllegalArgumentException("metadataEndpoints must be non-null");
+        if (controllerEndpoints == null) {
+            throw new IllegalArgumentException("controllerEndpoints must be non-null");
         }
         requireText(advertisedHost, "advertisedHost");
         requireText(zone, "zone");
@@ -45,10 +45,10 @@ public record NodeConfig(
         if (advertisedEndpointOverride != null) {
             validateEndpoint(advertisedEndpointOverride, "advertisedEndpointOverride");
         }
-        for (String endpoint : metadataEndpoints) {
-            validateEndpoint(endpoint, "metadata endpoint");
+        for (String endpoint : controllerEndpoints) {
+            validateEndpoint(endpoint, "controller endpoint");
         }
-        metadataEndpoints = List.copyOf(metadataEndpoints);
+        controllerEndpoints = List.copyOf(controllerEndpoints);
         if (listenPort < 0 || listenPort > 65_535) {
             throw new IllegalArgumentException("listenPort must be 0..65535: " + listenPort);
         }
@@ -71,28 +71,28 @@ public record NodeConfig(
         Endpoint.parse(endpoint, field);
     }
 
-    public static NodeConfig standalone(Path dataDir) {
-        return new NodeConfig(dataDir, 0, "127.0.0.1", null, List.of(), "z0", "r0",
+    public static DataNodeConfig standalone(Path dataDir) {
+        return new DataNodeConfig(dataDir, 0, "127.0.0.1", null, List.of(), "z0", "r0",
                 "h-" + dataDir.getFileName(), 1L << 40, 60_000);
     }
 
-    public static NodeConfig withMetadata(Path dataDir, List<String> metadataEndpoints, String host) {
-        return new NodeConfig(dataDir, 0, "127.0.0.1", null, metadataEndpoints, "z0", "r0",
+    public static DataNodeConfig withMetadata(Path dataDir, List<String> controllerEndpoints, String host) {
+        return new DataNodeConfig(dataDir, 0, "127.0.0.1", null, controllerEndpoints, "z0", "r0",
                 host, 1L << 40, 5_000);
     }
 
-    public NodeConfig withListenPort(int port) {
-        return new NodeConfig(dataDir, port, advertisedHost, advertisedEndpointOverride,
-                metadataEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy);
+    public DataNodeConfig withListenPort(int port) {
+        return new DataNodeConfig(dataDir, port, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy);
     }
 
-    public NodeConfig withAdvertisedEndpoint(String endpoint) {
-        return new NodeConfig(dataDir, listenPort, advertisedHost, endpoint,
-                metadataEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy);
+    public DataNodeConfig withAdvertisedEndpoint(String endpoint) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, endpoint,
+                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy);
     }
 
-    public NodeConfig withConnectionPolicy(ConnectionPolicy policy) {
-        return new NodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
-                metadataEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, policy);
+    public DataNodeConfig withConnectionPolicy(ConnectionPolicy policy) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, policy);
     }
 }

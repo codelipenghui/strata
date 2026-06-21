@@ -30,10 +30,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class RepairReliabilityTest {
 
     private TestingServer zk;
-    private MetadataService service;
+    private Controller service;
     private ScpClient client;
 
-    /** Minimal fake storage node: registers, heartbeats, auto-acks received commands. */
+    /** Minimal fake data node: registers, heartbeats, auto-acks received commands. */
     private final class FakeNode {
         final UUID inc = UUID.randomUUID();
         final String host;
@@ -90,8 +90,8 @@ class RepairReliabilityTest {
             try {
                 zk = new TestingServer(true);
                 // grace 0: exercise prompt missing-replica drop -> repair
-                service = new MetadataService(
-                        MetaConfig.forTests(zk.getConnectString()).withReplicaMissingGraceMs(0));
+                service = new Controller(
+                        ControllerConfig.forTests(zk.getConnectString()).withReplicaMissingGraceMs(0));
                 long deadline = System.currentTimeMillis() + 10_000;
                 while (!service.isLeader() && System.currentTimeMillis() < deadline) {
                     Thread.sleep(20);

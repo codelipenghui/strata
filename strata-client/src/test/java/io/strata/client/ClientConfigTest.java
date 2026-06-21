@@ -47,13 +47,13 @@ class ClientConfigTest {
         ClientConfig cfg = new ClientConfig(endpoints, 1024, 500);
         endpoints.set(0, "127.0.0.1:9999");
 
-        assertEquals(List.of("[::1]:2181"), cfg.metadataEndpoints());
-        assertThrows(UnsupportedOperationException.class, () -> cfg.metadataEndpoints().add("127.0.0.1:1"));
+        assertEquals(List.of("[::1]:2181"), cfg.controllerEndpoints());
+        assertThrows(UnsupportedOperationException.class, () -> cfg.controllerEndpoints().add("127.0.0.1:1"));
         assertEquals(2048, cfg.withChunkRollBytes(2048).chunkRollBytes());
         assertEquals(ConnectionPolicy.DEFAULT, cfg.connectionPolicy());
-        assertEquals(1, cfg.storageConnectionsPerEndpoint());
+        assertEquals(1, cfg.dataNodeConnectionsPerEndpoint());
         ConnectionPolicy policy = ConnectionPolicy.DEFAULT.withHeartbeatIntervalMs(1234);
         assertEquals(policy, cfg.withConnectionPolicy(policy).connectionPolicy());
-        assertEquals(3, cfg.withStorageConnectionsPerEndpoint(3).storageConnectionsPerEndpoint());
+        assertEquals(3, cfg.withDataNodeConnectionsPerEndpoint(3).dataNodeConnectionsPerEndpoint());
     }
 }

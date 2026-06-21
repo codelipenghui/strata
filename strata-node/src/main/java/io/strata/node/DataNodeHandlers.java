@@ -14,13 +14,19 @@ import java.util.ArrayList;
 import java.util.List;
 
 /** Maps SCP data-plane opcodes onto the ChunkStore engine (tech design §10.3). */
-final class NodeHandlers implements ScpServer.Handler {
+final class DataNodeHandlers implements ScpServer.Handler {
     private final ChunkStore store;
-    private final StorageNode node;
+    private final DataNode node;
+    private volatile ControlLoop controlLoop; // wired after the control loop starts (owner-repair path)
 
-    NodeHandlers(ChunkStore store, StorageNode node) {
+    DataNodeHandlers(ChunkStore store, DataNode node) {
         this.store = store;
         this.node = node;
+    }
+
+    /** Wires the control loop so this node can serve direct owner-driven EXEC_REPLICATE repairs. */
+    void controlLoop(ControlLoop controlLoop) {
+        this.controlLoop = controlLoop;
     }
 
     @Override
@@ -113,7 +119,22 @@ final class NodeHandlers implements ScpServer.Handler {
                 yield ScpServer.ok(req, new Messages.ReadLedgerResp(wire).encode(), null);
             }
 
-            default -> throw new ScpException(ErrorCode.UNKNOWN_OPCODE, op + " not served by storage node");
+            case EXEC_REPLICATE -> {
+                // A namespace owner that is not the cluster controller drives repair directly: pull the
+                // chunk from a live source via the proven control-loop path (design §11). Synchronous —
+                // the response confirms the pull+import completed.
+                ControlLoop loop = controlLoop;
+                if (loop == null) {
+                    throw new ScpException(ErrorCode.INTERNAL, "control loop unavailable for EXEC_REPLICATE");
+                }
+                if (!(Messages.Command.read(h) instanceof Messages.ReplicateCmd cmd)) {
+                    throw new ScpException(ErrorCode.PRECONDITION_FAILED, "EXEC_REPLICATE requires a ReplicateCmd");
+                }
+                loop.replicate(cmd);
+                yield ScpServer.ok(req, Messages.okHeader(), null);
+            }
+
+            default -> throw new ScpException(ErrorCode.UNKNOWN_OPCODE, op + " not served by data node");
         };
     }
 

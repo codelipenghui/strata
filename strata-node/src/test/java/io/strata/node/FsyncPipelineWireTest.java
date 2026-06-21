@@ -34,7 +34,7 @@ class FsyncPipelineWireTest {
     void pipelinedWireAppendsCoalesceForces() throws Exception {
         int appends = 300;
         byte[] payload = new byte[512];
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "perf")) {
 
             ChunkId id = new ChunkId(FileId.random(), 0);

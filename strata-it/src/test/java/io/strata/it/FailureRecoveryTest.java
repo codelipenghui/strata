@@ -44,7 +44,7 @@ class FailureRecoveryTest {
         cluster = new MiniCluster(4); // one spare so rolls/repair can re-place
         client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint())
                 .withChunkRollBytes(1 << 16)
-                .withStorageConnectionsPerEndpoint(3));
+                .withDataNodeConnectionsPerEndpoint(3));
     }
 
     @AfterEach
@@ -61,7 +61,7 @@ class FailureRecoveryTest {
         try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 200);
 
-            // find a storage node hosting the current open chunk and kill it
+            // find a data node hosting the current open chunk and kill it
             var lookup = lookupFile(fileId);
             var openChunk = lookup.chunks().get(lookup.chunks().size() - 1);
             int victimNodeId = openChunk.replicas().get(0).nodeId();
@@ -86,7 +86,7 @@ class FailureRecoveryTest {
     void pooledConnectionsRollingReplicaFailureThenRecoveryPreservesAckedPrefix() throws Exception {
         ClientConfig config = ClientConfig.of(cluster.metaEndpoint())
                 .withChunkRollBytes(512)
-                .withStorageConnectionsPerEndpoint(3);
+                .withDataNodeConnectionsPerEndpoint(3);
         try (StrataClient pooled = StrataClient.connect(config)) {
             FileId fileId = pooled.create(StrataClient.FileSpec.log("test", "/pooled-roll-fault-recover")).id();
             Workload workload = new Workload();
@@ -124,7 +124,7 @@ class FailureRecoveryTest {
         Random random = new Random(seed);
         ClientConfig config = ClientConfig.of(cluster.metaEndpoint())
                 .withChunkRollBytes(384)
-                .withStorageConnectionsPerEndpoint(3);
+                .withDataNodeConnectionsPerEndpoint(3);
         try (StrataClient pooled = StrataClient.connect(config)) {
             FileId fileId = pooled.create(StrataClient.FileSpec.log("test", "/pooled-random-stress")).id();
             BinaryWorkload workload = new BinaryWorkload();
@@ -534,7 +534,7 @@ class FailureRecoveryTest {
 
         client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint())
                 .withChunkRollBytes(1 << 16)
-                .withStorageConnectionsPerEndpoint(3));
+                .withDataNodeConnectionsPerEndpoint(3));
         assertEquals(originalId, client.open(namespace, path).id(),
                 "path binding changed after ZooKeeper restart");
         originalWorkload.verifyAckedPrefix(client, originalId);
@@ -592,7 +592,7 @@ class FailureRecoveryTest {
 
         client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint())
                 .withChunkRollBytes(1 << 16)
-                .withStorageConnectionsPerEndpoint(3));
+                .withDataNodeConnectionsPerEndpoint(3));
 
         assertEquals(sealedWorkload.ackedBytes(), sealedLength,
                 "sealed file committed a non-acked length before cold restart");
@@ -610,13 +610,13 @@ class FailureRecoveryTest {
 
     private void restartServices(List<String> hosts, List<Integer> nodeIds, boolean restartZooKeeper)
             throws Exception {
-        cluster.stopStorageNodes();
-        cluster.stopMetadataServices();
+        cluster.stopDataNodes();
+        cluster.stopControllers();
         if (restartZooKeeper) {
             cluster.restartZooKeeper();
         }
-        cluster.startMetadataServices();
-        cluster.startStorageNodes(hosts);
+        cluster.startControllers();
+        cluster.startDataNodes(hosts);
         for (int i = 0; i < nodeIds.size(); i++) {
             waitForNodeId(cluster.nodes.get(i), nodeIds.get(i));
         }
@@ -664,7 +664,7 @@ class FailureRecoveryTest {
         }
     }
 
-    private void waitForNodeId(io.strata.node.StorageNode node, int expectedNodeId) throws InterruptedException {
+    private void waitForNodeId(io.strata.node.DataNode node, int expectedNodeId) throws InterruptedException {
         long deadline = System.currentTimeMillis() + 10_000;
         while (node.nodeId() != expectedNodeId && System.currentTimeMillis() < deadline) {
             Thread.sleep(50);

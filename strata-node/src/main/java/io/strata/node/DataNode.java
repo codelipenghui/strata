@@ -18,14 +18,14 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Storage node process: ChunkStore engine + SCP server + control loop (register/heartbeat/
+ * Data node process: ChunkStore engine + SCP server + control loop (register/heartbeat/
  * inventory/commands) against the metadata plane. Identity is bound to the data volume
  * (tech design §10.4): nodeId + incarnationId persist in an identity file.
  */
-public final class StorageNode implements AutoCloseable {
-    private static final Logger log = LoggerFactory.getLogger(StorageNode.class);
+public final class DataNode implements AutoCloseable {
+    private static final Logger log = LoggerFactory.getLogger(DataNode.class);
 
-    private final NodeConfig config;
+    private final DataNodeConfig config;
     private final ChunkStore store;
     private final ScpServer server;
     private final ControlLoop controlLoop;
@@ -34,16 +34,16 @@ public final class StorageNode implements AutoCloseable {
     private volatile int nodeId;
     private final UUID incarnation;
 
-    public StorageNode(NodeConfig config) throws IOException {
+    public DataNode(DataNodeConfig config) throws IOException {
         this(config, null);
     }
 
     /**
-     * With a non-null {@code metaHandler}, this node's single SCP listener also serves the
+     * With a non-null {@code controllerHandler}, this node's single SCP listener also serves the
      * control-plane/metadata opcodes by routing them to that handler — combined mode, where a
-     * co-resident metadata service shares the node's port instead of binding its own.
+     * co-resident controller shares the node's port instead of binding its own.
      */
-    public StorageNode(NodeConfig config, ScpServer.Handler metaHandler) throws IOException {
+    public DataNode(DataNodeConfig config, ScpServer.Handler controllerHandler) throws IOException {
         this.config = config;
         Files.createDirectories(config.dataDir());
         Identity identity = loadIdentity(config.dataDir());
@@ -54,17 +54,18 @@ public final class StorageNode implements AutoCloseable {
         ControlLoop startedLoop = null;
         try {
             openedStore = new ChunkStore(config.dataDir().resolve("chunks"));
-            NodeHandlers dataHandler = new NodeHandlers(openedStore, this);
-            ScpServer.Handler handler = metaHandler == null
+            DataNodeHandlers dataHandler = new DataNodeHandlers(openedStore, this);
+            ScpServer.Handler handler = controllerHandler == null
                     ? dataHandler
-                    : ScpServer.Handler.route(dataHandler, metaHandler);
+                    : ScpServer.Handler.route(dataHandler, controllerHandler);
             openedServer = new ScpServer(config.listenPort(), nodeId,
                     incarnation.getMostSignificantBits(), incarnation.getLeastSignificantBits(), handler);
             this.store = openedStore;
             this.server = openedServer;
-            if (!config.metadataEndpoints().isEmpty()) {
+            if (!config.controllerEndpoints().isEmpty()) {
                 startedLoop = new ControlLoop(this, config, openedStore);
                 this.controlLoop = startedLoop;
+                dataHandler.controlLoop(startedLoop); // serve direct owner-repair EXEC_REPLICATE
                 startedLoop.start();
             } else {
                 this.controlLoop = null; // null in standalone data-plane tests
@@ -76,7 +77,7 @@ public final class StorageNode implements AutoCloseable {
             }
             throw e;
         }
-        log.info("storage node started: port={} incarnation={} nodeId={}", server.port(), incarnation, nodeId);
+        log.info("data node started: port={} incarnation={} nodeId={}", server.port(), incarnation, nodeId);
     }
 
     /** Closes whatever subset of the node's resources exists; returns the accumulated failure. */
@@ -181,7 +182,7 @@ public final class StorageNode implements AutoCloseable {
         return store;
     }
 
-    public NodeConfig config() {
+    public DataNodeConfig config() {
         return config;
     }
 
@@ -216,7 +217,7 @@ public final class StorageNode implements AutoCloseable {
             String nodeIdText = p.getProperty("nodeId");
             String incarnationText = p.getProperty("incarnation");
             if (nodeIdText == null || incarnationText == null) {
-                throw new IOException("storage node identity is missing nodeId or incarnation: " + f);
+                throw new IOException("data node identity is missing nodeId or incarnation: " + f);
             }
             try {
                 int nodeId = Integer.parseInt(nodeIdText);
@@ -225,7 +226,7 @@ public final class StorageNode implements AutoCloseable {
                 }
                 return new Identity(nodeId, UUID.fromString(incarnationText));
             } catch (IllegalArgumentException e) {
-                throw new IOException("invalid storage node identity: " + f, e);
+                throw new IOException("invalid data node identity: " + f, e);
             }
         }
         Identity fresh = new Identity(-1, UUID.randomUUID());
@@ -242,7 +243,7 @@ public final class StorageNode implements AutoCloseable {
         try (FileChannel ch = FileChannel.open(tmp, StandardOpenOption.CREATE,
                 StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
              var out = Channels.newOutputStream(ch)) {
-            p.store(out, "strata storage node identity — bound to this volume");
+            p.store(out, "strata data node identity — bound to this volume");
             out.flush();
             ch.force(true);
         }

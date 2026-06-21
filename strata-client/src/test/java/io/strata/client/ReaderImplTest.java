@@ -40,7 +40,7 @@ class ReaderImplTest {
 
         try (ScpServer metaServer = metadataServer(new AtomicReference<>(lookup))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
 
                 ScpException e = assertThrows(ScpException.class, () -> reader.read(Long.MAX_VALUE, 1));
@@ -57,7 +57,7 @@ class ReaderImplTest {
 
         try (ScpServer metaServer = metadataServer(lookup)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
 
                 try (StrataFile.ReadResult r = reader.read(0, 1)) {
@@ -84,7 +84,7 @@ class ReaderImplTest {
                              List.of(chunk(chunkId, ChunkState.SEALED, 3,
                                      new Messages.Replica(1, endpoint(replica)))))))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
 
                 try (StrataFile.ReadResult result = reader.read(0, 3)) {
@@ -106,7 +106,7 @@ class ReaderImplTest {
                              List.of(chunk(chunkId, ChunkState.SEALED, 5,
                                      new Messages.Replica(1, endpoint(shortReplica)))))))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
 
                 ScpException e = assertThrows(ScpException.class, () -> reader.read(0, 3));
@@ -132,7 +132,7 @@ class ReaderImplTest {
                              List.of(chunk(chunkId, ChunkState.SEALED, 3,
                                      new Messages.Replica(1, endpoint(failingReplica)))))))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
 
                 ScpException e = assertThrows(ScpException.class, () -> reader.read(0, 3));
@@ -152,7 +152,7 @@ class ReaderImplTest {
                              List.of(chunk(chunkId, ChunkState.OPEN, 0,
                                      new Messages.Replica(1, endpoint(replica)))))))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
 
                 try (StrataFile.ReadResult result = reader.read(0, 4)) {
@@ -174,8 +174,8 @@ class ReaderImplTest {
                              List.of(chunk(chunkId, ChunkState.SEALED, 1,
                                      new Messages.Replica(1, endpoint(replica)))))))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
-                    .withStorageConnectionsPerEndpoint(2);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool(config)) {
+                    .withDataNodeConnectionsPerEndpoint(2);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
                 String replicaEndpoint = endpoint(replica);
 
@@ -207,8 +207,8 @@ class ReaderImplTest {
                              List.of(chunk(chunkId, ChunkState.SEALED, 1,
                                      new Messages.Replica(1, endpoint(replica)))))))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
-                    .withStorageConnectionsPerEndpoint(2);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool(config)) {
+                    .withDataNodeConnectionsPerEndpoint(2);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
                 ReaderImpl first = new ReaderImpl(meta, pool, config, fileId);
                 ReaderImpl second = new ReaderImpl(meta, pool, config, fileId);
                 String replicaEndpoint = endpoint(replica);
@@ -240,7 +240,7 @@ class ReaderImplTest {
                                      new Messages.Replica(1, endpoint(negativeLocalEnd)),
                                      new Messages.Replica(2, endpoint(negativeDurable)))))))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
 
                 ScpException e = assertThrows(ScpException.class, () -> reader.read(0, 1));
@@ -273,7 +273,7 @@ class ReaderImplTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + req.opcode());
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
 
                 ScpException e = assertThrows(ScpException.class, () -> reader.read(0, 3));
@@ -298,7 +298,7 @@ class ReaderImplTest {
                              List.of(chunk(chunkId, ChunkState.SEALED, 3,
                                      new Messages.Replica(1, endpoint(replica)))))))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
                 StrataFile.ReadResult result = reader.read(0, 3);
                 Frame owner = (Frame) result.releaseHandleForTest();
@@ -325,7 +325,7 @@ class ReaderImplTest {
                                      new Messages.Replica(1, deadEndpoint),
                                      new Messages.Replica(2, endpoint(replica)))))))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId);
                 // readFromReplicas picks a random start replica, so repeat enough that the
                 // unreachable replica is tried first at least once; every read must still

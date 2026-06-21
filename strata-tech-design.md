@@ -17,7 +17,7 @@ Three services, three codebases, three deployment shapes:
 | Service | Role | Codebase | Durable state | Deployment (K8s) |
 |---|---|---|---|---|
 | **Broker** | Kafka protocol; partition leadership; group/transaction coordinators | Kafka fork (storage stack replaced) | none | Deployment; no PVCs; optional ephemeral NVMe for read cache |
-| **Storage node** | chunk persistence and serving | new, no Kafka code; language TBD (storage-server-appropriate) | chunk files on local disks | StatefulSet; local PVs; topology labels (zone/rack/host) |
+| **Data node** | chunk persistence and serving | new, no Kafka code; language TBD (storage-server-appropriate) | chunk files on local disks | StatefulSet; local PVs; topology labels (zone/rack/host) |
 | **Metadata plane** | KRaft quorum: controller state machine + chunk-map state machine | Kafka fork (controller extended) | Raft logs + snapshots | StatefulSet of 3 or 5; NVMe |
 
 Communication paths (protocol per link — see §10.1):
@@ -25,18 +25,18 @@ Communication paths (protocol per link — see §10.1):
 ```
 Kafka clients ──(Kafka wire protocol)──> Broker
 Broker        ──(Kafka RPC framework, new API keys)──> Metadata plane
-Broker        ──(SCP: append/read/fence/seal)──> Storage nodes
-Storage node  ──(SCP control: register/heartbeat/inventory)──> Metadata plane
-Storage node <──(SCP: fetch-chunk)──> Storage node      [repair/relocation only]
+Broker        ──(SCP: append/read/fence/seal)──> Data nodes
+Data node  ──(SCP control: register/heartbeat/inventory)──> Metadata plane
+Data node <──(SCP: fetch-chunk)──> Data node      [repair/relocation only]
 Metadata members ──(Raft)──> Metadata members           [quorum-internal only]
 ```
 
-**Codebase strategy.** Broker and metadata plane are derived from the Apache Kafka codebase — fork-and-replace, the path AutoMQ has proven in production. Deriving the metadata plane is a *requirement* of the KRaft decision (using KRaft means running Kafka's controller code); deriving the broker is a *choice* made for compatibility economics — the group and transaction coordinators live inside the broker, so a clean-room broker would reimplement the hardest compatibility surface regardless of how it reached the metadata plane. KRaft's consensus core is consumed untouched; all extensions are additive (new record types, new RPC APIs, the chunk-map state machine as a new Raft-layer client — the same pattern AutoMQ used for its stream/object metadata). The single invasive change is removing ISR and replica assignment from the controller's partition model (§4.1) — the main source of upstream-merge friction. Strata's custom records and APIs sit behind their own feature-level lane (§4.3) so rolling upgrades stay safe. The Strata file service contains no Kafka code; its language is an open decision (§17.5). A v0 bootstrap path (§4.4) decouples the first implementation from the fork timeline entirely: the storage engine is built and validated against a ZooKeeper-backed metadata service behind the same interfaces, while the controller work lands in parallel.
+**Codebase strategy.** Broker and metadata plane are derived from the Apache Kafka codebase — fork-and-replace, the path AutoMQ has proven in production. Deriving the metadata plane is a *requirement* of the KRaft decision (using KRaft means running Kafka's controller code); deriving the broker is a *choice* made for compatibility economics — the group and transaction coordinators live inside the broker, so a clean-room broker would reimplement the hardest compatibility surface regardless of how it reached the metadata plane. KRaft's consensus core is consumed untouched; all extensions are additive (new record types, new RPC APIs, the chunk-map state machine as a new Raft-layer client — the same pattern AutoMQ used for its stream/object metadata). The single invasive change is removing ISR and replica assignment from the controller's partition model (§4.1) — the main source of upstream-merge friction. Strata's custom records and APIs sit behind their own feature-level lane (§4.3) so rolling upgrades stay safe. The Strata file service contains no Kafka code; its language is an open decision (§17.5). A v0 bootstrap path (§4.4) decouples the first implementation from the fork timeline entirely: the storage engine is built and validated against a ZooKeeper-backed controller behind the same interfaces, while the controller work lands in parallel.
 
 Two load-bearing disciplines, stated once and assumed everywhere below:
 
 1. **The data path never touches the metadata plane.** Metadata participates at chunk boundaries, leadership changes, and topology changes only.
-2. **Storage nodes never read cluster metadata.** They report their own state and execute commands. Their metadata footprint is O(own state).
+2. **Data nodes never read cluster metadata.** They report their own state and execute commands. Their metadata footprint is O(own state).
 
 ## 3. Data model
 
@@ -70,7 +70,7 @@ Built on Kafka's KRaft layer: consensus core untouched; two state machines on tw
 
 Keeps: topics, configs, ACLs, features, broker registration/heartbeats, leadership + leader epochs.
 **Removed:** replica assignment, ISR state and shrink/expand logic, reassignment — Strata partitions are `{leaderBrokerId, leaderEpoch}` and nothing else. This deletion is the main upstream-merge friction point and gets the densest test coverage.
-**Added record types:** `StorageNodeRecord { nodeId, incarnationId, endpoints, topology{zone,rack,host}, capacityBytes, state: REGISTERED|FENCED|DRAINING|DEAD }`.
+**Added record types:** `NodeRecord { nodeId, incarnationId, endpoints, topology{zone,rack,host}, capacityBytes, state: REGISTERED|FENCED|DRAINING|DEAD }`.
 
 ### 4.2 Chunk-map state machine (new, second Raft log)
 
@@ -78,7 +78,7 @@ Holds `FileRecord { fileId, topicIdPartition, baseOffset, type }` and `ChunkDesc
 
 ### 4.3 RPC surface
 
-Broker-facing APIs use Kafka's schema-generated framework (both ends are Kafka-derived); new API keys in the fork; versioned behind a Strata feature level (`metadata.version` discipline) from day one. Storage-node-facing APIs are SCP control opcodes (§10.4) served by an SCP listener on the metadata plane — so a storage node needs exactly one protocol stack.
+Broker-facing APIs use Kafka's schema-generated framework (both ends are Kafka-derived); new API keys in the fork; versioned behind a Strata feature level (`metadata.version` discipline) from day one. Data-node-facing APIs are SCP control opcodes (§10.4) served by an SCP listener on the metadata plane — so a data node needs exactly one protocol stack.
 
 | API | Caller | Transport | Notes |
 |---|---|---|---|
@@ -86,7 +86,7 @@ Broker-facing APIs use Kafka's schema-generated framework (both ends are Kafka-d
 | `CreateChunk(fileId)` → `{chunkId, replicas[replicationFactor], writeEpoch}` | broker | Kafka RPC | placement decided here (§8); commit-before-write (§9.2 relies on this) |
 | `SealChunk(chunkId, length, crc)` | broker | Kafka RPC | metadata commit is the authoritative seal point |
 | `LookupChunks(topicIdPartition, offsetRange)` | broker | Kafka RPC | served from leader's in-memory state; brokers cache aggressively (sealed descriptors are immutable) |
-| `REGISTER_NODE` / `NODE_HEARTBEAT` / `INVENTORY_REPORT` | storage node | SCP (§10.4) | heartbeat **responses** carry commands: `REPLICATE`, `DELETE`, `DRAIN` |
+| `REGISTER_NODE` / `NODE_HEARTBEAT` / `INVENTORY_REPORT` | data node | SCP (§10.4) | heartbeat **responses** carry commands: `REPLICATE`, `DELETE`, `DRAIN` |
 
 Availability semantics: if the quorum is unavailable, open-chunk appends and all reads continue (no metadata on the data path); chunk creates/seals/leadership changes queue. Produce stalls only when an open chunk fills without a successor — minutes at typical per-partition rates. Heartbeat grace periods must exceed metadata failover time so a control-plane blip never triggers repair.
 
@@ -94,10 +94,10 @@ Availability semantics: if the quorum is unavailable, open-chunk appends and all
 
 The chunk-map and node-registry logic sits behind a **`MetadataStore` SPI** with two backends:
 
-- **ZooKeeper (v0 — development and prototype only).** A thin active/standby metadata service (ZK leader election) persists chunk descriptors and the node registry to znodes and hosts the repair coordinator — the BookKeeper pattern (pluggable metadata drivers; elected auditor). For v0, the same service can assign partition leadership and epochs for the test harness or a minimal broker; the storage layer only ever sees monotonic epochs through the same client API.
+- **ZooKeeper (v0 — development and prototype only).** A thin active/standby controller (ZK leader election) persists chunk descriptors and the node registry to znodes and hosts the repair coordinator — the BookKeeper pattern (pluggable metadata drivers; elected auditor). For v0, the same service can assign partition leadership and epochs for the test harness or a minimal broker; the storage layer only ever sees monotonic epochs through the same client API.
 - **KRaft (v1 — the product backend).** §4.1–§4.3.
 
-Three rules make the backend swappable rather than load-bearing: (1) the SCP control surface (§10.4) and Strata client behavior are **identical across backends** — storage nodes and brokers cannot tell which is running; (2) commands ride heartbeat responses on both backends — ZK watches are never exposed as semantics; (3) ZooKeeper never appears in the Kafka fork — it exists only inside the v0 service, which is new code.
+Three rules make the backend swappable rather than load-bearing: (1) the SCP control surface (§10.4) and Strata client behavior are **identical across backends** — data nodes and brokers cannot tell which is running; (2) commands ride heartbeat responses on both backends — ZK watches are never exposed as semantics; (3) ZooKeeper never appears in the Kafka fork — it exists only inside the v0 service, which is new code.
 
 Why this exists: build order. The Strata file service, SCP, on-disk formats, seal recovery, and repair are buildable and testable before any controller surgery lands; the fork work proceeds in parallel and binds at v1. The named risk is calcification (Pravega shipped on its ZK scaffolding and never escaped). Exit criteria are explicit: v1 GA requires the SPI conformance suite green on **both** backends, KRaft at full parity, the ZK backend excluded from product builds, and **no metadata-migration promise for v0 clusters** — prototype data does not survive to v1, by design and by announcement.
 
@@ -135,7 +135,7 @@ Kafka's leader epoch is the only fencing token in the system. New leader (epoch 
 | Tail fetch | leader broker | in-memory batch cache (data just flowed through); bounded by DO |
 | Recent miss / lagging consumer | leader broker | `READ` from any chunk replica; optional local-NVMe read cache (pure cache, never correctness) |
 | Historical / replay | broker (v1) | broker streams from storage replicas — sealed chunks: any replica, zero coordination, contiguous range, sendfile-friendly |
-| Historical, broker-bypass | storage node (v1.x option) | KIP-392 `PreferredReadReplica` redirect: leader points the consumer at a storage node implementing a minimal Fetch subset for sealed data. Standard clients already honor this. Open chunks stay broker-served. |
+| Historical, broker-bypass | data node (v1.x option) | KIP-392 `PreferredReadReplica` redirect: leader points the consumer at a data node implementing a minimal Fetch subset for sealed data. Standard clients already honor this. Open chunks stay broker-served. |
 
 Open-chunk reads are bounded by DO. The leader knows DO authoritatively; replicas know it with one-round lag (piggyback), which is sufficient for replica-served reads because anything ≤ piggybacked-DO is guaranteed quorum-durable. **Consumers never see un-quorum-acked bytes** — the analogue of Kafka's high-watermark rule, and the §17.1 item "DO propagation cadence" is about the *staleness bound*, not whether the rule exists.
 
@@ -145,7 +145,7 @@ Open-chunk reads are bounded by DO. The leader knows DO authoritatively; replica
 
 Controller detects (broker session expiry) → reassigns leadership of its partitions across surviving brokers in one batch of `PartitionChange` records → each new leader, per partition: fence open chunks at epoch+1 → read latest checkpoint → replay ≤16 MB of open-chunk tail (batch headers only) to rebuild producer state and indexes → run seal-recovery if the open chunk needs it (§7.3) → accept produces. No data moves; cost independent of history size. Per-partition recovery is milliseconds; the fleet-wide work is parallel across all survivors.
 
-### 7.2 Storage-node failure
+### 7.2 Data-node failure
 
 - **Detection:** missed heartbeats → `SUSPECT`; grace period (≥ several minutes, must exceed metadata failover and pod-reschedule time) → `DEAD`. Node identity = `incarnationId` persisted on its volumes: a pod rescheduled onto the same local PVs re-registers as the same node and cancels the clock. Repair of 100 TB must never be triggered by a 90-second reschedule.
 - **Repair (sealed chunks):** the chunk-map leader is the repair coordinator. From the `node → chunks` reverse index it enqueues every affected chunk, prioritized by exposure (chunks at 1 surviving replica jump the queue), picks new targets via standard placement (§8), and issues `REPLICATE` commands (in heartbeat responses) to the **new targets**, which pull via `FETCH_CHUNK` from surviving replicas (pull model: the target paces itself, owns retries, and dedups). Copies are checksum-verified, throttled per node; completion = atomic descriptor swap. Because placement scatters chunks, repair parallelism scales with pool size (100 TB node, 50-node pool ≈ ~2 TB per node ≈ ~3 h at 200 MB/s throttle).
@@ -165,7 +165,7 @@ Property: any producer-acked batch existed on at least `ackQuorum` replicas; wit
 
 ### 7.4 Metadata quorum failure
 
-Single-member loss: Raft failover, seconds, invisible to the data path. Quorum loss: data path continues (§4.3); chunk-boundary operations queue; recovery is standard KRaft disaster procedure. Brokers and storage nodes buffer/retry control operations idempotently (all control RPCs carry idempotency keys).
+Single-member loss: Raft failover, seconds, invisible to the data path. Quorum loss: data path continues (§4.3); chunk-boundary operations queue; recovery is standard KRaft disaster procedure. Brokers and data nodes buffer/retry control operations idempotently (all control RPCs carry idempotency keys).
 
 ## 8. Placement
 
@@ -195,11 +195,11 @@ Log compaction runs on the leader broker exactly as in Kafka — read, rewrite i
 |---|---|
 | Kafka clients ↔ broker | Kafka wire protocol (compatibility is the product) |
 | Broker ↔ metadata plane | Kafka RPC framework, new API keys (both ends Kafka-derived; rides existing machinery and feature gates) |
-| Broker ↔ storage node | **SCP** |
-| Storage node ↔ storage node | **SCP** (`FETCH_CHUNK`) |
-| Storage node ↔ metadata plane | **SCP** control opcodes (metadata plane hosts an SCP listener) |
+| Broker ↔ data node | **SCP** |
+| Data node ↔ data node | **SCP** (`FETCH_CHUNK`) |
+| Data node ↔ metadata plane | **SCP** control opcodes (metadata plane hosts an SCP listener) |
 
-SCP is a purpose-built binary protocol rather than a reuse of Kafka framing, for three reasons: (1) the **payload-as-suffix invariant** — every frame ends with its opaque payload, so receivers can scatter headers into the heap and splice payload bytes directly between socket, aligned buffer pools, and disk with zero re-encoding; (2) the storage node stays implementable in any language with **no Kafka dependency and exactly one protocol stack** (data, copy, and control all speak SCP); (3) independence from Kafka's API-key space and version cadence — the fork tracks upstream, and entangling storage APIs with Kafka's ApiKeys would couple storage-node releases to broker merges. The alternative (Kafka framing everywhere) was considered and is workable; it was rejected on (1) and (3).
+SCP is a purpose-built binary protocol rather than a reuse of Kafka framing, for three reasons: (1) the **payload-as-suffix invariant** — every frame ends with its opaque payload, so receivers can scatter headers into the heap and splice payload bytes directly between socket, aligned buffer pools, and disk with zero re-encoding; (2) the data node stays implementable in any language with **no Kafka dependency and exactly one protocol stack** (data, copy, and control all speak SCP); (3) independence from Kafka's API-key space and version cadence — the fork tracks upstream, and entangling storage APIs with Kafka's ApiKeys would couple data-node releases to broker merges. The alternative (Kafka framing everywhere) was considered and is workable; it was rejected on (1) and (3).
 
 ### 10.2 Conventions and framing
 
@@ -228,7 +228,7 @@ u16  headerLength
 - **Connection lifecycle:** TCP, TLS per deployment policy. First frame MUST be `HELLO`. Pipelining is allowed after handshake, bounded by the negotiated in-flight byte cap. All `APPEND`s for a given chunk MUST use a single connection (ordering); after reconnect, the writer resyncs with `STAT_CHUNK`.
 - **Implementation note (v0 finding):** on virtual-thread runtimes, never hold a monitor (`synchronized`) across blocking I/O or while response handlers may contend for it — blocked virtual threads inside monitors pin their carriers (JDK ≤23), and enough pinned carriers stall every virtual thread in the process. Use `ReentrantLock`, and keep blocking work/response callbacks off transport event-loop threads (a handler blocked on a lock must never stall frame dispatch for the very response its lock-holder is waiting on).
 
-**Handshake.** `HELLO` request: `u16 frameVersionMin, u16 frameVersionMax, u8 clientKind (1 broker | 2 storage-node | 3 metadata | 4 tool), u64 featureBits, string clientId`. Response: `u16 chosenFrameVersion, u64 featureBits (intersection), u32 nodeId (0 if n/a), uuid incarnationId, u32 maxFrameBytes, u64 maxInflightBytes, array{u16 opcode, u16 maxApiVersion}`. The per-opcode version map is the negotiation mechanism: a client uses `min(its max, advertised max)` per opcode and never sends an opcode absent from the map.
+**Handshake.** `HELLO` request: `u16 frameVersionMin, u16 frameVersionMax, u8 clientKind (1 broker | 2 data-node | 3 metadata | 4 tool), u64 featureBits, string clientId`. Response: `u16 chosenFrameVersion, u64 featureBits (intersection), u32 nodeId (0 if n/a), uuid incarnationId, u32 maxFrameBytes, u64 maxInflightBytes, array{u16 opcode, u16 maxApiVersion}`. The per-opcode version map is the negotiation mechanism: a client uses `min(its max, advertised max)` per opcode and never sends an opcode absent from the map.
 
 ### 10.3 Data-plane opcodes
 
@@ -254,7 +254,7 @@ sealed chunks therefore stay byte-identical across replicas with no caller input
 
 Notes: `FETCH_CHUNK` is distinct from `READ` so it can run in a separate QoS/throttle class (repair must never starve foreground reads) and because it copies the *file* representation (header + footer included) — a repaired sealed replica is byte-identical, so whole-file CRCs are comparable across replicas. The node-local sidecar and ledger (§11.3) are never copied; the puller starts fresh ones.
 
-### 10.4 Control-plane opcodes (storage node ↔ metadata plane)
+### 10.4 Control-plane opcodes (data node ↔ metadata plane)
 
 | Opcode | Name | Request (v1) | Response (after errorCode) |
 |---|---|---|---|
@@ -331,7 +331,7 @@ Fixed 64-byte trailer at EOF: `u64 dataLength · u64 footerStart · u32 sectionC
 ### 11.3 Sidecar and integrity ledger (per chunk, node-local, never replicated)
 
 - **Sidecar `<chunk>.meta`** — 512 bytes, single-sector atomic rewrite: `{magic "SMET", u16 ver, i32 writeEpoch, i32 fenceEpoch, u64 lastKnownDO (advisory), u8 state, u32 crc}`. Holds the fencing state that must survive restart (§5.4).
-- **Integrity ledger `<chunk>.j`** — append-only, one fixed 24-byte entry per `APPEND`: `{u64 endOffset, u32 payloadCrc, i32 writeEpoch, u32 reserved, u32 entryCrc}`. Crash recovery scans the ledger, verifies the last entries' CRCs against the data file, and truncates the data file to the last verified `endOffset` — **the storage node never parses payload bytes, even to recover.** When `fsyncOnAck=true`, data and ledger are fsynced before ack; otherwise both flush lazily. Overhead ≈ 24 B per multi-KB..MB append, written sequentially. The ledger is deleted once the chunk seals (the footer's CRC_RANGES supersede it).
+- **Integrity ledger `<chunk>.j`** — append-only, one fixed 24-byte entry per `APPEND`: `{u64 endOffset, u32 payloadCrc, i32 writeEpoch, u32 reserved, u32 entryCrc}`. Crash recovery scans the ledger, verifies the last entries' CRCs against the data file, and truncates the data file to the last verified `endOffset` — **the data node never parses payload bytes, even to recover.** When `fsyncOnAck=true`, data and ledger are fsynced before ack; otherwise both flush lazily. Overhead ≈ 24 B per multi-KB..MB append, written sequentially. The ledger is deleted once the chunk seals (the footer's CRC_RANGES supersede it).
 
 ### 11.4 Checkpoint file content (broker-defined, rides ordinary CHECKPOINT files)
 
@@ -418,8 +418,8 @@ attached above individual files; file identity remains the immutable, globally u
 
 ## 14. Invariants
 
-1. One writer per chunk per epoch; storage nodes enforce monotonic epoch fencing locally.
-2. Producer-acked data exists on ≥2 replicas; tolerates any single storage-node failure per replica set.
+1. One writer per chunk per epoch; data nodes enforce monotonic epoch fencing locally.
+2. Producer-acked data exists on ≥2 replicas; tolerates any single data-node failure per replica set.
 3. Consumers never read beyond the durable offset.
 4. Chunk state transitions are authoritative only at metadata commit; physical state converges via reconciliation.
 5. A chunk exists in metadata before any byte of it exists on any disk (commit-before-write).
@@ -447,10 +447,10 @@ Produce-path latency decomposed by stage (broker processing / storage append / q
 ## 17. Open questions
 
 1. **DO staleness bound** — empty-`APPEND` beacons cover idle partitions; the cadence and the maximum staleness a direct reader may observe need a number.
-2. **KIP-392 direct-read** — exact Fetch subset a storage node must implement; session/quota handling without broker mediation. v1 ships broker-proxied; this is the v1.x decision.
+2. **KIP-392 direct-read** — exact Fetch subset a data node must implement; session/quota handling without broker mediation. v1 ships broker-proxied; this is the v1.x decision.
 3. **Chunk-map sharding trigger** — at what descriptor count / commit rate the second log splits (Northguard-style); the two-state-machine seam exists, the threshold doesn't.
 4. **Segment-roll policy defaults** — balancing chunk-count inflation (metadata sizing) against failover replay bound for low-throughput partition fleets.
-5. **Storage-node language/runtime** — decision owed before repo bootstrap; constraint: predictable tail latency under mixed read/append load; must implement SCP + §11 formats from this spec alone.
+5. **Data-node language/runtime** — decision owed before repo bootstrap; constraint: predictable tail latency under mixed read/append load; must implement SCP + §11 formats from this spec alone.
 6. **Security baseline** — TLS posture per link (mandatory inter-node?), at-rest encryption (per-chunk envelope vs. volume-level), FIPS story — needs a design pass before the first regulated-industry conversation.
 7. **Fork baseline** — which Kafka version to track first, and the merge cadence policy.
 8. **Flow control** — v1 uses static per-connection caps from `HELLO`; whether repair traffic needs dynamic credit-based flow control to protect foreground p99 at scale is unproven either way.

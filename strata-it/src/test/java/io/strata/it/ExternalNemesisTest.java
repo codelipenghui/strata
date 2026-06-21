@@ -31,7 +31,7 @@ class ExternalNemesisTest {
     private static final String EXTERNAL_SEED_PROPERTY = "strata.external.seed";
 
     @Test
-    void childProcessStoragePartitionAndMetadataLeaderLossPreserveAckedBytes()
+    void childProcessDataNodePartitionAndMetadataLeaderLossPreserveAckedBytes()
             throws Exception {
         ExternalNemesisSchedule schedule = ExternalNemesisSchedule.configured();
         Random random = new Random(schedule.seed());
@@ -42,8 +42,8 @@ class ExternalNemesisTest {
             cluster.startMetadata("external-meta-a");
             cluster.startMetadata("external-meta-b");
             String initialLeader = cluster.awaitLeader();
-            int storageListenPort = ExternalCluster.freePort();
-            Testcontainers.exposeHostPorts(storageListenPort);
+            int dataNodeListenPort = ExternalCluster.freePort();
+            Testcontainers.exposeHostPorts(dataNodeListenPort);
             Testcontainers.exposeHostPorts(ExternalCluster.port(initialLeader));
 
             try (GenericContainer<?> toxiproxy = new GenericContainer<>(TOXIPROXY_IMAGE)
@@ -51,13 +51,13 @@ class ExternalNemesisTest {
                 toxiproxy.start();
                 ToxiproxyClient toxiproxyClient = new ToxiproxyClient(toxiproxy.getHost(),
                         toxiproxy.getMappedPort(8474));
-                Proxy storageProxy = toxiproxyClient.createProxy("external-storage", "0.0.0.0:8666",
-                        "host.testcontainers.internal:" + storageListenPort);
+                Proxy dataNodeProxy = toxiproxyClient.createProxy("external-data-node", "0.0.0.0:8666",
+                        "host.testcontainers.internal:" + dataNodeListenPort);
                 Proxy metadataProxy = toxiproxyClient.createProxy("external-metadata-leader",
                         "0.0.0.0:8667",
                         "host.testcontainers.internal:" + ExternalCluster.port(initialLeader));
 
-                String proxiedStorageEndpoint = "127.0.0.1:" + toxiproxy.getMappedPort(8666);
+                String proxiedDataNodeEndpoint = "127.0.0.1:" + toxiproxy.getMappedPort(8666);
                 String proxiedLeaderEndpoint = "127.0.0.1:" + toxiproxy.getMappedPort(8667);
                 List<String> clientMetadataEndpoints = clientMetadataEndpoints(cluster,
                         initialLeader, proxiedLeaderEndpoint);
@@ -67,24 +67,24 @@ class ExternalNemesisTest {
                         "replayCommand=./scripts/verify.sh --skip-default --chaos"
                                 + " -Dstrata.external.seed=" + schedule.seedHex()
                                 + " -Dtest=ExternalNemesisTest#"
-                                + "childProcessStoragePartitionAndMetadataLeaderLossPreserveAckedBytes",
+                                + "childProcessDataNodePartitionAndMetadataLeaderLossPreserveAckedBytes",
                         "schedule=" + schedule.events(),
                         "initialLeader=" + initialLeader,
                         "clientMetadataEndpoints=" + clientMetadataEndpoints,
-                        "proxiedStorageEndpoint=" + proxiedStorageEndpoint,
+                        "proxiedDataNodeEndpoint=" + proxiedDataNodeEndpoint,
                         "writePolicy=rf4-aq3-fsynctrue",
-                        "storageConnectionsPerEndpoint=2");
+                        "dataNodeConnectionsPerEndpoint=2");
 
                 for (int i = 0; i < 3; i++) {
-                    cluster.startStorage("external-host-" + i);
+                    cluster.startDataNode("external-host-" + i);
                 }
-                cluster.startStorage("external-host-proxied", storageListenPort,
-                        proxiedStorageEndpoint);
+                cluster.startDataNode("external-host-proxied", dataNodeListenPort,
+                        proxiedDataNodeEndpoint);
                 cluster.awaitRegistered(4);
-                artifact.add("initialStorage=" + cluster.storageSummary());
+                artifact.add("initialDataNode=" + cluster.dataNodeSummary());
 
                 ClientConfig config = new ClientConfig(clientMetadataEndpoints, 1 << 20, 5_000)
-                        .withStorageConnectionsPerEndpoint(2);
+                        .withDataNodeConnectionsPerEndpoint(2);
                 try (StrataClient client = StrataClient.connect(config)) {
                     FileId fileId = client.create(new StrataClient.FileSpec("test",
                             "/external-nemesis-" + schedule.seedHex(),
@@ -97,39 +97,39 @@ class ExternalNemesisTest {
                         appendBatch(artifact, workload, appender, random, 0,
                                 schedule.warmupRecords());
                         assertOpenChunkContainsEndpoint(clientMetadataEndpoints, fileId,
-                                proxiedStorageEndpoint);
+                                proxiedDataNodeEndpoint);
 
-                        storageProxy.toxics().timeout("storage-partition-upstream",
+                        dataNodeProxy.toxics().timeout("data-node-partition-upstream",
                                 ToxicDirection.UPSTREAM, 0);
-                        storageProxy.toxics().timeout("storage-partition-downstream",
+                        dataNodeProxy.toxics().timeout("data-node-partition-downstream",
                                 ToxicDirection.DOWNSTREAM, 0);
-                        artifact.add("fault=partition-storage endpoint=" + proxiedStorageEndpoint);
+                        artifact.add("fault=partition-data-node endpoint=" + proxiedDataNodeEndpoint);
 
                         try {
                             appendBatch(artifact, workload, appender, random, 1,
                                     schedule.partitionedRecords());
                             workload.verifyOpenReadIsAckedPrefix(client, fileId,
-                                    "external nemesis after storage partition");
+                                    "external nemesis after data-node partition");
                             ConsistencyVerifier.assertLiveFileDescriptorConsistent(
                                     clientMetadataEndpoints, fileId);
-                            artifact.add("openReadVerifiedAfterStoragePartition=true");
-                            artifact.add("liveDescriptorVerifiedAfterStoragePartition=true");
+                            artifact.add("openReadVerifiedAfterDataNodePartition=true");
+                            artifact.add("liveDescriptorVerifiedAfterDataNodePartition=true");
 
                             metadataProxy.toxics().timeout("metadata-leader-blackhole",
                                     ToxicDirection.DOWNSTREAM, 0);
                             artifact.add("fault=blackhole-metadata-leader endpoint="
                                     + initialLeader);
                             cluster.kill(cluster.metadataByEndpoint(initialLeader));
-                            String newLeader = ExternalCluster.awaitLeader(cluster.metadataEndpoints());
+                            String newLeader = ExternalCluster.awaitLeader(cluster.controllerEndpoints());
                             assertFalse(initialLeader.equals(newLeader),
-                                    "killed metadata endpoint remained leader");
+                                    "killed controller endpoint remained leader");
                             artifact.add("fault=kill-metadata-leader oldLeader=" + initialLeader,
                                     "newLeader=" + newLeader);
 
                             sealed = appender.seal();
                         } finally {
-                            removeToxic(storageProxy, "storage-partition-upstream");
-                            removeToxic(storageProxy, "storage-partition-downstream");
+                            removeToxic(dataNodeProxy, "data-node-partition-upstream");
+                            removeToxic(dataNodeProxy, "data-node-partition-downstream");
                             removeToxic(metadataProxy, "metadata-leader-blackhole");
                         }
                     }
@@ -139,11 +139,11 @@ class ExternalNemesisTest {
                     workload.verifySealedAckedPrefix(client, fileId, "external nemesis");
                     Messages.LookupFileResp descriptor = waitForFullReplicaConsistency(
                             clientMetadataEndpoints, client, fileId, sealed.sealedLength(), 4);
-                    ExternalCluster.ExternalStorage proxiedStorage = storageByEndpoint(cluster,
-                            descriptor, proxiedStorageEndpoint);
-                    ExternalCluster.ExternalStorage restarted = cluster.restartStorage(proxiedStorage);
-                    assertEquals(proxiedStorage.nodeId(), restarted.nodeId(),
-                            "healed storage node id changed after restart");
+                    ExternalCluster.ExternalDataNode proxiedDataNode = dataNodeByEndpoint(cluster,
+                            descriptor, proxiedDataNodeEndpoint);
+                    ExternalCluster.ExternalDataNode restarted = cluster.restartDataNode(proxiedDataNode);
+                    assertEquals(proxiedDataNode.nodeId(), restarted.nodeId(),
+                            "healed data node id changed after restart");
                     cluster.waitForAllReplicaEndpoints(fileId);
                     Messages.LookupFileResp afterRestart = waitForFullReplicaConsistency(
                             clientMetadataEndpoints, client, fileId, sealed.sealedLength(), 4);
@@ -151,7 +151,7 @@ class ExternalNemesisTest {
                             "finalAckedBytes=" + workload.ackedBytes(),
                             "finalAckedSha256=" + workload.ackedSha256(),
                             "fullReplicaConsistencyAfterRepair=true",
-                            "fault=restart-healed-storage nodeId=" + restarted.nodeId()
+                            "fault=restart-healed-data nodeId=" + restarted.nodeId()
                                     + " endpoint=" + restarted.endpoint());
                     artifact.addDescriptor("finalDescriptor", afterRestart);
                     artifact.markPassed();
@@ -168,7 +168,7 @@ class ExternalNemesisTest {
     }
 
     @Test
-    void concurrentClientFilesSurviveSharedStorageAndMetadataFaults() throws Exception {
+    void concurrentClientFilesSurviveSharedDataNodeAndMetadataFaults() throws Exception {
         ExternalNemesisSchedule schedule = ExternalNemesisSchedule.configured();
         Random primaryRandom = new Random(schedule.seed() ^ 0x4910_2026_0612L);
         Random secondaryRandom = new Random(schedule.seed() ^ 0x5e55_1020_2606L);
@@ -179,8 +179,8 @@ class ExternalNemesisTest {
             cluster.startMetadata("concurrent-meta-a");
             cluster.startMetadata("concurrent-meta-b");
             String initialLeader = cluster.awaitLeader();
-            int storageListenPort = ExternalCluster.freePort();
-            Testcontainers.exposeHostPorts(storageListenPort);
+            int dataNodeListenPort = ExternalCluster.freePort();
+            Testcontainers.exposeHostPorts(dataNodeListenPort);
             Testcontainers.exposeHostPorts(ExternalCluster.port(initialLeader));
 
             try (GenericContainer<?> toxiproxy = new GenericContainer<>(TOXIPROXY_IMAGE)
@@ -188,14 +188,14 @@ class ExternalNemesisTest {
                 toxiproxy.start();
                 ToxiproxyClient toxiproxyClient = new ToxiproxyClient(toxiproxy.getHost(),
                         toxiproxy.getMappedPort(8474));
-                Proxy storageProxy = toxiproxyClient.createProxy("concurrent-storage",
+                Proxy dataNodeProxy = toxiproxyClient.createProxy("concurrent-data-node",
                         "0.0.0.0:8669",
-                        "host.testcontainers.internal:" + storageListenPort);
+                        "host.testcontainers.internal:" + dataNodeListenPort);
                 Proxy metadataProxy = toxiproxyClient.createProxy("concurrent-metadata-leader",
                         "0.0.0.0:8670",
                         "host.testcontainers.internal:" + ExternalCluster.port(initialLeader));
 
-                String proxiedStorageEndpoint = "127.0.0.1:" + toxiproxy.getMappedPort(8669);
+                String proxiedDataNodeEndpoint = "127.0.0.1:" + toxiproxy.getMappedPort(8669);
                 String proxiedLeaderEndpoint = "127.0.0.1:" + toxiproxy.getMappedPort(8670);
                 List<String> clientMetadataEndpoints = clientMetadataEndpoints(cluster,
                         initialLeader, proxiedLeaderEndpoint);
@@ -205,25 +205,25 @@ class ExternalNemesisTest {
                         "replayCommand=./scripts/verify.sh --skip-default --chaos"
                                 + " -Dstrata.external.seed=" + schedule.seedHex()
                                 + " -Dtest=ExternalNemesisTest#"
-                                + "concurrentClientFilesSurviveSharedStorageAndMetadataFaults",
+                                + "concurrentClientFilesSurviveSharedDataNodeAndMetadataFaults",
                         "schedule=two-client-files," + schedule.events(),
                         "initialLeader=" + initialLeader,
                         "clientMetadataEndpoints=" + clientMetadataEndpoints,
-                        "proxiedStorageEndpoint=" + proxiedStorageEndpoint,
+                        "proxiedDataNodeEndpoint=" + proxiedDataNodeEndpoint,
                         "writePolicy=rf4-aq3-fsynctrue",
-                        "storageConnectionsPerEndpoint=2",
+                        "dataNodeConnectionsPerEndpoint=2",
                         "concurrentFiles=2");
 
                 for (int i = 0; i < 3; i++) {
-                    cluster.startStorage("concurrent-host-" + i);
+                    cluster.startDataNode("concurrent-host-" + i);
                 }
-                cluster.startStorage("concurrent-host-proxied", storageListenPort,
-                        proxiedStorageEndpoint);
+                cluster.startDataNode("concurrent-host-proxied", dataNodeListenPort,
+                        proxiedDataNodeEndpoint);
                 cluster.awaitRegistered(4);
-                artifact.add("initialStorage=" + cluster.storageSummary());
+                artifact.add("initialDataNode=" + cluster.dataNodeSummary());
 
                 ClientConfig config = new ClientConfig(clientMetadataEndpoints, 1 << 20, 5_000)
-                        .withStorageConnectionsPerEndpoint(2);
+                        .withDataNodeConnectionsPerEndpoint(2);
                 try (StrataClient primaryClient = StrataClient.connect(config);
                      StrataClient secondaryClient = StrataClient.connect(config)) {
                     FileId primaryFileId = primaryClient.create(new StrataClient.FileSpec("test",
@@ -251,9 +251,9 @@ class ExternalNemesisTest {
                         appendBatch(artifact, secondaryWorkload, secondaryAppender, secondaryRandom,
                                 0, schedule.warmupRecords(), "secondary");
                         assertOpenChunkContainsEndpoint(clientMetadataEndpoints, primaryFileId,
-                                proxiedStorageEndpoint);
+                                proxiedDataNodeEndpoint);
                         assertOpenChunkContainsEndpoint(clientMetadataEndpoints, secondaryFileId,
-                                proxiedStorageEndpoint);
+                                proxiedDataNodeEndpoint);
                         try (StrataFile.Reader primaryReader =
                                      secondaryClient.openById(primaryFileId).openForRead();
                              StrataFile.Reader secondaryReader =
@@ -269,12 +269,12 @@ class ExternalNemesisTest {
                             artifact.add("crossClientOpenReadVerifiedBeforePartition=true",
                                     "longLivedReaderVerifiedBeforePartition=true");
 
-                            storageProxy.toxics().timeout("concurrent-storage-partition-upstream",
+                            dataNodeProxy.toxics().timeout("concurrent-data-node-partition-upstream",
                                     ToxicDirection.UPSTREAM, 0);
-                            storageProxy.toxics().timeout("concurrent-storage-partition-downstream",
+                            dataNodeProxy.toxics().timeout("concurrent-data-node-partition-downstream",
                                     ToxicDirection.DOWNSTREAM, 0);
-                            artifact.add("fault=partition-storage endpoint="
-                                    + proxiedStorageEndpoint);
+                            artifact.add("fault=partition-data-node endpoint="
+                                    + proxiedDataNodeEndpoint);
 
                             try {
                                 appendBatch(artifact, primaryWorkload, primaryAppender,
@@ -283,22 +283,22 @@ class ExternalNemesisTest {
                                         secondaryRandom, 1, schedule.partitionedRecords(),
                                         "secondary");
                                 primaryWorkload.verifyReaderReadIsAckedPrefix(primaryReader,
-                                        "concurrent primary long-lived after storage partition");
+                                        "concurrent primary long-lived after data-node partition");
                                 secondaryWorkload.verifyReaderReadIsAckedPrefix(secondaryReader,
-                                        "concurrent secondary long-lived after storage partition");
+                                        "concurrent secondary long-lived after data-node partition");
                                 primaryWorkload.verifyOpenReadIsAckedPrefix(secondaryClient,
                                         primaryFileId,
-                                        "concurrent primary after storage partition");
+                                        "concurrent primary after data-node partition");
                                 secondaryWorkload.verifyOpenReadIsAckedPrefix(primaryClient,
                                         secondaryFileId,
-                                        "concurrent secondary after storage partition");
+                                        "concurrent secondary after data-node partition");
                                 ConsistencyVerifier.assertLiveFileDescriptorConsistent(
                                         clientMetadataEndpoints, primaryFileId);
                                 ConsistencyVerifier.assertLiveFileDescriptorConsistent(
                                         clientMetadataEndpoints, secondaryFileId);
-                                artifact.add("crossClientOpenReadVerifiedAfterStoragePartition=true",
-                                        "longLivedReaderVerifiedAfterStoragePartition=true",
-                                        "liveDescriptorVerifiedAfterStoragePartition=true");
+                                artifact.add("crossClientOpenReadVerifiedAfterDataNodePartition=true",
+                                        "longLivedReaderVerifiedAfterDataNodePartition=true",
+                                        "liveDescriptorVerifiedAfterDataNodePartition=true");
 
                                 metadataProxy.toxics().timeout(
                                         "concurrent-metadata-leader-blackhole",
@@ -307,9 +307,9 @@ class ExternalNemesisTest {
                                         + initialLeader);
                                 cluster.kill(cluster.metadataByEndpoint(initialLeader));
                                 String newLeader = ExternalCluster.awaitLeader(
-                                        cluster.metadataEndpoints());
+                                        cluster.controllerEndpoints());
                                 assertFalse(initialLeader.equals(newLeader),
-                                        "killed metadata endpoint remained leader");
+                                        "killed controller endpoint remained leader");
                                 artifact.add("fault=kill-metadata-leader oldLeader="
                                                 + initialLeader,
                                         "newLeader=" + newLeader);
@@ -319,10 +319,10 @@ class ExternalNemesisTest {
                                 secondarySeal = secondaryAppender.seal();
                                 secondarySealed = true;
                             } finally {
-                                removeToxic(storageProxy,
-                                        "concurrent-storage-partition-upstream");
-                                removeToxic(storageProxy,
-                                        "concurrent-storage-partition-downstream");
+                                removeToxic(dataNodeProxy,
+                                        "concurrent-data-node-partition-upstream");
+                                removeToxic(dataNodeProxy,
+                                        "concurrent-data-node-partition-downstream");
                                 removeToxic(metadataProxy,
                                         "concurrent-metadata-leader-blackhole");
                             }
@@ -351,11 +351,11 @@ class ExternalNemesisTest {
                             clientMetadataEndpoints, secondaryClient, secondaryFileId,
                             secondarySeal.sealedLength(), 4);
 
-                    ExternalCluster.ExternalStorage proxiedStorage = storageByEndpoint(cluster,
-                            primaryDescriptor, proxiedStorageEndpoint);
-                    ExternalCluster.ExternalStorage restarted = cluster.restartStorage(proxiedStorage);
-                    assertEquals(proxiedStorage.nodeId(), restarted.nodeId(),
-                            "healed storage node id changed after restart");
+                    ExternalCluster.ExternalDataNode proxiedDataNode = dataNodeByEndpoint(cluster,
+                            primaryDescriptor, proxiedDataNodeEndpoint);
+                    ExternalCluster.ExternalDataNode restarted = cluster.restartDataNode(proxiedDataNode);
+                    assertEquals(proxiedDataNode.nodeId(), restarted.nodeId(),
+                            "healed data node id changed after restart");
                     cluster.waitForAllReplicaEndpoints(primaryFileId);
                     cluster.waitForAllReplicaEndpoints(secondaryFileId);
                     Messages.LookupFileResp primaryAfterRestart = waitForFullReplicaConsistency(
@@ -373,7 +373,7 @@ class ExternalNemesisTest {
                             "secondaryFinalAckedBytes=" + secondaryWorkload.ackedBytes(),
                             "secondaryFinalAckedSha256=" + secondaryWorkload.ackedSha256(),
                             "secondaryFullReplicaConsistencyAfterRepair=true",
-                            "fault=restart-healed-storage nodeId=" + restarted.nodeId()
+                            "fault=restart-healed-data nodeId=" + restarted.nodeId()
                                     + " endpoint=" + restarted.endpoint());
                     artifact.addDescriptor("primaryFinalDescriptor", primaryAfterRestart);
                     artifact.addDescriptor("secondaryFinalDescriptor", secondaryAfterRestart);
@@ -391,7 +391,7 @@ class ExternalNemesisTest {
     }
 
     @Test
-    void storageControlPartitionDelaysRepairUntilHeartbeatPathHeals() throws Exception {
+    void dataNodeControlPartitionDelaysRepairUntilHeartbeatPathHeals() throws Exception {
         ExternalNemesisSchedule schedule = ExternalNemesisSchedule.configured();
         CorrectnessArtifact artifact = CorrectnessArtifact.create("external-control-nemesis",
                 schedule.seedHex());
@@ -407,7 +407,7 @@ class ExternalNemesisTest {
                 toxiproxy.start();
                 ToxiproxyClient toxiproxyClient = new ToxiproxyClient(toxiproxy.getHost(),
                         toxiproxy.getMappedPort(8474));
-                Proxy controlProxy = toxiproxyClient.createProxy("storage-control", "0.0.0.0:8668",
+                Proxy controlProxy = toxiproxyClient.createProxy("data-node-control", "0.0.0.0:8668",
                         "host.testcontainers.internal:" + leaderPort);
                 String proxiedMetadataEndpoint = "127.0.0.1:" + toxiproxy.getMappedPort(8668);
 
@@ -416,23 +416,23 @@ class ExternalNemesisTest {
                         "replayCommand=./scripts/verify.sh --skip-default --chaos"
                                 + " -Dstrata.external.seed=" + schedule.seedHex()
                                 + " -Dtest=ExternalNemesisTest#"
-                                + "storageControlPartitionDelaysRepairUntilHeartbeatPathHeals",
+                                + "dataNodeControlPartitionDelaysRepairUntilHeartbeatPathHeals",
                         "schedule=seal-rf3,start-spare-through-control-proxy,"
                                 + "partition-spare-control,kill-replica,verify-readable,"
                                 + "heal-control,repair-full-rf",
                         "metadataLeader=" + leader,
                         "proxiedMetadataEndpoint=" + proxiedMetadataEndpoint,
                         "writePolicy=rf3-aq2-fsynctrue",
-                        "storageConnectionsPerEndpoint=2");
+                        "dataNodeConnectionsPerEndpoint=2");
 
                 for (int i = 0; i < 3; i++) {
-                    cluster.startStorage("control-host-" + i);
+                    cluster.startDataNode("control-host-" + i);
                 }
                 cluster.awaitRegistered(3);
-                artifact.add("initialStorage=" + cluster.storageSummary());
+                artifact.add("initialDataNode=" + cluster.dataNodeSummary());
 
-                ClientConfig config = new ClientConfig(cluster.metadataEndpoints(), 1 << 20, 5_000)
-                        .withStorageConnectionsPerEndpoint(2);
+                ClientConfig config = new ClientConfig(cluster.controllerEndpoints(), 1 << 20, 5_000)
+                        .withDataNodeConnectionsPerEndpoint(2);
                 try (StrataClient client = StrataClient.connect(config)) {
                     FileId fileId = client.create(new StrataClient.FileSpec("test",
                             "/external-control-nemesis-" + schedule.seedHex(),
@@ -455,10 +455,10 @@ class ExternalNemesisTest {
                             "control nemesis sealed at a non-acked length");
 
                     Messages.LookupFileResp initial = ConsistencyVerifier.assertSealedFileConsistent(
-                            cluster.metadataEndpoints(), client, fileId, sealed.sealedLength());
+                            cluster.controllerEndpoints(), client, fileId, sealed.sealedLength());
                     artifact.addDescriptor("initialDescriptor", initial);
 
-                    ExternalCluster.ExternalStorage spare = cluster.startStorage(
+                    ExternalCluster.ExternalDataNode spare = cluster.startDataNode(
                             cluster.root().resolve("control-host-spare"), "control-host-spare",
                             0, null, List.of(proxiedMetadataEndpoint));
                     cluster.awaitRegistered(4);
@@ -469,15 +469,15 @@ class ExternalNemesisTest {
                             ToxicDirection.UPSTREAM, 0);
                     controlProxy.toxics().timeout("control-partition-downstream",
                             ToxicDirection.DOWNSTREAM, 0);
-                    ExternalCluster.ExternalStorage victim = cluster.storageByNodeId(
+                    ExternalCluster.ExternalDataNode victim = cluster.dataNodeByNodeId(
                             initial.chunks().get(0).replicas().get(0).nodeId());
-                    artifact.add("fault=partition-storage-control nodeId=" + spare.nodeId(),
-                            "fault=kill-storage-replica nodeId=" + victim.nodeId()
+                    artifact.add("fault=partition-data-node-control nodeId=" + spare.nodeId(),
+                            "fault=kill-data-node-replica nodeId=" + victim.nodeId()
                                     + " endpoint=" + victim.endpoint());
                     cluster.kill(victim);
 
                     Messages.LookupFileResp duringPartition = waitForReadableButNotFullRf(
-                            cluster.metadataEndpoints(), client, fileId, sealed.sealedLength(), 3);
+                            cluster.controllerEndpoints(), client, fileId, sealed.sealedLength(), 3);
                     workload.verifySealedAckedPrefix(client, fileId,
                             "external control nemesis during control partition");
                     artifact.add("duringControlPartitionUnderReplicated=true");
@@ -486,7 +486,7 @@ class ExternalNemesisTest {
                     removeToxic(controlProxy, "control-partition-upstream");
                     removeToxic(controlProxy, "control-partition-downstream");
                     Messages.LookupFileResp finalDescriptor = waitForFullReplicaConsistency(
-                            cluster.metadataEndpoints(), client, fileId, sealed.sealedLength(), 3);
+                            cluster.controllerEndpoints(), client, fileId, sealed.sealedLength(), 3);
                     assertTrue(finalDescriptor.chunks().stream()
                                     .flatMap(chunk -> chunk.replicas().stream())
                                     .anyMatch(replica -> replica.nodeId() == spare.nodeId()),
@@ -519,13 +519,13 @@ class ExternalNemesisTest {
                 "schedule",
                 "initialLeader",
                 "clientMetadataEndpoints",
-                "proxiedStorageEndpoint",
+                "proxiedDataNodeEndpoint",
                 "writePolicy",
-                "storageConnectionsPerEndpoint",
-                "initialStorage",
+                "dataNodeConnectionsPerEndpoint",
+                "initialDataNode",
                 "fileId",
-                "openReadVerifiedAfterStoragePartition",
-                "liveDescriptorVerifiedAfterStoragePartition",
+                "openReadVerifiedAfterDataNodePartition",
+                "liveDescriptorVerifiedAfterDataNodePartition",
                 "sealedLength",
                 "finalAckedBytes",
                 "finalAckedSha256",
@@ -543,18 +543,18 @@ class ExternalNemesisTest {
                 "schedule",
                 "initialLeader",
                 "clientMetadataEndpoints",
-                "proxiedStorageEndpoint",
+                "proxiedDataNodeEndpoint",
                 "writePolicy",
-                "storageConnectionsPerEndpoint",
+                "dataNodeConnectionsPerEndpoint",
                 "concurrentFiles",
-                "initialStorage",
+                "initialDataNode",
                 "primaryFileId",
                 "secondaryFileId",
                 "crossClientOpenReadVerifiedBeforePartition",
                 "longLivedReaderVerifiedBeforePartition",
-                "crossClientOpenReadVerifiedAfterStoragePartition",
-                "longLivedReaderVerifiedAfterStoragePartition",
-                "liveDescriptorVerifiedAfterStoragePartition",
+                "crossClientOpenReadVerifiedAfterDataNodePartition",
+                "longLivedReaderVerifiedAfterDataNodePartition",
+                "liveDescriptorVerifiedAfterDataNodePartition",
                 "primarySealedLength",
                 "primaryFinalAckedBytes",
                 "primaryFinalAckedSha256",
@@ -581,8 +581,8 @@ class ExternalNemesisTest {
                 "metadataLeader",
                 "proxiedMetadataEndpoint",
                 "writePolicy",
-                "storageConnectionsPerEndpoint",
-                "initialStorage",
+                "dataNodeConnectionsPerEndpoint",
+                "initialDataNode",
                 "fileId",
                 "spareNodeId",
                 "spareDataEndpoint",
@@ -615,9 +615,9 @@ class ExternalNemesisTest {
         }
 
         String events() {
-            return "append-warmup,partition-storage,append-partitioned,open-read,"
-                    + "blackhole-metadata-leader,kill-metadata-leader,heal-storage,"
-                    + "seal,repair-full-rf,restart-healed-storage,verify-full-rf";
+            return "append-warmup,partition-data-node,append-partitioned,open-read,"
+                    + "blackhole-metadata-leader,kill-metadata-leader,heal-data-node,"
+                    + "seal,repair-full-rf,restart-healed-data-node,verify-full-rf";
         }
     }
 
@@ -634,7 +634,7 @@ class ExternalNemesisTest {
                                                         String proxiedLeaderEndpoint) {
         List<String> endpoints = new ArrayList<>();
         endpoints.add(proxiedLeaderEndpoint);
-        endpoints.addAll(cluster.metadataEndpoints().stream()
+        endpoints.addAll(cluster.controllerEndpoints().stream()
                 .filter(endpoint -> !endpoint.equals(proxiedLeaderTarget))
                 .toList());
         return endpoints;
@@ -659,37 +659,37 @@ class ExternalNemesisTest {
                 + " ackedSha256=" + workload.ackedSha256());
     }
 
-    private static void assertOpenChunkContainsEndpoint(List<String> metadataEndpoints,
+    private static void assertOpenChunkContainsEndpoint(List<String> controllerEndpoints,
                                                         FileId fileId,
                                                         String endpoint) throws Exception {
-        Messages.LookupFileResp file = ConsistencyVerifier.lookupFile(metadataEndpoints, fileId);
+        Messages.LookupFileResp file = ConsistencyVerifier.lookupFile(controllerEndpoints, fileId);
         Messages.ChunkInfo tail = ExternalCluster.lastChunk(file);
         assertTrue(tail.replicas().stream().anyMatch(r -> r.endpoint().equals(endpoint)),
-                "test setup requires the proxied storage endpoint in the open replica set");
+                "test setup requires the proxied data-node endpoint in the open replica set");
     }
 
-    private static ExternalCluster.ExternalStorage storageByEndpoint(ExternalCluster cluster,
+    private static ExternalCluster.ExternalDataNode dataNodeByEndpoint(ExternalCluster cluster,
                                                                      Messages.LookupFileResp file,
                                                                      String endpoint) {
         for (Messages.ChunkInfo chunk : file.chunks()) {
             for (Messages.Replica replica : chunk.replicas()) {
                 if (replica.endpoint().equals(endpoint)) {
-                    return cluster.storageByNodeId(replica.nodeId());
+                    return cluster.dataNodeByNodeId(replica.nodeId());
                 }
             }
         }
-        throw new AssertionError("descriptor does not contain storage endpoint " + endpoint);
+        throw new AssertionError("descriptor does not contain data-node endpoint " + endpoint);
     }
 
     private static Messages.LookupFileResp waitForFullReplicaConsistency(
-            List<String> metadataEndpoints, StrataClient client, FileId fileId,
+            List<String> controllerEndpoints, StrataClient client, FileId fileId,
             long sealedLength, int replicationFactor) throws Exception {
         long deadline = System.currentTimeMillis() + 45_000;
         AssertionError last = null;
         while (System.currentTimeMillis() < deadline) {
             try {
                 Messages.LookupFileResp lookup = ConsistencyVerifier.assertSealedFileConsistent(
-                        metadataEndpoints, client, fileId, sealedLength);
+                        controllerEndpoints, client, fileId, sealedLength);
                 boolean fullRf = lookup.chunks().stream()
                         .allMatch(chunk -> ConsistencyVerifier.readableSealedReplicaCount(chunk)
                                 == replicationFactor);
@@ -708,14 +708,14 @@ class ExternalNemesisTest {
     }
 
     private static Messages.LookupFileResp waitForReadableButNotFullRf(
-            List<String> metadataEndpoints, StrataClient client, FileId fileId,
+            List<String> controllerEndpoints, StrataClient client, FileId fileId,
             long sealedLength, int replicationFactor) throws Exception {
         long deadline = System.currentTimeMillis() + 20_000;
         AssertionError last = null;
         while (System.currentTimeMillis() < deadline) {
             try {
                 Messages.LookupFileResp lookup = ConsistencyVerifier.assertSealedFileConsistent(
-                        metadataEndpoints, client, fileId, sealedLength);
+                        controllerEndpoints, client, fileId, sealedLength);
                 boolean belowRf = lookup.chunks().stream()
                         .anyMatch(chunk -> ConsistencyVerifier.readableSealedReplicaCount(chunk)
                                 < replicationFactor);

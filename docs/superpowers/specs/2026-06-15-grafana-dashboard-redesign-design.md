@@ -47,25 +47,25 @@ All custom + JVM metrics carry the global labels `role`, `instance`, `job`.
 - `strata_repair_backlog` — distinct chunks currently being repaired.
 
 ### Cluster membership / leadership / ZK (meta-plane gauges)
-- `strata_nodes{state="alive|suspect|dead"}` — storage nodes by liveness state.
-- `strata_meta_is_leader` — 1 if this instance is the active metadata leader (cluster sum should be 1).
-- `strata_meta_zk_connected` — 1 if ZooKeeper is reachable.
+- `strata_data_nodes{state="alive|suspect|dead"}` — data nodes by liveness state.
+- `strata_controller_is_leader` — 1 if this instance is the active controller leader (cluster sum should be 1).
+- `strata_controller_zk_connected` — 1 if ZooKeeper is reachable.
 
 ### Node registration / capacity / chunks (node-plane gauges)
-- `strata_node_registered` — 1 if the node holds a metadata registration.
-- `strata_node_disk_used_bytes` — bytes occupied by chunk data.
-- `strata_node_capacity_bytes` — configured node capacity.
-- `strata_node_capacity_used_ratio` — disk used / capacity (0..1).
-- `strata_node_chunks{state="open|sealed"}` — local chunks by state.
+- `strata_data_node_registered` — 1 if the node holds a metadata registration.
+- `strata_data_node_disk_used_bytes` — bytes occupied by chunk data.
+- `strata_data_node_capacity_bytes` — configured node capacity.
+- `strata_data_node_capacity_used_ratio` — disk used / capacity (0..1).
+- `strata_data_node_chunks{state="open|sealed"}` — local chunks by state.
 
 ### Write path (node-plane FunctionCounters → `_total`)
-- `strata_node_groupcommit_force_total` — group-commit force()/fsync calls.
-- `strata_node_append_ops_total` — appended records.
-- `strata_node_append_bytes_total` — appended payload bytes.
+- `strata_data_node_groupcommit_force_total` — group-commit force()/fsync calls.
+- `strata_data_node_append_ops_total` — appended records.
+- `strata_data_node_append_bytes_total` — appended payload bytes.
 
 ### Read path (NEW — added by this work; see §4)
-- `strata_node_read_ops_total` — client READ operations served.
-- `strata_node_read_bytes_total` — client READ payload bytes served.
+- `strata_data_node_read_ops_total` — client READ operations served.
+- `strata_data_node_read_bytes_total` — client READ payload bytes served.
 
 ### SCP request latency (Timer → Prometheus histogram, base unit seconds)
 - `strata_scp_request_duration_seconds_bucket{opcode,status,le}`
@@ -94,12 +94,12 @@ The request observer records only `(opcode, duration, success)` — no bytes —
 **Changes**
 1. **`ChunkStore`** — add `readOps`/`readBytes` atomic counters with `readOps()` / `readBytes()` accessors, mirroring the existing `appendOps()` / `appendBytes()`. Provide the increment site used by the read path (e.g. inside `readRegion(...)` or a `recordRead(long bytes)` called from the handler) so each served client READ adds 1 op and `length` bytes.
 2. **`StorageNode`** — add `readOps()` / `readBytes()` observability accessors delegating to the store (next to `appendOps()` / `appendBytes()` at lines ~148–154).
-3. **`ServerMetrics.registerNode`** — register:
-   - `FunctionCounter.builder("strata_node_read_ops", n, StorageNode::readOps)` → `strata_node_read_ops_total`
-   - `FunctionCounter.builder("strata_node_read_bytes", n, StorageNode::readBytes)` → `strata_node_read_bytes_total`
+3. **`ServerMetrics.registerDataNode`** — register:
+   - `FunctionCounter.builder("strata_data_node_read_ops", n, StorageNode::readOps)` → `strata_data_node_read_ops_total`
+   - `FunctionCounter.builder("strata_data_node_read_bytes", n, StorageNode::readBytes)` → `strata_data_node_read_bytes_total`
 4. **Tests** — unit test that issuing reads increments `readOps`/`readBytes` by the expected amounts (mirror the existing append-counter test), so the metric is verified independent of Grafana.
 
-**Scope boundary:** count **client `READ`** only. `FETCH_CHUNK` (replication/repair reads) and `READ_LEDGER` (metadata reads) remain represented through the SCP opcode latency/rate/error panels; they are not folded into `strata_node_read_bytes_total`.
+**Scope boundary:** count **client `READ`** only. `FETCH_CHUNK` (replication/repair reads) and `READ_LEDGER` (metadata reads) remain represented through the SCP opcode latency/rate/error panels; they are not folded into `strata_data_node_read_bytes_total`.
 
 ---
 
@@ -121,12 +121,12 @@ Replaces the old file; reuses uid `strata-overview` to preserve existing links/b
 - Chunks unavailable — `sum(strata_chunks_unavailable)` — green → **red ≥1**.
 - Under-replicated — `sum(strata_chunks_under_replicated)` — yellow ≥1.
 - At min redundancy (1 replica) — `sum(strata_chunks_at_min_redundancy)` — yellow ≥1.
-- Metadata leaders (want 1) — `sum(strata_meta_is_leader)` — thresholds `[red @null, green @1, red @2]` (0 = no leader, 1 = healthy, ≥2 = split-brain).
-- ZK connected (min) — `min(strata_meta_zk_connected)` — red → green @1.
-- Nodes alive — `sum(strata_nodes{state="alive"})`.
-- Nodes suspect/dead — `sum(strata_nodes{state=~"suspect|dead"})` — yellow ≥1.
-- Write throughput — `sum(rate(strata_node_append_bytes_total[$__rate_interval]))` — Bps.
-- Read throughput — `sum(rate(strata_node_read_bytes_total[$__rate_interval]))` — Bps.
+- Metadata leaders (want 1) — `sum(strata_controller_is_leader)` — thresholds `[red @null, green @1, red @2]` (0 = no leader, 1 = healthy, ≥2 = split-brain).
+- ZK connected (min) — `min(strata_controller_zk_connected)` — red → green @1.
+- Nodes alive — `sum(strata_data_nodes{state="alive"})`.
+- Nodes suspect/dead — `sum(strata_data_nodes{state=~"suspect|dead"})` — yellow ≥1.
+- Write throughput — `sum(rate(strata_data_node_append_bytes_total[$__rate_interval]))` — Bps.
+- Read throughput — `sum(rate(strata_data_node_read_bytes_total[$__rate_interval]))` — Bps.
 - Request rate — `sum(rate(strata_scp_request_duration_seconds_count[$__rate_interval]))` — reqps.
 - Error ratio — `sum(rate(strata_scp_request_duration_seconds_count{status="error"}[$__rate_interval])) / clamp_min(sum(rate(strata_scp_request_duration_seconds_count[$__rate_interval])), 1)` — percentunit, red on rise.
 
@@ -135,26 +135,26 @@ Replaces the old file; reuses uid `strata-overview` to preserve existing links/b
 - Repair backlog & in-flight (timeseries): `sum(strata_repair_backlog)`, `sum(strata_repair_inflight)`.
 
 **Row — Cluster membership**
-- Nodes by liveness (timeseries, stacked): `sum by (state)(strata_nodes)`, overrides alive=green/suspect=orange/dead=red.
+- Nodes by liveness (timeseries, stacked): `sum by (state)(strata_data_nodes)`, overrides alive=green/suspect=orange/dead=red.
 - **Per-node fleet table** (drill-down hub): one row per `instance`, columns: registered, capacity used %, disk used, capacity, open chunks, sealed chunks. Built from instant queries merged on the `instance` label:
-  - `strata_node_registered`
-  - `strata_node_capacity_used_ratio`
-  - `strata_node_disk_used_bytes`
-  - `strata_node_capacity_bytes`
-  - `strata_node_chunks{state="open"}`
-  - `strata_node_chunks{state="sealed"}`
+  - `strata_data_node_registered`
+  - `strata_data_node_capacity_used_ratio`
+  - `strata_data_node_disk_used_bytes`
+  - `strata_data_node_capacity_bytes`
+  - `strata_data_node_chunks{state="open"}`
+  - `strata_data_node_chunks{state="sealed"}`
   - Transformations: `labels to fields` / `merge` / `organize` keyed on `instance`; field overrides for units (percentunit, bytes) and a value-based color on capacity %.
   - **Data link** on the row → `/d/strata-node?var-node=${__data.fields.instance}&${__url_time_range}`.
 
 **Row — Capacity**
-- Capacity used ratio by node (timeseries): `strata_node_capacity_used_ratio` legend `{{instance}}`, percentunit, max 1, threshold lines at 0.8/0.9. Per-series data link → Node dashboard using `${__field.labels.instance}`.
-- Disk used vs total capacity (timeseries): `sum(strata_node_disk_used_bytes)`, `sum(strata_node_capacity_bytes)` — bytes.
+- Capacity used ratio by node (timeseries): `strata_data_node_capacity_used_ratio` legend `{{instance}}`, percentunit, max 1, threshold lines at 0.8/0.9. Per-series data link → Node dashboard using `${__field.labels.instance}`.
+- Disk used vs total capacity (timeseries): `sum(strata_data_node_disk_used_bytes)`, `sum(strata_data_node_capacity_bytes)` — bytes.
 
 **Row — I/O throughput**
-- Read vs write throughput (timeseries): `sum(rate(strata_node_append_bytes_total[$__rate_interval]))` (write), `sum(rate(strata_node_read_bytes_total[$__rate_interval]))` (read) — Bps.
-- Write ops/s & read ops/s (timeseries): `sum(rate(strata_node_append_ops_total[$__rate_interval]))`, `sum(rate(strata_node_read_ops_total[$__rate_interval]))`.
-- Group-commit force/s (fsync) by node (timeseries): `sum by (instance)(rate(strata_node_groupcommit_force_total[$__rate_interval]))`.
-- Avg bytes per append (timeseries): `sum(rate(strata_node_append_bytes_total[$__rate_interval])) / clamp_min(sum(rate(strata_node_append_ops_total[$__rate_interval])), 1)` — bytes.
+- Read vs write throughput (timeseries): `sum(rate(strata_data_node_append_bytes_total[$__rate_interval]))` (write), `sum(rate(strata_data_node_read_bytes_total[$__rate_interval]))` (read) — Bps.
+- Write ops/s & read ops/s (timeseries): `sum(rate(strata_data_node_append_ops_total[$__rate_interval]))`, `sum(rate(strata_data_node_read_ops_total[$__rate_interval]))`.
+- Group-commit force/s (fsync) by node (timeseries): `sum by (instance)(rate(strata_data_node_groupcommit_force_total[$__rate_interval]))`.
+- Avg bytes per append (timeseries): `sum(rate(strata_data_node_append_bytes_total[$__rate_interval])) / clamp_min(sum(rate(strata_data_node_append_ops_total[$__rate_interval])), 1)` — bytes.
 
 **Row — Requests (RED)**
 - Request rate by opcode: `sum by (opcode)(rate(strata_scp_request_duration_seconds_count[$__rate_interval]))` — reqps.
@@ -167,34 +167,34 @@ Replaces the old file; reuses uid `strata-overview` to preserve existing links/b
 ## 7. Dashboard 2 — `Strata — Node` (uid `strata-node`)
 
 **Template variables**
-- `$node` — query `label_values(strata_node_disk_used_bytes, instance)`; multi-select; includeAll (All = `.*` regex); default All; refresh on time range change.
+- `$node` — query `label_values(strata_data_node_disk_used_bytes, instance)`; multi-select; includeAll (All = `.*` regex); default All; refresh on time range change.
 - `$opcode` — query `label_values(strata_scp_request_duration_seconds_count, opcode)`; multi-select; includeAll; default All; used only by the request panels.
 
 Every panel filters `{instance=~"$node"}` (request panels also `opcode=~"$opcode"`).
 
 **Row — Overview** (stat tiles, reflecting the selection)
-- Nodes registered — `sum(strata_node_registered{instance=~"$node"})`.
-- Capacity used (max) — `max(strata_node_capacity_used_ratio{instance=~"$node"})` — percentunit, thresholds 0.8/0.9.
-- Disk used — `sum(strata_node_disk_used_bytes{instance=~"$node"})` — bytes.
-- Open chunks — `sum(strata_node_chunks{instance=~"$node",state="open"})`.
-- Sealed chunks — `sum(strata_node_chunks{instance=~"$node",state="sealed"})`.
-- Write throughput — `sum(rate(strata_node_append_bytes_total{instance=~"$node"}[$__rate_interval]))` — Bps.
-- Read throughput — `sum(rate(strata_node_read_bytes_total{instance=~"$node"}[$__rate_interval]))` — Bps.
-- fsync/s — `sum(rate(strata_node_groupcommit_force_total{instance=~"$node"}[$__rate_interval]))`.
+- Nodes registered — `sum(strata_data_node_registered{instance=~"$node"})`.
+- Capacity used (max) — `max(strata_data_node_capacity_used_ratio{instance=~"$node"})` — percentunit, thresholds 0.8/0.9.
+- Disk used — `sum(strata_data_node_disk_used_bytes{instance=~"$node"})` — bytes.
+- Open chunks — `sum(strata_data_node_chunks{instance=~"$node",state="open"})`.
+- Sealed chunks — `sum(strata_data_node_chunks{instance=~"$node",state="sealed"})`.
+- Write throughput — `sum(rate(strata_data_node_append_bytes_total{instance=~"$node"}[$__rate_interval]))` — Bps.
+- Read throughput — `sum(rate(strata_data_node_read_bytes_total{instance=~"$node"}[$__rate_interval]))` — Bps.
+- fsync/s — `sum(rate(strata_data_node_groupcommit_force_total{instance=~"$node"}[$__rate_interval]))`.
 
 **Row — Capacity & storage**
-- Capacity used ratio by node: `strata_node_capacity_used_ratio{instance=~"$node"}` — percentunit + threshold lines.
-- Disk used vs capacity by node: `strata_node_disk_used_bytes{instance=~"$node"}`, `strata_node_capacity_bytes{instance=~"$node"}` — bytes.
-- Local chunks by state: `sum by (instance, state)(strata_node_chunks{instance=~"$node"})`.
+- Capacity used ratio by node: `strata_data_node_capacity_used_ratio{instance=~"$node"}` — percentunit + threshold lines.
+- Disk used vs capacity by node: `strata_data_node_disk_used_bytes{instance=~"$node"}`, `strata_data_node_capacity_bytes{instance=~"$node"}` — bytes.
+- Local chunks by state: `sum by (instance, state)(strata_data_node_chunks{instance=~"$node"})`.
 
 **Row — I/O throughput**
-- Write throughput by node: `sum by (instance)(rate(strata_node_append_bytes_total{instance=~"$node"}[$__rate_interval]))` — Bps.
-- Read throughput by node: `sum by (instance)(rate(strata_node_read_bytes_total{instance=~"$node"}[$__rate_interval]))` — Bps.
-- Append ops/s & read ops/s by node: `sum by (instance)(rate(strata_node_append_ops_total{instance=~"$node"}[$__rate_interval]))`, `sum by (instance)(rate(strata_node_read_ops_total{instance=~"$node"}[$__rate_interval]))`.
-- Group-commit force/s (fsync) by node: `sum by (instance)(rate(strata_node_groupcommit_force_total{instance=~"$node"}[$__rate_interval]))`.
-- Avg bytes per append: `sum by (instance)(rate(strata_node_append_bytes_total{instance=~"$node"}[$__rate_interval])) / clamp_min(sum by (instance)(rate(strata_node_append_ops_total{instance=~"$node"}[$__rate_interval])), 1)` — bytes.
+- Write throughput by node: `sum by (instance)(rate(strata_data_node_append_bytes_total{instance=~"$node"}[$__rate_interval]))` — Bps.
+- Read throughput by node: `sum by (instance)(rate(strata_data_node_read_bytes_total{instance=~"$node"}[$__rate_interval]))` — Bps.
+- Append ops/s & read ops/s by node: `sum by (instance)(rate(strata_data_node_append_ops_total{instance=~"$node"}[$__rate_interval]))`, `sum by (instance)(rate(strata_data_node_read_ops_total{instance=~"$node"}[$__rate_interval]))`.
+- Group-commit force/s (fsync) by node: `sum by (instance)(rate(strata_data_node_groupcommit_force_total{instance=~"$node"}[$__rate_interval]))`.
+- Avg bytes per append: `sum by (instance)(rate(strata_data_node_append_bytes_total{instance=~"$node"}[$__rate_interval])) / clamp_min(sum by (instance)(rate(strata_data_node_append_ops_total{instance=~"$node"}[$__rate_interval])), 1)` — bytes.
 - Avg bytes per read: same shape with read counters — bytes.
-- Appends per fsync (batch efficiency): `sum by (instance)(rate(strata_node_append_ops_total{instance=~"$node"}[$__rate_interval])) / clamp_min(sum by (instance)(rate(strata_node_groupcommit_force_total{instance=~"$node"}[$__rate_interval])), 1)` — short.
+- Appends per fsync (batch efficiency): `sum by (instance)(rate(strata_data_node_append_ops_total{instance=~"$node"}[$__rate_interval])) / clamp_min(sum by (instance)(rate(strata_data_node_groupcommit_force_total{instance=~"$node"}[$__rate_interval])), 1)` — short.
 
 **Row — Requests on this node (RED)** (filtered `{instance=~"$node", opcode=~"$opcode"}`)
 - Request rate by opcode.
@@ -285,4 +285,4 @@ Every panel filters `{instance=~"$node"}` (request panels also `opcode=~"$opcode
 - **`role` is always `combined` in the bundled compose**, but queries deliberately avoid `role=` so they hold for split deployments too. No functional risk.
 - **`instance` carries the `:9300` port** (e.g. `node1:9300`); selector values and table rows show it verbatim. Acceptable; a regex strip is cosmetic and skipped (YAGNI).
 - **Heatmap panel** depends on Grafana 11's `heatmap` panel reading native histogram buckets via the `le` label — standard and supported in 11.2.0.
-- **Read-byte accounting** counts client `READ` served bytes only; replication (`FETCH_CHUNK`) and metadata (`READ_LEDGER`) reads remain visible via the SCP opcode panels but are excluded from `strata_node_read_bytes_total` by design.
+- **Read-byte accounting** counts client `READ` served bytes only; replication (`FETCH_CHUNK`) and metadata (`READ_LEDGER`) reads remain visible via the SCP opcode panels but are excluded from `strata_data_node_read_bytes_total` by design.

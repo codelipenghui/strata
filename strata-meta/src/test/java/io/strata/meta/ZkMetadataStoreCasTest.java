@@ -26,7 +26,7 @@ class ZkMetadataStoreCasTest {
     @Test
     void staleNodeWriteLosesCas() throws Exception {
         try (TestingServer zk = new TestingServer(true)) {
-            // two store handles = two metadata service instances
+            // two store handles = two controller instances
             try (ZkMetadataStore leaderA = new ZkMetadataStore(zk.getConnectString());
                  ZkMetadataStore leaderB = new ZkMetadataStore(zk.getConnectString())) {
 

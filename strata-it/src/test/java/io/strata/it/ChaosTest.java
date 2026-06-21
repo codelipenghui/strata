@@ -8,7 +8,7 @@ import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
-import io.strata.node.NodeConfig;
+import io.strata.node.DataNodeConfig;
 import io.strata.proto.Messages;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -35,8 +35,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Scenarios assert the STRUCTURAL product claims:
  *  - a slow replica never gates produce latency (quorum absorbs single-node stalls)
  *  - a black-holed replica triggers seal-and-roll with zero acked loss
- *  - a healed child-JVM storage partition repairs stale local data back to full RF
- *  - a black-holed metadata leader endpoint plus leader death is retried on the new leader
+ *  - a healed child-JVM data-node partition repairs stale local data back to full RF
+ *  - a black-holed controller leader endpoint plus leader death is retried on the new leader
  *  - a ZooKeeper outage does not touch the data path (metadata off the per-message path)
  *  - a short ZooKeeper outage at chunk-roll time is retried without acked loss
  *  - a short ZooKeeper outage at final seal time is retried without acked loss
@@ -64,7 +64,7 @@ class ChaosTest {
             String proxiedEndpoint = "127.0.0.1:" + toxiproxy.getMappedPort(8666);
 
             try (MiniCluster cluster = new MiniCluster(2)) {
-                cluster.addNode(NodeConfig.withMetadata(cluster.nodeDir("host-slow"),
+                cluster.addNode(DataNodeConfig.withMetadata(cluster.nodeDir("host-slow"),
                                 List.of(cluster.metaEndpoint()), "host-slow")
                         .withListenPort(nodePort)
                         .withAdvertisedEndpoint(proxiedEndpoint));
@@ -112,7 +112,7 @@ class ChaosTest {
             String proxiedEndpoint = "127.0.0.1:" + toxiproxy.getMappedPort(8666);
 
             try (MiniCluster cluster = new MiniCluster(3)) { // 3 healthy + 1 proxied = spare for rolls
-                cluster.addNode(NodeConfig.withMetadata(cluster.nodeDir("host-dark"),
+                cluster.addNode(DataNodeConfig.withMetadata(cluster.nodeDir("host-dark"),
                                 List.of(cluster.metaEndpoint()), "host-dark")
                         .withListenPort(nodePort)
                         .withAdvertisedEndpoint(proxiedEndpoint));
@@ -159,7 +159,7 @@ class ChaosTest {
             String proxiedEndpoint = "127.0.0.1:" + toxiproxy.getMappedPort(8666);
 
             try (MiniCluster cluster = new MiniCluster(3)) {
-                cluster.addNode(NodeConfig.withMetadata(cluster.nodeDir("host-heal"),
+                cluster.addNode(DataNodeConfig.withMetadata(cluster.nodeDir("host-heal"),
                                 List.of(cluster.metaEndpoint()), "host-heal")
                         .withListenPort(nodePort)
                         .withAdvertisedEndpoint(proxiedEndpoint));
@@ -197,12 +197,12 @@ class ChaosTest {
     }
 
     /**
-     * Same stale-open repair property as the in-process partition test, but storage nodes run in
+     * Same stale-open repair property as the in-process partition test, but data nodes run in
      * child JVMs so the data plane crosses process boundaries while Toxiproxy owns the partition.
      */
     @Test
-    void processStoragePartitionHealsAndRepairsStaleOpenCopy() throws Exception {
-        List<ExternalStorage> storageNodes = new ArrayList<>();
+    void processDataNodePartitionHealsAndRepairsStaleOpenCopy() throws Exception {
+        List<ExternalDataNode> dataNodes = new ArrayList<>();
         try (GenericContainer<?> toxiproxy = new GenericContainer<>(TOXIPROXY_IMAGE)
                 .withExposedPorts(8474, 8666);
              MiniCluster cluster = new MiniCluster(0)) {
@@ -217,9 +217,9 @@ class ChaosTest {
 
             try {
                 for (int i = 0; i < 3; i++) {
-                    storageNodes.add(startStorageProcess(cluster, "process-heal-host-" + i));
+                    dataNodes.add(startDataNodeProcess(cluster, "process-heal-host-" + i));
                 }
-                storageNodes.add(startStorageProcess(cluster, "process-heal-host-proxied",
+                dataNodes.add(startDataNodeProcess(cluster, "process-heal-host-proxied",
                         nodePort, proxiedEndpoint));
                 cluster.awaitRegistered(4);
 
@@ -252,7 +252,7 @@ class ChaosTest {
                     waitForFullReplicaConsistency(cluster, client, fileId, sealed.sealedLength(), 4);
                 }
             } finally {
-                for (ExternalStorage node : storageNodes) {
+                for (ExternalDataNode node : dataNodes) {
                     kill(node);
                 }
             }
@@ -260,7 +260,7 @@ class ChaosTest {
     }
 
     /**
-     * The client may be pinned to a metadata leader endpoint that becomes black-holed before the
+     * The client may be pinned to a controller leader endpoint that becomes black-holed before the
      * leader process dies. Boundary operations must time out, rotate, and complete on the new
      * leader without losing acknowledged bytes.
      */
@@ -272,7 +272,7 @@ class ChaosTest {
             List<String> fallbackEndpoints = cluster.metaEndpoints().stream()
                     .filter(endpoint -> !endpoint.equals(leader.endpoint()))
                     .toList();
-            assertEquals(1, fallbackEndpoints.size(), "test expects exactly one fallback metadata endpoint");
+            assertEquals(1, fallbackEndpoints.size(), "test expects exactly one fallback controller endpoint");
 
             Testcontainers.exposeHostPorts(leader.port());
             try (GenericContainer<?> toxiproxy = new GenericContainer<>(TOXIPROXY_IMAGE)
@@ -286,9 +286,9 @@ class ChaosTest {
                 int payloadBytes = Workload.payload(0).length;
                 int warmupRecords = 8;
                 long rollBytes = (long) payloadBytes * warmupRecords;
-                List<String> metadataEndpoints = List.of(proxiedLeader, fallbackEndpoints.get(0));
+                List<String> controllerEndpoints = List.of(proxiedLeader, fallbackEndpoints.get(0));
                 try (StrataClient client = StrataClient.connect(new ClientConfig(
-                        metadataEndpoints, rollBytes, 1_500))) {
+                        controllerEndpoints, rollBytes, 1_500))) {
                     FileId fileId = client.create(StrataClient.FileSpec.log(
                             "test", "/metadata-leader-proxy-blackhole")).id();
                     Workload workload = new Workload();
@@ -535,24 +535,24 @@ class ChaosTest {
                 return i;
             }
         }
-        throw new AssertionError("no metadata leader");
+        throw new AssertionError("no controller leader");
     }
 
     private static MetadataEndpoint metadataEndpoint(MiniCluster cluster, int index) {
         String endpoint = cluster.metas.get(index).endpoint();
         int colon = endpoint.lastIndexOf(':');
-        assertTrue(colon > 0, "invalid metadata endpoint: " + endpoint);
+        assertTrue(colon > 0, "invalid controller endpoint: " + endpoint);
         return new MetadataEndpoint(endpoint, Integer.parseInt(endpoint.substring(colon + 1)));
     }
 
     private record MetadataEndpoint(String endpoint, int port) {
     }
 
-    private static ExternalStorage startStorageProcess(MiniCluster cluster, String host) throws Exception {
-        return startStorageProcess(cluster, host, 0, null);
+    private static ExternalDataNode startDataNodeProcess(MiniCluster cluster, String host) throws Exception {
+        return startDataNodeProcess(cluster, host, 0, null);
     }
 
-    private static ExternalStorage startStorageProcess(MiniCluster cluster, String host, int listenPort,
+    private static ExternalDataNode startDataNodeProcess(MiniCluster cluster, String host, int listenPort,
                                                        String advertisedEndpoint) throws Exception {
         Path logRoot = processLogRoot();
         String processName = host + "-" + System.nanoTime();
@@ -565,7 +565,7 @@ class ChaosTest {
         command.add("-Dorg.slf4j.simpleLogger.defaultLogLevel=warn");
         command.add("-cp");
         command.add(System.getProperty("java.class.path"));
-        command.add(StorageNodeProcessMain.class.getName());
+        command.add(DataNodeProcessMain.class.getName());
         command.add(cluster.nodeDir(host).toString());
         command.add(String.join(",", cluster.metaEndpoints()));
         command.add(host);
@@ -579,39 +579,39 @@ class ChaosTest {
         builder.redirectErrorStream(true);
         builder.redirectOutput(logFile.toFile());
         Process process = builder.start();
-        return waitStorageReady(new ExternalStorage(host, readyFile, logFile, process, -1, ""));
+        return waitDataNodeReady(new ExternalDataNode(host, readyFile, logFile, process, -1, ""));
     }
 
-    private static ExternalStorage waitStorageReady(ExternalStorage node) throws Exception {
+    private static ExternalDataNode waitDataNodeReady(ExternalDataNode node) throws Exception {
         long deadline = System.currentTimeMillis() + 20_000;
         while (System.currentTimeMillis() < deadline) {
             if (Files.exists(node.readyFile())) {
                 String[] parts = Files.readString(node.readyFile()).trim().split("\\s+");
                 if (parts.length == 2) {
-                    return new ExternalStorage(node.host(), node.readyFile(), node.logFile(),
+                    return new ExternalDataNode(node.host(), node.readyFile(), node.logFile(),
                             node.process(), Integer.parseInt(parts[0]), parts[1]);
                 }
             }
             if (!node.process().isAlive()) {
-                throw new AssertionError("storage process exited early with code "
+                throw new AssertionError("data-node process exited early with code "
                         + node.process().exitValue() + "\n" + childLog(node));
             }
             Thread.sleep(50);
         }
-        throw new AssertionError("storage process did not become ready\n" + childLog(node));
+        throw new AssertionError("data-node process did not become ready\n" + childLog(node));
     }
 
-    private static void kill(ExternalStorage node) throws Exception {
+    private static void kill(ExternalDataNode node) throws Exception {
         if (node == null || !node.process().isAlive()) {
             return;
         }
         node.process().destroyForcibly();
         if (!node.process().waitFor(10, TimeUnit.SECONDS)) {
-            throw new AssertionError("storage process did not exit after destroyForcibly");
+            throw new AssertionError("data-node process did not exit after destroyForcibly");
         }
     }
 
-    private static String childLog(ExternalStorage node) throws Exception {
+    private static String childLog(ExternalDataNode node) throws Exception {
         return Files.exists(node.logFile()) ? Files.readString(node.logFile()) : "";
     }
 
@@ -621,7 +621,7 @@ class ChaosTest {
         return root;
     }
 
-    private record ExternalStorage(String host, Path readyFile, Path logFile, Process process,
+    private record ExternalDataNode(String host, Path readyFile, Path logFile, Process process,
                                    int nodeId, String endpoint) {
     }
 

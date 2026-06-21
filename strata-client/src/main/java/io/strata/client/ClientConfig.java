@@ -7,25 +7,25 @@ import java.util.List;
 import java.util.Objects;
 
 /** Client configuration. chunkRollBytes is ~2 GB nominal in production; tests use small values. */
-public record ClientConfig(List<String> metadataEndpoints, long chunkRollBytes, long callTimeoutMs,
-                           ConnectionPolicy connectionPolicy, int storageConnectionsPerEndpoint) {
-    public ClientConfig(List<String> metadataEndpoints, long chunkRollBytes, long callTimeoutMs) {
-        this(metadataEndpoints, chunkRollBytes, callTimeoutMs, ConnectionPolicy.DEFAULT, 1);
+public record ClientConfig(List<String> controllerEndpoints, long chunkRollBytes, long callTimeoutMs,
+                           ConnectionPolicy connectionPolicy, int dataNodeConnectionsPerEndpoint) {
+    public ClientConfig(List<String> controllerEndpoints, long chunkRollBytes, long callTimeoutMs) {
+        this(controllerEndpoints, chunkRollBytes, callTimeoutMs, ConnectionPolicy.DEFAULT, 1);
     }
 
-    public ClientConfig(List<String> metadataEndpoints, long chunkRollBytes, long callTimeoutMs,
+    public ClientConfig(List<String> controllerEndpoints, long chunkRollBytes, long callTimeoutMs,
                         ConnectionPolicy connectionPolicy) {
-        this(metadataEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy, 1);
+        this(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy, 1);
     }
 
     public ClientConfig {
-        if (metadataEndpoints == null || metadataEndpoints.isEmpty()) {
-            throw new IllegalArgumentException("at least one metadata endpoint is required");
+        if (controllerEndpoints == null || controllerEndpoints.isEmpty()) {
+            throw new IllegalArgumentException("at least one controller endpoint is required");
         }
-        for (String endpoint : metadataEndpoints) {
+        for (String endpoint : controllerEndpoints) {
             validateEndpoint(endpoint);
         }
-        metadataEndpoints = List.copyOf(metadataEndpoints);
+        controllerEndpoints = List.copyOf(controllerEndpoints);
         if (chunkRollBytes <= 0) {
             throw new IllegalArgumentException("chunkRollBytes must be positive");
         }
@@ -33,8 +33,8 @@ public record ClientConfig(List<String> metadataEndpoints, long chunkRollBytes, 
             throw new IllegalArgumentException("callTimeoutMs must be positive");
         }
         connectionPolicy = Objects.requireNonNull(connectionPolicy, "connectionPolicy");
-        if (storageConnectionsPerEndpoint <= 0) {
-            throw new IllegalArgumentException("storageConnectionsPerEndpoint must be positive");
+        if (dataNodeConnectionsPerEndpoint <= 0) {
+            throw new IllegalArgumentException("dataNodeConnectionsPerEndpoint must be positive");
         }
     }
 
@@ -43,20 +43,20 @@ public record ClientConfig(List<String> metadataEndpoints, long chunkRollBytes, 
     }
 
     public ClientConfig withChunkRollBytes(long bytes) {
-        return new ClientConfig(metadataEndpoints, bytes, callTimeoutMs, connectionPolicy,
-                storageConnectionsPerEndpoint);
+        return new ClientConfig(controllerEndpoints, bytes, callTimeoutMs, connectionPolicy,
+                dataNodeConnectionsPerEndpoint);
     }
 
     public ClientConfig withConnectionPolicy(ConnectionPolicy policy) {
-        return new ClientConfig(metadataEndpoints, chunkRollBytes, callTimeoutMs, policy,
-                storageConnectionsPerEndpoint);
+        return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, policy,
+                dataNodeConnectionsPerEndpoint);
     }
 
-    public ClientConfig withStorageConnectionsPerEndpoint(int connections) {
-        return new ClientConfig(metadataEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy, connections);
+    public ClientConfig withDataNodeConnectionsPerEndpoint(int connections) {
+        return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy, connections);
     }
 
     private static void validateEndpoint(String endpoint) {
-        Endpoint.parse(endpoint, "metadata endpoint");
+        Endpoint.parse(endpoint, "controller endpoint");
     }
 }

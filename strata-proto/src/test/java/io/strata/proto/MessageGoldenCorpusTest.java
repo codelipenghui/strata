@@ -60,7 +60,8 @@ class MessageGoldenCorpusTest {
                 "SEAL_FILE=0x0206",
                 "ABORT_CHUNK_META=0x0207",
                 "LOOKUP_PATH=0x0208",
-                "ALLOCATE_WRITER_EPOCH=0x0209"),
+                "ALLOCATE_WRITER_EPOCH=0x0209",
+                "EXEC_REPLICATE=0x020a"),
                 Arrays.stream(Opcode.values())
                         .map(op -> op.name() + "=0x" + String.format("%04x", op.code & 0xFFFF))
                         .toList());
@@ -151,10 +152,10 @@ class MessageGoldenCorpusTest {
                                 0x5555666677778888L, FrameIO.MAX_FRAME_BYTES, 1L << 30).encode(),
                         Messages.HelloResp::decode,
                         "0000000101020304050607080000002a11112222333344445555666677778888"
-                                + "04000000000000004000000018000100010010000100110001001200010013"
+                                + "04000000000000004000000019000100010010000100110001001200010013"
                                 + "0001001400010015000100160001001700010018000100190001001a0001"
                                 + "010100010102000101030001020100010202000102030001020400010205"
-                                + "00010206000102070001020800010209000100"),
+                                + "000102060001020700010208000102090001020a000100"),
                 request("openChunk",
                         new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L),
                         () -> new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L).encode(),
@@ -250,7 +251,7 @@ class MessageGoldenCorpusTest {
                         Messages.ReadLedgerResp::decode,
                         "0000020000000000000064000000010000000500000000000000c800000002"
                                 + "0000000500"),
-                request("registerNode",
+                request("registerDataNode",
                         new Messages.RegisterNode(1, 2, List.of("h1:9000", "h2:9000"), "z1",
                                 "r1", "host1", List.of(new Messages.StorageCapacity(1L << 40)),
                                 1, 0),

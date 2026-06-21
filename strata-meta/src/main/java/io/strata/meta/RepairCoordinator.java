@@ -1,10 +1,16 @@
 package io.strata.meta;
 
+import io.strata.common.Endpoint;
+import io.strata.common.ErrorCode;
 import io.strata.common.FileState;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
+import io.strata.proto.BufWriter;
 import io.strata.proto.Messages;
+import io.strata.proto.Opcode;
+import io.strata.proto.ScpClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,8 +61,14 @@ final class RepairCoordinator implements AutoCloseable {
 
     private final MetadataStore store;
     private final NodeRegistry registry;
-    private final MetaConfig config;
+    private final ControllerConfig config;
     private final java.util.function.BooleanSupplier isLeader;
+    // Whether this node owns every namespace (non-sharded / single-endpoint). When false (sharded), an
+    // inventory chunk whose file this node cannot see may belong to a namespace owned by another meta
+    // node, so it must NOT be deleted as an orphan (design §11 single-writer safety / data-loss guard).
+    private final java.util.function.BooleanSupplier ownsAll;
+    // Whether this node is the controller owner of a namespace — scopes the non-controller owner repair pass.
+    private final java.util.function.Predicate<StrataNamespace> ownsNamespace;
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicLong commandIds = new AtomicLong(System.currentTimeMillis());
     private final Map<Long, Action> inflight = new ConcurrentHashMap<>();
@@ -76,7 +88,7 @@ final class RepairCoordinator implements AutoCloseable {
     // A deleted file's record is kept as a DELETED tombstone (fencing a delayed CREATE replay from
     // resurrecting it) and reaped only after this window. INVARIANT: it must exceed the longest
     // possible create-replay delay — the client create-retry deadline (max(15s, callTimeoutMs), see
-    // MetaClient) plus the meta<->ZK clock-skew the mtime-based sweep tolerates — and it must exceed
+    // ControllerClient) plus the controller<->ZK clock-skew the mtime-based sweep tolerates — and it must exceed
     // repairScanIntervalMs (the sweep cadence). 10 min vs the 15s default is a ~40x margin; raise it
     // if callTimeoutMs is ever configured near it.
     private static final long DELETED_TOMBSTONE_TTL_MS = 600_000;
@@ -114,12 +126,27 @@ final class RepairCoordinator implements AutoCloseable {
 
     private record ReplicaKey(ChunkId chunkId, int nodeId) {}
 
-    RepairCoordinator(MetadataStore store, NodeRegistry registry, MetaConfig config,
+    RepairCoordinator(MetadataStore store, NodeRegistry registry, ControllerConfig config,
                       java.util.function.BooleanSupplier isLeader) {
+        this(store, registry, config, isLeader, () -> true, ns -> true);
+    }
+
+    RepairCoordinator(MetadataStore store, NodeRegistry registry, ControllerConfig config,
+                      java.util.function.BooleanSupplier isLeader,
+                      java.util.function.BooleanSupplier ownsAllNamespaces) {
+        this(store, registry, config, isLeader, ownsAllNamespaces, ns -> true);
+    }
+
+    RepairCoordinator(MetadataStore store, NodeRegistry registry, ControllerConfig config,
+                      java.util.function.BooleanSupplier isLeader,
+                      java.util.function.BooleanSupplier ownsAllNamespaces,
+                      java.util.function.Predicate<StrataNamespace> ownsNamespace) {
         this.store = store;
         this.registry = registry;
         this.config = config;
         this.isLeader = isLeader;
+        this.ownsAll = ownsAllNamespaces;
+        this.ownsNamespace = ownsNamespace;
     }
 
     void start() {
@@ -133,17 +160,23 @@ final class RepairCoordinator implements AutoCloseable {
             try {
                 Thread.sleep(config.repairScanIntervalMs());
                 if (!isLeader.getAsBoolean()) {
-                    // a standby must never run failure detection or repair: with no heartbeats
-                    // routed to it, it would declare every node DEAD and persist that to ZK
+                    // a standby must never run cluster-wide failure detection (no heartbeats are routed
+                    // to it). But a sharded non-controller OWNER still heals under-replication in the
+                    // namespaces it owns, directly via EXEC_REPLICATE (design §11).
                     leaderSince = 0;
+                    ownerRepairPass();
                     continue;
                 }
                 if (leaderSince == 0) {
                     leaderSince = System.currentTimeMillis();
                 }
+                // Publish the shared live-node snapshot every pass — NOT gated by the settle period.
+                // Sharded non-controller owners need a placement view immediately (to place their own
+                // metadata-log chunks); without it they see zero nodes and every forwarded op stalls.
+                registry.publishClusterLiveNodes();
                 // settle period after acquiring leadership: nodes registered with the previous
                 // leader need a lease cycle to re-register here, or every chunk looks
-                // under-replicated and the scan issues spurious repairs
+                // under-replicated and the scan issues spurious repairs. Gates REPAIR actions only.
                 if (System.currentTimeMillis() - leaderSince < config.leaseMs() + config.deadGraceMs()) {
                     continue;
                 }
@@ -174,6 +207,11 @@ final class RepairCoordinator implements AutoCloseable {
 
     /** One reconciliation pass over all files. Idempotent; safe to call while serving. */
     synchronized void scanOnce() throws Exception {
+        // The controller refreshes the shared live-node snapshot each pass so non-controller namespace
+        // owners have a current placement view (design §11). Leader-gated: a standby must not publish.
+        if (isLeader.getAsBoolean()) {
+            registry.publishClusterLiveNodes();
+        }
         sweepStuckCommands();
         record Repair(FileId fileId, Records.FileRecord file, Records.ChunkRecord chunk, int liveReplicas) {}
         List<Repair> repairs = new ArrayList<>();
@@ -283,6 +321,147 @@ final class RepairCoordinator implements AutoCloseable {
         registry.enqueue(target.record.nodeId(),
                 new Messages.ReplicateCmd(cmdId, chunkId, sources, (byte) 1, chunk.crc(), chunk.length()));
         log.info("repair: {} dead={} -> target={} (cmd {})", chunkId, deadNode, target.record.nodeId(), cmdId);
+    }
+
+    /**
+     * Non-controller owner repair (design §11): a namespace owner that does not hold the global latch
+     * cannot use the controller's heartbeat command channel, so it heals its own namespaces'
+     * under-replicated sealed chunks directly. It reads the controller's authoritative DEAD set from the
+     * consensus root, picks a replacement target from the shared live-node snapshot, tells that target
+     * to pull the chunk via EXEC_REPLICATE, then writes the replica change itself (single writer for the
+     * namespace). Non-sharded deployments return immediately — the cluster controller does all repair.
+     */
+    void ownerRepairPass() throws Exception {
+        if (ownsAll.getAsBoolean()) {
+            return;
+        }
+        Set<Integer> dead = new HashSet<>();
+        for (MetadataStore.Versioned<Records.NodeRecord> v : store.listNodes()) {
+            if (v.value().state() == Records.NodeState.DEAD) {
+                dead.add(v.value().nodeId());
+            }
+        }
+        for (StrataNamespace ns : store.listNamespaces()) {
+            if (!ownsNamespace.test(ns)) {
+                continue;
+            }
+            for (FileId fileId : store.listFiles(ns)) {
+                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
+                if (opt.isEmpty() || opt.get().value().state() == FileState.DELETING) {
+                    continue;
+                }
+                Records.FileRecord file = opt.get().value();
+                for (Records.ChunkRecord chunk : file.chunks()) {
+                    if (chunk.state() == ChunkState.SEALED) {
+                        ownerRepairChunk(ns, file, chunk, dead);
+                    }
+                }
+            }
+        }
+    }
+
+    private void ownerRepairChunk(StrataNamespace ns, Records.FileRecord file, Records.ChunkRecord chunk,
+                                  Set<Integer> dead) {
+        ChunkId chunkId = file.chunkId(chunk.index());
+        if (chunksBeingRepaired.contains(chunkId)) {
+            return;
+        }
+        int deadNode = -1;
+        List<Messages.Replica> sources = new ArrayList<>();
+        Set<String> usedHosts = new HashSet<>();
+        for (int nodeId : chunk.replicas()) {
+            if (dead.contains(nodeId)) {
+                deadNode = nodeId;
+            } else {
+                sources.add(registry.replicaOf(nodeId));
+                String host = registry.hostOf(nodeId);
+                if (host != null) {
+                    usedHosts.add(host);
+                }
+            }
+        }
+        if (sources.isEmpty()) {
+            return; // no live source to pull from
+        }
+        int liveReplicas = chunk.replicas().size() - (deadNode >= 0 ? 1 : 0);
+        if (liveReplicas >= file.replicationFactor()) {
+            return; // adequately replicated
+        }
+        List<NodeRegistry.LiveNode> targets;
+        try {
+            targets = Placement.choose(ns, registry, 1, new HashSet<>(chunk.replicas()), usedHosts);
+        } catch (Exception e) {
+            return; // no placement capacity right now; a later pass retries
+        }
+        NodeRegistry.LiveNode target = targets.get(0);
+        if (!chunksBeingRepaired.add(chunkId)) {
+            return;
+        }
+        try {
+            long cmdId = commandIds.incrementAndGet();
+            Messages.ReplicateCmd cmd = new Messages.ReplicateCmd(cmdId, chunkId, sources,
+                    (byte) 1, chunk.crc(), chunk.length());
+            if (execReplicate(target, cmd)) {
+                applyOwnerRepair(file.fileId(), chunkId, deadNode, target.record.nodeId());
+                log.info("owner repair: {} dead={} -> target={} (cmd {})", chunkId, deadNode,
+                        target.record.nodeId(), cmdId);
+            }
+        } catch (Exception e) {
+            log.warn("owner repair of {} failed", chunkId, e);
+        } finally {
+            chunksBeingRepaired.remove(chunkId);
+        }
+    }
+
+    /** Synchronously tells {@code target} to pull the chunk (EXEC_REPLICATE); true if it acked OK. */
+    private boolean execReplicate(NodeRegistry.LiveNode target, Messages.ReplicateCmd cmd) {
+        Endpoint endpoint;
+        try {
+            endpoint = Endpoint.parse(target.record.endpoint(), "node endpoint", ErrorCode.INTERNAL);
+        } catch (Exception e) {
+            return false;
+        }
+        BufWriter w = new BufWriter();
+        Messages.Command.write(w, cmd);
+        int timeoutMs = Math.max(30_000, config.repairCommandTimeoutMs());
+        try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(),
+                ScpClient.KIND_TOOL, "owner-repair")) {
+            client.call(Opcode.EXEC_REPLICATE, w.toBytes(), null, timeoutMs);
+            return true;
+        } catch (Exception e) {
+            log.warn("EXEC_REPLICATE to node {} for {} failed: {}", target.record.nodeId(),
+                    cmd.chunkId(), e.getMessage());
+            return false;
+        }
+    }
+
+    /** Writes the owner-repair replica change: swap the dead replica for the target, or add the target. */
+    private void applyOwnerRepair(FileId fileId, ChunkId chunkId, int deadNode, int targetNode)
+            throws Exception {
+        for (int attempt = 0; attempt < Controller.CAS_RETRIES; attempt++) {
+            Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
+            if (opt.isEmpty()) {
+                return;
+            }
+            Records.FileRecord file = opt.get().value();
+            List<Records.ChunkRecord> chunks = new ArrayList<>();
+            for (Records.ChunkRecord c : file.chunks()) {
+                if (file.chunkId(c.index()).equals(chunkId)) {
+                    List<Integer> replicas = new ArrayList<>(c.replicas());
+                    if (deadNode >= 0) {
+                        replicas.replaceAll(n -> n == deadNode ? targetNode : n);
+                    } else if (!replicas.contains(targetNode)) {
+                        replicas.add(targetNode);
+                    }
+                    chunks.add(c.withReplicas(replicas));
+                } else {
+                    chunks.add(c);
+                }
+            }
+            if (store.updateFile(file.withChunks(chunks), opt.get().version())) {
+                return;
+            }
+        }
     }
 
     /**
@@ -426,7 +605,7 @@ final class RepairCoordinator implements AutoCloseable {
                     r.targetNode(), r.chunkId());
             return;
         }
-        for (int attempt = 0; attempt < MetadataService.CAS_RETRIES; attempt++) {
+        for (int attempt = 0; attempt < Controller.CAS_RETRIES; attempt++) {
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(r.fileId());
             if (opt.isEmpty()) return;
             Records.FileRecord file = opt.get().value();
@@ -467,7 +646,7 @@ final class RepairCoordinator implements AutoCloseable {
     }
 
     private void applyDeleteConfirmed(FileId fileId, ChunkId chunkId, int nodeId) throws Exception {
-        for (int attempt = 0; attempt < MetadataService.CAS_RETRIES; attempt++) {
+        for (int attempt = 0; attempt < Controller.CAS_RETRIES; attempt++) {
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
             if (opt.isEmpty()) return;
             Records.FileRecord file = opt.get().value();
@@ -539,7 +718,12 @@ final class RepairCoordinator implements AutoCloseable {
                         }
                     }
                 }
-                if (!known && !isRepairProtected(e.chunkId(), report.nodeId())) {
+                // Orphan only when this node can authoritatively account for the chunk's file: either
+                // it owns every namespace (non-sharded), or the file IS present (so the descriptor just
+                // does not reference this replica). A not-found file under sharding may belong to a
+                // namespace owned by another controller node — deleting it would destroy that owner's data.
+                if (!known && !isRepairProtected(e.chunkId(), report.nodeId())
+                        && (ownsAll.getAsBoolean() || opt.isPresent())) {
                     orphans.add(e.chunkId());
                 }
             }

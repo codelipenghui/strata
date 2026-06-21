@@ -15,6 +15,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -40,6 +41,14 @@ public final class ZkMetadataStore implements MetadataStore {
     private static final String IDS = "/strata/ids";
     private static final String FILE_MARKER = "__file";
     private static final byte[] DELETED_FILE_MARKER = new byte[0];
+    // Namespace-sharding consensus root (design §5, §6.1): a single global metadata-epoch counter
+    // and one assignment record per namespace. Distinct from /strata/namespaces (user path/file
+    // bindings) so the two never collide.
+    private static final String META = "/strata/meta";
+    private static final String META_NAMESPACES = META + "/namespaces";
+    private static final String META_EPOCH = META + "/epoch";
+    private static final String META_LIVE_NODES = META + "/live-nodes";
+    private static final String META_FIDX = META + "/fidx";  // fileId -> owning namespace (sharding owner resolution)
 
     /** The next-level znodes under {@code /strata}, used to tag per-subtree ZK request metrics. */
     public static final List<String> SUBTREES = List.of("files", "namespaces", "nodes", "ids");
@@ -101,13 +110,13 @@ public final class ZkMetadataStore implements MetadataStore {
 
     private void init() {
         try {
-            for (String path : new String[]{FILES, NAMESPACES, NODES, IDS}) {
+            for (String path : new String[]{FILES, NAMESPACES, NODES, IDS, META, META_NAMESPACES}) {
                 try {
                     if (curator.checkExists().forPath(path) == null) {
                         curator.create().creatingParentsIfNeeded().forPath(path);
                     }
                 } catch (KeeperException.NodeExistsException ignored) {
-                    // Another metadata service won the create race for this root; continue
+                    // Another controller won the create race for this root; continue
                     // initializing the rest of the namespace.
                 }
             }
@@ -298,7 +307,7 @@ public final class ZkMetadataStore implements MetadataStore {
     public int sweepDeletedFiles(long olderThanMs) throws Exception {
         // Ages tombstones by the znode mtime (set when deleteFile wrote DELETED). Relies on a DELETED
         // znode never being mutated again (every writer goes through getFile, which hides it), so
-        // mtime == delete time. The meta clock (now) is compared to the ZK-server mtime, so olderThanMs
+        // mtime == delete time. The controller clock (now) is compared to the ZK-server mtime, so olderThanMs
         // must absorb that skew — see DELETED_TOMBSTONE_TTL_MS.
         long now = System.currentTimeMillis();
         int reaped = 0;
@@ -470,6 +479,172 @@ public final class ZkMetadataStore implements MetadataStore {
             getNode(Integer.parseInt(child)).ifPresent(out::add);
         }
         return out;
+    }
+
+    @Override
+    public long allocateMetadataEpoch() throws Exception {
+        // ZK atomic counter: read-modify-CAS with retry. Each successful step increments by exactly
+        // one, so concurrent allocators see distinct, strictly-monotonic values with no gaps here.
+        while (true) {
+            try {
+                Stat stat = new Stat();
+                byte[] data = curator.getData().storingStatIn(stat).forPath(META_EPOCH);
+                long current = data.length == 8 ? ByteBuffer.wrap(data).getLong() : 0L;
+                long next = current + 1;
+                try {
+                    curator.setData().withVersion(stat.getVersion())
+                            .forPath(META_EPOCH, ByteBuffer.allocate(8).putLong(next).array());
+                    return next;
+                } catch (KeeperException.BadVersionException retry) {
+                    // lost the CAS race; re-read and try again
+                }
+            } catch (KeeperException.NoNodeException e) {
+                try {
+                    curator.create().creatingParentsIfNeeded()
+                            .forPath(META_EPOCH, ByteBuffer.allocate(8).putLong(1L).array());
+                    return 1L;
+                } catch (KeeperException.NodeExistsException created) {
+                    // another writer created it first; loop to CAS-increment off its value
+                }
+            }
+        }
+    }
+
+    @Override
+    public Optional<Versioned<Records.NamespaceAssignment>> getNamespaceAssignment(StrataNamespace namespace)
+            throws Exception {
+        try {
+            Stat stat = new Stat();
+            byte[] data = curator.getData().storingStatIn(stat).forPath(assignmentPath(namespace));
+            return Optional.of(new Versioned<>(Records.NamespaceAssignment.decode(data), stat.getVersion()));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    @Override
+    public boolean putNamespaceAssignment(Records.NamespaceAssignment assignment, int expectedVersion)
+            throws Exception {
+        String path = assignmentPath(assignment.namespace());
+        try {
+            byte[] enc = assignment.encode();
+            if (expectedVersion < 0) {
+                curator.create().creatingParentsIfNeeded().forPath(path, enc);
+            } else {
+                curator.setData().withVersion(expectedVersion).forPath(path, enc);
+            }
+            return true;
+        } catch (KeeperException.NodeExistsException | KeeperException.BadVersionException
+                 | KeeperException.NoNodeException e) {
+            return false;
+        }
+    }
+
+    @Override
+    public List<StrataNamespace> listAssignedNamespaces() throws Exception {
+        try {
+            List<String> children = curator.getChildren().forPath(META_NAMESPACES);
+            List<StrataNamespace> out = new ArrayList<>(children.size());
+            for (String child : children) {
+                out.add(StrataNamespace.of(child));
+            }
+            return out;
+        } catch (KeeperException.NoNodeException e) {
+            return List.of();
+        }
+    }
+
+    private static String assignmentPath(StrataNamespace namespace) {
+        return META_NAMESPACES + "/" + namespace + "/assignment";
+    }
+
+    @Override
+    public Optional<Versioned<Records.NamespaceManifest>> getNamespaceManifest(StrataNamespace namespace)
+            throws Exception {
+        try {
+            Stat stat = new Stat();
+            byte[] data = curator.getData().storingStatIn(stat).forPath(manifestPath(namespace));
+            return Optional.of(new Versioned<>(Records.NamespaceManifest.decode(data), stat.getVersion()));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    @Override
+    public boolean putNamespaceManifest(Records.NamespaceManifest manifest, int expectedVersion)
+            throws Exception {
+        String path = manifestPath(manifest.namespace());
+        try {
+            byte[] enc = manifest.encode();
+            if (expectedVersion < 0) {
+                curator.create().creatingParentsIfNeeded().forPath(path, enc);
+            } else {
+                curator.setData().withVersion(expectedVersion).forPath(path, enc);
+            }
+            return true;
+        } catch (KeeperException.NodeExistsException | KeeperException.BadVersionException
+                 | KeeperException.NoNodeException e) {
+            return false;
+        }
+    }
+
+    private static String manifestPath(StrataNamespace namespace) {
+        return META_NAMESPACES + "/" + namespace + "/manifest";
+    }
+
+    @Override
+    public void putClusterLiveNodes(byte[] snapshot) throws Exception {
+        try {
+            curator.setData().forPath(META_LIVE_NODES, snapshot);
+        } catch (KeeperException.NoNodeException e) {
+            try {
+                curator.create().creatingParentsIfNeeded().forPath(META_LIVE_NODES, snapshot);
+            } catch (KeeperException.NodeExistsException created) {
+                curator.setData().forPath(META_LIVE_NODES, snapshot);
+            }
+        }
+    }
+
+    @Override
+    public Optional<byte[]> getClusterLiveNodes() throws Exception {
+        try {
+            return Optional.of(curator.getData().forPath(META_LIVE_NODES));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Global {@code fileId -> owning namespace} index, used ONLY for namespace sharding: a node that does
+     * not own a file (so does not hold it in its namespace-log) resolves the file's owner from here to
+     * forward file-scoped ops. Written by the owner on create, removed on delete. A per-file znode — fine
+     * at the current scale; for very large fleets this should become owner bits encoded in the FileId.
+     */
+    public void putFileNamespace(FileId fileId, StrataNamespace namespace) throws Exception {
+        byte[] data = namespace.value().getBytes(StandardCharsets.UTF_8);
+        String path = META_FIDX + "/" + fileId;
+        try {
+            curator.create().creatingParentsIfNeeded().forPath(path, data);
+        } catch (KeeperException.NodeExistsException e) {
+            curator.setData().forPath(path, data); // idempotent on a create retry
+        }
+    }
+
+    public Optional<StrataNamespace> getFileNamespace(FileId fileId) throws Exception {
+        try {
+            byte[] data = curator.getData().forPath(META_FIDX + "/" + fileId);
+            return Optional.of(StrataNamespace.of(new String(data, StandardCharsets.UTF_8)));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    public void deleteFileNamespace(FileId fileId) throws Exception {
+        try {
+            curator.delete().forPath(META_FIDX + "/" + fileId);
+        } catch (KeeperException.NoNodeException ignored) {
+            // already gone — idempotent
+        }
     }
 
     /** Read-only: ZooKeeper requests issued against a {@code /strata} subtree, by op kind. */

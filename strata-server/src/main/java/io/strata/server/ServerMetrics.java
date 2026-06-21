@@ -3,20 +3,23 @@ package io.strata.server;
 import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.MultiGauge;
+import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
-import io.strata.meta.MetadataService;
+import io.strata.meta.Controller;
 import io.strata.meta.ZkMetadataStore;
-import io.strata.node.StorageNode;
+import io.strata.node.DataNode;
 import io.strata.proto.RequestObserver;
 
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Registers Strata's domain metrics on the meter registry by wiring Micrometer gauges/counters to
- * the read-only accessors on {@link MetadataService} / {@link StorageNode}. All of these are either
+ * the read-only accessors on {@link Controller} / {@link DataNode}. All of these are either
  * periodic gauges over existing in-memory state (zero data-path cost) or monotonic function-counters
  * over plain atomic counters — no timers on the hot path. The {@code role} common tag is set by
  * {@code StrataMetrics}, so a single Prometheus job can scrape both process kinds.
@@ -26,78 +29,129 @@ final class ServerMetrics {
     }
 
     /** Control-plane: durability census, repair progress, cluster liveness, leadership, ZK. */
-    static void registerMeta(MeterRegistry reg, MetadataService s) {
-        Gauge.builder("strata_meta_is_leader", s, m -> m.isLeader() ? 1 : 0)
-                .description("1 if this instance is the active metadata leader (cluster sum should be 1)").register(reg);
-        Gauge.builder("strata_meta_zk_connected", s, m -> m.zkConnected() ? 1 : 0)
+    static void registerController(MeterRegistry reg, Controller s) {
+        Gauge.builder("strata_controller_is_leader", s, m -> m.isLeader() ? 1 : 0)
+                .description("1 if this instance is the active controller leader (cluster sum should be 1)").register(reg);
+        Gauge.builder("strata_controller_zk_connected", s, m -> m.zkConnected() ? 1 : 0)
                 .description("1 if ZooKeeper is reachable; 0 freezes the control plane").register(reg);
 
-        Gauge.builder("strata_chunks_unavailable", s, MetadataService::unavailableChunks)
+        Gauge.builder("strata_chunks_unavailable", s, Controller::unavailableChunks)
                 .description("SEALED chunks with zero live replicas — data-loss exposure (PAGE)").register(reg);
-        Gauge.builder("strata_chunks_under_replicated", s, MetadataService::underReplicatedChunks)
+        Gauge.builder("strata_chunks_under_replicated", s, Controller::underReplicatedChunks)
                 .description("SEALED chunks below their replication factor").register(reg);
-        Gauge.builder("strata_chunks_at_min_redundancy", s, MetadataService::chunksAtMinRedundancy)
+        Gauge.builder("strata_chunks_at_min_redundancy", s, Controller::chunksAtMinRedundancy)
                 .description("SEALED chunks down to a single live replica — one failure from loss").register(reg);
 
-        Gauge.builder("strata_repair_inflight", s, MetadataService::repairInflight)
+        Gauge.builder("strata_repair_inflight", s, Controller::repairInflight)
                 .description("outstanding repair/delete commands").register(reg);
-        Gauge.builder("strata_repair_backlog", s, MetadataService::repairBacklog)
+        Gauge.builder("strata_repair_backlog", s, Controller::repairBacklog)
                 .description("distinct chunks currently being repaired").register(reg);
 
-        Gauge.builder("strata_nodes", s, MetadataService::aliveNodes)
-                .tag("state", "alive").description("storage nodes by liveness state").register(reg);
-        Gauge.builder("strata_nodes", s, MetadataService::suspectNodes)
+        Gauge.builder("strata_data_nodes", s, Controller::aliveNodes)
+                .tag("state", "alive").description("data nodes by liveness state").register(reg);
+        Gauge.builder("strata_data_nodes", s, Controller::suspectNodes)
                 .tag("state", "suspect").register(reg);
-        Gauge.builder("strata_nodes", s, MetadataService::deadNodes)
+        Gauge.builder("strata_data_nodes", s, Controller::deadNodes)
                 .tag("state", "dead").register(reg);
 
-        // Per-subtree metadata-store request load: rate(strata_meta_store_ops_total) = requests/s and
-        // rate(strata_meta_store_bytes_total) = throughput, tagged by `backend` (e.g. zk), the /strata
+        // Per-subtree metadata-store request load: rate(strata_controller_store_ops_total) = requests/s and
+        // rate(strata_controller_store_bytes_total) = throughput, tagged by `backend` (e.g. zk), the /strata
         // child the op touched (files/namespaces/nodes/ids), and op=read|write. Backend-neutral name +
         // label so a future non-ZK metadata store surfaces on the same Cluster/Node dashboard panels.
         String backend = s.metadataBackend();
         for (String subtree : ZkMetadataStore.SUBTREES) {
             for (boolean write : new boolean[]{false, true}) {
                 String op = write ? "write" : "read";
-                FunctionCounter.builder("strata_meta_store_ops", s, m -> m.metaStoreOps(subtree, write))
+                FunctionCounter.builder("strata_controller_store_ops", s, m -> m.metadataStoreOps(subtree, write))
                         .tag("backend", backend).tag("subtree", subtree).tag("op", op)
                         .description("metadata-store requests issued, by backend, /strata subtree, and op").register(reg);
-                FunctionCounter.builder("strata_meta_store_bytes", s, m -> m.metaStoreBytes(subtree, write))
+                FunctionCounter.builder("strata_controller_store_bytes", s, m -> m.metadataStoreBytes(subtree, write))
                         .tag("backend", backend).tag("subtree", subtree).tag("op", op)
                         .description("metadata-store payload bytes read/written, by backend, /strata subtree, and op").register(reg);
             }
         }
+
+        // Namespace-log backend: user file/path metadata is stored as replicated Strata files, sharded
+        // one owner per namespace. These read 0 under the ZK backend, so the same panels work for both;
+        // the metadata log's OWN chunk durability is already counted in strata_chunks_* (the reserved
+        // strata-meta namespace is in the repair scan). The `backend` tag matches strata_controller_store_*.
+        Gauge.builder("strata_controller_namespace_log_active", s, m -> m.namespaceLogActive() ? 1 : 0)
+                .description("1 if the namespace-log backend is active (metadata stored as Strata files)").register(reg);
+        Gauge.builder("strata_controller_namespaces_loaded", s, Controller::loadedNamespaces)
+                .description("namespaces this instance owns a live metadata-log repository for (sharding load)").register(reg);
+        Gauge.builder("strata_controller_endpoints_configured", s, Controller::controllerEndpointsConfigured)
+                .description("configured controller-endpoint membership = controllers sharing the namespaces; max() = fleet count").register(reg);
+        Gauge.builder("strata_controller_sharding_active", s, m -> m.shardingActive() ? 1 : 0)
+                .description("1 if namespaces are sharded across multiple controllers; 0 = single global leader").register(reg);
+        FunctionCounter.builder("strata_controller_log_append_records", s, Controller::metadataLogAppendRecords)
+                .tag("backend", backend).description("metadata-log records appended (rate() = metadata ops/s)").register(reg);
+        FunctionCounter.builder("strata_controller_log_append_bytes", s, Controller::metadataLogAppendBytes)
+                .tag("backend", backend).description("metadata-log bytes appended (rate() = metadata write throughput)").register(reg);
+        FunctionCounter.builder("strata_controller_log_compactions", s, Controller::metadataLogCompactions)
+                .tag("backend", backend).description("metadata-log snapshot+roll compactions").register(reg);
+        FunctionCounter.builder("strata_controller_log_recoveries", s, Controller::metadataLogRecoveries)
+                .tag("backend", backend).description("namespace repositories (re)opened from a manifest (failover/restart churn)").register(reg);
+
+        registerPerNamespace(reg, s);
+    }
+
+    /**
+     * Per-namespace gauges (namespace-stacked dashboard panels): live files + open metadata-log bytes,
+     * labelled by {@code namespace}, for the namespaces THIS controller owns. Refreshed off a daemon
+     * timer because the namespace set changes at runtime (a {@link MultiGauge} must be re-registered, not
+     * supplier-bound). Cardinality grows with the namespace count — namespace stays control-plane, so
+     * these live only on the controller (data nodes never see namespaces).
+     */
+    private static void registerPerNamespace(MeterRegistry reg, Controller s) {
+        MultiGauge files = MultiGauge.builder("strata_controller_namespace_files")
+                .description("live files per namespace owned by this controller").register(reg);
+        MultiGauge logBytes = MultiGauge.builder("strata_controller_namespace_log_bytes")
+                .description("open metadata-log bytes per namespace owned by this controller").register(reg);
+        var refresh = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "controller-ns-metrics");
+            t.setDaemon(true);
+            return t;
+        });
+        refresh.scheduleAtFixedRate(() -> {
+            Map<String, long[]> stats = s.namespaceStats();
+            files.register(stats.entrySet().stream()
+                    .map(e -> MultiGauge.Row.of(Tags.of("namespace", e.getKey()), e.getValue()[0]))
+                    .collect(java.util.stream.Collectors.toList()), true);
+            logBytes.register(stats.entrySet().stream()
+                    .map(e -> MultiGauge.Row.of(Tags.of("namespace", e.getKey()), e.getValue()[1]))
+                    .collect(java.util.stream.Collectors.toList()), true);
+        }, 0, 10, TimeUnit.SECONDS);
     }
 
     /** Data plane: capacity, chunk state, write throughput, fsync force rate, registration. */
-    static void registerNode(MeterRegistry reg, StorageNode n) {
-        Gauge.builder("strata_node_registered", n, x -> x.registered() ? 1 : 0)
+    static void registerDataNode(MeterRegistry reg, DataNode n) {
+        Gauge.builder("strata_data_node_registered", n, x -> x.registered() ? 1 : 0)
                 .description("1 if the node holds a metadata registration").register(reg);
 
-        Gauge.builder("strata_node_disk_used_bytes", n, StorageNode::diskUsedBytes)
+        Gauge.builder("strata_data_node_disk_used_bytes", n, DataNode::diskUsedBytes)
                 .description("bytes occupied by chunk data").register(reg);
-        Gauge.builder("strata_node_capacity_bytes", n, StorageNode::capacityBytes)
+        Gauge.builder("strata_data_node_capacity_bytes", n, DataNode::capacityBytes)
                 .description("configured node capacity").register(reg);
-        Gauge.builder("strata_node_capacity_used_ratio", n,
+        Gauge.builder("strata_data_node_capacity_used_ratio", n,
                         x -> x.capacityBytes() > 0 ? (double) x.diskUsedBytes() / x.capacityBytes() : 0.0)
                 .description("disk used / capacity").register(reg);
 
-        Gauge.builder("strata_node_chunks", n, StorageNode::openChunks)
+        Gauge.builder("strata_data_node_chunks", n, DataNode::openChunks)
                 .tag("state", "open").description("local chunks by state").register(reg);
-        Gauge.builder("strata_node_chunks", n, StorageNode::sealedChunks)
+        Gauge.builder("strata_data_node_chunks", n, DataNode::sealedChunks)
                 .tag("state", "sealed").register(reg);
 
-        FunctionCounter.builder("strata_node_groupcommit_force", n, StorageNode::fsyncForceCount)
+        FunctionCounter.builder("strata_data_node_groupcommit_force", n, DataNode::fsyncForceCount)
                 .description("group-commit force()/fsync calls").register(reg);
-        FunctionCounter.builder("strata_node_append_ops", n, StorageNode::appendOps)
+        FunctionCounter.builder("strata_data_node_append_ops", n, DataNode::appendOps)
                 .description("appended records (rate() = write ops/sec)").register(reg);
-        FunctionCounter.builder("strata_node_append_bytes", n, StorageNode::appendBytes)
+        FunctionCounter.builder("strata_data_node_append_bytes", n, DataNode::appendBytes)
                 .description("appended payload bytes (rate() = write throughput)").register(reg);
-        FunctionCounter.builder("strata_node_read_ops", n, StorageNode::readOps)
+        FunctionCounter.builder("strata_data_node_read_ops", n, DataNode::readOps)
                 .description("client READ operations served (rate() = read ops/sec)").register(reg);
-        FunctionCounter.builder("strata_node_read_bytes", n, StorageNode::readBytes)
+        FunctionCounter.builder("strata_data_node_read_bytes", n, DataNode::readBytes)
                 .description("client READ payload bytes served (rate() = read throughput)").register(reg);
-        FunctionCounter.builder("strata_node_background_flush", n, StorageNode::backgroundFlushes)
+        FunctionCounter.builder("strata_data_node_background_flush", n, DataNode::backgroundFlushes)
                 .description("background-writeback fsyncs of open chunks").register(reg);
     }
 

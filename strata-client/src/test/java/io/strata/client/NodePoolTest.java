@@ -27,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class NodePoolTest {
 
     @Test
-    void rejectsMalformedStorageEndpointsAsScpErrors() {
+    void rejectsMalformedDataNodeEndpointsAsScpErrors() {
         try (NodePool pool = new NodePool()) {
             for (String endpoint : List.of("missing-port", "localhost:", ":1234",
                     " localhost:1234", "localhost :1234", "localhost:not-a-port",
@@ -39,7 +39,7 @@ class NodePoolTest {
     }
 
     @Test
-    void rejectsNullStorageEndpointAsScpError() {
+    void rejectsNullDataNodeEndpointAsScpError() {
         try (NodePool pool = new NodePool()) {
             ScpException e = assertThrows(ScpException.class, () -> pool.get(null));
             assertEquals(ErrorCode.INTERNAL, e.code());
@@ -48,12 +48,12 @@ class NodePoolTest {
 
     @Test
     void endpointParserHandlesBracketedIpv6AndNullGuard() {
-        Endpoint parsed = Endpoint.parse("[::1]:1234", "storage endpoint", ErrorCode.INTERNAL);
+        Endpoint parsed = Endpoint.parse("[::1]:1234", "data-node endpoint", ErrorCode.INTERNAL);
         assertEquals("::1", parsed.host());
         assertEquals(1234, parsed.port());
 
         ScpException e = assertThrows(ScpException.class,
-                () -> Endpoint.parse(null, "storage endpoint", ErrorCode.INTERNAL));
+                () -> Endpoint.parse(null, "data-node endpoint", ErrorCode.INTERNAL));
         assertEquals(ErrorCode.INTERNAL, e.code());
     }
 
@@ -70,7 +70,7 @@ class NodePoolTest {
     @Test
     void configuredPoolRoundRobinsWithinEndpoint() {
         ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500)
-                .withStorageConnectionsPerEndpoint(3);
+                .withDataNodeConnectionsPerEndpoint(3);
         try (NodePool pool = new NodePool(config)) {
             ManagedScpConnection first = pool.get("127.0.0.1:1234");
             ManagedScpConnection second = pool.get("127.0.0.1:1234");
@@ -87,7 +87,7 @@ class NodePoolTest {
     @Test
     void closeShutsDownEveryPooledConnection() {
         ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500)
-                .withStorageConnectionsPerEndpoint(2);
+                .withDataNodeConnectionsPerEndpoint(2);
         ManagedScpConnection first;
         ManagedScpConnection second;
         NodePool pool = new NodePool(config);
@@ -105,7 +105,7 @@ class NodePoolTest {
     @Test
     void closeStopsEveryPooledConnectionMonitorThread() throws Exception {
         ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500)
-                .withStorageConnectionsPerEndpoint(3);
+                .withDataNodeConnectionsPerEndpoint(3);
         String endpoint = "127.0.0.1:1234";
         ManagedScpConnection[] connections;
         NodePool pool = new NodePool(config);
@@ -146,7 +146,7 @@ class NodePoolTest {
     }
 
     @Test
-    void replacesClosedStorageConnectionOnNextUse() throws Exception {
+    void replacesClosedDataNodeConnectionOnNextUse() throws Exception {
         AtomicInteger pings = new AtomicInteger();
         try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
                 if (Opcode.fromCode(req.opcode()) == Opcode.PING) {

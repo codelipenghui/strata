@@ -35,7 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Single-node data-plane test over the real wire (standalone mode, no metadata plane). */
-class StorageNodeWireTest {
+class DataNodeWireTest {
 
     @TempDir
     Path dir;
@@ -46,11 +46,11 @@ class StorageNodeWireTest {
     void failedServerBindLeavesDataDirReusable() throws Exception {
         Path nodeDir = dir.resolve("node");
         try (ServerSocket blocker = new ServerSocket(0)) {
-            NodeConfig config = NodeConfig.standalone(nodeDir).withListenPort(blocker.getLocalPort());
-            assertThrows(IOException.class, () -> new StorageNode(config));
+            DataNodeConfig config = DataNodeConfig.standalone(nodeDir).withListenPort(blocker.getLocalPort());
+            assertThrows(IOException.class, () -> new DataNode(config));
         }
 
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(nodeDir));
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(nodeDir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
             Frame ping = client.callFrame(Opcode.PING, Messages.okHeader(),
                     ByteBuffer.wrap("ok".getBytes()), 5000);
@@ -63,7 +63,7 @@ class StorageNodeWireTest {
     void corruptIdentityFailsAsIOException() throws Exception {
         Files.writeString(dir.resolve("identity.properties"), "nodeId=1\nincarnation=not-a-uuid\n");
 
-        IOException e = assertThrows(IOException.class, () -> new StorageNode(NodeConfig.standalone(dir)));
+        IOException e = assertThrows(IOException.class, () -> new DataNode(DataNodeConfig.standalone(dir)));
         assertTrue(e.getMessage().contains("identity"));
     }
 
@@ -71,7 +71,7 @@ class StorageNodeWireTest {
     void identityFileMustContainBothNodeIdAndIncarnation() throws Exception {
         Files.writeString(dir.resolve("identity.properties"), "nodeId=1\n");
 
-        IOException e = assertThrows(IOException.class, () -> new StorageNode(NodeConfig.standalone(dir)));
+        IOException e = assertThrows(IOException.class, () -> new DataNode(DataNodeConfig.standalone(dir)));
         assertTrue(e.getMessage().contains("missing nodeId or incarnation"));
     }
 
@@ -80,15 +80,15 @@ class StorageNodeWireTest {
         Files.writeString(dir.resolve("identity.properties"),
                 "nodeId=-2\nincarnation=" + UUID.randomUUID() + "\n");
 
-        IOException e = assertThrows(IOException.class, () -> new StorageNode(NodeConfig.standalone(dir)));
-        assertTrue(e.getMessage().contains("invalid storage node identity"));
+        IOException e = assertThrows(IOException.class, () -> new DataNode(DataNodeConfig.standalone(dir)));
+        assertTrue(e.getMessage().contains("invalid data node identity"));
     }
 
     @Test
     void nodeIdentityAndAdvertisedEndpointAreVolumeBound() throws Exception {
-        NodeConfig config = NodeConfig.standalone(dir).withAdvertisedEndpoint("published-node:19000");
+        DataNodeConfig config = DataNodeConfig.standalone(dir).withAdvertisedEndpoint("published-node:19000");
         UUID incarnation;
-        try (StorageNode node = new StorageNode(config)) {
+        try (DataNode node = new DataNode(config)) {
             assertEquals("published-node:19000", node.endpoint());
             assertEquals(-1, node.nodeId());
             assertFalse(node.isDraining());
@@ -101,7 +101,7 @@ class StorageNodeWireTest {
             incarnation = node.incarnation();
         }
 
-        try (StorageNode reopened = new StorageNode(NodeConfig.standalone(dir))) {
+        try (DataNode reopened = new DataNode(DataNodeConfig.standalone(dir))) {
             assertEquals(42, reopened.nodeId());
             assertEquals(incarnation, reopened.incarnation());
         }
@@ -109,7 +109,7 @@ class StorageNodeWireTest {
 
     @Test
     void nodeIdAssignmentDoesNotPublishBeforeIdentityPersistenceSucceeds() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             Files.createDirectory(dir.resolve("identity.properties.tmp"));
 
             IOException e = assertThrows(IOException.class, () -> node.nodeIdAssigned(42));
@@ -121,7 +121,7 @@ class StorageNodeWireTest {
 
     @Test
     void fullChunkLifecycleOverTheWire() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
 
             // open
@@ -198,7 +198,7 @@ class StorageNodeWireTest {
 
     @Test
     void openReadIsClampedToReplicaDurableHighWatermark() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
                     1 << 20, 1718000000000L).encode(), null, 5000);
@@ -234,7 +234,7 @@ class StorageNodeWireTest {
         // Seal recovery must re-read the never-acked tail above the durable high watermark to decide
         // whether a quorum still holds it (tech design §7.3). The client READ path clamps that tail
         // away; READ_RECOVERY must expose it (up to localEnd) so recovery does not seal short.
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_TOOL, "recovery")) {
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
                     1 << 20, 1718000000000L).encode(), null, 5000);
@@ -272,7 +272,7 @@ class StorageNodeWireTest {
         // corrupt sealed data region is served as-is. Integrity is caught by the verified read() /
         // fetch() / import paths and background scrub, not at read time.
         byte[] payload = "sealed-payload".getBytes();
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
                     1 << 20, 1718000000000L).encode(), null, 5000);
@@ -300,10 +300,10 @@ class StorageNodeWireTest {
     }
 
     @Test
-    void pingDrainingAndUnsupportedStorageOpcodesAreHandled() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+    void pingDrainingAndUnsupportedDataNodeOpcodesAreHandled() throws Exception {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
-            byte[] payload = "storage-ping".getBytes();
+            byte[] payload = "data-node-ping".getBytes();
             Frame ping = client.callFrame(Opcode.PING, Messages.okHeader(), ByteBuffer.wrap(payload), 5000);
             Resp.check(ping.headerSlice());
             byte[] echoed = new byte[ping.payloadLength()];
@@ -320,7 +320,7 @@ class StorageNodeWireTest {
                     () -> client.call(Opcode.CREATE_FILE, new byte[0], null, 5000));
             assertEquals(ErrorCode.UNKNOWN_OPCODE, metadataOpcode.code());
 
-            NodeHandlers handlers = new NodeHandlers(node.store(), node);
+            DataNodeHandlers handlers = new DataNodeHandlers(node.store(), node);
             ScpException numeric = assertThrows(ScpException.class, () -> handlers.handle(
                     new Frame((short) 0x7FFF, (short) 1, (short) 0, 99,
                             ByteBuffer.allocate(0), ByteBuffer.allocate(0))));
@@ -331,7 +331,7 @@ class StorageNodeWireTest {
     @Test
     void sealChunkPassesPayloadFooterToStore() throws Exception {
         ChunkId chunk = new ChunkId(FileId.random(), 0);
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk, 1, false,
                     1 << 20, 1L).encode(), null, 5000);
@@ -345,7 +345,7 @@ class StorageNodeWireTest {
     @Test
     void nodeRestartRecoversChunksOverTheWire() throws Exception {
         UUID incarnation;
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "t")) {
             incarnation = node.incarnation();
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
@@ -353,7 +353,7 @@ class StorageNodeWireTest {
             client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0).encode(),
                     ByteBuffer.wrap("persistent".getBytes()), 5000);
         }
-        try (StorageNode node2 = new StorageNode(NodeConfig.standalone(dir));
+        try (DataNode node2 = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node2.port(), ScpClient.KIND_BROKER, "t")) {
             ByteBuffer sth = client.call(Opcode.STAT_CHUNK, new Messages.StatChunk(id).encode(), null, 5000);
             var stat = Messages.StatResp.decode(sth);
@@ -376,7 +376,7 @@ class StorageNodeWireTest {
                     ByteBuffer.wrap(new byte[] {1}));
         });
              ScpClient src = new ScpClient("127.0.0.1", source.port(),
-                     ScpClient.KIND_STORAGE_NODE, "repair-test")) {
+                     ScpClient.KIND_DATA_NODE, "repair-test")) {
             ControlLoop loop = new ControlLoop(null, null, null);
             var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4);
             Path output = dir.resolve("oversized-repair-fetch.chunk");
@@ -395,7 +395,7 @@ class StorageNodeWireTest {
                 new Messages.FetchResp(fileBytes.length, ChunkState.SEALED).encode(),
                 ByteBuffer.wrap(fileBytes)));
              ScpClient src = new ScpClient("127.0.0.1", source.port(),
-                     ScpClient.KIND_STORAGE_NODE, "repair-test")) {
+                     ScpClient.KIND_DATA_NODE, "repair-test")) {
             ControlLoop loop = new ControlLoop(null, null, null);
             var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4);
             Path output = dir.resolve("valid-repair-fetch.chunk");
@@ -415,7 +415,7 @@ class StorageNodeWireTest {
                 new Messages.FetchResp(4096 + 4 + 64, ChunkState.OPEN).encode(),
                 ByteBuffer.wrap(new byte[] {1})));
              ScpClient src = new ScpClient("127.0.0.1", openSource.port(),
-                     ScpClient.KIND_STORAGE_NODE, "repair-test")) {
+                     ScpClient.KIND_DATA_NODE, "repair-test")) {
             assertEquals(ErrorCode.INTERNAL,
                     assertThrows(ScpException.class,
                             () -> loop.fetchWholeFile(src, cmd, dir.resolve("open-source-fetch.chunk"))).code());
@@ -424,7 +424,7 @@ class StorageNodeWireTest {
         try (ScpServer malformedHeader = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
                 new byte[] {0}, ByteBuffer.wrap(new byte[] {1})));
              ScpClient src = new ScpClient("127.0.0.1", malformedHeader.port(),
-                     ScpClient.KIND_STORAGE_NODE, "repair-test")) {
+                     ScpClient.KIND_DATA_NODE, "repair-test")) {
             assertEquals(ErrorCode.CORRUPT_CHUNK,
                     assertThrows(ScpException.class,
                             () -> loop.fetchWholeFile(src, cmd, dir.resolve("malformed-source-fetch.chunk"))).code());
@@ -438,7 +438,7 @@ class StorageNodeWireTest {
                     ByteBuffer.wrap(new byte[] {1}));
         });
              ScpClient src = new ScpClient("127.0.0.1", changingLength.port(),
-                     ScpClient.KIND_STORAGE_NODE, "repair-test")) {
+                     ScpClient.KIND_DATA_NODE, "repair-test")) {
             assertEquals(ErrorCode.CORRUPT_CHUNK,
                     assertThrows(ScpException.class,
                             () -> loop.fetchWholeFile(src, cmd, dir.resolve("changing-source-fetch.chunk"))).code());
@@ -448,7 +448,7 @@ class StorageNodeWireTest {
                 new Messages.FetchResp(4096 + 64, ChunkState.SEALED).encode(),
                 ByteBuffer.wrap(new byte[4096 + 65])));
              ScpClient src = new ScpClient("127.0.0.1", pastEof.port(),
-                     ScpClient.KIND_STORAGE_NODE, "repair-test")) {
+                     ScpClient.KIND_DATA_NODE, "repair-test")) {
             assertEquals(ErrorCode.CORRUPT_CHUNK,
                     assertThrows(ScpException.class,
                             () -> loop.fetchWholeFile(src, cmd, dir.resolve("past-eof-fetch.chunk"))).code());
@@ -459,7 +459,7 @@ class StorageNodeWireTest {
                 new Messages.FetchResp(4096L + overFetchLimit.length + 64, ChunkState.SEALED).encode(),
                 ByteBuffer.wrap(overFetchLimit)));
              ScpClient src = new ScpClient("127.0.0.1", ignoresRequestLimit.port(),
-                     ScpClient.KIND_STORAGE_NODE, "repair-test")) {
+                     ScpClient.KIND_DATA_NODE, "repair-test")) {
             assertEquals(ErrorCode.CORRUPT_CHUNK,
                     assertThrows(ScpException.class,
                             () -> loop.fetchWholeFile(src, cmd, dir.resolve("over-limit-fetch.chunk"))).code());
@@ -469,7 +469,7 @@ class StorageNodeWireTest {
                 new Messages.FetchResp(4096 + 4 + 64, ChunkState.SEALED).encode(),
                 ByteBuffer.wrap(new byte[0])));
              ScpClient src = new ScpClient("127.0.0.1", shortFetch.port(),
-                     ScpClient.KIND_STORAGE_NODE, "repair-test")) {
+                     ScpClient.KIND_DATA_NODE, "repair-test")) {
             assertEquals(ErrorCode.INTERNAL,
                     assertThrows(ScpException.class,
                             () -> loop.fetchWholeFile(src, cmd, dir.resolve("short-fetch.chunk"))).code());

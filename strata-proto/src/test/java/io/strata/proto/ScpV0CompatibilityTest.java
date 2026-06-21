@@ -254,7 +254,7 @@ class ScpV0CompatibilityTest {
                                 new Messages.LedgerEntry(100, 1, 5),
                                 new Messages.LedgerEntry(200, 2, 5))),
                         b -> decodeResp(b, Messages.ReadLedgerResp::decode)),
-                exchange("registerNode", Opcode.REGISTER_NODE,
+                exchange("registerDataNode", Opcode.REGISTER_NODE,
                         "00000000000000010000000000000002020768313a393030300768323a39303030027a3102723105686f73743101000001000000000000000001000000000000000000",
                         null,
                         new Messages.RegisterNode(1, 2, List.of("h1:9000", "h2:9000"),

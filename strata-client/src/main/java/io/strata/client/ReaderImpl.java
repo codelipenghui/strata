@@ -23,7 +23,7 @@ import static io.strata.common.Checks.addChunkLength;
  * replica-known durable offset, so a reader never sees un-quorum-acked bytes (invariant §14.3).
  */
 final class ReaderImpl implements StrataFile.Reader {
-    private final MetaClient meta;
+    private final ControllerClient controller;
     private final NodePool pool;
     private final ClientConfig config;
     private final io.strata.common.FileId fileId;
@@ -31,8 +31,8 @@ final class ReaderImpl implements StrataFile.Reader {
 
     private volatile Messages.LookupFileResp file;
 
-    ReaderImpl(MetaClient meta, NodePool pool, ClientConfig config, io.strata.common.FileId fileId) {
-        this.meta = meta;
+    ReaderImpl(ControllerClient controller, NodePool pool, ClientConfig config, io.strata.common.FileId fileId) {
+        this.controller = controller;
         this.pool = pool;
         this.config = config;
         this.fileId = fileId;
@@ -41,7 +41,7 @@ final class ReaderImpl implements StrataFile.Reader {
 
     @Override
     public void refresh() {
-        this.file = meta.lookupFile(fileId);
+        this.file = controller.lookupFile(fileId);
     }
 
     @Override

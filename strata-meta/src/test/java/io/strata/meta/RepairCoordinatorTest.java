@@ -1,10 +1,15 @@
 package io.strata.meta;
 
+import io.strata.common.ErrorCode;
 import io.strata.common.FileState;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
+import io.strata.common.ScpException;
 import io.strata.proto.Messages;
+import io.strata.proto.Opcode;
+import io.strata.proto.ScpClient;
+import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Constructor;
@@ -15,7 +20,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -316,7 +323,7 @@ class RepairCoordinatorTest {
     @Test
     void expiredReplicateCommandIsRetried() throws Exception {
         FakeStore store = new FakeStore();
-        MetaConfig config = config(-1);
+        ControllerConfig config = config(-1);
         NodeRegistry registry = new NodeRegistry(store, config);
         Registered source = register(registry, 120, "source");
         Registered target = register(registry, 130, "target");
@@ -410,7 +417,7 @@ class RepairCoordinatorTest {
     @Test
     void expiredDeleteCommandIsRetriedByNextScan() throws Exception {
         FakeStore store = new FakeStore();
-        MetaConfig config = config(-1);
+        ControllerConfig config = config(-1);
         NodeRegistry registry = new NodeRegistry(store, config);
         Registered node = register(registry, 1411, "delete-target");
         FileId fileId = fileId(821);
@@ -539,7 +546,7 @@ class RepairCoordinatorTest {
     @Test
     void inventoryGracesStaleOpenReportForJustSealedReplica() throws Exception {
         FakeStore store = new FakeStore();
-        MetaConfig graceConfig = config().withReplicaMissingGraceMs(60_000);
+        ControllerConfig graceConfig = config().withReplicaMissingGraceMs(60_000);
         NodeRegistry registry = new NodeRegistry(store, graceConfig);
         Registered node = register(registry, 151, "node");
         FileId fileId = fileId(12);
@@ -640,7 +647,7 @@ class RepairCoordinatorTest {
     @Test
     void scanLoopContinuesAfterStoreFailure() throws Exception {
         FakeStore store = new FakeStore();
-        MetaConfig fast = new MetaConfig("unused", 0, 1, 10_000, 0, 1, 1);
+        ControllerConfig fast = new ControllerConfig("unused", 0, 1, 10_000, 0, 1, 1);
         NodeRegistry registry = new NodeRegistry(store, fast);
         Registered source = register(registry, 149, "source");
         Registered target = register(registry, 159, "target");
@@ -672,13 +679,97 @@ class RepairCoordinatorTest {
         }
     }
 
-    private static MetaConfig config() {
+    @Test
+    void shardedControllerDoesNotOrphanDeleteAChunkItDoesNotOwn() throws Exception {
+        // A sealed chunk reported by a node whose file this node cannot see. Under sharding the file may
+        // belong to a namespace owned by another controller node, so it must NOT be deleted as an orphan.
+        FileId foreignFile = fileId(7777);
+        ChunkId foreignChunk = new ChunkId(foreignFile, 0);
+        Messages.InventoryEntry entry =
+                new Messages.InventoryEntry(foreignChunk, ChunkState.SEALED, 4096, 0xAB);
+
+        // sharded (ownsAll = false): the unknown chunk is left alone (no delete command).
+        FakeStore shardedStore = new FakeStore();
+        NodeRegistry shardedRegistry = new NodeRegistry(shardedStore, config());
+        Registered shardedTarget = register(shardedRegistry, 900, "target");
+        RepairCoordinator sharded = new RepairCoordinator(shardedStore, shardedRegistry, config(),
+                () -> true, () -> false);
+        sharded.onInventory(inventory(shardedTarget, List.of(entry)));
+        assertTrue(heartbeat(shardedRegistry, sharded, shardedTarget, List.of()).commands().isEmpty(),
+                "a sharded controller must not orphan-delete another owner's chunk");
+
+        // non-sharded (ownsAll = true): the same unknown chunk is a genuine orphan and is deleted.
+        FakeStore ownsAllStore = new FakeStore();
+        NodeRegistry ownsAllRegistry = new NodeRegistry(ownsAllStore, config());
+        Registered ownsAllTarget = register(ownsAllRegistry, 901, "target");
+        RepairCoordinator ownsAll = new RepairCoordinator(ownsAllStore, ownsAllRegistry, config(), () -> true);
+        ownsAll.onInventory(inventory(ownsAllTarget, List.of(entry)));
+        assertInstanceOf(Messages.DeleteCmd.class,
+                onlyCommand(heartbeat(ownsAllRegistry, ownsAll, ownsAllTarget, List.of())),
+                "a non-sharded controller deletes a genuine orphan");
+    }
+
+    @Test
+    void nonControllerOwnerHealsUnderReplicatedChunkViaExecReplicate() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        List<Messages.ReplicateCmd> received = new CopyOnWriteArrayList<>();
+        UUID inc = UUID.randomUUID();
+        try (ScpServer targetServer = new ScpServer(0, 999, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.EXEC_REPLICATE.code) {
+                        received.add((Messages.ReplicateCmd) Messages.Command.read(req.headerSlice()));
+                        return ScpServer.ok(req, Messages.okHeader(), null);
+                    }
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
+                })) {
+            Registered dead = register(registry, 500, "dead-host");
+            Registered live1 = register(registry, 510, "live1-host");
+            Registered live2 = register(registry, 520, "live2-host");
+            Registered target = registerAt(registry, 530, "target-host", "127.0.0.1:" + targetServer.port());
+
+            // the controller's authoritative view: the dead node is DEAD in the root store
+            Optional<MetadataStore.Versioned<Records.NodeRecord>> deadRecord = store.getNode(dead.nodeId());
+            store.putNode(deadRecord.orElseThrow().value().withState(Records.NodeState.DEAD),
+                    deadRecord.get().version());
+
+            // an under-replicated sealed chunk (RF 3, one dead replica) in an owned namespace
+            FileId fileId = fileId(42);
+            Records.ChunkRecord chunk = sealed(0, 4096, 0xCAFE,
+                    List.of(dead.nodeId(), live1.nodeId(), live2.nodeId()));
+            store.createFile(file(fileId, FileState.SEALED, List.of(chunk)));
+
+            // a sharded non-controller owner of the namespace heals the chunk directly
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                    () -> false, () -> false, ns -> true);
+            owner.ownerRepairPass();
+
+            assertEquals(1, received.size(), "owner sent exactly one EXEC_REPLICATE");
+            assertEquals(new ChunkId(fileId, 0), received.get(0).chunkId());
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertTrue(replicas.contains(target.nodeId()), "the repair target became a replica");
+            assertFalse(replicas.contains(dead.nodeId()), "the dead replica was swapped out");
+            assertEquals(3, replicas.size(), "chunk restored to its replication factor");
+        }
+    }
+
+    private static Registered registerAt(NodeRegistry registry, long incMsb, String host, String endpoint)
+            throws Exception {
+        long incLsb = incMsb + 1;
+        Messages.RegisterResp resp = registry.register(new Messages.RegisterNode(
+                incMsb, incLsb, List.of(endpoint), "zone", "rack", host,
+                List.of(new Messages.StorageCapacity(1_000_000)), 1, 0));
+        return new Registered(resp.nodeId(), incMsb, incLsb, resp.sessionEpoch());
+    }
+
+    private static ControllerConfig config() {
         return config(1);
     }
 
-    private static MetaConfig config(int repairCommandTimeoutMs) {
+    private static ControllerConfig config(int repairCommandTimeoutMs) {
         // grace 0: these tests assert prompt missing-replica drops
-        return new MetaConfig("unused", 0, 1, 60_000, 0, 1,
+        return new ControllerConfig("unused", 0, 1, 60_000, 0, 1,
                 repairCommandTimeoutMs).withReplicaMissingGraceMs(0);
     }
 

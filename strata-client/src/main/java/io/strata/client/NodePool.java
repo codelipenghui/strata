@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Lazily-created SCP connection pools for storage-node endpoints. {@link #get} hands out a
+ * Lazily-created SCP connection pools for data-node endpoints. {@link #get} hands out a
  * round-robin connection within an endpoint; callers that need per-replica ordering (appenders and
  * readers) cache the returned connection for the lifetime of an open chunk.
  */
@@ -26,7 +26,7 @@ final class NodePool implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     NodePool(ClientConfig config) {
-        this(config, "strata-client-storage");
+        this(config, "strata-client-data-node");
     }
 
     NodePool(ClientConfig config, String clientIdPrefix) {
@@ -44,9 +44,9 @@ final class NodePool implements AutoCloseable {
 
     private EndpointPool endpointPool(String endpoint) {
         if (endpoint == null) {
-            throw new ScpException(ErrorCode.INTERNAL, "invalid storage endpoint: null");
+            throw new ScpException(ErrorCode.INTERNAL, "invalid data-node endpoint: null");
         }
-        Endpoint.parse(endpoint, "storage endpoint", ErrorCode.INTERNAL);
+        Endpoint.parse(endpoint, "data-node endpoint", ErrorCode.INTERNAL);
         if (closed.get()) {
             throw new ScpException(ErrorCode.INTERNAL, "node pool is closed");
         }
@@ -81,11 +81,11 @@ final class NodePool implements AutoCloseable {
         private final AtomicInteger next = new AtomicInteger();
 
         EndpointPool(String endpoint) {
-            connections = new ManagedScpConnection[config.storageConnectionsPerEndpoint()];
+            connections = new ManagedScpConnection[config.dataNodeConnectionsPerEndpoint()];
             for (int i = 0; i < connections.length; i++) {
                 connections[i] = new ManagedScpConnection(
                         List.of(endpoint), config.connectionPolicy(), ScpClient.KIND_BROKER,
-                        clientIdPrefix + "-" + i, "storage endpoint", false, true);
+                        clientIdPrefix + "-" + i, "data-node endpoint", false, true);
             }
         }
 

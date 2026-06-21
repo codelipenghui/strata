@@ -233,7 +233,7 @@ class StrataClientBehaviorTest {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
-        try (ScpServer storage = new ScpServer(0, 1, 0, 0, req -> {
+        try (ScpServer dataNode = new ScpServer(0, 1, 0, 0, req -> {
             var read = Messages.Read.decode(req.headerSlice());
             if (read.offset() == 0 && read.maxBytes() == 3) {
                 return ScpServer.ok(req, new Messages.ReadResp(3, 3).encode(),
@@ -246,7 +246,7 @@ class StrataClientBehaviorTest {
              StrataClient client = StrataClient.connect(ClientConfig.of(endpoint(meta)))) {
             lookup.set(new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1,
                     List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
-                            new Messages.Replica(1, endpoint(storage))))));
+                            new Messages.Replica(1, endpoint(dataNode))))));
             try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
                 try (StrataFile.ReadResult result = reader.read(0, 10)) {
                     assertArrayEquals(new byte[] {1, 2, 3}, drain(result.buffer()));
@@ -256,7 +256,7 @@ class StrataClientBehaviorTest {
 
             lookup.set(new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 0,
                     List.of(chunk(chunkId, ChunkState.OPEN, 0, 0, 1,
-                            new Messages.Replica(1, endpoint(storage))))));
+                            new Messages.Replica(1, endpoint(dataNode))))));
             try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
                 try (StrataFile.ReadResult result = reader.read(0, 4)) {
                     assertArrayEquals(new byte[] {4, 5}, drain(result.buffer()));
@@ -292,12 +292,12 @@ class StrataClientBehaviorTest {
     }
 
     @Test
-    void readerRejectsNegativeArgumentsBeforeCallingStorage() throws Exception {
+    void readerRejectsNegativeArgumentsBeforeCallingDataNode() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
         AtomicInteger reads = new AtomicInteger();
-        try (ScpServer storage = new ScpServer(0, 1, 0, 0, req -> {
+        try (ScpServer dataNode = new ScpServer(0, 1, 0, 0, req -> {
             reads.incrementAndGet();
             return ScpServer.ok(req, new Messages.ReadResp(3, 3).encode(), ByteBuffer.allocate(0));
         });
@@ -305,7 +305,7 @@ class StrataClientBehaviorTest {
              StrataClient client = StrataClient.connect(ClientConfig.of(endpoint(meta)))) {
             lookup.set(new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1,
                     List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
-                            new Messages.Replica(1, endpoint(storage))))));
+                            new Messages.Replica(1, endpoint(dataNode))))));
             try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
                 assertEquals(ErrorCode.INTERNAL,
                         assertThrows(ScpException.class, () -> reader.read(-1, 10)).code());

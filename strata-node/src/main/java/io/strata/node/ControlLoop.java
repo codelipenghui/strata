@@ -30,9 +30,9 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Storage-node control plane (tech design §10.4): register, heartbeat (commands ride the
+ * Data-node control plane (tech design §10.4): register, heartbeat (commands ride the
  * responses), inventory reports, and the REPLICATE executor (pull via FETCH_CHUNK).
- * Storage nodes never read cluster metadata — everything here is self-reporting and obedience.
+ * Data nodes never read cluster metadata — everything here is self-reporting and obedience.
  */
 final class ControlLoop implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ControlLoop.class);
@@ -40,14 +40,14 @@ final class ControlLoop implements AutoCloseable {
     private static final int FETCH_CHUNK_BYTES = 4 * 1024 * 1024;
     private static final long MAX_REPAIR_FOOTER_BYTES = 64L * 1024 * 1024;
 
-    private final StorageNode node;
-    private final NodeConfig config;
+    private final DataNode node;
+    private final DataNodeConfig config;
     private final ChunkStore store;
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final LinkedBlockingQueue<Messages.Command> commandQueue = new LinkedBlockingQueue<>();
     private final ConcurrentLinkedQueue<Messages.CompletedCommand> completed = new ConcurrentLinkedQueue<>();
 
-    private volatile ManagedScpConnection meta;
+    private volatile ManagedScpConnection controller;
     private volatile long sessionEpoch = -1;
     private volatile int heartbeatIntervalMs = 1_000;
     // confined to the control (run) thread today; volatile guards the lock-discipline asymmetry —
@@ -55,7 +55,7 @@ final class ControlLoop implements AutoCloseable {
     private volatile int endpointIndex = 0;
     private final Backoff backoff;
 
-    ControlLoop(StorageNode node, NodeConfig config, ChunkStore store) {
+    ControlLoop(DataNode node, DataNodeConfig config, ChunkStore store) {
         this.node = node;
         this.config = config;
         this.store = store;
@@ -81,7 +81,7 @@ final class ControlLoop implements AutoCloseable {
             try {
                 ensureRegistered();
                 if (closed.get()) {
-                    continue; // raced with close(): skip heartbeat (meta may be absent) and exit
+                    continue; // raced with close(): skip heartbeat (controller may be absent) and exit
                 }
                 heartbeatOnce();
                 backoff.reset();
@@ -127,13 +127,13 @@ final class ControlLoop implements AutoCloseable {
             // shutting down: do not create a fresh connection that close() might race past
             return;
         }
-        if (meta == null) {
+        if (controller == null) {
             disconnect();
-            String ep = config.metadataEndpoints().get(endpointIndex % config.metadataEndpoints().size());
+            String ep = config.controllerEndpoints().get(endpointIndex % config.controllerEndpoints().size());
             Endpoint.parse(ep, "endpoint", ErrorCode.INTERNAL);
-            meta = new ManagedScpConnection(List.of(ep), config.connectionPolicy(),
-                    ScpClient.KIND_STORAGE_NODE, "node-" + node.incarnation(),
-                    "metadata endpoint", false, false);
+            controller = new ManagedScpConnection(List.of(ep), config.connectionPolicy(),
+                    ScpClient.KIND_DATA_NODE, "node-" + node.incarnation(),
+                    "controller endpoint", false, false);
             sessionEpoch = -1;
         }
         if (sessionEpoch < 0) {
@@ -142,7 +142,7 @@ final class ControlLoop implements AutoCloseable {
                     List.of(node.endpoint()), config.zone(), config.rack(), config.host(),
                     List.of(new Messages.StorageCapacity(config.capacityBytes())),
                     1, 0);
-            ByteBuffer resp = meta.call(Opcode.REGISTER_NODE, reg.encode(), null, CALL_TIMEOUT_MS);
+            ByteBuffer resp = controller.call(Opcode.REGISTER_NODE, reg.encode(), null, CALL_TIMEOUT_MS);
             var r = Messages.RegisterResp.decode(resp);
             node.nodeIdAssigned(r.nodeId());
             sessionEpoch = r.sessionEpoch();
@@ -163,7 +163,7 @@ final class ControlLoop implements AutoCloseable {
                 List.of(new Messages.StorageUsage(used, Math.max(0, config.capacityBytes() - used))),
                 commandQueue.size(), done);
         try {
-            ByteBuffer resp = meta.call(Opcode.NODE_HEARTBEAT, hb.encode(), null, CALL_TIMEOUT_MS);
+            ByteBuffer resp = controller.call(Opcode.NODE_HEARTBEAT, hb.encode(), null, CALL_TIMEOUT_MS);
             var r = Messages.HeartbeatResp.decode(resp);
             commandQueue.addAll(r.commands());
         } catch (RuntimeException e) {
@@ -206,7 +206,7 @@ final class ControlLoop implements AutoCloseable {
         }
     }
 
-    private void replicate(Messages.ReplicateCmd cmd) throws IOException {
+    void replicate(Messages.ReplicateCmd cmd) throws IOException {
         if (store.contains(cmd.chunkId())) {
             // command replay — but only a VALID copy counts: a local chunk whose seal state or
             // crc/length mismatch the descriptor is corrupt and must be replaced, not trusted
@@ -228,7 +228,7 @@ final class ControlLoop implements AutoCloseable {
             if (source.nodeId() == node.nodeId()) continue;
             try {
                 Endpoint hp = Endpoint.parse(source.endpoint(), "endpoint", ErrorCode.INTERNAL);
-                try (ScpClient src = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_STORAGE_NODE,
+                try (ScpClient src = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_DATA_NODE,
                         "repair-" + node.nodeId())) {
                     Path tmp = store.createImportTemp(cmd.chunkId());
                     try {
@@ -340,7 +340,7 @@ final class ControlLoop implements AutoCloseable {
                 if (++cycle % 10 == 0) {
                     store.scrubOnce();
                 }
-                ManagedScpConnection m = meta;
+                ManagedScpConnection m = controller;
                 if (m == null || sessionEpoch < 0) continue;
                 List<Messages.InventoryEntry> entries = new ArrayList<>();
                 for (var item : store.inventory()) {
@@ -362,8 +362,8 @@ final class ControlLoop implements AutoCloseable {
     }
 
     private void disconnect() {
-        ManagedScpConnection m = meta;
-        meta = null;
+        ManagedScpConnection m = controller;
+        controller = null;
         sessionEpoch = -1;
         if (m != null) m.close();
     }

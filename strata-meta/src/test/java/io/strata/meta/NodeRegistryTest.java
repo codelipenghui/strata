@@ -62,7 +62,7 @@ class NodeRegistryTest {
         store.nodes.put(1, new MetadataStore.Versioned<>(node(1, Records.NodeState.REGISTERED), 1));
         store.nodes.put(2, new MetadataStore.Versioned<>(node(2, Records.NodeState.REGISTERED), 1));
         store.nodes.put(3, new MetadataStore.Versioned<>(node(3, Records.NodeState.REGISTERED), 1));
-        MetaConfig config = new MetaConfig("unused", 0, 1, 1_000, 60_000, 1, 1);
+        ControllerConfig config = new ControllerConfig("unused", 0, 1, 1_000, 60_000, 1, 1);
 
         NodeRegistry registry = new NodeRegistry(store, config);
 
@@ -79,7 +79,7 @@ class NodeRegistryTest {
     @Test
     void placementCandidatesExcludeNodesPastDeadGrace() throws Exception {
         FakeStore store = new FakeStore();
-        MetaConfig config = new MetaConfig("unused", 0, 1, 1_000, 50, 1, 1);
+        ControllerConfig config = new ControllerConfig("unused", 0, 1, 1_000, 50, 1, 1);
         NodeRegistry registry = new NodeRegistry(store, config);
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
                 101, 102, List.of("node:9000"), "z", "r", "h",
@@ -272,7 +272,7 @@ class NodeRegistryTest {
     @Test
     void heartbeatLeaseIsComputedAfterWaitingForNodeLock() throws Exception {
         FakeStore store = new FakeStore();
-        MetaConfig config = config();
+        ControllerConfig config = config();
         NodeRegistry registry = new NodeRegistry(store, config);
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
                 35, 36, List.of("node:9000"), "z", "r", "h",
@@ -383,7 +383,7 @@ class NodeRegistryTest {
     @Test
     void heartbeatCompletionProcessingPreventsExpireScanFromDeclaringNodeDead() throws Exception {
         FakeStore store = new FakeStore();
-        MetaConfig config = new MetaConfig("unused", 0, 1, 50, 0, 1, 1);
+        ControllerConfig config = new ControllerConfig("unused", 0, 1, 50, 0, 1, 1);
         NodeRegistry registry = new NodeRegistry(store, config);
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
                 39, 40, List.of("node:9000"), "z", "r", "h",
@@ -612,8 +612,8 @@ class NodeRegistryTest {
         assertEquals(Boolean.FALSE, currentSession.get());
     }
 
-    private static MetaConfig config() {
-        return new MetaConfig("unused", 0, 1, 1_000, 0, 1, 1);
+    private static ControllerConfig config() {
+        return new ControllerConfig("unused", 0, 1, 1_000, 0, 1, 1);
     }
 
     private static Records.NodeRecord node(int id, Records.NodeState state) {

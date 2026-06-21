@@ -3,9 +3,9 @@ package io.strata.server;
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.common.FileId;
-import io.strata.meta.MetaConfig;
+import io.strata.meta.ControllerConfig;
 import io.strata.meta.ZkMetadataStore;
-import io.strata.node.NodeConfig;
+import io.strata.node.DataNodeConfig;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
 
@@ -21,28 +21,28 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 /**
- * The {@code combined} run mode hosts a {@link io.strata.meta.MetadataService} and a
- * {@link io.strata.node.StorageNode} in one JVM. This proves both halves come up and interoperate in
- * one process: the co-resident storage node registers with the co-resident meta leader, and a client
+ * The {@code combined} run mode hosts a {@link io.strata.meta.Controller} and a
+ * {@link io.strata.node.DataNode} in one JVM. This proves both halves come up and interoperate in
+ * one process: the co-resident data node registers with the co-resident controller leader, and a client
  * can create files through that same meta.
  */
 class CombinedServerTest {
 
     @Test
-    void combinedNodeServesMetadataAndRegistersItsStorageNode() throws Exception {
+    void combinedNodeServesMetadataAndRegistersItsDataNode() throws Exception {
         try (TestingServer zk = new TestingServer(true)) {
             Path dataDir = Files.createTempDirectory("strata-combined-it");
             int port = freePort();
             // The meta is embedded (server-less) and shares the node's listener, so its own listenPort
             // is unused here.
-            MetaConfig metaConfig = MetaConfig.forTests(zk.getConnectString());
-            NodeConfig nodeConfig = NodeConfig
+            ControllerConfig controllerConfig = ControllerConfig.forTests(zk.getConnectString());
+            DataNodeConfig nodeConfig = DataNodeConfig
                     .withMetadata(dataDir, List.of("127.0.0.1:" + port), "host-0")
                     .withListenPort(port);
 
-            try (StrataServer.Combined combined = StrataServer.startCombined(metaConfig, nodeConfig)) {
+            try (StrataServer.Combined combined = StrataServer.startCombined(controllerConfig, nodeConfig)) {
                 // Both planes share ONE listener: the co-resident node registers with the co-resident
-                // meta leader over that single port (registration is leader-gated, so this also
+                // controller leader over that single port (registration is leader-gated, so this also
                 // confirms the embedded meta won the latch).
                 awaitRegistered(zk.getConnectString(), 1);
 

@@ -552,9 +552,9 @@ class AppenderImplTest {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
 
-        try (ScpServer s1 = storageServer(1, 123, false);
-             ScpServer s2 = storageServer(2, 0, true);
-             ScpServer s3 = storageServer(3, 0, true);
+        try (ScpServer s1 = dataNodeServer(1, 123, false);
+             ScpServer s2 = dataNodeServer(2, 0, true);
+             ScpServer s3 = dataNodeServer(3, 0, true);
              NodePool pool = new NodePool()) {
             ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500);
             AppenderImpl appender = new AppenderImpl(null, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
@@ -613,7 +613,7 @@ class AppenderImplTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
@@ -663,7 +663,7 @@ class AppenderImplTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
@@ -725,7 +725,7 @@ class AppenderImplTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1,
                         Messages.WritePolicy.DEFAULT, 0);
 
@@ -741,7 +741,7 @@ class AppenderImplTest {
     }
 
     @Test
-    void createChunkWithWrongReplicaSetIsAbortedBeforeOpeningStorage() throws Exception {
+    void createChunkWithWrongReplicaSetIsAbortedBeforeOpeningDataNode() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
@@ -764,7 +764,7 @@ class AppenderImplTest {
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
@@ -776,19 +776,19 @@ class AppenderImplTest {
     }
 
     @Test
-    void createChunkWithWrongFileIdIsAbortedBeforeOpeningStorage() throws Exception {
+    void createChunkWithWrongFileIdIsAbortedBeforeOpeningDataNode() throws Exception {
         FileId fileId = FileId.random();
         ChunkId wrongChunkId = new ChunkId(FileId.random(), 0);
         AtomicBoolean aborted = new AtomicBoolean();
-        AtomicBoolean openedStorage = new AtomicBoolean();
+        AtomicBoolean openedDataNode = new AtomicBoolean();
 
-        try (ScpServer storage = openTrackingStorage(1, openedStorage);
+        try (ScpServer dataNode = openTrackingDataNode(1, openedDataNode);
              ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
                  Opcode op = Opcode.fromCode(req.opcode());
                  if (op == Opcode.CREATE_CHUNK) {
                      Messages.CreateChunk.decode(req.headerSlice());
                      return ScpServer.ok(req, new Messages.CreateChunkResp(wrongChunkId, 1, List.of(
-                             new Messages.Replica(1, endpoint(storage)),
+                             new Messages.Replica(1, endpoint(dataNode)),
                              new Messages.Replica(2, "127.0.0.1:2"),
                              new Messages.Replica(3, "127.0.0.1:3"))).encode(), null);
                  }
@@ -800,32 +800,32 @@ class AppenderImplTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
                 assertEquals(ErrorCode.INTERNAL, e.code());
                 assertTrue(aborted.get());
-                assertFalse(openedStorage.get());
+                assertFalse(openedDataNode.get());
             }
         }
     }
 
     @Test
-    void createChunkWithDuplicateNodeIdIsAbortedBeforeOpeningStorage() throws Exception {
+    void createChunkWithDuplicateNodeIdIsAbortedBeforeOpeningDataNode() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
-        AtomicBoolean openedStorage = new AtomicBoolean();
+        AtomicBoolean openedDataNode = new AtomicBoolean();
 
-        try (ScpServer storage = openTrackingStorage(1, openedStorage);
+        try (ScpServer dataNode = openTrackingDataNode(1, openedDataNode);
              ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
                  Opcode op = Opcode.fromCode(req.opcode());
                  if (op == Opcode.CREATE_CHUNK) {
                      Messages.CreateChunk.decode(req.headerSlice());
                      return ScpServer.ok(req, new Messages.CreateChunkResp(chunkId, 1, List.of(
-                             new Messages.Replica(1, endpoint(storage)),
+                             new Messages.Replica(1, endpoint(dataNode)),
                              new Messages.Replica(1, "127.0.0.1:2"),
                              new Messages.Replica(3, "127.0.0.1:3"))).encode(), null);
                  }
@@ -837,32 +837,32 @@ class AppenderImplTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
                 assertEquals(ErrorCode.INTERNAL, e.code());
                 assertTrue(aborted.get());
-                assertFalse(openedStorage.get());
+                assertFalse(openedDataNode.get());
             }
         }
     }
 
     @Test
-    void createChunkWithBlankEndpointIsAbortedBeforeOpeningStorage() throws Exception {
+    void createChunkWithBlankEndpointIsAbortedBeforeOpeningDataNode() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
-        AtomicBoolean openedStorage = new AtomicBoolean();
+        AtomicBoolean openedDataNode = new AtomicBoolean();
 
-        try (ScpServer storage = openTrackingStorage(1, openedStorage);
+        try (ScpServer dataNode = openTrackingDataNode(1, openedDataNode);
              ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
                  Opcode op = Opcode.fromCode(req.opcode());
                  if (op == Opcode.CREATE_CHUNK) {
                      Messages.CreateChunk.decode(req.headerSlice());
                      return ScpServer.ok(req, new Messages.CreateChunkResp(chunkId, 1, List.of(
-                             new Messages.Replica(1, endpoint(storage)),
+                             new Messages.Replica(1, endpoint(dataNode)),
                              new Messages.Replica(2, " "),
                              new Messages.Replica(3, "127.0.0.1:3"))).encode(), null);
                  }
@@ -874,14 +874,14 @@ class AppenderImplTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
                 assertEquals(ErrorCode.INTERNAL, e.code());
                 assertTrue(aborted.get());
-                assertFalse(openedStorage.get());
+                assertFalse(openedDataNode.get());
             }
         }
     }
@@ -895,7 +895,7 @@ class AppenderImplTest {
     }
 
     @Test
-    void createChunkWithDuplicateEndpointIsAbortedBeforeOpeningStorage() throws Exception {
+    void createChunkWithDuplicateEndpointIsAbortedBeforeOpeningDataNode() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
@@ -917,7 +917,7 @@ class AppenderImplTest {
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
@@ -929,19 +929,19 @@ class AppenderImplTest {
     }
 
     @Test
-    void createChunkWithInvalidNodeIdIsAbortedBeforeOpeningStorage() throws Exception {
+    void createChunkWithInvalidNodeIdIsAbortedBeforeOpeningDataNode() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
-        AtomicBoolean openedStorage = new AtomicBoolean();
+        AtomicBoolean openedDataNode = new AtomicBoolean();
 
-        try (ScpServer storage = openTrackingStorage(1, openedStorage);
+        try (ScpServer dataNode = openTrackingDataNode(1, openedDataNode);
              ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
                  Opcode op = Opcode.fromCode(req.opcode());
                  if (op == Opcode.CREATE_CHUNK) {
                      Messages.CreateChunk.decode(req.headerSlice());
                      return ScpServer.ok(req, new Messages.CreateChunkResp(chunkId, 1, List.of(
-                             new Messages.Replica(0, endpoint(storage)),
+                             new Messages.Replica(0, endpoint(dataNode)),
                              new Messages.Replica(2, "127.0.0.1:2"),
                              new Messages.Replica(3, "127.0.0.1:3"))).encode(), null);
                  }
@@ -953,32 +953,32 @@ class AppenderImplTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
                 assertEquals(ErrorCode.INTERNAL, e.code());
                 assertTrue(aborted.get());
-                assertFalse(openedStorage.get());
+                assertFalse(openedDataNode.get());
             }
         }
     }
 
     @Test
-    void createChunkWithMismatchedEpochIsAbortedBeforeOpeningStorage() throws Exception {
+    void createChunkWithMismatchedEpochIsAbortedBeforeOpeningDataNode() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
-        AtomicBoolean openedStorage = new AtomicBoolean();
+        AtomicBoolean openedDataNode = new AtomicBoolean();
 
-        try (ScpServer storage = openTrackingStorage(1, openedStorage);
+        try (ScpServer dataNode = openTrackingDataNode(1, openedDataNode);
              ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
                  Opcode op = Opcode.fromCode(req.opcode());
                  if (op == Opcode.CREATE_CHUNK) {
                      Messages.CreateChunk.decode(req.headerSlice());
                      return ScpServer.ok(req, new Messages.CreateChunkResp(chunkId, 2, List.of(
-                             new Messages.Replica(1, endpoint(storage)),
+                             new Messages.Replica(1, endpoint(dataNode)),
                              new Messages.Replica(2, "127.0.0.1:2"),
                              new Messages.Replica(3, "127.0.0.1:3"))).encode(), null);
                  }
@@ -990,24 +990,24 @@ class AppenderImplTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
                 assertEquals(ErrorCode.INTERNAL, e.code());
                 assertTrue(aborted.get());
-                assertFalse(openedStorage.get());
+                assertFalse(openedDataNode.get());
             }
         }
     }
 
     @Test
-    void createChunkFailureKillsAppenderWithoutOpeningStorage() throws Exception {
+    void createChunkFailureKillsAppenderWithoutOpeningDataNode() throws Exception {
         FileId fileId = FileId.random();
-        AtomicBoolean openedStorage = new AtomicBoolean();
+        AtomicBoolean openedDataNode = new AtomicBoolean();
 
-        try (ScpServer storage = openTrackingStorage(1, openedStorage);
+        try (ScpServer dataNode = openTrackingDataNode(1, openedDataNode);
              ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
                  Opcode op = Opcode.fromCode(req.opcode());
                  if (op == Opcode.CREATE_CHUNK) {
@@ -1017,13 +1017,13 @@ class AppenderImplTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
                 assertEquals(ErrorCode.INTERNAL, e.code());
-                assertFalse(openedStorage.get());
+                assertFalse(openedDataNode.get());
             }
         }
     }
@@ -1050,7 +1050,7 @@ class AppenderImplTest {
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
@@ -1082,7 +1082,7 @@ class AppenderImplTest {
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
              ScpServer fenced = openErrorServer(2, ErrorCode.FENCED_EPOCH);
-             ScpServer shouldNotOpen = openTrackingStorage(3, openedAfterFence);
+             ScpServer shouldNotOpen = openTrackingDataNode(3, openedAfterFence);
              ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
                  Opcode op = Opcode.fromCode(req.opcode());
                  if (op == Opcode.CREATE_CHUNK) {
@@ -1100,7 +1100,7 @@ class AppenderImplTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
@@ -1114,17 +1114,17 @@ class AppenderImplTest {
     }
 
     @Test
-    void closeDuringChunkCreateAbortsMetadataBeforeOpeningStorage() throws Exception {
+    void closeDuringChunkCreateAbortsMetadataBeforeOpeningDataNode() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
         CountDownLatch createStarted = new CountDownLatch(1);
         CountDownLatch releaseCreate = new CountDownLatch(1);
         AtomicBoolean aborted = new AtomicBoolean();
-        AtomicBoolean openedStorage = new AtomicBoolean();
+        AtomicBoolean openedDataNode = new AtomicBoolean();
 
-        try (ScpServer s1 = openTrackingStorage(1, openedStorage);
-             ScpServer s2 = openTrackingStorage(2, openedStorage);
-             ScpServer s3 = openTrackingStorage(3, openedStorage);
+        try (ScpServer s1 = openTrackingDataNode(1, openedDataNode);
+             ScpServer s2 = openTrackingDataNode(2, openedDataNode);
+             ScpServer s3 = openTrackingDataNode(3, openedDataNode);
              ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
                  Opcode op = Opcode.fromCode(req.opcode());
                  if (op == Opcode.CREATE_CHUNK) {
@@ -1146,7 +1146,7 @@ class AppenderImplTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
                 CompletableFuture<ScpException> appendFailure = CompletableFuture.supplyAsync(() -> {
                     try {
@@ -1164,7 +1164,7 @@ class AppenderImplTest {
                 ScpException e = appendFailure.get(1, TimeUnit.SECONDS);
                 assertEquals(ErrorCode.INTERNAL, e.code());
                 assertTrue(aborted.get());
-                assertFalse(openedStorage.get());
+                assertFalse(openedDataNode.get());
             }
         }
     }
@@ -1176,15 +1176,15 @@ class AppenderImplTest {
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
         AtomicReference<Long> sealedFileLength = new AtomicReference<>();
 
-        try (ScpServer s1 = storageServer(1, 123, false);
-             ScpServer s2 = storageServer(2, 123, false);
-             ScpServer s3 = storageServer(3, 456, false);
+        try (ScpServer s1 = dataNodeServer(1, 123, false);
+             ScpServer s2 = dataNodeServer(2, 123, false);
+             ScpServer s3 = dataNodeServer(3, 456, false);
              ScpServer metaServer = metadataForAppender(fileId, chunkId, sealedReplicas, sealedFileLength,
                      new Messages.Replica(1, endpoint(s1)),
                      new Messages.Replica(2, endpoint(s2)),
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
 
                 StrataFile.AppendAck ack = appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
@@ -1209,15 +1209,15 @@ class AppenderImplTest {
         AtomicInteger s2Appends = new AtomicInteger();
         AtomicInteger s3Appends = new AtomicInteger();
 
-        try (ScpServer s1 = countedStorageServer(1, s1Appends);
-             ScpServer s2 = countedStorageServer(2, s2Appends);
-             ScpServer s3 = countedStorageServer(3, s3Appends);
+        try (ScpServer s1 = countedDataNodeServer(1, s1Appends);
+             ScpServer s2 = countedDataNodeServer(2, s2Appends);
+             ScpServer s3 = countedDataNodeServer(3, s3Appends);
              ScpServer metaServer = metadataForAppender(fileId, chunkId, sealedReplicas, sealedFileLength,
                      new Messages.Replica(1, endpoint(s1)),
                      new Messages.Replica(2, endpoint(s2)),
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool(config)) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1,
                         Messages.WritePolicy.DEFAULT, 0);
 
@@ -1248,16 +1248,16 @@ class AppenderImplTest {
         AtomicInteger s2Appends = new AtomicInteger();
         AtomicInteger s3Appends = new AtomicInteger();
 
-        try (ScpServer s1 = countedStorageServer(1, s1Appends);
-             ScpServer s2 = countedStorageServer(2, s2Appends);
-             ScpServer s3 = countedStorageServer(3, s3Appends);
+        try (ScpServer s1 = countedDataNodeServer(1, s1Appends);
+             ScpServer s2 = countedDataNodeServer(2, s2Appends);
+             ScpServer s3 = countedDataNodeServer(3, s3Appends);
              ScpServer metaServer = metadataForAppender(fileId, chunkId, sealedReplicas, sealedFileLength,
                      new Messages.Replica(1, endpoint(s1)),
                      new Messages.Replica(2, endpoint(s2)),
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
-                    .withStorageConnectionsPerEndpoint(2);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool(config)) {
+                    .withDataNodeConnectionsPerEndpoint(2);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1,
                         Messages.WritePolicy.DEFAULT, 0);
 
@@ -1288,16 +1288,16 @@ class AppenderImplTest {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
 
-        try (ScpServer s1 = storageServer(1, 123, false);
-             ScpServer s2 = storageServer(2, 123, false);
-             ScpServer s3 = storageServer(3, 123, false);
+        try (ScpServer s1 = dataNodeServer(1, 123, false);
+             ScpServer s2 = dataNodeServer(2, 123, false);
+             ScpServer s3 = dataNodeServer(3, 123, false);
              ScpServer metaServer = metadataForAppender(fileId, chunkId, new AtomicReference<>(),
                      new AtomicReference<>(),
                      new Messages.Replica(1, endpoint(s1)),
                      new Messages.Replica(2, endpoint(s2)),
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
                 Object session = chunkSession(chunkId,
                         new Messages.Replica(1, endpoint(s1)),
@@ -1320,15 +1320,15 @@ class AppenderImplTest {
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
 
-        try (ScpServer s1 = storageServer(1, 123, false, 1);
-             ScpServer s2 = storageServer(2, 123, false, 1);
-             ScpServer s3 = storageServer(3, 123, false, 0);
+        try (ScpServer s1 = dataNodeServer(1, 123, false, 1);
+             ScpServer s2 = dataNodeServer(2, 123, false, 1);
+             ScpServer s3 = dataNodeServer(3, 123, false, 0);
              ScpServer metaServer = metadataForAppender(fileId, chunkId, sealedReplicas, new AtomicReference<>(),
                      new Messages.Replica(1, endpoint(s1)),
                      new Messages.Replica(2, endpoint(s2)),
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
@@ -1344,16 +1344,16 @@ class AppenderImplTest {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
 
-        try (ScpServer s1 = storageServer(1, 123, false);
-             ScpServer s2 = storageServer(2, 0, true);
-             ScpServer s3 = storageServer(3, 0, true);
+        try (ScpServer s1 = dataNodeServer(1, 123, false);
+             ScpServer s2 = dataNodeServer(2, 0, true);
+             ScpServer s3 = dataNodeServer(3, 0, true);
              ScpServer metaServer = metadataForAppender(fileId, chunkId, new AtomicReference<>(),
                      new AtomicReference<>(),
                      new Messages.Replica(1, endpoint(s1)),
                      new Messages.Replica(2, endpoint(s2)),
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
@@ -1373,15 +1373,15 @@ class AppenderImplTest {
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
 
-        try (ScpServer s1 = storageServer(1, 111, false);
-             ScpServer s2 = storageServer(2, 222, false);
-             ScpServer s3 = storageServer(3, 333, false);
+        try (ScpServer s1 = dataNodeServer(1, 111, false);
+             ScpServer s2 = dataNodeServer(2, 222, false);
+             ScpServer s3 = dataNodeServer(3, 333, false);
              ScpServer metaServer = metadataForAppender(fileId, chunkId, sealedReplicas, new AtomicReference<>(),
                      new Messages.Replica(1, endpoint(s1)),
                      new Messages.Replica(2, endpoint(s2)),
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
@@ -1398,16 +1398,16 @@ class AppenderImplTest {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
 
-        try (ScpServer s1 = storageServer(1, 123, false);
+        try (ScpServer s1 = dataNodeServer(1, 123, false);
              ScpServer s2 = malformedSealServer(2);
-             ScpServer s3 = storageServer(3, 0, true);
+             ScpServer s3 = dataNodeServer(3, 0, true);
              ScpServer metaServer = metadataForAppender(fileId, chunkId, new AtomicReference<>(),
                      new AtomicReference<>(),
                      new Messages.Replica(1, endpoint(s1)),
                      new Messages.Replica(2, endpoint(s2)),
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
@@ -1441,15 +1441,15 @@ class AppenderImplTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             ScpServer s2 = storageServer(2, 123, false);
-             ScpServer s3 = storageServer(3, 123, false);
+             ScpServer s2 = dataNodeServer(2, 123, false);
+             ScpServer s3 = dataNodeServer(3, 123, false);
              ScpServer metaServer = metadataForAppender(fileId, chunkId, new AtomicReference<>(),
                      new AtomicReference<>(),
                      new Messages.Replica(1, endpoint(fencedSeal)),
                      new Messages.Replica(2, endpoint(s2)),
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
@@ -1466,9 +1466,9 @@ class AppenderImplTest {
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean sealFileCalled = new AtomicBoolean();
 
-        try (ScpServer s1 = storageServer(1, 123, false);
-             ScpServer s2 = storageServer(2, 123, false);
-             ScpServer s3 = storageServer(3, 123, false);
+        try (ScpServer s1 = dataNodeServer(1, 123, false);
+             ScpServer s2 = dataNodeServer(2, 123, false);
+             ScpServer s3 = dataNodeServer(3, 123, false);
              ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
                  Opcode op = Opcode.fromCode(req.opcode());
                  if (op == Opcode.CREATE_CHUNK) {
@@ -1489,7 +1489,7 @@ class AppenderImplTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
@@ -1507,15 +1507,15 @@ class AppenderImplTest {
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
 
-        try (ScpServer s1 = storageServer(1, 123, false);
-             ScpServer s2 = storageServer(2, 123, false);
-             ScpServer s3 = storageServer(3, 123, false);
+        try (ScpServer s1 = dataNodeServer(1, 123, false);
+             ScpServer s2 = dataNodeServer(2, 123, false);
+             ScpServer s3 = dataNodeServer(3, 123, false);
              ScpServer metaServer = metadataForAppender(fileId, chunkId, sealedReplicas, new AtomicReference<>(),
                      new Messages.Replica(1, endpoint(s1)),
                      new Messages.Replica(2, endpoint(s2)),
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT,
                         Long.MAX_VALUE - 1);
                 Object session = chunkSession(chunkId,
@@ -1539,15 +1539,15 @@ class AppenderImplTest {
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
 
-        try (ScpServer s1 = storageServer(1, 123, false);
-             ScpServer s2 = storageServer(2, 123, false);
-             ScpServer s3 = storageServer(3, 123, false);
+        try (ScpServer s1 = dataNodeServer(1, 123, false);
+             ScpServer s2 = dataNodeServer(2, 123, false);
+             ScpServer s3 = dataNodeServer(3, 123, false);
              ScpServer metaServer = metadataForAppender(fileId, chunkId, sealedReplicas, new AtomicReference<>(),
                      new Messages.Replica(1, endpoint(s1)),
                      new Messages.Replica(2, endpoint(s2)),
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT,
                         Long.MAX_VALUE - 1);
                 Object session = chunkSession(chunkId,
@@ -1574,15 +1574,15 @@ class AppenderImplTest {
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
         AtomicReference<Long> sealedFileLength = new AtomicReference<>();
 
-        try (ScpServer s1 = storageServer(1, 123, false);
-             ScpServer s2 = storageServer(2, 123, false);
-             ScpServer s3 = storageServer(3, 123, false);
+        try (ScpServer s1 = dataNodeServer(1, 123, false);
+             ScpServer s2 = dataNodeServer(2, 123, false);
+             ScpServer s3 = dataNodeServer(3, 123, false);
              ScpServer metaServer = metadataForAppender(fileId, chunkId, sealedReplicas, sealedFileLength, true,
                      new Messages.Replica(1, endpoint(s1)),
                      new Messages.Replica(2, endpoint(s2)),
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
@@ -1770,11 +1770,11 @@ class AppenderImplTest {
         });
     }
 
-    private static ScpServer openTrackingStorage(int nodeId, AtomicBoolean openedStorage) throws Exception {
+    private static ScpServer openTrackingDataNode(int nodeId, AtomicBoolean openedDataNode) throws Exception {
         return new ScpServer(0, nodeId, 0, 0, req -> {
             Opcode op = Opcode.fromCode(req.opcode());
             if (op == Opcode.OPEN_CHUNK) {
-                openedStorage.set(true);
+                openedDataNode.set(true);
                 return ScpServer.ok(req, Messages.okHeader(), null);
             }
             if (op == Opcode.DELETE_CHUNKS) {
@@ -1784,7 +1784,7 @@ class AppenderImplTest {
         });
     }
 
-    private static ScpServer countedStorageServer(int nodeId, AtomicInteger appends) throws Exception {
+    private static ScpServer countedDataNodeServer(int nodeId, AtomicInteger appends) throws Exception {
         return new ScpServer(0, nodeId, 0, 0, req -> {
             Opcode op = Opcode.fromCode(req.opcode());
             if (op == Opcode.OPEN_CHUNK) {
@@ -1804,11 +1804,11 @@ class AppenderImplTest {
         });
     }
 
-    private static ScpServer storageServer(int nodeId, int sealCrc, boolean failSeal) throws Exception {
-        return storageServer(nodeId, sealCrc, failSeal, 0);
+    private static ScpServer dataNodeServer(int nodeId, int sealCrc, boolean failSeal) throws Exception {
+        return dataNodeServer(nodeId, sealCrc, failSeal, 0);
     }
 
-    private static ScpServer storageServer(int nodeId, int sealCrc, boolean failSeal, long sealLengthDelta)
+    private static ScpServer dataNodeServer(int nodeId, int sealCrc, boolean failSeal, long sealLengthDelta)
             throws Exception {
         return new ScpServer(0, nodeId, 0, 0, req -> {
             Opcode op = Opcode.fromCode(req.opcode());

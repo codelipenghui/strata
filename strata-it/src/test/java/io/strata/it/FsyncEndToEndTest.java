@@ -35,7 +35,7 @@ class FsyncEndToEndTest {
         cluster = new MiniCluster(3);
         client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint())
                 .withChunkRollBytes(4 * 1024)
-                .withStorageConnectionsPerEndpoint(3));
+                .withDataNodeConnectionsPerEndpoint(3));
     }
 
     @AfterAll

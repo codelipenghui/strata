@@ -10,9 +10,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -51,9 +54,15 @@ final class NodeRegistry {
     }
 
     private final MetadataStore store;
-    private final MetaConfig config;
+    private final ControllerConfig config;
     private final Map<Integer, LiveNode> live = new ConcurrentHashMap<>();
     private final AtomicLong sessionCounter = new AtomicLong(System.currentTimeMillis());
+    // Shared cluster-liveness snapshot (design §11): the controller publishes it; any namespace owner
+    // reads it to fill placement candidates it cannot see live in memory. Cached briefly to bound the
+    // root-store reads on the placement path.
+    private static final long SNAPSHOT_RELOAD_MS = 100;
+    private volatile Records.ClusterLiveNodes cachedSnapshot;
+    private volatile long cachedSnapshotAtMs;
 
     @FunctionalInterface
     interface CompletionSink {
@@ -61,7 +70,7 @@ final class NodeRegistry {
                                        Messages.CompletedCommand completion);
     }
 
-    NodeRegistry(MetadataStore store, MetaConfig config) throws Exception {
+    NodeRegistry(MetadataStore store, ControllerConfig config) throws Exception {
         this.store = store;
         this.config = config;
         // Warm persisted registrations as SUSPECT rather than DEAD. A metadata failover resets
@@ -403,19 +412,81 @@ final class NodeRegistry {
      * Nodes eligible to hold a replica for {@code namespace}. The per-namespace placement hook: today
      * every REGISTERED node still inside dead-grace is eligible (namespace-agnostic), but this is
      * where a future per-tenant affinity/isolation policy would filter candidates. Placement includes
-     * suspect nodes because metadata heartbeat stalls and leader failover should not make storage
+     * suspect nodes because metadata heartbeat stalls and leader failover should not make data
      * nodes disappear before the dead-grace window; the subsequent node RPC is the real liveness
      * probe for creating the replica.
      */
     List<LiveNode> candidatesFor(StrataNamespace namespace) {
         long now = System.currentTimeMillis();
         List<LiveNode> out = new ArrayList<>();
+        Set<Integer> included = new HashSet<>();
         for (LiveNode n : live.values()) {
             if (placementEligible(n, now)) {
                 out.add(n);
+                included.add(n.record.nodeId());
+            }
+        }
+        // Shared liveness (design §11): a non-controller owner has no heartbeat channel, so fall back
+        // to the controller's published live-node snapshot for nodes it cannot see live in memory.
+        // In-memory wins (added first); the snapshot only fills gaps.
+        Records.ClusterLiveNodes snapshot = currentSnapshot(now);
+        if (snapshot != null && now - snapshot.publishedAtMs() < snapshotValidityMs()) {
+            for (Records.ClusterLiveNodes.LiveEntry e : snapshot.entries()) {
+                if (included.add(e.record().nodeId())) {
+                    out.add(snapshotLiveNode(e, now));
+                }
             }
         }
         return out;
+    }
+
+    /**
+     * Controller-only (all call sites are leader-gated): publishes the current live-node set to the
+     * root store so non-controller namespace owners can place and repair replicas (design §11).
+     */
+    void publishClusterLiveNodes() {
+        long now = System.currentTimeMillis();
+        List<Records.ClusterLiveNodes.LiveEntry> entries = new ArrayList<>();
+        for (LiveNode n : live.values()) {
+            if (n.alive(now)) {
+                entries.add(new Records.ClusterLiveNodes.LiveEntry(n.record, n.freeBytes));
+            }
+        }
+        try {
+            store.putClusterLiveNodes(new Records.ClusterLiveNodes(now, entries).encode());
+        } catch (Exception e) {
+            log.warn("publishing cluster live-nodes snapshot failed", e);
+        }
+    }
+
+    /** A published snapshot is trusted for one lease plus two dead-grace windows after publication. */
+    private long snapshotValidityMs() {
+        return (long) config.leaseMs() + 2L * config.deadGraceMs();
+    }
+
+    private Records.ClusterLiveNodes currentSnapshot(long now) {
+        Records.ClusterLiveNodes snap = cachedSnapshot;
+        if (snap == null || now - cachedSnapshotAtMs > SNAPSHOT_RELOAD_MS) {
+            try {
+                Optional<byte[]> bytes = store.getClusterLiveNodes();
+                snap = bytes.map(Records.ClusterLiveNodes::decode).orElse(null);
+                cachedSnapshot = snap;
+                cachedSnapshotAtMs = now;
+            } catch (Exception e) {
+                log.debug("reading cluster live-nodes snapshot failed; using cached view", e);
+            }
+        }
+        return snap;
+    }
+
+    private static LiveNode snapshotLiveNode(Records.ClusterLiveNodes.LiveEntry e, long now) {
+        LiveNode n = new LiveNode();
+        n.record = e.record();        // REGISTERED, carries endpoints/host/zone/rack/capacity
+        n.recordVersion = -1;         // not this node's record to CAS — placement only reads it
+        n.sessionEpoch = -1;
+        n.leaseUntil = now;           // the controller vouched for it at publish; a placement candidate
+        n.freeBytes = e.freeBytes();
+        return n;
     }
 
     private boolean placementEligible(LiveNode n, long now) {

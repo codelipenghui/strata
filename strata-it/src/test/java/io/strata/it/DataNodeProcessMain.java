@@ -1,7 +1,7 @@
 package io.strata.it;
 
-import io.strata.node.NodeConfig;
-import io.strata.node.StorageNode;
+import io.strata.node.DataNodeConfig;
+import io.strata.node.DataNode;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -10,37 +10,37 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 
 /**
- * Test-only child process entry point for OS-level storage-node crash tests.
+ * Test-only child process entry point for OS-level data-node crash tests.
  */
-final class StorageNodeProcessMain {
-    private StorageNodeProcessMain() {
+final class DataNodeProcessMain {
+    private DataNodeProcessMain() {
     }
 
     public static void main(String[] args) throws Exception {
         if (args.length != 4 && args.length != 6) {
             throw new IllegalArgumentException(
-                    "usage: StorageNodeProcessMain <dataDir> <metadataEndpointsCsv> <host> <readyFile>"
+                    "usage: DataNodeProcessMain <dataDir> <controllerEndpointsCsv> <host> <readyFile>"
                             + " [<listenPort> <advertisedEndpoint>]");
         }
         Path dataDir = Path.of(args[0]);
-        List<String> metadataEndpoints = Arrays.stream(args[1].split(","))
+        List<String> controllerEndpoints = Arrays.stream(args[1].split(","))
                 .filter(s -> !s.isBlank())
                 .toList();
         String host = args[2];
         Path readyFile = Path.of(args[3]);
-        NodeConfig config = NodeConfig.withMetadata(dataDir, metadataEndpoints, host);
+        DataNodeConfig config = DataNodeConfig.withMetadata(dataDir, controllerEndpoints, host);
         if (args.length == 6) {
             config = config.withListenPort(Integer.parseInt(args[4]))
                     .withAdvertisedEndpoint(args[5]);
         }
 
-        try (StorageNode node = new StorageNode(config)) {
+        try (DataNode node = new DataNode(config)) {
             long deadline = System.currentTimeMillis() + 15_000;
             while (node.nodeId() < 0 && System.currentTimeMillis() < deadline) {
                 Thread.sleep(20);
             }
             if (node.nodeId() < 0) {
-                throw new IllegalStateException("storage node did not register before deadline");
+                throw new IllegalStateException("data node did not register before deadline");
             }
             Files.createDirectories(readyFile.getParent());
             Files.writeString(readyFile, node.nodeId() + " " + node.endpoint() + System.lineSeparator());

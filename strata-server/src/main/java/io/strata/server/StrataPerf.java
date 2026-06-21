@@ -38,14 +38,17 @@ import java.util.function.Consumer;
  * Default run:
  * - 8 files, 8 writers, 8 readers
  * - 256 MiB per file, 128 MiB chunk roll
- * - 8 storage connections per endpoint
+ * - 8 data-node connections per endpoint
  * - readers tail open files and read each file's bytes exactly once before delete
  *
  * Useful flags:
- *   --meta host:port
+ *   --controller host:port
  *   --duration SECONDS (default 300, 0 = until Ctrl-C)
  *   --files N (also the writer count; default 8)
  *   --readers N (readers per file; default 1, 0 = write/seal/delete only)
+ *   --namespaces N (distinct namespaces to round-robin files across; default 8 — with the
+ *                   namespace-log backend these shard across controller owners by rendezvous hash;
+ *                   pass 1 for the single-owner baseline)
  *   --read-sealed (read each file once after it is sealed instead of while it is open)
  *   --file-size BYTES (default 256 MiB)
  *   --chunk-roll BYTES (default 128 MiB)
@@ -64,7 +67,7 @@ final class StrataPerf {
     private static final int DEFAULT_READERS_PER_FILE = 1;
     private static final int DEFAULT_WRITE_WINDOW = 64;
     private static final int DEFAULT_DURATION_SEC = 300;
-    private static final int DEFAULT_STORAGE_CONNECTIONS_PER_ENDPOINT = 8;
+    private static final int DEFAULT_DATA_NODE_CONNECTIONS_PER_ENDPOINT = 8;
     private static final long DEFAULT_FILE_SIZE_BYTES = 256L << 20;
     private static final long DEFAULT_CHUNK_ROLL_BYTES = 128L << 20;
     private static final double DEFAULT_TARGET_WRITE_MBPS = 200.0;
@@ -76,8 +79,8 @@ final class StrataPerf {
     static void run(String[] argv) throws Exception {
         stop = false;
         Map<String, String> a = parse(argv);
-        String meta = a.getOrDefault("meta",
-                StrataServer.env("STRATA_META_ENDPOINTS", "localhost:9100")).split(",")[0].trim();
+        String controller = a.getOrDefault("controller",
+                StrataServer.env("STRATA_CONTROLLER_ENDPOINTS", "localhost:9100")).split(",")[0].trim();
 
         int files = intArg(a, "files", DEFAULT_FILES);
         int readersPerFile = intArg(a, "readers", DEFAULT_READERS_PER_FILE);
@@ -85,32 +88,39 @@ final class StrataPerf {
         int readSize = intArg(a, "read-size", DEFAULT_READ_SIZE);
         int writeWindow = intArg(a, "write-window", DEFAULT_WRITE_WINDOW);
         int durationSec = intArg(a, "duration", DEFAULT_DURATION_SEC);
-        int connections = intArg(a, "connections", DEFAULT_STORAGE_CONNECTIONS_PER_ENDPOINT);
+        int connections = intArg(a, "connections", DEFAULT_DATA_NODE_CONNECTIONS_PER_ENDPOINT);
         long fileSize = longArg(a, "file-size", DEFAULT_FILE_SIZE_BYTES);
         long chunkRoll = longArg(a, "chunk-roll", DEFAULT_CHUNK_ROLL_BYTES);
         boolean readSealed = a.containsKey("read-sealed");
         double targetWriteMbps = doubleArg(a, "target-write-mbps", DEFAULT_TARGET_WRITE_MBPS);
         long targetWriteBurstMs = longArg(a, "target-write-burst-ms", DEFAULT_TARGET_WRITE_BURST_MS);
+        // Default to 8 namespaces so the load actually exercises sharding: distinct namespaces shard
+        // across controller owners by rendezvous hash, spreading metadata/control-plane load. Pass
+        // --namespaces 1 for the single-owner baseline (all metadata on one controller).
+        int namespaces = intArg(a, "namespaces", 8);
 
         validate(files, readersPerFile, recordSize, readSize, writeWindow, fileSize, chunkRoll, connections);
+        if (namespaces < 1) {
+            throw new IllegalArgumentException("--namespaces must be positive");
+        }
 
         ThroughputLimiter writeLimiter = targetWriteMbps > 0
                 ? new ThroughputLimiter(targetWriteMbps, targetWriteBurstMs) : null;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> stop = true, "perf-stop"));
         String readMode = readersPerFile == 0 ? "none" : readSealed ? "sealed" : "open";
 
-        log.info("perf: meta={} files={} writers={} readersPerFile={} totalReaders={} readMode={} "
+        log.info("perf: controller={} files={} writers={} readersPerFile={} totalReaders={} namespaces={} readMode={} "
                         + "fileSize={}B chunkRoll={}B "
                         + "recordSize={}B readSize={}B writeWindow={} duration={}s connections={} targetWrite={}",
-                meta, files, files, readersPerFile, files * readersPerFile, readMode,
+                controller, files, files, readersPerFile, files * readersPerFile, namespaces, readMode,
                 fileSize, chunkRoll, recordSize, readSize, writeWindow, durationSec, connections,
                 writeLimiter == null ? "unlimited" : targetWriteMbps + "MiB/s");
 
         PerfConfig config = new PerfConfig(files, readersPerFile, recordSize, readSize, writeWindow,
-                durationSec, fileSize, readSealed, writeLimiter);
-        try (StrataClient client = StrataClient.connect(ClientConfig.of(meta)
+                durationSec, fileSize, readSealed, writeLimiter, namespaces);
+        try (StrataClient client = StrataClient.connect(ClientConfig.of(controller)
                 .withChunkRollBytes(chunkRoll)
-                .withStorageConnectionsPerEndpoint(connections))) {
+                .withDataNodeConnectionsPerEndpoint(connections))) {
             runFileLifecycle(client, config);
         }
     }
@@ -142,9 +152,14 @@ final class StrataPerf {
 
     private record PerfConfig(int files, int readersPerFile, int recordSize, int readSize, int writeWindow,
                               int durationSec, long fileSize, boolean readSealed,
-                              ThroughputLimiter writeLimiter) {
+                              ThroughputLimiter writeLimiter, int namespaces) {
         int totalReaders() {
             return files * readersPerFile;
+        }
+
+        /** Namespace for a file by sequence number — round-robins across {@code namespaces} (sharding). */
+        String namespaceFor(int seq) {
+            return namespaces <= 1 ? "perf" : "perf-" + Math.floorMod(seq, namespaces);
         }
     }
 
@@ -242,8 +257,9 @@ final class StrataPerf {
                 StrataFile.Appender appender = null;
                 boolean published = false;
                 try {
+                    int seq = fileSeq.incrementAndGet();
                     FileId id = client.create(new StrataClient.FileSpec(
-                            "perf", "/perf/run-" + runId + "-" + fileSeq.incrementAndGet())).id();
+                            config.namespaceFor(seq), "/perf/run-" + runId + "-" + seq)).id();
                     filesCreated.increment();
                     file = new PerfFile(id, lane.readerCount);
                     appender = client.openById(id).openForAppend();

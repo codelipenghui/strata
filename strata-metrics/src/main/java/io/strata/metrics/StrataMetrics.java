@@ -12,12 +12,12 @@ import io.micrometer.prometheus.PrometheusMeterRegistry;
 
 /**
  * Owns the process-wide Prometheus meter registry and registers the standard JVM/process binders.
- * A {@code role} (node|meta) common tag is applied to every meter so one Prometheus job can scrape
+ * A {@code role} (controller|data-node) common tag is applied to every meter so one Prometheus job can scrape
  * both kinds of process and disambiguate by label.
  *
- * <p>Server-side only: strata-node/meta/server depend on this module; the client/proto/format/
+ * <p>Server-side only: strata data-node/controller/server depend on this module; the client/proto/format/
  * common modules deliberately do not, so Micrometer never enters the client API or the data-path
- * hot loops. Instrumentation is done at the node/meta layer as periodic gauges over existing state
+ * hot loops. Instrumentation is done at the data-node/controller layer as periodic gauges over existing state
  * plus a few cheap function-counters — see {@code StrataServer} for the wiring.
  */
 public final class StrataMetrics implements AutoCloseable {

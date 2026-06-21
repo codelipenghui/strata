@@ -4,7 +4,7 @@
 
 **Goal:** Replace the single `strata-overview.json` Grafana dashboard with three focused dashboards (Cluster / Node / JVM) and add read-path byte/ops counters so read throughput charts symmetrically with writes.
 
-**Architecture:** A small data-path change adds two FunctionCounters (`strata_node_read_bytes_total`, `strata_node_read_ops_total`) mirroring the existing append counters, incremented in `ChunkStore.readRegion` (the client-READ-only path). Three new provisioned Grafana JSON dashboards consume the full verified metric set, wired with `$node`/`$opcode` template variables and cross-dashboard drill-down links. The old overview file is deleted; its uid is reused by the new Cluster dashboard.
+**Architecture:** A small data-path change adds two FunctionCounters (`strata_data_node_read_bytes_total`, `strata_data_node_read_ops_total`) mirroring the existing append counters, incremented in `ChunkStore.readRegion` (the client-READ-only path). Three new provisioned Grafana JSON dashboards consume the full verified metric set, wired with `$node`/`$opcode` template variables and cross-dashboard drill-down links. The old overview file is deleted; its uid is reused by the new Cluster dashboard.
 
 **Tech Stack:** Java 21, Maven (no wrapper — use `mvn`), Micrometer + Prometheus registry, JUnit 5, Grafana 11.2.0 (provisioned dashboards, schemaVersion 39), Prometheus, Docker Compose.
 
@@ -66,8 +66,8 @@ Reusable JSON fragments (copy and adapt per panel):
   "datasource": { "type": "prometheus", "uid": "prometheus" },
   "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
   "targets": [
-    { "expr": "sum(rate(strata_node_append_bytes_total[$__rate_interval]))", "refId": "A", "legendFormat": "write" },
-    { "expr": "sum(rate(strata_node_read_bytes_total[$__rate_interval]))", "refId": "B", "legendFormat": "read" }
+    { "expr": "sum(rate(strata_data_node_append_bytes_total[$__rate_interval]))", "refId": "A", "legendFormat": "write" },
+    { "expr": "sum(rate(strata_data_node_read_bytes_total[$__rate_interval]))", "refId": "B", "legendFormat": "read" }
   ],
   "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 10, "showPoints": "never" } } },
   "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last","max","mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
@@ -79,7 +79,7 @@ Reusable JSON fragments (copy and adapt per panel):
 {
   "name": "node", "label": "Node", "type": "query",
   "datasource": { "type": "prometheus", "uid": "prometheus" },
-  "query": { "query": "label_values(strata_node_disk_used_bytes, instance)", "refId": "StandardVariableQuery" },
+  "query": { "query": "label_values(strata_data_node_disk_used_bytes, instance)", "refId": "StandardVariableQuery" },
   "includeAll": true, "multi": true, "allValue": ".*", "current": { "text": "All", "value": "$__all" },
   "refresh": 2, "sort": 1
 }
@@ -271,12 +271,12 @@ git commit -m "Expose read ops/bytes accessors on StorageNode"
 
 - [ ] **Step 1: Register the two counters**
 
-In `ServerMetrics.registerNode`, after the existing `strata_node_append_bytes` builder (currently lines 76–77), add:
+In `ServerMetrics.registerDataNode`, after the existing `strata_data_node_append_bytes` builder (currently lines 76–77), add:
 
 ```java
-        FunctionCounter.builder("strata_node_read_ops", n, StorageNode::readOps)
+        FunctionCounter.builder("strata_data_node_read_ops", n, StorageNode::readOps)
                 .description("client READ operations served (rate() = read ops/sec)").register(reg);
-        FunctionCounter.builder("strata_node_read_bytes", n, StorageNode::readBytes)
+        FunctionCounter.builder("strata_data_node_read_bytes", n, StorageNode::readBytes)
                 .description("client READ payload bytes served (rate() = read throughput)").register(reg);
 ```
 
@@ -294,7 +294,7 @@ Expected: BUILD SUCCESS, all module tests pass (includes the Task 1 counter test
 
 ```bash
 git add strata-server/src/main/java/io/strata/server/ServerMetrics.java
-git commit -m "Export strata_node_read_bytes_total + strata_node_read_ops_total"
+git commit -m "Export strata_data_node_read_bytes_total + strata_data_node_read_ops_total"
 ```
 
 ---
@@ -316,12 +316,12 @@ Row **Health & SLOs** — stat tiles (`h:4,w:4`):
 | Chunks unavailable | `sum(strata_chunks_unavailable)` | short | green, red@1 |
 | Under-replicated | `sum(strata_chunks_under_replicated)` | short | green, yellow@1 |
 | At min redundancy | `sum(strata_chunks_at_min_redundancy)` | short | green, yellow@1 |
-| Metadata leaders (want 1) | `sum(strata_meta_is_leader)` | short | red@null, green@1, red@2 |
-| ZK connected (min) | `min(strata_meta_zk_connected)` | short | red@null, green@1 |
-| Nodes alive | `sum(strata_nodes{state="alive"})` | short | green |
-| Nodes suspect/dead | `sum(strata_nodes{state=~"suspect\|dead"})` | short | green, yellow@1 |
-| Write throughput | `sum(rate(strata_node_append_bytes_total[$__rate_interval]))` | Bps | — |
-| Read throughput | `sum(rate(strata_node_read_bytes_total[$__rate_interval]))` | Bps | — |
+| Metadata leaders (want 1) | `sum(strata_controller_is_leader)` | short | red@null, green@1, red@2 |
+| ZK connected (min) | `min(strata_controller_zk_connected)` | short | red@null, green@1 |
+| Nodes alive | `sum(strata_data_nodes{state="alive"})` | short | green |
+| Nodes suspect/dead | `sum(strata_data_nodes{state=~"suspect\|dead"})` | short | green, yellow@1 |
+| Write throughput | `sum(rate(strata_data_node_append_bytes_total[$__rate_interval]))` | Bps | — |
+| Read throughput | `sum(rate(strata_data_node_read_bytes_total[$__rate_interval]))` | Bps | — |
 | Request rate | `sum(rate(strata_scp_request_duration_seconds_count[$__rate_interval]))` | reqps | — |
 | Error ratio | `sum(rate(strata_scp_request_duration_seconds_count{status="error"}[$__rate_interval])) / clamp_min(sum(rate(strata_scp_request_duration_seconds_count[$__rate_interval])), 1)` | percentunit | green, red@0.01 |
 
@@ -330,27 +330,27 @@ Row **Durability & repair** — timeseries (`h:8,w:12`):
 - Repair backlog & in-flight: `sum(strata_repair_backlog)`, `sum(strata_repair_inflight)`; unit short.
 
 Row **Cluster membership**:
-- Nodes by liveness (timeseries `h:8,w:12`, stacked): `sum by (state)(strata_nodes)`, `legendFormat "{{state}}"`; field overrides color alive=green / suspect=orange / dead=red; `custom.stacking.mode = "normal"`.
+- Nodes by liveness (timeseries `h:8,w:12`, stacked): `sum by (state)(strata_data_nodes)`, `legendFormat "{{state}}"`; field overrides color alive=green / suspect=orange / dead=red; `custom.stacking.mode = "normal"`.
 - Per-node fleet table (`h:10,w:24`, `"type":"table"`) — six **instant** targets:
-  - A `strata_node_registered`
-  - B `strata_node_capacity_used_ratio`
-  - C `strata_node_disk_used_bytes`
-  - D `strata_node_capacity_bytes`
-  - E `strata_node_chunks{state="open"}`
-  - F `strata_node_chunks{state="sealed"}`
+  - A `strata_data_node_registered`
+  - B `strata_data_node_capacity_used_ratio`
+  - C `strata_data_node_disk_used_bytes`
+  - D `strata_data_node_capacity_bytes`
+  - E `strata_data_node_chunks{state="open"}`
+  - F `strata_data_node_chunks{state="sealed"}`
   - `transformations`: `[{ "id": "merge" }, { "id": "organize", "options": { ... rename Value #A..F to Registered / Capacity % / Disk used / Capacity / Open chunks / Sealed chunks, keep instance } }]`
   - field overrides: Capacity % → `unit percentunit` + value thresholds (green / yellow@0.8 / red@0.9); Disk used & Capacity → `unit bytes`.
   - data link (table fragment from Conventions).
 
 Row **Capacity** — timeseries (`h:8,w:12`):
-- Capacity used ratio by node: `strata_node_capacity_used_ratio`, `legendFormat "{{instance}}"`, unit percentunit, `min 0 max 1`, threshold lines at 0.8/0.9; per-series data link fragment.
-- Disk used vs total capacity: `sum(strata_node_disk_used_bytes)`, `sum(strata_node_capacity_bytes)`; unit bytes.
+- Capacity used ratio by node: `strata_data_node_capacity_used_ratio`, `legendFormat "{{instance}}"`, unit percentunit, `min 0 max 1`, threshold lines at 0.8/0.9; per-series data link fragment.
+- Disk used vs total capacity: `sum(strata_data_node_disk_used_bytes)`, `sum(strata_data_node_capacity_bytes)`; unit bytes.
 
 Row **I/O throughput** — timeseries (`h:8,w:12`):
-- Read vs write throughput: `sum(rate(strata_node_append_bytes_total[$__rate_interval]))` (write), `sum(rate(strata_node_read_bytes_total[$__rate_interval]))` (read); unit Bps.
-- Write & read ops/s: `sum(rate(strata_node_append_ops_total[$__rate_interval]))`, `sum(rate(strata_node_read_ops_total[$__rate_interval]))`; unit ops (use `"short"` or `"ops"`).
-- Group-commit force/s (fsync) by node: `sum by (instance)(rate(strata_node_groupcommit_force_total[$__rate_interval]))`; unit short.
-- Avg bytes per append: `sum(rate(strata_node_append_bytes_total[$__rate_interval])) / clamp_min(sum(rate(strata_node_append_ops_total[$__rate_interval])), 1)`; unit bytes.
+- Read vs write throughput: `sum(rate(strata_data_node_append_bytes_total[$__rate_interval]))` (write), `sum(rate(strata_data_node_read_bytes_total[$__rate_interval]))` (read); unit Bps.
+- Write & read ops/s: `sum(rate(strata_data_node_append_ops_total[$__rate_interval]))`, `sum(rate(strata_data_node_read_ops_total[$__rate_interval]))`; unit ops (use `"short"` or `"ops"`).
+- Group-commit force/s (fsync) by node: `sum by (instance)(rate(strata_data_node_groupcommit_force_total[$__rate_interval]))`; unit short.
+- Avg bytes per append: `sum(rate(strata_data_node_append_bytes_total[$__rate_interval])) / clamp_min(sum(rate(strata_data_node_append_ops_total[$__rate_interval])), 1)`; unit bytes.
 
 Row **Requests (RED)** — timeseries (`h:8,w:12`):
 - Request rate by opcode: `sum by (opcode)(rate(strata_scp_request_duration_seconds_count[$__rate_interval]))`, `legendFormat "{{opcode}}"`, unit reqps.
@@ -381,18 +381,18 @@ Top-level: `"uid": "strata-node"`, `"title": "Strata — Node"`, `"tags": ["stra
 
 - [ ] **Step 1: Build the panel array**
 
-Row **Overview** — stat tiles (`h:4,w:4`): nodes registered `sum(strata_node_registered{instance=~"$node"})`; capacity used (max) `max(strata_node_capacity_used_ratio{instance=~"$node"})` percentunit thresholds 0.8/0.9; disk used `sum(strata_node_disk_used_bytes{instance=~"$node"})` bytes; open chunks `sum(strata_node_chunks{instance=~"$node",state="open"})`; sealed chunks `sum(strata_node_chunks{instance=~"$node",state="sealed"})`; write throughput `sum(rate(strata_node_append_bytes_total{instance=~"$node"}[$__rate_interval]))` Bps; read throughput `sum(rate(strata_node_read_bytes_total{instance=~"$node"}[$__rate_interval]))` Bps; fsync/s `sum(rate(strata_node_groupcommit_force_total{instance=~"$node"}[$__rate_interval]))`.
+Row **Overview** — stat tiles (`h:4,w:4`): nodes registered `sum(strata_data_node_registered{instance=~"$node"})`; capacity used (max) `max(strata_data_node_capacity_used_ratio{instance=~"$node"})` percentunit thresholds 0.8/0.9; disk used `sum(strata_data_node_disk_used_bytes{instance=~"$node"})` bytes; open chunks `sum(strata_data_node_chunks{instance=~"$node",state="open"})`; sealed chunks `sum(strata_data_node_chunks{instance=~"$node",state="sealed"})`; write throughput `sum(rate(strata_data_node_append_bytes_total{instance=~"$node"}[$__rate_interval]))` Bps; read throughput `sum(rate(strata_data_node_read_bytes_total{instance=~"$node"}[$__rate_interval]))` Bps; fsync/s `sum(rate(strata_data_node_groupcommit_force_total{instance=~"$node"}[$__rate_interval]))`.
 
-Row **Capacity & storage** — timeseries (`h:8,w:12`): capacity used ratio `strata_node_capacity_used_ratio{instance=~"$node"}` `{{instance}}` percentunit + threshold lines; disk used vs capacity `strata_node_disk_used_bytes{instance=~"$node"}` + `strata_node_capacity_bytes{instance=~"$node"}` bytes; local chunks by state `sum by (instance, state)(strata_node_chunks{instance=~"$node"})` `{{instance}} {{state}}`.
+Row **Capacity & storage** — timeseries (`h:8,w:12`): capacity used ratio `strata_data_node_capacity_used_ratio{instance=~"$node"}` `{{instance}}` percentunit + threshold lines; disk used vs capacity `strata_data_node_disk_used_bytes{instance=~"$node"}` + `strata_data_node_capacity_bytes{instance=~"$node"}` bytes; local chunks by state `sum by (instance, state)(strata_data_node_chunks{instance=~"$node"})` `{{instance}} {{state}}`.
 
 Row **I/O throughput** — timeseries (`h:8,w:12`):
-- Write throughput by node: `sum by (instance)(rate(strata_node_append_bytes_total{instance=~"$node"}[$__rate_interval]))` Bps.
-- Read throughput by node: `sum by (instance)(rate(strata_node_read_bytes_total{instance=~"$node"}[$__rate_interval]))` Bps.
-- Append & read ops/s by node: `sum by (instance)(rate(strata_node_append_ops_total{instance=~"$node"}[$__rate_interval]))`, `sum by (instance)(rate(strata_node_read_ops_total{instance=~"$node"}[$__rate_interval]))`.
-- Group-commit force/s by node: `sum by (instance)(rate(strata_node_groupcommit_force_total{instance=~"$node"}[$__rate_interval]))`.
-- Avg bytes per append: `sum by (instance)(rate(strata_node_append_bytes_total{instance=~"$node"}[$__rate_interval])) / clamp_min(sum by (instance)(rate(strata_node_append_ops_total{instance=~"$node"}[$__rate_interval])), 1)` bytes.
+- Write throughput by node: `sum by (instance)(rate(strata_data_node_append_bytes_total{instance=~"$node"}[$__rate_interval]))` Bps.
+- Read throughput by node: `sum by (instance)(rate(strata_data_node_read_bytes_total{instance=~"$node"}[$__rate_interval]))` Bps.
+- Append & read ops/s by node: `sum by (instance)(rate(strata_data_node_append_ops_total{instance=~"$node"}[$__rate_interval]))`, `sum by (instance)(rate(strata_data_node_read_ops_total{instance=~"$node"}[$__rate_interval]))`.
+- Group-commit force/s by node: `sum by (instance)(rate(strata_data_node_groupcommit_force_total{instance=~"$node"}[$__rate_interval]))`.
+- Avg bytes per append: `sum by (instance)(rate(strata_data_node_append_bytes_total{instance=~"$node"}[$__rate_interval])) / clamp_min(sum by (instance)(rate(strata_data_node_append_ops_total{instance=~"$node"}[$__rate_interval])), 1)` bytes.
 - Avg bytes per read: same shape with `read_bytes`/`read_ops` bytes.
-- Appends per fsync: `sum by (instance)(rate(strata_node_append_ops_total{instance=~"$node"}[$__rate_interval])) / clamp_min(sum by (instance)(rate(strata_node_groupcommit_force_total{instance=~"$node"}[$__rate_interval])), 1)` short.
+- Appends per fsync: `sum by (instance)(rate(strata_data_node_append_ops_total{instance=~"$node"}[$__rate_interval])) / clamp_min(sum by (instance)(rate(strata_data_node_groupcommit_force_total{instance=~"$node"}[$__rate_interval])), 1)` short.
 
 Row **Requests on this node (RED)** — filter `{instance=~"$node", opcode=~"$opcode"}`:
 - Request rate by opcode (timeseries `h:8,w:12`): `sum by (opcode)(rate(strata_scp_request_duration_seconds_count{instance=~"$node",opcode=~"$opcode"}[$__rate_interval]))` reqps.
@@ -519,11 +519,11 @@ python3 - <<'PY'
 import json, re, glob, sys
 known = {
  "strata_chunks_unavailable","strata_chunks_under_replicated","strata_chunks_at_min_redundancy",
- "strata_repair_inflight","strata_repair_backlog","strata_nodes","strata_meta_is_leader",
- "strata_meta_zk_connected","strata_node_registered","strata_node_disk_used_bytes",
- "strata_node_capacity_bytes","strata_node_capacity_used_ratio","strata_node_chunks",
- "strata_node_groupcommit_force_total","strata_node_append_ops_total","strata_node_append_bytes_total",
- "strata_node_read_ops_total","strata_node_read_bytes_total",
+ "strata_repair_inflight","strata_repair_backlog","strata_data_nodes","strata_controller_is_leader",
+ "strata_controller_zk_connected","strata_data_node_registered","strata_data_node_disk_used_bytes",
+ "strata_data_node_capacity_bytes","strata_data_node_capacity_used_ratio","strata_data_node_chunks",
+ "strata_data_node_groupcommit_force_total","strata_data_node_append_ops_total","strata_data_node_append_bytes_total",
+ "strata_data_node_read_ops_total","strata_data_node_read_bytes_total",
  "strata_scp_request_duration_seconds_bucket","strata_scp_request_duration_seconds_count",
  "strata_scp_request_duration_seconds_sum",
  "jvm_memory_used_bytes","jvm_memory_committed_bytes","jvm_memory_max_bytes",
@@ -584,11 +584,11 @@ Only if Docker + a built image are available:
 ./scripts/build-image.sh
 docker compose up -d
 sleep 30
-docker compose run --rm --no-deps loadgen perf --meta node1:9100 --workload write --duration 20 || true
-docker compose exec node1 sh -c 'wget -qO- localhost:9300/metrics | grep -E "strata_node_read_(bytes|ops)_total|strata_node_append_bytes_total"'
+docker compose run --rm --no-deps loadgen perf --controller node1:9100 --workload write --duration 20 || true
+docker compose exec node1 sh -c 'wget -qO- localhost:9300/metrics | grep -E "strata_data_node_read_(bytes|ops)_total|strata_data_node_append_bytes_total"'
 docker compose down
 ```
-Expected: lines for `strata_node_read_bytes_total` and `strata_node_read_ops_total` appear.
+Expected: lines for `strata_data_node_read_bytes_total` and `strata_data_node_read_ops_total` appear.
 
 - [ ] **Step 5: Commit (if any fixes were needed)**
 
@@ -605,7 +605,7 @@ git commit -m "Fix dashboard lint/provisioning issues" || echo "nothing to fix"
 
 - [ ] **Step 1: Refresh the memory note**
 
-Update `observability.md` in the memory directory so it reflects three dashboards (Cluster / Node with `$node`+`$opcode` selectors / JVM) and the new `strata_node_read_bytes_total` + `strata_node_read_ops_total` counters. (Do this via the memory Write tool, not a repo commit.)
+Update `observability.md` in the memory directory so it reflects three dashboards (Cluster / Node with `$node`+`$opcode` selectors / JVM) and the new `strata_data_node_read_bytes_total` + `strata_data_node_read_ops_total` counters. (Do this via the memory Write tool, not a repo commit.)
 
 ---
 
@@ -622,4 +622,4 @@ Update `observability.md` in the memory directory so it reflects three dashboard
 
 **Placeholder scan:** code steps show full code; dashboard steps give exact PromQL + JSON fragment templates + sizes; verification gives runnable scripts with expected output. No TBD/TODO. ✅
 
-**Type/name consistency:** `readOps()`/`readBytes()` used identically across ChunkStore (Task 1) → StorageNode (Task 2) → `StorageNode::readOps`/`::readBytes` (Task 3). Prometheus names `strata_node_read_ops_total`/`strata_node_read_bytes_total` match the metric lint allowlist (Task 8) and the dashboard queries (Tasks 4–5). uid `strata-overview` (Task 4) matches the deleted file's uid (Task 7) and the drill-down targets `strata-node`/`strata-jvm`. ✅
+**Type/name consistency:** `readOps()`/`readBytes()` used identically across ChunkStore (Task 1) → StorageNode (Task 2) → `StorageNode::readOps`/`::readBytes` (Task 3). Prometheus names `strata_data_node_read_ops_total`/`strata_data_node_read_bytes_total` match the metric lint allowlist (Task 8) and the dashboard queries (Tasks 4–5). uid `strata-overview` (Task 4) matches the deleted file's uid (Task 7) and the drill-down targets `strata-node`/`strata-jvm`. ✅

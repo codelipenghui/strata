@@ -15,6 +15,14 @@
       <artifactId>strata-proto</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <!-- The namespace-log backend stores each namespace's metadata log as a replicated Strata file,
+         reusing the client's append/seal/recovery machinery (design §5, §8). strata-client depends only
+         on strata-proto, so this edge is acyclic. -->
+    <dependency>
+      <groupId>io.strata</groupId>
+      <artifactId>strata-client</artifactId>
+      <version>${project.version}</version>
+    </dependency>
     <dependency>
       <groupId>org.apache.curator</groupId>
       <artifactId>curator-framework</artifactId>

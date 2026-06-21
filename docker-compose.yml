@@ -1,8 +1,8 @@
 # A runnable single-host Strata cluster: ZooKeeper + a 3-node fleet where each node runs in
 # `combined` mode — one SCP listener (:9100) serving BOTH the data plane and a co-resident metadata
-# service (routed by opcode). One node is elected metadata leader; the others are warm standbys, and
-# clients reach the leader via the NOT_LEADER redirect. There is no separate strata-meta to deploy —
-# the metadata plane scales with the nodes. Clients run inside the cluster network (e.g. the loadgen)
+# service (routed by opcode). One node is elected controller leader; the others are warm standbys, and
+# clients reach the leader via the NOT_LEADER redirect. There is no separate controller to deploy —
+# the control plane scales with the nodes. Clients run inside the cluster network (e.g. the loadgen)
 # and reach nodes by name, following the redirect to the leader, so no port is published to the host.
 #
 #   ./scripts/build-image.sh     # packages the jar + builds strata-server:local
@@ -38,8 +38,8 @@ services:
       timeout: 3s
       retries: 10
 
-  # Each node is `combined`: a StorageNode + a MetadataService sharing one SCP listener (:9100) in one
-  # process. STRATA_META_ENDPOINTS lists all three nodes at that port, so each node and any in-cluster
+  # Each node is `combined`: a DataNode + a Controller sharing one SCP listener (:9100) in one
+  # process. STRATA_CONTROLLER_ENDPOINTS lists all three nodes at that port, so each node and any in-cluster
   # client find the current leader (one hop, via the redirect). STRATA_ADVERTISED_HOST is the name
   # peers resolve and is also the leader's NOT_LEADER redirect hint.
   node1:
@@ -47,7 +47,18 @@ services:
     command: ["combined"]
     environment:
       STRATA_ZK_CONNECT: "zookeeper:2181"
-      STRATA_META_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
+      STRATA_CONTROLLER_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
+      # Default to the scalable namespace-log metadata backend with namespace sharding ON: each node owns
+      # a shard of namespaces (rendezvous-hash) and forwards non-owned metadata ops to the owner. Override
+      # any of these to "zk"/"false" to fall back to the single-leader in-ZooKeeper store.
+      STRATA_CONTROLLER_BACKEND: "${STRATA_CONTROLLER_BACKEND:-namespace-log}"
+      STRATA_CONTROLLER_SHARDING: "${STRATA_CONTROLLER_SHARDING:-true}"
+      STRATA_CONTROLLER_LOG_RF: "${STRATA_CONTROLLER_LOG_RF:-3}"
+      STRATA_CONTROLLER_LOG_ACK: "${STRATA_CONTROLLER_LOG_ACK:-2}"
+      # Metadata-log durability is by replication (RF/ack), not single-node fsync — page-cache durable on the
+      # ack quorum (crash-safe; disk-durable shortly via background writeback), matching the data plane.
+      # Set true to fsync every metadata append (correlated-power-loss safe, much slower under data load).
+      STRATA_CONTROLLER_LOG_FSYNC: "${STRATA_CONTROLLER_LOG_FSYNC:-false}"
       STRATA_LISTEN_PORT: "9100"
       STRATA_HEARTBEAT_INTERVAL_MS: "${STRATA_HEARTBEAT_INTERVAL_MS:-3000}"
       STRATA_REPAIR_SCAN_INTERVAL_MS: "${STRATA_REPAIR_SCAN_INTERVAL_MS:-5000}"
@@ -82,7 +93,18 @@ services:
     command: ["combined"]
     environment:
       STRATA_ZK_CONNECT: "zookeeper:2181"
-      STRATA_META_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
+      STRATA_CONTROLLER_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
+      # Default to the scalable namespace-log metadata backend with namespace sharding ON: each node owns
+      # a shard of namespaces (rendezvous-hash) and forwards non-owned metadata ops to the owner. Override
+      # any of these to "zk"/"false" to fall back to the single-leader in-ZooKeeper store.
+      STRATA_CONTROLLER_BACKEND: "${STRATA_CONTROLLER_BACKEND:-namespace-log}"
+      STRATA_CONTROLLER_SHARDING: "${STRATA_CONTROLLER_SHARDING:-true}"
+      STRATA_CONTROLLER_LOG_RF: "${STRATA_CONTROLLER_LOG_RF:-3}"
+      STRATA_CONTROLLER_LOG_ACK: "${STRATA_CONTROLLER_LOG_ACK:-2}"
+      # Metadata-log durability is by replication (RF/ack), not single-node fsync — page-cache durable on the
+      # ack quorum (crash-safe; disk-durable shortly via background writeback), matching the data plane.
+      # Set true to fsync every metadata append (correlated-power-loss safe, much slower under data load).
+      STRATA_CONTROLLER_LOG_FSYNC: "${STRATA_CONTROLLER_LOG_FSYNC:-false}"
       STRATA_LISTEN_PORT: "9100"
       STRATA_HEARTBEAT_INTERVAL_MS: "${STRATA_HEARTBEAT_INTERVAL_MS:-3000}"
       STRATA_REPAIR_SCAN_INTERVAL_MS: "${STRATA_REPAIR_SCAN_INTERVAL_MS:-5000}"
@@ -108,7 +130,18 @@ services:
     command: ["combined"]
     environment:
       STRATA_ZK_CONNECT: "zookeeper:2181"
-      STRATA_META_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
+      STRATA_CONTROLLER_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
+      # Default to the scalable namespace-log metadata backend with namespace sharding ON: each node owns
+      # a shard of namespaces (rendezvous-hash) and forwards non-owned metadata ops to the owner. Override
+      # any of these to "zk"/"false" to fall back to the single-leader in-ZooKeeper store.
+      STRATA_CONTROLLER_BACKEND: "${STRATA_CONTROLLER_BACKEND:-namespace-log}"
+      STRATA_CONTROLLER_SHARDING: "${STRATA_CONTROLLER_SHARDING:-true}"
+      STRATA_CONTROLLER_LOG_RF: "${STRATA_CONTROLLER_LOG_RF:-3}"
+      STRATA_CONTROLLER_LOG_ACK: "${STRATA_CONTROLLER_LOG_ACK:-2}"
+      # Metadata-log durability is by replication (RF/ack), not single-node fsync — page-cache durable on the
+      # ack quorum (crash-safe; disk-durable shortly via background writeback), matching the data plane.
+      # Set true to fsync every metadata append (correlated-power-loss safe, much slower under data load).
+      STRATA_CONTROLLER_LOG_FSYNC: "${STRATA_CONTROLLER_LOG_FSYNC:-false}"
       STRATA_LISTEN_PORT: "9100"
       STRATA_HEARTBEAT_INTERVAL_MS: "${STRATA_HEARTBEAT_INTERVAL_MS:-3000}"
       STRATA_REPAIR_SCAN_INTERVAL_MS: "${STRATA_REPAIR_SCAN_INTERVAL_MS:-5000}"
@@ -159,12 +192,12 @@ services:
 
   # One-off load generator — does NOT start with `up` (profile-gated). Runs on the cluster network so
   # it resolves node names and follows leader redirects. Use scripts/perf.sh, or:
-  #   docker compose run --rm --no-deps loadgen perf --meta node1:9100 --duration 300
+  #   docker compose run --rm --no-deps loadgen perf --controller node1:9100 --duration 300
   loadgen:
     <<: *strata
     profiles: ["tools"]
     restart: "no"
-    command: ["perf", "--meta", "node1:9100"]
+    command: ["perf", "--controller", "node1:9100"]
 
 volumes:
   node1-data:

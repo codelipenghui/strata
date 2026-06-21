@@ -7,6 +7,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.FileState;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -22,26 +23,29 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BiFunction;
 
 /**
- * v0 metadata service (tech design §4.4): ZooKeeper-backed MetadataStore behind the same SCP
+ * v0 controller (tech design §4.4): ZooKeeper-backed MetadataStore behind the same SCP
  * surface the v1 KRaft backend will serve. Single active leader (Curator LeaderLatch);
  * non-leaders answer NOT_LEADER. Placement, leases, repair, and retention orchestration live here.
  */
-public final class MetadataService implements AutoCloseable {
-    private static final Logger log = LoggerFactory.getLogger(MetadataService.class);
+public final class Controller implements AutoCloseable {
+    private static final Logger log = LoggerFactory.getLogger(Controller.class);
     /** Optimistic-concurrency retry bound, shared with RepairCoordinator's descriptor CAS loops. */
     static final int CAS_RETRIES = 5;
 
-    private final MetaConfig config;
+    private final ControllerConfig config;
     private final MetadataStore store;
+    private final ZkMetadataStore rootZk; // the consensus root (latch + ZK metrics), under any backend
     private final NodeRegistry registry;
     private final RepairCoordinator repair;
     private final ScpServer server;
     private final LeaderLatch leaderLatch;
     private final String advertisedEndpoint;  // this node's reachable host:port — the leader hint clients redirect to
+    private final NamespaceOwnership ownership; // resolves the controller owner of each namespace (design §6)
 
-    public MetadataService(MetaConfig config) throws Exception {
+    public Controller(ControllerConfig config) throws Exception {
         this(config, null);
     }
 
@@ -51,7 +55,18 @@ public final class MetadataService implements AutoCloseable {
      * port), and {@code advertisedEndpoint} is that listener's reachable host:port (the NOT_LEADER
      * redirect hint). Null = standalone: bind an own server on {@code config.listenPort()}.
      */
-    public MetadataService(MetaConfig config, String advertisedEndpoint) throws Exception {
+    public Controller(ControllerConfig config, String advertisedEndpoint) throws Exception {
+        this(config, advertisedEndpoint, defaultBackendFactory());
+    }
+
+    /**
+     * Advanced/test hook: the metadata-store backend is supplied as a function of the ZooKeeper root
+     * store. The consensus root (leader latch, node registry, sharding root) is always ZooKeeper; the
+     * factory chooses whether file/path metadata is served from ZooKeeper directly (default) or from the
+     * namespace-log backend wrapping that same root (design §16 Step 3).
+     */
+    Controller(ControllerConfig config, String advertisedEndpoint,
+                    BiFunction<ZkMetadataStore, String, MetadataStore> backendFactory) throws Exception {
         this.config = config;
         boolean embedded = advertisedEndpoint != null;
         ZkMetadataStore openedStore = null;
@@ -61,7 +76,6 @@ public final class MetadataService implements AutoCloseable {
         try {
             openedStore = new ZkMetadataStore(config.zkConnect(),
                     config.zkSessionTimeoutMs(), config.zkConnectionTimeoutMs());
-            NodeRegistry openedRegistry = new NodeRegistry(openedStore, config);
             UUID serviceId = UUID.randomUUID();
 
             if (embedded) {
@@ -75,14 +89,34 @@ public final class MetadataService implements AutoCloseable {
                         serviceId.getMostSignificantBits(), serviceId.getLeastSignificantBits(), this::handle);
                 this.advertisedEndpoint = config.advertisedHost() + ":" + openedServer.port();
             }
+            // Build the backend once the endpoint is known: the namespace-log backend's system-file store
+            // connects an embedded client back to this node's own endpoint to store metadata-log bytes as
+            // replicated Strata chunks (design §5, §8).
+            MetadataStore backendStore = backendFactory.apply(openedStore, this.advertisedEndpoint);
+            NodeRegistry openedRegistry = new NodeRegistry(backendStore, config);
             openedLatch = new LeaderLatch(openedStore.curator(), "/strata/leader", this.advertisedEndpoint);
-            openedRepair = new RepairCoordinator(openedStore, openedRegistry, config, openedLatch::hasLeadership);
+            // Static rendezvous ownership over the configured controller endpoints (design §6.1). With an
+            // empty/single-endpoint membership this node owns every namespace (no behavior change).
+            NamespaceOwnership openedOwnership = new NamespaceOwnership(this.advertisedEndpoint,
+                    config.controllerEndpoints(), 0, config.controllerReplicaCount());
+            // Repair's orphan-deletion is gated on owning every namespace (a sharded controller never
+            // deletes an inventory chunk owned by another controller node), and a non-controller owner heals
+            // only the namespaces it owns via the direct EXEC_REPLICATE pass.
+            openedRepair = new RepairCoordinator(backendStore, openedRegistry, config,
+                    openedLatch::hasLeadership, openedOwnership::ownsAll, openedOwnership::isOwner);
 
-            this.store = openedStore;
+            this.store = backendStore;
+            this.rootZk = openedStore;
             this.registry = openedRegistry;
             this.server = openedServer;
             this.leaderLatch = openedLatch;
             this.repair = openedRepair;
+            this.ownership = openedOwnership;
+            // Eager namespace recovery on the namespace-log backend is scoped to the namespaces this
+            // node owns, so it never republishes (and fences) another owner's namespace.
+            if (backendStore instanceof NamespaceLogMetadataStore namespaceLog) {
+                namespaceLog.setOwnership(openedOwnership::isOwner);
+            }
 
             openedLatch.start();
             openedRepair.start();
@@ -93,7 +127,7 @@ public final class MetadataService implements AutoCloseable {
             }
             throw e;
         }
-        log.info("metadata service started ({}) on {} (zk {})",
+        log.info("controller started ({}) on {} (zk {})",
                 embedded ? "embedded" : "standalone", this.advertisedEndpoint, config.zkConnect());
     }
 
@@ -132,6 +166,54 @@ public final class MetadataService implements AutoCloseable {
         return failure;
     }
 
+    /**
+     * The backend factory selected by environment: {@code STRATA_CONTROLLER_BACKEND=namespace-log} stores
+     * each namespace's file/path metadata in a per-namespace metadata log whose bytes are replicated
+     * Strata chunks (a {@link StrataSystemMetadataFileStore}, RF/ack from {@code STRATA_CONTROLLER_LOG_RF}
+     * / {@code STRATA_CONTROLLER_LOG_ACK}; durability is by replication, so fsync-per-append is off by
+     * default and gated by {@code STRATA_CONTROLLER_LOG_FSYNC}); anything else uses the ZooKeeper store
+     * directly (the default).
+     */
+    private static BiFunction<ZkMetadataStore, String, MetadataStore> defaultBackendFactory() {
+        String backend = setting("STRATA_CONTROLLER_BACKEND", "strata.controller.backend", "zk");
+        if (!"namespace-log".equalsIgnoreCase(backend)) {
+            return (root, endpoint) -> root;
+        }
+        int replicationFactor = intSetting("STRATA_CONTROLLER_LOG_RF", "strata.controller.log.rf", 3);
+        int ackQuorum = intSetting("STRATA_CONTROLLER_LOG_ACK", "strata.controller.log.ack", 2);
+        // Durability by replication (RF/ack); per-append fsync off by default — see StrataSystemMetadataFileStore.
+        boolean logFsync = boolSetting("STRATA_CONTROLLER_LOG_FSYNC", "strata.controller.log.fsync", false);
+        return (root, endpoint) -> new NamespaceLogMetadataStore(new NamespaceLogBackend(
+                root, new StrataSystemMetadataFileStore(() -> endpoint, replicationFactor, ackQuorum, logFsync),
+                true));
+    }
+
+    /** Reads an environment variable, falling back to a JVM system property (settable in tests). */
+    private static String setting(String envName, String propName, String fallback) {
+        String value = System.getenv(envName);
+        if (value == null || value.isBlank()) {
+            value = System.getProperty(propName);
+        }
+        return value == null || value.isBlank() ? fallback : value;
+    }
+
+    private static int intSetting(String envName, String propName, int fallback) {
+        String value = setting(envName, propName, null);
+        if (value == null) {
+            return fallback;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    private static boolean boolSetting(String envName, String propName, boolean fallback) {
+        String value = setting(envName, propName, null);
+        return value == null ? fallback : Boolean.parseBoolean(value.trim());
+    }
+
     public int port() {
         return server != null ? server.port() : -1;  // -1 in embedded mode (served on the host's port)
     }
@@ -154,22 +236,80 @@ public final class MetadataService implements AutoCloseable {
 
     /** Whether ZooKeeper is reachable; a LOST connection freezes all metadata mutations. */
     public boolean zkConnected() {
-        return !(store instanceof ZkMetadataStore zk) || zk.isConnected();
+        return rootZk.isConnected();
     }
 
-    /** The metadata-store backend identifier (the {@code backend} metric label), e.g. {@code zk}. */
+    /** The metadata-store backend identifier (the {@code backend} metric label). */
     public String metadataBackend() {
-        return store instanceof ZkMetadataStore ? "zk" : "none";
+        return store instanceof NamespaceLogMetadataStore ? "namespace-log" : "zk";
     }
 
-    /** Metadata-store requests this service has issued against a {@code /strata} subtree, by op kind. */
-    public long metaStoreOps(String subtree, boolean write) {
-        return store instanceof ZkMetadataStore zk ? zk.zkOps(subtree, write) : 0;
+    /** 1 if the namespace-log backend is active (file/path metadata stored as replicated Strata files). */
+    public boolean namespaceLogActive() {
+        return store instanceof NamespaceLogMetadataStore;
     }
 
-    /** Metadata-store payload bytes this service has read/written against a {@code /strata} subtree. */
-    public long metaStoreBytes(String subtree, boolean write) {
-        return store instanceof ZkMetadataStore zk ? zk.zkBytes(subtree, write) : 0;
+    /**
+     * The configured controller-endpoint membership size — the number of controllers that share the
+     * namespaces (rendezvous-hash owners). Same on every node; {@code max()} across the fleet is the
+     * controller-server count. Backend-independent (sharding is keyed on endpoint count, not the store kind).
+     */
+    public int controllerEndpointsConfigured() {
+        return ownership.eligibleEndpoints().size();
+    }
+
+    /** 1 if namespaces are sharded across multiple controllers (multi-endpoint); 0 = single global leader. */
+    public boolean shardingActive() {
+        return !ownership.ownsAll();
+    }
+
+    /** Namespaces this instance owns a live metadata-log repository for (sharding load); 0 under ZK. */
+    public int loadedNamespaces() {
+        return store instanceof NamespaceLogMetadataStore log ? log.loadedNamespaceCount() : 0;
+    }
+
+    /**
+     * Per-namespace stats for the namespaces this controller owns: {@code namespace -> [liveFiles,
+     * openLogBytes]}. Empty under the ZK backend. For the per-namespace dashboard panels (namespace-
+     * stacked) — cardinality grows with the namespace count, so it is namespace-log + control-plane only.
+     */
+    public java.util.Map<String, long[]> namespaceStats() {
+        if (!(store instanceof NamespaceLogMetadataStore log)) {
+            return java.util.Map.of();
+        }
+        java.util.Map<String, long[]> out = new java.util.HashMap<>();
+        log.namespaceStats().forEach((ns, stat) -> out.put(ns.value(), stat));
+        return out;
+    }
+
+    /** Metadata-log records appended ({@code rate()} = metadata-mutation ops/s); 0 under ZK. */
+    public long metadataLogAppendRecords() {
+        return store instanceof NamespaceLogMetadataStore log ? log.metrics().appendRecords() : 0L;
+    }
+
+    /** Metadata-log bytes appended ({@code rate()} = metadata write throughput); 0 under ZK. */
+    public long metadataLogAppendBytes() {
+        return store instanceof NamespaceLogMetadataStore log ? log.metrics().appendBytes() : 0L;
+    }
+
+    /** Metadata-log snapshot+roll compactions; cadence of open-log truncation; 0 under ZK. */
+    public long metadataLogCompactions() {
+        return store instanceof NamespaceLogMetadataStore log ? log.metrics().compactions() : 0L;
+    }
+
+    /** Namespace repositories (re)opened from a manifest; a spike = failover/restart churn; 0 under ZK. */
+    public long metadataLogRecoveries() {
+        return store instanceof NamespaceLogMetadataStore log ? log.metrics().recoveries() : 0L;
+    }
+
+    /** Consensus-root requests this service has issued against a {@code /strata} subtree, by op kind. */
+    public long metadataStoreOps(String subtree, boolean write) {
+        return rootZk.zkOps(subtree, write);
+    }
+
+    /** Consensus-root payload bytes this service has read/written against a {@code /strata} subtree. */
+    public long metadataStoreBytes(String subtree, boolean write) {
+        return rootZk.zkBytes(subtree, write);
     }
 
     /** SEALED chunks below their replication factor (last reconciliation scan). */
@@ -223,7 +363,7 @@ public final class MetadataService implements AutoCloseable {
     private void requireLeader() {
         LeaderLatch latch = this.leaderLatch;
         if (latch == null || !latch.hasLeadership()) {
-            throw new ScpException(ErrorCode.NOT_LEADER, "not the metadata leader", 0, leaderHint());
+            throw new ScpException(ErrorCode.NOT_LEADER, "not the controller leader", 0, leaderHint());
         }
     }
 
@@ -248,27 +388,91 @@ public final class MetadataService implements AutoCloseable {
         }
     }
 
+    /**
+     * Gate a namespace-scoped op (design §6): the controller owner serves; a non-owner is redirected with a
+     * NOT_LEADER hint pointing at the owner endpoint. A non-sharded (single-endpoint) deployment falls
+     * back to the global leader latch, so single-leader behavior is unchanged.
+     */
+    private void requireNamespaceOwner(StrataNamespace namespace) {
+        if (NamespaceLogBackend.isSystem(namespace)) {
+            // Metadata-log system files live in the shared ZK root (CAS-guarded), so any node may serve
+            // them — a non-controller owner writes its own namespace's metadata-log files here.
+            return;
+        }
+        if (ownership.ownsAll()) {
+            requireLeader();
+            return;
+        }
+        if (!ownership.isOwner(namespace)) {
+            // Redirect to the namespace's owner; the owner-aware client caches namespace->owner and
+            // routes directly, re-resolving only on this exception (an ownership change) (design §6).
+            throw new ScpException(ErrorCode.NOT_LEADER,
+                    "namespace " + namespace + " is owned by another controller", 0,
+                    ownership.ownerOf(namespace));
+        }
+    }
+
+    /**
+     * The same ownership gate for a file-scoped op, resolving the file's namespace from the shared
+     * root store. An unknown file falls through so the op itself surfaces FILE_NOT_FOUND, exactly as
+     * the non-sharded path does.
+     */
+    private void requireNamespaceOwnerForFile(FileId fileId) throws Exception {
+        if (ownership.ownsAll()) {
+            requireLeader();
+            return;
+        }
+        StrataNamespace ns = fileNamespace(fileId);
+        if (ns == null) {
+            return; // unknown file — let the op surface FILE_NOT_FOUND, as the non-sharded path does
+        }
+        requireNamespaceOwner(ns);
+    }
+
+    /**
+     * The owning namespace of a file, for ownership routing: from the local store if this node holds the
+     * file, else from the global {@code fileId -> namespace} index (a non-owner has no local copy, since
+     * the record lives in the owner's namespace-log). Null = the file is unknown everywhere.
+     */
+    private StrataNamespace fileNamespace(FileId fileId) throws Exception {
+        var local = store.getFile(fileId);
+        if (local.isPresent()) {
+            return local.get().value().namespace();
+        }
+        return rootZk.getFileNamespace(fileId).orElse(null);
+    }
+
+    /** Test/inspection hook: this node's namespace-ownership resolver. */
+    NamespaceOwnership ownership() {
+        return ownership;
+    }
+
     private Frame handle(Frame req) throws Exception {
         Opcode op = Opcode.fromCode(req.opcode());
         if (op == null) throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "0x" + Integer.toHexString(req.opcode()));
         ByteBuffer h = req.headerSlice();
-        requireLeader();
         return switch (op) {
-            case PING -> ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
+            case PING -> {
+                requireLeader();
+                yield ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
+            }
 
-            /* ---- storage-node control (tech design §10.4) ---- */
+            /* ---- data-node control (tech design §10.4): cluster-controller scope, global latch ---- */
 
             case REGISTER_NODE -> {
+                requireLeader();
                 var m = Messages.RegisterNode.decode(h);
                 yield ScpServer.ok(req, registry.register(m).encode(), null);
             }
 
             case NODE_HEARTBEAT -> {
+                requireLeader();
                 var m = Messages.NodeHeartbeat.decode(h);
                 yield ScpServer.ok(req, registry.heartbeat(m, repair::onCommandCompletedAsync).encode(), null);
             }
 
             case INVENTORY_REPORT -> {
+                requireLeader();
                 var m = Messages.InventoryReport.decode(h);
                 repair.onInventory(m);
                 yield ScpServer.ok(req, Messages.okHeader(), null);
@@ -278,35 +482,41 @@ public final class MetadataService implements AutoCloseable {
 
             case CREATE_FILE -> {
                 var m = Messages.CreateFile.decode(h);
+                requireNamespaceOwner(m.namespace());
                 FileId id = createFile(m);
                 yield ScpServer.ok(req, new Messages.CreateFileResp(id).encode(), null);
             }
 
             case CREATE_CHUNK -> {
                 var m = Messages.CreateChunk.decode(h);
+                requireNamespaceOwnerForFile(m.fileId());
                 yield ScpServer.ok(req, createChunk(m).encode(), null);
             }
 
             case ALLOCATE_WRITER_EPOCH -> {
                 var m = Messages.AllocateWriterEpoch.decode(h);
+                requireNamespaceOwnerForFile(m.fileId());
                 yield ScpServer.ok(req, new Messages.AllocateWriterEpochResp(allocateWriterEpoch(m)).encode(),
                         null);
             }
 
             case SEAL_CHUNK_META -> {
                 var m = Messages.SealChunkMeta.decode(h);
+                requireNamespaceOwnerForFile(m.chunkId().fileId());
                 sealChunk(m);
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
 
             case ABORT_CHUNK_META -> {
                 var m = Messages.AbortChunkMeta.decode(h);
+                requireNamespaceOwnerForFile(m.chunkId().fileId());
                 abortChunk(m);
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
 
             case SEAL_FILE -> {
                 var m = Messages.SealFile.decode(h);
+                requireNamespaceOwnerForFile(m.fileId());
                 // a file seals only when every chunk is sealed and the lengths add up — a stale
                 // or buggy client must not freeze a file mid-write (validated under CAS, so it
                 // is race-free against concurrent chunk creates)
@@ -344,20 +554,28 @@ public final class MetadataService implements AutoCloseable {
 
             case LOOKUP_FILE -> {
                 var m = Messages.LookupFile.decode(h);
+                requireNamespaceOwnerForFile(m.fileId());
                 yield ScpServer.ok(req, lookup(m.fileId()).encode(), null);
             }
 
             case LOOKUP_PATH -> {
                 var m = Messages.LookupPath.decode(h);
+                requireNamespaceOwner(m.namespace());
                 yield ScpServer.ok(req, new Messages.LookupPathResp(lookupPath(m.namespace(), m.path())).encode(),
                         null);
             }
 
             case DELETE_FILES -> {
                 var m = Messages.DeleteFiles.decode(h);
+                if (ownership.ownsAll()) {
+                    requireLeader(); // non-sharded: a non-leader rejects the whole op (unchanged behavior)
+                }
                 List<Short> codes = new ArrayList<>();
                 for (FileId id : m.fileIds()) {
                     try {
+                        if (!ownership.ownsAll()) {
+                            requireNamespaceOwnerForFile(id); // sharded: a file owned elsewhere redirects per entry
+                        }
                         markDeleting(id);
                         repair.driveDeletionSoon(id); // prompt reclaim, but don't block metadata delete responses
                         codes.add(ErrorCode.OK.code);
@@ -408,6 +626,7 @@ public final class MetadataService implements AutoCloseable {
                     policy.replicationFactor(), policy.ackQuorum(), policy.fsyncOnAck(),
                     FileState.OPEN, System.currentTimeMillis(), List.of(),
                     m.opIdMsb(), m.opIdLsb()));
+            indexFileNamespace(m.fileId(), m.namespace());
             return m.fileId();
         } catch (KeeperException.NodeExistsException e) {
             var existing = store.getFile(m.fileId());
@@ -415,6 +634,7 @@ public final class MetadataService implements AutoCloseable {
                 Records.FileRecord record = existing.get().value();
                 if (sameCreateRequest(record, m) && record.state() != FileState.DELETING
                         && pathStillOwnsCreate(record, m)) {
+                    indexFileNamespace(m.fileId(), m.namespace()); // idempotent on a create retry
                     return m.fileId();
                 }
                 throw new ScpException(ErrorCode.PRECONDITION_FAILED,
@@ -667,10 +887,27 @@ public final class MetadataService implements AutoCloseable {
                     throw new ScpException(ErrorCode.INTERNAL,
                             "path " + current.namespace() + ":" + current.path() + " is bound to a different file");
                 }
+                unindexFileNamespace(id); // drop the sharding owner-index entry once the file is deleting
                 return;
             }
         }
         throw new ScpException(ErrorCode.INTERNAL, "delete CAS exhausted");
+    }
+
+    /**
+     * Records {@code fileId -> namespace} for sharded owner resolution; no-op when not sharded, and
+     * skipped for system (metadata-log) files, which any node resolves locally from the ZK root.
+     */
+    private void indexFileNamespace(FileId fileId, StrataNamespace namespace) throws Exception {
+        if (!ownership.ownsAll() && !NamespaceLogBackend.isSystem(namespace)) {
+            rootZk.putFileNamespace(fileId, namespace);
+        }
+    }
+
+    private void unindexFileNamespace(FileId fileId) throws Exception {
+        if (!ownership.ownsAll()) {
+            rootZk.deleteFileNamespace(fileId);
+        }
     }
 
     @Override

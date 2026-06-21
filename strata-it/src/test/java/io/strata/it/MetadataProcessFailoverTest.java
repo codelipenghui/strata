@@ -8,8 +8,8 @@ import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.meta.ZkMetadataStore;
-import io.strata.node.NodeConfig;
-import io.strata.node.StorageNode;
+import io.strata.node.DataNodeConfig;
+import io.strata.node.DataNode;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -33,31 +33,31 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * OS-process crash coverage for the metadata control plane. This complements MiniCluster's
- * in-process metadata failover by killing the JVM that owns the active SCP metadata endpoint.
+ * in-process metadata failover by killing the JVM that owns the active SCP controller endpoint.
  */
 @Tag("chaos")
 class MetadataProcessFailoverTest {
 
     @Test
-    void clientAndStorageNodesRecoverAfterMetadataLeaderProcessCrashDuringChunkRoll() throws Exception {
+    void clientAndDataNodesRecoverAfterMetadataLeaderProcessCrashDuringChunkRoll() throws Exception {
         List<ExternalMetadata> metas = new ArrayList<>();
-        List<StorageNode> nodes = new ArrayList<>();
+        List<DataNode> nodes = new ArrayList<>();
         Path root = Files.createTempDirectory("strata-meta-process");
 
         try (TestingServer zk = new TestingServer(true)) {
             metas.add(startMetadata(zk.getConnectString(), "meta-a"));
             metas.add(startMetadata(zk.getConnectString(), "meta-b"));
-            List<String> metadataEndpoints = metas.stream().map(ExternalMetadata::endpoint).toList();
+            List<String> controllerEndpoints = metas.stream().map(ExternalMetadata::endpoint).toList();
 
-            String firstLeader = awaitLeader(metadataEndpoints);
+            String firstLeader = awaitLeader(controllerEndpoints);
             for (int i = 0; i < 3; i++) {
-                nodes.add(new StorageNode(NodeConfig.withMetadata(root.resolve("host-" + i),
-                        metadataEndpoints, "host-" + i)));
+                nodes.add(new DataNode(DataNodeConfig.withMetadata(root.resolve("host-" + i),
+                        controllerEndpoints, "host-" + i)));
             }
             awaitRegistered(zk.getConnectString(), 3);
 
-            ClientConfig config = new ClientConfig(metadataEndpoints, 512, 5_000)
-                    .withStorageConnectionsPerEndpoint(2);
+            ClientConfig config = new ClientConfig(controllerEndpoints, 512, 5_000)
+                    .withDataNodeConnectionsPerEndpoint(2);
             try (StrataClient client = StrataClient.connect(config)) {
                 FileId fileId = client.create(new StrataClient.FileSpec("test",
                         "/metadata-process-failover",
@@ -69,8 +69,8 @@ class MetadataProcessFailoverTest {
                     workload.appendAcked(appender, 0, 20);
 
                     kill(metadataByEndpoint(metas, firstLeader));
-                    String newLeader = awaitLeader(metadataEndpoints);
-                    assertFalse(firstLeader.equals(newLeader), "killed metadata endpoint remained leader");
+                    String newLeader = awaitLeader(controllerEndpoints);
+                    assertFalse(firstLeader.equals(newLeader), "killed controller endpoint remained leader");
 
                     workload.appendAcked(appender, 20, 80);
                     sealed = appender.seal();
@@ -79,11 +79,11 @@ class MetadataProcessFailoverTest {
                 assertEquals(workload.ackedBytes(), sealed.sealedLength(),
                         "metadata process failover sealed at a non-acked length");
                 workload.verifyAckedPrefix(client, fileId);
-                ConsistencyVerifier.assertSealedFileConsistent(metadataEndpoints, client, fileId,
+                ConsistencyVerifier.assertSealedFileConsistent(controllerEndpoints, client, fileId,
                         sealed.sealedLength());
             }
         } finally {
-            for (StorageNode node : nodes) {
+            for (DataNode node : nodes) {
                 try {
                     node.close();
                 } catch (Exception ignored) {
@@ -96,27 +96,27 @@ class MetadataProcessFailoverTest {
     }
 
     @Test
-    void clientSurvivesMetadataLeaderAndStorageReplicaProcessCrashInSameOpenSession() throws Exception {
+    void clientSurvivesMetadataLeaderAndDataNodeReplicaProcessCrashInSameOpenSession() throws Exception {
         List<ExternalMetadata> metas = new ArrayList<>();
-        List<ExternalStorage> storageNodes = new ArrayList<>();
+        List<ExternalDataNode> dataNodes = new ArrayList<>();
         Path root = Files.createTempDirectory("strata-combined-process");
 
         try (TestingServer zk = new TestingServer(true)) {
             metas.add(startMetadata(zk.getConnectString(), "combined-meta-a"));
             metas.add(startMetadata(zk.getConnectString(), "combined-meta-b"));
-            List<String> metadataEndpoints = metas.stream().map(ExternalMetadata::endpoint).toList();
+            List<String> controllerEndpoints = metas.stream().map(ExternalMetadata::endpoint).toList();
 
             for (int i = 0; i < 4; i++) {
-                storageNodes.add(startStorage(root.resolve("host-" + i), metadataEndpoints,
+                dataNodes.add(startDataNode(root.resolve("host-" + i), controllerEndpoints,
                         "combined-host-" + i));
             }
             awaitRegistered(zk.getConnectString(), 4);
 
-            ClientConfig config = new ClientConfig(metadataEndpoints, 512, 5_000)
-                    .withStorageConnectionsPerEndpoint(2);
+            ClientConfig config = new ClientConfig(controllerEndpoints, 512, 5_000)
+                    .withDataNodeConnectionsPerEndpoint(2);
             try (StrataClient client = StrataClient.connect(config)) {
                 FileId fileId = client.create(new StrataClient.FileSpec("test",
-                        "/metadata-and-storage-process-failover",
+                        "/metadata-and-data-node-process-failover",
                         StrataClient.WritePolicy.replicated(3, 2))).id();
                 Workload workload = new Workload();
                 StrataFile.SealInfo sealed;
@@ -125,28 +125,28 @@ class MetadataProcessFailoverTest {
                     workload.appendAcked(appender, 0, 20);
 
                     Messages.ChunkInfo openChunk = lastChunk(
-                            ConsistencyVerifier.lookupFile(metadataEndpoints, fileId));
-                    ExternalStorage storageVictim = storageByNodeId(storageNodes,
+                            ConsistencyVerifier.lookupFile(controllerEndpoints, fileId));
+                    ExternalDataNode dataNodeVictim = dataNodeByNodeId(dataNodes,
                             openChunk.replicas().get(0).nodeId());
-                    kill(storageVictim);
+                    kill(dataNodeVictim);
 
-                    String firstLeader = awaitLeader(metadataEndpoints);
+                    String firstLeader = awaitLeader(controllerEndpoints);
                     kill(metadataByEndpoint(metas, firstLeader));
-                    String newLeader = awaitLeader(metadataEndpoints);
-                    assertFalse(firstLeader.equals(newLeader), "killed metadata endpoint remained leader");
+                    String newLeader = awaitLeader(controllerEndpoints);
+                    assertFalse(firstLeader.equals(newLeader), "killed controller endpoint remained leader");
 
                     workload.appendAcked(appender, 20, 80);
                     sealed = appender.seal();
                 }
 
                 assertEquals(workload.ackedBytes(), sealed.sealedLength(),
-                        "combined metadata/storage process crash sealed at a non-acked length");
+                        "combined metadata/data-node process crash sealed at a non-acked length");
                 workload.verifyAckedPrefix(client, fileId);
-                ConsistencyVerifier.assertSealedFileConsistent(metadataEndpoints, client, fileId,
+                ConsistencyVerifier.assertSealedFileConsistent(controllerEndpoints, client, fileId,
                         sealed.sealedLength());
             }
         } finally {
-            for (ExternalStorage node : storageNodes) {
+            for (ExternalDataNode node : dataNodes) {
                 kill(node);
             }
             for (ExternalMetadata meta : metas) {
@@ -162,7 +162,7 @@ class MetadataProcessFailoverTest {
         String seedHex = Long.toUnsignedString(seed, 16);
         CorrectnessArtifact artifact = CorrectnessArtifact.create("process-stress-fault", seedHex);
         List<ExternalMetadata> metas = new ArrayList<>();
-        List<ExternalStorage> storageNodes = new ArrayList<>();
+        List<ExternalDataNode> dataNodes = new ArrayList<>();
 
         artifact.add("scenario=process-stress-fault",
                 "seed=" + seedHex,
@@ -170,24 +170,24 @@ class MetadataProcessFailoverTest {
                 "replayCommand=./scripts/verify.sh --skip-default --fault"
                         + " -Dtest=MetadataProcessFailoverTest#deterministicProcessFaultSchedulePreservesAckedBytes",
                 "writePolicy=rf3-aq2-fsynctrue",
-                "storageConnectionsPerEndpoint=2");
+                "dataNodeConnectionsPerEndpoint=2");
 
         try (TestingServer zk = new TestingServer(true)) {
             Path root = Files.createTempDirectory("strata-process-stress-fault");
             metas.add(startMetadata(zk.getConnectString(), "stress-meta-a"));
             metas.add(startMetadata(zk.getConnectString(), "stress-meta-b"));
-            List<String> metadataEndpoints = metadataEndpoints(metas);
-            artifact.add("initialMetadataEndpoints=" + metadataEndpoints);
+            List<String> controllerEndpoints = controllerEndpoints(metas);
+            artifact.add("initialMetadataEndpoints=" + controllerEndpoints);
 
             for (int i = 0; i < 4; i++) {
-                storageNodes.add(startStorage(root.resolve("host-" + i), metadataEndpoints,
+                dataNodes.add(startDataNode(root.resolve("host-" + i), controllerEndpoints,
                         "stress-host-" + i));
             }
             awaitRegistered(zk.getConnectString(), 4);
-            artifact.add("initialStorage=" + storageSummary(storageNodes));
+            artifact.add("initialDataNode=" + dataNodeSummary(dataNodes));
 
-            ClientConfig config = new ClientConfig(metadataEndpoints, 512, 10_000)
-                    .withStorageConnectionsPerEndpoint(2);
+            ClientConfig config = new ClientConfig(controllerEndpoints, 512, 10_000)
+                    .withDataNodeConnectionsPerEndpoint(2);
             try (StrataClient client = StrataClient.connect(config)) {
                 FileId fileId = client.create(new StrataClient.FileSpec("test",
                         "/process-stress-fault",
@@ -196,7 +196,7 @@ class MetadataProcessFailoverTest {
 
                 BinaryWorkload workload = new BinaryWorkload();
                 try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
-                    ExternalStorage killedStorage = null;
+                    ExternalDataNode killedDataNode = null;
 
                     try {
                         for (int batch = 0; batch < 12; batch++) {
@@ -210,58 +210,58 @@ class MetadataProcessFailoverTest {
 
                             if (batch == 2) {
                                 Messages.ChunkInfo openChunk = lastChunk(
-                                        ConsistencyVerifier.lookupFile(metadataEndpoints, fileId));
+                                        ConsistencyVerifier.lookupFile(controllerEndpoints, fileId));
                                 int victimReplica = random.nextInt(openChunk.replicas().size());
-                                killedStorage = storageByNodeId(storageNodes,
+                                killedDataNode = dataNodeByNodeId(dataNodes,
                                         openChunk.replicas().get(victimReplica).nodeId());
-                                artifact.add("fault=kill-storage-process batch=" + batch
-                                        + " nodeId=" + killedStorage.nodeId()
-                                        + " endpoint=" + killedStorage.endpoint()
+                                artifact.add("fault=kill-data-node-process batch=" + batch
+                                        + " nodeId=" + killedDataNode.nodeId()
+                                        + " endpoint=" + killedDataNode.endpoint()
                                         + " openChunk=" + openChunk.chunkId());
-                                kill(killedStorage);
+                                kill(killedDataNode);
                             }
 
                             if (batch == 4 || batch == 8) {
                                 workload.verifyOpenReadIsAckedPrefix(client, fileId,
                                         "process stress/fault batch " + batch);
                                 ConsistencyVerifier.assertLiveFileDescriptorConsistent(
-                                        metadataEndpoints, fileId);
+                                        controllerEndpoints, fileId);
                                 artifact.add("openReadVerifiedBatch=" + batch);
                                 artifact.add("liveDescriptorVerifiedBatch=" + batch);
                             }
 
                             if (batch == 5) {
-                                String oldLeader = awaitLeader(metadataEndpoints);
+                                String oldLeader = awaitLeader(controllerEndpoints);
                                 artifact.add("fault=kill-metadata-leader batch=" + batch
                                         + " endpoint=" + oldLeader);
                                 kill(metadataByEndpoint(metas, oldLeader));
-                                String newLeader = awaitLeader(metadataEndpoints);
+                                String newLeader = awaitLeader(controllerEndpoints);
                                 assertFalse(oldLeader.equals(newLeader),
-                                        "killed metadata endpoint remained leader");
+                                        "killed controller endpoint remained leader");
                                 artifact.add("metadataLeaderAfterFault=" + newLeader);
                             }
 
-                            if (batch == 7 && killedStorage != null) {
-                                ExternalStorage restarted = startStorage(killedStorage.dataDir(),
-                                        metadataEndpoints, killedStorage.host());
-                                assertEquals(killedStorage.nodeId(), restarted.nodeId(),
-                                        "node id changed after storage process restart");
-                                storageNodes.set(storageIndexByNodeId(storageNodes,
-                                        killedStorage.nodeId()), restarted);
-                                waitForAllReplicaEndpoints(metadataEndpoints, fileId,
-                                        storageMapByNodeId(storageNodes));
+                            if (batch == 7 && killedDataNode != null) {
+                                ExternalDataNode restarted = startDataNode(killedDataNode.dataDir(),
+                                        controllerEndpoints, killedDataNode.host());
+                                assertEquals(killedDataNode.nodeId(), restarted.nodeId(),
+                                        "node id changed after data-node process restart");
+                                dataNodes.set(dataNodeIndexByNodeId(dataNodes,
+                                        killedDataNode.nodeId()), restarted);
+                                waitForAllReplicaEndpoints(controllerEndpoints, fileId,
+                                        dataNodeMapByNodeId(dataNodes));
                                 ConsistencyVerifier.assertLiveFileDescriptorConsistent(
-                                        metadataEndpoints, fileId);
-                                artifact.add("fault=restarted-storage-process batch=" + batch
+                                        controllerEndpoints, fileId);
+                                artifact.add("fault=restarted-data-node-process batch=" + batch
                                         + " nodeId=" + restarted.nodeId()
                                         + " endpoint=" + restarted.endpoint());
-                                artifact.add("liveDescriptorVerifiedAfterStorageRestart=true");
+                                artifact.add("liveDescriptorVerifiedAfterDataNodeRestart=true");
                             }
                         }
 
-                        String leader = awaitLeader(metadataEndpoints);
+                        String leader = awaitLeader(controllerEndpoints);
                         artifact.add("leaderAvailableBeforeSeal=" + leader);
-                        ConsistencyVerifier.assertLiveFileDescriptorConsistent(metadataEndpoints, fileId);
+                        ConsistencyVerifier.assertLiveFileDescriptorConsistent(controllerEndpoints, fileId);
                         artifact.add("liveDescriptorVerifiedBeforeSeal=true");
                         StrataFile.SealInfo sealed = appender.seal();
                         assertEquals(workload.ackedBytes(), sealed.sealedLength(),
@@ -270,7 +270,7 @@ class MetadataProcessFailoverTest {
                         workload.verifySealedAckedPrefix(client, fileId, "process stress/fault");
                         Messages.LookupFileResp finalDescriptor =
                                 ConsistencyVerifier.waitForFullSealedFileConsistent(
-                                        metadataEndpoints, client, fileId, sealed.sealedLength());
+                                        controllerEndpoints, client, fileId, sealed.sealedLength());
                         artifact.add("sealedLength=" + sealed.sealedLength(),
                                 "finalAckedBytes=" + workload.ackedBytes(),
                                 "finalAckedSha256=" + workload.ackedSha256(),
@@ -288,7 +288,7 @@ class MetadataProcessFailoverTest {
             artifact.addFailure(t);
             throw t;
         } finally {
-            killAllStorage(storageNodes);
+            killAllDataNode(dataNodes);
             killAllMetadata(metas);
         }
     }
@@ -308,25 +308,25 @@ class MetadataProcessFailoverTest {
 
         List<ExternalMetadata> metas = new ArrayList<>();
         List<ExternalMetadata> restartedMetas = new ArrayList<>();
-        List<ExternalStorage> storageNodes = new ArrayList<>();
-        List<ExternalStorage> restartedStorageNodes = new ArrayList<>();
+        List<ExternalDataNode> dataNodes = new ArrayList<>();
+        List<ExternalDataNode> restartedDataNodes = new ArrayList<>();
         Path root = Files.createTempDirectory("strata-full-process-restart");
 
         try (TestingServer zk = new TestingServer(true)) {
             metas.add(startMetadata(zk.getConnectString(), "restart-meta-a"));
             metas.add(startMetadata(zk.getConnectString(), "restart-meta-b"));
-            List<String> metadataEndpoints = metadataEndpoints(metas);
-            artifact.add("initialMetadataEndpoints=" + metadataEndpoints);
+            List<String> controllerEndpoints = controllerEndpoints(metas);
+            artifact.add("initialMetadataEndpoints=" + controllerEndpoints);
 
             for (int i = 0; i < 4; i++) {
-                storageNodes.add(startStorage(root.resolve("host-" + i), metadataEndpoints,
+                dataNodes.add(startDataNode(root.resolve("host-" + i), controllerEndpoints,
                         "restart-host-" + i));
             }
             awaitRegistered(zk.getConnectString(), 4);
-            artifact.add("initialStorage=" + storageSummary(storageNodes));
+            artifact.add("initialDataNode=" + dataNodeSummary(dataNodes));
 
-            ClientConfig config = new ClientConfig(metadataEndpoints, 512, 10_000)
-                    .withStorageConnectionsPerEndpoint(2);
+            ClientConfig config = new ClientConfig(controllerEndpoints, 512, 10_000)
+                    .withDataNodeConnectionsPerEndpoint(2);
             FileId fileId;
             BinaryWorkload workload = new BinaryWorkload();
             StrataClient writer = StrataClient.connect(config);
@@ -339,11 +339,11 @@ class MetadataProcessFailoverTest {
                 abandoned = writer.openById(fileId).openForAppend();
                 workload.appendRandomBatch(abandoned, new Random(seed), 96);
 
-                Messages.LookupFileResp beforeRestart = ConsistencyVerifier.lookupFile(metadataEndpoints, fileId);
+                Messages.LookupFileResp beforeRestart = ConsistencyVerifier.lookupFile(controllerEndpoints, fileId);
                 Messages.ChunkInfo openTail = lastChunk(beforeRestart);
                 assertEquals(ChunkState.OPEN, openTail.state(), "restart scenario must leave an open tail");
                 workload.verifyOpenReadIsAckedPrefix(writer, fileId, context + " before restart");
-                ConsistencyVerifier.assertLiveFileDescriptorConsistent(metadataEndpoints, fileId);
+                ConsistencyVerifier.assertLiveFileDescriptorConsistent(controllerEndpoints, fileId);
                 artifact.add(
                         "ackedBytes=" + workload.ackedBytes(),
                         "ackedSha256=" + workload.ackedSha256(),
@@ -352,7 +352,7 @@ class MetadataProcessFailoverTest {
                         "liveDescriptorVerifiedBeforeCrash=true");
                 artifact.addDescriptor("beforeRestartDescriptor", beforeRestart);
 
-                killAllStorage(storageNodes);
+                killAllDataNode(dataNodes);
                 killAllMetadata(metas);
                 artifact.add("allProcessesKilled=true");
             } finally {
@@ -364,25 +364,25 @@ class MetadataProcessFailoverTest {
 
             restartedMetas.add(startMetadata(zk.getConnectString(), "restart-meta-c"));
             restartedMetas.add(startMetadata(zk.getConnectString(), "restart-meta-d"));
-            List<String> restartedMetadataEndpoints = metadataEndpoints(restartedMetas);
+            List<String> restartedMetadataEndpoints = controllerEndpoints(restartedMetas);
             String leader = awaitLeader(restartedMetadataEndpoints);
             artifact.add(
                     "restartedMetadataEndpoints=" + restartedMetadataEndpoints,
                     "restartedLeader=" + leader);
 
-            for (ExternalStorage old : storageNodes) {
-                ExternalStorage restarted = startStorage(old.dataDir(), restartedMetadataEndpoints, old.host());
+            for (ExternalDataNode old : dataNodes) {
+                ExternalDataNode restarted = startDataNode(old.dataDir(), restartedMetadataEndpoints, old.host());
                 assertEquals(old.nodeId(), restarted.nodeId(),
                         "node id changed for " + old.host() + " after full process restart");
-                restartedStorageNodes.add(restarted);
+                restartedDataNodes.add(restarted);
             }
-            waitForAllReplicaEndpoints(restartedMetadataEndpoints, fileId, storageMapByNodeId(restartedStorageNodes));
+            waitForAllReplicaEndpoints(restartedMetadataEndpoints, fileId, dataNodeMapByNodeId(restartedDataNodes));
             ConsistencyVerifier.assertLiveFileDescriptorConsistent(restartedMetadataEndpoints, fileId);
-            artifact.add("restartedStorage=" + storageSummary(restartedStorageNodes));
+            artifact.add("restartedDataNode=" + dataNodeSummary(restartedDataNodes));
             artifact.add("liveDescriptorVerifiedAfterFullRestart=true");
 
             ClientConfig recoveryConfig = new ClientConfig(restartedMetadataEndpoints, 512, 10_000)
-                    .withStorageConnectionsPerEndpoint(2);
+                    .withDataNodeConnectionsPerEndpoint(2);
             try (StrataClient recoveryClient = StrataClient.connect(recoveryConfig)) {
                 StrataFile.SealInfo sealed = recoveryClient.openById(fileId).recoverAndSeal();
                 assertEquals(workload.ackedBytes(), sealed.sealedLength(),
@@ -402,8 +402,8 @@ class MetadataProcessFailoverTest {
             artifact.addFailure(t);
             throw t;
         } finally {
-            killAllStorage(storageNodes);
-            killAllStorage(restartedStorageNodes);
+            killAllDataNode(dataNodes);
+            killAllDataNode(restartedDataNodes);
             killAllMetadata(metas);
             killAllMetadata(restartedMetas);
         }
@@ -414,9 +414,9 @@ class MetadataProcessFailoverTest {
                 "seed",
                 "batches",
                 "writePolicy",
-                "storageConnectionsPerEndpoint",
+                "dataNodeConnectionsPerEndpoint",
                 "initialMetadataEndpoints",
-                "initialStorage",
+                "initialDataNode",
                 "fileId",
                 "leaderAvailableBeforeSeal",
                 "liveDescriptorVerifiedBeforeSeal",
@@ -441,14 +441,14 @@ class MetadataProcessFailoverTest {
                 "seed",
                 "writePolicy",
                 "initialMetadataEndpoints",
-                "initialStorage",
+                "initialDataNode",
                 "fileId",
                 "ackedBytes",
                 "ackedSha256",
                 "allProcessesKilled",
                 "restartedMetadataEndpoints",
                 "restartedLeader",
-                "restartedStorage",
+                "restartedDataNode",
                 "liveDescriptorVerifiedBeforeCrash",
                 "liveDescriptorVerifiedAfterFullRestart",
                 "sealedLength",
@@ -477,7 +477,7 @@ class MetadataProcessFailoverTest {
                 java,
                 "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
                 "-cp", classpath,
-                MetadataServiceProcessMain.class.getName(),
+                ControllerProcessMain.class.getName(),
                 zkConnect,
                 Integer.toString(port),
                 readyFile.toString());
@@ -487,7 +487,7 @@ class MetadataProcessFailoverTest {
         return waitReady(new ExternalMetadata("127.0.0.1:" + port, readyFile, logFile, process));
     }
 
-    private static ExternalStorage startStorage(Path dataDir, List<String> metadataEndpoints,
+    private static ExternalDataNode startDataNode(Path dataDir, List<String> controllerEndpoints,
                                                 String host) throws Exception {
         String processName = host + "-" + System.nanoTime();
         Path logRoot = processLogRoot("process-crash-logs");
@@ -501,15 +501,15 @@ class MetadataProcessFailoverTest {
                 java,
                 "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
                 "-cp", classpath,
-                StorageNodeProcessMain.class.getName(),
+                DataNodeProcessMain.class.getName(),
                 dataDir.toString(),
-                String.join(",", metadataEndpoints),
+                String.join(",", controllerEndpoints),
                 host,
                 readyFile.toString());
         builder.redirectErrorStream(true);
         builder.redirectOutput(logFile.toFile());
         Process process = builder.start();
-        return waitReady(new ExternalStorage(dataDir, host, readyFile, logFile, process, -1, ""));
+        return waitReady(new ExternalDataNode(dataDir, host, readyFile, logFile, process, -1, ""));
     }
 
     private static ExternalMetadata waitReady(ExternalMetadata meta) throws Exception {
@@ -530,30 +530,30 @@ class MetadataProcessFailoverTest {
         throw new AssertionError("metadata process did not become ready\n" + childLog(meta));
     }
 
-    private static ExternalStorage waitReady(ExternalStorage node) throws Exception {
+    private static ExternalDataNode waitReady(ExternalDataNode node) throws Exception {
         long deadline = System.currentTimeMillis() + 20_000;
         while (System.currentTimeMillis() < deadline) {
             if (Files.exists(node.readyFile())) {
                 String[] parts = Files.readString(node.readyFile()).trim().split("\\s+");
                 if (parts.length == 2) {
-                    return new ExternalStorage(node.dataDir(), node.host(), node.readyFile(), node.logFile(),
+                    return new ExternalDataNode(node.dataDir(), node.host(), node.readyFile(), node.logFile(),
                             node.process(), Integer.parseInt(parts[0]), parts[1]);
                 }
             }
             if (!node.process().isAlive()) {
-                throw new AssertionError("storage node process exited early with code "
+                throw new AssertionError("data node process exited early with code "
                         + node.process().exitValue() + "\n" + childLog(node));
             }
             Thread.sleep(50);
         }
-        throw new AssertionError("storage node process did not become ready\n" + childLog(node));
+        throw new AssertionError("data node process did not become ready\n" + childLog(node));
     }
 
-    private static String awaitLeader(List<String> metadataEndpoints) throws Exception {
+    private static String awaitLeader(List<String> controllerEndpoints) throws Exception {
         long deadline = System.currentTimeMillis() + 20_000;
         AssertionError failure = new AssertionError("no metadata process became leader");
         while (System.currentTimeMillis() < deadline) {
-            for (String endpoint : metadataEndpoints) {
+            for (String endpoint : controllerEndpoints) {
                 String[] hp = endpoint.split(":");
                 try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                         ScpClient.KIND_TOOL, "metadata-process-leader-probe")) {
@@ -585,7 +585,7 @@ class MetadataProcessFailoverTest {
         throw new AssertionError("nodes did not register in time");
     }
 
-    private static List<String> metadataEndpoints(List<ExternalMetadata> metas) {
+    private static List<String> controllerEndpoints(List<ExternalMetadata> metas) {
         return metas.stream().map(ExternalMetadata::endpoint).toList();
     }
 
@@ -593,31 +593,31 @@ class MetadataProcessFailoverTest {
         return metas.stream()
                 .filter(meta -> meta.endpoint().equals(endpoint))
                 .findFirst()
-                .orElseThrow(() -> new AssertionError("metadata endpoint not found: " + endpoint));
+                .orElseThrow(() -> new AssertionError("controller endpoint not found: " + endpoint));
     }
 
-    private static ExternalStorage storageByNodeId(List<ExternalStorage> nodes, int nodeId) {
+    private static ExternalDataNode dataNodeByNodeId(List<ExternalDataNode> nodes, int nodeId) {
         return nodes.stream()
                 .filter(node -> node.nodeId() == nodeId)
                 .findFirst()
-                .orElseThrow(() -> new AssertionError("storage node not found: " + nodeId));
+                .orElseThrow(() -> new AssertionError("data node not found: " + nodeId));
     }
 
-    private static Map<Integer, ExternalStorage> storageMapByNodeId(List<ExternalStorage> nodes) {
-        Map<Integer, ExternalStorage> byId = new HashMap<>();
-        for (ExternalStorage node : nodes) {
+    private static Map<Integer, ExternalDataNode> dataNodeMapByNodeId(List<ExternalDataNode> nodes) {
+        Map<Integer, ExternalDataNode> byId = new HashMap<>();
+        for (ExternalDataNode node : nodes) {
             byId.put(node.nodeId(), node);
         }
         return byId;
     }
 
-    private static int storageIndexByNodeId(List<ExternalStorage> nodes, int nodeId) {
+    private static int dataNodeIndexByNodeId(List<ExternalDataNode> nodes, int nodeId) {
         for (int i = 0; i < nodes.size(); i++) {
             if (nodes.get(i).nodeId() == nodeId) {
                 return i;
             }
         }
-        throw new AssertionError("storage node not found: " + nodeId);
+        throw new AssertionError("data node not found: " + nodeId);
     }
 
     private static Messages.ChunkInfo lastChunk(Messages.LookupFileResp file) {
@@ -625,17 +625,17 @@ class MetadataProcessFailoverTest {
         return file.chunks().get(file.chunks().size() - 1);
     }
 
-    private static void waitForAllReplicaEndpoints(List<String> metadataEndpoints, FileId fileId,
-                                                   Map<Integer, ExternalStorage> expected)
+    private static void waitForAllReplicaEndpoints(List<String> controllerEndpoints, FileId fileId,
+                                                   Map<Integer, ExternalDataNode> expected)
             throws Exception {
         long deadline = System.currentTimeMillis() + 20_000;
         while (System.currentTimeMillis() < deadline) {
-            Messages.LookupFileResp lookup = ConsistencyVerifier.lookupFile(metadataEndpoints, fileId);
+            Messages.LookupFileResp lookup = ConsistencyVerifier.lookupFile(controllerEndpoints, fileId);
             boolean allRefreshed = true;
             int replicasSeen = 0;
             for (Messages.ChunkInfo chunk : lookup.chunks()) {
                 for (Messages.Replica replica : chunk.replicas()) {
-                    ExternalStorage node = expected.get(replica.nodeId());
+                    ExternalDataNode node = expected.get(replica.nodeId());
                     if (node == null || !node.endpoint().equals(replica.endpoint())) {
                         allRefreshed = false;
                         break;
@@ -654,9 +654,9 @@ class MetadataProcessFailoverTest {
         throw new AssertionError("replica endpoints did not refresh after full process restart");
     }
 
-    private static String storageSummary(List<ExternalStorage> nodes) {
+    private static String dataNodeSummary(List<ExternalDataNode> nodes) {
         List<String> parts = new ArrayList<>(nodes.size());
-        for (ExternalStorage node : nodes) {
+        for (ExternalDataNode node : nodes) {
             parts.add(node.host() + "#" + node.nodeId() + "@" + node.endpoint()
                     + " dir=" + node.dataDir());
         }
@@ -683,7 +683,7 @@ class MetadataProcessFailoverTest {
         return Files.exists(meta.logFile()) ? Files.readString(meta.logFile()) : "";
     }
 
-    private static String childLog(ExternalStorage node) throws Exception {
+    private static String childLog(ExternalDataNode node) throws Exception {
         return Files.exists(node.logFile()) ? Files.readString(node.logFile()) : "";
     }
 
@@ -697,13 +697,13 @@ class MetadataProcessFailoverTest {
         }
     }
 
-    private static void kill(ExternalStorage node) throws Exception {
+    private static void kill(ExternalDataNode node) throws Exception {
         if (node == null || !node.process().isAlive()) {
             return;
         }
         node.process().destroyForcibly();
         if (!node.process().waitFor(10, TimeUnit.SECONDS)) {
-            throw new AssertionError("storage node process did not exit after destroyForcibly");
+            throw new AssertionError("data node process did not exit after destroyForcibly");
         }
     }
 
@@ -713,8 +713,8 @@ class MetadataProcessFailoverTest {
         }
     }
 
-    private static void killAllStorage(List<ExternalStorage> nodes) throws Exception {
-        for (ExternalStorage node : nodes) {
+    private static void killAllDataNode(List<ExternalDataNode> nodes) throws Exception {
+        for (ExternalDataNode node : nodes) {
             kill(node);
         }
     }
@@ -722,7 +722,7 @@ class MetadataProcessFailoverTest {
     private record ExternalMetadata(String endpoint, Path readyFile, Path logFile, Process process) {
     }
 
-    private record ExternalStorage(Path dataDir, String host, Path readyFile, Path logFile,
+    private record ExternalDataNode(Path dataDir, String host, Path readyFile, Path logFile,
                                    Process process, int nodeId, String endpoint) {
     }
 }

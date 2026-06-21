@@ -1,5 +1,5 @@
 # Scrapes the Strata cluster's /metrics endpoints. Each combined node tags its metrics with
-# role=combined (it serves both the meta and node metric sets); Prometheus adds an `instance` label.
+# role=combined (it serves both the controller and data-node metric sets); Prometheus adds an `instance` label.
 global:
   scrape_interval: 15s
   evaluation_interval: 15s

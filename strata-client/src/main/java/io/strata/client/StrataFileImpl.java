@@ -15,7 +15,7 @@ import static io.strata.common.Checks.addChunkLength;
 
 /** SCP-backed StrataFile handle over one logical file id. */
 final class StrataFileImpl implements StrataFile {
-    private final MetaClient meta;
+    private final ControllerClient controller;
     private final NodePool appendPool;
     private final NodePool readPool;
     private final ClientConfig config;
@@ -23,9 +23,9 @@ final class StrataFileImpl implements StrataFile {
     private final StrataNamespace namespace;
     private final StrataPath path;
 
-    StrataFileImpl(MetaClient meta, NodePool appendPool, NodePool readPool, ClientConfig config,
+    StrataFileImpl(ControllerClient controller, NodePool appendPool, NodePool readPool, ClientConfig config,
                    FileId fileId, StrataNamespace namespace, StrataPath path) {
-        this.meta = Objects.requireNonNull(meta, "meta");
+        this.controller = Objects.requireNonNull(controller, "controller");
         this.appendPool = Objects.requireNonNull(appendPool, "appendPool");
         this.readPool = Objects.requireNonNull(readPool, "readPool");
         this.config = Objects.requireNonNull(config, "config");
@@ -51,7 +51,7 @@ final class StrataFileImpl implements StrataFile {
 
     @Override
     public Appender openForAppend() {
-        Messages.LookupFileResp file = meta.lookupFile(fileId);
+        Messages.LookupFileResp file = controller.lookupFile(fileId);
         if (file.fileState() != FileState.OPEN.value) {
             throw new ScpException(ErrorCode.FILE_SEALED, "file state " + file.fileState());
         }
@@ -63,17 +63,17 @@ final class StrataFileImpl implements StrataFile {
             }
             length = addChunkLength(length, c.length());
         }
-        int writeEpoch = meta.allocateWriterEpochForAppend(fileId);
-        return new AppenderImpl(meta, appendPool, config, fileId, writeEpoch, file.writePolicy(), length);
+        int writeEpoch = controller.allocateWriterEpochForAppend(fileId);
+        return new AppenderImpl(controller, appendPool, config, fileId, writeEpoch, file.writePolicy(), length);
     }
 
     @Override
     public Reader openForRead() {
-        return new ReaderImpl(meta, readPool, config, fileId);
+        return new ReaderImpl(controller, readPool, config, fileId);
     }
 
     @Override
     public SealInfo recoverAndSeal() {
-        return new Recovery(meta, appendPool, readPool, config).recoverAndSeal(fileId);
+        return new Recovery(controller, appendPool, readPool, config).recoverAndSeal(fileId);
     }
 }

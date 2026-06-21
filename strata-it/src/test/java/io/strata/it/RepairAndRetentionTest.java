@@ -8,7 +8,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.format.ChunkFormats;
-import io.strata.node.StorageNode;
+import io.strata.node.DataNode;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -43,7 +43,7 @@ class RepairAndRetentionTest {
         cluster = new MiniCluster(4);
         client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint())
                 .withChunkRollBytes(4096)
-                .withStorageConnectionsPerEndpoint(3));
+                .withDataNodeConnectionsPerEndpoint(3));
     }
 
     @AfterEach
@@ -98,7 +98,7 @@ class RepairAndRetentionTest {
     @Test
     void orphanChunkIsReconciledAway() throws Exception {
         // plant an orphan: a sealed chunk on a node that metadata knows nothing about
-        StorageNode node = cluster.nodes.get(0);
+        DataNode node = cluster.nodes.get(0);
         ChunkId orphan = new ChunkId(FileId.random(), 0);
         try (ScpClient direct = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_TOOL, "planter")) {
             direct.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(orphan, 1, false, 1 << 20, System.currentTimeMillis()).encode(), null, 5000);
@@ -130,12 +130,12 @@ class RepairAndRetentionTest {
         var lookup = lookupFile(fileId);
         Messages.ChunkInfo chunk = lookup.chunks().get(0);
         ChunkId chunkId = chunk.chunkId();
-        StorageNode victim = nodeById(chunk.replicas().get(0).nodeId());
+        DataNode victim = nodeById(chunk.replicas().get(0).nodeId());
         assertEquals(ErrorCode.OK, victim.store().delete(chunkId));
         assertFalse(victim.store().contains(chunkId));
 
         // allow for the inventory-loss grace (a sealed replica is only dropped once it has stayed
-        // missing from inventory past MetaConfig.replicaMissingGraceMs()) plus the re-repair
+        // missing from inventory past ControllerConfig.replicaMissingGraceMs()) plus the re-repair
         long deadline = System.currentTimeMillis() + 140_000;
         boolean repaired = false;
         while (System.currentTimeMillis() < deadline && !repaired) {
@@ -171,7 +171,7 @@ class RepairAndRetentionTest {
         Messages.ChunkInfo chunk = lookupFile(fileId).chunks().get(0);
         assertTrue(chunk.length() > 0, "test setup requires a non-empty sealed chunk");
         ChunkId chunkId = chunk.chunkId();
-        StorageNode victim = nodeById(chunk.replicas().get(0).nodeId());
+        DataNode victim = nodeById(chunk.replicas().get(0).nodeId());
         corruptDataByte(victim, chunkId, Math.min(3, chunk.length() - 1));
 
         assertEquals(ErrorCode.CRC_MISMATCH,
@@ -243,7 +243,7 @@ class RepairAndRetentionTest {
         var lookup = lookupFile(fileId);
         List<ChunkId> chunkIds = lookup.chunks().stream().map(Messages.ChunkInfo::chunkId).toList();
         Messages.ChunkInfo chunk = lookup.chunks().get(0);
-        StorageNode victim = nodeById(chunk.replicas().get(0).nodeId());
+        DataNode victim = nodeById(chunk.replicas().get(0).nodeId());
         assertEquals(ErrorCode.OK, victim.store().delete(chunk.chunkId()));
         assertFalse(victim.store().contains(chunk.chunkId()));
 
@@ -293,7 +293,7 @@ class RepairAndRetentionTest {
 
         var lookup = lookupFile(fileId);
         var replica = lookup.chunks().get(0).replicas().get(0);
-        StorageNode node = nodeById(replica.nodeId());
+        DataNode node = nodeById(replica.nodeId());
         sendInventory(new Messages.InventoryReport(replica.nodeId(),
                 node.incarnation().getMostSignificantBits(), node.incarnation().getLeastSignificantBits(),
                 -1, 0, 1, List.of()));
@@ -320,8 +320,8 @@ class RepairAndRetentionTest {
         }
     }
 
-    private StorageNode nodeById(int nodeId) {
-        for (StorageNode node : cluster.nodes) {
+    private DataNode nodeById(int nodeId) {
+        for (DataNode node : cluster.nodes) {
             if (node.nodeId() == nodeId) {
                 return node;
             }
@@ -329,7 +329,7 @@ class RepairAndRetentionTest {
         throw new AssertionError("node " + nodeId + " not found");
     }
 
-    private static void corruptDataByte(StorageNode node, ChunkId chunkId, long dataOffset) throws Exception {
+    private static void corruptDataByte(DataNode node, ChunkId chunkId, long dataOffset) throws Exception {
         var chunkPath = node.config().dataDir().resolve("chunks")
                 .resolve(ChunkFormats.baseName(chunkId) + ".chunk");
         long position = ChunkFormats.DATA_START + dataOffset;
@@ -361,7 +361,7 @@ class RepairAndRetentionTest {
     }
 
     private void assertNoNodeContains(List<ChunkId> chunkIds) {
-        for (StorageNode node : cluster.nodes) {
+        for (DataNode node : cluster.nodes) {
             for (ChunkId id : chunkIds) {
                 assertFalse(node.store().contains(id),
                         "node " + node.nodeId() + " still holds deleted chunk " + id);

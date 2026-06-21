@@ -17,7 +17,7 @@ public enum Opcode {
     // recovery-scoped ranged read: serves locally-present bytes up to localEndOffset, including the
     // never-acked tail above the durable high watermark that the client READ path clamps away.
     READ_RECOVERY(0x001A),
-    // control plane (storage node -> metadata)
+    // control plane (data node -> metadata)
     REGISTER_NODE(0x0101),
     NODE_HEARTBEAT(0x0102),
     INVENTORY_REPORT(0x0103),
@@ -30,7 +30,11 @@ public enum Opcode {
     SEAL_FILE(0x0206),
     ABORT_CHUNK_META(0x0207),
     LOOKUP_PATH(0x0208),
-    ALLOCATE_WRITER_EPOCH(0x0209);
+    ALLOCATE_WRITER_EPOCH(0x0209),
+    // direct metadata-owner -> data-node repair: a non-controller namespace owner, which has no heartbeat
+    // command channel, tells a target node to pull a chunk from a live source (reuses the proven
+    // ControlLoop.replicate path). Append-only — kept last (design §11).
+    EXEC_REPLICATE(0x020A);
 
     public final short code;
 

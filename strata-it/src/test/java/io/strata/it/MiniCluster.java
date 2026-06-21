@@ -1,10 +1,10 @@
 package io.strata.it;
 
-import io.strata.meta.MetaConfig;
-import io.strata.meta.MetadataService;
+import io.strata.meta.ControllerConfig;
+import io.strata.meta.Controller;
 import io.strata.meta.ZkMetadataStore;
-import io.strata.node.NodeConfig;
-import io.strata.node.StorageNode;
+import io.strata.node.DataNodeConfig;
+import io.strata.node.DataNode;
 import org.apache.curator.test.TestingServer;
 
 import java.io.IOException;
@@ -15,17 +15,17 @@ import java.util.List;
 import java.util.function.Function;
 
 /**
- * In-process cluster for integration tests: embedded ZooKeeper + metadata service + N storage
+ * In-process cluster for integration tests: embedded ZooKeeper + controller + N data nodes
  * nodes. This is the primary correctness layer (tech design §16) — real sockets, real disk,
  * deterministic fault injection by killing components.
  */
 final class MiniCluster implements AutoCloseable {
     TestingServer zk;             // null when an external (containerized) ZK is supplied
-    final List<MetadataService> metas = new ArrayList<>();
-    MetadataService meta;         // the first instance (initial leader) — legacy accessor
-    final List<StorageNode> nodes = new ArrayList<>();
+    final List<Controller> metas = new ArrayList<>();
+    Controller meta;         // the first instance (initial leader) — legacy accessor
+    final List<DataNode> nodes = new ArrayList<>();
     final Path root;
-    private final Function<String, MetaConfig> metaConfigFactory;
+    private final Function<String, ControllerConfig> metaConfigFactory;
     private final int metadataServiceCount;
     private String zkConnect;
 
@@ -39,12 +39,12 @@ final class MiniCluster implements AutoCloseable {
 
     /** zkConnectOverride lets chaos tests supply a containerized ZooKeeper. */
     MiniCluster(int nodeCount, String zkConnectOverride, int metaCount) throws Exception {
-        this(nodeCount, zkConnectOverride, metaCount, MetaConfig::forTests);
+        this(nodeCount, zkConnectOverride, metaCount, ControllerConfig::forTests);
     }
 
     /** Allows fault tests to alter timing without changing production service wiring. */
     MiniCluster(int nodeCount, String zkConnectOverride, int metaCount,
-                Function<String, MetaConfig> metaConfigFactory) throws Exception {
+                Function<String, ControllerConfig> metaConfigFactory) throws Exception {
         this.root = Files.createTempDirectory("strata-it");
         this.metaConfigFactory = metaConfigFactory;
         this.metadataServiceCount = metaCount;
@@ -55,7 +55,7 @@ final class MiniCluster implements AutoCloseable {
             } else {
                 this.zkConnect = zkConnectOverride;
             }
-            startMetadataServices();
+            startControllers();
             for (int i = 0; i < nodeCount; i++) {
                 addNode("host-" + i);
             }
@@ -75,22 +75,22 @@ final class MiniCluster implements AutoCloseable {
     void awaitAnyLeader() throws InterruptedException {
         long deadline = System.currentTimeMillis() + 15_000;
         while (System.currentTimeMillis() < deadline) {
-            if (metas.stream().anyMatch(MetadataService::isLeader)) return;
+            if (metas.stream().anyMatch(Controller::isLeader)) return;
             Thread.sleep(20);
         }
-        throw new IllegalStateException("no metadata service became leader");
+        throw new IllegalStateException("no controller became leader");
     }
 
     List<String> metaEndpoints() {
-        return metas.stream().map(MetadataService::endpoint).toList();
+        return metas.stream().map(Controller::endpoint).toList();
     }
 
     void killMeta(int index) throws IOException {
         metas.get(index).close();
     }
 
-    void stopMetadataServices() {
-        for (MetadataService m : metas) {
+    void stopControllers() {
+        for (Controller m : metas) {
             try {
                 m.close();
             } catch (Exception ignored) {
@@ -100,17 +100,17 @@ final class MiniCluster implements AutoCloseable {
         meta = null;
     }
 
-    void startMetadataServices() throws Exception {
+    void startControllers() throws Exception {
         for (int i = 0; i < metadataServiceCount; i++) {
-            metas.add(new MetadataService(metaConfigFactory.apply(zkConnect)));
+            metas.add(new Controller(metaConfigFactory.apply(zkConnect)));
         }
         this.meta = metas.get(0);
         awaitAnyLeader();
     }
 
-    void restartMetadataServices() throws Exception {
-        stopMetadataServices();
-        startMetadataServices();
+    void restartControllers() throws Exception {
+        stopControllers();
+        startControllers();
     }
 
     void restartZooKeeper() throws Exception {
@@ -121,15 +121,15 @@ final class MiniCluster implements AutoCloseable {
         zkConnect = zk.getConnectString();
     }
 
-    StorageNode addNode(String host) throws IOException {
+    DataNode addNode(String host) throws IOException {
         Path dir = root.resolve(host);
-        StorageNode node = new StorageNode(NodeConfig.withMetadata(dir, metaEndpoints(), host));
+        DataNode node = new DataNode(DataNodeConfig.withMetadata(dir, metaEndpoints(), host));
         nodes.add(node);
         return node;
     }
 
-    StorageNode addNode(NodeConfig config) throws IOException {
-        StorageNode node = new StorageNode(config);
+    DataNode addNode(DataNodeConfig config) throws IOException {
+        DataNode node = new DataNode(config);
         nodes.add(node);
         return node;
     }
@@ -139,15 +139,15 @@ final class MiniCluster implements AutoCloseable {
     }
 
     /** Restarts a node on the same data dir (same volume-bound identity). */
-    StorageNode restartNode(int index) throws IOException {
-        StorageNode old = nodes.get(index);
-        NodeConfig cfg = old.config();
+    DataNode restartNode(int index) throws IOException {
+        DataNode old = nodes.get(index);
+        DataNodeConfig cfg = old.config();
         try {
             old.close();
         } catch (IOException ignored) {
         }
-        StorageNode fresh = new StorageNode(NodeConfig.withMetadata(cfg.dataDir(),
-                cfg.metadataEndpoints(), cfg.host()));
+        DataNode fresh = new DataNode(DataNodeConfig.withMetadata(cfg.dataDir(),
+                cfg.controllerEndpoints(), cfg.host()));
         nodes.set(index, fresh);
         return fresh;
     }
@@ -159,8 +159,8 @@ final class MiniCluster implements AutoCloseable {
         }
     }
 
-    void stopStorageNodes() {
-        for (StorageNode node : nodes) {
+    void stopDataNodes() {
+        for (DataNode node : nodes) {
             try {
                 node.close();
             } catch (IOException ignored) {
@@ -169,7 +169,7 @@ final class MiniCluster implements AutoCloseable {
         nodes.clear();
     }
 
-    void startStorageNodes(List<String> hosts) throws IOException {
+    void startDataNodes(List<String> hosts) throws IOException {
         for (String host : hosts) {
             addNode(host);
         }
@@ -193,13 +193,13 @@ final class MiniCluster implements AutoCloseable {
     @Override
     public void close() throws Exception {
         try {
-            for (StorageNode n : nodes) {
+            for (DataNode n : nodes) {
                 try {
                     n.close();
                 } catch (IOException ignored) {
                 }
             }
-            for (MetadataService m : metas) {
+            for (Controller m : metas) {
                 try {
                     m.close();
                 } catch (Exception ignored) {

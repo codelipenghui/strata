@@ -58,21 +58,21 @@ class ControlLoopTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
             getClosed(loop).set(true);
 
             invoke(loop, "ensureRegistered"); // the control thread runs this each iteration
 
-            assertNull(get(loop, "meta"),
-                    "a control loop observed as closed must not open a new metadata connection");
+            assertNull(get(loop, "controller"),
+                    "a control loop observed as closed must not open a new controller connection");
             loop.close();
         }
     }
 
     @Test
     void startLaunchesWorkersAndCloseStopsThem() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
 
             loop.start();
@@ -104,7 +104,7 @@ class ControlLoopTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
 
             Thread worker = Thread.ofVirtual().name("control-loop-test-interrupt").start(() -> {
@@ -141,7 +141,7 @@ class ControlLoopTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
             closedRef.set(getClosed(loop));
 
@@ -179,7 +179,7 @@ class ControlLoopTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
             closedRef.set(getClosed(loop));
 
@@ -217,7 +217,7 @@ class ControlLoopTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
             closedRef.set(getClosed(loop));
 
@@ -256,7 +256,7 @@ class ControlLoopTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
             closedRef.set(getClosed(loop));
 
@@ -296,7 +296,7 @@ class ControlLoopTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
 
             invoke(loop, "ensureRegistered");
@@ -332,7 +332,7 @@ class ControlLoopTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
             invoke(loop, "ensureRegistered");
 
@@ -385,7 +385,7 @@ class ControlLoopTest {
                  }
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              });
-             StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node,
                     config(List.of(endpoint(standby), endpoint(leader)), 60_000), node.store());
             closedRef.set(getClosed(loop));
@@ -416,7 +416,7 @@ class ControlLoopTest {
 
     @Test
     void executeCommandsReportsDrainDeleteAndReplicateFailures() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             LinkedBlockingQueue<Messages.Command> commands = get(loop, "commandQueue");
             ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
@@ -449,7 +449,7 @@ class ControlLoopTest {
 
     @Test
     void executeCommandsReportsDeleteFailureStatus() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             LinkedBlockingQueue<Messages.Command> commands = get(loop, "commandQueue");
             ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
@@ -499,7 +499,7 @@ class ControlLoopTest {
 
     @Test
     void replicateReturnsForValidLocalCopyAndDeletesMismatchedReplay() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             ChunkStore store = node.store();
 
@@ -542,7 +542,7 @@ class ControlLoopTest {
 
     @Test
     void replicateDeletesOpenLocalReplayBeforeTryingSources() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             ChunkId open = new ChunkId(FileId.random(), 0);
             node.store().open(open, false, 1, 1L);
@@ -558,7 +558,7 @@ class ControlLoopTest {
 
     @Test
     void replicateThrowsLastSourceFailureWhenAllSourcesFail() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             ChunkId chunkId = new ChunkId(FileId.random(), 0);
 
@@ -577,7 +577,7 @@ class ControlLoopTest {
         ChunkId chunkId = new ChunkId(FileId.random(), 0);
         byte[] data = "repair-source".getBytes();
         try (ChunkStore sourceStore = new ChunkStore(dir.resolve("source-io"));
-             StorageNode node = new StorageNode(NodeConfig.standalone(dir.resolve("target-io")))) {
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir.resolve("target-io")))) {
             sourceStore.open(chunkId, false, 1, 1L);
             sourceStore.append(chunkId, 1, 0, 0, ByteBuffer.wrap(data));
             int crc = sourceStore.seal(chunkId, 1, data.length, null).dataCrc();
@@ -607,7 +607,7 @@ class ControlLoopTest {
         ChunkId chunkId = new ChunkId(FileId.random(), 0);
         byte[] data = "repair-source".getBytes();
         try (ChunkStore sourceStore = new ChunkStore(dir.resolve("source"));
-             StorageNode node = new StorageNode(NodeConfig.standalone(dir.resolve("target")))) {
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir.resolve("target")))) {
             sourceStore.open(chunkId, false, 1, 1L);
             sourceStore.append(chunkId, 1, 0, 0, ByteBuffer.wrap(data));
             int crc = sourceStore.seal(chunkId, 1, data.length, null).dataCrc();
@@ -634,7 +634,7 @@ class ControlLoopTest {
 
     @Test
     void replicateIgnoresSelfSourcesBeforeReportingNoUsableSource() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             ChunkId chunkId = new ChunkId(FileId.random(), 0);
 
@@ -665,7 +665,7 @@ class ControlLoopTest {
 
     @Test
     void fetchWholeFileRejectsInvalidRepairLengthBeforeUsingSource() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             ChunkId chunkId = new ChunkId(FileId.random(), 0);
             Path output = dir.resolve("invalid-repair-fetch.chunk");
@@ -686,14 +686,14 @@ class ControlLoopTest {
     void fetchWholeFileDoesNotRejectLargeValidRepairLengthBeforeReadingSource() throws Exception {
         long minLength = ChunkFormats.HEADER_SIZE + ChunkFormats.TRAILER_SIZE;
         AtomicInteger calls = new AtomicInteger();
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpServer source = new ScpServer(0, 77, 0, 0, req -> {
                  calls.incrementAndGet();
                  return ScpServer.ok(req, new Messages.FetchResp(minLength, ChunkState.SEALED).encode(),
                          ByteBuffer.wrap(new byte[0]));
              });
              ScpClient client = new ScpClient("127.0.0.1", source.port(),
-                     ScpClient.KIND_STORAGE_NODE, "fetch-large-length-test")) {
+                     ScpClient.KIND_DATA_NODE, "fetch-large-length-test")) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             Path output = dir.resolve("large-repair-fetch.chunk");
 
@@ -745,7 +745,7 @@ class ControlLoopTest {
         for (int i = 0; i < file.length; i++) {
             file[i] = (byte) i;
         }
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpServer source = new ScpServer(0, 77, 0, 0, req -> {
                  Messages.FetchChunk fetch = Messages.FetchChunk.decode(req.headerSlice());
                  int offset = Math.toIntExact(fetch.offset());
@@ -754,7 +754,7 @@ class ControlLoopTest {
                          ByteBuffer.wrap(file, offset, len));
              });
              ScpClient client = new ScpClient("127.0.0.1", source.port(),
-                     ScpClient.KIND_STORAGE_NODE, "fetch-multipart-test")) {
+                     ScpClient.KIND_DATA_NODE, "fetch-multipart-test")) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             Path output = dir.resolve("fetch-multipart.chunk");
 
@@ -771,7 +771,7 @@ class ControlLoopTest {
 
     @Test
     void closeRestoresInterruptWhenInterruptedDuringJoin() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             List<Thread> threads = get(loop, "threads");
             Thread sleeper = Thread.ofVirtual().name("control-loop-test-sleeper").start(() -> {
@@ -812,7 +812,7 @@ class ControlLoopTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, config(metaServer, 1), node.store());
             invoke(loop, "ensureRegistered");
 
@@ -835,7 +835,7 @@ class ControlLoopTest {
 
     @Test
     void inventoryLoopSkipsWhenNotRegistered() throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir))) {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
 
             Thread worker = Thread.ofVirtual().name("control-loop-test-inventory-unregistered").start(() -> {
@@ -855,18 +855,18 @@ class ControlLoopTest {
         }
     }
 
-    private static NodeConfig config(ScpServer metaServer, int inventoryIntervalMs) {
+    private static DataNodeConfig config(ScpServer metaServer, int inventoryIntervalMs) {
         return config(List.of(endpoint(metaServer)), inventoryIntervalMs);
     }
 
-    private static NodeConfig config(List<String> metadataEndpoints, int inventoryIntervalMs) {
+    private static DataNodeConfig config(List<String> controllerEndpoints, int inventoryIntervalMs) {
         ConnectionPolicy testPolicy = new ConnectionPolicy(1_000, 1_000, 100, 1_000, 1, 1);
-        return new NodeConfig(Path.of("."), 0, "127.0.0.1", null, metadataEndpoints,
+        return new DataNodeConfig(Path.of("."), 0, "127.0.0.1", null, controllerEndpoints,
                 "z", "r", "h", 1L << 20, inventoryIntervalMs, testPolicy);
     }
 
-    private static NodeConfig configWithoutMetadata() {
-        return new NodeConfig(Path.of("."), 0, "127.0.0.1", null, List.of(),
+    private static DataNodeConfig configWithoutMetadata() {
+        return new DataNodeConfig(Path.of("."), 0, "127.0.0.1", null, List.of(),
                 "z", "r", "h", 1L << 20, 60_000);
     }
 
@@ -906,7 +906,7 @@ class ControlLoopTest {
     }
 
     private void assertFetchFailure(ErrorCode expectedCode, FetchResponder responder) throws Exception {
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpServer source = new ScpServer(0, 77, 0, 0, req -> {
                  Opcode op = Opcode.fromCode(req.opcode());
                  if (op == Opcode.FETCH_CHUNK) {
@@ -916,7 +916,7 @@ class ControlLoopTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              });
              ScpClient client = new ScpClient("127.0.0.1", source.port(),
-                     ScpClient.KIND_STORAGE_NODE, "fetch-test")) {
+                     ScpClient.KIND_DATA_NODE, "fetch-test")) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             Path output = Files.createTempFile(dir, "fetch-failure.", ".chunk");
             ScpException e = assertThrows(ScpException.class,

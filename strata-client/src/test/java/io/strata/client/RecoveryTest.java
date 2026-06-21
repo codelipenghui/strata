@@ -36,7 +36,7 @@ class RecoveryTest {
 
         try (ScpServer metaServer = metadataServer(lookup, null)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 Recovery recovery = new Recovery(meta, pool, config);
 
                 lookup.set(lookup(chunk(c0, ChunkState.SEALED, -1, 1)));
@@ -53,7 +53,7 @@ class RecoveryTest {
     }
 
     @Test
-    void openChunkWithNoReachableReplicasFailsQuorumBeforeStorageUse() throws Exception {
+    void openChunkWithNoReachableReplicasFailsQuorumBeforeDataNodeUse() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>(
@@ -63,7 +63,7 @@ class RecoveryTest {
 
         try (ScpServer metaServer = metadataServer(lookup, null)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.INTERNAL, e.code());
@@ -86,7 +86,7 @@ class RecoveryTest {
 
         try (ScpServer metaServer = metadataServer(lookup, sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.INTERNAL, e.code(),
@@ -100,22 +100,22 @@ class RecoveryTest {
     void deletingFileRecoveryFailsBeforeFencingReplicas() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
-        AtomicBoolean storageTouched = new AtomicBoolean(false);
+        AtomicBoolean dataNodeTouched = new AtomicBoolean(false);
 
-        try (ScpServer storage = new ScpServer(0, 1, 0, 0, req -> {
-            storageTouched.set(true);
-            throw new ScpException(ErrorCode.INTERNAL, "storage should not be contacted");
+        try (ScpServer dataNode = new ScpServer(0, 1, 0, 0, req -> {
+            dataNodeTouched.set(true);
+            throw new ScpException(ErrorCode.INTERNAL, "data node should not be contacted");
         });
              ScpServer metaServer = metadataServer(new AtomicReference<>(
                      new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 2,
                              List.of(chunk(chunkId, ChunkState.OPEN, 0, 1,
-                                     new Messages.Replica(1, endpoint(storage)))))), null)) {
+                                     new Messages.Replica(1, endpoint(dataNode)))))), null)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.PRECONDITION_FAILED, e.code());
-                assertFalse(storageTouched.get());
+                assertFalse(dataNodeTouched.get());
             }
         }
     }
@@ -124,22 +124,22 @@ class RecoveryTest {
     void unknownFileStateRecoveryFailsBeforeFencingReplicas() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
-        AtomicBoolean storageTouched = new AtomicBoolean(false);
+        AtomicBoolean dataNodeTouched = new AtomicBoolean(false);
 
-        try (ScpServer storage = new ScpServer(0, 1, 0, 0, req -> {
-            storageTouched.set(true);
-            throw new ScpException(ErrorCode.INTERNAL, "storage should not be contacted");
+        try (ScpServer dataNode = new ScpServer(0, 1, 0, 0, req -> {
+            dataNodeTouched.set(true);
+            throw new ScpException(ErrorCode.INTERNAL, "data node should not be contacted");
         });
              ScpServer metaServer = metadataServer(new AtomicReference<>(
                      new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 99,
                              List.of(chunk(chunkId, ChunkState.OPEN, 0, 1,
-                                     new Messages.Replica(1, endpoint(storage)))))), null)) {
+                                     new Messages.Replica(1, endpoint(dataNode)))))), null)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.INTERNAL, e.code());
-                assertFalse(storageTouched.get());
+                assertFalse(dataNodeTouched.get());
             }
         }
     }
@@ -148,7 +148,7 @@ class RecoveryTest {
     void fencedEpochFromReplicaIsPropagated() throws Exception {
         FileId fileId = FileId.random();
         ChunkId chunkId = new ChunkId(fileId, 0);
-        try (ScpServer storage = new ScpServer(0, 1, 0, 0, req -> {
+        try (ScpServer dataNode = new ScpServer(0, 1, 0, 0, req -> {
             if (Opcode.fromCode(req.opcode()) == Opcode.FENCE) {
                 throw new ScpException(ErrorCode.FENCED_EPOCH, "fenced", 7);
             }
@@ -156,9 +156,9 @@ class RecoveryTest {
         });
              ScpServer metaServer = metadataServer(new AtomicReference<>(
                      lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
-                             new Messages.Replica(1, endpoint(storage))))), null)) {
+                             new Messages.Replica(1, endpoint(dataNode))))), null)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.FENCED_EPOCH, e.code());
@@ -194,7 +194,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(donor)),
                              new Messages.Replica(2, endpoint(lagging))))), null)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.INTERNAL, e.code());
@@ -214,7 +214,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(s1)),
                              new Messages.Replica(2, endpoint(s2))))), null)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.INTERNAL, e.code());
@@ -236,7 +236,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(s1)),
                              new Messages.Replica(2, endpoint(s2))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.CORRUPT_CHUNK, e.code());
@@ -258,7 +258,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(malformed)),
                              new Messages.Replica(2, endpoint(valid))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.INTERNAL, e.code());
@@ -292,7 +292,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(malformed)),
                              new Messages.Replica(2, endpoint(valid))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.INTERNAL, e.code());
@@ -319,7 +319,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(malformed)),
                              new Messages.Replica(2, endpoint(valid))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.INTERNAL, e.code());
@@ -347,7 +347,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(malformed)),
                              new Messages.Replica(2, endpoint(valid))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.INTERNAL, e.code());
@@ -400,7 +400,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(donor)),
                              new Messages.Replica(2, endpoint(lagging))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.INTERNAL, e.code());
@@ -444,7 +444,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(donor)),
                              new Messages.Replica(2, endpoint(lagging))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.INTERNAL, e.code());
@@ -468,7 +468,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(s1)),
                              new Messages.Replica(2, endpoint(s2))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 var sealed = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(0, sealed.sealedLength());
@@ -490,7 +490,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(sealed)),
                              new Messages.Replica(2, endpoint(open))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(5, sealedInfo.sealedLength());
@@ -514,7 +514,7 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(validA)),
                              new Messages.Replica(3, endpoint(validB))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(4, sealedInfo.sealedLength());
@@ -540,7 +540,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(donor)),
                              new Messages.Replica(2, endpoint(lagging))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(0, sealedInfo.sealedLength());
@@ -569,7 +569,7 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(donorB)),
                              new Messages.Replica(3, endpoint(lagging))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(4, sealedInfo.sealedLength());
@@ -606,7 +606,7 @@ class RecoveryTest {
                                      new Messages.Replica(3, endpoint(validShortB)),
                                      new Messages.Replica(4, endpoint(invalidLong)))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(4, sealedInfo.sealedLength());
@@ -653,7 +653,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(failingLedger)),
                              new Messages.Replica(2, endpoint(malformedLedger))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(0, sealedInfo.sealedLength());
@@ -694,7 +694,7 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(donorB)),
                              new Messages.Replica(3, endpoint(lagging))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(4, sealedInfo.sealedLength());
@@ -733,7 +733,7 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(donorB)),
                              new Messages.Replica(3, endpoint(lagging))))), null)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
 
@@ -765,7 +765,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(donor)),
                              new Messages.Replica(2, endpoint(lagging))))), null)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
 
@@ -797,7 +797,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(donor)),
                              new Messages.Replica(2, endpoint(lagging))))), null)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
 
@@ -822,7 +822,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(s1)),
                              new Messages.Replica(2, endpoint(s2))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(0, sealedInfo.sealedLength());
@@ -847,7 +847,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(s1)),
                              new Messages.Replica(2, endpoint(s2))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(0, sealedInfo.sealedLength());
@@ -871,7 +871,7 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(s2)),
                              new Messages.Replica(3, endpoint(s3))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.INTERNAL, e.code());
@@ -893,7 +893,7 @@ class RecoveryTest {
                              new Messages.Replica(1, endpoint(fenced)),
                              new Messages.Replica(2, endpoint(valid))))), null)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config).recoverAndSeal(fileId, 2));
 
@@ -918,7 +918,7 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(b)),
                              new Messages.Replica(3, endpoint(divergent))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(0, sealedInfo.sealedLength());
@@ -944,7 +944,7 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(partial)),
                              new Messages.Replica(3, endpoint(full))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
-            try (MetaClient meta = new MetaClient(config); NodePool pool = new NodePool()) {
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config).recoverAndSeal(fileId, 2);
 
                 assertEquals(4, sealedInfo.sealedLength());
@@ -956,7 +956,7 @@ class RecoveryTest {
     }
 
     @Test
-    void readRangeRejectsInvalidArgumentsBeforeStorageUse() throws Exception {
+    void readRangeRejectsInvalidArgumentsBeforeDataNodeUse() throws Exception {
         Recovery recovery = new Recovery(null, null, null);
         ChunkId chunkId = new ChunkId(FileId.random(), 0);
         Object source = replicaState(new Messages.Replica(1, "unused"), 10, 10, ChunkState.OPEN);

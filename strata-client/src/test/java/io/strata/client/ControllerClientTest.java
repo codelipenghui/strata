@@ -6,28 +6,24 @@ import io.strata.common.ErrorCode;
 import io.strata.common.ConnectionPolicy;
 import io.strata.common.ScpException;
 import io.strata.proto.Messages;
-import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.net.ServerSocket;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class MetaClientTest {
+class ControllerClientTest {
 
     @Test
     void endpointParserCoversValidAndInvalidBoundaries() {
@@ -54,7 +50,7 @@ class MetaClientTest {
 
     @Test
     void decodePropagatesTypedExceptionsWithoutWrapping() throws Exception {
-        MetaClient meta = new MetaClient(new ClientConfig(List.of("127.0.0.1:1"), 1024, 100));
+        ControllerClient meta = new ControllerClient(new ClientConfig(List.of("127.0.0.1:1"), 1024, 100));
         ScpException expected = new ScpException(ErrorCode.NOT_LEADER, "standby");
 
         Throwable thrown = decodeFailure(meta, Opcode.CREATE_FILE, ignored -> {
@@ -65,7 +61,7 @@ class MetaClientTest {
     }
 
     @Test
-    void malformedMetadataResponseDisconnectsManagedConnection() throws Exception {
+    void malformedMetadataResponseSurfacesAsInternal() throws Exception {
         FileId id = FileId.random();
         try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
                 Opcode op = Opcode.fromCode(req.opcode());
@@ -77,17 +73,14 @@ class MetaClientTest {
                 }
                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              });
-             MetaClient meta = new MetaClient(new ClientConfig(List.of(endpoint(server)), 1024, 100))) {
+             ControllerClient meta = new ControllerClient(new ClientConfig(List.of(endpoint(server)), 1024, 100))) {
             assertEquals(id, meta.createFile(StrataClient.FileSpec.log("test", "/test-file")));
-            ManagedScpConnection connection = connectionField(meta);
-            long before = connection.generation();
 
             Throwable thrown = decodeFailure(meta, Opcode.CREATE_FILE, ignored -> {
                 throw new IllegalArgumentException("bad response");
             });
 
             assertEquals(ErrorCode.INTERNAL, ((ScpException) thrown).code());
-            assertNotEquals(before, connection.generation());
         }
     }
 
@@ -101,7 +94,7 @@ class MetaClientTest {
              });
              ScpServer leader = new ScpServer(0, 1, 0, 0,
                      req -> ScpServer.ok(req, new Messages.CreateFileResp(id).encode(), null));
-             MetaClient meta = new MetaClient(new ClientConfig(
+             ControllerClient meta = new ControllerClient(new ClientConfig(
                      List.of(endpoint(standby), endpoint(leader)), 1024, 100))) {
 
             assertEquals(id, meta.createFile(StrataClient.FileSpec.log("test", "/test-file")));
@@ -122,7 +115,7 @@ class MetaClientTest {
             ConnectionPolicy policy = ConnectionPolicy.DEFAULT
                     .withConnectTimeoutMs(100)
                     .withHeartbeatIntervalMs(1_000);
-            try (MetaClient meta = new MetaClient(new ClientConfig(
+            try (ControllerClient meta = new ControllerClient(new ClientConfig(
                     List.of("127.0.0.1:" + deadPort, endpoint(leader)), 1024, 200, policy))) {
 
                 assertEquals(id, meta.createFile(StrataClient.FileSpec.log("test", "/test-file")));
@@ -140,7 +133,7 @@ class MetaClientTest {
                 }
                 return ScpServer.ok(req, new Messages.CreateFileResp(id).encode(), null);
              });
-             MetaClient meta = new MetaClient(new ClientConfig(List.of(endpoint(server)), 1024, 100))) {
+             ControllerClient meta = new ControllerClient(new ClientConfig(List.of(endpoint(server)), 1024, 100))) {
 
             assertEquals(id, meta.createFile(StrataClient.FileSpec.log("test", "/test-file")));
 
@@ -149,10 +142,11 @@ class MetaClientTest {
     }
 
     @Test
-    void metadataHeartbeatReconnectsToNextEndpointAfterLeaderConnectionDies() throws Exception {
+    void clientFailsOverToAnotherControllerWhenOneDies() throws Exception {
+        // Owner-aware client: the first call goes to the first seed; once that controller dies, a retriable
+        // transport failure advances to the next controller, so the second call still succeeds.
         FileId firstId = FileId.random();
         FileId secondId = FileId.random();
-        AtomicInteger secondPings = new AtomicInteger();
         try (ScpServer first = new ScpServer(0, 1, 0, 0, req -> {
                 Opcode op = Opcode.fromCode(req.opcode());
                 if (op == Opcode.CREATE_FILE) {
@@ -169,20 +163,17 @@ class MetaClientTest {
                      return ScpServer.ok(req, new Messages.CreateFileResp(secondId).encode(), null);
                  }
                  if (op == Opcode.PING) {
-                     secondPings.incrementAndGet();
                      return ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
                  }
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              })) {
             ConnectionPolicy policy = new ConnectionPolicy(500, 50, 50, 10_000, 50, 200);
             ClientConfig config = new ClientConfig(List.of(endpoint(first), endpoint(second)), 1024, 500, policy);
-            try (MetaClient meta = new MetaClient(config)) {
+            try (ControllerClient meta = new ControllerClient(config)) {
                 assertEquals(firstId, meta.createFile(StrataClient.FileSpec.log("test", "/first")));
                 first.close();
-
-                waitFor(() -> secondPings.get() > 0);
-
-                assertEquals(secondId, meta.createFile(StrataClient.FileSpec.log("test", "/second")));
+                assertEquals(secondId, meta.createFile(StrataClient.FileSpec.log("test", "/second")),
+                        "after the first controller dies, the client fails over to the second");
             }
         }
     }
@@ -194,7 +185,7 @@ class MetaClientTest {
                 calls.incrementAndGet();
                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "missing");
              });
-             MetaClient meta = new MetaClient(new ClientConfig(List.of(endpoint(server)), 1024, 100))) {
+             ControllerClient meta = new ControllerClient(new ClientConfig(List.of(endpoint(server)), 1024, 100))) {
 
             ScpException e = assertThrows(ScpException.class,
                     () -> meta.lookupFile(FileId.random()));
@@ -210,7 +201,7 @@ class MetaClientTest {
         try (ServerSocket socket = new ServerSocket(0)) {
             unusedPort = socket.getLocalPort();
         }
-        MetaClient meta = new MetaClient(new ClientConfig(List.of("127.0.0.1:" + unusedPort), 1024, 100));
+        ControllerClient meta = new ControllerClient(new ClientConfig(List.of("127.0.0.1:" + unusedPort), 1024, 100));
         Thread.currentThread().interrupt();
         try {
             ScpException e = assertThrows(ScpException.class,
@@ -228,12 +219,12 @@ class MetaClientTest {
     }
 
     private static Endpoint parseEndpoint(String endpoint) {
-        return Endpoint.parse(endpoint, "metadata endpoint", ErrorCode.INTERNAL);
+        return Endpoint.parse(endpoint, "controller endpoint", ErrorCode.INTERNAL);
     }
 
-    private static Throwable decodeFailure(MetaClient meta, Opcode op,
+    private static Throwable decodeFailure(ControllerClient meta, Opcode op,
                                            Function<ByteBuffer, ?> decoder) throws Exception {
-        Method method = MetaClient.class.getDeclaredMethod("decode", Opcode.class, ByteBuffer.class, Function.class);
+        Method method = ControllerClient.class.getDeclaredMethod("decode", Opcode.class, ByteBuffer.class, Function.class);
         method.setAccessible(true);
         try {
             method.invoke(meta, op, ByteBuffer.allocate(0), decoder);
@@ -243,24 +234,7 @@ class MetaClientTest {
         }
     }
 
-    private static ManagedScpConnection connectionField(MetaClient meta) throws ReflectiveOperationException {
-        Field field = MetaClient.class.getDeclaredField("connection");
-        field.setAccessible(true);
-        return (ManagedScpConnection) field.get(meta);
-    }
-
     private static String endpoint(ScpServer server) {
         return "127.0.0.1:" + server.port();
-    }
-
-    private static void waitFor(BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 5_000;
-        while (System.currentTimeMillis() < deadline) {
-            if (condition.getAsBoolean()) {
-                return;
-            }
-            Thread.sleep(10);
-        }
-        throw new AssertionError("condition not met before deadline");
     }
 }

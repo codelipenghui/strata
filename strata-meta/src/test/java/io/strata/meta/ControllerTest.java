@@ -39,13 +39,13 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
-class MetadataServiceTest {
+class ControllerTest {
 
     private TestingServer zk;
-    private MetadataService service;
+    private Controller service;
     private ScpClient client;
 
-    /** A fake storage node: registers and heartbeats but executes nothing for real. */
+    /** A fake data node: registers and heartbeats but executes nothing for real. */
     private class FakeNode {
         final UUID inc = UUID.randomUUID();
         final String host;
@@ -56,7 +56,7 @@ class MetadataServiceTest {
         final List<Messages.CompletedCommand> toReport = new ArrayList<>();
 
         FakeNode(String host) {
-            this(host, MetadataServiceTest.this.client);
+            this(host, ControllerTest.this.client);
         }
 
         FakeNode(String host, ScpClient controlClient) {
@@ -93,7 +93,7 @@ class MetadataServiceTest {
     @BeforeAll
     void setup() throws Exception {
         zk = new TestingServer(true);
-        service = new MetadataService(MetaConfig.forTests(zk.getConnectString()));
+        service = new Controller(ControllerConfig.forTests(zk.getConnectString()));
         awaitLeader(service);
         client = new ScpClient("127.0.0.1", service.port(), ScpClient.KIND_TOOL, "test");
     }
@@ -105,7 +105,7 @@ class MetadataServiceTest {
         zk.close();
     }
 
-    private static void awaitLeader(MetadataService metadataService) throws InterruptedException {
+    private static void awaitLeader(Controller metadataService) throws InterruptedException {
         long deadline = System.currentTimeMillis() + 10_000;
         while (!metadataService.isLeader() && System.currentTimeMillis() < deadline) {
             Thread.sleep(20);
@@ -202,7 +202,7 @@ class MetadataServiceTest {
 
     @Test
     void nonLeaderRejectsRequestsWithTypedRedirectSignal() throws Exception {
-        try (MetadataService follower = new MetadataService(MetaConfig.forTests(zk.getConnectString()));
+        try (Controller follower = new Controller(ControllerConfig.forTests(zk.getConnectString()));
              ScpClient followerClient = new ScpClient("127.0.0.1", follower.port(),
                      ScpClient.KIND_TOOL, "follower-test")) {
             Thread.sleep(200); // let the follower's LeaderLatch finish its background join
@@ -219,9 +219,9 @@ class MetadataServiceTest {
     void failedServerBindCleansStartupResources() throws Exception {
         int participantsBefore = leaderParticipantCount();
         try (ServerSocket blocker = new ServerSocket(0)) {
-            MetaConfig blocked = new MetaConfig(zk.getConnectString(), blocker.getLocalPort(),
+            ControllerConfig blocked = new ControllerConfig(zk.getConnectString(), blocker.getLocalPort(),
                     200, 1_000, 1_500, 300, 3_000);
-            assertThrows(Exception.class, () -> new MetadataService(blocked));
+            assertThrows(Exception.class, () -> new Controller(blocked));
         }
 
         long deadline = System.currentTimeMillis() + 2_000;
@@ -282,7 +282,7 @@ class MetadataServiceTest {
     @Test
     void fileChunkLifecycleWithPlacement() throws Exception {
         try (TestingServer localZk = new TestingServer(true);
-             MetadataService localService = new MetadataService(MetaConfig.forTests(localZk.getConnectString()));
+             Controller localService = new Controller(ControllerConfig.forTests(localZk.getConnectString()));
              ScpClient localClient = new ScpClient("127.0.0.1", localService.port(),
                      ScpClient.KIND_TOOL, "isolated-lifecycle")) {
             awaitLeader(localService);
@@ -468,7 +468,7 @@ class MetadataServiceTest {
     @Test
     void placementExcludesNodesWithNoFreeBytes() throws Exception {
         try (TestingServer localZk = new TestingServer(true);
-             MetadataService localService = new MetadataService(MetaConfig.forTests(localZk.getConnectString()));
+             Controller localService = new Controller(ControllerConfig.forTests(localZk.getConnectString()));
              ScpClient localClient = new ScpClient("127.0.0.1", localService.port(),
                      ScpClient.KIND_TOOL, "isolated-fullness")) {
             awaitLeader(localService);
@@ -511,13 +511,13 @@ class MetadataServiceTest {
     }
 
     private NodeRegistry registry() throws Exception {
-        Field field = MetadataService.class.getDeclaredField("registry");
+        Field field = Controller.class.getDeclaredField("registry");
         field.setAccessible(true);
         return (NodeRegistry) field.get(service);
     }
 
     private ZkMetadataStore metadataStore() throws Exception {
-        Field field = MetadataService.class.getDeclaredField("store");
+        Field field = Controller.class.getDeclaredField("store");
         field.setAccessible(true);
         return (ZkMetadataStore) field.get(service);
     }
@@ -536,7 +536,7 @@ class MetadataServiceTest {
     }
 
     private MetadataStore replaceStore(MetadataStore replacement) throws Exception {
-        Field field = MetadataService.class.getDeclaredField("store");
+        Field field = Controller.class.getDeclaredField("store");
         field.setAccessible(true);
         MetadataStore previous = (MetadataStore) field.get(service);
         field.set(service, replacement);
@@ -1160,7 +1160,7 @@ class MetadataServiceTest {
     @Test
     void placementRequiresThreeAliveNodesOnDistinctHosts() throws Exception {
         try (TestingServer localZk = new TestingServer(true);
-             MetadataService localService = new MetadataService(MetaConfig.forTests(localZk.getConnectString()));
+             Controller localService = new Controller(ControllerConfig.forTests(localZk.getConnectString()));
              ScpClient localClient = new ScpClient("127.0.0.1", localService.port(),
                      ScpClient.KIND_TOOL, "isolated-host-affinity")) {
             awaitLeader(localService);

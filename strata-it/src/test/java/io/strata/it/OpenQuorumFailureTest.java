@@ -7,7 +7,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
-import io.strata.node.StorageNode;
+import io.strata.node.DataNode;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -70,7 +70,7 @@ class OpenQuorumFailureTest {
             assertTrue(chunk.replicas().stream().noneMatch(replica -> replica.nodeId() == victimNodeId),
                     "failed-open replica must not remain in the sealed descriptor");
 
-            StorageNode restarted = cluster.restartNode(victimIndex);
+            DataNode restarted = cluster.restartNode(victimIndex);
             waitForNodeId(restarted, victimNodeId);
             waitForChunkRepaired(cluster, fileId, chunkId, victimNodeId);
 
@@ -87,7 +87,7 @@ class OpenQuorumFailureTest {
         }
     }
 
-    private static void waitForNodeId(StorageNode node, int expectedNodeId) throws Exception {
+    private static void waitForNodeId(DataNode node, int expectedNodeId) throws Exception {
         long deadline = System.currentTimeMillis() + 10_000;
         while (node.nodeId() != expectedNodeId && System.currentTimeMillis() < deadline) {
             Thread.sleep(50);
@@ -117,8 +117,8 @@ class OpenQuorumFailureTest {
         throw new AssertionError("partial-open chunk was not repaired to RF=3");
     }
 
-    private static StorageNode nodeById(MiniCluster cluster, int nodeId) {
-        for (StorageNode node : cluster.nodes) {
+    private static DataNode nodeById(MiniCluster cluster, int nodeId) {
+        for (DataNode node : cluster.nodes) {
             if (node.nodeId() == nodeId) {
                 return node;
             }

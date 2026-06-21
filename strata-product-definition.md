@@ -10,7 +10,7 @@
 
 - **The gap.** Every modern fix for Kafka's storage problem — WarpStream, AutoMQ, Bufstream, Confluent Freight, Diskless Kafka (KIP-1150) — assumes an S3-class object store underneath. Self-managed datacenters, regulated and air-gapped environments, sovereign clouds, and edge deployments are excluded, yet they feel Kafka's storage pain most acutely.
 - **The product.** Keep the Kafka protocol and ecosystem unchanged. Make brokers diskless and stateless. Store all log data in a purpose-built, quorum-replicated Strata file service on commodity disks. Coordinate with a compact, KRaft-based metadata plane.
-- **The wins.** Storage scales by adding storage nodes, not brokers. Operations move metadata, never data. Cold data ages in place on cheap media — no tiering pipeline, because nothing ever needs to migrate. Quorum acks keep produce p99 flat.
+- **The wins.** Storage scales by adding data nodes, not brokers. Operations move metadata, never data. Cold data ages in place on cheap media — no tiering pipeline, because nothing ever needs to migrate. Quorum acks keep produce p99 flat.
 - **The position.** Kafka compatibility + disaggregated storage + no object-store dependency. No product on the market offers all three.
 - **The reach.** Sealed-data placement is pluggable — local media, object store, or hybrid — so one architecture serves both self-managed and cloud deployments.
 
@@ -32,13 +32,13 @@ Strata separates the Kafka protocol from log storage. Three independently scalab
 - **First-class file namespaces** let one Strata storage cluster serve multiple Kafka clusters or tenants while keeping paths, future ACLs, and quotas separate.
 - **A compact metadata plane** built on Kafka's own KRaft — consulted at chunk boundaries and leadership changes, never per message.
 
-Two operational facts that follow: a failed broker's 1,000 partitions re-lead in seconds with zero data movement; a failed 100 TB storage node is re-replicated by the whole pool in parallel — hours, not the days a Kafka broker replacement takes — and the exposure window *shrinks* as the cluster grows.
+Two operational facts that follow: a failed broker's 1,000 partitions re-lead in seconds with zero data movement; a failed 100 TB data node is re-replicated by the whole pool in parallel — hours, not the days a Kafka broker replacement takes — and the exposure window *shrinks* as the cluster grows.
 
 **Pluggable placement** is the strategic hinge: sealed data can target dense local media (self-managed), object storage (cloud), or both (hybrid) — one architecture for all three deployment modes (§5).
 
 ## 3. What you get
 
-- **Elastic storage without an object store.** Retention becomes a configuration change backed by adding storage nodes — unavailable in any Kafka-compatible product today without an S3 dependency.
+- **Elastic storage without an object store.** Retention becomes a configuration change backed by adding data nodes — unavailable in any Kafka-compatible product today without an S3 dependency.
 - **No partition outgrows a node.** Retention is bounded by aggregate pool capacity, not one broker's disks. (Capacity, not throughput: hot partitions still split for bandwidth.)
 - **Zero-data-movement operations.** Hot partition on an overloaded broker: Kafka moves the partition — hours of throttled copying; Strata moves its leadership — seconds, zero bytes. Storage balance is passive: write-time placement plus retention converge on their own. There is no Cruise Control equivalent because there is nothing for it to do.
 - **Cheap-media economics without tiering.** Cost is set by where data is placed at write time — dense HDD works, since the workload is sequential. Storage class is user configuration; Strata never migrates data between classes on its own. (Erasure coding remains a future option, not committed scope: 3x → ~1.4x.)
@@ -78,7 +78,7 @@ Four observations structure the field:
 
 ## 6. Delivery phasing
 
-- **v0 — storage engine bootstrap (internal milestone, not a release).** The Strata file service, chunk protocol, and repair machinery are built and validated against a thin ZooKeeper-backed metadata service behind the same interfaces — decoupling the first implementation from the Kafka-fork timeline, so the riskiest new engineering is proven while the controller work lands in parallel. ZooKeeper is a development expedient with explicit retirement criteria, never a shipped configuration.
+- **v0 — storage engine bootstrap (internal milestone, not a release).** The Strata file service, chunk protocol, and repair machinery are built and validated against a thin ZooKeeper-backed controller behind the same interfaces — decoupling the first implementation from the Kafka-fork timeline, so the riskiest new engineering is proven while the controller work lands in parallel. ZooKeeper is a development expedient with explicit retirement criteria, never a shipped configuration.
 - **v1 — the structural wins.** Quorum-replicated Strata file service, diskless brokers, KRaft-based metadata plane, Kafka protocol core. Delivers what Kafka structurally cannot: independent storage scaling, seconds-level failover, flat produce p99, passive balancing. Cold data stays at 3x. Protocol compatibility is staffed as a first-class workstream.
 - **v1.x — heterogeneous media.** Media-aware placement (latency-critical topics to NVMe, everything else to dense HDD) plus relocation and decommission tooling. Still no migration pipeline.
 - **Future exploration — erasure coding (not committed).** Could cut cold-data overhead from 3x toward ~1.4x; the only forward dependency (a polymorphic chunk-layout descriptor) ships in v1. Kafka, KIP-405, and Northguard v1 all ship without EC — current scope concedes nothing.

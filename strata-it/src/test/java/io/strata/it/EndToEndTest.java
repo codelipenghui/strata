@@ -29,7 +29,7 @@ class EndToEndTest {
         // small chunks force several rolls in one test
         client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint())
                 .withChunkRollBytes(4096)
-                .withStorageConnectionsPerEndpoint(3));
+                .withDataNodeConnectionsPerEndpoint(3));
     }
 
     @AfterAll
@@ -53,7 +53,7 @@ class EndToEndTest {
         // every acked byte reads back, in order, to EOF
         workload.verifyAckedPrefix(client, fileId);
 
-        // metadata and storage replicas agree on the sealed file shape
+        // metadata and data-node replicas agree on the sealed file shape
         var lookup = ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                 workload.ackedBytes());
         assertTrue(lookup.chunks().size() >= 5, "expected several chunks, got " + lookup.chunks().size());

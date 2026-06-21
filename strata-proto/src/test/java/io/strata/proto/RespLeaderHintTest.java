@@ -27,7 +27,7 @@ class RespLeaderHintTest {
     @Test
     void carriesLeaderHintOnNotLeader() {
         ScpException e = roundTrip(
-                Resp.error(ErrorCode.NOT_LEADER, "not the metadata leader", 0, "10.0.0.5:9200"));
+                Resp.error(ErrorCode.NOT_LEADER, "not the controller leader", 0, "10.0.0.5:9200"));
         assertEquals(ErrorCode.NOT_LEADER, e.code());
         assertEquals("10.0.0.5:9200", e.leaderHint());
         assertEquals(0, e.detail());
