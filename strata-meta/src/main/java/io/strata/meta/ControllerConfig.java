@@ -11,6 +11,7 @@ public record ControllerConfig(
         int deadGraceMs,           // lease expiry -> SUSPECT; expiry + grace -> DEAD (repair starts)
         int repairScanIntervalMs,
         int repairCommandTimeoutMs, // in-flight command without completion past this -> re-issue
+        int reconcileIntervalMs,   // slow-reconcile cadence: full inventory sweep vs. repair-log delta
         int zkSessionTimeoutMs,
         int zkConnectionTimeoutMs,
         String advertisedHost,     // host clients/peers reach this meta at; carried in the leader hint
@@ -37,7 +38,7 @@ public record ControllerConfig(
     public ControllerConfig(String zkConnect, int listenPort, int heartbeatIntervalMs, int leaseMs,
                       int deadGraceMs, int repairScanIntervalMs, int repairCommandTimeoutMs) {
         this(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs, repairScanIntervalMs,
-                repairCommandTimeoutMs, 60_000, 15_000, "127.0.0.1", 90_000, List.of(), 3);
+                repairCommandTimeoutMs, 60_000, 60_000, 15_000, "127.0.0.1", 90_000, List.of(), 3);
     }
 
     /** Full v0 tuning tuple without namespace sharding (kept so existing callers compile unchanged). */
@@ -46,21 +47,29 @@ public record ControllerConfig(
                       int zkSessionTimeoutMs, int zkConnectionTimeoutMs, String advertisedHost,
                       long replicaMissingGraceMs) {
         this(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs, repairScanIntervalMs,
-                repairCommandTimeoutMs, zkSessionTimeoutMs, zkConnectionTimeoutMs, advertisedHost,
+                repairCommandTimeoutMs, 60_000, zkSessionTimeoutMs, zkConnectionTimeoutMs, advertisedHost,
                 replicaMissingGraceMs, List.of(), 3);
     }
 
     public ControllerConfig withAdvertisedHost(String host) {
         return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
-                repairScanIntervalMs, repairCommandTimeoutMs, zkSessionTimeoutMs, zkConnectionTimeoutMs,
-                host, replicaMissingGraceMs, controllerEndpoints, controllerReplicaCount);
+                repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
+                zkConnectionTimeoutMs, host, replicaMissingGraceMs, controllerEndpoints, controllerReplicaCount);
     }
 
     /** A copy with the missing-replica grace overridden — lets tests drop a deleted replica promptly. */
     public ControllerConfig withReplicaMissingGraceMs(long graceMs) {
         return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
-                repairScanIntervalMs, repairCommandTimeoutMs, zkSessionTimeoutMs, zkConnectionTimeoutMs,
-                advertisedHost, graceMs, controllerEndpoints, controllerReplicaCount);
+                repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
+                zkConnectionTimeoutMs, advertisedHost, graceMs, controllerEndpoints, controllerReplicaCount);
+    }
+
+    /** A copy with the slow-reconcile cadence overridden. */
+    public ControllerConfig withReconcileIntervalMs(int reconcileIntervalMs) {
+        return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
+                repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
+                zkConnectionTimeoutMs, advertisedHost, replicaMissingGraceMs, controllerEndpoints,
+                controllerReplicaCount);
     }
 
     /**
@@ -70,12 +79,12 @@ public record ControllerConfig(
      */
     public ControllerConfig withControllerEndpoints(List<String> endpoints, int replicaCount) {
         return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
-                repairScanIntervalMs, repairCommandTimeoutMs, zkSessionTimeoutMs, zkConnectionTimeoutMs,
-                advertisedHost, replicaMissingGraceMs, endpoints, replicaCount);
+                repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
+                zkConnectionTimeoutMs, advertisedHost, replicaMissingGraceMs, endpoints, replicaCount);
     }
 
     public static ControllerConfig forTests(String zkConnect) {
-        return new ControllerConfig(zkConnect, 0, 200, 1_000, 1_500, 300, 3_000, 5_000, 20_000, "127.0.0.1",
+        return new ControllerConfig(zkConnect, 0, 200, 1_000, 1_500, 300, 3_000, 60_000, 5_000, 20_000, "127.0.0.1",
                 90_000, List.of(), 3);
     }
 }
