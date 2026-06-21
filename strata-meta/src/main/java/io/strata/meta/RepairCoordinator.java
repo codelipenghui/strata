@@ -78,6 +78,11 @@ class RepairCoordinator implements AutoCloseable {
             Thread.ofVirtual().name("meta-delete-dispatch-", 0).factory());
     private final ExecutorService completionExecutor = Executors.newSingleThreadExecutor(
             Thread.ofVirtual().name("meta-command-completion-", 0).factory());
+    // Lane B: a node death surfaced by expireScan() is fanned out here so the slow reconcile no longer
+    // gates how fast under-replication repair starts. Single-thread (serialized with itself) and off the
+    // tick() thread so a slow per-namespace enumeration can never stall lease expiry / command sweeping.
+    private final ExecutorService repairEventExecutor = Executors.newSingleThreadExecutor(
+            Thread.ofVirtual().name("meta-repair-event-", 0).factory());
     // (nodeId:chunkId) -> first time the node's inventory reported a sealed replica unhealthy
     // (missing or still locally OPEN/DELETING). A just-sealed chunk can race with an in-flight
     // inventory snapshot; only drop the replica if it stays unhealthy past the grace, so churn can't
@@ -205,8 +210,88 @@ class RepairCoordinator implements AutoCloseable {
         if (System.currentTimeMillis() - leaderSince < config.leaseMs() + config.deadGraceMs()) {
             return;
         }
-        registry.expireScan();
+        // Lane B: feed each newly-dead node to a targeted repair so a death starts repair immediately
+        // instead of waiting up to a full reconcileIntervalMs. The slow reconcile remains the backstop;
+        // the event path goes through the same dedup'd per-chunk issue, so the two cannot double-issue.
+        List<Integer> dead = registry.expireScan();
+        for (int deadNodeId : dead) {
+            repairEventExecutor.submit(() -> repairForDeadNodeSafe(deadNodeId));
+        }
         sweepStuckCommands();
+    }
+
+    /** Test seam: stamps {@code leaderSince} far enough in the past that the settle gate is open. */
+    void becomeLeaderForTest() {
+        leaderSince = System.currentTimeMillis() - (config.leaseMs() + config.deadGraceMs()) - 1;
+    }
+
+    /**
+     * Wraps {@link #repairForDeadNode} so a failure on the event path never escapes the executor: the
+     * slow reconcile is the correctness backstop, so a missed event-driven repair only delays healing.
+     */
+    private void repairForDeadNodeSafe(int deadNodeId) {
+        try {
+            repairForDeadNode(deadNodeId);
+        } catch (Exception e) {
+            log.warn("event repair for dead node {} failed — reconcile backstops", deadNodeId, e);
+        }
+    }
+
+    /**
+     * Lane B targeted repair: re-replicate exactly the sealed chunks that had a replica on
+     * {@code deadNodeId} and are now under-replicated. Leader-only (owners are wired in a later task)
+     * and settle-gated like the reconcile, so a freshly-elected leader does not repair before nodes
+     * re-register. Enumerates the namespaces this leader can authoritatively account for — the ones it
+     * owns (or all, when non-sharded) plus the system meta-log namespace — and reuses the shared
+     * per-chunk path, so it dedups against {@code chunksBeingRepaired} with any concurrent reconcile.
+     */
+    void repairForDeadNode(int deadNodeId) throws Exception {
+        if (!isLeader.getAsBoolean()) {
+            return;
+        }
+        if (System.currentTimeMillis() - leaderSince < config.leaseMs() + config.deadGraceMs()) {
+            return;
+        }
+        for (StrataNamespace ns : store.listNamespaces()) {
+            if (!ownsAll.getAsBoolean() && !ownsNamespace.test(ns) && !NamespaceLogBackend.isSystem(ns)) {
+                continue;
+            }
+            for (FileId fileId : store.listFiles(ns)) {
+                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
+                if (opt.isEmpty()) {
+                    continue;
+                }
+                repairFileChunksOnNode(fileId, opt.get().value(), deadNodeId);
+            }
+        }
+    }
+
+    /**
+     * Issues repair for every sealed, under-replicated chunk of {@code file} that still references
+     * {@code deadNodeId}. Shared by the event path; {@link #issueReplicate} performs the placement,
+     * the {@code chunksBeingRepaired} dedup, and the command enqueue exactly as the reconcile does —
+     * this method only narrows the candidate set to chunks affected by the dead node.
+     */
+    private void repairFileChunksOnNode(FileId fileId, Records.FileRecord file, int deadNodeId) {
+        if (file.state() == FileState.DELETING) {
+            return; // deletion, not repair, drives a DELETING file's chunks
+        }
+        for (Records.ChunkRecord chunk : file.chunks()) {
+            if (chunk.state() != ChunkState.SEALED || !chunk.replicas().contains(deadNodeId)) {
+                continue;
+            }
+            ChunkId chunkId = file.chunkId(chunk.index());
+            if (chunksBeingRepaired.contains(chunkId)) {
+                continue;
+            }
+            int live = 0;
+            for (int nodeId : chunk.replicas()) {
+                if (!registry.isDead(nodeId)) live++;
+            }
+            if (live < file.replicationFactor() && live > 0) {
+                issueReplicate(fileId, file, chunk);
+            }
+        }
     }
 
     /**
@@ -894,8 +979,10 @@ class RepairCoordinator implements AutoCloseable {
         }
         deleteDispatchExecutor.shutdown();
         completionExecutor.shutdown();
+        repairEventExecutor.shutdown();
         awaitTermination(deleteDispatchExecutor);
         awaitTermination(completionExecutor);
+        awaitTermination(repairEventExecutor);
     }
 
     private static void awaitTermination(ExecutorService executor) {
