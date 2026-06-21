@@ -1,15 +1,20 @@
 package io.strata.meta;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
+import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.FileState;
+import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 import io.strata.proto.Messages;
+import io.strata.proto.Opcode;
+import io.strata.proto.ScpServer;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
@@ -17,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 import org.junit.jupiter.api.Test;
@@ -97,6 +103,85 @@ class RepairCoordinatorEventTest {
                 "a standby must not issue event-driven repair");
     }
 
+    /**
+     * Lane B owner path: a non-leader namespace owner has no heartbeat channel, so it detects a node
+     * death by that node DISAPPEARING from the published cluster-live-nodes snapshot (alive-only). On
+     * that delta it repairs the owned chunks that had a replica on the departed node, using OWNER
+     * liveness (the snapshot alive set) and the owner per-chunk repair — NOT {@code registry.isDead()}.
+     */
+    @Test
+    void ownerRepairsWhenNodeLeavesPublishedSnapshot() throws Exception {
+        FakeStore store = new FakeStore();
+        ControllerConfig config = config();
+        NodeRegistry registry = new NodeRegistry(store, config);
+        Registered source = register(registry, 2110, "source");
+        Registered other = register(registry, 2111, "other");
+
+        UUID inc = UUID.randomUUID();
+        try (ScpServer targetServer = new ScpServer(0, 999, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.EXEC_REPLICATE.code) {
+                        return ScpServer.ok(req, Messages.okHeader(), null);
+                    }
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
+                })) {
+            Registered target = registerAt(registry, 2112, "target", "127.0.0.1:" + targetServer.port());
+
+            // RF 3, sealed, currently on {source, other}; `target` is the only spare.
+            FileId fileId = fileId(2400);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xABCD, List.of(source.nodeId(), other.nodeId())))));
+
+            // Non-leader owner: isLeader=false, ownsAll=false, ownsNamespace=true for the file's namespace.
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config,
+                    () -> false, () -> false, ns -> true);
+
+            // tick 1: snapshot has all three -> nothing to repair (and it records the baseline ids).
+            publishSnapshotWith(registry);
+            owner.tick();
+            // tick 2: `source` is gone from the snapshot -> owner detects the delta and repairs.
+            expire(registry, source.nodeId());
+            publishSnapshotWith(registry);
+            owner.tick();
+
+            assertTrue(replicateIssuedFor(owner, store, fileId, target.nodeId()),
+                    "owner must replicate the source's chunk to the spare target after it leaves the snapshot");
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertFalse(replicas.contains(source.nodeId()), "the departed replica was swapped out");
+        }
+    }
+
+    /**
+     * Awaits the owner event path (async via {@code repairEventExecutor}) writing the target into the
+     * chunk's replica set — the owner repair applies the swap itself after EXEC_REPLICATE acks.
+     */
+    private static boolean replicateIssuedFor(RepairCoordinator coord, FakeStore store, FileId fileId,
+                                              int targetNode) throws Exception {
+        long deadline = System.currentTimeMillis() + 2_000;
+        while (System.currentTimeMillis() < deadline) {
+            var v = store.files.get(fileId);
+            if (v != null && v.value().chunks().get(0).replicas().contains(targetNode)) {
+                return true;
+            }
+            Thread.sleep(5);
+        }
+        return false;
+    }
+
+    /** Publishes a live-node snapshot from the registry's current in-memory live (alive) set. */
+    private static void publishSnapshotWith(NodeRegistry registry) {
+        registry.publishClusterLiveNodes();
+    }
+
+    private static Registered registerAt(NodeRegistry registry, long incMsb, String host, String endpoint)
+            throws Exception {
+        long incLsb = incMsb + 1;
+        Messages.RegisterResp resp = registry.register(new Messages.RegisterNode(
+                incMsb, incLsb, List.of(endpoint), "zone", "rack", host,
+                List.of(new Messages.StorageCapacity(1_000_000)), 1, 0));
+        return new Registered(resp.nodeId(), incMsb, incLsb, resp.sessionEpoch());
+    }
+
     /** Drives heartbeats until the targeted node gets a ReplicateCmd (the event path is async via tick()). */
     private static Messages.ReplicateCmd awaitReplicate(NodeRegistry registry, RepairCoordinator coord,
                                                         Registered node) throws Exception {
@@ -173,7 +258,18 @@ class RepairCoordinatorEventTest {
     private static final class FakeStore implements MetadataStore {
         private final Map<FileId, Versioned<Records.FileRecord>> files = new LinkedHashMap<>();
         private final Map<Integer, Versioned<Records.NodeRecord>> nodes = new LinkedHashMap<>();
+        private volatile byte[] clusterLiveNodes;
         private int nextNodeId = 1;
+
+        @Override
+        public void putClusterLiveNodes(byte[] snapshot) {
+            this.clusterLiveNodes = snapshot;
+        }
+
+        @Override
+        public Optional<byte[]> getClusterLiveNodes() {
+            return Optional.ofNullable(clusterLiveNodes);
+        }
 
         @Override
         public void createFile(Records.FileRecord record) {
