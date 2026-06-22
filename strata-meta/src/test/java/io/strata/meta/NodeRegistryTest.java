@@ -612,6 +612,32 @@ class NodeRegistryTest {
         assertEquals(Boolean.FALSE, currentSession.get());
     }
 
+    @Test
+    void placementSnapshotReadIsCachedForTheRepairScanInterval() throws Exception {
+        FakeStore store = new FakeStore();
+        long t0 = 1_000_000L;
+        // A non-empty published snapshot so the cache populates (a null snapshot never caches).
+        store.liveNodesSnapshot = new Records.ClusterLiveNodes(t0,
+                List.of(new Records.ClusterLiveNodes.LiveEntry(node(5, Records.NodeState.REGISTERED), 1_000L)))
+                .encode();
+        // repairScanIntervalMs = 5000 (the publishClusterLiveNodes cadence); the snapshot-read TTL tracks it.
+        ControllerConfig config = new ControllerConfig("unused", 0, 1, 1_000, 60_000, 5_000, 1);
+        NodeRegistry registry = new NodeRegistry(store, config);
+
+        registry.candidatesFor(StrataNamespace.of("ns"), t0);
+        assertEquals(1, store.liveNodeReads, "first placement reads the snapshot once");
+
+        // Well past the old hard-coded 100ms TTL but within the 5s publish cadence: must stay cached.
+        registry.candidatesFor(StrataNamespace.of("ns"), t0 + 101);
+        registry.candidatesFor(StrataNamespace.of("ns"), t0 + 4_999);
+        assertEquals(1, store.liveNodeReads,
+                "within the repair-scan/publish interval the snapshot read is served from cache (was re-read every 100ms)");
+
+        // Past the publish cadence: a non-publisher re-reads once to pick up a fresh snapshot.
+        registry.candidatesFor(StrataNamespace.of("ns"), t0 + 5_001);
+        assertEquals(2, store.liveNodeReads, "after the publish interval the snapshot is re-read once");
+    }
+
     private static ControllerConfig config() {
         return new ControllerConfig("unused", 0, 1, 1_000, 0, 1, 1);
     }
@@ -655,6 +681,9 @@ class NodeRegistryTest {
         private boolean failNextPutNode;
         private int failPutNodeAttempts;
         private boolean throwOnPutNode;
+        // Counts snapshot reads on the placement path; serves a published snapshot if set.
+        private int liveNodeReads;
+        private byte[] liveNodesSnapshot;
 
         @Override
         public void createFile(Records.FileRecord record) {
@@ -706,6 +735,17 @@ class NodeRegistryTest {
         @Override
         public int nextNodeId() {
             return nextNodeId++;
+        }
+
+        @Override
+        public Optional<byte[]> getClusterLiveNodes() {
+            liveNodeReads++;
+            return Optional.ofNullable(liveNodesSnapshot);
+        }
+
+        @Override
+        public void putClusterLiveNodes(byte[] snapshot) {
+            liveNodesSnapshot = snapshot;
         }
 
         @Override

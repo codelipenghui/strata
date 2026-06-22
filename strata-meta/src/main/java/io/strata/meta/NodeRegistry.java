@@ -58,9 +58,11 @@ final class NodeRegistry {
     private final Map<Integer, LiveNode> live = new ConcurrentHashMap<>();
     private final AtomicLong sessionCounter = new AtomicLong(System.currentTimeMillis());
     // Shared cluster-liveness snapshot (design §11): the controller publishes it; any namespace owner
-    // reads it to fill placement candidates it cannot see live in memory. Cached briefly to bound the
-    // root-store reads on the placement path.
-    private static final long SNAPSHOT_RELOAD_MS = 100;
+    // reads it to fill placement candidates it cannot see live in memory. The placement path caches the
+    // read for one publish cadence (repairScanIntervalMs): publishClusterLiveNodes (RepairCoordinator
+    // tick) is the only writer, so reading faster just re-fetches identical bytes. The publisher
+    // refreshes this cache on each publish, so it never re-reads from the store at all; a non-publisher
+    // owner re-reads at most once per publish interval.
     private volatile Records.ClusterLiveNodes cachedSnapshot;
     private volatile long cachedSnapshotAtMs;
 
@@ -417,7 +419,12 @@ final class NodeRegistry {
      * probe for creating the replica.
      */
     List<LiveNode> candidatesFor(StrataNamespace namespace) {
-        long now = System.currentTimeMillis();
+        return candidatesFor(namespace, System.currentTimeMillis());
+    }
+
+    // Package-private overload taking an explicit clock so the snapshot-cache TTL is deterministically
+    // testable; production always uses the wall clock via the one-arg form above.
+    List<LiveNode> candidatesFor(StrataNamespace namespace, long now) {
         List<LiveNode> out = new ArrayList<>();
         Set<Integer> included = new HashSet<>();
         for (LiveNode n : live.values()) {
@@ -471,7 +478,7 @@ final class NodeRegistry {
 
     private Records.ClusterLiveNodes currentSnapshot(long now) {
         Records.ClusterLiveNodes snap = cachedSnapshot;
-        if (snap == null || now - cachedSnapshotAtMs > SNAPSHOT_RELOAD_MS) {
+        if (snap == null || now - cachedSnapshotAtMs > config.repairScanIntervalMs()) {
             try {
                 Optional<byte[]> bytes = store.getClusterLiveNodes();
                 snap = bytes.map(Records.ClusterLiveNodes::decode).orElse(null);
