@@ -25,16 +25,20 @@ import java.util.function.Predicate;
  * <p><b>System namespace routing (design §5).</b> The metadata-log files themselves are stored as Strata
  * files in the reserved {@link #SYSTEM_NAMESPACE}; their own descriptors live directly in the ZK root
  * store (otherwise the log would recurse into itself). So every op for the system namespace is routed
- * straight to {@code root}, and — crucially — <b>without taking the engine lock</b>: a user-namespace
- * mutation holds the lock while it writes its metadata-log file, which (with a replicated-chunk file
- * store) self-loops back into this engine for the system file; if that re-took the lock it would
- * deadlock. {@code getFile(fileId)} has no namespace, so it checks the in-memory user index lock-free,
- * then falls back to the root (system files are only ever in the root).
+ * straight to {@code root}, and — crucially — <b>without taking any namespace lock</b>: a user-namespace
+ * mutation holds <em>that namespace's</em> lock while it writes its metadata-log file, which (with a
+ * replicated-chunk file store) self-loops back into this engine for the system file; if that re-took a
+ * namespace lock it would deadlock. {@code getFile(fileId)} has no namespace, so it checks the in-memory
+ * user index lock-free, then falls back to the root (system files are only ever in the root).
  *
  * <p>A single engine is shared across {@link NamespaceLogMetadataStore} handles so multiple in-process
  * leaders observe one consistent log per namespace; cross-process single-writer is enforced by ownership
- * routing (M2). A {@link ReentrantLock} (not {@code synchronized}) guards user-namespace mutations so the
- * blocking root/file-store I/O inside a critical section never pins a virtual-thread carrier.
+ * routing (M2). Each {@link NamespaceMetadataLogRepository} owns a per-namespace {@link ReentrantLock}
+ * (not {@code synchronized}) held across that namespace's durable append, so the blocking root/file-store
+ * I/O inside a critical section never pins a virtual-thread carrier — and a slow append in one namespace
+ * never head-of-line-blocks a mutation in another. Repo creation/warm/close is guarded by
+ * {@code repoCreateLock}; best-effort metric reads ({@code loadedNamespaceCount}/{@code namespaceStats}/
+ * {@code listNamespaces}) run lock-free over the {@link ConcurrentHashMap} of repos.
  */
 final class NamespaceLogBackend implements AutoCloseable {
 
@@ -49,7 +53,6 @@ final class NamespaceLogBackend implements AutoCloseable {
     private final NamespaceMetadataFileStore fileStore;
     private final boolean ownsRoot;
     private final NamespaceLogMetrics metrics = new NamespaceLogMetrics();
-    private final ReentrantLock lock = new ReentrantLock();
     private final ConcurrentHashMap<StrataNamespace, NamespaceMetadataLogRepository> repos =
             new ConcurrentHashMap<>();
     private final ReentrantLock repoCreateLock = new ReentrantLock();
@@ -77,26 +80,17 @@ final class NamespaceLogBackend implements AutoCloseable {
 
     /** Namespaces with a live owner repository on this instance — the sharding load this node carries. */
     int loadedNamespaceCount() {
-        lock.lock();
-        try {
-            return repos.size();
-        } finally {
-            lock.unlock();
-        }
+        return repos.size(); // best-effort gauge over the ConcurrentHashMap (lock-free)
     }
 
     /** Per-namespace stats for the namespaces this node owns: {@code namespace -> [liveFiles, openLogBytes]}. */
     Map<StrataNamespace, long[]> namespaceStats() {
-        lock.lock();
-        try {
-            Map<StrataNamespace, long[]> out = new HashMap<>(repos.size());
-            for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
-                out.put(e.getKey(), new long[]{e.getValue().liveFileCount(), e.getValue().openLogBytes()});
-            }
-            return out;
-        } finally {
-            lock.unlock();
+        // Best-effort gauges over the ConcurrentHashMap; a momentarily-stale per-namespace read is fine.
+        Map<StrataNamespace, long[]> out = new HashMap<>(repos.size());
+        for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
+            out.put(e.getKey(), new long[]{e.getValue().liveFileCount(), e.getValue().openLogBytes()});
         }
+        return out;
     }
 
     /** Restricts eager recovery to the namespaces this node owns (wired from Controller). */
@@ -131,9 +125,9 @@ final class NamespaceLogBackend implements AutoCloseable {
             root.createFile(record); // metadata-log system file — lives in the ZK root (lock-free)
             return;
         }
-        lock.lock();
+        NamespaceMetadataLogRepository repo = repo(record.namespace());
+        repo.lock();
         try {
-            NamespaceMetadataLogRepository repo = repo(record.namespace());
             NamespaceMetadataState state = repo.state();
             if (state.hasTombstone(record.fileId()) || state.file(record.fileId()).isPresent()) {
                 throw new KeeperException.NodeExistsException("file " + record.fileId());
@@ -151,7 +145,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             }
             fileIndex.put(record.fileId(), record.namespace());
         } finally {
-            lock.unlock();
+            repo.unlock();
         }
     }
 
@@ -161,7 +155,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             return lockedFile(ns, id);
         }
         // A metadata-log system file lives in the root; this read is lock-free, so a self-looping
-        // system-file lookup never blocks on a user op that holds the engine lock.
+        // system-file lookup never blocks on a user op that holds its namespace's lock.
         Optional<MetadataStore.Versioned<Records.FileRecord>> system = root.getFile(id);
         if (system.isPresent()) {
             return system;
@@ -180,12 +174,13 @@ final class NamespaceLogBackend implements AutoCloseable {
 
     private Optional<MetadataStore.Versioned<Records.FileRecord>> lockedFile(StrataNamespace ns, FileId id)
             throws Exception {
-        lock.lock();
+        NamespaceMetadataLogRepository repo = repo(ns);
+        repo.lock();
         try {
-            NamespaceMetadataState state = repo(ns).state();
+            NamespaceMetadataState state = repo.state();
             return state.file(id).map(f -> new MetadataStore.Versioned<>(f, state.version(id)));
         } finally {
-            lock.unlock();
+            repo.unlock();
         }
     }
 
@@ -215,11 +210,12 @@ final class NamespaceLogBackend implements AutoCloseable {
         if (isSystem(namespace)) {
             return root.resolvePath(namespace, path);
         }
-        lock.lock();
+        NamespaceMetadataLogRepository repo = repo(namespace);
+        repo.lock();
         try {
-            return repo(namespace).state().resolvePath(path);
+            return repo.state().resolvePath(path);
         } finally {
-            lock.unlock();
+            repo.unlock();
         }
     }
 
@@ -227,9 +223,9 @@ final class NamespaceLogBackend implements AutoCloseable {
         if (isSystem(record.namespace())) {
             return root.updateFile(record, expectedVersion);
         }
-        lock.lock();
+        NamespaceMetadataLogRepository repo = repo(record.namespace());
+        repo.lock();
         try {
-            NamespaceMetadataLogRepository repo = repo(record.namespace());
             NamespaceMetadataState state = repo.state();
             Optional<Records.FileRecord> current = state.file(record.fileId());
             if (current.isEmpty() || state.version(record.fileId()) != expectedVersion) {
@@ -240,7 +236,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             }
             return true;
         } finally {
-            lock.unlock();
+            repo.unlock();
         }
     }
 
@@ -248,9 +244,9 @@ final class NamespaceLogBackend implements AutoCloseable {
         if (isSystem(namespace)) {
             return root.deletePath(namespace, path, expectedFileId);
         }
-        lock.lock();
+        NamespaceMetadataLogRepository repo = repo(namespace);
+        repo.lock();
         try {
-            NamespaceMetadataLogRepository repo = repo(namespace);
             Optional<FileId> bound = repo.state().resolvePath(path);
             if (bound.isEmpty()) {
                 return true; // already unbound — idempotent
@@ -261,7 +257,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             repo.append(new MetadataLogRecord.PathUnbound(namespace, path, expectedFileId));
             return true;
         } finally {
-            lock.unlock();
+            repo.unlock();
         }
     }
 
@@ -271,9 +267,9 @@ final class NamespaceLogBackend implements AutoCloseable {
             // a metadata-log system file (root), or unknown/already-swept — root delete is lock-free
             return root.deleteFile(id, expectedVersion);
         }
-        lock.lock();
+        NamespaceMetadataLogRepository repo = repo(ns);
+        repo.lock();
         try {
-            NamespaceMetadataLogRepository repo = repo(ns);
             NamespaceMetadataState state = repo.state();
             Optional<Records.FileRecord> current = state.file(id);
             if (current.isEmpty()) {
@@ -289,7 +285,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             repo.append(new MetadataLogRecord.FileDeleted(id, System.currentTimeMillis()));
             return true;
         } finally {
-            lock.unlock();
+            repo.unlock();
         }
     }
 
@@ -297,51 +293,50 @@ final class NamespaceLogBackend implements AutoCloseable {
         if (isSystem(namespace)) {
             return root.listFiles(namespace);
         }
-        lock.lock();
+        NamespaceMetadataLogRepository repo = repo(namespace);
+        repo.lock();
         try {
-            return repo(namespace).state().liveFiles();
+            return repo.state().liveFiles();
         } finally {
-            lock.unlock();
+            repo.unlock();
         }
     }
 
     List<StrataNamespace> listNamespaces() throws Exception {
         // System (metadata-log) namespaces come from the root; user namespaces from the loaded repos.
+        // Best-effort listing over the ConcurrentHashMap (lock-free); a stale live-files snapshot is fine.
         Set<StrataNamespace> out = new LinkedHashSet<>(root.listNamespaces());
-        lock.lock();
-        try {
-            for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
-                if (!e.getValue().state().liveFiles().isEmpty()) {
-                    out.add(e.getKey());
-                }
+        for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
+            if (!e.getValue().state().liveFiles().isEmpty()) {
+                out.add(e.getKey());
             }
-        } finally {
-            lock.unlock();
         }
         return new ArrayList<>(out);
     }
 
     int sweepDeletedFiles(long olderThanMs) throws Exception {
         int reaped = root.sweepDeletedFiles(olderThanMs); // metadata-log system-file tombstones
-        lock.lock();
-        try {
-            long cutoff = System.currentTimeMillis() - olderThanMs;
-            for (NamespaceMetadataLogRepository repo : repos.values()) {
+        long cutoff = System.currentTimeMillis() - olderThanMs;
+        // Iterate the repos lock-free, but lock EACH repo around its own sweep so the tombstone append
+        // stays under that namespace's mutation lock (no cross-namespace head-of-line blocking).
+        for (NamespaceMetadataLogRepository repo : repos.values()) {
+            repo.lock();
+            try {
                 for (FileId id : repo.state().tombstonesDeletedAtOrBefore(cutoff)) {
                     repo.append(new MetadataLogRecord.TombstoneSwept(id));
                     fileIndex.remove(id);
                     reaped++;
                 }
+            } finally {
+                repo.unlock();
             }
-        } finally {
-            lock.unlock();
         }
         return reaped;
     }
 
     @Override
     public void close() {
-        lock.lock();
+        repoCreateLock.lock();
         try {
             if (closed) {
                 return;
@@ -356,7 +351,7 @@ final class NamespaceLogBackend implements AutoCloseable {
                 root.close();
             }
         } finally {
-            lock.unlock();
+            repoCreateLock.unlock();
         }
     }
 }

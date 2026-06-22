@@ -26,6 +26,8 @@ final class NamespaceMetadataLogRepository {
     private final MetadataStore rootStore;
     private final long metadataEpoch;
     private final NamespaceLogMetrics metrics;
+    private final java.util.concurrent.locks.ReentrantLock lock =
+            new java.util.concurrent.locks.ReentrantLock();
 
     private NamespaceMetadataState state;
     private FileId logFileId;
@@ -95,6 +97,15 @@ final class NamespaceMetadataLogRepository {
 
     StrataNamespace namespace() {
         return namespace;
+    }
+
+    /** Acquires this namespace's mutation lock (held across the durable append; single-writer ordering). */
+    void lock() {
+        lock.lock();
+    }
+
+    void unlock() {
+        lock.unlock();
     }
 
     /** Durably appends a record (file store first), applies it to state, returns the new applied offset. */
