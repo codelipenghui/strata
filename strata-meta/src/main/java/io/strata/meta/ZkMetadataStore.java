@@ -48,8 +48,6 @@ public final class ZkMetadataStore implements MetadataStore {
     private static final String META_NAMESPACES = META + "/namespaces";
     private static final String META_EPOCH = META + "/epoch";
     private static final String META_LIVE_NODES = META + "/live-nodes";
-    private static final String META_FIDX = META + "/fidx";  // fileId -> owning namespace (sharding owner resolution)
-
     /** The next-level znodes under {@code /strata}, used to tag per-subtree ZK request metrics. */
     public static final List<String> SUBTREES = List.of("files", "namespaces", "nodes", "ids");
 
@@ -611,39 +609,6 @@ public final class ZkMetadataStore implements MetadataStore {
             return Optional.of(curator.getData().forPath(META_LIVE_NODES));
         } catch (KeeperException.NoNodeException e) {
             return Optional.empty();
-        }
-    }
-
-    /**
-     * Global {@code fileId -> owning namespace} index, used ONLY for namespace sharding: a node that does
-     * not own a file (so does not hold it in its namespace-log) resolves the file's owner from here to
-     * forward file-scoped ops. Written by the owner on create, removed on delete. A per-file znode — fine
-     * at the current scale; for very large fleets this should become owner bits encoded in the FileId.
-     */
-    public void putFileNamespace(FileId fileId, StrataNamespace namespace) throws Exception {
-        byte[] data = namespace.value().getBytes(StandardCharsets.UTF_8);
-        String path = META_FIDX + "/" + fileId;
-        try {
-            curator.create().creatingParentsIfNeeded().forPath(path, data);
-        } catch (KeeperException.NodeExistsException e) {
-            curator.setData().forPath(path, data); // idempotent on a create retry
-        }
-    }
-
-    public Optional<StrataNamespace> getFileNamespace(FileId fileId) throws Exception {
-        try {
-            byte[] data = curator.getData().forPath(META_FIDX + "/" + fileId);
-            return Optional.of(StrataNamespace.of(new String(data, StandardCharsets.UTF_8)));
-        } catch (KeeperException.NoNodeException e) {
-            return Optional.empty();
-        }
-    }
-
-    public void deleteFileNamespace(FileId fileId) throws Exception {
-        try {
-            curator.delete().forPath(META_FIDX + "/" + fileId);
-        } catch (KeeperException.NoNodeException ignored) {
-            // already gone — idempotent
         }
     }
 

@@ -601,7 +601,6 @@ public final class Controller implements AutoCloseable {
                     policy.replicationFactor(), policy.ackQuorum(), policy.fsyncOnAck(),
                     FileState.OPEN, System.currentTimeMillis(), List.of(),
                     m.opIdMsb(), m.opIdLsb()));
-            indexFileNamespace(m.fileId(), m.namespace());
             return m.fileId();
         } catch (KeeperException.NodeExistsException e) {
             var existing = store.getFile(m.fileId());
@@ -609,7 +608,6 @@ public final class Controller implements AutoCloseable {
                 Records.FileRecord record = existing.get().value();
                 if (sameCreateRequest(record, m) && record.state() != FileState.DELETING
                         && pathStillOwnsCreate(record, m)) {
-                    indexFileNamespace(m.fileId(), m.namespace()); // idempotent on a create retry
                     return m.fileId();
                 }
                 throw new ScpException(ErrorCode.PRECONDITION_FAILED,
@@ -862,27 +860,10 @@ public final class Controller implements AutoCloseable {
                     throw new ScpException(ErrorCode.INTERNAL,
                             "path " + current.namespace() + ":" + current.path() + " is bound to a different file");
                 }
-                unindexFileNamespace(id); // drop the sharding owner-index entry once the file is deleting
                 return;
             }
         }
         throw new ScpException(ErrorCode.INTERNAL, "delete CAS exhausted");
-    }
-
-    /**
-     * Records {@code fileId -> namespace} for sharded owner resolution; no-op when not sharded, and
-     * skipped for system (metadata-log) files, which any node resolves locally from the ZK root.
-     */
-    private void indexFileNamespace(FileId fileId, StrataNamespace namespace) throws Exception {
-        if (!ownership.ownsAll() && !NamespaceLogBackend.isSystem(namespace)) {
-            rootZk.putFileNamespace(fileId, namespace);
-        }
-    }
-
-    private void unindexFileNamespace(FileId fileId) throws Exception {
-        if (!ownership.ownsAll()) {
-            rootZk.deleteFileNamespace(fileId);
-        }
     }
 
     @Override
