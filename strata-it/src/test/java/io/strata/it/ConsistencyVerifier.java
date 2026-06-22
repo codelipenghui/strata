@@ -6,6 +6,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.FileId;
 import io.strata.common.FileState;
+import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -43,7 +44,7 @@ final class ConsistencyVerifier {
                 try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                         ScpClient.KIND_TOOL, "consistency-lookup")) {
                     ByteBuffer h = direct.call(Opcode.LOOKUP_FILE,
-                            new Messages.LookupFile(fileId).encode(), null, CALL_TIMEOUT_MS);
+                            new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, CALL_TIMEOUT_MS);
                     return Messages.LookupFileResp.decode(h);
                 }
             } catch (Exception e) {
@@ -56,6 +57,12 @@ final class ConsistencyVerifier {
     static Messages.LookupFileResp assertSealedFileConsistent(MiniCluster cluster, StrataClient client,
                                                               FileId fileId, long sealedLength) throws Exception {
         return assertSealedFileConsistent(cluster.metaEndpoints(), client, fileId, sealedLength);
+    }
+
+    static Messages.LookupFileResp assertSealedFileConsistent(MiniCluster cluster, StrataClient client,
+                                                              StrataNamespace namespace,
+                                                              FileId fileId, long sealedLength) throws Exception {
+        return assertSealedFileConsistent(cluster.metaEndpoints(), client, namespace, fileId, sealedLength);
     }
 
     static Messages.LookupFileResp waitForFullSealedFileConsistent(MiniCluster cluster,
@@ -98,7 +105,18 @@ final class ConsistencyVerifier {
                                                               FileId fileId,
                                                               long sealedLength) throws Exception {
         Messages.LookupFileResp lookup = assertSealedDescriptorConsistent(controllerEndpoints, fileId, sealedLength);
-        assertClientReadsExactlySealedLength(client, fileId, sealedLength);
+        assertClientReadsExactlySealedLength(client, StrataNamespace.of("test"), fileId, sealedLength);
+        assertSealedReplicasAreByteIdentical(lookup);
+        return lookup;
+    }
+
+    static Messages.LookupFileResp assertSealedFileConsistent(List<String> controllerEndpoints,
+                                                              StrataClient client,
+                                                              StrataNamespace namespace,
+                                                              FileId fileId,
+                                                              long sealedLength) throws Exception {
+        Messages.LookupFileResp lookup = assertSealedDescriptorConsistent(controllerEndpoints, fileId, sealedLength);
+        assertClientReadsExactlySealedLength(client, namespace, fileId, sealedLength);
         assertSealedReplicasAreByteIdentical(lookup);
         return lookup;
     }
@@ -275,10 +293,11 @@ final class ConsistencyVerifier {
     }
 
     private static void assertClientReadsExactlySealedLength(StrataClient client,
+                                                             StrataNamespace namespace,
                                                              FileId fileId,
                                                              long sealedLength) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
+        try (StrataFile.Reader reader = client.openById(namespace, fileId).openForRead()) {
             long offset = 0;
             for (int idle = 0; idle < 3; ) {
                 try (StrataFile.ReadResult result = reader.read(offset, 1 << 20)) {

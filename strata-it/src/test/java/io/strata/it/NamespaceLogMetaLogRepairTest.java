@@ -57,7 +57,7 @@ class NamespaceLogMetaLogRepairTest {
         // write a user file — its metadata is stored as replicated (RF 3) metadata-log Strata chunks
         try (StrataClient client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()))) {
             FileId fileId = client.create(StrataClient.FileSpec.log("tenant-a", "/topic-0")).id();
-            try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+            try (StrataFile.Appender appender = client.openById(StrataNamespace.of("tenant-a"), fileId).openForAppend()) {
                 appender.append(ByteBuffer.wrap(new byte[8_192])).get();
                 appender.seal();
             }

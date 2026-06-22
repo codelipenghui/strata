@@ -706,7 +706,7 @@ public final class Messages {
         }
     }
 
-    public record CreateChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb,
+    public record CreateChunk(StrataNamespace namespace, FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb,
                               List<Integer> excludedNodeIds) {
         public static final int TAG_EXCLUDED_NODE_IDS = 0;
 
@@ -714,21 +714,21 @@ public final class Messages {
             excludedNodeIds = List.copyOf(excludedNodeIds);
         }
 
-        public CreateChunk(FileId fileId, int writeEpoch) {
-            this(fileId, writeEpoch, UUID.randomUUID());
+        public CreateChunk(StrataNamespace namespace, FileId fileId, int writeEpoch) {
+            this(namespace, fileId, writeEpoch, UUID.randomUUID());
         }
 
-        public CreateChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb) {
-            this(fileId, writeEpoch, opIdMsb, opIdLsb, List.of());
+        public CreateChunk(StrataNamespace namespace, FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb) {
+            this(namespace, fileId, writeEpoch, opIdMsb, opIdLsb, List.of());
         }
 
-        private CreateChunk(FileId fileId, int writeEpoch, UUID opId) {
-            this(fileId, writeEpoch, opId.getMostSignificantBits(), opId.getLeastSignificantBits(), List.of());
+        private CreateChunk(StrataNamespace namespace, FileId fileId, int writeEpoch, UUID opId) {
+            this(namespace, fileId, writeEpoch, opId.getMostSignificantBits(), opId.getLeastSignificantBits(), List.of());
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.fileId(fileId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb);
+            w.string(namespace.toString()).fileId(fileId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb);
             if (excludedNodeIds.isEmpty()) {
                 w.noTags();
             } else {
@@ -741,6 +741,7 @@ public final class Messages {
         }
 
         public static CreateChunk decode(ByteBuffer b) {
+            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             FileId fileId = FileId.readFrom(b);
             int writeEpoch = b.getInt();
             long opIdMsb = b.getLong();
@@ -759,7 +760,7 @@ public final class Messages {
                 }
                 excluded = ids;
             }
-            return new CreateChunk(fileId, writeEpoch, opIdMsb, opIdLsb, excluded);
+            return new CreateChunk(namespace, fileId, writeEpoch, opIdMsb, opIdLsb, excluded);
         }
     }
 
@@ -784,7 +785,7 @@ public final class Messages {
         }
     }
 
-    public record AllocateWriterEpoch(FileId fileId, byte purpose) {
+    public record AllocateWriterEpoch(StrataNamespace namespace, FileId fileId, byte purpose) {
         public static final byte FOR_APPEND = 1;
         public static final byte FOR_RECOVERY = 2;
 
@@ -795,22 +796,23 @@ public final class Messages {
             }
         }
 
-        public static AllocateWriterEpoch forAppend(FileId fileId) {
-            return new AllocateWriterEpoch(fileId, FOR_APPEND);
+        public static AllocateWriterEpoch forAppend(StrataNamespace namespace, FileId fileId) {
+            return new AllocateWriterEpoch(namespace, fileId, FOR_APPEND);
         }
 
-        public static AllocateWriterEpoch forRecovery(FileId fileId) {
-            return new AllocateWriterEpoch(fileId, FOR_RECOVERY);
+        public static AllocateWriterEpoch forRecovery(StrataNamespace namespace, FileId fileId) {
+            return new AllocateWriterEpoch(namespace, fileId, FOR_RECOVERY);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.fileId(fileId).u8(purpose).noTags();
+            w.string(namespace.toString()).fileId(fileId).u8(purpose).noTags();
             return w.toBytes();
         }
 
         public static AllocateWriterEpoch decode(ByteBuffer b) {
-            AllocateWriterEpoch m = new AllocateWriterEpoch(FileId.readFrom(b), b.get());
+            AllocateWriterEpoch m = new AllocateWriterEpoch(
+                    StrataNamespace.of(Varint.readString(b)), FileId.readFrom(b), b.get());
             TaggedFields.readFrom(b);
             return m;
         }
@@ -836,7 +838,7 @@ public final class Messages {
      * replica skipped during seal would otherwise stay listed and serve short/stale reads).
      * Empty = keep all (compat). v0 fixed-field addition (pre-release; single apiVersion).
      */
-    public record SealChunkMeta(ChunkId chunkId, int writeEpoch, long length, int crc,
+    public record SealChunkMeta(StrataNamespace namespace, ChunkId chunkId, int writeEpoch, long length, int crc,
                                 List<Integer> sealedReplicas) {
         public SealChunkMeta {
             sealedReplicas = List.copyOf(sealedReplicas);
@@ -844,7 +846,7 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(writeEpoch).u64(length).u32(crc);
+            w.string(namespace.toString()).chunkId(chunkId).i32(writeEpoch).u64(length).u32(crc);
             w.varint(sealedReplicas.size());
             for (int id : sealedReplicas) w.u32(id);
             w.noTags();
@@ -852,6 +854,7 @@ public final class Messages {
         }
 
         public static SealChunkMeta decode(ByteBuffer b) {
+            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             ChunkId id = ChunkId.readFrom(b);
             int epoch = b.getInt();
             long length = b.getLong();
@@ -860,33 +863,34 @@ public final class Messages {
             List<Integer> sealed = new ArrayList<>(n);
             for (int i = 0; i < n; i++) sealed.add(b.getInt());
             TaggedFields.readFrom(b);
-            return new SealChunkMeta(id, epoch, length, crc, sealed);
+            return new SealChunkMeta(namespace, id, epoch, length, crc, sealed);
         }
     }
 
-    public record AbortChunkMeta(ChunkId chunkId, int writeEpoch, long opIdMsb, long opIdLsb) {
+    public record AbortChunkMeta(StrataNamespace namespace, ChunkId chunkId, int writeEpoch, long opIdMsb, long opIdLsb) {
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb).noTags();
+            w.string(namespace.toString()).chunkId(chunkId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
         public static AbortChunkMeta decode(ByteBuffer b) {
-            AbortChunkMeta m = new AbortChunkMeta(ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong());
+            AbortChunkMeta m = new AbortChunkMeta(
+                    StrataNamespace.of(Varint.readString(b)), ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }
     }
 
-    public record LookupFile(FileId fileId) {
+    public record LookupFile(StrataNamespace namespace, FileId fileId) {
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.fileId(fileId).noTags();
+            w.string(namespace.toString()).fileId(fileId).noTags();
             return w.toBytes();
         }
 
         public static LookupFile decode(ByteBuffer b) {
-            LookupFile m = new LookupFile(FileId.readFrom(b));
+            LookupFile m = new LookupFile(StrataNamespace.of(Varint.readString(b)), FileId.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -987,13 +991,14 @@ public final class Messages {
         }
     }
 
-    public record DeleteFiles(List<FileId> fileIds) {
+    public record DeleteFiles(StrataNamespace namespace, List<FileId> fileIds) {
         public DeleteFiles {
             fileIds = List.copyOf(fileIds);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
+            w.string(namespace.toString());
             w.varint(fileIds.size());
             for (FileId f : fileIds) w.fileId(f);
             w.noTags();
@@ -1001,11 +1006,12 @@ public final class Messages {
         }
 
         public static DeleteFiles decode(ByteBuffer b) {
+            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             int n = count(b);
             List<FileId> ids = new ArrayList<>(n);
             for (int i = 0; i < n; i++) ids.add(FileId.readFrom(b));
             TaggedFields.readFrom(b);
-            return new DeleteFiles(ids);
+            return new DeleteFiles(namespace, ids);
         }
     }
 
@@ -1042,15 +1048,15 @@ public final class Messages {
         }
     }
 
-    public record SealFile(FileId fileId, long totalLength) {
+    public record SealFile(StrataNamespace namespace, FileId fileId, long totalLength) {
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.fileId(fileId).u64(totalLength).noTags();
+            w.string(namespace.toString()).fileId(fileId).u64(totalLength).noTags();
             return w.toBytes();
         }
 
         public static SealFile decode(ByteBuffer b) {
-            SealFile m = new SealFile(FileId.readFrom(b), b.getLong());
+            SealFile m = new SealFile(StrataNamespace.of(Varint.readString(b)), FileId.readFrom(b), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }

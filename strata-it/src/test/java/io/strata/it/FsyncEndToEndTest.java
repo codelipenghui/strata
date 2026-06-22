@@ -4,6 +4,7 @@ import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -49,11 +50,11 @@ class FsyncEndToEndTest {
         FileId fileId = client.create(fsyncSpec("/fsync-policy")).id();
         Workload workload = new Workload();
         StrataFile.SealInfo sealed;
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 500); // several rolls under fsync
             sealed = appender.seal();
         }
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
 
         // the policy must be burned into the chunk header on EVERY replica
         var lookup = ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
@@ -73,13 +74,13 @@ class FsyncEndToEndTest {
     void sealRecoveryWorksUnderFsyncMode() throws Exception {
         FileId fileId = client.create(fsyncSpec("/fsync-recovery")).id();
         Workload workload = new Workload();
-        StrataFile.Appender zombie = client.openById(fileId).openForAppend();
+        StrataFile.Appender zombie = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         workload.appendAcked(zombie, 0, 120);
 
-        var sealed = client.openById(fileId).recoverAndSeal();
+        var sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
         assertTrue(sealed.sealedLength() >= workload.ackedBytes());
         zombie.close();
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
     }
 

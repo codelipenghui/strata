@@ -8,6 +8,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.node.DataNode;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -44,7 +45,7 @@ class MetadataFailoverTest {
                 List<Integer> nodeIdsBefore = new ArrayList<>();
                 for (var n : cluster.nodes) nodeIdsBefore.add(n.nodeId());
 
-                try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                     workload.appendAcked(appender, 0, 300);
 
                     // kill the current leader
@@ -73,7 +74,7 @@ class MetadataFailoverTest {
                 assertEquals(1, leaders, "exactly the survivor should lead");
 
                 // every acked byte reads back through the new leader
-                workload.verifyAckedPrefix(client, fileId);
+                workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                 ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, workload.ackedBytes());
 
                 // volume-bound identity survived re-registration with the new leader
@@ -95,7 +96,7 @@ class MetadataFailoverTest {
                 FileId fileId = client.create(StrataClient.FileSpec.log("test",
                         "/failover-after-replica-seal")).id();
                 Workload workload = new Workload();
-                StrataFile.Appender zombie = client.openById(fileId).openForAppend();
+                StrataFile.Appender zombie = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
                 try {
                     workload.appendAcked(zombie, 0, 80);
                     long ackedBytes = workload.ackedBytes();
@@ -113,7 +114,7 @@ class MetadataFailoverTest {
                     cluster.killMeta(leaderIndex(cluster));
                     cluster.awaitAnyLeader();
 
-                    StrataFile.SealInfo sealed = client.openById(fileId).recoverAndSeal();
+                    StrataFile.SealInfo sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
                     assertEquals(ackedBytes, sealed.sealedLength(),
                             "recovery after metadata failover must preserve the replica-sealed prefix");
 
@@ -122,7 +123,7 @@ class MetadataFailoverTest {
                     assertTrue(t instanceof ScpException se && se.code() == ErrorCode.FENCED_EPOCH,
                             "expected FENCED_EPOCH, got " + t);
 
-                    workload.verifyAckedPrefix(client, fileId);
+                    workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                     ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                             sealed.sealedLength());
                 } finally {
@@ -141,7 +142,7 @@ class MetadataFailoverTest {
                 FileId fileId = client.create(StrataClient.FileSpec.log("test",
                         "/failover-delete-open")).id();
                 Workload workload = new Workload();
-                StrataFile.Appender stale = client.openById(fileId).openForAppend();
+                StrataFile.Appender stale = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
                 try {
                     workload.appendAcked(stale, 0, 80);
                     List<ChunkId> chunkIds = ConsistencyVerifier.lookupFile(cluster, fileId).chunks().stream()
@@ -149,7 +150,7 @@ class MetadataFailoverTest {
                             .toList();
                     assertTrue(!chunkIds.isEmpty(), "test setup requires an open metadata chunk");
 
-                    client.deleteById(List.of(fileId));
+                    client.deleteById(StrataNamespace.of("test"), fileId);
                     cluster.killMeta(leaderIndex(cluster));
                     cluster.awaitAnyLeader();
 
@@ -179,7 +180,7 @@ class MetadataFailoverTest {
                         "/failover-stale-inventory")).id();
                 Workload workload = new Workload();
                 StrataFile.SealInfo sealed;
-                try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                     workload.appendAcked(appender, 0, 160);
                     sealed = appender.seal();
                 }
@@ -202,7 +203,7 @@ class MetadataFailoverTest {
                 assertTrue(after.chunks().get(0).replicas().stream()
                                 .anyMatch(r -> r.nodeId() == replica.nodeId()),
                         "stale inventory on the new leader must not drop a healthy replica");
-                workload.verifyAckedPrefix(client, fileId);
+                workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                 ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                         sealed.sealedLength());
             }
@@ -253,7 +254,7 @@ class MetadataFailoverTest {
             try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                     ScpClient.KIND_TOOL, "failover-lookup")) {
                 ByteBuffer h = direct.call(Opcode.LOOKUP_FILE,
-                        new Messages.LookupFile(fileId).encode(), null, 5_000);
+                        new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, 5_000);
                 return Messages.LookupFileResp.decode(h);
             } catch (ScpException e) {
                 last = e;

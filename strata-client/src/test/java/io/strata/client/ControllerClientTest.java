@@ -5,6 +5,7 @@ import io.strata.common.FileId;
 import io.strata.common.ErrorCode;
 import io.strata.common.ConnectionPolicy;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpServer;
@@ -188,10 +189,44 @@ class ControllerClientTest {
              ControllerClient meta = new ControllerClient(new ClientConfig(List.of(endpoint(server)), 1024, 100))) {
 
             ScpException e = assertThrows(ScpException.class,
-                    () -> meta.lookupFile(FileId.random()));
+                    () -> meta.lookupFile(StrataNamespace.of("test"), FileId.random()));
 
             assertEquals(ErrorCode.FILE_NOT_FOUND, e.code());
             assertEquals(1, calls.get());
+        }
+    }
+
+    @Test
+    void lookupFileCarriesNamespaceAsFirstWireField() throws Exception {
+        // Routing test: the namespace passed to lookupFile must appear as the first decoded field
+        // in the LOOKUP_FILE request that arrives at the controller — the server uses it to route
+        // to the correct namespace owner.
+        StrataNamespace ns = StrataNamespace.of("tenant-x");
+        FileId fileId = FileId.random();
+        Messages.LookupFileResp stubResp = new Messages.LookupFileResp(
+                ns.toString(), "/some/path", Messages.WritePolicy.DEFAULT, (byte) 0, List.of());
+
+        AtomicInteger calls = new AtomicInteger();
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
+                Opcode op = Opcode.fromCode(req.opcode());
+                if (op == Opcode.LOOKUP_FILE) {
+                    calls.incrementAndGet();
+                    Messages.LookupFile decoded = Messages.LookupFile.decode(req.headerSlice());
+                    assertEquals(ns, decoded.namespace(), "namespace must be first wire field");
+                    assertEquals(fileId, decoded.fileId(), "fileId must follow namespace");
+                    return ScpServer.ok(req, stubResp.encode(), null);
+                }
+                if (op == Opcode.PING) {
+                    return ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
+                }
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+             });
+             ControllerClient meta = new ControllerClient(new ClientConfig(List.of(endpoint(server)), 1024, 200))) {
+
+            Messages.LookupFileResp result = meta.lookupFile(ns, fileId);
+
+            assertEquals(1, calls.get(), "server must have received exactly one LOOKUP_FILE request");
+            assertEquals(ns, result.namespace());
         }
     }
 

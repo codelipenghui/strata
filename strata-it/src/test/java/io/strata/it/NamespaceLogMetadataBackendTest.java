@@ -75,7 +75,7 @@ class NamespaceLogMetadataBackendTest {
         for (int i = 0; i < data.length; i++) {
             data[i] = (byte) (i * 31 + 7);
         }
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("tenant-a"), fileId).openForAppend()) {
             appender.append(ByteBuffer.wrap(data)).get();
             appender.seal();
         }
@@ -107,7 +107,7 @@ class NamespaceLogMetadataBackendTest {
 
     private static byte[] readAll(StrataClient client, FileId fileId) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
+        try (StrataFile.Reader reader = client.openById(StrataNamespace.of("tenant-a"), fileId).openForRead()) {
             long offset = 0;
             while (true) {
                 try (StrataFile.ReadResult result = reader.read(offset, 1 << 20)) {

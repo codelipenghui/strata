@@ -7,6 +7,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.meta.ControllerConfig;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -67,7 +68,7 @@ class ProcessCrashRecoveryTest {
                             "/process-single-crash-roll",
                             StrataClient.WritePolicy.replicated(3, 2))).id();
                     Workload workload = new Workload();
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 80);
 
                         Messages.ChunkInfo openChunk = latestChunk(fileId);
@@ -82,7 +83,7 @@ class ProcessCrashRecoveryTest {
                                 "single process crash sealed at non-acked length");
                     }
 
-                    workload.verifyAckedPrefix(client, fileId);
+                    workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                     ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                             workload.ackedBytes());
                 }
@@ -120,7 +121,7 @@ class ProcessCrashRecoveryTest {
                             "/process-repair-copy-crash")).id();
                     Workload workload = new Workload();
                     StrataFile.SealInfo sealed;
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 180);
                         sealed = appender.seal();
                     }
@@ -137,7 +138,7 @@ class ProcessCrashRecoveryTest {
                     kill(target);
                     waitForChunkRepairedExcluding(processes, chunkId, target.nodeId(), 3);
 
-                    workload.verifyAckedPrefix(client, fileId);
+                    workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                     ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                             sealed.sealedLength());
                 }
@@ -168,7 +169,7 @@ class ProcessCrashRecoveryTest {
                             "/process-repair-failover")).id();
                     Workload workload = new Workload();
                     StrataFile.SealInfo sealed;
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 180);
                         sealed = appender.seal();
                     }
@@ -186,7 +187,7 @@ class ProcessCrashRecoveryTest {
                     cluster.awaitAnyLeader();
 
                     waitForChunkRepaired(processes, chunkId, 3);
-                    workload.verifyAckedPrefix(client, fileId);
+                    workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                     ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                             sealed.sealedLength());
                 }
@@ -218,7 +219,7 @@ class ProcessCrashRecoveryTest {
                             "/process-delete-local-crash")).id();
                     Workload workload = new Workload();
                     StrataFile.SealInfo sealed;
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 160);
                         sealed = appender.seal();
                     }
@@ -226,7 +227,7 @@ class ProcessCrashRecoveryTest {
                             sealed.sealedLength());
 
                     ChunkId chunkId = lookupFile(fileId).chunks().get(0).chunkId();
-                    client.deleteById(List.of(fileId));
+                    client.deleteById(StrataNamespace.of("test"), fileId);
 
                     ExternalNode victim = waitForAnyProcessMissingLocalCopy(processes, chunkId);
                     kill(victim);
@@ -265,7 +266,7 @@ class ProcessCrashRecoveryTest {
                             "/process-delete-failover")).id();
                     Workload workload = new Workload();
                     StrataFile.SealInfo sealed;
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 160);
                         sealed = appender.seal();
                     }
@@ -273,7 +274,7 @@ class ProcessCrashRecoveryTest {
                             sealed.sealedLength());
 
                     ChunkId chunkId = lookupFile(fileId).chunks().get(0).chunkId();
-                    client.deleteById(List.of(fileId));
+                    client.deleteById(StrataNamespace.of("test"), fileId);
 
                     waitForAnyProcessMissingLocalCopy(processes, chunkId);
                     killLeader("delete failover after local delete");
@@ -327,7 +328,7 @@ class ProcessCrashRecoveryTest {
                                 "/process-crash-" + crashCase.name(), crashCase.writePolicy())).id();
                         artifact.add("fileId=" + fileId);
                         Workload workload = new Workload();
-                        StrataFile.Appender abandoned = client.openById(fileId).openForAppend();
+                        StrataFile.Appender abandoned = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
                         try {
                             workload.appendAcked(abandoned, 0, recordCount);
                             artifact.add("ackedBeforeCrashBytes=" + workload.ackedBytes(),
@@ -378,10 +379,10 @@ class ProcessCrashRecoveryTest {
                             artifact.add("liveDescriptorVerifiedAfterRestart=true",
                                     "restartedReplicaNodeIds=" + restartedById.keySet());
 
-                            StrataFile.SealInfo sealed = client.openById(fileId).recoverAndSeal();
+                            StrataFile.SealInfo sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
                             assertEquals(workload.ackedBytes(), sealed.sealedLength(),
                                     "recovery sealed at a non-acked length");
-                            workload.verifyAckedPrefix(client, fileId);
+                            workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                             Messages.LookupFileResp finalDescriptor =
                                     ConsistencyVerifier.waitForFullSealedFileConsistent(cluster, client,
                                             fileId, sealed.sealedLength());
@@ -696,7 +697,7 @@ class ProcessCrashRecoveryTest {
             String[] hp = endpoint.split(":");
             try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                     ScpClient.KIND_TOOL, "process-delete-lookup")) {
-                direct.call(Opcode.LOOKUP_FILE, new Messages.LookupFile(fileId).encode(), null, 5_000);
+                direct.call(Opcode.LOOKUP_FILE, new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, 5_000);
                 return false;
             } catch (ScpException e) {
                 if (e.code() == ErrorCode.FILE_NOT_FOUND) {

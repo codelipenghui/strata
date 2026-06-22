@@ -4,6 +4,7 @@ import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -43,7 +44,7 @@ class EndToEndTest {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/topicA-0")).id();
         Workload workload = new Workload();
 
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 1500); // ~24 KB -> several 4 KB chunk rolls
             assertEquals(workload.ackedBytes(), appender.durableOffset());
             var sealed = appender.seal();
@@ -51,7 +52,7 @@ class EndToEndTest {
         }
 
         // every acked byte reads back, in order, to EOF
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
 
         // metadata and data-node replicas agree on the sealed file shape
         var lookup = ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
@@ -66,10 +67,10 @@ class EndToEndTest {
     void tailReadNeverExceedsDurableOffset() throws Exception {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/topicB-0")).id();
         Workload workload = new Workload();
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 50);
 
-            try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
+            try (StrataFile.Reader reader = client.openById(StrataNamespace.of("test"), fileId).openForRead()) {
                 try (StrataFile.ReadResult r = reader.read(0, 1 << 20)) {
                     int n = r.length();
                     // open-chunk read is clamped to the replica-known DO (may lag by one append round)
@@ -78,20 +79,20 @@ class EndToEndTest {
                     byte[] got = new byte[n];
                     r.buffer().get(got);
                     byte[] expected = new byte[n];
-                    System.arraycopy(Workload.readAll(client, fileId, 0), 0, expected, 0, n);
+                    System.arraycopy(Workload.readAll(client, StrataNamespace.of("test"), fileId, 0), 0, expected, 0, n);
                     assertArrayEquals(expected, got);
                 }
             }
             appender.seal();
         }
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
     }
 
     @Test
     void emptyAppendCompletesWithoutCreatingAChunk() throws Exception {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/empty-append")).id();
 
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             var ack = appender.append(ByteBuffer.allocate(0)).get(1, TimeUnit.SECONDS);
             assertEquals(0, ack.endOffset());
             assertEquals(0, ack.durableOffset());

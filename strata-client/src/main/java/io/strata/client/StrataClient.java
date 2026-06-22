@@ -77,7 +77,7 @@ public interface StrataClient extends AutoCloseable {
 
     StrataFile open(StrataNamespace namespace, StrataPath path);
 
-    StrataFile openById(FileId fileId);
+    StrataFile openById(StrataNamespace namespace, FileId fileId);
 
     default StrataFile open(String namespace, String path) {
         return open(StrataNamespace.of(namespace), StrataPath.of(path));
@@ -88,7 +88,8 @@ public interface StrataClient extends AutoCloseable {
     }
 
     default void delete(StrataFile file) {
-        deleteById(Objects.requireNonNull(file, "file").id());
+        Objects.requireNonNull(file, "file");
+        deleteById(file.namespace(), file.id());
     }
 
     default void delete(String namespace, String path) {
@@ -97,11 +98,11 @@ public interface StrataClient extends AutoCloseable {
 
     void delete(List<FilePath> paths);
 
-    default void deleteById(FileId fileId) {
-        deleteById(List.of(Objects.requireNonNull(fileId, "fileId")));
+    default void deleteById(StrataNamespace namespace, FileId fileId) {
+        deleteById(namespace, List.of(Objects.requireNonNull(fileId, "fileId")));
     }
 
-    void deleteById(List<FileId> fileIds);
+    void deleteById(StrataNamespace namespace, List<FileId> fileIds);
 
     @Override
     void close();

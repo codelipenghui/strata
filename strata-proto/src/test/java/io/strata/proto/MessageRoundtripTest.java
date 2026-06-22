@@ -3,6 +3,7 @@ package io.strata.proto;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
@@ -16,6 +17,7 @@ class MessageRoundtripTest {
 
     private final FileId f = FileId.fromString("11111111-2222-3333-4444-555555555555");
     private final ChunkId c = new ChunkId(f, 3);
+    private final StrataNamespace ns = StrataNamespace.of("test");
 
     private static ByteBuffer buf(byte[] b) {
         return ByteBuffer.wrap(b);
@@ -129,35 +131,35 @@ class MessageRoundtripTest {
         var cfr = new Messages.CreateFileResp(f);
         assertEquals(cfr, decodeResp(cfr.encode(), Messages.CreateFileResp::decode));
 
-        var cc = new Messages.CreateChunk(f, 5);
+        var cc = new Messages.CreateChunk(ns, f, 5);
         assertEquals(cc, Messages.CreateChunk.decode(buf(cc.encode())));
 
-        var ccExcluded = new Messages.CreateChunk(f, 5, 11, 12, List.of(2, 4));
+        var ccExcluded = new Messages.CreateChunk(ns, f, 5, 11, 12, List.of(2, 4));
         assertEquals(ccExcluded, Messages.CreateChunk.decode(buf(ccExcluded.encode())));
 
         var ccr = new Messages.CreateChunkResp(c, 5,
                 List.of(new Messages.Replica(1, "a:1"), new Messages.Replica(2, "b:2"), new Messages.Replica(3, "c:3")));
         assertEquals(ccr, decodeResp(ccr.encode(), Messages.CreateChunkResp::decode));
 
-        var appendEpoch = Messages.AllocateWriterEpoch.forAppend(f);
+        var appendEpoch = Messages.AllocateWriterEpoch.forAppend(ns, f);
         assertEquals(appendEpoch, Messages.AllocateWriterEpoch.decode(buf(appendEpoch.encode())));
 
-        var recoveryEpoch = Messages.AllocateWriterEpoch.forRecovery(f);
+        var recoveryEpoch = Messages.AllocateWriterEpoch.forRecovery(ns, f);
         assertEquals(recoveryEpoch, Messages.AllocateWriterEpoch.decode(buf(recoveryEpoch.encode())));
 
         assertThrows(IllegalArgumentException.class,
-                () -> new Messages.AllocateWriterEpoch(f, (byte) 99));
+                () -> new Messages.AllocateWriterEpoch(ns, f, (byte) 99));
 
         var epochResp = new Messages.AllocateWriterEpochResp(7);
         assertEquals(epochResp, decodeResp(epochResp.encode(), Messages.AllocateWriterEpochResp::decode));
 
-        var scm = new Messages.SealChunkMeta(c, 5, 4096, 0xDD, List.of(1, 2));
+        var scm = new Messages.SealChunkMeta(ns, c, 5, 4096, 0xDD, List.of(1, 2));
         assertEquals(scm, Messages.SealChunkMeta.decode(buf(scm.encode())));
 
-        var abort = new Messages.AbortChunkMeta(c, 5, 1, 2);
+        var abort = new Messages.AbortChunkMeta(ns, c, 5, 1, 2);
         assertEquals(abort, Messages.AbortChunkMeta.decode(buf(abort.encode())));
 
-        var lf = new Messages.LookupFile(f);
+        var lf = new Messages.LookupFile(ns, f);
         assertEquals(lf, Messages.LookupFile.decode(buf(lf.encode())));
 
         var lp = new Messages.LookupPath("test", "/kafka/topicA/0/00000000000000000000");
@@ -172,13 +174,13 @@ class MessageRoundtripTest {
                                 List.of(new Messages.Replica(1, "a:1")))));
         assertEquals(lfr, decodeResp(lfr.encode(), Messages.LookupFileResp::decode));
 
-        var df = new Messages.DeleteFiles(List.of(f));
+        var df = new Messages.DeleteFiles(ns, List.of(f));
         assertEquals(df, Messages.DeleteFiles.decode(buf(df.encode())));
 
         var dfr = new Messages.DeleteFilesResp(List.of(f), List.of((short) 0));
         assertEquals(dfr, decodeResp(dfr.encode(), Messages.DeleteFilesResp::decode));
 
-        var sf = new Messages.SealFile(f, 1 << 20);
+        var sf = new Messages.SealFile(ns, f, 1 << 20);
         assertEquals(sf, Messages.SealFile.decode(buf(sf.encode())));
     }
 

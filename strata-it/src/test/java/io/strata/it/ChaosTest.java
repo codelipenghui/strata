@@ -8,6 +8,7 @@ import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.node.DataNodeConfig;
 import io.strata.proto.Messages;
 import org.junit.jupiter.api.Tag;
@@ -75,7 +76,7 @@ class ChaosTest {
                     FileId fileId = client.create(StrataClient.FileSpec.log("test", "/slow-replica")).id();
                     Workload workload = new Workload();
 
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 20); // warm-up: chunk spans all 3 nodes
 
                         // stall the proxied replica's responses by 3s
@@ -91,7 +92,7 @@ class ChaosTest {
                                 "produce was gated by the slow replica: " + elapsedMs + "ms for 100 appends");
                         appender.seal();
                     }
-                    workload.verifyAckedPrefix(client, fileId);
+                    workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                 }
             }
         }
@@ -124,7 +125,7 @@ class ChaosTest {
                     FileId fileId = client.create(StrataClient.FileSpec.log("test", "/blackhole")).id();
                     Workload workload = new Workload();
 
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 100);
 
                         // drop all responses from the proxied replica, forever
@@ -135,7 +136,7 @@ class ChaosTest {
                         workload.appendAcked(appender, 100, 200);
                         appender.seal();
                     }
-                    workload.verifyAckedPrefix(client, fileId);
+                    workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                 }
             }
         }
@@ -172,7 +173,7 @@ class ChaosTest {
                     Workload workload = new Workload();
                     StrataFile.SealInfo sealed;
 
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 40);
                         assertOpenChunkContainsEndpoint(cluster, fileId, proxiedEndpoint);
 
@@ -189,7 +190,7 @@ class ChaosTest {
 
                     assertEquals(workload.ackedBytes(), sealed.sealedLength(),
                             "partitioned appender sealed at a non-acked length");
-                    workload.verifyAckedPrefix(client, fileId);
+                    workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                     waitForFullReplicaConsistency(cluster, client, fileId, sealed.sealedLength(), 4);
                 }
             }
@@ -231,7 +232,7 @@ class ChaosTest {
                     Workload workload = new Workload();
                     StrataFile.SealInfo sealed;
 
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 40);
                         assertOpenChunkContainsEndpoint(cluster, fileId, proxiedEndpoint);
 
@@ -248,7 +249,7 @@ class ChaosTest {
 
                     assertEquals(workload.ackedBytes(), sealed.sealedLength(),
                             "process partition sealed at a non-acked length");
-                    workload.verifyAckedPrefix(client, fileId);
+                    workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                     waitForFullReplicaConsistency(cluster, client, fileId, sealed.sealedLength(), 4);
                 }
             } finally {
@@ -293,7 +294,7 @@ class ChaosTest {
                             "test", "/metadata-leader-proxy-blackhole")).id();
                     Workload workload = new Workload();
 
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, warmupRecords);
 
                         proxy.toxics().timeout("metadata-blackhole", ToxicDirection.DOWNSTREAM, 0);
@@ -308,7 +309,7 @@ class ChaosTest {
                         }
                     }
 
-                    workload.verifyAckedPrefix(client, fileId);
+                    workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                     ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                             workload.ackedBytes());
                 }
@@ -331,7 +332,7 @@ class ChaosTest {
                 FileId fileId = client.create(StrataClient.FileSpec.log("test", "/zk-outage")).id();
                 Workload workload = new Workload();
 
-                try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                     workload.appendAcked(appender, 0, 50);
 
                     // freeze ZooKeeper (SIGSTOP semantics)
@@ -349,7 +350,7 @@ class ChaosTest {
                     Thread.sleep(500); // let curator settle
                     appender.seal();   // chunk-boundary op needs ZK again — must work after unpause
                 }
-                workload.verifyAckedPrefix(client, fileId);
+                workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
             }
         }
     }
@@ -372,7 +373,7 @@ class ChaosTest {
                 FileId fileId = client.create(StrataClient.FileSpec.log("test", "/zk-roll-outage")).id();
                 Workload workload = new Workload();
 
-                try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                     workload.appendAcked(appender, 0, warmupRecords);
 
                     zkContainer.getDockerClient().pauseContainerCmd(zkContainer.getContainerId()).exec();
@@ -391,7 +392,7 @@ class ChaosTest {
                     appender.seal();
                 }
 
-                workload.verifyAckedPrefix(client, fileId);
+                workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                 Messages.LookupFileResp lookup = ConsistencyVerifier.lookupFile(cluster, fileId);
                 assertTrue(lookup.chunks().size() >= 2, "test did not exercise a chunk roll");
             }
@@ -414,7 +415,7 @@ class ChaosTest {
                 Workload workload = new Workload();
                 StrataFile.SealInfo sealed;
 
-                try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                     workload.appendAcked(appender, 0, 80);
 
                     zkContainer.getDockerClient().pauseContainerCmd(zkContainer.getContainerId()).exec();
@@ -433,7 +434,7 @@ class ChaosTest {
 
                 assertEquals(workload.ackedBytes(), sealed.sealedLength(),
                         "final seal committed a non-acked length after ZK outage");
-                workload.verifyAckedPrefix(client, fileId);
+                workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                 ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
             }
         }
@@ -458,7 +459,7 @@ class ChaosTest {
                         "test", "/zk-long-roll-outage")).id();
                 Workload workload = new Workload();
 
-                try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                     workload.appendAcked(appender, 0, warmupRecords);
 
                     zkContainer.getDockerClient().pauseContainerCmd(zkContainer.getContainerId()).exec();
@@ -472,11 +473,11 @@ class ChaosTest {
                 }
 
                 waitForMetadataAvailable(cluster, fileId);
-                StrataFile.SealInfo recovered = client.openById(fileId).recoverAndSeal();
+                StrataFile.SealInfo recovered = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
                 assertTrue(recovered.sealedLength() >= workload.ackedBytes(),
                         "recovery sealed " + recovered.sealedLength()
                                 + " below acked " + workload.ackedBytes());
-                workload.verifyAckedPrefix(client, fileId);
+                workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                 ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                         recovered.sealedLength());
             }
@@ -499,7 +500,7 @@ class ChaosTest {
                         "test", "/zk-long-final-seal-outage")).id();
                 Workload workload = new Workload();
 
-                try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                     workload.appendAcked(appender, 0, 80);
 
                     zkContainer.getDockerClient().pauseContainerCmd(zkContainer.getContainerId()).exec();
@@ -512,11 +513,11 @@ class ChaosTest {
                 }
 
                 waitForMetadataAvailable(cluster, fileId);
-                StrataFile.SealInfo recovered = client.openById(fileId).recoverAndSeal();
+                StrataFile.SealInfo recovered = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
                 assertTrue(recovered.sealedLength() >= workload.ackedBytes(),
                         "recovery sealed " + recovered.sealedLength()
                                 + " below acked " + workload.ackedBytes());
-                workload.verifyAckedPrefix(client, fileId);
+                workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                 ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                         recovered.sealedLength());
             }

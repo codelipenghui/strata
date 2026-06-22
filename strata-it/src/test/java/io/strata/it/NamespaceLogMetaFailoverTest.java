@@ -4,6 +4,7 @@ import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import io.strata.meta.ControllerConfig;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -62,7 +63,7 @@ class NamespaceLogMetaFailoverTest {
         FileId fileId;
         try (StrataClient client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()))) {
             fileId = client.create(StrataClient.FileSpec.log("tenant-a", "/topic-0")).id();
-            try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+            try (StrataFile.Appender appender = client.openById(StrataNamespace.of("tenant-a"), fileId).openForAppend()) {
                 appender.append(ByteBuffer.wrap(data)).get();
                 appender.seal();
             }
@@ -94,7 +95,7 @@ class NamespaceLogMetaFailoverTest {
 
     private static byte[] readAll(StrataClient client, FileId fileId) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
+        try (StrataFile.Reader reader = client.openById(StrataNamespace.of("tenant-a"), fileId).openForRead()) {
             long offset = 0;
             while (true) {
                 try (StrataFile.ReadResult result = reader.read(offset, 1 << 20)) {

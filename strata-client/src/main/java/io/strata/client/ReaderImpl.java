@@ -27,21 +27,24 @@ final class ReaderImpl implements StrataFile.Reader {
     private final NodePool pool;
     private final ClientConfig config;
     private final io.strata.common.FileId fileId;
+    private final io.strata.common.StrataNamespace namespace;
     private final Map<String, ManagedScpConnection> pinnedConnections = new ConcurrentHashMap<>();
 
     private volatile Messages.LookupFileResp file;
 
-    ReaderImpl(ControllerClient controller, NodePool pool, ClientConfig config, io.strata.common.FileId fileId) {
+    ReaderImpl(ControllerClient controller, NodePool pool, ClientConfig config, io.strata.common.FileId fileId,
+               io.strata.common.StrataNamespace namespace) {
         this.controller = controller;
         this.pool = pool;
         this.config = config;
         this.fileId = fileId;
+        this.namespace = namespace;
         refresh();
     }
 
     @Override
     public void refresh() {
-        this.file = controller.lookupFile(fileId);
+        this.file = controller.lookupFile(namespace, fileId);
     }
 
     @Override

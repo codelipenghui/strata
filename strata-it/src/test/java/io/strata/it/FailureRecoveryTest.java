@@ -7,6 +7,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.FileState;
+import io.strata.common.StrataNamespace;
 import io.strata.common.ScpException;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -58,7 +59,7 @@ class FailureRecoveryTest {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/kill-replica")).id();
         Workload workload = new Workload();
 
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 200);
 
             // find a data node hosting the current open chunk and kill it
@@ -78,7 +79,7 @@ class FailureRecoveryTest {
             assertEquals(workload.ackedBytes(), sealed.sealedLength());
         }
 
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, workload.ackedBytes());
     }
 
@@ -90,7 +91,7 @@ class FailureRecoveryTest {
         try (StrataClient pooled = StrataClient.connect(config)) {
             FileId fileId = pooled.create(StrataClient.FileSpec.log("test", "/pooled-roll-fault-recover")).id();
             Workload workload = new Workload();
-            StrataFile.Appender zombie = pooled.openById(fileId).openForAppend();
+            StrataFile.Appender zombie = pooled.openById(StrataNamespace.of("test"), fileId).openForAppend();
 
             workload.appendAcked(zombie, 0, 75);
             var lookup = lookupFile(fileId);
@@ -100,7 +101,7 @@ class FailureRecoveryTest {
 
             workload.appendAcked(zombie, 75, 100);
 
-            try (StrataFile.Reader reader = pooled.openById(fileId).openForRead()) {
+            try (StrataFile.Reader reader = pooled.openById(StrataNamespace.of("test"), fileId).openForRead()) {
                 try (StrataFile.ReadResult tail = reader.read(0, 1 << 20)) {
                     assertTrue(tail.length() <= workload.ackedBytes(),
                             "open read exposed " + tail.length() + " bytes above acked "
@@ -108,12 +109,12 @@ class FailureRecoveryTest {
                 }
             }
 
-            StrataFile.SealInfo sealed = pooled.openById(fileId).recoverAndSeal();
+            StrataFile.SealInfo sealed = pooled.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
             assertTrue(sealed.sealedLength() >= workload.ackedBytes(),
                     "recovery sealed " + sealed.sealedLength() + " < acked " + workload.ackedBytes());
             zombie.close();
 
-            workload.verifyAckedPrefix(pooled, fileId);
+            workload.verifyAckedPrefix(pooled, StrataNamespace.of("test"), fileId);
             ConsistencyVerifier.assertSealedFileConsistent(cluster, pooled, fileId, sealed.sealedLength());
         }
     }
@@ -128,7 +129,7 @@ class FailureRecoveryTest {
         try (StrataClient pooled = StrataClient.connect(config)) {
             FileId fileId = pooled.create(StrataClient.FileSpec.log("test", "/pooled-random-stress")).id();
             BinaryWorkload workload = new BinaryWorkload();
-            StrataFile.Appender appender = pooled.openById(fileId).openForAppend();
+            StrataFile.Appender appender = pooled.openById(StrataNamespace.of("test"), fileId).openForAppend();
             boolean appenderClosed = false;
             try {
                 int faultBatch = 2 + random.nextInt(3);
@@ -147,19 +148,19 @@ class FailureRecoveryTest {
                     }
 
                     if ((batch & 1) == 1) {
-                        workload.verifyOpenReadIsAckedPrefix(pooled, fileId,
+                        workload.verifyOpenReadIsAckedPrefix(pooled, StrataNamespace.of("test"), fileId,
                                 "seed " + seed + " batch " + batch);
                     }
                 }
 
-                StrataFile.SealInfo sealed = pooled.openById(fileId).recoverAndSeal();
+                StrataFile.SealInfo sealed = pooled.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
                 assertTrue(sealed.sealedLength() >= workload.ackedBytes(),
                         "seed " + seed + " recovery sealed " + sealed.sealedLength()
                                 + " < acked " + workload.ackedBytes());
                 appender.close();
                 appenderClosed = true;
 
-                workload.verifySealedAckedPrefix(pooled, fileId, "seed " + seed);
+                workload.verifySealedAckedPrefix(pooled, StrataNamespace.of("test"), fileId, "seed " + seed);
                 ConsistencyVerifier.assertSealedFileConsistent(cluster, pooled, fileId, sealed.sealedLength());
             } finally {
                 if (!appenderClosed) {
@@ -175,7 +176,7 @@ class FailureRecoveryTest {
         byte[] acked = "acked-prefix".getBytes(java.nio.charset.StandardCharsets.UTF_8);
         byte[] dirtyTail = "never-acked-tail".getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
-        StrataFile.Appender appender = client.openById(fileId).openForAppend();
+        StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         try {
             var ack = appender.append(ByteBuffer.wrap(acked)).join();
             assertEquals(acked.length, ack.endOffset());
@@ -192,7 +193,7 @@ class FailureRecoveryTest {
                 }
             }
 
-            try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
+            try (StrataFile.Reader reader = client.openById(StrataNamespace.of("test"), fileId).openForRead()) {
                 try (StrataFile.ReadResult full = reader.read(0, 1 << 20)) {
                     byte[] got = new byte[full.length()];
                     full.buffer().get(got);
@@ -215,7 +216,7 @@ class FailureRecoveryTest {
         byte[] acked = "acked-prefix".getBytes(java.nio.charset.StandardCharsets.UTF_8);
         byte[] dirtyTail = "never-acked-tail".getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
-        StrataFile.Appender appender = client.openById(fileId).openForAppend();
+        StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         try {
             var ack = appender.append(ByteBuffer.wrap(acked)).join();
             assertEquals(acked.length, ack.endOffset());
@@ -226,11 +227,11 @@ class FailureRecoveryTest {
             Messages.Replica dirtyReplica = openChunk.replicas().get(0);
             appendOnlyToReplica(dirtyReplica, openChunk, acked.length, acked.length, dirtyTail);
 
-            StrataFile.SealInfo sealed = client.openById(fileId).recoverAndSeal();
+            StrataFile.SealInfo sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
             assertEquals(acked.length, sealed.sealedLength(),
                     "recovery committed bytes that were only present on one replica");
 
-            try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
+            try (StrataFile.Reader reader = client.openById(StrataNamespace.of("test"), fileId).openForRead()) {
                 try (StrataFile.ReadResult full = reader.read(0, 1 << 20)) {
                     byte[] got = new byte[full.length()];
                     full.buffer().get(got);
@@ -251,11 +252,11 @@ class FailureRecoveryTest {
         Workload workload = new Workload();
 
         // the "old leader" writes and is then abandoned without sealing (broker died)
-        StrataFile.Appender zombie = client.openById(fileId).openForAppend();
+        StrataFile.Appender zombie = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         workload.appendAcked(zombie, 0, 137);
 
         // the "new leader" recovers with epoch 2
-        var sealed = client.openById(fileId).recoverAndSeal();
+        var sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
         assertTrue(sealed.sealedLength() >= workload.ackedBytes(),
                 "recovery sealed " + sealed.sealedLength() + " < acked " + workload.ackedBytes());
 
@@ -267,7 +268,7 @@ class FailureRecoveryTest {
         zombie.close();
 
         // every acked byte survives recovery
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
 
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
     }
@@ -277,7 +278,7 @@ class FailureRecoveryTest {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/mid-seal-before-meta")).id();
         Workload workload = new Workload();
 
-        StrataFile.Appender abandoned = client.openById(fileId).openForAppend();
+        StrataFile.Appender abandoned = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         try {
             workload.appendAcked(abandoned, 0, 60);
             long ackedBytes = workload.ackedBytes();
@@ -293,11 +294,11 @@ class FailureRecoveryTest {
             assertEquals(ChunkState.OPEN, stillOpenInMetadata.state(),
                     "test setup requires metadata to stay open after only a replica seal");
 
-            StrataFile.SealInfo sealed = client.openById(fileId).recoverAndSeal();
+            StrataFile.SealInfo sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
             assertEquals(ackedBytes, sealed.sealedLength(),
                     "mid-seal recovery must not move the commit point");
 
-            workload.verifyAckedPrefix(client, fileId);
+            workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
             ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
         } finally {
             abandoned.close();
@@ -309,7 +310,7 @@ class FailureRecoveryTest {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/mid-chunk-meta-before-file-seal")).id();
         Workload workload = new Workload();
 
-        StrataFile.Appender abandoned = client.openById(fileId).openForAppend();
+        StrataFile.Appender abandoned = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         try {
             workload.appendAcked(abandoned, 0, 60);
             long ackedBytes = workload.ackedBytes();
@@ -341,11 +342,11 @@ class FailureRecoveryTest {
                     halfCommitted.chunks().get(halfCommitted.chunks().size() - 1).state(),
                     "test setup requires chunk metadata to be committed");
 
-            StrataFile.SealInfo sealed = client.openById(fileId).recoverAndSeal();
+            StrataFile.SealInfo sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
             assertEquals(ackedBytes, sealed.sealedLength(),
                     "recovery must only add the missing file seal");
 
-            workload.verifyAckedPrefix(client, fileId);
+            workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
             ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
         } finally {
             abandoned.close();
@@ -357,16 +358,16 @@ class FailureRecoveryTest {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/retry-after-file-seal")).id();
         Workload workload = new Workload();
         long sealedLength;
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 75);
             sealedLength = appender.seal().sealedLength();
         }
 
-        StrataFile.SealInfo retried = client.openById(fileId).recoverAndSeal();
+        StrataFile.SealInfo retried = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
         assertEquals(sealedLength, retried.sealedLength(),
                 "retry after observed-or-lost file seal commit must be idempotent");
         assertEquals(workload.ackedBytes(), retried.sealedLength());
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, retried.sealedLength());
     }
 
@@ -375,7 +376,7 @@ class FailureRecoveryTest {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/recover-degraded")).id();
         Workload workload = new Workload();
 
-        StrataFile.Appender zombie = client.openById(fileId).openForAppend();
+        StrataFile.Appender zombie = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         workload.appendAcked(zombie, 0, 80);
 
         // kill one replica of the open chunk, then recover with only 2 reachable
@@ -386,11 +387,11 @@ class FailureRecoveryTest {
             if (cluster.nodes.get(i).nodeId() == victimNodeId) cluster.killNode(i);
         }
 
-        var sealed = client.openById(fileId).recoverAndSeal();
+        var sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
         assertTrue(sealed.sealedLength() >= workload.ackedBytes(),
                 "acked data lost: sealed " + sealed.sealedLength() + " < acked " + workload.ackedBytes());
         zombie.close();
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
     }
 
@@ -399,7 +400,7 @@ class FailureRecoveryTest {
         FileId fileId = client.create(new StrataClient.FileSpec("test", "/recover-aq3",
                 StrataClient.WritePolicy.replicated(3, 3))).id();
         Workload workload = new Workload();
-        StrataFile.Appender abandoned = client.openById(fileId).openForAppend();
+        StrataFile.Appender abandoned = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         try {
             workload.appendAcked(abandoned, 0, 40);
 
@@ -407,7 +408,7 @@ class FailureRecoveryTest {
             assertEquals(ChunkState.OPEN, openChunk.state());
             cluster.killNode(nodeIndex(openChunk.replicas().get(0).nodeId()));
 
-            ScpException e = assertThrows(ScpException.class, () -> client.openById(fileId).recoverAndSeal());
+            ScpException e = assertThrows(ScpException.class, () -> client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal());
             assertEquals(ErrorCode.INTERNAL, e.code());
             assertTrue(e.getMessage().contains("need 3"),
                     "recovery must enforce the file ack quorum, got: " + e.getMessage());
@@ -423,7 +424,7 @@ class FailureRecoveryTest {
     @Test
     void staleRecoveryEpochFailsWhenAnyReplicaIsAlreadyFencedHigher() throws Exception {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/recover-stale-epoch")).id();
-        StrataFile.Appender zombie = client.openById(fileId).openForAppend();
+        StrataFile.Appender zombie = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         new Workload().appendAcked(zombie, 0, 10);
 
         var lookup = lookupFile(fileId);
@@ -435,7 +436,7 @@ class FailureRecoveryTest {
             direct.call(Opcode.FENCE, new Messages.Fence(openChunk.chunkId(), 3).encode(), null, 5000);
         }
 
-        ScpException e = assertThrows(ScpException.class, () -> client.openById(fileId).recoverAndSeal());
+        ScpException e = assertThrows(ScpException.class, () -> client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal());
         assertEquals(ErrorCode.FENCED_EPOCH, e.code());
         assertEquals(3, e.detail());
 
@@ -451,7 +452,7 @@ class FailureRecoveryTest {
     void nodeRestartKeepsIdentityAndData() throws Exception {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/restart")).id();
         Workload workload = new Workload();
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 100);
             appender.seal();
         }
@@ -465,7 +466,7 @@ class FailureRecoveryTest {
         }
         assertEquals(oldNodeId, restarted.nodeId(), "node identity must survive restart");
 
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, workload.ackedBytes());
     }
 
@@ -474,7 +475,7 @@ class FailureRecoveryTest {
         FileId fileId = client.create(new StrataClient.FileSpec("test", "/restart-open-fsync",
                 StrataClient.WritePolicy.fsync(3, 2))).id();
         Workload workload = new Workload();
-        StrataFile.Appender abandoned = client.openById(fileId).openForAppend();
+        StrataFile.Appender abandoned = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         try {
             workload.appendAcked(abandoned, 0, 160);
 
@@ -489,11 +490,11 @@ class FailureRecoveryTest {
             }
             waitForReplicaEndpoints(fileId, restartedNodeIds);
 
-            StrataFile.SealInfo sealed = client.openById(fileId).recoverAndSeal();
+            StrataFile.SealInfo sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
             assertTrue(sealed.sealedLength() >= workload.ackedBytes(),
                     "recovery sealed " + sealed.sealedLength() + " < acked " + workload.ackedBytes());
 
-            workload.verifyAckedPrefix(client, fileId);
+            workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
             ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
         } finally {
             abandoned.close();
@@ -537,7 +538,7 @@ class FailureRecoveryTest {
                 .withDataNodeConnectionsPerEndpoint(3));
         assertEquals(originalId, client.open(namespace, path).id(),
                 "path binding changed after ZooKeeper restart");
-        originalWorkload.verifyAckedPrefix(client, originalId);
+        originalWorkload.verifyAckedPrefix(client, StrataNamespace.of("test"), originalId);
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, originalId, originalLength);
 
         client.delete(namespace, path);
@@ -556,7 +557,7 @@ class FailureRecoveryTest {
 
         assertEquals(replacement.id(), client.open(namespace, path).id(),
                 "recreated path must resolve to the replacement file");
-        replacementWorkload.verifyAckedPrefix(client, replacement.id());
+        replacementWorkload.verifyAckedPrefix(client, StrataNamespace.of("test"), replacement.id());
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, replacement.id(),
                 replacementLength);
     }
@@ -566,7 +567,7 @@ class FailureRecoveryTest {
                 restartZooKeeper ? "/zk-cold-restart-sealed" : "/cold-restart-sealed")).id();
         Workload sealedWorkload = new Workload();
         long sealedLength;
-        try (StrataFile.Appender appender = client.openById(sealedFileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), sealedFileId).openForAppend()) {
             sealedWorkload.appendAcked(appender, 0, 120);
             sealedLength = appender.seal().sealedLength();
         }
@@ -575,7 +576,7 @@ class FailureRecoveryTest {
                 restartZooKeeper ? "/zk-cold-restart-open" : "/cold-restart-open",
                 StrataClient.WritePolicy.fsync(3, 2))).id();
         Workload openWorkload = new Workload();
-        StrataFile.Appender abandoned = client.openById(openFileId).openForAppend();
+        StrataFile.Appender abandoned = client.openById(StrataNamespace.of("test"), openFileId).openForAppend();
         openWorkload.appendAcked(abandoned, 0, 140);
 
         Set<Integer> sealedReplicaNodeIds = replicaNodeIds(lookupFile(sealedFileId));
@@ -596,14 +597,14 @@ class FailureRecoveryTest {
 
         assertEquals(sealedWorkload.ackedBytes(), sealedLength,
                 "sealed file committed a non-acked length before cold restart");
-        sealedWorkload.verifyAckedPrefix(client, sealedFileId);
+        sealedWorkload.verifyAckedPrefix(client, StrataNamespace.of("test"), sealedFileId);
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, sealedFileId, sealedLength);
 
-        StrataFile.SealInfo recovered = client.openById(openFileId).recoverAndSeal();
+        StrataFile.SealInfo recovered = client.openById(StrataNamespace.of("test"), openFileId).recoverAndSeal();
         assertTrue(recovered.sealedLength() >= openWorkload.ackedBytes(),
                 "cold recovery sealed " + recovered.sealedLength()
                         + " < acked " + openWorkload.ackedBytes());
-        openWorkload.verifyAckedPrefix(client, openFileId);
+        openWorkload.verifyAckedPrefix(client, StrataNamespace.of("test"), openFileId);
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, openFileId,
                 recovered.sealedLength());
     }
@@ -658,7 +659,7 @@ class FailureRecoveryTest {
         try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                 ScpClient.KIND_TOOL, "seal-chunk-meta")) {
             meta.call(Opcode.SEAL_CHUNK_META,
-                    new Messages.SealChunkMeta(chunk.chunkId(), chunk.writeEpoch(), length, crc,
+                    new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), chunk.writeEpoch(), length, crc,
                             sealedReplicas).encode(),
                     null, 5000);
         }

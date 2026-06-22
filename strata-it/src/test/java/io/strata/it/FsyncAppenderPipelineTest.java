@@ -4,6 +4,7 @@ import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
@@ -28,7 +29,7 @@ class FsyncAppenderPipelineTest {
                     StrataClient.WritePolicy.fsync(3, 2))).id();
             byte[] payload = new byte[512];
 
-            try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+            try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                 long start = System.nanoTime();
                 List<CompletableFuture<StrataFile.AppendAck>> futures = new ArrayList<>(appends);
                 for (int i = 0; i < appends; i++) {

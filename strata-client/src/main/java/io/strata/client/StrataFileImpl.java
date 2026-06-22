@@ -51,7 +51,7 @@ final class StrataFileImpl implements StrataFile {
 
     @Override
     public Appender openForAppend() {
-        Messages.LookupFileResp file = controller.lookupFile(fileId);
+        Messages.LookupFileResp file = controller.lookupFile(namespace, fileId);
         if (file.fileState() != FileState.OPEN.value) {
             throw new ScpException(ErrorCode.FILE_SEALED, "file state " + file.fileState());
         }
@@ -63,17 +63,17 @@ final class StrataFileImpl implements StrataFile {
             }
             length = addChunkLength(length, c.length());
         }
-        int writeEpoch = controller.allocateWriterEpochForAppend(fileId);
-        return new AppenderImpl(controller, appendPool, config, fileId, writeEpoch, file.writePolicy(), length);
+        int writeEpoch = controller.allocateWriterEpochForAppend(namespace, fileId);
+        return new AppenderImpl(controller, appendPool, config, fileId, namespace, writeEpoch, file.writePolicy(), length);
     }
 
     @Override
     public Reader openForRead() {
-        return new ReaderImpl(controller, readPool, config, fileId);
+        return new ReaderImpl(controller, readPool, config, fileId, namespace);
     }
 
     @Override
     public SealInfo recoverAndSeal() {
-        return new Recovery(controller, appendPool, readPool, config).recoverAndSeal(fileId);
+        return new Recovery(controller, appendPool, readPool, config, namespace).recoverAndSeal(fileId);
     }
 }

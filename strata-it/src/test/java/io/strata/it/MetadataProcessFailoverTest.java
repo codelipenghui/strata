@@ -7,6 +7,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.meta.ZkMetadataStore;
 import io.strata.node.DataNodeConfig;
 import io.strata.node.DataNode;
@@ -65,7 +66,7 @@ class MetadataProcessFailoverTest {
                 Workload workload = new Workload();
                 StrataFile.SealInfo sealed;
 
-                try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                     workload.appendAcked(appender, 0, 20);
 
                     kill(metadataByEndpoint(metas, firstLeader));
@@ -78,7 +79,7 @@ class MetadataProcessFailoverTest {
 
                 assertEquals(workload.ackedBytes(), sealed.sealedLength(),
                         "metadata process failover sealed at a non-acked length");
-                workload.verifyAckedPrefix(client, fileId);
+                workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                 ConsistencyVerifier.assertSealedFileConsistent(controllerEndpoints, client, fileId,
                         sealed.sealedLength());
             }
@@ -121,7 +122,7 @@ class MetadataProcessFailoverTest {
                 Workload workload = new Workload();
                 StrataFile.SealInfo sealed;
 
-                try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                     workload.appendAcked(appender, 0, 20);
 
                     Messages.ChunkInfo openChunk = lastChunk(
@@ -141,7 +142,7 @@ class MetadataProcessFailoverTest {
 
                 assertEquals(workload.ackedBytes(), sealed.sealedLength(),
                         "combined metadata/data-node process crash sealed at a non-acked length");
-                workload.verifyAckedPrefix(client, fileId);
+                workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                 ConsistencyVerifier.assertSealedFileConsistent(controllerEndpoints, client, fileId,
                         sealed.sealedLength());
             }
@@ -195,7 +196,7 @@ class MetadataProcessFailoverTest {
                 artifact.add("fileId=" + fileId);
 
                 BinaryWorkload workload = new BinaryWorkload();
-                try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                     ExternalDataNode killedDataNode = null;
 
                     try {
@@ -222,7 +223,7 @@ class MetadataProcessFailoverTest {
                             }
 
                             if (batch == 4 || batch == 8) {
-                                workload.verifyOpenReadIsAckedPrefix(client, fileId,
+                                workload.verifyOpenReadIsAckedPrefix(client, StrataNamespace.of("test"), fileId,
                                         "process stress/fault batch " + batch);
                                 ConsistencyVerifier.assertLiveFileDescriptorConsistent(
                                         controllerEndpoints, fileId);
@@ -267,7 +268,7 @@ class MetadataProcessFailoverTest {
                         assertEquals(workload.ackedBytes(), sealed.sealedLength(),
                                 "process stress/fault sealed at a non-acked length");
 
-                        workload.verifySealedAckedPrefix(client, fileId, "process stress/fault");
+                        workload.verifySealedAckedPrefix(client, StrataNamespace.of("test"), fileId, "process stress/fault");
                         Messages.LookupFileResp finalDescriptor =
                                 ConsistencyVerifier.waitForFullSealedFileConsistent(
                                         controllerEndpoints, client, fileId, sealed.sealedLength());
@@ -336,13 +337,13 @@ class MetadataProcessFailoverTest {
                         "/full-process-cluster-restart",
                         StrataClient.WritePolicy.fsync(3, 2))).id();
                 artifact.add("fileId=" + fileId);
-                abandoned = writer.openById(fileId).openForAppend();
+                abandoned = writer.openById(StrataNamespace.of("test"), fileId).openForAppend();
                 workload.appendRandomBatch(abandoned, new Random(seed), 96);
 
                 Messages.LookupFileResp beforeRestart = ConsistencyVerifier.lookupFile(controllerEndpoints, fileId);
                 Messages.ChunkInfo openTail = lastChunk(beforeRestart);
                 assertEquals(ChunkState.OPEN, openTail.state(), "restart scenario must leave an open tail");
-                workload.verifyOpenReadIsAckedPrefix(writer, fileId, context + " before restart");
+                workload.verifyOpenReadIsAckedPrefix(writer, StrataNamespace.of("test"), fileId, context + " before restart");
                 ConsistencyVerifier.assertLiveFileDescriptorConsistent(controllerEndpoints, fileId);
                 artifact.add(
                         "ackedBytes=" + workload.ackedBytes(),
@@ -384,10 +385,10 @@ class MetadataProcessFailoverTest {
             ClientConfig recoveryConfig = new ClientConfig(restartedMetadataEndpoints, 512, 10_000)
                     .withDataNodeConnectionsPerEndpoint(2);
             try (StrataClient recoveryClient = StrataClient.connect(recoveryConfig)) {
-                StrataFile.SealInfo sealed = recoveryClient.openById(fileId).recoverAndSeal();
+                StrataFile.SealInfo sealed = recoveryClient.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
                 assertEquals(workload.ackedBytes(), sealed.sealedLength(),
                         "full process restart recovery sealed at a non-acked length");
-                workload.verifySealedAckedPrefix(recoveryClient, fileId, context);
+                workload.verifySealedAckedPrefix(recoveryClient, StrataNamespace.of("test"), fileId, context);
                 Messages.LookupFileResp finalDescriptor =
                         ConsistencyVerifier.assertSealedFileConsistent(restartedMetadataEndpoints, recoveryClient,
                                 fileId, sealed.sealedLength());

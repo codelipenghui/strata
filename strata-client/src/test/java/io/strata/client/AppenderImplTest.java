@@ -3,6 +3,7 @@ package io.strata.client;
 import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import io.strata.common.ScpException;
 import io.strata.proto.Frame;
 import io.strata.proto.ManagedScpConnection;
@@ -379,7 +380,7 @@ class AppenderImplTest {
              NodePool pool = new NodePool()) {
             AppenderImpl appender = new AppenderImpl(null, pool,
                     new ClientConfig(List.of("127.0.0.1:1"), 1024, 500),
-                    fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                    fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
             Object session = chunkSession(chunkId,
                     new Messages.Replica(1, "invalid-replica-a"),
                     new Messages.Replica(2, "invalid-replica-b"),
@@ -471,7 +472,7 @@ class AppenderImplTest {
     void appendRejectsChunkOffsetOverflowBeforeSending() throws Exception {
         AppenderImpl appender = new AppenderImpl(null, null,
                 new ClientConfig(List.of("127.0.0.1:1"), Long.MAX_VALUE, 100),
-                FileId.random(), 1, Messages.WritePolicy.DEFAULT, 0);
+                FileId.random(), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
         Object session = chunkSession();
         setSession(appender, session);
         setLong(session, "end", Long.MAX_VALUE - 1);
@@ -485,7 +486,7 @@ class AppenderImplTest {
     void appendAckFileOffsetOverflowKillsAppender() throws Exception {
         AppenderImpl appender = new AppenderImpl(null, null,
                 new ClientConfig(List.of("127.0.0.1:1"), 1024, 100),
-                FileId.random(), 1, Messages.WritePolicy.DEFAULT, Long.MAX_VALUE - 1);
+                FileId.random(), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, Long.MAX_VALUE - 1);
         Object session = chunkSession();
         setSession(appender, session);
         setLong(session, "end", 2);
@@ -504,7 +505,7 @@ class AppenderImplTest {
     void rollTimesOutDrainingPendingAppendAndDies() throws Exception {
         AppenderImpl appender = new AppenderImpl(null, null,
                 new ClientConfig(List.of("127.0.0.1:1"), 1024, 5),
-                FileId.random(), 1, Messages.WritePolicy.DEFAULT, 0);
+                FileId.random(), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
         Object session = chunkSession();
         setSession(appender, session);
         setLong(session, "end", 1);
@@ -525,7 +526,7 @@ class AppenderImplTest {
     void rollInterruptedWhileDrainingRestoresInterruptAndDies() throws Exception {
         AppenderImpl appender = new AppenderImpl(null, null,
                 new ClientConfig(List.of("127.0.0.1:1"), 1024, 100),
-                FileId.random(), 1, Messages.WritePolicy.DEFAULT, 0);
+                FileId.random(), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
         Object session = chunkSession();
         setSession(appender, session);
         setLong(session, "end", 1);
@@ -557,7 +558,7 @@ class AppenderImplTest {
              ScpServer s3 = dataNodeServer(3, 0, true);
              NodePool pool = new NodePool()) {
             ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500);
-            AppenderImpl appender = new AppenderImpl(null, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+            AppenderImpl appender = new AppenderImpl(null, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
             Object session = chunkSession(chunkId,
                     new Messages.Replica(1, endpoint(s1)),
                     new Messages.Replica(2, endpoint(s2)),
@@ -614,7 +615,7 @@ class AppenderImplTest {
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
@@ -664,7 +665,7 @@ class AppenderImplTest {
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
@@ -726,8 +727,8 @@ class AppenderImplTest {
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1,
-                        Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
@@ -765,7 +766,7 @@ class AppenderImplTest {
         })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
@@ -801,7 +802,7 @@ class AppenderImplTest {
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
@@ -838,7 +839,7 @@ class AppenderImplTest {
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
@@ -875,7 +876,7 @@ class AppenderImplTest {
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
@@ -918,7 +919,7 @@ class AppenderImplTest {
         })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
@@ -954,7 +955,7 @@ class AppenderImplTest {
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
@@ -991,7 +992,7 @@ class AppenderImplTest {
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
@@ -1018,7 +1019,7 @@ class AppenderImplTest {
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
@@ -1051,7 +1052,7 @@ class AppenderImplTest {
         })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
@@ -1101,7 +1102,7 @@ class AppenderImplTest {
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[] {1})));
@@ -1147,7 +1148,7 @@ class AppenderImplTest {
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
                 CompletableFuture<ScpException> appendFailure = CompletableFuture.supplyAsync(() -> {
                     try {
                         appender.append(ByteBuffer.wrap(new byte[] {1}));
@@ -1185,7 +1186,7 @@ class AppenderImplTest {
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 StrataFile.AppendAck ack = appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
                 assertEquals(1, ack.endOffset());
@@ -1218,8 +1219,8 @@ class AppenderImplTest {
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1,
-                        Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 assertEquals(1, appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS).endOffset());
                 waitFor(() -> s1Appends.get() == 1 && s2Appends.get() == 1 && s3Appends.get() == 1);
@@ -1258,8 +1259,8 @@ class AppenderImplTest {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
                     .withDataNodeConnectionsPerEndpoint(2);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1,
-                        Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 assertEquals(1, appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS).endOffset());
                 Object session = currentSession(appender);
@@ -1298,7 +1299,7 @@ class AppenderImplTest {
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
                 Object session = chunkSession(chunkId,
                         new Messages.Replica(1, endpoint(s1)),
                         new Messages.Replica(2, endpoint(s2)),
@@ -1329,7 +1330,7 @@ class AppenderImplTest {
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
                 ScpException e = assertThrows(ScpException.class, appender::seal);
@@ -1354,7 +1355,7 @@ class AppenderImplTest {
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
                 ScpException e = assertThrows(ScpException.class, appender::seal);
@@ -1382,7 +1383,7 @@ class AppenderImplTest {
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
                 ScpException e = assertThrows(ScpException.class, appender::seal);
@@ -1408,7 +1409,7 @@ class AppenderImplTest {
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
                 ScpException e = assertThrows(ScpException.class, appender::seal);
@@ -1450,7 +1451,7 @@ class AppenderImplTest {
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
                 ScpException e = assertThrows(ScpException.class, appender::seal);
@@ -1490,7 +1491,7 @@ class AppenderImplTest {
              })) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
                 ScpException e = assertThrows(ScpException.class, appender::seal);
@@ -1516,7 +1517,7 @@ class AppenderImplTest {
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT,
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT,
                         Long.MAX_VALUE - 1);
                 Object session = chunkSession(chunkId,
                         new Messages.Replica(1, endpoint(s1)),
@@ -1548,7 +1549,7 @@ class AppenderImplTest {
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT,
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT,
                         Long.MAX_VALUE - 1);
                 Object session = chunkSession(chunkId,
                         new Messages.Replica(1, endpoint(s1)),
@@ -1583,7 +1584,7 @@ class AppenderImplTest {
                      new Messages.Replica(3, endpoint(s3)))) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, 1, Messages.WritePolicy.DEFAULT, 0);
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
                 appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
 
                 ScpException sealFailure = assertThrows(ScpException.class, appender::seal);
@@ -1627,7 +1628,7 @@ class AppenderImplTest {
 
     private static AppenderImpl appender() {
         return new AppenderImpl(null, null, new ClientConfig(List.of("127.0.0.1:1"), 1024, 100),
-                FileId.random(), 1, Messages.WritePolicy.DEFAULT, 0);
+                FileId.random(), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
     }
 
     private static Object chunkSession() throws Exception {

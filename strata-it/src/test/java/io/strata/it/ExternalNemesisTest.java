@@ -7,6 +7,7 @@ import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -93,7 +94,7 @@ class ExternalNemesisTest {
 
                     BinaryWorkload workload = new BinaryWorkload();
                     StrataFile.SealInfo sealed;
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         appendBatch(artifact, workload, appender, random, 0,
                                 schedule.warmupRecords());
                         assertOpenChunkContainsEndpoint(clientMetadataEndpoints, fileId,
@@ -108,7 +109,7 @@ class ExternalNemesisTest {
                         try {
                             appendBatch(artifact, workload, appender, random, 1,
                                     schedule.partitionedRecords());
-                            workload.verifyOpenReadIsAckedPrefix(client, fileId,
+                            workload.verifyOpenReadIsAckedPrefix(client, StrataNamespace.of("test"), fileId,
                                     "external nemesis after data-node partition");
                             ConsistencyVerifier.assertLiveFileDescriptorConsistent(
                                     clientMetadataEndpoints, fileId);
@@ -136,7 +137,7 @@ class ExternalNemesisTest {
 
                     assertEquals(workload.ackedBytes(), sealed.sealedLength(),
                             "external nemesis sealed at a non-acked length");
-                    workload.verifySealedAckedPrefix(client, fileId, "external nemesis");
+                    workload.verifySealedAckedPrefix(client, StrataNamespace.of("test"), fileId, "external nemesis");
                     Messages.LookupFileResp descriptor = waitForFullReplicaConsistency(
                             clientMetadataEndpoints, client, fileId, sealed.sealedLength(), 4);
                     ExternalCluster.ExternalDataNode proxiedDataNode = dataNodeByEndpoint(cluster,
@@ -238,9 +239,9 @@ class ExternalNemesisTest {
                     BinaryWorkload primaryWorkload = new BinaryWorkload();
                     BinaryWorkload secondaryWorkload = new BinaryWorkload();
                     StrataFile.Appender primaryAppender =
-                            primaryClient.openById(primaryFileId).openForAppend();
+                            primaryClient.openById(StrataNamespace.of("test"), primaryFileId).openForAppend();
                     StrataFile.Appender secondaryAppender =
-                            secondaryClient.openById(secondaryFileId).openForAppend();
+                            secondaryClient.openById(StrataNamespace.of("test"), secondaryFileId).openForAppend();
                     boolean primarySealed = false;
                     boolean secondarySealed = false;
                     StrataFile.SealInfo primarySeal;
@@ -255,17 +256,17 @@ class ExternalNemesisTest {
                         assertOpenChunkContainsEndpoint(clientMetadataEndpoints, secondaryFileId,
                                 proxiedDataNodeEndpoint);
                         try (StrataFile.Reader primaryReader =
-                                     secondaryClient.openById(primaryFileId).openForRead();
+                                     secondaryClient.openById(StrataNamespace.of("test"), primaryFileId).openForRead();
                              StrataFile.Reader secondaryReader =
-                                     primaryClient.openById(secondaryFileId).openForRead()) {
+                                     primaryClient.openById(StrataNamespace.of("test"), secondaryFileId).openForRead()) {
                             primaryWorkload.verifyReaderReadIsAckedPrefix(primaryReader,
                                     "concurrent primary long-lived before partition");
                             secondaryWorkload.verifyReaderReadIsAckedPrefix(secondaryReader,
                                     "concurrent secondary long-lived before partition");
                             primaryWorkload.verifyOpenReadIsAckedPrefix(secondaryClient,
-                                    primaryFileId, "concurrent primary before partition");
+                                    StrataNamespace.of("test"), primaryFileId, "concurrent primary before partition");
                             secondaryWorkload.verifyOpenReadIsAckedPrefix(primaryClient,
-                                    secondaryFileId, "concurrent secondary before partition");
+                                    StrataNamespace.of("test"), secondaryFileId, "concurrent secondary before partition");
                             artifact.add("crossClientOpenReadVerifiedBeforePartition=true",
                                     "longLivedReaderVerifiedBeforePartition=true");
 
@@ -287,10 +288,10 @@ class ExternalNemesisTest {
                                 secondaryWorkload.verifyReaderReadIsAckedPrefix(secondaryReader,
                                         "concurrent secondary long-lived after data-node partition");
                                 primaryWorkload.verifyOpenReadIsAckedPrefix(secondaryClient,
-                                        primaryFileId,
+                                        StrataNamespace.of("test"), primaryFileId,
                                         "concurrent primary after data-node partition");
                                 secondaryWorkload.verifyOpenReadIsAckedPrefix(primaryClient,
-                                        secondaryFileId,
+                                        StrataNamespace.of("test"), secondaryFileId,
                                         "concurrent secondary after data-node partition");
                                 ConsistencyVerifier.assertLiveFileDescriptorConsistent(
                                         clientMetadataEndpoints, primaryFileId);
@@ -340,9 +341,9 @@ class ExternalNemesisTest {
                             "concurrent primary sealed at a non-acked length");
                     assertEquals(secondaryWorkload.ackedBytes(), secondarySeal.sealedLength(),
                             "concurrent secondary sealed at a non-acked length");
-                    primaryWorkload.verifySealedAckedPrefix(secondaryClient, primaryFileId,
+                    primaryWorkload.verifySealedAckedPrefix(secondaryClient, StrataNamespace.of("test"), primaryFileId,
                             "concurrent primary");
-                    secondaryWorkload.verifySealedAckedPrefix(primaryClient, secondaryFileId,
+                    secondaryWorkload.verifySealedAckedPrefix(primaryClient, StrataNamespace.of("test"), secondaryFileId,
                             "concurrent secondary");
                     Messages.LookupFileResp primaryDescriptor = waitForFullReplicaConsistency(
                             clientMetadataEndpoints, primaryClient, primaryFileId,
@@ -441,7 +442,7 @@ class ExternalNemesisTest {
 
                     BinaryWorkload workload = new BinaryWorkload();
                     StrataFile.SealInfo sealed;
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         int nextRecord = workload.appendRandomBatch(appender,
                                 new Random(schedule.seed()), schedule.warmupRecords());
                         artifact.add("batch=0"
@@ -478,7 +479,7 @@ class ExternalNemesisTest {
 
                     Messages.LookupFileResp duringPartition = waitForReadableButNotFullRf(
                             cluster.controllerEndpoints(), client, fileId, sealed.sealedLength(), 3);
-                    workload.verifySealedAckedPrefix(client, fileId,
+                    workload.verifySealedAckedPrefix(client, StrataNamespace.of("test"), fileId,
                             "external control nemesis during control partition");
                     artifact.add("duringControlPartitionUnderReplicated=true");
                     artifact.addDescriptor("duringControlPartition", duringPartition);
@@ -491,7 +492,7 @@ class ExternalNemesisTest {
                                     .flatMap(chunk -> chunk.replicas().stream())
                                     .anyMatch(replica -> replica.nodeId() == spare.nodeId()),
                             "repaired descriptor did not include the healed control-path spare");
-                    workload.verifySealedAckedPrefix(client, fileId, "external control nemesis");
+                    workload.verifySealedAckedPrefix(client, StrataNamespace.of("test"), fileId, "external control nemesis");
                     artifact.add("sealedLength=" + sealed.sealedLength(),
                             "finalAckedBytes=" + workload.ackedBytes(),
                             "finalAckedSha256=" + workload.ackedSha256(),

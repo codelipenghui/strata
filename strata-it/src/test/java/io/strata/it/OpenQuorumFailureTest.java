@@ -7,6 +7,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.node.DataNode;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -32,7 +33,7 @@ class OpenQuorumFailureTest {
             cluster.killNode(1);
             cluster.killNode(2);
 
-            try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+            try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[]{1})));
                 assertEquals(ErrorCode.INTERNAL, e.code());
@@ -56,7 +57,7 @@ class OpenQuorumFailureTest {
 
             Workload workload = new Workload();
             StrataFile.SealInfo sealed;
-            try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+            try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                 workload.appendAcked(appender, 0, 1);
                 sealed = appender.seal();
             }
@@ -74,7 +75,7 @@ class OpenQuorumFailureTest {
             waitForNodeId(restarted, victimNodeId);
             waitForChunkRepaired(cluster, fileId, chunkId, victimNodeId);
 
-            workload.verifyAckedPrefix(client, fileId);
+            workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
             ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
         }
     }
@@ -82,7 +83,7 @@ class OpenQuorumFailureTest {
     private static Messages.LookupFileResp lookup(String endpoint, FileId fileId) throws Exception {
         String[] hp = endpoint.split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "lookup")) {
-            ByteBuffer h = direct.call(Opcode.LOOKUP_FILE, new Messages.LookupFile(fileId).encode(), null, 5000);
+            ByteBuffer h = direct.call(Opcode.LOOKUP_FILE, new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, 5000);
             return Messages.LookupFileResp.decode(h);
         }
     }

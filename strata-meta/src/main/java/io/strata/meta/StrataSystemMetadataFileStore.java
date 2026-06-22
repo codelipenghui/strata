@@ -67,7 +67,7 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
         // Recovery read: fence any previous writer and seal the open tail at the committed prefix (§7.3),
         // then read the sealed content. Drop our own appender first if we still hold one.
         closeQuietly(openLogAppenders.remove(logFileId));
-        StrataFile file = client().openById(logFileId);
+        StrataFile file = client().openById(NamespaceLogBackend.SYSTEM_NAMESPACE, logFileId);
         file.recoverAndSeal();
         return readAll(file);
     }
@@ -86,13 +86,13 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
 
     @Override
     public byte[] readSnapshot(FileId snapshotFileId) throws Exception {
-        return readAll(client().openById(snapshotFileId)); // sealed and immutable — no fencing needed
+        return readAll(client().openById(NamespaceLogBackend.SYSTEM_NAMESPACE, snapshotFileId)); // sealed and immutable — no fencing needed
     }
 
     @Override
     public void deleteFile(FileId fileId) throws Exception {
         closeQuietly(openLogAppenders.remove(fileId));
-        client().deleteById(fileId);
+        client().deleteById(NamespaceLogBackend.SYSTEM_NAMESPACE, fileId);
     }
 
     @Override
@@ -108,7 +108,8 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
     }
 
     private StrataFile.Appender appenderFor(FileId logFileId) {
-        return openLogAppenders.computeIfAbsent(logFileId, id -> client().openById(id).openForAppend());
+        return openLogAppenders.computeIfAbsent(logFileId,
+                id -> client().openById(NamespaceLogBackend.SYSTEM_NAMESPACE, id).openForAppend());
     }
 
     private byte[] readAll(StrataFile file) {

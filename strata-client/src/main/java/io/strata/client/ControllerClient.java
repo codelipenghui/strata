@@ -120,78 +120,65 @@ final class ControllerClient implements AutoCloseable {
         var resp = call(Opcode.CREATE_FILE, new Messages.CreateFile(spec.namespace(), spec.path(),
                 new Messages.WritePolicy(policy.replicationFactor(), policy.ackQuorum(), policy.fsyncOnAck()))
                 .encode(), spec.namespace());
-        FileId id = decode(Opcode.CREATE_FILE, resp, Messages.CreateFileResp::decode).fileId();
-        inheritOwner(id, spec.namespace()); // the file is served by its namespace's owner
-        return id;
+        return decode(Opcode.CREATE_FILE, resp, Messages.CreateFileResp::decode).fileId();
     }
 
-    Messages.CreateChunkResp createChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb) {
-        return createChunk(fileId, writeEpoch, opIdMsb, opIdLsb, Set.of());
+    Messages.CreateChunkResp createChunk(StrataNamespace namespace, FileId fileId, int writeEpoch,
+                                         long opIdMsb, long opIdLsb) {
+        return createChunk(namespace, fileId, writeEpoch, opIdMsb, opIdLsb, Set.of());
     }
 
-    Messages.CreateChunkResp createChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb,
-                                         Set<Integer> excludedNodeIds) {
+    Messages.CreateChunkResp createChunk(StrataNamespace namespace, FileId fileId, int writeEpoch,
+                                         long opIdMsb, long opIdLsb, Set<Integer> excludedNodeIds) {
         var resp = call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(fileId, writeEpoch, opIdMsb, opIdLsb,
-                        List.copyOf(excludedNodeIds)).encode(), fileId);
+                new Messages.CreateChunk(namespace, fileId, writeEpoch, opIdMsb, opIdLsb,
+                        List.copyOf(excludedNodeIds)).encode(), namespace);
         return decode(Opcode.CREATE_CHUNK, resp, Messages.CreateChunkResp::decode);
     }
 
-    int allocateWriterEpochForAppend(FileId fileId) {
-        var resp = call(Opcode.ALLOCATE_WRITER_EPOCH, Messages.AllocateWriterEpoch.forAppend(fileId).encode(), fileId);
+    int allocateWriterEpochForAppend(StrataNamespace namespace, FileId fileId) {
+        var resp = call(Opcode.ALLOCATE_WRITER_EPOCH,
+                Messages.AllocateWriterEpoch.forAppend(namespace, fileId).encode(), namespace);
         return decode(Opcode.ALLOCATE_WRITER_EPOCH, resp, Messages.AllocateWriterEpochResp::decode).writerEpoch();
     }
 
-    int allocateWriterEpochForRecovery(FileId fileId) {
-        var resp = call(Opcode.ALLOCATE_WRITER_EPOCH, Messages.AllocateWriterEpoch.forRecovery(fileId).encode(), fileId);
+    int allocateWriterEpochForRecovery(StrataNamespace namespace, FileId fileId) {
+        var resp = call(Opcode.ALLOCATE_WRITER_EPOCH,
+                Messages.AllocateWriterEpoch.forRecovery(namespace, fileId).encode(), namespace);
         return decode(Opcode.ALLOCATE_WRITER_EPOCH, resp, Messages.AllocateWriterEpochResp::decode).writerEpoch();
     }
 
-    void sealChunkMeta(io.strata.common.ChunkId chunkId, int writeEpoch, long length, int crc,
-                       java.util.List<Integer> sealedReplicas) {
+    void sealChunkMeta(StrataNamespace namespace, io.strata.common.ChunkId chunkId, int writeEpoch, long length,
+                       int crc, java.util.List<Integer> sealedReplicas) {
         call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunkId, writeEpoch, length, crc, sealedReplicas).encode(),
-                chunkId.fileId());
+                new Messages.SealChunkMeta(namespace, chunkId, writeEpoch, length, crc, sealedReplicas).encode(),
+                namespace);
     }
 
-    void abortChunkMeta(io.strata.common.ChunkId chunkId, int writeEpoch, long opIdMsb, long opIdLsb) {
+    void abortChunkMeta(StrataNamespace namespace, io.strata.common.ChunkId chunkId, int writeEpoch,
+                        long opIdMsb, long opIdLsb) {
         call(Opcode.ABORT_CHUNK_META,
-                new Messages.AbortChunkMeta(chunkId, writeEpoch, opIdMsb, opIdLsb).encode(),
-                chunkId.fileId());
+                new Messages.AbortChunkMeta(namespace, chunkId, writeEpoch, opIdMsb, opIdLsb).encode(),
+                namespace);
     }
 
-    Messages.LookupFileResp lookupFile(FileId fileId) {
-        var resp = call(Opcode.LOOKUP_FILE, new Messages.LookupFile(fileId).encode(), fileId);
+    Messages.LookupFileResp lookupFile(StrataNamespace namespace, FileId fileId) {
+        var resp = call(Opcode.LOOKUP_FILE, new Messages.LookupFile(namespace, fileId).encode(), namespace);
         return decode(Opcode.LOOKUP_FILE, resp, Messages.LookupFileResp::decode);
     }
 
     FileId lookupPath(StrataNamespace namespace, StrataPath path) {
         var resp = call(Opcode.LOOKUP_PATH, new Messages.LookupPath(namespace, path).encode(), namespace);
-        FileId id = decode(Opcode.LOOKUP_PATH, resp, Messages.LookupPathResp::decode).fileId();
-        inheritOwner(id, namespace);
-        return id;
+        return decode(Opcode.LOOKUP_PATH, resp, Messages.LookupPathResp::decode).fileId();
     }
 
-    void sealFile(FileId fileId, long totalLength) {
-        call(Opcode.SEAL_FILE, new Messages.SealFile(fileId, totalLength).encode(), fileId);
+    void sealFile(StrataNamespace namespace, FileId fileId, long totalLength) {
+        call(Opcode.SEAL_FILE, new Messages.SealFile(namespace, fileId, totalLength).encode(), namespace);
     }
 
-    Messages.DeleteFilesResp deleteFiles(List<FileId> ids) {
-        // One batch, routed by the first file's owner (so the per-file response codes map positionally to
-        // the request, as the caller expects). The common case is a single-file delete; a batch that spans
-        // owners would see per-file NOT_LEADER codes for files owned elsewhere (rare — the data path deletes
-        // one file at a time).
-        Object key = ids.isEmpty() ? null : ids.get(0);
-        var resp = call(Opcode.DELETE_FILES, new Messages.DeleteFiles(ids).encode(), key);
+    Messages.DeleteFilesResp deleteFiles(StrataNamespace namespace, List<FileId> ids) {
+        var resp = call(Opcode.DELETE_FILES, new Messages.DeleteFiles(namespace, ids).encode(), namespace);
         return decode(Opcode.DELETE_FILES, resp, Messages.DeleteFilesResp::decode);
-    }
-
-    /** A file is owned by its namespace's owner; mirror that mapping so file-scoped ops route directly. */
-    private void inheritOwner(FileId fileId, StrataNamespace namespace) {
-        String owner = ownerByKey.get(namespace);
-        if (owner != null) {
-            ownerByKey.put(fileId, owner);
-        }
     }
 
     @Override

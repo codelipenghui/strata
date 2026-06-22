@@ -41,16 +41,20 @@ final class Recovery {
     private final NodePool appendPool;
     private final NodePool readPool;
     private final ClientConfig config;
+    private final io.strata.common.StrataNamespace namespace;
 
-    Recovery(ControllerClient controller, NodePool pool, ClientConfig config) {
-        this(controller, pool, pool, config);
+    Recovery(ControllerClient controller, NodePool pool, ClientConfig config,
+             io.strata.common.StrataNamespace namespace) {
+        this(controller, pool, pool, config, namespace);
     }
 
-    Recovery(ControllerClient controller, NodePool appendPool, NodePool readPool, ClientConfig config) {
+    Recovery(ControllerClient controller, NodePool appendPool, NodePool readPool, ClientConfig config,
+             io.strata.common.StrataNamespace namespace) {
         this.controller = controller;
         this.appendPool = appendPool;
         this.readPool = readPool;
         this.config = config;
+        this.namespace = namespace;
     }
 
     /** Mutable per-replica recovery state; `end` tracks our view of its local end offset. */
@@ -69,18 +73,18 @@ final class Recovery {
     }
 
     StrataFile.SealInfo recoverAndSeal(io.strata.common.FileId fileId) {
-        Messages.LookupFileResp file = controller.lookupFile(fileId);
+        Messages.LookupFileResp file = controller.lookupFile(namespace, fileId);
         boolean needsRecovery = file.chunks().stream().anyMatch(c -> c.state() != ChunkState.SEALED);
         int writerEpoch = 0;
         if (needsRecovery) {
-            writerEpoch = controller.allocateWriterEpochForRecovery(fileId);
-            file = controller.lookupFile(fileId);
+            writerEpoch = controller.allocateWriterEpochForRecovery(namespace, fileId);
+            file = controller.lookupFile(namespace, fileId);
         }
         return recoverAndSeal(fileId, file, writerEpoch);
     }
 
     StrataFile.SealInfo recoverAndSeal(io.strata.common.FileId fileId, int writerEpoch) {
-        Messages.LookupFileResp file = controller.lookupFile(fileId);
+        Messages.LookupFileResp file = controller.lookupFile(namespace, fileId);
         return recoverAndSeal(fileId, file, writerEpoch);
     }
 
@@ -108,7 +112,7 @@ final class Recovery {
                         maySealAbandonedEmptyTail));
             }
         }
-        controller.sealFile(fileId, total);
+        controller.sealFile(namespace, fileId, total);
         return new StrataFile.SealInfo(total);
     }
 
@@ -479,7 +483,7 @@ final class Recovery {
             log.warn("recovery seal divergence on {} — committing agreeing quorum {} of {} successful seals",
                     chunkId, quorum.getValue().size(), ok);
         }
-        controller.sealChunkMeta(chunkId, epoch, quorum.getKey().finalLength(), quorum.getKey().crc(),
+        controller.sealChunkMeta(namespace, chunkId, epoch, quorum.getKey().finalLength(), quorum.getKey().crc(),
                 List.copyOf(quorum.getValue()));
         return quorum.getKey().finalLength();
     }

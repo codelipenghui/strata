@@ -6,6 +6,7 @@ import io.strata.client.StrataFile;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -177,7 +178,7 @@ final class StrataPerf {
         LongAdder filesDeleted = new LongAdder();
         AtomicInteger activeWriters = new AtomicInteger(config.files());
         AtomicInteger fileSeq = new AtomicInteger();
-        List<FileId> cleanupIds = java.util.Collections.synchronizedList(new ArrayList<>());
+        List<PerfFile> cleanupFiles = java.util.Collections.synchronizedList(new ArrayList<>());
 
         logReaderDistribution(lanes);
         Thread writeReporter = startReporter(writeStats, config.recordSize(), "write");
@@ -191,7 +192,7 @@ final class StrataPerf {
                 final int fileIndex = i;
                 futures.add(exec.submit(() -> {
                     writerLoop(client, config, fileIndex, lanes[fileIndex], payload, deadline, runId,
-                            fileSeq, filesCreated, filesDeleted, cleanupIds, writeStats, deleteStats,
+                            fileSeq, filesCreated, filesDeleted, cleanupFiles, writeStats, deleteStats,
                             activeWriters);
                     return null;
                 }));
@@ -199,7 +200,7 @@ final class StrataPerf {
             for (int r = 0; r < config.totalReaders(); r++) {
                 FileLane lane = lanes[r % config.files()];
                 futures.add(exec.submit(() -> {
-                    readerLoop(client, config, lane, activeWriters, filesDeleted, cleanupIds,
+                    readerLoop(client, config, lane, activeWriters, filesDeleted, cleanupFiles,
                             readStats, deleteStats);
                     return null;
                 }));
@@ -224,8 +225,8 @@ final class StrataPerf {
         }
         deleteStats.printFinal(config.recordSize(), "delete");
         log.info("perf: files created={} deleted={} cleanupCandidates={}",
-                filesCreated.sum(), filesDeleted.sum(), cleanupIds.size());
-        cleanup(client, cleanupIds);
+                filesCreated.sum(), filesDeleted.sum(), cleanupFiles.size());
+        cleanup(client, cleanupFiles);
     }
 
     private static FileLane[] buildLanes(int files, int readersPerFile) {
@@ -249,7 +250,7 @@ final class StrataPerf {
 
     private static void writerLoop(StrataClient client, PerfConfig config, int fileIndex, FileLane lane,
                                    byte[] payload, long deadline, long runId, AtomicInteger fileSeq,
-                                   LongAdder filesCreated, LongAdder filesDeleted, List<FileId> cleanupIds,
+                                   LongAdder filesCreated, LongAdder filesDeleted, List<PerfFile> cleanupFiles,
                                    Stats writeStats, Stats deleteStats, AtomicInteger activeWriters) {
         try {
             while (!stop && System.nanoTime() < deadline) {
@@ -258,11 +259,12 @@ final class StrataPerf {
                 boolean published = false;
                 try {
                     int seq = fileSeq.incrementAndGet();
+                    StrataNamespace ns = StrataNamespace.of(config.namespaceFor(seq));
                     FileId id = client.create(new StrataClient.FileSpec(
-                            config.namespaceFor(seq), "/perf/run-" + runId + "-" + seq)).id();
+                            ns.toString(), "/perf/run-" + runId + "-" + seq)).id();
                     filesCreated.increment();
-                    file = new PerfFile(id, lane.readerCount);
-                    appender = client.openById(id).openForAppend();
+                    file = new PerfFile(id, ns, lane.readerCount);
+                    appender = client.openById(ns, id).openForAppend();
                     if (lane.readerCount > 0 && !config.readSealed()) {
                         lane.publish(file);
                         published = true;
@@ -275,7 +277,7 @@ final class StrataPerf {
                     appender = null;
 
                     if (lane.readerCount == 0) {
-                        deleteFile(client, file, filesDeleted, cleanupIds, deleteStats);
+                        deleteFile(client, file, filesDeleted, cleanupFiles, deleteStats);
                         file.completed.complete(null);
                     } else if (config.readSealed()) {
                         lane.publish(file);
@@ -287,11 +289,11 @@ final class StrataPerf {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     stop = true;
-                    abortOrDelete(client, file, published, cleanupIds);
+                    abortOrDelete(client, file, published, cleanupFiles);
                     return;
                 } catch (RuntimeException e) {
                     writeStats.recordError("perf writer lane " + fileIndex, e);
-                    abortOrDelete(client, file, published, cleanupIds);
+                    abortOrDelete(client, file, published, cleanupFiles);
                     sleepQuietly(200);
                 } finally {
                     if (appender != null) {
@@ -371,7 +373,7 @@ final class StrataPerf {
 
     private static void readerLoop(StrataClient client, PerfConfig config, FileLane lane,
                                    AtomicInteger activeWriters, LongAdder filesDeleted,
-                                   List<FileId> cleanupIds, Stats readStats, Stats deleteStats) {
+                                   List<PerfFile> cleanupFiles, Stats readStats, Stats deleteStats) {
         while (true) {
             if (stop && lane.queue.isEmpty()) {
                 return;
@@ -393,7 +395,7 @@ final class StrataPerf {
             try {
                 readFileOnce(client, config, file, readStats);
             } finally {
-                completeReader(client, file, filesDeleted, cleanupIds, deleteStats);
+                completeReader(client, file, filesDeleted, cleanupFiles, deleteStats);
             }
         }
     }
@@ -403,7 +405,7 @@ final class StrataPerf {
         if (file.aborted.get()) {
             return;
         }
-        try (StrataFile.Reader reader = client.openById(file.id).openForRead()) {
+        try (StrataFile.Reader reader = client.openById(file.namespace, file.id).openForRead()) {
             long reads = 0;
             while (!file.aborted.get()) {
                 if (stop) {
@@ -476,31 +478,31 @@ final class StrataPerf {
     }
 
     private static void completeReader(StrataClient client, PerfFile file, LongAdder filesDeleted,
-                                       List<FileId> cleanupIds, Stats deleteStats) {
+                                       List<PerfFile> cleanupFiles, Stats deleteStats) {
         if (file.remainingReaders.decrementAndGet() != 0) {
             return;
         }
-        deleteFile(client, file, filesDeleted, cleanupIds, deleteStats);
+        deleteFile(client, file, filesDeleted, cleanupFiles, deleteStats);
         file.completed.complete(null);
     }
 
     private static void deleteFile(StrataClient client, PerfFile file, LongAdder filesDeleted,
-                                   List<FileId> cleanupIds, Stats deleteStats) {
+                                   List<PerfFile> cleanupFiles, Stats deleteStats) {
         long t0 = System.nanoTime();
         try {
-            client.deleteById(List.of(file.id));
+            client.deleteById(file.namespace, file.id);
             deleteStats.record(System.nanoTime() - t0);
             deleteStats.ops.increment();
             deleteStats.bytes.add(file.length());
             filesDeleted.increment();
         } catch (RuntimeException e) {
             deleteStats.recordError("perf delete " + file.id, e);
-            cleanupIds.add(file.id);
+            cleanupFiles.add(file);
         }
     }
 
     private static void abortOrDelete(StrataClient client, PerfFile file, boolean published,
-                                      List<FileId> cleanupIds) {
+                                      List<PerfFile> cleanupFiles) {
         if (file == null) {
             return;
         }
@@ -510,9 +512,9 @@ final class StrataPerf {
             return;
         }
         try {
-            client.deleteById(List.of(file.id));
+            client.deleteById(file.namespace, file.id);
         } catch (RuntimeException e) {
-            cleanupIds.add(file.id);
+            cleanupFiles.add(file);
         } finally {
             file.completed.complete(null);
         }
@@ -583,6 +585,7 @@ final class StrataPerf {
 
     private static final class PerfFile {
         final FileId id;
+        final StrataNamespace namespace;
         final AtomicLong durableOffset = new AtomicLong();
         final AtomicLong finalLength = new AtomicLong(-1);
         final AtomicLong nextReadOffset = new AtomicLong();
@@ -590,8 +593,9 @@ final class StrataPerf {
         final AtomicBoolean aborted = new AtomicBoolean();
         final CompletableFuture<Void> completed = new CompletableFuture<>();
 
-        PerfFile(FileId id, int readers) {
+        PerfFile(FileId id, StrataNamespace namespace, int readers) {
             this.id = id;
+            this.namespace = namespace;
             this.remainingReaders = new AtomicInteger(readers);
         }
 
@@ -638,16 +642,22 @@ final class StrataPerf {
         }
     }
 
-    private static void cleanup(StrataClient client, List<FileId> ids) {
-        if (ids.isEmpty()) {
+    private static void cleanup(StrataClient client, List<PerfFile> files) {
+        if (files.isEmpty()) {
             return;
         }
-        try {
-            client.deleteById(List.copyOf(ids));
-            log.info("cleanup deleted {} perf file candidate(s)", ids.size());
-        } catch (RuntimeException e) {
-            log.warn("perf file cleanup failed (delete manually): {}", e.toString());
+        int deleted = 0;
+        int failed = 0;
+        for (PerfFile f : files) {
+            try {
+                client.deleteById(f.namespace, f.id);
+                deleted++;
+            } catch (RuntimeException e) {
+                failed++;
+                log.warn("perf file cleanup failed for {} (delete manually): {}", f.id, e.toString());
+            }
         }
+        log.info("cleanup: deleted={} failed={}", deleted, failed);
     }
 
     private static long deadline(int durationSec) {

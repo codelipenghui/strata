@@ -40,28 +40,29 @@ final class StrataClientImpl implements StrataClient {
     }
 
     @Override
-    public StrataFile openById(FileId fileId) {
+    public StrataFile openById(StrataNamespace namespace, FileId fileId) {
+        Objects.requireNonNull(namespace, "namespace");
         Objects.requireNonNull(fileId, "fileId");
-        Messages.LookupFileResp file = controller.lookupFile(fileId);
-        return new StrataFileImpl(controller, appendPool, readPool, config, fileId, file.namespace(), file.path());
+        Messages.LookupFileResp file = controller.lookupFile(namespace, fileId);
+        return new StrataFileImpl(controller, appendPool, readPool, config, fileId, namespace, file.path());
     }
 
     @Override
     public void delete(List<FilePath> paths) {
         Objects.requireNonNull(paths, "paths");
-        deleteById(paths.stream()
-                .map(path -> {
-                    Objects.requireNonNull(path, "path");
-                    return controller.lookupPath(path.namespace(), path.path());
-                })
-                .toList());
+        for (FilePath p : paths) {
+            Objects.requireNonNull(p, "path");
+            FileId id = controller.lookupPath(p.namespace(), p.path());
+            deleteById(p.namespace(), List.of(id));
+        }
     }
 
     @Override
-    public void deleteById(List<FileId> fileIds) {
+    public void deleteById(StrataNamespace namespace, List<FileId> fileIds) {
+        Objects.requireNonNull(namespace, "namespace");
         Objects.requireNonNull(fileIds, "fileIds");
         fileIds = fileIds.stream().map(id -> Objects.requireNonNull(id, "fileId")).toList();
-        Messages.DeleteFilesResp resp = controller.deleteFiles(fileIds);
+        Messages.DeleteFilesResp resp = controller.deleteFiles(namespace, fileIds);
         if (!resp.fileIds().equals(fileIds) || resp.codes().size() != fileIds.size()) {
             throw new ScpException(ErrorCode.INTERNAL, "metadata delete response did not match request");
         }

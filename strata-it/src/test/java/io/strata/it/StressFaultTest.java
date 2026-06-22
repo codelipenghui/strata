@@ -4,6 +4,7 @@ import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -165,7 +166,7 @@ class StressFaultTest {
                             "/mixed-chaos-" + faultCase.name(), faultCase.writePolicy())).id();
                     artifact.add("fileId=" + fileId);
                     BinaryWorkload workload = new BinaryWorkload();
-                    StrataFile.Appender appender = client.openById(fileId).openForAppend();
+                    StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
                     boolean appenderClosed = false;
 
                     try {
@@ -219,7 +220,7 @@ class StressFaultTest {
                             }
 
                             if (batch % 3 == 2) {
-                                workload.verifyOpenReadIsAckedPrefix(client, fileId,
+                                workload.verifyOpenReadIsAckedPrefix(client, StrataNamespace.of("test"), fileId,
                                         context + " batch " + batch);
                                 ConsistencyVerifier.assertLiveFileDescriptorConsistent(cluster, fileId);
                                 artifact.add("openReadVerifiedBatch=" + batch);
@@ -236,7 +237,7 @@ class StressFaultTest {
                         assertEquals(workload.ackedBytes(), sealed.sealedLength(),
                                 context + " appender sealed at a non-acked length");
 
-                        workload.verifySealedAckedPrefix(client, fileId, context);
+                        workload.verifySealedAckedPrefix(client, StrataNamespace.of("test"), fileId, context);
                         Messages.LookupFileResp finalDescriptor =
                                 ConsistencyVerifier.waitForFullSealedFileConsistent(cluster, client,
                                         fileId, sealed.sealedLength());

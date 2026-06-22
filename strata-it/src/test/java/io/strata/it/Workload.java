@@ -2,6 +2,7 @@ package io.strata.it;
 
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
+import io.strata.common.StrataNamespace;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -66,9 +67,9 @@ final class Workload {
     }
 
     /** Asserts the file's prefix equals every acked byte, in order. */
-    synchronized void verifyAckedPrefix(StrataClient store, io.strata.common.FileId fileId) {
+    synchronized void verifyAckedPrefix(StrataClient store, StrataNamespace namespace, io.strata.common.FileId fileId) {
         byte[] expectedBytes = expected.toString().getBytes(StandardCharsets.UTF_8);
-        byte[] actual = readAll(store, fileId, expectedBytes.length);
+        byte[] actual = readAll(store, namespace, fileId, expectedBytes.length);
         if (actual.length < expectedBytes.length) {
             throw new AssertionError("ACKED DATA LOST: acked " + expectedBytes.length
                     + " bytes but only " + actual.length + " readable");
@@ -80,8 +81,8 @@ final class Workload {
         }
     }
 
-    static byte[] readAll(StrataClient store, io.strata.common.FileId fileId, int atLeast) {
-        try (StrataFile.Reader reader = store.openById(fileId).openForRead()) {
+    static byte[] readAll(StrataClient store, StrataNamespace namespace, io.strata.common.FileId fileId, int atLeast) {
+        try (StrataFile.Reader reader = store.openById(namespace, fileId).openForRead()) {
             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
             long offset = 0;
             int idleRounds = 0;

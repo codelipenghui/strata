@@ -4,6 +4,7 @@ import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -31,18 +32,18 @@ class RecoveryDivergenceTest {
                     List.of("AAAA".getBytes(), "AAAA".getBytes(), "BBBB".getBytes()));
 
             String[] hp = cluster.metaEndpoint().split(":");
-            var sealed = client.openById(setup.fileId()).recoverAndSeal();
+            var sealed = client.openById(StrataNamespace.of("test"), setup.fileId()).recoverAndSeal();
             assertEquals(4, sealed.sealedLength());
 
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
                 var lookup = Messages.LookupFileResp.decode(meta.call(Opcode.LOOKUP_FILE,
-                        new Messages.LookupFile(setup.fileId()).encode(), null, 5000));
+                        new Messages.LookupFile(StrataNamespace.of("test"), setup.fileId()).encode(), null, 5000));
                 assertEquals(io.strata.common.ChunkState.SEALED, lookup.chunks().get(0).state());
                 assertEquals(2, lookup.chunks().get(0).replicas().size(),
                         "metadata must retain only the agreeing seal quorum");
             }
 
-            try (var reader = client.openById(setup.fileId()).openForRead()) {
+            try (var reader = client.openById(StrataNamespace.of("test"), setup.fileId()).openForRead()) {
                 try (StrataFile.ReadResult rr = reader.read(0, 4)) {
                     byte[] got = new byte[rr.length()];
                     rr.buffer().get(got);
@@ -59,14 +60,14 @@ class RecoveryDivergenceTest {
             var setup = createOpenChunkWithReplicaPayloads(cluster, "/split",
                     List.of("AAAA".getBytes(), "BBBB".getBytes(), "CCCC".getBytes()));
 
-            var sealed = client.openById(setup.fileId()).recoverAndSeal();
+            var sealed = client.openById(StrataNamespace.of("test"), setup.fileId()).recoverAndSeal();
             assertEquals(0, sealed.sealedLength(),
                     "recovery must not commit a tail without an agreeing quorum");
 
             String[] hp = cluster.metaEndpoint().split(":");
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
                 var lookup = Messages.LookupFileResp.decode(meta.call(Opcode.LOOKUP_FILE,
-                        new Messages.LookupFile(setup.fileId()).encode(), null, 5000));
+                        new Messages.LookupFile(StrataNamespace.of("test"), setup.fileId()).encode(), null, 5000));
                 assertEquals(io.strata.common.ChunkState.SEALED, lookup.chunks().get(0).state());
                 assertEquals(0, lookup.chunks().get(0).length());
             }
@@ -80,7 +81,7 @@ class RecoveryDivergenceTest {
             var setup = createOpenChunkWithReplicaPayloadsAndDurableFloor(cluster, "/floor-split",
                     List.of("BBBB".getBytes(), "AAAA".getBytes(), new byte[0]));
 
-            assertThrows(ScpException.class, () -> client.openById(setup.fileId()).recoverAndSeal(),
+            assertThrows(ScpException.class, () -> client.openById(StrataNamespace.of("test"), setup.fileId()).recoverAndSeal(),
                     "recovery must not copy one divergent donor into a lagging replica and then "
                             + "commit that manufactured quorum below the durable floor");
         }
@@ -98,7 +99,7 @@ class RecoveryDivergenceTest {
                     new Messages.CreateFile("test", path).encode(), null, 5000));
             fileId = file.fileId();
             chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
-                    new Messages.CreateChunk(fileId, 1).encode(), null, 5000));
+                    new Messages.CreateChunk(StrataNamespace.of("test"), fileId, 1).encode(), null, 5000));
         }
         assertEquals(payloads.size(), chunk.replicas().size());
 
@@ -148,7 +149,7 @@ class RecoveryDivergenceTest {
             var file = Messages.CreateFileResp.decode(meta.call(Opcode.CREATE_FILE,
                     new Messages.CreateFile("test", path).encode(), null, 5000));
             var chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
-                    new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                    new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
             return new OpenChunkSetup(file.fileId(), chunk);
         }
     }

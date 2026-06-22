@@ -33,6 +33,7 @@ class MessageGoldenCorpusTest {
     private static final ChunkId CHUNK_ID = new ChunkId(FILE_ID, 3);
     private static final long OP_ID_MSB = 0x0123456789abcdefL;
     private static final long OP_ID_LSB = 0xfedcba9876543210L;
+    private static final StrataNamespace NS = StrataNamespace.of("test");
 
     @Test
     void opcodeTableIsAppendOnlyGoldenCorpus() {
@@ -334,10 +335,10 @@ class MessageGoldenCorpusTest {
                         Messages.CreateFileResp::decode,
                         "00001111111122223333444455555555555500"),
                 request("createChunk",
-                        new Messages.CreateChunk(FILE_ID, 5, OP_ID_MSB, OP_ID_LSB),
-                        () -> new Messages.CreateChunk(FILE_ID, 5, OP_ID_MSB, OP_ID_LSB).encode(),
+                        new Messages.CreateChunk(NS, FILE_ID, 5, OP_ID_MSB, OP_ID_LSB),
+                        () -> new Messages.CreateChunk(NS, FILE_ID, 5, OP_ID_MSB, OP_ID_LSB).encode(),
                         Messages.CreateChunk::decode,
-                        "11111111222233334444555555555555000000050123456789abcdeffedcba987654321000"),
+                        "047465737411111111222233334444555555555555000000050123456789abcdeffedcba987654321000"),
                 response("createChunkResp",
                         new Messages.CreateChunkResp(CHUNK_ID, 5,
                                 List.of(new Messages.Replica(1, "a:1"),
@@ -351,38 +352,38 @@ class MessageGoldenCorpusTest {
                         "000011111111222233334444555555555555000000030000000503000000010361"
                                 + "3a310000000203623a320000000303633a3300"),
                 request("allocateWriterEpochAppend",
-                        Messages.AllocateWriterEpoch.forAppend(FILE_ID),
-                        () -> Messages.AllocateWriterEpoch.forAppend(FILE_ID).encode(),
+                        Messages.AllocateWriterEpoch.forAppend(NS, FILE_ID),
+                        () -> Messages.AllocateWriterEpoch.forAppend(NS, FILE_ID).encode(),
                         Messages.AllocateWriterEpoch::decode,
-                        "111111112222333344445555555555550100"),
+                        "04746573741111111122223333444455555555555501" + "00"),
                 request("allocateWriterEpochRecovery",
-                        Messages.AllocateWriterEpoch.forRecovery(FILE_ID),
-                        () -> Messages.AllocateWriterEpoch.forRecovery(FILE_ID).encode(),
+                        Messages.AllocateWriterEpoch.forRecovery(NS, FILE_ID),
+                        () -> Messages.AllocateWriterEpoch.forRecovery(NS, FILE_ID).encode(),
                         Messages.AllocateWriterEpoch::decode,
-                        "111111112222333344445555555555550200"),
+                        "04746573741111111122223333444455555555555502" + "00"),
                 response("allocateWriterEpochResp",
                         new Messages.AllocateWriterEpochResp(7),
                         () -> new Messages.AllocateWriterEpochResp(7).encode(),
                         Messages.AllocateWriterEpochResp::decode,
                         "00000000000700"),
                 request("sealChunkMeta",
-                        new Messages.SealChunkMeta(CHUNK_ID, 5, 4096, 0xDD, List.of(1, 2)),
-                        () -> new Messages.SealChunkMeta(CHUNK_ID, 5, 4096, 0xDD,
+                        new Messages.SealChunkMeta(NS, CHUNK_ID, 5, 4096, 0xDD, List.of(1, 2)),
+                        () -> new Messages.SealChunkMeta(NS, CHUNK_ID, 5, 4096, 0xDD,
                                 List.of(1, 2)).encode(),
                         Messages.SealChunkMeta::decode,
-                        "1111111122223333444455555555555500000003000000050000000000001000"
+                        "04746573741111111122223333444455555555555500000003000000050000000000001000"
                                 + "000000dd02000000010000000200"),
                 request("abortChunkMeta",
-                        new Messages.AbortChunkMeta(CHUNK_ID, 5, 1, 2),
-                        () -> new Messages.AbortChunkMeta(CHUNK_ID, 5, 1, 2).encode(),
+                        new Messages.AbortChunkMeta(NS, CHUNK_ID, 5, 1, 2),
+                        () -> new Messages.AbortChunkMeta(NS, CHUNK_ID, 5, 1, 2).encode(),
                         Messages.AbortChunkMeta::decode,
-                        "1111111122223333444455555555555500000003000000050000000000000001"
+                        "04746573741111111122223333444455555555555500000003000000050000000000000001"
                                 + "000000000000000200"),
                 request("lookupFile",
-                        new Messages.LookupFile(FILE_ID),
-                        () -> new Messages.LookupFile(FILE_ID).encode(),
+                        new Messages.LookupFile(NS, FILE_ID),
+                        () -> new Messages.LookupFile(NS, FILE_ID).encode(),
                         Messages.LookupFile::decode,
-                        "1111111122223333444455555555555500"),
+                        "047465737411111111222233334444555555555555" + "00"),
                 request("lookupPath",
                         new Messages.LookupPath("test", "/kafka/topicA/0/00000000000000000000"),
                         () -> new Messages.LookupPath("test",
@@ -407,20 +408,20 @@ class MessageGoldenCorpusTest {
                         Messages.LookupFileResp::decode,
                         "00000474657374242f6b61666b612f746f706963412f302f3030303030303030303030303030303030303030000000030000000200000111111111222233334444555555555555000000030000000000000000000000000000000005010000000103613a3100"),
                 request("deleteFiles",
-                        new Messages.DeleteFiles(List.of(FILE_ID)),
-                        () -> new Messages.DeleteFiles(List.of(FILE_ID)).encode(),
+                        new Messages.DeleteFiles(NS, List.of(FILE_ID)),
+                        () -> new Messages.DeleteFiles(NS, List.of(FILE_ID)).encode(),
                         Messages.DeleteFiles::decode,
-                        "011111111122223333444455555555555500"),
+                        "047465737401" + "11111111222233334444555555555555" + "00"),
                 response("deleteFilesResp",
                         new Messages.DeleteFilesResp(List.of(FILE_ID), List.of((short) 0)),
                         () -> new Messages.DeleteFilesResp(List.of(FILE_ID), List.of((short) 0)).encode(),
                         Messages.DeleteFilesResp::decode,
                         "00000111111111222233334444555555555555000000"),
                 request("sealFile",
-                        new Messages.SealFile(FILE_ID, 1L << 20),
-                        () -> new Messages.SealFile(FILE_ID, 1L << 20).encode(),
+                        new Messages.SealFile(NS, FILE_ID, 1L << 20),
+                        () -> new Messages.SealFile(NS, FILE_ID, 1L << 20).encode(),
                         Messages.SealFile::decode,
-                        "11111111222233334444555555555555000000000010000000"));
+                        "0474657374" + "11111111222233334444555555555555" + "000000000010000000"));
     }
 
     private static <T> GoldenCase<T> request(String name, T expected, Supplier<byte[]> encoder,
