@@ -1,6 +1,7 @@
 package io.strata.meta;
 
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -102,9 +103,9 @@ class MetadataSharedLivenessTest {
                 null, 5_000));
         FileId fileId = created.fileId();
         var epoch = Messages.AllocateWriterEpochResp.decode(client.call(Opcode.ALLOCATE_WRITER_EPOCH,
-                Messages.AllocateWriterEpoch.forAppend(fileId).encode(), null, 5_000));
+                Messages.AllocateWriterEpoch.forAppend(StrataNamespace.of(namespace), fileId).encode(), null, 5_000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(fileId, epoch.writerEpoch()).encode(), null, 5_000));
+                new Messages.CreateChunk(StrataNamespace.of(namespace), fileId, epoch.writerEpoch()).encode(), null, 5_000));
         return chunk.replicas().size();
     }
 
@@ -118,7 +119,7 @@ class MetadataSharedLivenessTest {
 
     private String namespaceOwnedBy(String endpoint) {
         for (int i = 0; i < 10_000; i++) {
-            io.strata.common.StrataNamespace ns = io.strata.common.StrataNamespace.of("live-ns-" + i);
+            StrataNamespace ns = StrataNamespace.of("live-ns-" + i);
             if (NamespaceAssignmentPolicy.assign(ns, 0, endpoints, 2).preferredLeader().equals(endpoint)) {
                 return ns.value();
             }

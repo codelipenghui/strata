@@ -1,5 +1,6 @@
 package io.strata.meta;
 
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -35,7 +36,7 @@ class ControllerNamespaceLogBackendTest {
                                 new Messages.WritePolicy(3, 2, true)).encode(), null, 5_000));
 
                 var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
-                        new Messages.LookupFile(created.fileId()).encode(), null, 5_000));
+                        new Messages.LookupFile(StrataNamespace.of("tenant-a"), created.fileId()).encode(), null, 5_000));
                 assertEquals("tenant-a", lookup.namespace().value(), "metadata served from the namespace log");
 
                 var byPath = Messages.LookupPathResp.decode(client.call(Opcode.LOOKUP_PATH,
@@ -43,7 +44,7 @@ class ControllerNamespaceLogBackendTest {
                 assertEquals(created.fileId(), byPath.fileId());
 
                 var codes = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
-                        new Messages.DeleteFiles(java.util.List.of(created.fileId())).encode(), null, 5_000));
+                        new Messages.DeleteFiles(StrataNamespace.of("tenant-a"), java.util.List.of(created.fileId())).encode(), null, 5_000));
                 assertEquals(io.strata.common.ErrorCode.OK.code, codes.codes().get(0));
             }
         }

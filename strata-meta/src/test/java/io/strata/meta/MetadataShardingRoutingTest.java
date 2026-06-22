@@ -90,15 +90,15 @@ class MetadataShardingRoutingTest {
         assertEquals(ErrorCode.NOT_LEADER, redirect1.code());
         assertEquals(ep1, redirect1.leaderHint());
 
-        // each owner resolves its own file; a file-id op (no namespace) routes by the file's namespace,
-        // resolved on the receiving node from the local store or the global fileId→namespace index, so the
-        // wrong node redirects to the owning controller.
+        // each owner resolves its own file; a file-scoped op carries the namespace so routing is by
+        // the supplied namespace's owner — the wrong node redirects to the owning controller.
+        StrataNamespace owningNs = StrataNamespace.of(nsOf0);
         assertEquals(nsOf0, Messages.LookupFileResp.decode(client0.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(created0.fileId()).encode(), null, 5_000)).namespace().value());
+                new Messages.LookupFile(owningNs, created0.fileId()).encode(), null, 5_000)).namespace().value());
         ScpException wrongNode = assertThrows(ScpException.class, () -> client1.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(created0.fileId()).encode(), null, 5_000));
+                new Messages.LookupFile(owningNs, created0.fileId()).encode(), null, 5_000));
         assertEquals(ErrorCode.NOT_LEADER, wrongNode.code());
-        assertEquals(ep0, wrongNode.leaderHint(), "file-id op redirects to the file's namespace owner");
+        assertEquals(ep0, wrongNode.leaderHint(), "file-id op redirects to the supplied namespace's owner");
     }
 
     @Test
@@ -114,7 +114,7 @@ class MetadataShardingRoutingTest {
         var created = Messages.CreateFileResp.decode(followerClient.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile(nsOwnedByFollower, "/follower-seg-0").encode(), null, 5_000));
         var look = Messages.LookupFileResp.decode(followerClient.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(created.fileId()).encode(), null, 5_000));
+                new Messages.LookupFile(StrataNamespace.of(nsOwnedByFollower), created.fileId()).encode(), null, 5_000));
         assertEquals(nsOwnedByFollower, look.namespace().value());
     }
 

@@ -6,6 +6,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Frame;
 import io.strata.proto.FrameIO;
 import io.strata.proto.Messages;
@@ -121,7 +122,7 @@ class ControllerTest {
                 new Messages.CreateFile("test", "/write-policy", policy).encode(),
                 null, 5000));
         var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(accepted.fileId()).encode(), null, 5000));
+                new Messages.LookupFile(StrataNamespace.of("test"), accepted.fileId()).encode(), null, 5000));
         assertEquals(policy, lookup.writePolicy());
     }
 
@@ -136,7 +137,7 @@ class ControllerTest {
         assertEquals(created.fileId(), byPath.fileId());
 
         var byId = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(created.fileId()).encode(), null, 5000));
+                new Messages.LookupFile(StrataNamespace.of("test"), created.fileId()).encode(), null, 5000));
         assertEquals(io.strata.common.StrataNamespace.of("test"), byId.namespace());
         assertEquals(io.strata.common.StrataPath.of("/namespace/topicA/0/segment-0"), byId.path());
 
@@ -153,7 +154,7 @@ class ControllerTest {
         assertEquals(samePathOtherNamespace.fileId(), byOtherNamespace.fileId());
 
         var delete = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
-                new Messages.DeleteFiles(List.of(created.fileId(), samePathOtherNamespace.fileId())).encode(),
+                new Messages.DeleteFiles(StrataNamespace.of("test"), List.of(created.fileId(), samePathOtherNamespace.fileId())).encode(),
                 null, 5000));
         assertEquals(List.of(ErrorCode.OK.code, ErrorCode.OK.code), delete.codes());
 
@@ -179,7 +180,7 @@ class ControllerTest {
         assertEquals(ErrorCode.FILE_NOT_FOUND, wrongBinding.code());
 
         var byId = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(first.fileId()).encode(), null, 5000));
+                new Messages.LookupFile(StrataNamespace.of("test"), first.fileId()).encode(), null, 5000));
         assertEquals(io.strata.common.StrataPath.of("/marker-identity-a"), byId.path());
     }
 
@@ -237,28 +238,28 @@ class ControllerTest {
         FileId missing = FileId.random();
 
         ScpException createChunk = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(missing, 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), missing, 1).encode(), null, 5000));
         assertEquals(ErrorCode.FILE_NOT_FOUND, createChunk.code());
 
         ScpException allocate = assertThrows(ScpException.class, () -> client.call(Opcode.ALLOCATE_WRITER_EPOCH,
-                Messages.AllocateWriterEpoch.forAppend(missing).encode(), null, 5000));
+                Messages.AllocateWriterEpoch.forAppend(StrataNamespace.of("test"), missing).encode(), null, 5000));
         assertEquals(ErrorCode.FILE_NOT_FOUND, allocate.code());
 
         ScpException sealChunk = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(new ChunkId(missing, 0), 1, 10, 0x1, List.of()).encode(),
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), new ChunkId(missing, 0), 1, 10, 0x1, List.of()).encode(),
                 null, 5000));
         assertEquals(ErrorCode.FILE_NOT_FOUND, sealChunk.code());
 
         ScpException lookup = assertThrows(ScpException.class, () -> client.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(missing).encode(), null, 5000));
+                new Messages.LookupFile(StrataNamespace.of("test"), missing).encode(), null, 5000));
         assertEquals(ErrorCode.FILE_NOT_FOUND, lookup.code());
 
         var delete = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
-                new Messages.DeleteFiles(List.of(missing)).encode(), null, 5000));
+                new Messages.DeleteFiles(StrataNamespace.of("test"), List.of(missing)).encode(), null, 5000));
         assertEquals(ErrorCode.FILE_NOT_FOUND.code, delete.codes().get(0).shortValue());
 
         client.call(Opcode.ABORT_CHUNK_META,
-                new Messages.AbortChunkMeta(new ChunkId(missing, 0), 1, 1, 2).encode(), null, 5000);
+                new Messages.AbortChunkMeta(StrataNamespace.of("test"), new ChunkId(missing, 0), 1, 1, 2).encode(), null, 5000);
     }
 
     @Test
@@ -270,7 +271,7 @@ class ControllerTest {
         MetadataStore original = replaceStore(rejecting);
         try {
             var delete = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
-                    new Messages.DeleteFiles(List.of(created.fileId())).encode(), null, 5000));
+                    new Messages.DeleteFiles(StrataNamespace.of("test"), List.of(created.fileId())).encode(), null, 5000));
 
             assertEquals(ErrorCode.INTERNAL.code, delete.codes().get(0).shortValue());
             assertEquals(1, rejecting.deletePathCalls);
@@ -301,7 +302,7 @@ class ControllerTest {
 
             // create chunk: 3 replicas, all distinct nodes and hosts
             var chunkResp = Messages.CreateChunkResp.decode(localClient.call(Opcode.CREATE_CHUNK,
-                    new Messages.CreateChunk(fileId, 1).encode(), null, 5000));
+                    new Messages.CreateChunk(StrataNamespace.of("test"), fileId, 1).encode(), null, 5000));
             assertEquals(0, chunkResp.chunkId().index());
             assertEquals(3, chunkResp.replicas().size());
             Set<Integer> ids = new HashSet<>();
@@ -313,18 +314,18 @@ class ControllerTest {
 
             // seal chunk 0, then a higher-epoch writer takes over with chunk 1
             localClient.call(Opcode.SEAL_CHUNK_META,
-                    new Messages.SealChunkMeta(chunkResp.chunkId(), 1, 4096, 0xAB, List.of()).encode(), null, 5000);
+                    new Messages.SealChunkMeta(StrataNamespace.of("test"), chunkResp.chunkId(), 1, 4096, 0xAB, List.of()).encode(), null, 5000);
             var chunk2 = Messages.CreateChunkResp.decode(localClient.call(Opcode.CREATE_CHUNK,
-                    new Messages.CreateChunk(fileId, 2).encode(), null, 5000));
+                    new Messages.CreateChunk(StrataNamespace.of("test"), fileId, 2).encode(), null, 5000));
             assertEquals(1, chunk2.chunkId().index());
 
             // lower-epoch create rejected (stale leader guard; fence precedence over tail-open)
             ScpException stale = assertThrows(ScpException.class, () -> localClient.call(Opcode.CREATE_CHUNK,
-                    new Messages.CreateChunk(fileId, 1).encode(), null, 5000));
+                    new Messages.CreateChunk(StrataNamespace.of("test"), fileId, 1).encode(), null, 5000));
             assertEquals(ErrorCode.FENCED_EPOCH, stale.code());
 
             var lookup = Messages.LookupFileResp.decode(localClient.call(Opcode.LOOKUP_FILE,
-                    new Messages.LookupFile(fileId).encode(), null, 5000));
+                    new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, 5000));
             assertEquals(2, lookup.chunks().size());
             assertEquals(ChunkState.SEALED, lookup.chunks().get(0).state());
             assertEquals(4096, lookup.chunks().get(0).length());
@@ -332,14 +333,14 @@ class ControllerTest {
 
             // idempotent seal ok; conflicting seal rejected
             localClient.call(Opcode.SEAL_CHUNK_META,
-                    new Messages.SealChunkMeta(chunkResp.chunkId(), 1, 4096, 0xAB, List.of()).encode(), null, 5000);
+                    new Messages.SealChunkMeta(StrataNamespace.of("test"), chunkResp.chunkId(), 1, 4096, 0xAB, List.of()).encode(), null, 5000);
             ScpException conflict = assertThrows(ScpException.class, () -> localClient.call(Opcode.SEAL_CHUNK_META,
-                    new Messages.SealChunkMeta(chunkResp.chunkId(), 1, 5000, 0xAB, List.of()).encode(), null, 5000));
+                    new Messages.SealChunkMeta(StrataNamespace.of("test"), chunkResp.chunkId(), 1, 5000, 0xAB, List.of()).encode(), null, 5000));
             assertEquals(ErrorCode.CHUNK_SEALED, conflict.code());
 
             // delete the file: DELETING -> DELETE commands ride heartbeats -> confirmations -> gone
             var delResp = Messages.DeleteFilesResp.decode(localClient.call(Opcode.DELETE_FILES,
-                    new Messages.DeleteFiles(List.of(fileId)).encode(), null, 5000));
+                    new Messages.DeleteFiles(StrataNamespace.of("test"), List.of(fileId)).encode(), null, 5000));
             assertEquals((short) 0, delResp.codes().get(0).shortValue());
 
             for (int round = 0; round < 10; round++) {
@@ -349,7 +350,7 @@ class ControllerTest {
                 n3.heartbeat();
                 try {
                     Messages.LookupFileResp.decode(localClient.call(Opcode.LOOKUP_FILE,
-                            new Messages.LookupFile(fileId).encode(), null, 5000));
+                            new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, 5000));
                 } catch (ScpException e) {
                     assertEquals(ErrorCode.FILE_NOT_FOUND, e.code());
                     assertTrue(n1.received.stream().anyMatch(c -> c instanceof Messages.DeleteCmd)
@@ -496,7 +497,7 @@ class ControllerTest {
             var fileResp = Messages.CreateFileResp.decode(localClient.call(Opcode.CREATE_FILE,
                     new Messages.CreateFile("test", "/full").encode(), null, 5000));
             ScpException noCapacity = assertThrows(ScpException.class, () -> localClient.call(Opcode.CREATE_CHUNK,
-                    new Messages.CreateChunk(fileResp.fileId(), 1).encode(), null, 5000));
+                    new Messages.CreateChunk(StrataNamespace.of("test"), fileResp.fileId(), 1).encode(), null, 5000));
             assertEquals(ErrorCode.NO_CAPACITY, noCapacity.code());
 
             localClient.call(Opcode.NODE_HEARTBEAT,
@@ -505,7 +506,7 @@ class ControllerTest {
                             List.of(new Messages.StorageUsage(0, 100)), 0, List.of()).encode(),
                     null, 5000);
             var chunkResp = Messages.CreateChunkResp.decode(localClient.call(Opcode.CREATE_CHUNK,
-                    new Messages.CreateChunk(fileResp.fileId(), 1).encode(), null, 5000));
+                    new Messages.CreateChunk(StrataNamespace.of("test"), fileResp.fileId(), 1).encode(), null, 5000));
             assertEquals(3, chunkResp.replicas().size());
         }
     }
@@ -673,23 +674,23 @@ class ControllerTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/tail-open").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
 
         // no legitimate flow creates a chunk while the tail is OPEN (appenders seal before
         // rolling; recovery seals before a new appender opens) — two same-epoch appenders racing
         // would otherwise both claim file offset 0 in different chunks
         ScpException e = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, e.code());
         ScpException e2 = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 2).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 2).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, e2.code());
 
         // sealing the tail re-enables creation
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 10, 0xA, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 10, 0xA, List.of()).encode(), null, 5000);
         var next = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         assertEquals(1, next.chunkId().index());
     }
 
@@ -713,7 +714,7 @@ class ControllerTest {
                 new Messages.CreateFile("test", "/idem", requested, 101, 201).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, conflictingFile.code());
 
-        var createChunk = new Messages.CreateChunk(file1.fileId(), 1, 300, 400);
+        var createChunk = new Messages.CreateChunk(StrataNamespace.of("test"), file1.fileId(), 1, 300, 400);
         var chunk1 = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 createChunk.encode(), null, 5000));
         var chunk2 = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
@@ -721,7 +722,7 @@ class ControllerTest {
         assertEquals(chunk1, chunk2);
 
         ScpException conflictingChunk = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file1.fileId(), 1, 301, 401).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file1.fileId(), 1, 301, 401).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, conflictingChunk.code());
     }
 
@@ -748,7 +749,7 @@ class ControllerTest {
         assertEquals(requested, created.fileId());
 
         var delete = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
-                new Messages.DeleteFiles(List.of(requested)).encode(), null, 5000));
+                new Messages.DeleteFiles(StrataNamespace.of("test"), List.of(requested)).encode(), null, 5000));
         assertEquals(List.of(ErrorCode.OK.code), delete.codes());
 
         ScpException staleReplay = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_FILE,
@@ -775,32 +776,32 @@ class ControllerTest {
         registerTrio("abortHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/abort").encode(), null, 5000));
-        var createChunk = new Messages.CreateChunk(file.fileId(), 1, 500, 600);
+        var createChunk = new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1, 500, 600);
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 createChunk.encode(), null, 5000));
 
         ScpException wrongToken = assertThrows(ScpException.class, () -> client.call(Opcode.ABORT_CHUNK_META,
-                new Messages.AbortChunkMeta(chunk.chunkId(), 1, 501, 601).encode(), null, 5000));
+                new Messages.AbortChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 501, 601).encode(), null, 5000));
         assertEquals(ErrorCode.FENCED_EPOCH, wrongToken.code());
 
         ScpException wrongEpoch = assertThrows(ScpException.class, () -> client.call(Opcode.ABORT_CHUNK_META,
-                new Messages.AbortChunkMeta(chunk.chunkId(), 2,
+                new Messages.AbortChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 2,
                         createChunk.opIdMsb(), createChunk.opIdLsb()).encode(), null, 5000));
         assertEquals(ErrorCode.FENCED_EPOCH, wrongEpoch.code());
 
         client.call(Opcode.ABORT_CHUNK_META,
-                new Messages.AbortChunkMeta(chunk.chunkId(), 1,
+                new Messages.AbortChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1,
                         createChunk.opIdMsb(), createChunk.opIdLsb()).encode(), null, 5000);
         client.call(Opcode.ABORT_CHUNK_META,
-                new Messages.AbortChunkMeta(chunk.chunkId(), 1,
+                new Messages.AbortChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1,
                         createChunk.opIdMsb(), createChunk.opIdLsb()).encode(), null, 5000);
 
         var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(file.fileId()).encode(), null, 5000));
+                new Messages.LookupFile(StrataNamespace.of("test"), file.fileId()).encode(), null, 5000));
         assertEquals(0, lookup.chunks().size());
 
         var replacement = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         assertEquals(0, replacement.chunkId().index());
     }
 
@@ -810,21 +811,21 @@ class ControllerTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/abort-non-tail").encode(), null, 5000));
         var chunk0 = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1, 700, 800).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1, 700, 800).encode(), null, 5000));
 
         client.call(Opcode.ABORT_CHUNK_META,
-                new Messages.AbortChunkMeta(new ChunkId(file.fileId(), 99), 1, 1, 2).encode(), null, 5000);
+                new Messages.AbortChunkMeta(StrataNamespace.of("test"), new ChunkId(file.fileId(), 99), 1, 1, 2).encode(), null, 5000);
         var lookupAfterMissingAbort = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(file.fileId()).encode(), null, 5000));
+                new Messages.LookupFile(StrataNamespace.of("test"), file.fileId()).encode(), null, 5000));
         assertEquals(1, lookupAfterMissingAbort.chunks().size());
 
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk0.chunkId(), 1, 100, 0xD, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk0.chunkId(), 1, 100, 0xD, List.of()).encode(), null, 5000);
         client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 2, 701, 801).encode(), null, 5000);
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 2, 701, 801).encode(), null, 5000);
 
         ScpException nonTail = assertThrows(ScpException.class, () -> client.call(Opcode.ABORT_CHUNK_META,
-                new Messages.AbortChunkMeta(chunk0.chunkId(), 1, 700, 800).encode(), null, 5000));
+                new Messages.AbortChunkMeta(StrataNamespace.of("test"), chunk0.chunkId(), 1, 700, 800).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, nonTail.code());
     }
 
@@ -835,41 +836,41 @@ class ControllerTest {
                 new Messages.CreateFile("test", "/writer-epoch").encode(), null, 5000));
 
         var first = Messages.AllocateWriterEpochResp.decode(client.call(Opcode.ALLOCATE_WRITER_EPOCH,
-                Messages.AllocateWriterEpoch.forAppend(file.fileId()).encode(), null, 5000));
+                Messages.AllocateWriterEpoch.forAppend(StrataNamespace.of("test"), file.fileId()).encode(), null, 5000));
         assertEquals(1, first.writerEpoch());
 
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), first.writerEpoch(), 900, 901).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), first.writerEpoch(), 900, 901).encode(), null, 5000));
         assertEquals(first.writerEpoch(), chunk.writeEpoch());
 
         ScpException appendWhileOpen = assertThrows(ScpException.class, () -> client.call(
                 Opcode.ALLOCATE_WRITER_EPOCH,
-                Messages.AllocateWriterEpoch.forAppend(file.fileId()).encode(), null, 5000));
+                Messages.AllocateWriterEpoch.forAppend(StrataNamespace.of("test"), file.fileId()).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, appendWhileOpen.code());
 
         var recovery = Messages.AllocateWriterEpochResp.decode(client.call(Opcode.ALLOCATE_WRITER_EPOCH,
-                Messages.AllocateWriterEpoch.forRecovery(file.fileId()).encode(), null, 5000));
+                Messages.AllocateWriterEpoch.forRecovery(StrataNamespace.of("test"), file.fileId()).encode(), null, 5000));
         assertEquals(2, recovery.writerEpoch());
 
         ScpException staleSeal = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), first.writerEpoch(), 10, 0xA, List.of()).encode(),
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), first.writerEpoch(), 10, 0xA, List.of()).encode(),
                 null, 5000));
         assertEquals(ErrorCode.FENCED_EPOCH, staleSeal.code());
 
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), recovery.writerEpoch(), 10, 0xA, List.of()).encode(),
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), recovery.writerEpoch(), 10, 0xA, List.of()).encode(),
                 null, 5000);
 
         var nextAppend = Messages.AllocateWriterEpochResp.decode(client.call(Opcode.ALLOCATE_WRITER_EPOCH,
-                Messages.AllocateWriterEpoch.forAppend(file.fileId()).encode(), null, 5000));
+                Messages.AllocateWriterEpoch.forAppend(StrataNamespace.of("test"), file.fileId()).encode(), null, 5000));
         assertEquals(3, nextAppend.writerEpoch());
 
         ScpException staleCreate = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), recovery.writerEpoch()).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), recovery.writerEpoch()).encode(), null, 5000));
         assertEquals(ErrorCode.FENCED_EPOCH, staleCreate.code());
 
         var nextChunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), nextAppend.writerEpoch()).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), nextAppend.writerEpoch()).encode(), null, 5000));
         assertEquals(1, nextChunk.chunkId().index());
         assertEquals(nextAppend.writerEpoch(), nextChunk.writeEpoch());
     }
@@ -880,15 +881,15 @@ class ControllerTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/abort-sealed").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1, 710, 810).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1, 710, 810).encode(), null, 5000));
 
         client.call(Opcode.ABORT_CHUNK_META,
-                new Messages.AbortChunkMeta(new ChunkId(file.fileId(), 99), 1, 1, 2).encode(), null, 5000);
+                new Messages.AbortChunkMeta(StrataNamespace.of("test"), new ChunkId(file.fileId(), 99), 1, 1, 2).encode(), null, 5000);
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 20, 0xE, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 20, 0xE, List.of()).encode(), null, 5000);
 
         ScpException sealed = assertThrows(ScpException.class, () -> client.call(Opcode.ABORT_CHUNK_META,
-                new Messages.AbortChunkMeta(chunk.chunkId(), 1, 710, 810).encode(), null, 5000));
+                new Messages.AbortChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 710, 810).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, sealed.code());
     }
 
@@ -898,37 +899,37 @@ class ControllerTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/deleting-seal").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
 
-        client.call(Opcode.DELETE_FILES, new Messages.DeleteFiles(List.of(file.fileId())).encode(), null, 5000);
+        client.call(Opcode.DELETE_FILES, new Messages.DeleteFiles(StrataNamespace.of("test"), List.of(file.fileId())).encode(), null, 5000);
 
         ScpException allocate = assertThrows(ScpException.class, () -> client.call(Opcode.ALLOCATE_WRITER_EPOCH,
-                Messages.AllocateWriterEpoch.forAppend(file.fileId()).encode(), null, 5000));
+                Messages.AllocateWriterEpoch.forAppend(StrataNamespace.of("test"), file.fileId()).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, allocate.code());
 
         // an in-flight appender's seal must not mutate a DELETING file...
         ScpException sealChunk = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 10, 0xA, List.of()).encode(), null, 5000));
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 10, 0xA, List.of()).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, sealChunk.code());
 
         // ...and SEAL_FILE must never resurrect it to SEALED (deletion would half-stop, leaving
         // a live file with missing chunks)
         ScpException sealFile = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_FILE,
-                new Messages.SealFile(file.fileId(), 0).encode(), null, 5000));
+                new Messages.SealFile(StrataNamespace.of("test"), file.fileId(), 0).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, sealFile.code());
 
         ScpException createChunk = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 2).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 2).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, createChunk.code());
 
         // stale abort must not remove the open chunk descriptor while deletion is coordinating
         // physical cleanup.
         ScpException abortChunk = assertThrows(ScpException.class, () -> client.call(Opcode.ABORT_CHUNK_META,
-                new Messages.AbortChunkMeta(chunk.chunkId(), 1, 0, 0).encode(), null, 5000));
+                new Messages.AbortChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 0, 0).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, abortChunk.code());
 
         var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(file.fileId()).encode(), null, 5000));
+                new Messages.LookupFile(StrataNamespace.of("test"), file.fileId()).encode(), null, 5000));
         assertEquals(2, lookup.fileState(), "file must remain DELETING");
         assertEquals(1, lookup.chunks().size(), "stale abort must not hide replicas from deletion");
         assertEquals(ChunkState.OPEN, lookup.chunks().get(0).state());
@@ -940,21 +941,21 @@ class ControllerTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/seal-length").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
 
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xA, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xA, List.of()).encode(), null, 5000);
         // true idempotent retry: same length AND same crc -> OK
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xA, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xA, List.of()).encode(), null, 5000);
         // same length, DIFFERENT crc: byte divergence — the metadata layer must refuse
         ScpException e = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xB, List.of()).encode(), null, 5000));
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xB, List.of()).encode(), null, 5000));
         assertEquals(ErrorCode.CHUNK_SEALED, e.code());
 
         // A stale writer must still be fenced even if it reports the already-committed bytes.
         ScpException stale = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 0, 100, 0xA, List.of()).encode(), null, 5000));
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 0, 100, 0xA, List.of()).encode(), null, 5000));
         assertEquals(ErrorCode.FENCED_EPOCH, stale.code());
     }
 
@@ -964,14 +965,14 @@ class ControllerTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/seal-replica-quorum").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
 
         ScpException e = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, -1, 0xC, List.of()).encode(), null, 5000));
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, -1, 0xC, List.of()).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, e.code());
 
         var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(file.fileId()).encode(), null, 5000));
+                new Messages.LookupFile(StrataNamespace.of("test"), file.fileId()).encode(), null, 5000));
         assertEquals(ChunkState.OPEN, lookup.chunks().get(0).state());
         assertEquals(0, lookup.chunks().get(0).length());
     }
@@ -982,18 +983,18 @@ class ControllerTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/seal-replica-retain").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
 
         ScpException oneReplica = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC,
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC,
                         List.of(chunk.replicas().get(0).nodeId())).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, oneReplica.code());
 
         List<Integer> quorum = List.of(chunk.replicas().get(0).nodeId(), chunk.replicas().get(1).nodeId());
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC, quorum).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC, quorum).encode(), null, 5000);
         var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(file.fileId()).encode(), null, 5000));
+                new Messages.LookupFile(StrataNamespace.of("test"), file.fileId()).encode(), null, 5000));
         assertEquals(2, lookup.chunks().get(0).replicas().size());
     }
 
@@ -1003,15 +1004,15 @@ class ControllerTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/seal-disjoint").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
 
         ScpException disjoint = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC, List.of(999_999)).encode(),
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC, List.of(999_999)).encode(),
                 null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, disjoint.code());
 
         ScpException missingChunk = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(new ChunkId(file.fileId(), 99), 1, 100, 0xC, List.of()).encode(),
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), new ChunkId(file.fileId(), 99), 1, 100, 0xC, List.of()).encode(),
                 null, 5000));
         assertEquals(ErrorCode.CHUNK_NOT_FOUND, missingChunk.code());
     }
@@ -1022,34 +1023,34 @@ class ControllerTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/seal-file-state").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
 
         // open chunk present -> sealing the file must be refused
         ScpException open = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_FILE,
-                new Messages.SealFile(file.fileId(), 0).encode(), null, 5000));
+                new Messages.SealFile(StrataNamespace.of("test"), file.fileId(), 0).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, open.code());
 
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC, List.of()).encode(), null, 5000);
 
         // wrong total length -> refused
         ScpException wrongLen = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_FILE,
-                new Messages.SealFile(file.fileId(), 999).encode(), null, 5000));
+                new Messages.SealFile(StrataNamespace.of("test"), file.fileId(), 999).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, wrongLen.code());
 
         // correct total -> OK, and idempotent
-        client.call(Opcode.SEAL_FILE, new Messages.SealFile(file.fileId(), 100).encode(), null, 5000);
-        client.call(Opcode.SEAL_FILE, new Messages.SealFile(file.fileId(), 100).encode(), null, 5000);
+        client.call(Opcode.SEAL_FILE, new Messages.SealFile(StrataNamespace.of("test"), file.fileId(), 100).encode(), null, 5000);
+        client.call(Opcode.SEAL_FILE, new Messages.SealFile(StrataNamespace.of("test"), file.fileId(), 100).encode(), null, 5000);
         var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(file.fileId()).encode(), null, 5000));
+                new Messages.LookupFile(StrataNamespace.of("test"), file.fileId()).encode(), null, 5000));
         assertEquals(1, lookup.fileState());
 
         ScpException allocate = assertThrows(ScpException.class, () -> client.call(Opcode.ALLOCATE_WRITER_EPOCH,
-                Messages.AllocateWriterEpoch.forAppend(file.fileId()).encode(), null, 5000));
+                Messages.AllocateWriterEpoch.forAppend(StrataNamespace.of("test"), file.fileId()).encode(), null, 5000));
         assertEquals(ErrorCode.FILE_SEALED, allocate.code());
 
         ScpException sealedFile = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 2).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 2).encode(), null, 5000));
         assertEquals(ErrorCode.FILE_SEALED, sealedFile.code());
     }
 
@@ -1060,7 +1061,7 @@ class ControllerTest {
                 List.of(new Records.ChunkRecord(0, ChunkState.SEALED, -1, 0, 1, List.of()))));
 
         ScpException negativeLength = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_FILE,
-                new Messages.SealFile(negative, 0).encode(), null, 5000));
+                new Messages.SealFile(StrataNamespace.of("test"), negative, 0).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, negativeLength.code());
 
         FileId overflow = FileId.random();
@@ -1070,7 +1071,7 @@ class ControllerTest {
                         new Records.ChunkRecord(1, ChunkState.SEALED, 1, 0, 1, List.of()))));
 
         ScpException overflowLength = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_FILE,
-                new Messages.SealFile(overflow, 0).encode(), null, 5000));
+                new Messages.SealFile(StrataNamespace.of("test"), overflow, 0).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, overflowLength.code());
     }
 
@@ -1085,7 +1086,7 @@ class ControllerTest {
         MetadataStore original = replaceStore(createRejecting);
         try {
             ScpException createChunk = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
-                    new Messages.CreateChunk(createChunkFile.fileId(), 1).encode(), null, 5000));
+                    new Messages.CreateChunk(StrataNamespace.of("test"), createChunkFile.fileId(), 1).encode(), null, 5000));
             assertEquals(ErrorCode.INTERNAL, createChunk.code());
             assertTrue(createChunk.getMessage().contains("createChunk CAS exhausted"));
             assertTrue(createRejecting.updateCalls >= 5);
@@ -1101,7 +1102,7 @@ class ControllerTest {
         try {
             ScpException allocateEpoch = assertThrows(ScpException.class,
                     () -> client.call(Opcode.ALLOCATE_WRITER_EPOCH,
-                            Messages.AllocateWriterEpoch.forAppend(allocateEpochFile.fileId()).encode(),
+                            Messages.AllocateWriterEpoch.forAppend(StrataNamespace.of("test"), allocateEpochFile.fileId()).encode(),
                             null, 5000));
             assertEquals(ErrorCode.INTERNAL, allocateEpoch.code());
             assertTrue(allocateEpoch.getMessage().contains("allocateWriterEpoch CAS exhausted"));
@@ -1112,7 +1113,7 @@ class ControllerTest {
 
         var chunkFile = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/cas-chunk").encode(), null, 5000));
-        var createChunk = new Messages.CreateChunk(chunkFile.fileId(), 1, 7000, 8000);
+        var createChunk = new Messages.CreateChunk(StrataNamespace.of("test"), chunkFile.fileId(), 1, 7000, 8000);
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 createChunk.encode(), null, 5000));
 
@@ -1120,7 +1121,7 @@ class ControllerTest {
         original = replaceStore(sealRejecting);
         try {
             ScpException sealChunk = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
-                    new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xCC, List.of()).encode(), null, 5000));
+                    new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xCC, List.of()).encode(), null, 5000));
             assertEquals(ErrorCode.INTERNAL, sealChunk.code());
             assertTrue(sealChunk.getMessage().contains("sealChunk CAS exhausted"));
             assertTrue(sealRejecting.updateCalls >= 5);
@@ -1132,7 +1133,7 @@ class ControllerTest {
         original = replaceStore(abortRejecting);
         try {
             ScpException abortChunk = assertThrows(ScpException.class, () -> client.call(Opcode.ABORT_CHUNK_META,
-                    new Messages.AbortChunkMeta(chunk.chunkId(), 1,
+                    new Messages.AbortChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1,
                             createChunk.opIdMsb(), createChunk.opIdLsb()).encode(), null, 5000));
             assertEquals(ErrorCode.INTERNAL, abortChunk.code());
             assertTrue(abortChunk.getMessage().contains("abortChunk CAS exhausted"));
@@ -1148,7 +1149,7 @@ class ControllerTest {
         original = replaceStore(mutateRejecting);
         try {
             ScpException seal = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_FILE,
-                    new Messages.SealFile(sealFile.fileId(), 0).encode(), null, 5000));
+                    new Messages.SealFile(StrataNamespace.of("test"), sealFile.fileId(), 0).encode(), null, 5000));
             assertEquals(ErrorCode.INTERNAL, seal.code());
             assertTrue(seal.getMessage().contains("file mutation CAS exhausted"));
             assertTrue(mutateRejecting.updateCalls >= 5);
@@ -1175,7 +1176,7 @@ class ControllerTest {
 
             // only 2 distinct hosts -> NO_CAPACITY
             ScpException e = assertThrows(ScpException.class, () -> localClient.call(Opcode.CREATE_CHUNK,
-                    new Messages.CreateChunk(fileResp.fileId(), 1).encode(), null, 5000));
+                    new Messages.CreateChunk(StrataNamespace.of("test"), fileResp.fileId(), 1).encode(), null, 5000));
             assertEquals(ErrorCode.NO_CAPACITY, e.code());
         }
     }
@@ -1194,7 +1195,7 @@ class ControllerTest {
         var fileResp = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/huge").encode(), null, 5000));
         var chunkResp = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(fileResp.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), fileResp.fileId(), 1).encode(), null, 5000));
 
         assertEquals(3, chunkResp.replicas().size());
         assertEquals(3, chunkResp.replicas().stream().map(Messages.Replica::nodeId).collect(

@@ -5,6 +5,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -153,7 +154,7 @@ class RepairReliabilityTest {
 
     private Messages.LookupFileResp lookup(FileId fileId) {
         return Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
-                new Messages.LookupFile(fileId).encode(), null, 5000));
+                new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, 5000));
     }
 
     private void waitForReplicaCount(FileId fileId, int expected, long windowMs) throws InterruptedException {
@@ -190,9 +191,9 @@ class RepairReliabilityTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/t").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC0FFEE, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC0FFEE, List.of()).encode(), null, 5000);
 
         int replicaNode = chunk.replicas().get(0).nodeId();
         FakeNode replica = nodeById(nodes, replicaNode);
@@ -269,9 +270,9 @@ class RepairReliabilityTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/t").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC, List.of()).encode(), null, 5000);
 
         // catastrophic: every replica reports a corrupt copy — all three get dropped
         for (var replica : chunk.replicas()) {
@@ -301,9 +302,9 @@ class RepairReliabilityTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/t").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC, List.of()).encode(), null, 5000);
 
         for (var replica : chunk.replicas()) {
             client.call(Opcode.INVENTORY_REPORT, inventory(nodeById(nodes, replica.nodeId()),
@@ -313,7 +314,7 @@ class RepairReliabilityTest {
         assertEquals(0, lookup(file.fileId()).chunks().get(0).replicas().size());
 
         var delResp = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
-                new Messages.DeleteFiles(List.of(file.fileId())).encode(), null, 5000));
+                new Messages.DeleteFiles(StrataNamespace.of("test"), List.of(file.fileId())).encode(), null, 5000));
         assertEquals((short) 0, delResp.codes().get(0).shortValue());
 
         for (int round = 0; round < 5; round++) {
@@ -340,14 +341,14 @@ class RepairReliabilityTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/t").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
 
         // the writer sealed on a quorum of 2 — the third replica failed mid-chunk and holds a
         // short OPEN copy; committing it into the SEALED descriptor would let it serve reads
         List<Integer> sealedSubset = List.of(chunk.replicas().get(0).nodeId(),
                 chunk.replicas().get(1).nodeId());
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC, sealedSubset).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC, sealedSubset).encode(), null, 5000);
 
         var sealedLookup = lookup(file.fileId()).chunks().get(0);
         assertEquals(2, sealedLookup.replicas().size(),
@@ -383,9 +384,9 @@ class RepairReliabilityTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/t").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC, List.of()).encode(), null, 5000);
 
         // a replica still OPEN under a SEALED descriptor never converges by itself: nothing
         // re-seals it, FETCH from it fails, and reads to it return short — it must be dropped
@@ -413,9 +414,9 @@ class RepairReliabilityTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/t").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xD, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xD, List.of()).encode(), null, 5000);
 
         Set<Integer> replicaIds = new HashSet<>();
         for (var r : chunk.replicas()) replicaIds.add(r.nodeId());
@@ -454,9 +455,9 @@ class RepairReliabilityTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/t").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC0DE, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC0DE, List.of()).encode(), null, 5000);
 
         int droppedNode = chunk.replicas().get(0).nodeId();
         client.call(Opcode.INVENTORY_REPORT, inventory(nodeById(nodes, droppedNode),
@@ -509,9 +510,9 @@ class RepairReliabilityTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/t").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC0DE, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC0DE, List.of()).encode(), null, 5000);
 
         int replicaNode = chunk.replicas().get(0).nodeId();
         FakeNode stale = nodes.stream().filter(n -> n.nodeId == replicaNode).findFirst().orElseThrow();
@@ -561,9 +562,9 @@ class RepairReliabilityTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/t").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xC0DE, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC0DE, List.of()).encode(), null, 5000);
 
         int missingNode = chunk.replicas().get(0).nodeId();
         client.call(Opcode.INVENTORY_REPORT, inventory(nodeById(nodes, missingNode), List.of())
@@ -597,12 +598,12 @@ class RepairReliabilityTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/t").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xD1E7, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xD1E7, List.of()).encode(), null, 5000);
 
         var delResp = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
-                new Messages.DeleteFiles(List.of(file.fileId())).encode(), null, 5000));
+                new Messages.DeleteFiles(StrataNamespace.of("test"), List.of(file.fileId())).encode(), null, 5000));
         assertEquals((short) 0, delResp.codes().get(0).shortValue());
 
         service.reconcileNow();
@@ -630,9 +631,9 @@ class RepairReliabilityTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/t").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xD1E7, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xD1E7, List.of()).encode(), null, 5000);
 
         FakeNode deadReplica = nodes.stream()
                 .filter(n -> n.nodeId == chunk.replicas().get(0).nodeId())
@@ -641,7 +642,7 @@ class RepairReliabilityTest {
         deadReplica.alive = false;
 
         var delResp = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
-                new Messages.DeleteFiles(List.of(file.fileId())).encode(), null, 5000));
+                new Messages.DeleteFiles(StrataNamespace.of("test"), List.of(file.fileId())).encode(), null, 5000));
         assertEquals((short) 0, delResp.codes().get(0).shortValue());
 
         long deadline = System.currentTimeMillis() + 8_000;
@@ -672,9 +673,9 @@ class RepairReliabilityTest {
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/t").encode(), null, 5000));
         var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
-                new Messages.CreateChunk(file.fileId(), 1).encode(), null, 5000));
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
         client.call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(chunk.chunkId(), 1, 100, 0xA11, List.of()).encode(), null, 5000);
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xA11, List.of()).encode(), null, 5000);
 
         int droppedNode = chunk.replicas().get(0).nodeId();
         client.call(Opcode.INVENTORY_REPORT, inventory(nodeById(nodes, droppedNode),

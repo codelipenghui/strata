@@ -422,36 +422,6 @@ public final class Controller implements AutoCloseable {
         }
     }
 
-    /**
-     * The same ownership gate for a file-scoped op, resolving the file's namespace from the shared
-     * root store. An unknown file falls through so the op itself surfaces FILE_NOT_FOUND, exactly as
-     * the non-sharded path does.
-     */
-    private void requireNamespaceOwnerForFile(FileId fileId) throws Exception {
-        if (ownership.ownsAll()) {
-            requireLeader();
-            return;
-        }
-        StrataNamespace ns = fileNamespace(fileId);
-        if (ns == null) {
-            return; // unknown file — let the op surface FILE_NOT_FOUND, as the non-sharded path does
-        }
-        requireNamespaceOwner(ns);
-    }
-
-    /**
-     * The owning namespace of a file, for ownership routing: from the local store if this node holds the
-     * file, else from the global {@code fileId -> namespace} index (a non-owner has no local copy, since
-     * the record lives in the owner's namespace-log). Null = the file is unknown everywhere.
-     */
-    private StrataNamespace fileNamespace(FileId fileId) throws Exception {
-        var local = store.getFile(fileId);
-        if (local.isPresent()) {
-            return local.get().value().namespace();
-        }
-        return rootZk.getFileNamespace(fileId).orElse(null);
-    }
-
     /** Test/inspection hook: this node's namespace-ownership resolver. */
     NamespaceOwnership ownership() {
         return ownership;
@@ -499,34 +469,34 @@ public final class Controller implements AutoCloseable {
 
             case CREATE_CHUNK -> {
                 var m = Messages.CreateChunk.decode(h);
-                requireNamespaceOwnerForFile(m.fileId());
+                requireNamespaceOwner(m.namespace());
                 yield ScpServer.ok(req, createChunk(m).encode(), null);
             }
 
             case ALLOCATE_WRITER_EPOCH -> {
                 var m = Messages.AllocateWriterEpoch.decode(h);
-                requireNamespaceOwnerForFile(m.fileId());
+                requireNamespaceOwner(m.namespace());
                 yield ScpServer.ok(req, new Messages.AllocateWriterEpochResp(allocateWriterEpoch(m)).encode(),
                         null);
             }
 
             case SEAL_CHUNK_META -> {
                 var m = Messages.SealChunkMeta.decode(h);
-                requireNamespaceOwnerForFile(m.chunkId().fileId());
+                requireNamespaceOwner(m.namespace());
                 sealChunk(m);
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
 
             case ABORT_CHUNK_META -> {
                 var m = Messages.AbortChunkMeta.decode(h);
-                requireNamespaceOwnerForFile(m.chunkId().fileId());
+                requireNamespaceOwner(m.namespace());
                 abortChunk(m);
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
 
             case SEAL_FILE -> {
                 var m = Messages.SealFile.decode(h);
-                requireNamespaceOwnerForFile(m.fileId());
+                requireNamespaceOwner(m.namespace());
                 // a file seals only when every chunk is sealed and the lengths add up — a stale
                 // or buggy client must not freeze a file mid-write (validated under CAS, so it
                 // is race-free against concurrent chunk creates)
@@ -564,7 +534,7 @@ public final class Controller implements AutoCloseable {
 
             case LOOKUP_FILE -> {
                 var m = Messages.LookupFile.decode(h);
-                requireNamespaceOwnerForFile(m.fileId());
+                requireNamespaceOwner(m.namespace());
                 yield ScpServer.ok(req, lookup(m.fileId()).encode(), null);
             }
 
@@ -577,15 +547,10 @@ public final class Controller implements AutoCloseable {
 
             case DELETE_FILES -> {
                 var m = Messages.DeleteFiles.decode(h);
-                if (ownership.ownsAll()) {
-                    requireLeader(); // non-sharded: a non-leader rejects the whole op (unchanged behavior)
-                }
+                requireNamespaceOwner(m.namespace());
                 List<Short> codes = new ArrayList<>();
                 for (FileId id : m.fileIds()) {
                     try {
-                        if (!ownership.ownsAll()) {
-                            requireNamespaceOwnerForFile(id); // sharded: a file owned elsewhere redirects per entry
-                        }
                         markDeleting(id);
                         repair.driveDeletionSoon(id); // prompt reclaim, but don't block metadata delete responses
                         codes.add(ErrorCode.OK.code);
