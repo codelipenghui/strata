@@ -1,11 +1,15 @@
 package io.strata.meta;
 
 import io.strata.common.ErrorCode;
+import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
+import org.apache.curator.framework.CuratorFramework;
+import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.retry.RetryOneTime;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -19,6 +23,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
@@ -134,6 +139,29 @@ class MetadataShardingRoutingTest {
             }
         }
         throw new IllegalStateException("no namespace found owned by " + endpoint);
+    }
+
+    @Test
+    void shardedCreateAndDeleteLeaveNoOwnerIndexZnode() throws Exception {
+        // Use a namespace owned by ep0 so we exercise the sharded path on node0.
+        String ns = namespaceOwnedBy(ep0);
+        // CREATE_FILE: sharded path; pre-Task-4 code wrote /strata/meta/fidx/<fileId> here.
+        FileId id = Messages.CreateFileResp.decode(client0.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile(ns, "/fidx-check").encode(), null, 5_000)).fileId();
+        // DELETE_FILES: cleans up the file; also wrote the owner-index on old code.
+        Messages.DeleteFilesResp del = Messages.DeleteFilesResp.decode(client0.call(Opcode.DELETE_FILES,
+                new Messages.DeleteFiles(StrataNamespace.of(ns), List.of(id)).encode(), null, 5_000));
+        assertEquals(ErrorCode.OK.code, del.codes().get(0));
+
+        // Assert that no per-file owner-index znode was ever created.
+        // The parent /strata/meta IS created by the store (confirmed: controller writes it on start-up),
+        // so checkExists returning null for /strata/meta/fidx is meaningful, not a missing-parent false pass.
+        try (CuratorFramework zkClient = CuratorFrameworkFactory.newClient(
+                zk.getConnectString(), new RetryOneTime(100))) {
+            zkClient.start();
+            assertNull(zkClient.checkExists().forPath("/strata/meta/fidx"),
+                    "no per-file owner-index znode should exist after a sharded create+delete");
+        }
     }
 
     private static int freePort() throws IOException {
