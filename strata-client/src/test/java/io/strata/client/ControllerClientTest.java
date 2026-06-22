@@ -231,6 +231,24 @@ class ControllerClientTest {
     }
 
     @Test
+    void fileScopedOpRoutesByNamespaceAndFollowsRedirect() throws Exception {
+        StrataNamespace ns = StrataNamespace.of("tenant-x");
+        FileId id = FileId.random();
+        AtomicInteger standbyCalls = new AtomicInteger();
+        try (ScpServer standby = new ScpServer(0, 1, 0, 0, req -> {
+                standbyCalls.incrementAndGet();
+                throw new ScpException(ErrorCode.NOT_LEADER, "standby"); // null hint -> client rotates to next seed
+             });
+             ScpServer owner = new ScpServer(0, 1, 0, 0,
+                     req -> ScpServer.ok(req, new Messages.AllocateWriterEpochResp(7).encode(), null));
+             ControllerClient cc = new ControllerClient(new ClientConfig(
+                     List.of(endpoint(standby), endpoint(owner)), 1024, 100))) {
+            assertEquals(7, cc.allocateWriterEpochForAppend(ns, id));
+            assertEquals(1, standbyCalls.get());
+        }
+    }
+
+    @Test
     void interruptedRetryRestoresInterruptAndRethrowsLastError() throws Exception {
         int unusedPort;
         try (ServerSocket socket = new ServerSocket(0)) {
