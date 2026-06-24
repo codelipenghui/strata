@@ -65,14 +65,6 @@ final class NamespaceMetadataState {
     }
 
     /**
-     * @deprecated Use {@link #peekNextFileId()} and let {@code apply(FileCreated)} advance the counter.
-     *             Keeping this method for tests that test the monotonicity of the counter directly.
-     */
-    FileId assignFileId() {
-        return FileId.of(nextFileId++);
-    }
-
-    /**
      * The compacted serialized form of this state at a log cut offset (design §9, §10). Path bindings
      * and {@code node -> chunks} are derived on restore (a path binds exactly to its OPEN/SEALED file),
      * so only the file table and tombstone deletion timestamps are kept.

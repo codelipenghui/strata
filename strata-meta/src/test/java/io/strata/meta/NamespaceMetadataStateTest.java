@@ -107,23 +107,37 @@ class NamespaceMetadataStateTest {
 
     @Test
     void nextFileIdIsMonotonicAndSurvivesTombstoneSweepViaSnapshot() {
-        FileId a = state.assignFileId();   // 0
-        FileId b = state.assignFileId();   // 1
-        assertEquals(FileId.of(0), a);
-        assertEquals(FileId.of(1), b);
-        // simulate: create+delete+sweep file 1, then snapshot/restore; next id must still be 2, never reuse 1
+        // peekNextFileId does NOT advance on repeated calls — same value returned twice.
+        FileId first = state.peekNextFileId();   // 0
+        FileId second = state.peekNextFileId();  // still 0
+        assertEquals(FileId.of(0), first);
+        assertEquals(first, second, "peekNextFileId must not advance the counter");
+
+        // apply(FileCreated(id=0)) advances nextFileId to 1; next peek returns 1.
+        state.apply(new MetadataLogRecord.FileCreated(FileId.of(0), NS, P, 3, 2, true, 1000, 7, 8));
+        assertEquals(FileId.of(1), state.peekNextFileId());
+
+        // Drive id 1 as well: peek returns 1, apply advances to 2.
+        state.apply(new MetadataLogRecord.FileCreated(FileId.of(1), NS,
+                StrataPath.of("/logs/seg-1"), 3, 2, true, 1001, 9, 10));
+        assertEquals(FileId.of(2), state.peekNextFileId());
+
+        // Snapshot/restore: nextFileId must survive as 2 — no reuse of ids 0 or 1.
         var snap = state.exportSnapshot(123);
         assertEquals(2, snap.nextFileId());
         NamespaceMetadataState restored = new NamespaceMetadataState(NS);
         restored.restore(snap);
-        assertEquals(FileId.of(2), restored.assignFileId());
+        assertEquals(FileId.of(2), restored.peekNextFileId(),
+                "restored state must not regress nextFileId — would reuse a durable id");
     }
 
     @Test
     void applyAdvancesHighWaterFromReplayedCreate() {
+        // apply(FileCreated(id=41)) must advance nextFileId to 42.
         state.apply(new MetadataLogRecord.FileCreated(FileId.of(41), NS,
                 StrataPath.of("/p"), 3, 2, true, 1000, 7, 8));
-        assertEquals(FileId.of(42), state.assignFileId());
+        assertEquals(FileId.of(42), state.peekNextFileId(),
+                "nextFileId must be max(current, id+1) after apply(FileCreated)");
     }
 
     @Test

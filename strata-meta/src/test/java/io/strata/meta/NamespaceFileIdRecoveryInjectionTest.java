@@ -57,9 +57,22 @@ class NamespaceFileIdRecoveryInjectionTest {
 
     /**
      * Window (a): the id is peeked (no durable side-effect) but the FileCreated record is never
-     * appended. After recovery the same id is validly reused for the next create — no durable file
-     * existed at that id. Assert: the set of ids from durable FileCreated records is strictly
-     * monotone and collision-free across the failover.
+     * appended. After recovery the same id is VALIDLY reused for the next file — no durable file
+     * existed at that id. The test drives the REAL {@link NamespaceLogBackend#createFileOwnerAssigned}
+     * path (not just the bare state methods) so the assertion would FAIL under the OLD buggy
+     * {@code assignFileId()} code: that code pre-incremented {@code nextFileId} in memory before the
+     * durable append, so a crash left the successor seeding from the incremented snapshot value and it
+     * would SKIP the peeked id, assigning id+1 for both the crashed call and the next create — a
+     * gap, or worse a double-assign if the snapshot captured the incremented value before the crash.
+     *
+     * <p>The no-reuse assertion checks that every durable FileCreated id is distinct across the
+     * whole run (pre-crash durable ids ∩ post-recovery ids = ∅). Under the old buggy code, the
+     * post-recovery successor would SKIP id 3 (because the snapshot would have nextFileId=4 from
+     * the in-memory pre-increment) and assign ids {4,5,6} — no intersection — but then id 3 would
+     * be lost forever (a gap, not a reuse). The strengthened test additionally asserts that the
+     * successor DOES reuse id 3 (the peeked-but-not-appended id), confirming the counter was NOT
+     * advanced in durable state. This second assertion would catch the old bug: under the old code,
+     * the successor's first id would be 4 (not 3) and the equality would fail.
      */
     @Test
     void windowA_crashAfterPeekBeforeAppend_noDurableIdReuse() throws Exception {
@@ -67,44 +80,52 @@ class NamespaceFileIdRecoveryInjectionTest {
              ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
             TestNamespaceMetadataFileStore fileStore = new TestNamespaceMetadataFileStore();
 
-            // ---- Phase 1: leader creates 3 files, then crashes at window (a) ----
-            NamespaceMetadataLogRepository leader = NamespaceMetadataLogRepository.open(NS, fileStore, root, 1);
+            // ---- Phase 1: leader backend creates 3 files via the REAL owner-assign path ----
+            NamespaceLogBackend leaderBackend = new NamespaceLogBackend(root, fileStore, false);
             List<FileId> durableIds = new ArrayList<>();
-            durableIds.add(appendFileCreated(leader, "/a", 1));   // id 0 — durable
-            durableIds.add(appendFileCreated(leader, "/b", 2));   // id 1 — durable
-            durableIds.add(appendFileCreated(leader, "/c", 3));   // id 2 — durable
+            durableIds.add(leaderBackend.createFileOwnerAssigned(template("/a", 1)));   // id 0 — durable
+            durableIds.add(leaderBackend.createFileOwnerAssigned(template("/b", 2)));   // id 1 — durable
+            durableIds.add(leaderBackend.createFileOwnerAssigned(template("/c", 3)));   // id 2 — durable
 
-            // The next id to be assigned is 3 (peekNextFileId returns 3).
-            // Arm window (a): crash before the FileCreated append fires.
+            // The next id to be assigned is 3. Arm window (a): crash before the FileCreated append.
             FailureInjector.arm("meta.log.afterAssignBeforeAppend",
                     p -> { throw new RuntimeException("injected: crash after peek, before append"); });
-            // Simulate the peek + crash: peek the id, trigger the injection point, then recover.
-            // In production this happens inside NamespaceLogBackend.createFileOwnerAssigned.
-            FileId peekedId = leader.state().peekNextFileId(); // no side-effect; returns 3
+            // Drive the REAL owner-assign path — it will peek id 3, hit the injection, and throw.
+            // The FileCreated(3) record is NEVER appended: no durable side-effect.
             assertThrows(RuntimeException.class,
-                    () -> FailureInjector.point("meta.log.afterAssignBeforeAppend"));
+                    () -> leaderBackend.createFileOwnerAssigned(template("/d", 4)));
             FailureInjector.reset();
 
-            // Verify: the peeked id was NOT applied — leader's state still has nextFileId == 3.
-            assertEquals(peekedId, leader.state().peekNextFileId(),
-                    "leader nextFileId must not advance when no FileCreated was appended");
+            // id 3 was peeked but NOT durably appended. Verify no durable record for id 3 exists
+            // by checking the leader backend itself never applied the FileCreated.
+            assertTrue(leaderBackend.getFile(FileId.of(3)).isEmpty(),
+                    "the crashed create must leave NO durable FileCreated(3) — it never reached the log");
 
-            // ---- Phase 2: successor recovers ----
-            NamespaceMetadataLogRepository successor = NamespaceMetadataLogRepository.open(NS, fileStore, root, 2);
+            // ---- Phase 2: successor backend recovers from the same durable state ----
+            NamespaceLogBackend successorBackend = new NamespaceLogBackend(root, fileStore, false);
 
-            // The successor must see exactly the 3 durable files.
+            // All 3 pre-crash durable files must survive.
             for (FileId id : durableIds) {
-                assertTrue(successor.state().file(id).isPresent(),
+                assertTrue(successorBackend.getFile(id).isPresent(),
                         "durable file " + id + " must survive the crash");
             }
 
-            // ---- Phase 3: successor assigns more ids — no collision with durable ids ----
+            // ---- Phase 3: successor assigns more ids — NO collision with durable ids ----
             List<FileId> successorIds = new ArrayList<>();
-            successorIds.add(appendFileCreated(successor, "/d", 4));
-            successorIds.add(appendFileCreated(successor, "/e", 5));
-            successorIds.add(appendFileCreated(successor, "/f", 6));
+            // CRITICAL: the first id assigned by the successor MUST be 3 (the peeked-but-not-appended
+            // id). This confirms the durable nextFileId was NOT advanced by the crashed call.
+            // Under the OLD buggy assignFileId() code, nextFileId was pre-incremented in memory before
+            // the crash, so if the snapshot captured that incremented value the successor would start
+            // at 4 — this assertion would fail, exposing the bug.
+            FileId firstSuccessorId = successorBackend.createFileOwnerAssigned(template("/d", 4));
+            assertEquals(FileId.of(3), firstSuccessorId,
+                    "successor must reuse peeked-but-not-appended id 3 — the counter must not have "
+                    + "advanced durably before the crash");
+            successorIds.add(firstSuccessorId);
+            successorIds.add(successorBackend.createFileOwnerAssigned(template("/e", 5)));
+            successorIds.add(successorBackend.createFileOwnerAssigned(template("/f", 6)));
 
-            // Strict no-reuse: every id across the whole run (durable pre-crash + post-crash) is unique.
+            // Strict no-reuse: durable pre-crash ids ∩ post-recovery ids = ∅.
             assertNoReuse(durableIds, successorIds, "window (a)");
         }
     }
@@ -281,6 +302,16 @@ class NamespaceFileIdRecoveryInjectionTest {
 
     private static MetadataLogRecord fileCreated(FileId id, String path, long op) {
         return new MetadataLogRecord.FileCreated(id, NS, StrataPath.of(path), 3, 2, true, 100, op, op);
+    }
+
+    /**
+     * Builds a {@link Records.FileRecord} template for use with
+     * {@link NamespaceLogBackend#createFileOwnerAssigned}. The fileId field is a placeholder
+     * (the backend assigns the real id); opId is unique per call so idempotency does not interfere.
+     */
+    private static Records.FileRecord template(String path, long opId) {
+        return new Records.FileRecord(FileId.of(0), NS, StrataPath.of(path),
+                3, 2, true, FileState.OPEN, 100L, List.of(), opId, opId);
     }
 
     /**
