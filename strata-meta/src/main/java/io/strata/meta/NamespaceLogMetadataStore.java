@@ -62,6 +62,18 @@ public final class NamespaceLogMetadataStore implements MetadataStore {
         return backend.getFile(id);
     }
 
+    /**
+     * Namespace-scoped file lookup: routes directly to {@code namespace}'s repo, bypassing the
+     * global file-id index. Use this (instead of {@link #getFile(FileId)}) whenever the caller
+     * knows the namespace — which is true for all file-scoped SCP operations (they carry the
+     * namespace in their message). Required for correctness when two user namespaces share the
+     * same per-namespace {@link FileId} (per-namespace counters start at 0 independently).
+     */
+    Optional<Versioned<Records.FileRecord>> getFileInNamespace(StrataNamespace namespace, FileId id)
+            throws Exception {
+        return backend.getFileInNamespace(namespace, id);
+    }
+
     @Override
     public Optional<FileId> resolvePath(StrataNamespace namespace, StrataPath path) throws Exception {
         return backend.resolvePath(namespace, path);

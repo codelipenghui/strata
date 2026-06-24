@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.BiFunction;
@@ -501,7 +502,7 @@ public final class Controller implements AutoCloseable {
                 // a file seals only when every chunk is sealed and the lengths add up — a stale
                 // or buggy client must not freeze a file mid-write (validated under CAS, so it
                 // is race-free against concurrent chunk creates)
-                mutateFile(m.fileId(), file -> {
+                mutateFile(m.namespace(), m.fileId(), file -> {
                     if (file.state() == FileState.DELETING) {
                         // sealing must never resurrect a DELETING file: deletion would stop
                         // half-way, leaving a "live" file with missing chunks
@@ -536,7 +537,7 @@ public final class Controller implements AutoCloseable {
             case LOOKUP_FILE -> {
                 var m = Messages.LookupFile.decode(h);
                 requireNamespaceOwner(m.namespace());
-                yield ScpServer.ok(req, lookup(m.fileId()).encode(), null);
+                yield ScpServer.ok(req, lookup(m.namespace(), m.fileId()).encode(), null);
             }
 
             case LOOKUP_PATH -> {
@@ -552,7 +553,7 @@ public final class Controller implements AutoCloseable {
                 List<Short> codes = new ArrayList<>();
                 for (FileId id : m.fileIds()) {
                     try {
-                        markDeleting(id);
+                        markDeleting(m.namespace(), id);
                         repair.driveDeletionSoon(id); // prompt reclaim, but don't block metadata delete responses
                         codes.add(ErrorCode.OK.code);
                     } catch (ScpException e) {
@@ -568,7 +569,7 @@ public final class Controller implements AutoCloseable {
 
     private int allocateWriterEpoch(Messages.AllocateWriterEpoch m) throws Exception {
         for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
-            var opt = store.getFile(m.fileId());
+            var opt = getFile(m.namespace(), m.fileId());
             if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, m.fileId().toString());
             Records.FileRecord file = opt.get().value();
             if (file.state() == FileState.DELETING) {
@@ -676,7 +677,7 @@ public final class Controller implements AutoCloseable {
 
     private Messages.CreateChunkResp createChunk(Messages.CreateChunk m) throws Exception {
         for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
-            var opt = store.getFile(m.fileId());
+            var opt = getFile(m.namespace(), m.fileId());
             if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, m.fileId().toString());
             Records.FileRecord file = opt.get().value();
             if (file.state() == FileState.DELETING) {
@@ -750,7 +751,7 @@ public final class Controller implements AutoCloseable {
             throw new ScpException(ErrorCode.PRECONDITION_FAILED, "negative sealed length " + m.length());
         }
         for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
-            var opt = store.getFile(m.chunkId().fileId());
+            var opt = getFile(m.namespace(), m.chunkId().fileId());
             if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, m.chunkId().toString());
             Records.FileRecord file = opt.get().value();
             if (file.state() == FileState.DELETING) {
@@ -806,7 +807,7 @@ public final class Controller implements AutoCloseable {
 
     private void abortChunk(Messages.AbortChunkMeta m) throws Exception {
         for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
-            var opt = store.getFile(m.chunkId().fileId());
+            var opt = getFile(m.namespace(), m.chunkId().fileId());
             if (opt.isEmpty()) return; // idempotent after deletion
             Records.FileRecord file = opt.get().value();
             if (file.state() == FileState.DELETING) {
@@ -839,8 +840,24 @@ public final class Controller implements AutoCloseable {
         throw new ScpException(ErrorCode.INTERNAL, "abortChunk CAS exhausted");
     }
 
-    private Messages.LookupFileResp lookup(FileId fileId) throws Exception {
-        var opt = store.getFile(fileId);
+    /**
+     * Namespace-aware file lookup: when the backend is the namespace-log store (per-namespace
+     * owner-assigned FileIds that start at 0 in each namespace) a plain {@code store.getFile(id)}
+     * can collide — two namespaces may hold the same numeric FileId. The namespace-log store
+     * provides {@link NamespaceLogMetadataStore#getFileInNamespace} that goes directly to the
+     * correct namespace repo. For the ZK v0 backend FileIds are globally unique and the namespace
+     * is unused (the store doesn't distinguish).
+     */
+    private Optional<MetadataStore.Versioned<Records.FileRecord>> getFile(
+            StrataNamespace namespace, FileId fileId) throws Exception {
+        if (store instanceof NamespaceLogMetadataStore log) {
+            return log.getFileInNamespace(namespace, fileId);
+        }
+        return store.getFile(fileId);
+    }
+
+    private Messages.LookupFileResp lookup(StrataNamespace namespace, FileId fileId) throws Exception {
+        var opt = getFile(namespace, fileId);
         if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, fileId.toString());
         Records.FileRecord file = opt.get().value();
         List<Messages.ChunkInfo> chunks = new ArrayList<>(file.chunks().size());
@@ -863,7 +880,7 @@ public final class Controller implements AutoCloseable {
         if (id.isEmpty()) {
             throw new ScpException(ErrorCode.FILE_NOT_FOUND, namespace + ":" + path);
         }
-        var file = store.getFile(id.get());
+        var file = getFile(namespace, id.get());
         if (file.isEmpty() || file.get().value().state() == FileState.DELETING) {
             throw new ScpException(ErrorCode.FILE_NOT_FOUND, namespace + ":" + path);
         }
@@ -874,18 +891,19 @@ public final class Controller implements AutoCloseable {
         return id.get();
     }
 
-    private void mutateFile(FileId id, java.util.function.UnaryOperator<Records.FileRecord> fn) throws Exception {
+    private void mutateFile(StrataNamespace namespace, FileId id,
+                            java.util.function.UnaryOperator<Records.FileRecord> fn) throws Exception {
         for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
-            var opt = store.getFile(id);
+            var opt = getFile(namespace, id);
             if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, id.toString());
             if (store.updateFile(fn.apply(opt.get().value()), opt.get().version())) return;
         }
         throw new ScpException(ErrorCode.INTERNAL, "file mutation CAS exhausted");
     }
 
-    private void markDeleting(FileId id) throws Exception {
+    private void markDeleting(StrataNamespace namespace, FileId id) throws Exception {
         for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
-            var opt = store.getFile(id);
+            var opt = getFile(namespace, id);
             if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, id.toString());
             Records.FileRecord current = opt.get().value();
             Records.FileRecord deleting = current.withState(FileState.DELETING);

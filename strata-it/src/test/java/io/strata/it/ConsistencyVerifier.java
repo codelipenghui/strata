@@ -38,6 +38,11 @@ final class ConsistencyVerifier {
     }
 
     static Messages.LookupFileResp lookupFile(List<String> controllerEndpoints, FileId fileId) throws Exception {
+        return lookupFile(controllerEndpoints, TEST_NS, fileId);
+    }
+
+    static Messages.LookupFileResp lookupFile(List<String> controllerEndpoints,
+                                               StrataNamespace namespace, FileId fileId) throws Exception {
         AssertionError failure = new AssertionError("no controller endpoint could serve lookup for " + fileId);
         for (String endpoint : controllerEndpoints) {
             try {
@@ -45,7 +50,7 @@ final class ConsistencyVerifier {
                 try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                         ScpClient.KIND_TOOL, "consistency-lookup")) {
                     ByteBuffer h = direct.call(Opcode.LOOKUP_FILE,
-                            new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, CALL_TIMEOUT_MS);
+                            new Messages.LookupFile(namespace, fileId).encode(), null, CALL_TIMEOUT_MS);
                     return Messages.LookupFileResp.decode(h);
                 }
             } catch (Exception e) {
@@ -116,7 +121,8 @@ final class ConsistencyVerifier {
                                                               StrataNamespace namespace,
                                                               FileId fileId,
                                                               long sealedLength) throws Exception {
-        Messages.LookupFileResp lookup = assertSealedDescriptorConsistent(controllerEndpoints, fileId, sealedLength);
+        Messages.LookupFileResp lookup = assertSealedDescriptorConsistent(
+                controllerEndpoints, namespace, fileId, sealedLength);
         assertClientReadsExactlySealedLength(client, namespace, fileId, sealedLength);
         assertSealedReplicasAreByteIdentical(lookup);
         return lookup;
@@ -131,7 +137,14 @@ final class ConsistencyVerifier {
     static Messages.LookupFileResp assertSealedDescriptorConsistent(List<String> controllerEndpoints,
                                                                     FileId fileId,
                                                                     long sealedLength) throws Exception {
-        Messages.LookupFileResp lookup = lookupFile(controllerEndpoints, fileId);
+        return assertSealedDescriptorConsistent(controllerEndpoints, TEST_NS, fileId, sealedLength);
+    }
+
+    static Messages.LookupFileResp assertSealedDescriptorConsistent(List<String> controllerEndpoints,
+                                                                    StrataNamespace namespace,
+                                                                    FileId fileId,
+                                                                    long sealedLength) throws Exception {
+        Messages.LookupFileResp lookup = lookupFile(controllerEndpoints, namespace, fileId);
         assertLiveDescriptorInvariants(fileId, lookup);
         assertEquals(FileState.SEALED.value, lookup.fileState(),
                 "file metadata must be sealed for " + fileId);

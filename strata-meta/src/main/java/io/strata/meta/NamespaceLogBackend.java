@@ -268,6 +268,22 @@ final class NamespaceLogBackend implements AutoCloseable {
         return Optional.empty();
     }
 
+    /**
+     * Namespace-aware file lookup: routes directly to {@code namespace}'s repo, bypassing the
+     * {@link #fileIndex}. Required when two user namespaces share the same per-namespace
+     * {@link FileId} (they each start at 0), where the index would only record one of them.
+     *
+     * <p>Falls back to the ZK root for system-namespace files (which use a global counter and
+     * are never ambiguous).
+     */
+    Optional<MetadataStore.Versioned<Records.FileRecord>> getFileInNamespace(
+            StrataNamespace namespace, FileId id) throws Exception {
+        if (isSystem(namespace)) {
+            return root.getFile(id);
+        }
+        return lockedFile(namespace, id);
+    }
+
     private Optional<MetadataStore.Versioned<Records.FileRecord>> lockedFile(StrataNamespace ns, FileId id)
             throws Exception {
         NamespaceMetadataLogRepository repo = repo(ns);
