@@ -56,7 +56,7 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
         }
 
         @Override
-        public Optional<Versioned<Records.FileRecord>> getFile(FileId id) {
+        public Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) {
             synchronized (state) {
                 ensureOpen();
                 Versioned<Records.FileRecord> v = state.files.get(id);
@@ -107,7 +107,7 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
         }
 
         @Override
-        public boolean deleteFile(FileId id, int expectedVersion) {
+        public boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) {
             synchronized (state) {
                 ensureOpen();
                 Versioned<Records.FileRecord> current = state.files.get(id);

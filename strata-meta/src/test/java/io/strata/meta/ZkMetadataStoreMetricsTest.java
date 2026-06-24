@@ -43,7 +43,7 @@ class ZkMetadataStoreMetricsTest {
             assertTrue(store.zkOps("namespaces", true) >= 1, "createFile must count a namespaces write (marker)");
 
             // files read: getFile reads the record
-            store.getFile(fileId);
+            store.getFile(StrataNamespace.of("test"), fileId);
             assertTrue(store.zkOps("files", false) >= 1, "getFile must count a files read");
             assertTrue(store.zkBytes("files", false) > 0, "getFile must count files read bytes");
 

@@ -51,7 +51,7 @@ class NamespaceLogBackendDurabilityTest {
                 assertEquals(fileId, store.resolvePath(ns, path).orElseThrow(),
                         "path binding survived restart via the on-disk log + ZK manifest");
                 assertEquals(List.of(fileId), store.listFiles(ns));
-                assertTrue(store.getFile(fileId).isPresent(), "file record recovered after restart");
+                assertTrue(store.getFile(ns, fileId).isPresent(), "file record recovered after restart");
                 backend.close();
             }
         }
@@ -77,7 +77,7 @@ class NamespaceLogBackendDurabilityTest {
             try (ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
                 LocalNamespaceMetadataFileStore fileStore = new LocalNamespaceMetadataFileStore(dir);
                 NamespaceLogBackend backend = new NamespaceLogBackend(root, fileStore, false);
-                assertTrue(backend.getFile(fileId).isPresent(),
+                assertTrue(backend.getFile(ns, fileId).isPresent(),
                         "getFile(fileId)/openById resolves after restart via eager namespace recovery");
                 backend.close();
             }

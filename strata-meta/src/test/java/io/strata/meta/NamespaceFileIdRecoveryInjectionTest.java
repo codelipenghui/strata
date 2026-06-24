@@ -98,7 +98,7 @@ class NamespaceFileIdRecoveryInjectionTest {
 
             // id 3 was peeked but NOT durably appended. Verify no durable record for id 3 exists
             // by checking the leader backend itself never applied the FileCreated.
-            assertTrue(leaderBackend.getFile(FileId.of(3)).isEmpty(),
+            assertTrue(leaderBackend.getFile(NS, FileId.of(3)).isEmpty(),
                     "the crashed create must leave NO durable FileCreated(3) — it never reached the log");
 
             // ---- Phase 2: successor backend recovers from the same durable state ----
@@ -106,7 +106,7 @@ class NamespaceFileIdRecoveryInjectionTest {
 
             // All 3 pre-crash durable files must survive.
             for (FileId id : durableIds) {
-                assertTrue(successorBackend.getFile(id).isPresent(),
+                assertTrue(successorBackend.getFile(NS, id).isPresent(),
                         "durable file " + id + " must survive the crash");
             }
 

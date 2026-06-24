@@ -919,19 +919,19 @@ class RepairCoordinatorTest {
     private static void issueReplicate(RepairCoordinator coordinator, FileId fileId,
                                        Records.FileRecord file, Records.ChunkRecord chunk) throws Exception {
         Method method = RepairCoordinator.class.getDeclaredMethod(
-                "issueReplicate", FileId.class, Records.FileRecord.class, Records.ChunkRecord.class,
-                RepairCoordinator.RepairTrigger.class);
+                "issueReplicate", StrataNamespace.class, FileId.class, Records.FileRecord.class,
+                Records.ChunkRecord.class, RepairCoordinator.RepairTrigger.class);
         method.setAccessible(true);
-        method.invoke(coordinator, fileId, file, chunk, RepairCoordinator.RepairTrigger.RECONCILE);
+        method.invoke(coordinator, file.namespace(), fileId, file, chunk, RepairCoordinator.RepairTrigger.RECONCILE);
     }
 
     private static Object replicateAction(FileId fileId, ChunkId chunkId, int deadNode, int targetNode)
             throws Exception {
         Class<?> type = Class.forName("io.strata.meta.RepairCoordinator$ReplicateAction");
-        Constructor<?> ctor = type.getDeclaredConstructor(FileId.class, ChunkId.class, int.class, int.class,
-                long.class);
+        Constructor<?> ctor = type.getDeclaredConstructor(StrataNamespace.class, FileId.class, ChunkId.class,
+                int.class, int.class, long.class);
         ctor.setAccessible(true);
-        return ctor.newInstance(fileId, chunkId, deadNode, targetNode, System.currentTimeMillis());
+        return ctor.newInstance(TEST_NS, fileId, chunkId, deadNode, targetNode, System.currentTimeMillis());
     }
 
     private static void applyReplicaSwap(RepairCoordinator coordinator, Object action) throws Exception {
@@ -943,9 +943,9 @@ class RepairCoordinatorTest {
     private static void applyDeleteConfirmed(RepairCoordinator coordinator, FileId fileId, ChunkId chunkId, int nodeId)
             throws Exception {
         Method method = RepairCoordinator.class.getDeclaredMethod(
-                "applyDeleteConfirmed", FileId.class, ChunkId.class, int.class);
+                "applyDeleteConfirmed", StrataNamespace.class, FileId.class, ChunkId.class, int.class);
         method.setAccessible(true);
-        method.invoke(coordinator, fileId, chunkId, nodeId);
+        method.invoke(coordinator, TEST_NS, fileId, chunkId, nodeId);
     }
 
     private static Records.FileRecord file(FileId fileId, FileState state,
@@ -1007,7 +1007,7 @@ class RepairCoordinatorTest {
         }
 
         @Override
-        public Optional<Versioned<Records.FileRecord>> getFile(FileId id) {
+        public Optional<Versioned<Records.FileRecord>> getFile(io.strata.common.StrataNamespace namespace, FileId id) {
             if (throwOnGetFile) {
                 throw new IllegalStateException("getFile failure");
             }
@@ -1051,7 +1051,7 @@ class RepairCoordinatorTest {
         }
 
         @Override
-        public boolean deleteFile(FileId id, int expectedVersion) {
+        public boolean deleteFile(io.strata.common.StrataNamespace namespace, FileId id, int expectedVersion) {
             Versioned<Records.FileRecord> current = files.get(id);
             if (current == null) {
                 return true;

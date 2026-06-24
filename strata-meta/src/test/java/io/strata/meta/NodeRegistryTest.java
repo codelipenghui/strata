@@ -764,7 +764,7 @@ class NodeRegistryTest {
         }
 
         @Override
-        public Optional<Versioned<Records.FileRecord>> getFile(FileId id) {
+        public Optional<Versioned<Records.FileRecord>> getFile(io.strata.common.StrataNamespace namespace, FileId id) {
             throw new UnsupportedOperationException();
         }
 
@@ -791,7 +791,7 @@ class NodeRegistryTest {
         }
 
         @Override
-        public boolean deleteFile(FileId id, int expectedVersion) {
+        public boolean deleteFile(io.strata.common.StrataNamespace namespace, FileId id, int expectedVersion) {
             throw new UnsupportedOperationException();
         }
 

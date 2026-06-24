@@ -248,7 +248,7 @@ class RepairCoordinatorEventTest {
         }
 
         @Override
-        public Optional<Versioned<Records.FileRecord>> getFile(FileId id) {
+        public Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) {
             return Optional.ofNullable(files.get(id));
         }
 
@@ -273,7 +273,7 @@ class RepairCoordinatorEventTest {
         }
 
         @Override
-        public boolean deleteFile(FileId id, int expectedVersion) {
+        public boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) {
             files.remove(id);
             return true;
         }

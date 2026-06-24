@@ -170,7 +170,9 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     @Override
-    public Optional<Versioned<Records.FileRecord>> getFile(FileId id) throws Exception {
+    public Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) throws Exception {
+        // ZK backend: file ids are globally unique (all records live under /strata/files/<id>);
+        // the namespace arg satisfies the interface contract but does not change the lookup.
         try {
             Stat stat = new Stat();
             byte[] data = curator.getData().storingStatIn(stat).forPath(FILES + "/" + id);
@@ -227,10 +229,12 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     @Override
-    public boolean deleteFile(FileId id, int expectedVersion) throws Exception {
+    public boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) throws Exception {
+        // ZK backend: file ids are globally unique; the namespace arg satisfies the interface
+        // contract but does not change the lookup — the record's own namespace() is used below.
         String filePath = FILES + "/" + id;
         try {
-            Optional<Versioned<Records.FileRecord>> current = getFile(id);
+            Optional<Versioned<Records.FileRecord>> current = getFile(namespace, id);
             if (current.isEmpty()) {
                 return true;
             }
@@ -262,7 +266,7 @@ public final class ZkMetadataStore implements MetadataStore {
         } catch (KeeperException.BadVersionException e) {
             return false;
         } catch (KeeperException.NoNodeException ignored) {
-            return getFile(id).isEmpty();
+            return getFile(namespace, id).isEmpty();
         }
     }
 
@@ -278,7 +282,7 @@ public final class ZkMetadataStore implements MetadataStore {
         record(NAMESPACES, false, 0);
         for (String child : children) {
             FileId id = FileId.fromHex(child);
-            if (getFile(id).isPresent()) {  // skip DELETED tombstones (index entry not yet swept)
+            if (getFile(namespace, id).isPresent()) {  // skip DELETED tombstones (index entry not yet swept)
                 out.add(id);
             }
         }

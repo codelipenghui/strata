@@ -554,7 +554,7 @@ public final class Controller implements AutoCloseable {
                 for (FileId id : m.fileIds()) {
                     try {
                         markDeleting(m.namespace(), id);
-                        repair.driveDeletionSoon(id); // prompt reclaim, but don't block metadata delete responses
+                        repair.driveDeletionSoon(m.namespace(), id); // prompt reclaim, but don't block metadata delete responses
                         codes.add(ErrorCode.OK.code);
                     } catch (ScpException e) {
                         codes.add(e.code().code);
@@ -646,7 +646,7 @@ public final class Controller implements AutoCloseable {
         } catch (KeeperException.NodeExistsException e) {
             // Path already bound (race or same-opId retry we missed above) — scan live files.
             for (FileId candidate : store.listFiles(m.namespace())) {
-                var opt = store.getFile(candidate);
+                var opt = store.getFile(m.namespace(), candidate);
                 if (opt.isPresent()) {
                     Records.FileRecord record = opt.get().value();
                     if (sameCreateRequest(record, m) && record.state() != FileState.DELETING) {
@@ -840,20 +840,9 @@ public final class Controller implements AutoCloseable {
         throw new ScpException(ErrorCode.INTERNAL, "abortChunk CAS exhausted");
     }
 
-    /**
-     * Namespace-aware file lookup: when the backend is the namespace-log store (per-namespace
-     * owner-assigned FileIds that start at 0 in each namespace) a plain {@code store.getFile(id)}
-     * can collide — two namespaces may hold the same numeric FileId. The namespace-log store
-     * provides {@link NamespaceLogMetadataStore#getFileInNamespace} that goes directly to the
-     * correct namespace repo. For the ZK v0 backend FileIds are globally unique and the namespace
-     * is unused (the store doesn't distinguish).
-     */
     private Optional<MetadataStore.Versioned<Records.FileRecord>> getFile(
             StrataNamespace namespace, FileId fileId) throws Exception {
-        if (store instanceof NamespaceLogMetadataStore log) {
-            return log.getFileInNamespace(namespace, fileId);
-        }
-        return store.getFile(fileId);
+        return store.getFile(namespace, fileId);
     }
 
     private Messages.LookupFileResp lookup(StrataNamespace namespace, FileId fileId) throws Exception {

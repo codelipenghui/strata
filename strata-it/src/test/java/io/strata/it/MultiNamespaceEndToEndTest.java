@@ -218,6 +218,61 @@ class MultiNamespaceEndToEndTest {
                 "ns-t2-1 data must survive node restart");
     }
 
+    /**
+     * Exercises {@code deleteFile} routing under cross-namespace FileId(0) collision (Task 9 regression fix).
+     *
+     * <p>With per-namespace ids both {@code ns-t3-0} and {@code ns-t3-1} get {@code FileId(0)}.
+     * The old global {@code fileIndex} would record only one of them (last-writer-wins), so a
+     * {@code deleteFile} for {@code ns-t3-0/FileId(0)} could silently resolve to
+     * {@code ns-t3-1/FileId(0)} and destroy the wrong namespace's file. The fix routes every
+     * delete by namespace, making cross-namespace collision impossible.
+     *
+     * <p>Assertion: after deleting {@code ns-t3-0}'s file, {@code ns-t3-1}'s file STILL exists
+     * and reads back its correct bytes — a misrouted delete would have destroyed it.
+     *
+     * <p>Uses namespace pair {@code ns-t3-0} / {@code ns-t3-1} to isolate from other tests.
+     */
+    @Test
+    void deleteRoutingIsNamespaceScopedUnderFileIdCollision() throws Exception {
+        assertEquals("namespace-log", cluster.meta.metadataBackend(),
+                "this test requires the namespace-log backend");
+
+        StrataNamespace ns0 = StrataNamespace.of("ns-t3-0");
+        StrataNamespace ns1 = StrataNamespace.of("ns-t3-1");
+
+        // Create the first file in each namespace — both receive FileId(0).
+        FileId fileId0 = client.create(StrataClient.FileSpec.log("ns-t3-0", "/topic-0")).id();
+        FileId fileId1 = client.create(StrataClient.FileSpec.log("ns-t3-1", "/topic-0")).id();
+        assertEquals(FileId.of(0), fileId0, "ns-t3-0 first file must be FileId(0)");
+        assertEquals(FileId.of(0), fileId1, "ns-t3-1 first file must be FileId(0)");
+
+        // Write distinctive data into each and seal.
+        byte[] data0 = makeData(4096, 31);
+        byte[] data1 = makeData(4096, 37);
+        try (StrataFile.Appender a = client.openById(ns0, fileId0).openForAppend()) {
+            a.append(java.nio.ByteBuffer.wrap(data0)).get();
+            a.seal();
+        }
+        try (StrataFile.Appender a = client.openById(ns1, fileId1).openForAppend()) {
+            a.append(java.nio.ByteBuffer.wrap(data1)).get();
+            a.seal();
+        }
+
+        // Both files readable before deletion.
+        assertArrayEquals(data0, readAll(client, ns0, fileId0), "ns-t3-0 data must read before delete");
+        assertArrayEquals(data1, readAll(client, ns1, fileId1), "ns-t3-1 data must read before delete");
+
+        // Delete only ns-t3-0's file — if routing uses the global index it would misroute and
+        // delete ns-t3-1's file instead (whichever was last in the index).
+        client.deleteById(ns0, fileId0);
+
+        // ns-t3-1's FileId(0) file must still be present and readable with its original data.
+        // A misrouted delete would have destroyed ns-t3-1's file, causing this assertion to fail.
+        assertArrayEquals(data1, readAll(client, ns1, fileId1),
+                "ns-t3-1/FileId(0) must survive deletion of ns-t3-0/FileId(0) — "
+                + "failure means deleteFile misrouted across namespaces");
+    }
+
     // ---- helpers ----
 
     private static byte[] makeData(int size, int seed) {

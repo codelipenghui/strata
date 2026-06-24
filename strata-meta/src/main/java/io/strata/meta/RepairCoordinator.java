@@ -58,16 +58,16 @@ class RepairCoordinator implements AutoCloseable {
         long issuedAtMs();
     }
 
-    private record ReplicateAction(FileId fileId, ChunkId chunkId, int deadNode, int targetNode,
-                                   long issuedAtMs) implements Action {
+    private record ReplicateAction(StrataNamespace namespace, FileId fileId, ChunkId chunkId,
+                                   int deadNode, int targetNode, long issuedAtMs) implements Action {
         @Override
         public int executingNode() {
             return targetNode;
         }
     }
 
-    private record DeleteAction(FileId fileId, ChunkId chunkId, int nodeId, long issuedAtMs)
-            implements Action {
+    private record DeleteAction(StrataNamespace namespace, FileId fileId, ChunkId chunkId,
+                                int nodeId, long issuedAtMs) implements Action {
         @Override
         public int executingNode() {
             return nodeId;
@@ -298,11 +298,11 @@ class RepairCoordinator implements AutoCloseable {
                 continue;
             }
             for (FileId fileId : store.listFiles(ns)) {
-                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
+                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
                 if (opt.isEmpty()) {
                     continue;
                 }
-                repairFileChunksOnNode(fileId, opt.get().value(), deadNodeId);
+                repairFileChunksOnNode(ns, fileId, opt.get().value(), deadNodeId);
             }
         }
     }
@@ -313,7 +313,8 @@ class RepairCoordinator implements AutoCloseable {
      * the {@code chunksBeingRepaired} dedup, and the command enqueue exactly as the reconcile does —
      * this method only narrows the candidate set to chunks affected by the dead node.
      */
-    private void repairFileChunksOnNode(FileId fileId, Records.FileRecord file, int deadNodeId) {
+    private void repairFileChunksOnNode(StrataNamespace ns, FileId fileId, Records.FileRecord file,
+                                         int deadNodeId) {
         if (file.state() == FileState.DELETING) {
             return; // deletion, not repair, drives a DELETING file's chunks
         }
@@ -330,7 +331,7 @@ class RepairCoordinator implements AutoCloseable {
                 if (!registry.isDead(nodeId)) live++;
             }
             if (live < file.replicationFactor() && live > 0) {
-                issueReplicate(fileId, file, chunk, RepairTrigger.EVENT);
+                issueReplicate(ns, fileId, file, chunk, RepairTrigger.EVENT);
             }
         }
     }
@@ -357,13 +358,16 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /**
-     * Live file ids across every namespace. Repair reconciles the whole cluster, not one tenant, so it
-     * composes the per-namespace listing — there is no global flat file enumeration in the store.
+     * Live file ids across every namespace, keyed by namespace. Repair reconciles the whole cluster,
+     * not one tenant, so it composes per-namespace listings — there is no global flat file enumeration.
+     * The namespace is carried so every {@code getFile}/{@code deleteFile} call can supply it.
      */
-    private List<FileId> allFileIds() throws Exception {
-        List<FileId> out = new ArrayList<>();
+    private Map<FileId, StrataNamespace> allFilesByNamespace() throws Exception {
+        Map<FileId, StrataNamespace> out = new HashMap<>();
         for (var ns : store.listNamespaces()) {
-            out.addAll(store.listFiles(ns));
+            for (FileId id : store.listFiles(ns)) {
+                out.put(id, ns);
+            }
         }
         return out;
     }
@@ -378,12 +382,15 @@ class RepairCoordinator implements AutoCloseable {
             registry.publishClusterLiveNodes();
         }
         sweepStuckCommands();
-        record Repair(FileId fileId, Records.FileRecord file, Records.ChunkRecord chunk, int liveReplicas) {}
+        record Repair(StrataNamespace ns, FileId fileId, Records.FileRecord file,
+                      Records.ChunkRecord chunk, int liveReplicas) {}
         List<Repair> repairs = new ArrayList<>();
         int under = 0, unavailable = 0, atMin = 0; // durability census, published to gauges at the end
 
-        for (FileId fileId : allFileIds()) {
-            Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
+        for (Map.Entry<FileId, StrataNamespace> entry : allFilesByNamespace().entrySet()) {
+            FileId fileId = entry.getKey();
+            StrataNamespace ns = entry.getValue();
+            Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
             if (opt.isEmpty()) continue;
             Records.FileRecord file = opt.get().value();
 
@@ -407,7 +414,7 @@ class RepairCoordinator implements AutoCloseable {
                 }
                 if (chunksBeingRepaired.contains(chunkId)) continue;
                 if (live < file.replicationFactor() && live > 0) {
-                    repairs.add(new Repair(fileId, file, chunk, live));
+                    repairs.add(new Repair(ns, fileId, file, chunk, live));
                 } else if (live == 0) {
                     log.error("chunk {} has NO live replicas — data loss exposure, cannot repair", chunkId);
                 }
@@ -420,7 +427,7 @@ class RepairCoordinator implements AutoCloseable {
         // exposure priority: fewest live replicas first (tech design §7.2)
         repairs.sort(java.util.Comparator.comparingInt(Repair::liveReplicas));
         for (Repair r : repairs) {
-            issueReplicate(r.fileId(), r.file(), r.chunk(), RepairTrigger.RECONCILE);
+            issueReplicate(r.ns(), r.fileId(), r.file(), r.chunk(), RepairTrigger.RECONCILE);
         }
         } finally {
             reconcileLock.unlock();
@@ -448,8 +455,8 @@ class RepairCoordinator implements AutoCloseable {
         }
     }
 
-    private void issueReplicate(FileId fileId, Records.FileRecord file, Records.ChunkRecord chunk,
-                                RepairTrigger trigger) {
+    private void issueReplicate(StrataNamespace ns, FileId fileId, Records.FileRecord file,
+                                Records.ChunkRecord chunk, RepairTrigger trigger) {
         ChunkId chunkId = file.chunkId(chunk.index());
         int deadNode = -1;
         List<Messages.Replica> sources = new ArrayList<>();
@@ -475,7 +482,7 @@ class RepairCoordinator implements AutoCloseable {
 
         List<NodeRegistry.LiveNode> targets;
         try {
-            targets = Placement.choose(file.namespace(), registry, 1, existing, usedHosts);
+            targets = Placement.choose(ns, registry, 1, existing, usedHosts);
         } catch (Exception e) {
             log.warn("no repair target for {}: {}", chunkId, e.getMessage());
             return;
@@ -485,11 +492,11 @@ class RepairCoordinator implements AutoCloseable {
             return;
         }
         long cmdId = commandIds.incrementAndGet();
-        inflight.put(cmdId, new ReplicateAction(fileId, chunkId, deadNode, target.record.nodeId(),
+        inflight.put(cmdId, new ReplicateAction(ns, fileId, chunkId, deadNode, target.record.nodeId(),
                 System.currentTimeMillis()));
         registry.enqueue(target.record.nodeId(),
                 new Messages.ReplicateCmd(cmdId, chunkId, sources, (byte) 1, chunk.crc(), chunk.length(),
-                        file.namespace()));
+                        ns));
         recordRepairIssued(trigger);
         log.info("repair: {} dead={} -> target={} (cmd {})", chunkId, deadNode, target.record.nodeId(), cmdId);
     }
@@ -520,7 +527,7 @@ class RepairCoordinator implements AutoCloseable {
                     continue;
                 }
                 for (FileId fileId : store.listFiles(ns)) {
-                    Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
+                    Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
                     if (opt.isEmpty()) {
                         continue;
                     }
@@ -586,7 +593,7 @@ class RepairCoordinator implements AutoCloseable {
             Messages.ReplicateCmd cmd = new Messages.ReplicateCmd(cmdId, chunkId, sources,
                     (byte) 1, chunk.crc(), chunk.length(), ns);
             if (execReplicate(target, cmd)
-                    && applyOwnerRepair(file.fileId(), chunkId, deadNode, target.record.nodeId())) {
+                    && applyOwnerRepair(ns, file.fileId(), chunkId, deadNode, target.record.nodeId())) {
                 recordRepairIssued(trigger);
                 log.info("owner repair: {} dead={} -> target={} (cmd {})", chunkId, deadNode,
                         target.record.nodeId(), cmdId);
@@ -658,10 +665,10 @@ class RepairCoordinator implements AutoCloseable {
      * Returns true if the descriptor swap landed; false if the file vanished or every CAS attempt lost
      * (so the caller does not log success or bump the repair metric for a swap that never committed).
      */
-    private boolean applyOwnerRepair(FileId fileId, ChunkId chunkId, int deadNode, int targetNode)
-            throws Exception {
+    private boolean applyOwnerRepair(StrataNamespace ns, FileId fileId, ChunkId chunkId,
+                                      int deadNode, int targetNode) throws Exception {
         for (int attempt = 0; attempt < Controller.CAS_RETRIES; attempt++) {
-            Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
+            Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
             if (opt.isEmpty()) {
                 return false;
             }
@@ -693,10 +700,10 @@ class RepairCoordinator implements AutoCloseable {
      * background scan (which is slow under heavy churn), so physical space is reclaimed promptly and the
      * disk stays bounded under sustained delete load. Synchronized with the scan so they don't race.
      */
-    void driveDeletionNow(FileId fileId) {
+    void driveDeletionNow(StrataNamespace namespace, FileId fileId) {
         reconcileLock.lock();
         try {
-            Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
+            Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(namespace, fileId);
             if (opt.isEmpty() || opt.get().value().state() != FileState.DELETING) {
                 return;
             }
@@ -715,29 +722,30 @@ class RepairCoordinator implements AutoCloseable {
         }
     }
 
-    void driveDeletionSoon(FileId fileId) {
+    void driveDeletionSoon(StrataNamespace namespace, FileId fileId) {
         try {
-            deleteDispatchExecutor.execute(() -> driveDeletionNow(fileId));
+            deleteDispatchExecutor.execute(() -> driveDeletionNow(namespace, fileId));
         } catch (RuntimeException e) {
             log.warn("prompt delete dispatch for {} was not scheduled — background scan will retry", fileId, e);
         }
     }
 
     private void driveDeletion(Records.FileRecord file, int version) throws Exception {
+        StrataNamespace ns = file.namespace();
         for (Records.ChunkRecord chunk : file.chunks()) {
             ChunkId chunkId = file.chunkId(chunk.index());
             if (chunk.replicas().isEmpty()) {
                 // A DELETING file can contain zero-replica chunks if all copies were already
                 // lost while the file was still live. There is no node left to confirm the
                 // physical delete, so let descriptor deletion converge immediately.
-                applyDeleteConfirmed(file.fileId(), chunkId, -1);
+                applyDeleteConfirmed(ns, file.fileId(), chunkId, -1);
                 continue;
             }
             for (int nodeId : chunk.replicas()) {
                 if (registry.isDead(nodeId)) {
                     // a dead node's data is unreachable; its files vanish with the volume —
                     // drop the replica reference so deletion can converge
-                    applyDeleteConfirmed(file.fileId(), chunkId, nodeId);
+                    applyDeleteConfirmed(ns, file.fileId(), chunkId, nodeId);
                     continue;
                 }
                 boolean alreadyInflight = inflight.values().stream()
@@ -745,9 +753,9 @@ class RepairCoordinator implements AutoCloseable {
                                 && d.chunkId().equals(chunkId) && d.nodeId() == nodeId);
                 if (!alreadyInflight) {
                     long cmdId = commandIds.incrementAndGet();
-                    inflight.put(cmdId, new DeleteAction(file.fileId(), chunkId, nodeId,
+                    inflight.put(cmdId, new DeleteAction(ns, file.fileId(), chunkId, nodeId,
                             System.currentTimeMillis()));
-                    registry.enqueue(nodeId, new Messages.DeleteCmd(cmdId, List.of(chunkId), file.namespace()));
+                    registry.enqueue(nodeId, new Messages.DeleteCmd(cmdId, List.of(chunkId), ns));
                 }
             }
         }
@@ -755,7 +763,7 @@ class RepairCoordinator implements AutoCloseable {
         // replica confirms); only a chunkless file is deleted here, where `version` is still
         // valid because no mutation happened in this pass
         if (file.chunks().isEmpty()) {
-            if (store.deleteFile(file.fileId(), version)) {
+            if (store.deleteFile(file.namespace(), file.fileId(), version)) {
                 log.info("file {} fully deleted", file.fileId());
             }
         }
@@ -770,26 +778,27 @@ class RepairCoordinator implements AutoCloseable {
      */
     private void ownerDriveDeletion(Records.FileRecord file, int version,
                                     Map<Integer, Records.NodeRecord> nodes) throws Exception {
+        StrataNamespace ns = file.namespace();
         for (Records.ChunkRecord chunk : file.chunks()) {
             ChunkId chunkId = file.chunkId(chunk.index());
             if (chunk.replicas().isEmpty()) {
-                applyDeleteConfirmed(file.fileId(), chunkId, -1);
+                applyDeleteConfirmed(ns, file.fileId(), chunkId, -1);
                 continue;
             }
             for (int nodeId : chunk.replicas()) {
                 Records.NodeRecord node = nodes.get(nodeId);
                 if (node == null || node.state() == Records.NodeState.DEAD) {
                     // node gone/dead — its data is unreachable; drop the replica so deletion can converge
-                    applyDeleteConfirmed(file.fileId(), chunkId, nodeId);
-                } else if (execDelete(node, chunkId, file.namespace())) {
-                    applyDeleteConfirmed(file.fileId(), chunkId, nodeId);
+                    applyDeleteConfirmed(ns, file.fileId(), chunkId, nodeId);
+                } else if (execDelete(node, chunkId, ns)) {
+                    applyDeleteConfirmed(ns, file.fileId(), chunkId, nodeId);
                 }
                 // else: still present — a later ownerRepairPass retries
             }
         }
         // a chunkless DELETING file has no replica to confirm; delete the record directly (version still
         // valid since no chunk was mutated in this pass), matching driveDeletion.
-        if (file.chunks().isEmpty() && store.deleteFile(file.fileId(), version)) {
+        if (file.chunks().isEmpty() && store.deleteFile(file.namespace(), file.fileId(), version)) {
             log.info("file {} fully deleted (owner)", file.fileId());
         }
     }
@@ -864,7 +873,7 @@ class RepairCoordinator implements AutoCloseable {
                 }
             } else if (action instanceof DeleteAction d) {
                 if (completion.status() == 0) {
-                    applyDeleteConfirmed(d.fileId(), d.chunkId(), d.nodeId());
+                    applyDeleteConfirmed(d.namespace(), d.fileId(), d.chunkId(), d.nodeId());
                 }
             }
         } catch (Exception e) {
@@ -882,7 +891,7 @@ class RepairCoordinator implements AutoCloseable {
             return;
         }
         for (int attempt = 0; attempt < Controller.CAS_RETRIES; attempt++) {
-            Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(r.fileId());
+            Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(r.namespace(), r.fileId());
             if (opt.isEmpty()) return;
             Records.FileRecord file = opt.get().value();
             if (file.state() == FileState.DELETING) {
@@ -921,9 +930,10 @@ class RepairCoordinator implements AutoCloseable {
         log.warn("descriptor swap for {} kept failing CAS — next scan reconciles", r.chunkId());
     }
 
-    private void applyDeleteConfirmed(FileId fileId, ChunkId chunkId, int nodeId) throws Exception {
+    private void applyDeleteConfirmed(StrataNamespace namespace, FileId fileId, ChunkId chunkId,
+                                      int nodeId) throws Exception {
         for (int attempt = 0; attempt < Controller.CAS_RETRIES; attempt++) {
-            Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
+            Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(namespace, fileId);
             if (opt.isEmpty()) return;
             Records.FileRecord file = opt.get().value();
             List<Records.ChunkRecord> chunks = new ArrayList<>();
@@ -947,7 +957,7 @@ class RepairCoordinator implements AutoCloseable {
             }
             Records.FileRecord updated = file.withChunks(chunks);
             if (chunks.isEmpty() && file.state() == FileState.DELETING) {
-                if (store.deleteFile(fileId, opt.get().version())) {
+                if (store.deleteFile(namespace, fileId, opt.get().version())) {
                     log.info("file {} fully deleted", fileId);
                     return;
                 }
@@ -977,15 +987,20 @@ class RepairCoordinator implements AutoCloseable {
             for (Messages.InventoryEntry e : report.entries()) {
                 reported.put(e.chunkId(), e);
             }
-            // one descriptor fetch per file for the whole report: chunks of the same file would
-            // otherwise re-fetch the identical record, and the missing/corrupt sweep below would
-            // fetch every file a second time (reconciliation already tolerates a stale snapshot)
-            Map<FileId, Optional<MetadataStore.Versioned<Records.FileRecord>>> records = new java.util.HashMap<>();
+            // one descriptor fetch per (namespace, fileId) pair for the whole report: chunks of the
+            // same file would otherwise re-fetch the identical record, and the missing/corrupt sweep
+            // below would fetch every file a second time (reconciliation already tolerates a stale snapshot).
+            // Keyed by NsFileKey (namespace + fileId) because per-namespace counters start at 0 and a
+            // bare FileId is not unique across namespaces.
+            Map<NsFileKey, Optional<MetadataStore.Versioned<Records.FileRecord>>> records = new java.util.HashMap<>();
             // orphan detection
             // orphansByNs: namespace -> list of orphan chunkIds in that namespace
-            java.util.Map<io.strata.common.StrataNamespace, List<ChunkId>> orphansByNs = new java.util.LinkedHashMap<>();
+            java.util.Map<StrataNamespace, List<ChunkId>> orphansByNs = new java.util.LinkedHashMap<>();
             for (Messages.InventoryEntry e : report.entries()) {
-                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = cachedFile(records, e.chunkId().fileId());
+                // The inventory entry carries the namespace it was written under — use it to route
+                // to the correct per-namespace repo (avoids collisions between ns-0/FileId(0) and ns-1/FileId(0)).
+                Optional<MetadataStore.Versioned<Records.FileRecord>> opt =
+                        cachedFile(records, e.namespace(), e.chunkId().fileId());
                 boolean known = false;
                 if (opt.isPresent()) {
                     for (Records.ChunkRecord c : opt.get().value().chunks()) {
@@ -1015,8 +1030,10 @@ class RepairCoordinator implements AutoCloseable {
             // with the descriptor's exact length and crc — right id with wrong bytes is corruption
             // and the replica must stop being a read/repair source (the under-replication scan
             // then re-repairs, and the dropped node's copy becomes an orphan to delete)
-            for (FileId fileId : allFileIds()) {
-                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = cachedFile(records, fileId);
+            for (Map.Entry<FileId, StrataNamespace> fe : allFilesByNamespace().entrySet()) {
+                FileId fileId = fe.getKey();
+                StrataNamespace ns = fe.getValue();
+                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = cachedFile(records, ns, fileId);
                 if (opt.isEmpty() || opt.get().value().state() == FileState.DELETING) continue;
                 Records.FileRecord file = opt.get().value();
                 for (Records.ChunkRecord c : file.chunks()) {
@@ -1035,7 +1052,7 @@ class RepairCoordinator implements AutoCloseable {
                             log.warn("node {} lost sealed chunk {} (missing >= {}ms) — dropping replica for re-repair",
                                     report.nodeId(), chunkId, config.replicaMissingGraceMs());
                             replicaMissingSince.remove(missKey);
-                            applyDeleteConfirmed(fileId, chunkId, report.nodeId());
+                            applyDeleteConfirmed(ns, fileId, chunkId, report.nodeId());
                         }
                     } else {
                         if (entry.state() != ChunkState.SEALED) {
@@ -1047,21 +1064,21 @@ class RepairCoordinator implements AutoCloseable {
                                                 + "for re-repair", report.nodeId(), entry.state(), chunkId,
                                         config.replicaMissingGraceMs());
                                 replicaMissingSince.remove(missKey);
-                                applyDeleteConfirmed(fileId, chunkId, report.nodeId());
+                                applyDeleteConfirmed(ns, fileId, chunkId, report.nodeId());
                                 registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
-                                        commandIds.incrementAndGet(), List.of(chunkId), file.namespace()));
+                                        commandIds.incrementAndGet(), List.of(chunkId), ns));
                             }
                         } else if (entry.length() != c.length() || entry.crc() != c.crc()) {
                             replicaMissingSince.remove(missKey); // definitely reported; this copy is corrupt
                             log.warn("node {} holds corrupt sealed chunk {} (len {}/{} crc {}/{}) — "
                                             + "dropping replica for re-repair", report.nodeId(), chunkId,
                                     entry.length(), c.length(), entry.crc(), c.crc());
-                            applyDeleteConfirmed(fileId, chunkId, report.nodeId());
+                            applyDeleteConfirmed(ns, fileId, chunkId, report.nodeId());
                             // schedule physical deletion NOW: placement may legitimately re-pick this
                             // node as the add-repair target, and the corrupt bytes must be gone first
                             // (FIFO command delivery guarantees delete-before-replicate)
                             registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
-                                    commandIds.incrementAndGet(), List.of(chunkId), file.namespace()));
+                                    commandIds.incrementAndGet(), List.of(chunkId), ns));
                         } else {
                             replicaMissingSince.remove(missKey); // healthy report — clear any pending anomaly
                         }
@@ -1111,12 +1128,17 @@ class RepairCoordinator implements AutoCloseable {
         return Math.max(config.repairCommandTimeoutMs(), config.leaseMs() + config.deadGraceMs());
     }
 
+    // Cache key that pairs namespace + fileId for unambiguous per-namespace lookup.
+    private record NsFileKey(StrataNamespace namespace, FileId fileId) {}
+
     private Optional<MetadataStore.Versioned<Records.FileRecord>> cachedFile(
-            Map<FileId, Optional<MetadataStore.Versioned<Records.FileRecord>>> cache, FileId fileId) throws Exception {
-        Optional<MetadataStore.Versioned<Records.FileRecord>> cached = cache.get(fileId);
+            Map<NsFileKey, Optional<MetadataStore.Versioned<Records.FileRecord>>> cache,
+            StrataNamespace namespace, FileId fileId) throws Exception {
+        NsFileKey key = new NsFileKey(namespace, fileId);
+        Optional<MetadataStore.Versioned<Records.FileRecord>> cached = cache.get(key);
         if (cached == null) {
-            cached = store.getFile(fileId);
-            cache.put(fileId, cached);
+            cached = store.getFile(namespace, fileId);
+            cache.put(key, cached);
         }
         return cached;
     }

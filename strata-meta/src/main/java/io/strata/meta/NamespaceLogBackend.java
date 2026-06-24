@@ -60,11 +60,9 @@ final class NamespaceLogBackend implements AutoCloseable {
     private final ConcurrentHashMap<StrataNamespace, NamespaceMetadataLogRepository> repos =
             new ConcurrentHashMap<>();
     private final ReentrantLock repoCreateLock = new ReentrantLock();
-    private final Map<FileId, StrataNamespace> fileIndex = new ConcurrentHashMap<>();
     // Only namespaces this node OWNS may be opened here — opening another owner's namespace would
     // republish its manifest and fence the real owner. Default ns->true for single-node / tests.
     private volatile Predicate<StrataNamespace> ownsNamespace = ns -> true;
-    private volatile boolean ownedNamespacesWarmed;
     private boolean closed;
 
     NamespaceLogBackend(MetadataStore root, NamespaceMetadataFileStore fileStore, boolean ownsRoot) {
@@ -121,10 +119,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             if (r == null) {
                 long epoch = root.allocateMetadataEpoch();
                 r = NamespaceMetadataLogRepository.open(namespace, fileStore, root, epoch, metrics);
-                for (FileId id : r.state().liveFiles()) {
-                    fileIndex.put(id, namespace);
-                }
-                repos.put(namespace, r);   // publish only after recovery + fileIndex populated
+                repos.put(namespace, r);   // publish only after recovery
             }
             return r;
         } finally {
@@ -155,7 +150,6 @@ final class NamespaceLogBackend implements AutoCloseable {
             for (MetadataLogRecord r : MetadataLogDiff.diff(created, record)) {
                 repo.append(r);
             }
-            fileIndex.put(record.fileId(), record.namespace());
         } finally {
             repo.unlock();
         }
@@ -231,7 +225,6 @@ final class NamespaceLogBackend implements AutoCloseable {
             repo.append(new MetadataLogRecord.FileCreated(id, template.namespace(),
                     template.path(), template.replicationFactor(), template.ackQuorum(), template.fsyncOnAck(),
                     template.createdAtMs(), template.createOpMsb(), template.createOpLsb()));
-            fileIndex.put(id, template.namespace());
             return id;
         } finally {
             repo.unlock();
@@ -245,41 +238,18 @@ final class NamespaceLogBackend implements AutoCloseable {
                 && existing.fsyncOnAck() == template.fsyncOnAck();
     }
 
-    Optional<MetadataStore.Versioned<Records.FileRecord>> getFile(FileId id) throws Exception {
-        StrataNamespace ns = fileIndex.get(id); // lock-free
-        if (ns != null) {
-            return lockedFile(ns, id);
-        }
-        // A metadata-log system file lives in the root; this read is lock-free, so a self-looping
-        // system-file lookup never blocks on a user op that holds its namespace's lock.
-        Optional<MetadataStore.Versioned<Records.FileRecord>> system = root.getFile(id);
-        if (system.isPresent()) {
-            return system;
-        }
-        // A file-id op (e.g. openById right after a restart) for an owned namespace not yet loaded:
-        // warm the owned namespaces once, then re-resolve.
-        if (!ownedNamespacesWarmed) {
-            warmOwnedNamespaces();
-            ns = fileIndex.get(id);
-            if (ns != null) {
-                return lockedFile(ns, id);
-            }
-        }
-        return Optional.empty();
-    }
-
     /**
-     * Namespace-aware file lookup: routes directly to {@code namespace}'s repo, bypassing the
-     * {@link #fileIndex}. Required when two user namespaces share the same per-namespace
-     * {@link FileId} (they each start at 0), where the index would only record one of them.
+     * Namespace-scoped file lookup: routes directly to {@code namespace}'s repo. Required because
+     * file ids are per-namespace (each namespace's owner assigns 0, 1, 2, …), so a bare FileId
+     * is not globally unique across namespaces.
      *
-     * <p>Falls back to the ZK root for system-namespace files (which use a global counter and
-     * are never ambiguous).
+     * <p>Routes to the ZK root for system-namespace files (which use a global counter and are
+     * never ambiguous).
      */
-    Optional<MetadataStore.Versioned<Records.FileRecord>> getFileInNamespace(
+    Optional<MetadataStore.Versioned<Records.FileRecord>> getFile(
             StrataNamespace namespace, FileId id) throws Exception {
         if (isSystem(namespace)) {
-            return root.getFile(id);
+            return root.getFile(namespace, id);
         }
         return lockedFile(namespace, id);
     }
@@ -293,28 +263,6 @@ final class NamespaceLogBackend implements AutoCloseable {
             return state.file(id).map(f -> new MetadataStore.Versioned<>(f, state.version(id)));
         } finally {
             repo.unlock();
-        }
-    }
-
-    /**
-     * Opens (recovers) every namespace this node owns that has a published manifest, once — so a
-     * file-id op can resolve a file whose namespace has not yet been touched by a path-scoped op.
-     * Ownership-scoped: opening a non-owned namespace would republish its manifest and fence the owner.
-     */
-    private void warmOwnedNamespaces() throws Exception {
-        repoCreateLock.lock();
-        try {
-            if (ownedNamespacesWarmed) {
-                return;
-            }
-            for (StrataNamespace ns : root.listAssignedNamespaces()) {
-                if (!isSystem(ns) && ownsNamespace.test(ns)) {
-                    repo(ns); // recover + populate fileIndex
-                }
-            }
-            ownedNamespacesWarmed = true;
-        } finally {
-            repoCreateLock.unlock();
         }
     }
 
@@ -373,13 +321,12 @@ final class NamespaceLogBackend implements AutoCloseable {
         }
     }
 
-    boolean deleteFile(FileId id, int expectedVersion) throws Exception {
-        StrataNamespace ns = fileIndex.get(id); // lock-free
-        if (ns == null) {
-            // a metadata-log system file (root), or unknown/already-swept — root delete is lock-free
-            return root.deleteFile(id, expectedVersion);
+    boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) throws Exception {
+        if (isSystem(namespace)) {
+            // metadata-log system file lives in the root — lock-free
+            return root.deleteFile(namespace, id, expectedVersion);
         }
-        NamespaceMetadataLogRepository repo = repo(ns);
+        NamespaceMetadataLogRepository repo = repo(namespace);
         repo.lock();
         try {
             NamespaceMetadataState state = repo.state();
@@ -392,7 +339,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             }
             Records.FileRecord file = current.get();
             if (state.resolvePath(file.path()).map(id::equals).orElse(false)) {
-                repo.append(new MetadataLogRecord.PathUnbound(ns, file.path(), id));
+                repo.append(new MetadataLogRecord.PathUnbound(namespace, file.path(), id));
             }
             repo.append(new MetadataLogRecord.FileDeleted(id, System.currentTimeMillis()));
             return true;
@@ -445,7 +392,6 @@ final class NamespaceLogBackend implements AutoCloseable {
             try {
                 for (FileId id : repo.state().tombstonesDeletedAtOrBefore(cutoff)) {
                     repo.append(new MetadataLogRecord.TombstoneSwept(id));
-                    fileIndex.remove(id);
                     reaped++;
                 }
             } finally {

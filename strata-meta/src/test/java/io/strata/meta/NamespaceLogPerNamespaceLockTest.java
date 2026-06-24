@@ -137,8 +137,8 @@ class NamespaceLogPerNamespaceLockTest {
                 // A: create then delete a file -> a sweepable DELETED tombstone on A's log.
                 FileId fA = FileId.of(3);
                 backend.createFile(NamespaceLogTestSupport.fileRecord(fA, nsA, StrataPath.of("/a")));
-                int versionA = backend.getFile(fA).orElseThrow().version();
-                assertTrue(backend.deleteFile(fA, versionA), "delete should tombstone A's file");
+                int versionA = backend.getFile(nsA, fA).orElseThrow().version();
+                assertTrue(backend.deleteFile(nsA, fA, versionA), "delete should tombstone A's file");
                 // B: a live file so B's repo is loaded and B's lock is independently acquirable.
                 FileId fB = FileId.of(4);
                 backend.createFile(NamespaceLogTestSupport.fileRecord(fB, nsB, StrataPath.of("/b")));

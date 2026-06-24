@@ -2,6 +2,7 @@ package io.strata.meta;
 
 import io.strata.common.FileState;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.retry.ExponentialBackoffRetry;
@@ -56,19 +57,20 @@ class ZkMetadataStoreCasTest {
             try (ZkMetadataStore leaderA = new ZkMetadataStore(zk.getConnectString());
                  ZkMetadataStore leaderB = new ZkMetadataStore(zk.getConnectString())) {
                 FileId fileId = FileId.of(1);
+                StrataNamespace ns = StrataNamespace.of("test");
                 Records.FileRecord file = new Records.FileRecord(fileId, "test", "/test-file", 3, 2, false, FileState.OPEN, System.currentTimeMillis(), List.of());
                 leaderA.createFile(file);
-                int v0 = leaderA.getFile(fileId).orElseThrow().version();
+                int v0 = leaderA.getFile(ns, fileId).orElseThrow().version();
 
                 assertTrue(leaderB.updateFile(file.withState(FileState.SEALED), v0));
 
-                assertFalse(leaderA.deleteFile(fileId, v0), "stale-version delete must be rejected");
+                assertFalse(leaderA.deleteFile(ns, fileId, v0), "stale-version delete must be rejected");
                 assertEquals(FileState.SEALED,
-                        leaderA.getFile(fileId).orElseThrow().value().state(),
+                        leaderA.getFile(ns, fileId).orElseThrow().value().state(),
                         "the newer file version must survive");
 
-                int currentVersion = leaderA.getFile(fileId).orElseThrow().version();
-                assertTrue(leaderA.deleteFile(fileId, currentVersion));
+                int currentVersion = leaderA.getFile(ns, fileId).orElseThrow().version();
+                assertTrue(leaderA.deleteFile(ns, fileId, currentVersion));
             }
         }
     }

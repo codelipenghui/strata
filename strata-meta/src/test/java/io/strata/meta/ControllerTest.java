@@ -580,8 +580,8 @@ class ControllerTest {
         }
 
         @Override
-        public java.util.Optional<Versioned<Records.FileRecord>> getFile(FileId id) throws Exception {
-            return delegate.getFile(id);
+        public java.util.Optional<Versioned<Records.FileRecord>> getFile(io.strata.common.StrataNamespace namespace, FileId id) throws Exception {
+            return delegate.getFile(namespace, id);
         }
 
         @Override
@@ -612,8 +612,8 @@ class ControllerTest {
         }
 
         @Override
-        public boolean deleteFile(FileId id, int expectedVersion) throws Exception {
-            return delegate.deleteFile(id, expectedVersion);
+        public boolean deleteFile(io.strata.common.StrataNamespace namespace, FileId id, int expectedVersion) throws Exception {
+            return delegate.deleteFile(namespace, id, expectedVersion);
         }
 
         @Override

@@ -73,7 +73,7 @@ class RepairCoordinatorLoopTest {
         }
 
         @Override
-        public java.util.Optional<Versioned<Records.FileRecord>> getFile(io.strata.common.FileId id) {
+        public java.util.Optional<Versioned<Records.FileRecord>> getFile(io.strata.common.StrataNamespace namespace, io.strata.common.FileId id) {
             return java.util.Optional.empty();
         }
 
@@ -95,7 +95,7 @@ class RepairCoordinatorLoopTest {
         }
 
         @Override
-        public boolean deleteFile(io.strata.common.FileId id, int expectedVersion) {
+        public boolean deleteFile(io.strata.common.StrataNamespace namespace, io.strata.common.FileId id, int expectedVersion) {
             return true;
         }
 

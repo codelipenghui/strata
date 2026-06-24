@@ -92,7 +92,7 @@ class NamespaceLogMetadataBackendTest {
                     "the namespace metadata log must be stored as Strata system files");
             boolean replicatedAcrossNodes = false;
             for (FileId sys : metaLogFiles) {
-                Records.FileRecord record = root.getFile(sys).orElseThrow().value();
+                Records.FileRecord record = root.getFile(StrataNamespace.of("strata-meta"), sys).orElseThrow().value();
                 for (Records.ChunkRecord chunk : record.chunks()) {
                     assertFalse(chunk.replicas().isEmpty(), "a meta-log chunk must have data-node replicas");
                     if (chunk.replicas().size() >= 2) {

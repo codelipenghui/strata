@@ -81,7 +81,7 @@ class NamespaceLogMetaLogRepairTest {
 
     private int aSealedMetaLogReplica(ZkMetadataStore root) throws Exception {
         for (FileId sys : root.listFiles(SYSTEM)) {
-            Records.FileRecord record = root.getFile(sys).orElseThrow().value();
+            Records.FileRecord record = root.getFile(SYSTEM, sys).orElseThrow().value();
             for (Records.ChunkRecord chunk : record.chunks()) {
                 if (chunk.state() == ChunkState.SEALED && !chunk.replicas().isEmpty()) {
                     return chunk.replicas().get(0);
@@ -106,7 +106,7 @@ class NamespaceLogMetaLogRepairTest {
             boolean healthy = true;
             try (ZkMetadataStore root = new ZkMetadataStore(cluster.zk.getConnectString())) {
                 for (FileId sys : root.listFiles(SYSTEM)) {
-                    var record = root.getFile(sys);
+                    var record = root.getFile(SYSTEM, sys);
                     if (record.isEmpty()) {
                         continue; // compacted/deleted system file
                     }

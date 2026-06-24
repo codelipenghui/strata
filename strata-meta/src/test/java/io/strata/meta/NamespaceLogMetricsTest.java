@@ -63,7 +63,7 @@ class NamespaceLogMetricsTest {
             try (ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
                 NamespaceLogBackend backend = new NamespaceLogBackend(root, fileStore, false);
                 NamespaceLogMetadataStore store = new NamespaceLogMetadataStore(backend);
-                assertTrue(store.getFile(fileId).isPresent(), "file recovered after restart");
+                assertTrue(store.getFile(ns, fileId).isPresent(), "file recovered after restart");
                 assertTrue(store.metrics().recoveries() >= 1, "the restart re-recovered the namespace");
                 assertEquals(1, store.loadedNamespaceCount());
                 backend.close();

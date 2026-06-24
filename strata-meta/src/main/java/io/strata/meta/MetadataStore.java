@@ -29,7 +29,13 @@ public interface MetadataStore extends AutoCloseable {
      */
     void createFile(Records.FileRecord record) throws Exception;
 
-    Optional<Versioned<Records.FileRecord>> getFile(FileId id) throws Exception;
+    /**
+     * Namespace-scoped file lookup. For the namespace-log backend, file ids are per-namespace
+     * (each namespace's owner assigns 0, 1, 2, …), so the namespace is required to route to the
+     * correct repo. For the ZK v0 backend file ids are globally unique and the namespace satisfies
+     * the signature but does not change the lookup.
+     */
+    Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) throws Exception;
 
     Optional<FileId> resolvePath(StrataNamespace namespace, StrataPath path) throws Exception;
 
@@ -38,8 +44,12 @@ public interface MetadataStore extends AutoCloseable {
 
     boolean deletePath(StrataNamespace namespace, StrataPath path, FileId expectedFileId) throws Exception;
 
-    /** CAS delete; returns false on version conflict. */
-    boolean deleteFile(FileId id, int expectedVersion) throws Exception;
+    /**
+     * Namespace-scoped CAS delete; returns false on version conflict. For the namespace-log
+     * backend the namespace routes the delete to the correct per-namespace repo. For the ZK v0
+     * backend the namespace satisfies the signature but does not change the lookup.
+     */
+    boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) throws Exception;
 
     /** Live file ids within one namespace (excludes DELETED tombstones awaiting sweep). */
     List<FileId> listFiles(StrataNamespace namespace) throws Exception;
