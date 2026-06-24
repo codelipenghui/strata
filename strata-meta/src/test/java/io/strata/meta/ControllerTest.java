@@ -713,8 +713,8 @@ class ControllerTest {
         assertEquals(file1.fileId(), file2.fileId());
         assertEquals(requested, file1.fileId());
 
-        assertCreateReplayConflict("/idem-path", "test", "/idem-path-replay");
-        assertCreateReplayConflict("/idem-namespace", "test-replay", "/idem-namespace");
+        assertCreateReplayConflict("/idem-path", "test", "/idem-path-replay", FileId.of(3));
+        assertCreateReplayConflict("/idem-namespace", "test-replay", "/idem-namespace", FileId.of(4));
 
         ScpException conflictingFile = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/idem", requested, 101, 201).encode(), null, 5000));
@@ -732,8 +732,7 @@ class ControllerTest {
         assertEquals(ErrorCode.PRECONDITION_FAILED, conflictingChunk.code());
     }
 
-    private void assertCreateReplayConflict(String path, String replayNamespace, String replayPath) {
-        FileId requested = FileId.of(3);
+    private void assertCreateReplayConflict(String path, String replayNamespace, String replayPath, FileId requested) {
         long opMsb = requested.id();
         long opLsb = 0L;
         client.call(Opcode.CREATE_FILE,
