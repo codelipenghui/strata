@@ -1415,13 +1415,11 @@ public final class ChunkStore implements AutoCloseable {
     /* ---------------- startup recovery (tech design §11.3) ---------------- */
 
     /**
-     * Startup recovery: walks the namespace-sharded directory tree looking for {@code .chunk} files.
-     * Task 7 owns the full namespace-aware recovery walk; this stub currently does a flat scan of
-     * {@code dir} for backward-compat during the transition and will be replaced by Task 7.
-     *
-     * <p>After the namespace-sharded layout (Task 6), new chunks are created under
-     * {@code dir/<ns>/<l1>/<l2>/}. The flat scan finds nothing until Task 7 replaces it with a
-     * recursive walk; a fresh node starts with an empty chunks map, which is correct.
+     * Startup recovery: walks the namespace-sharded directory tree in parallel, recovering every
+     * {@code .chunk} file found under {@code dir/<ns>/<shard>/}. Each top-level namespace directory
+     * is recovered concurrently (one thread per namespace, bounded by available processors) via
+     * {@link #recoverNamespace}. Any unexpected flat {@code .chunk} files sitting directly in the
+     * store root (outside a namespace directory) are quarantined and logged as errors.
      */
     private void recoverAll() throws IOException {
         if (!Files.isDirectory(dir)) return;
