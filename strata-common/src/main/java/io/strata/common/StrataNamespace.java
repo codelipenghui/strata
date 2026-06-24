@@ -37,14 +37,17 @@ public record StrataNamespace(String value) implements Comparable<StrataNamespac
         if (bytes > MAX_BYTES) {
             throw new IllegalArgumentException("namespace too long: " + bytes);
         }
-        if (raw.equals(".") || raw.equals("..") || raw.equals("__file") || raw.startsWith("__")) {
+        if (raw.equals(".") || raw.equals("..")) {
+            throw new IllegalArgumentException("namespace must not be . or ..");
+        }
+        if (raw.equals("__file") || raw.startsWith("__")) {
             throw new IllegalArgumentException("namespace is reserved: " + raw);
         }
         for (int i = 0; i < raw.length(); i++) {
             char c = raw.charAt(i);
-            if (!Names.isNameChar(c)) {
-                throw new IllegalArgumentException("invalid namespace character '" + c + "' in " + raw);
-            }
+            boolean ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+            if (!ok) throw new IllegalArgumentException("namespace has unsafe char '" + c + "': " + raw);
         }
         return raw;
     }
