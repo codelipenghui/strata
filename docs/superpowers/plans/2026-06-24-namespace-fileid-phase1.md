@@ -309,7 +309,15 @@ Today the client mints a random fileId and create is idempotent by that fileId. 
 
 ---
 
-### Task 7: Recovery walk reconstructs `(namespace, fileId, index)`, per-namespace parallel
+### Task 7 (EXPANDED 2026-06-24, user-approved): Make the data node fully namespace-aware — index key + remaining chunk RPCs + recovery
+
+> **Scope expansion rationale:** With per-namespace owner-assigned fileIds (Task 5), `ChunkId = (fileId, index)` is **no longer globally unique** — `perf-0/file0` and `perf-1/file0` both produce `ChunkId(0,0)`, and with RF3 every data node holds both. The original plan only threaded namespace through `OpenChunk`/`ReplicateCmd` (Task 6); the data node's in-memory index `Map<ChunkId,Handle>` and 8 chunk RPCs (`Append`, `Read`, `SealChunk`, `Fence`, `StatChunk`, `DeleteChunks`, `FetchChunk`, `ReadLedger`) remained `ChunkId`-only and collide across namespaces. The spec lists "(ns,fileId,index) through proto" as Phase 1, and Task 9's multi-namespace e2e cannot pass without this. These changes all touch the chunk-index key and must compile atomically, so they are folded into Task 7 together with the original recovery walk. **The original Task 7 deliverable (namespace-aware parallel recovery) is retained as part (C) below.**
+>
+> **(A) Namespace-key the in-memory chunk index.** Change `ChunkStore.chunks`/`creating` from `ChunkId`-keyed to namespace-aware (e.g. a `record NsChunkId(StrataNamespace, ChunkId)` key, or nested maps). The `Handle` carries its `StrataNamespace`. Every `chunks.get/put/remove` and `creating` site keys by namespace. The public `ChunkStore` methods that take a `ChunkId` (read/append/seal/fence/stat/delete/fetch/readLedger) gain a `StrataNamespace` parameter.
+> **(B) Thread namespace through the 8 chunk RPCs + handlers + clients + golden corpus.** Add `StrataNamespace` to `Append`, `Read`, `SealChunk`, `Fence`, `StatChunk`, `DeleteChunks` (decide single-namespace-per-batch vs per-entry by inspecting call sites — the owner-direct delete lane is per-namespace), `FetchChunk`, `ReadLedger` (encode+decode). Update `DataNodeHandlers` to read namespace and pass it down. Update the client builders (`AppenderImpl`, `ReaderImpl`, `RepairCoordinator`, `ControlLoop`) to pass the file's namespace. Regenerate the golden corpus for every changed message.
+> **(C) Namespace-aware parallel recovery (original Task 7).** Below.
+
+### Task 7C: Recovery walk reconstructs `(namespace, fileId, index)`, per-namespace parallel
 
 **Files:**
 - Modify: `strata-format/.../ChunkStore.java` (`recoverAll` / the startup scan)
