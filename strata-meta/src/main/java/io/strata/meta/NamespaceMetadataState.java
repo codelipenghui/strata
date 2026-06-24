@@ -29,6 +29,9 @@ import java.util.function.UnaryOperator;
  * so {@code apply} is a deterministic state transition with no validation.
  */
 final class NamespaceMetadataState {
+    /** Packs two longs into a single long[] key for the opId index map. */
+    private record OpIdKey(long msb, long lsb) {}
+
     private final StrataNamespace namespace;
     private long nextFileId = 0;
     private final Map<FileId, Records.FileRecord> files = new HashMap<>();
@@ -36,6 +39,9 @@ final class NamespaceMetadataState {
     private final Map<StrataPath, FileId> pathBindings = new HashMap<>();
     private final Map<Integer, Set<ChunkId>> nodeChunks = new HashMap<>(); // derived reverse index
     private final Map<FileId, Integer> versions = new HashMap<>();        // per-file CAS version (SPI)
+    // opId → fileId index: rebuilt from log/snapshot on recovery via apply(FileCreated).
+    // Entry is removed on TombstoneSwept so the opId may be reused after the tombstone is reaped.
+    private final Map<OpIdKey, FileId> opIdIndex = new HashMap<>();
 
     NamespaceMetadataState(StrataNamespace namespace) {
         this.namespace = Objects.requireNonNull(namespace, "namespace");
@@ -75,6 +81,7 @@ final class NamespaceMetadataState {
         pathBindings.clear();
         nodeChunks.clear();
         versions.clear();
+        opIdIndex.clear();
         for (Records.FileRecord f : snapshot.files()) {
             files.put(f.fileId(), f);
             addToNodeChunks(f);
@@ -82,6 +89,7 @@ final class NamespaceMetadataState {
             if (f.state() == FileState.OPEN || f.state() == FileState.SEALED) {
                 pathBindings.put(f.path(), f.fileId());
             }
+            opIdIndex.put(new OpIdKey(f.createOpMsb(), f.createOpLsb()), f.fileId());
         }
         tombstones.putAll(snapshot.tombstones());
     }
@@ -95,6 +103,7 @@ final class NamespaceMetadataState {
                         r.createdAtMs(), List.of(), r.createOpMsb(), r.createOpLsb()));
                 tombstones.remove(r.fileId());
                 pathBindings.put(r.path(), r.fileId());
+                opIdIndex.put(new OpIdKey(r.createOpMsb(), r.createOpLsb()), r.fileId());
             }
             case MetadataLogRecord.WriterEpochAllocated r ->
                     mutate(r.fileId(), f -> f.withWriterEpoch(r.writerEpoch()));
@@ -133,6 +142,7 @@ final class NamespaceMetadataState {
                 Records.FileRecord removed = files.remove(r.fileId());
                 if (removed != null) {
                     removeFromNodeChunks(removed);
+                    opIdIndex.remove(new OpIdKey(removed.createOpMsb(), removed.createOpLsb()));
                 }
                 tombstones.remove(r.fileId());
                 versions.remove(r.fileId());
@@ -164,6 +174,15 @@ final class NamespaceMetadataState {
             }
         }
         return out;
+    }
+
+    /**
+     * Returns the file id previously created by this opId, if any live (non-swept) record carries it.
+     * Used for opId-keyed idempotency: a retried create with the same opId returns the same file id
+     * without assigning a new one. Empty means no live record; the opId is fresh or tombstone-swept.
+     */
+    Optional<FileId> fileIdForOpId(long opIdMsb, long opIdLsb) {
+        return Optional.ofNullable(opIdIndex.get(new OpIdKey(opIdMsb, opIdLsb)));
     }
 
     /** Whether a DELETED tombstone for {@code id} is still present (fences a recreate of the id). */

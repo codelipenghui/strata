@@ -49,6 +49,14 @@ public final class NamespaceLogMetadataStore implements MetadataStore {
         backend.createFile(record);
     }
 
+    /**
+     * Owner-assigned create: delegates to {@link NamespaceLogBackend#createFileOwnerAssigned}.
+     * The server assigns the file id; opId-keyed idempotency is enforced in the namespace log.
+     */
+    FileId createFileOwnerAssigned(Records.FileRecord template) throws Exception {
+        return backend.createFileOwnerAssigned(template);
+    }
+
     @Override
     public Optional<Versioned<Records.FileRecord>> getFile(FileId id) throws Exception {
         return backend.getFile(id);

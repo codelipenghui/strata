@@ -644,16 +644,15 @@ public final class Messages {
     }
 
     public record CreateFile(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy,
-                             FileId fileId, long opIdMsb, long opIdLsb) {
+                             long opIdMsb, long opIdLsb) {
         public CreateFile {
             namespace = Objects.requireNonNull(namespace, "namespace");
             path = Objects.requireNonNull(path, "path");
             writePolicy = Objects.requireNonNull(writePolicy, "writePolicy");
-            fileId = Objects.requireNonNull(fileId, "fileId");
         }
 
         public CreateFile(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy) {
-            this(namespace, path, writePolicy, FileId.of(0), UUID.randomUUID()); // TASK3: owner assigns id
+            this(namespace, path, writePolicy, UUID.randomUUID());
         }
 
         public CreateFile(String namespace, String path) {
@@ -665,28 +664,28 @@ public final class Messages {
         }
 
         private CreateFile(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy,
-                           FileId fileId, UUID opId) {
-            this(namespace, path, writePolicy, fileId,
+                           UUID opId) {
+            this(namespace, path, writePolicy,
                     opId.getMostSignificantBits(), opId.getLeastSignificantBits());
         }
 
-        public CreateFile(String namespace, String path, FileId fileId, long opIdMsb, long opIdLsb) {
+        public CreateFile(String namespace, String path, long opIdMsb, long opIdLsb) {
             this(StrataNamespace.of(namespace), StrataPath.of(path), WritePolicy.DEFAULT,
-                    fileId, opIdMsb, opIdLsb);
+                    opIdMsb, opIdLsb);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.string(namespace.toString()).string(path.toString());
             writePolicy.writeTo(w);
-            w.fileId(fileId).u64(opIdMsb).u64(opIdLsb).noTags();
+            w.u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
         public static CreateFile decode(ByteBuffer b) {
             CreateFile m = new CreateFile(StrataNamespace.of(Varint.readString(b)),
                     StrataPath.of(Varint.readString(b)), WritePolicy.readFrom(b),
-                    FileId.readFrom(b), b.getLong(), b.getLong());
+                    b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }

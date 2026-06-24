@@ -96,16 +96,20 @@ abstract class MetadataStoreConformanceTest {
         try (Backend backend = startBackend();
              MetadataStore store = backend.openStore()) {
             StrataPath sharedPath = StrataPath.of("/logs/shared/segment-0");
-            Records.FileRecord first = file(FileId.of(10), "tenant-a", sharedPath.toString(), FileState.OPEN);
+            // Each file gets a unique FileId; a duplicate create for the same (namespace, path) must fail.
+            FileId idA = FileId.of(10);  // tenant-a's first file
+            FileId idB = FileId.of(11);  // tenant-b's file (different namespace)
+            FileId idADup = FileId.of(12);  // tenant-a attempted duplicate — create must fail + no orphan
+            Records.FileRecord first = file(idA, "tenant-a", sharedPath.toString(), FileState.OPEN);
             Records.FileRecord samePathOtherNamespace =
-                    file(FileId.of(10), "tenant-b", sharedPath.toString(), FileState.OPEN);
+                    file(idB, "tenant-b", sharedPath.toString(), FileState.OPEN);
             Records.FileRecord duplicateSameNamespace =
-                    file(FileId.of(10), "tenant-a", sharedPath.toString(), FileState.OPEN);
+                    file(idADup, "tenant-a", sharedPath.toString(), FileState.OPEN);
 
             store.createFile(first);
             store.createFile(samePathOtherNamespace);
             assertThrows(Exception.class, () -> store.createFile(duplicateSameNamespace));
-            assertTrue(store.getFile(duplicateSameNamespace.fileId()).isEmpty(),
+            assertTrue(store.getFile(idADup).isEmpty(),
                     "failed path binding transaction must not leave an orphan file record");
 
             assertEquals(first.fileId(), store.resolvePath(first.namespace(), sharedPath).orElseThrow());
@@ -118,8 +122,11 @@ abstract class MetadataStoreConformanceTest {
             assertEquals(samePathOtherNamespace.fileId(),
                     store.resolvePath(samePathOtherNamespace.namespace(), sharedPath).orElseThrow());
 
+            // After sweep, tenant-a can create a new file at the same path.
+            assertEquals(1, store.sweepDeletedFiles(0));
+            FileId idAReplacement = FileId.of(13);
             Records.FileRecord replacement =
-                    file(FileId.of(10), "tenant-a", sharedPath.toString(), FileState.OPEN);
+                    file(idAReplacement, "tenant-a", sharedPath.toString(), FileState.OPEN);
             store.createFile(replacement);
             assertEquals(replacement.fileId(), store.resolvePath(replacement.namespace(), sharedPath).orElseThrow());
             assertEquals(Set.of(samePathOtherNamespace.fileId(), replacement.fileId()), fileIds(store));
@@ -134,8 +141,10 @@ abstract class MetadataStoreConformanceTest {
             StrataPath path = StrataPath.of("/logs/reused/segment-0");
             Records.FileRecord oldDeletingFile =
                     file(FileId.of(11), namespace.toString(), path.toString(), FileState.DELETING);
+            // Replacement uses a different FileId — once a FileId is tombstoned the replacement
+            // has a fresh id (server increments the per-namespace counter).
             Records.FileRecord replacement =
-                    file(FileId.of(11), namespace.toString(), path.toString(), FileState.OPEN);
+                    file(FileId.of(12), namespace.toString(), path.toString(), FileState.OPEN);
 
             store.createFile(oldDeletingFile);
             int oldVersion = store.getFile(oldDeletingFile.fileId()).orElseThrow().version();
@@ -175,7 +184,9 @@ abstract class MetadataStoreConformanceTest {
             assertThrows(Exception.class, () -> store.createFile(deleted),
                     "a stale create replay must not resurrect a fully deleted FileId");
 
-            Records.FileRecord replacement = file(FileId.of(12), namespace.toString(), path.toString(),
+            // Sweep the tombstone so the path (not the id) is free for a new file with a fresh id.
+            assertEquals(1, store.sweepDeletedFiles(0));
+            Records.FileRecord replacement = file(FileId.of(13), namespace.toString(), path.toString(),
                     FileState.OPEN);
             store.createFile(replacement);
             assertEquals(replacement.fileId(), store.resolvePath(namespace, path).orElseThrow());
@@ -281,7 +292,8 @@ abstract class MetadataStoreConformanceTest {
             StrataPath path = StrataPath.of("/logs/stale-handle/segment-0");
             Records.FileRecord oldFile = file(FileId.of(30), namespace.toString(), path.toString(),
                     FileState.OPEN);
-            Records.FileRecord replacement = file(FileId.of(30), namespace.toString(), path.toString(),
+            // Replacement uses a fresh FileId — server increments the counter after deletion.
+            Records.FileRecord replacement = file(FileId.of(31), namespace.toString(), path.toString(),
                     FileState.OPEN);
 
             staleLeader.createFile(oldFile);
@@ -321,11 +333,12 @@ abstract class MetadataStoreConformanceTest {
              MetadataStore staleFirstLeader = backend.openStore()) {
             StrataNamespace namespace = StrataNamespace.of("tenant-a");
             StrataPath path = StrataPath.of("/logs/replacement-history/segment-0");
+            // Each generation gets a unique FileId (server increments counter per create).
             Records.FileRecord first = file(FileId.of(40), namespace.toString(), path.toString(),
                     FileState.OPEN);
-            Records.FileRecord second = file(FileId.of(40), namespace.toString(), path.toString(),
+            Records.FileRecord second = file(FileId.of(41), namespace.toString(), path.toString(),
                     FileState.OPEN);
-            Records.FileRecord third = file(FileId.of(40), namespace.toString(), path.toString(),
+            Records.FileRecord third = file(FileId.of(42), namespace.toString(), path.toString(),
                     FileState.OPEN);
 
             staleFirstLeader.createFile(first);
@@ -383,9 +396,10 @@ abstract class MetadataStoreConformanceTest {
              MetadataStore store = backend.openStore()) {
             StrataNamespace a = StrataNamespace.of("tenant-a");
             StrataNamespace b = StrataNamespace.of("tenant-b");
+            // Each file gets a unique numeric id (server assigns monotonically increasing ids).
             FileId a1 = FileId.of(50);
-            FileId a2 = FileId.of(50);
-            FileId b1 = FileId.of(50);
+            FileId a2 = FileId.of(51);
+            FileId b1 = FileId.of(52);
             store.createFile(file(a1, "tenant-a", "/logs/a/seg-0", FileState.OPEN));
             store.createFile(file(a2, "tenant-a", "/logs/a/seg-1", FileState.OPEN));
             store.createFile(file(b1, "tenant-b", "/logs/b/seg-0", FileState.OPEN));

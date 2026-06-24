@@ -1,6 +1,9 @@
 package io.strata.meta;
 
+import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.FileState;
+import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 import org.apache.zookeeper.KeeperException;
@@ -155,6 +158,83 @@ final class NamespaceLogBackend implements AutoCloseable {
         } finally {
             repo.unlock();
         }
+    }
+
+    /**
+     * Owner-assigned create: the server assigns the file id, with opId-keyed idempotency.
+     *
+     * <p>For the system namespace, id is allocated via the ZK root's {@code nextSystemFileId()} counter
+     * (low-volume; lives in the consensus root). For user namespaces, id is assigned by the owner's
+     * {@link NamespaceMetadataState#assignFileId()} (per-namespace monotonic counter, log-recovered).
+     *
+     * <p>Idempotency: if a live (non-DELETING) file already carries the same {@code (namespace, opId)},
+     * the existing file id is returned immediately — {@code sameCreateRequest} guards that the path and
+     * policy match; mismatch is PRECONDITION_FAILED. A swept-tombstone opId is treated as fresh.
+     *
+     * @return the server-assigned (or previously assigned) {@link FileId}
+     * @throws io.strata.common.ScpException with PRECONDITION_FAILED if the opId is already in use
+     *         for a different path or policy, or if the path is bound to a different file
+     */
+    FileId createFileOwnerAssigned(Records.FileRecord template) throws Exception {
+        if (isSystem(template.namespace())) {
+            // System files live in the ZK root; use the dedicated system-file-id counter.
+            long sysId = root.nextSystemFileId();
+            Records.FileRecord sysRecord = new Records.FileRecord(
+                    FileId.of(sysId), template.namespace(), template.path(),
+                    template.replicationFactor(), template.ackQuorum(), template.fsyncOnAck(),
+                    template.state(), template.createdAtMs(), template.chunks(),
+                    template.createOpMsb(), template.createOpLsb());
+            root.createFile(sysRecord);
+            return sysRecord.fileId();
+        }
+        NamespaceMetadataLogRepository repo = repo(template.namespace());
+        repo.lock();
+        try {
+            NamespaceMetadataState state = repo.state();
+            // --- opId-keyed idempotency (O(1) index lookup) ---
+            Optional<FileId> existing = state.fileIdForOpId(template.createOpMsb(), template.createOpLsb());
+            if (existing.isPresent()) {
+                FileId existingId = existing.get();
+                Optional<Records.FileRecord> existingFile = state.file(existingId);
+                if (existingFile.isPresent()) {
+                    Records.FileRecord f = existingFile.get();
+                    if (f.state() == FileState.DELETING) {
+                        // The file has been deleted; this opId is consumed — reject the replay.
+                        throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                                "create opId already consumed by a deleted file: " + existingId);
+                    }
+                    if (!f.path().equals(template.path()) || !samePolicyAs(f, template)) {
+                        throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                                "create opId already used with a different path or policy: " + existingId);
+                    }
+                    return existingId; // idempotent: same opId, same request
+                }
+                // Tombstone present but not yet swept — the opId is consumed; reject.
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "create opId already consumed by a deleted file");
+            }
+            // --- path conflict check ---
+            if (state.resolvePath(template.path()).isPresent()) {
+                throw new KeeperException.NodeExistsException(
+                        "path " + template.namespace() + ":" + template.path());
+            }
+            // --- assign id and append ---
+            FileId id = state.assignFileId();
+            repo.append(new MetadataLogRecord.FileCreated(id, template.namespace(),
+                    template.path(), template.replicationFactor(), template.ackQuorum(), template.fsyncOnAck(),
+                    template.createdAtMs(), template.createOpMsb(), template.createOpLsb()));
+            fileIndex.put(id, template.namespace());
+            return id;
+        } finally {
+            repo.unlock();
+        }
+    }
+
+    /** True if the existing file's write policy matches the template. */
+    private static boolean samePolicyAs(Records.FileRecord existing, Records.FileRecord template) {
+        return existing.replicationFactor() == template.replicationFactor()
+                && existing.ackQuorum() == template.ackQuorum()
+                && existing.fsyncOnAck() == template.fsyncOnAck();
     }
 
     Optional<MetadataStore.Versioned<Records.FileRecord>> getFile(FileId id) throws Exception {

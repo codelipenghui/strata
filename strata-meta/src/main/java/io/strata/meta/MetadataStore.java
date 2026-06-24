@@ -87,6 +87,25 @@ public interface MetadataStore extends AutoCloseable {
         throw new UnsupportedOperationException("metadata epoch allocation requires a consensus-root backend");
     }
 
+    /**
+     * Atomically allocates and returns the next file id for the system namespace ({@code strata-meta}).
+     * System files are low-volume (a handful of metadata-log segments/snapshots per namespace), so a
+     * single ZK CAS counter is adequate. Lives in the consensus root; non-root backends return a
+     * local AtomicLong (in-memory / test use only).
+     */
+    default long nextSystemFileId() throws Exception {
+        throw new UnsupportedOperationException("system file-id allocation requires a consensus-root backend");
+    }
+
+    /**
+     * Allocates the next file id for {@code namespace} and returns it. This is the server-side id
+     * assignment point: the client no longer mints file ids. The returned id is guaranteed unique
+     * within the namespace for this store's lifetime (per-namespace monotonic counter; gaps allowed).
+     */
+    default FileId assignFileId(StrataNamespace namespace) throws Exception {
+        throw new UnsupportedOperationException("file-id assignment requires a backend that tracks per-namespace counters");
+    }
+
     /** The persisted rendezvous assignment for {@code namespace}, if one has been written (design §6.1). */
     default Optional<Versioned<Records.NamespaceAssignment>> getNamespaceAssignment(StrataNamespace namespace)
             throws Exception {

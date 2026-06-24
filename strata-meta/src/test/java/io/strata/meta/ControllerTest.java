@@ -242,7 +242,8 @@ class ControllerTest {
 
     @Test
     void missingFileOperationsReturnTypedErrorsOrIdempotentSuccess() {
-        FileId missing = FileId.of(1);
+        // Use an id that will never be server-assigned in this test run (server starts at 1, not MaxValue).
+        FileId missing = FileId.of(Long.MAX_VALUE);
 
         ScpException createChunk = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(StrataNamespace.of("test"), missing, 1).encode(), null, 5000));
@@ -542,7 +543,7 @@ class ControllerTest {
     }
 
     private static byte[] fileIdBytes(FileId fileId) {
-        ByteBuffer b = ByteBuffer.allocate(16);
+        ByteBuffer b = ByteBuffer.allocate(8);
         fileId.writeTo(b);
         return b.array();
     }
@@ -704,20 +705,25 @@ class ControllerTest {
     void fileAndChunkCreatesAreIdempotentByOperationId() {
         registerTrio("idemHost");
 
-        FileId requested = FileId.of(2);
-        var createFile = new Messages.CreateFile("test", "/idem", requested, 100, 200);
+        // Server assigns the fileId; same opId must return the same server-assigned id.
+        var createFile = new Messages.CreateFile("test", "/idem", 100, 200);
         var file1 = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 createFile.encode(), null, 5000));
         var file2 = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 createFile.encode(), null, 5000));
         assertEquals(file1.fileId(), file2.fileId());
-        assertEquals(requested, file1.fileId());
 
-        assertCreateReplayConflict("/idem-path", "test", "/idem-path-replay", FileId.of(3));
-        assertCreateReplayConflict("/idem-namespace", "test-replay", "/idem-namespace", FileId.of(4));
+        // Different opId on the same path → new file id.
+        var file3 = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", "/idem-op2", 102, 202).encode(), null, 5000));
+        assertNotEquals(file1.fileId(), file3.fileId());
 
+        assertCreateReplayConflict("/idem-path", 1003L, "test", "/idem-path-replay");
+        assertCreateReplayConflict("/idem-path2", 1004L, "test", "/idem-path2-replay");
+
+        // Same opId but different path/policy is a conflict.
         ScpException conflictingFile = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile("test", "/idem", requested, 101, 201).encode(), null, 5000));
+                new Messages.CreateFile("test", "/idem", 101, 201).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, conflictingFile.code());
 
         var createChunk = new Messages.CreateChunk(StrataNamespace.of("test"), file1.fileId(), 1, 300, 400);
@@ -732,29 +738,26 @@ class ControllerTest {
         assertEquals(ErrorCode.PRECONDITION_FAILED, conflictingChunk.code());
     }
 
-    private void assertCreateReplayConflict(String path, String replayNamespace, String replayPath, FileId requested) {
-        long opMsb = requested.id();
+    private void assertCreateReplayConflict(String path, long opMsb, String replayNamespace, String replayPath) {
         long opLsb = 0L;
         client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile("test", path, requested, opMsb, opLsb).encode(),
+                new Messages.CreateFile("test", path, opMsb, opLsb).encode(),
                 null, 5000);
 
         ScpException conflict = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_FILE,
-                new Messages.CreateFile(replayNamespace, replayPath,
-                        requested, opMsb, opLsb).encode(), null, 5000));
+                new Messages.CreateFile(replayNamespace, replayPath, opMsb, opLsb).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, conflict.code());
     }
 
     @Test
     void createFileReplayAfterDeleteCannotReturnOldFileOrClearReplacementPath() {
-        FileId requested = FileId.of(4);
-        var create = new Messages.CreateFile("test", "/idem-after-delete", requested, 1200, 1300);
+        var create = new Messages.CreateFile("test", "/idem-after-delete", 1200, 1300);
         var created = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 create.encode(), null, 5000));
-        assertEquals(requested, created.fileId());
+        FileId assigned = created.fileId();
 
         var delete = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
-                new Messages.DeleteFiles(StrataNamespace.of("test"), List.of(requested)).encode(), null, 5000));
+                new Messages.DeleteFiles(StrataNamespace.of("test"), List.of(assigned)).encode(), null, 5000));
         assertEquals(List.of(ErrorCode.OK.code), delete.codes());
 
         ScpException staleReplay = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_FILE,
@@ -763,7 +766,7 @@ class ControllerTest {
 
         var replacement = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/idem-after-delete").encode(), null, 5000));
-        assertNotEquals(requested, replacement.fileId());
+        assertNotEquals(assigned, replacement.fileId());
         var byPath = Messages.LookupPathResp.decode(client.call(Opcode.LOOKUP_PATH,
                 new Messages.LookupPath("test", "/idem-after-delete").encode(), null, 5000));
         assertEquals(replacement.fileId(), byPath.fileId());
@@ -1061,7 +1064,7 @@ class ControllerTest {
 
     @Test
     void sealFileRejectsCorruptCommittedChunkLengths() throws Exception {
-        FileId negative = FileId.of(5);
+        FileId negative = FileId.of(Long.MAX_VALUE - 1);
         metadataStore().createFile(new Records.FileRecord(negative, "test", "/negative-length", 3, 2, false, FileState.OPEN, System.currentTimeMillis(),
                 List.of(new Records.ChunkRecord(0, ChunkState.SEALED, -1, 0, 1, List.of()))));
 
@@ -1069,7 +1072,7 @@ class ControllerTest {
                 new Messages.SealFile(StrataNamespace.of("test"), negative, 0).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, negativeLength.code());
 
-        FileId overflow = FileId.of(6);
+        FileId overflow = FileId.of(Long.MAX_VALUE - 2);
         metadataStore().createFile(new Records.FileRecord(overflow, "test", "/overflow-length", 3, 2, false, FileState.OPEN, System.currentTimeMillis(),
                 List.of(
                         new Records.ChunkRecord(0, ChunkState.SEALED, Long.MAX_VALUE, 0, 1, List.of()),

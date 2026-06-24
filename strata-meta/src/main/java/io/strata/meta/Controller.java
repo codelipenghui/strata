@@ -597,38 +597,71 @@ public final class Controller implements AutoCloseable {
 
     private FileId createFile(Messages.CreateFile m) throws Exception {
         Messages.WritePolicy policy = m.writePolicy();
+        // Namespace-log backend: opId-keyed idempotency and id assignment are handled atomically
+        // inside the owner's namespace lock (O(1) index lookup, no id waste on retry).
+        if (store instanceof NamespaceLogMetadataStore log) {
+            Records.FileRecord template = new Records.FileRecord(
+                    FileId.of(0), // placeholder — backend assigns the real id
+                    m.namespace(), m.path(),
+                    policy.replicationFactor(), policy.ackQuorum(), policy.fsyncOnAck(),
+                    FileState.OPEN, System.currentTimeMillis(), List.of(),
+                    m.opIdMsb(), m.opIdLsb());
+            return log.createFileOwnerAssigned(template);
+        }
+        // ZK backend (v0 prototype): assign via global ZK counter, then create.
+        // Pre-check: scan namespace for any live or tombstoned file with this opId; if found,
+        // either return it (idempotent retry) or reject (stale replay after deletion). O(N) per-create
+        // is acceptable for the v0 prototype.
+        if (store instanceof ZkMetadataStore zk) {
+            for (FileId candidate : zk.listFilesIncludingTombstones(m.namespace())) {
+                var opt = zk.getFileIncludingTombstone(candidate);
+                if (opt.isPresent()) {
+                    Records.FileRecord record = opt.get();
+                    if (record.createdBy(m.opIdMsb(), m.opIdLsb())) {
+                        if (record.state() == FileState.DELETED) {
+                            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                                    "create opId was already used for a file that has been deleted");
+                        }
+                        if (record.state() == FileState.DELETING) {
+                            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                                    "create opId belongs to a file that is being deleted");
+                        }
+                        if (sameCreateRequest(record, m)) {
+                            return record.fileId();  // idempotent retry
+                        }
+                        throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                                "create opId already in use for a different request");
+                    }
+                }
+            }
+        }
+        FileId assigned = store.assignFileId(m.namespace());
         try {
-            store.createFile(new Records.FileRecord(m.fileId(), m.namespace(), m.path(),
+            store.createFile(new Records.FileRecord(assigned, m.namespace(), m.path(),
                     policy.replicationFactor(), policy.ackQuorum(), policy.fsyncOnAck(),
                     FileState.OPEN, System.currentTimeMillis(), List.of(),
                     m.opIdMsb(), m.opIdLsb()));
-            return m.fileId();
+            return assigned;
         } catch (KeeperException.NodeExistsException e) {
-            var existing = store.getFile(m.fileId());
-            if (existing.isPresent()) {
-                Records.FileRecord record = existing.get().value();
-                if (sameCreateRequest(record, m) && record.state() != FileState.DELETING
-                        && pathStillOwnsCreate(record, m)) {
-                    return m.fileId();
+            // Path already bound (race or same-opId retry we missed above) — scan live files.
+            for (FileId candidate : store.listFiles(m.namespace())) {
+                var opt = store.getFile(candidate);
+                if (opt.isPresent()) {
+                    Records.FileRecord record = opt.get().value();
+                    if (sameCreateRequest(record, m) && record.state() != FileState.DELETING) {
+                        return record.fileId();
+                    }
                 }
-                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
-                        "file id already exists for a different create request: " + m.fileId());
             }
+            // Path exists but doesn't match this opId/request — conflict.
             var pathOwner = store.resolvePath(m.namespace(), m.path());
             if (pathOwner.isPresent()) {
                 throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                         "path already exists: " + m.namespace() + ":" + m.path());
             }
             throw new ScpException(ErrorCode.PRECONDITION_FAILED,
-                    "file id already exists for a different create request: " + m.fileId());
+                    "create opId already in use for a different request");
         }
-    }
-
-    private boolean pathStillOwnsCreate(Records.FileRecord existing, Messages.CreateFile requested)
-            throws Exception {
-        return store.resolvePath(existing.namespace(), existing.path())
-                .filter(requested.fileId()::equals)
-                .isPresent();
     }
 
     private static boolean sameCreateRequest(Records.FileRecord existing, Messages.CreateFile requested) {

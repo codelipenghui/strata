@@ -35,8 +35,8 @@ class FrameGoldenTest {
         byte[] wire = bos.toByteArray();
 
         String expectedHex =
-                // u32 frameLength = 26 (preamble) + 41 (header) + 2 (payload) = 69 = 0x45
-                "00000045"
+                // u32 frameLength = 26 (preamble) + 33 (header) + 2 (payload) = 61 = 0x3d
+                "0000003d"
                 // magic 0x5C, frameVersion 1
                 + "5c01"
                 // opcode APPEND = 0x0011, apiVersion 1
@@ -49,10 +49,10 @@ class FrameGoldenTest {
                 + "00000002"
                 // payloadCrc32c of DE AD
                 + HexFormat.of().toHexDigits(io.strata.common.Crc.of(new byte[]{(byte) 0xDE, (byte) 0xAD}))
-                // headerLength 41 = chunkId 20 + epoch 4 + base 8 + do 8 + tags 1
-                + "0029"
-                // header: chunkId(fileId msb/lsb + index), epoch 5, baseOffset 100, durableOffset 50, empty tags
-                + "0102030405060708" + "090a0b0c0d0e0f10" + "00000002"
+                // headerLength 33 = chunkId 12 (fileId 8 + index 4) + epoch 4 + base 8 + do 8 + tags 1
+                + "0021"
+                // header: chunkId(fileId 8B + index 4B), epoch 5, baseOffset 100, durableOffset 50, empty tags
+                + "0102030405060708" + "00000002"
                 + "00000005"
                 + "0000000000000064"
                 + "0000000000000032"
