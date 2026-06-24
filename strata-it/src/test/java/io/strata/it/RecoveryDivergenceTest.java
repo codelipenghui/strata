@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * floor must be truncated rather than committed.
  */
 class RecoveryDivergenceTest {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     @Test
     void recoveryCommitsAgreeingSealQuorumAndDropsOutlier() throws Exception {
@@ -109,8 +110,8 @@ class RecoveryDivergenceTest {
             try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                     ScpClient.KIND_TOOL, "writer")) {
                 node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1,
-                        false, 1 << 20, 1L).encode(), null, 5000);
-                node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0).encode(),
+                        false, 1 << 20, 1L, TEST_NS).encode(), null, 5000);
+                node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0, TEST_NS).encode(),
                         ByteBuffer.wrap(payloads.get(i)), 5000);
             }
         }
@@ -130,12 +131,12 @@ class RecoveryDivergenceTest {
             try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                     ScpClient.KIND_TOOL, "writer")) {
                 node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1,
-                        false, 1 << 20, 1L).encode(), null, 5000);
+                        false, 1 << 20, 1L, TEST_NS).encode(), null, 5000);
                 if (payload.length > 0) {
-                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0).encode(),
+                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0, TEST_NS).encode(),
                             ByteBuffer.wrap(payload), 5000);
                     node.call(Opcode.APPEND,
-                            new Messages.Append(chunk.chunkId(), 1, payload.length, payload.length).encode(),
+                            new Messages.Append(chunk.chunkId(), 1, payload.length, payload.length, TEST_NS).encode(),
                             ByteBuffer.allocate(0), 5000);
                 }
             }

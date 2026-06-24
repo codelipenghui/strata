@@ -4,6 +4,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.FileState;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
+import io.strata.common.StrataNamespace;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.proto.Messages;
@@ -30,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RepairCoordinatorTest {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
     private static final byte MEDIA = 1;
 
     @Test
@@ -107,9 +109,9 @@ class RepairCoordinatorTest {
         Messages.ReplicateCmd replicate = assertInstanceOf(Messages.ReplicateCmd.class,
                 onlyCommand(heartbeat(registry, coordinator, target, List.of())));
         coordinator.onInventory(inventory(target, List.of(
-                new Messages.InventoryEntry(chunkId, ChunkState.SEALED, 512, 3001))));
+                new Messages.InventoryEntry(chunkId, ChunkState.SEALED, 512, 3001, TEST_NS))));
         assertTrue(heartbeat(registry, coordinator, target, List.of()).commands().isEmpty());
-        registry.enqueue(target.nodeId(), new Messages.DeleteCmd(123, List.of(chunkId)));
+        registry.enqueue(target.nodeId(), new Messages.DeleteCmd(123, List.of(chunkId), TEST_NS));
 
         Messages.HeartbeatResp afterCompletion = heartbeat(registry, coordinator, target,
                 List.of(new Messages.CompletedCommand(replicate.commandId(), (short) 0)));
@@ -522,10 +524,10 @@ class RepairCoordinatorTest {
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
         coordinator.onInventory(inventory(node, List.of(
-                new Messages.InventoryEntry(corrupt, ChunkState.SEALED, 201, 200),
-                new Messages.InventoryEntry(open, ChunkState.OPEN, 300, 300),
-                new Messages.InventoryEntry(deleting, ChunkState.DELETING, 400, 400),
-                new Messages.InventoryEntry(orphan, ChunkState.SEALED, 1, 1))));
+                new Messages.InventoryEntry(corrupt, ChunkState.SEALED, 201, 200, TEST_NS),
+                new Messages.InventoryEntry(open, ChunkState.OPEN, 300, 300, TEST_NS),
+                new Messages.InventoryEntry(deleting, ChunkState.DELETING, 400, 400, TEST_NS),
+                new Messages.InventoryEntry(orphan, ChunkState.SEALED, 1, 1, TEST_NS))));
 
         Records.FileRecord file = store.files.get(fileId).value();
         assertEquals(List.of(List.of(), List.of(), List.of(), List.of()),
@@ -556,13 +558,13 @@ class RepairCoordinatorTest {
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, graceConfig, () -> true);
 
         coordinator.onInventory(inventory(node, List.of(
-                new Messages.InventoryEntry(chunkId, ChunkState.OPEN, 100, 100))));
+                new Messages.InventoryEntry(chunkId, ChunkState.OPEN, 100, 100, TEST_NS))));
 
         assertEquals(List.of(node.nodeId()), store.files.get(fileId).value().chunks().get(0).replicas());
         assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
 
         coordinator.onInventory(inventory(node, List.of(
-                new Messages.InventoryEntry(chunkId, ChunkState.SEALED, 100, 100))));
+                new Messages.InventoryEntry(chunkId, ChunkState.SEALED, 100, 100, TEST_NS))));
 
         assertEquals(List.of(node.nodeId()), store.files.get(fileId).value().chunks().get(0).replicas());
         assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
@@ -575,7 +577,7 @@ class RepairCoordinatorTest {
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
         coordinator.onInventory(new Messages.InventoryReport(999, 1, 2, 3, 0, 1,
-                List.of(new Messages.InventoryEntry(new ChunkId(fileId(85), 0), ChunkState.SEALED, 1, 1))));
+                List.of(new Messages.InventoryEntry(new ChunkId(fileId(85), 0), ChunkState.SEALED, 1, 1, TEST_NS))));
 
         Registered node = register(registry, 146, "node");
         store.throwOnListFiles = true;
@@ -620,7 +622,7 @@ class RepairCoordinatorTest {
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
 
         coordinator.onInventory(inventory(node, List.of(
-                new Messages.InventoryEntry(healthy, ChunkState.SEALED, 10, 100))));
+                new Messages.InventoryEntry(healthy, ChunkState.SEALED, 10, 100, TEST_NS))));
 
         assertEquals(List.of(node.nodeId()), store.files.get(healthyFile).value().chunks().get(0).replicas());
         assertEquals(List.of(node.nodeId()), store.files.get(deletingFile).value().chunks().get(0).replicas());
@@ -686,7 +688,7 @@ class RepairCoordinatorTest {
         FileId foreignFile = fileId(7777);
         ChunkId foreignChunk = new ChunkId(foreignFile, 0);
         Messages.InventoryEntry entry =
-                new Messages.InventoryEntry(foreignChunk, ChunkState.SEALED, 4096, 0xAB);
+                new Messages.InventoryEntry(foreignChunk, ChunkState.SEALED, 4096, 0xAB, TEST_NS);
 
         // sharded (ownsAll = false): the unknown chunk is left alone (no delete command).
         FakeStore shardedStore = new FakeStore();

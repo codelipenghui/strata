@@ -4,6 +4,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -27,7 +28,7 @@ class FrameGoldenTest {
     @Test
     void appendFrameGoldenBytes() throws IOException {
         FileId f = FileId.of(0x0102030405060708L);
-        var append = new Messages.Append(new ChunkId(f, 2), 5, 100, 50);
+        var append = new Messages.Append(new ChunkId(f, 2), 5, 100, 50, StrataNamespace.of("test"));
         ByteBuffer payload = ByteBuffer.wrap(new byte[]{(byte) 0xDE, (byte) 0xAD});
 
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
@@ -35,8 +36,8 @@ class FrameGoldenTest {
         byte[] wire = bos.toByteArray();
 
         String expectedHex =
-                // u32 frameLength = 26 (preamble) + 33 (header) + 2 (payload) = 61 = 0x3d
-                "0000003d"
+                // u32 frameLength = 26 (preamble) + 38 (header) + 2 (payload) = 66 = 0x42
+                "00000042"
                 // magic 0x5C, frameVersion 1
                 + "5c01"
                 // opcode APPEND = 0x0011, apiVersion 1
@@ -49,13 +50,14 @@ class FrameGoldenTest {
                 + "00000002"
                 // payloadCrc32c of DE AD
                 + HexFormat.of().toHexDigits(io.strata.common.Crc.of(new byte[]{(byte) 0xDE, (byte) 0xAD}))
-                // headerLength 33 = chunkId 12 (fileId 8 + index 4) + epoch 4 + base 8 + do 8 + tags 1
-                + "0021"
-                // header: chunkId(fileId 8B + index 4B), epoch 5, baseOffset 100, durableOffset 50, empty tags
+                // headerLength 38 = chunkId 12 (fileId 8 + index 4) + epoch 4 + base 8 + do 8 + namespace 5 + tags 1
+                + "0026"
+                // header: chunkId(fileId 8B + index 4B), epoch 5, baseOffset 100, durableOffset 50, namespace "test", empty tags
                 + "0102030405060708" + "00000002"
                 + "00000005"
                 + "0000000000000064"
                 + "0000000000000032"
+                + "0474657374"
                 + "00"
                 // payload
                 + "dead";
@@ -74,7 +76,7 @@ class FrameGoldenTest {
     @Test
     void corruptPayloadRejected() throws IOException {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        var append = new Messages.Append(new ChunkId(FileId.of(1), 0), 1, 0, 0);
+        var append = new Messages.Append(new ChunkId(FileId.of(1), 0), 1, 0, 0, StrataNamespace.of("test"));
         FrameIO.write(new DataOutputStream(bos), Frame.request(Opcode.APPEND, append.encode(),
                 ByteBuffer.wrap(new byte[]{1, 2, 3, 4}), 1));
         byte[] wire = bos.toByteArray();
@@ -96,9 +98,9 @@ class FrameGoldenTest {
         // a future writer adds tag 99 to Append — current reader must ignore it
         BufWriter w = new BufWriter();
         FileId f = FileId.of(1);
-        w.chunkId(new ChunkId(f, 0)).i32(1).u64(0).u64(0);
+        w.chunkId(new ChunkId(f, 0)).i32(1).u64(0).u64(0).string("test");
         TaggedFields.of(java.util.Map.of(99, new byte[]{1, 2, 3})).writeTo(w);
         var decoded = Messages.Append.decode(ByteBuffer.wrap(w.toBytes()));
-        assertEquals(new Messages.Append(new ChunkId(f, 0), 1, 0, 0), decoded);
+        assertEquals(new Messages.Append(new ChunkId(f, 0), 1, 0, 0, StrataNamespace.of("test")), decoded);
     }
 }

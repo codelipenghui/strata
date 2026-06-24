@@ -36,7 +36,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             // defers until durability per the chunk's policy — for ack-on-fsync that means a
             // covering group-commit force, while this connection keeps processing frames
             var m = Messages.Append.decode(req.headerSlice());
-            return store.appendAsync(m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
+            return store.appendAsync(m.namespace(), m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
                             req.payloadSlice())
                     .thenApply(r -> ScpServer.ok(req, new Messages.AppendResp(r.endOffset()).encode(), null));
         }
@@ -66,33 +66,33 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 // Client read: open reads are bounded to the replica-known durable high watermark, so
                 // both open durable-prefix reads and sealed reads can use a zero-copy file region.
                 var m = Messages.Read.decode(h);
-                yield readRegionResponse(req, store.readRegion(m.chunkId(), m.offset(), m.maxBytes()));
+                yield readRegionResponse(req, store.readRegion(m.namespace(), m.chunkId(), m.offset(), m.maxBytes()));
             }
 
             case READ_RECOVERY -> {
                 // Seal recovery reads the never-acked tail above the durable watermark (clamped away
                 // from client READs) to re-prove and re-replicate bytes a quorum still holds.
                 var m = Messages.Read.decode(h);
-                yield readRegionResponse(req, store.readRegionForRecovery(m.chunkId(), m.offset(), m.maxBytes()));
+                yield readRegionResponse(req, store.readRegionForRecovery(m.namespace(), m.chunkId(), m.offset(), m.maxBytes()));
             }
 
             case FENCE -> {
                 var m = Messages.Fence.decode(h);
-                var r = store.fence(m.chunkId(), m.fenceEpoch());
+                var r = store.fence(m.namespace(), m.chunkId(), m.fenceEpoch());
                 yield ScpServer.ok(req, new Messages.FenceResp(r.persistedFenceEpoch(), r.localEndOffset(),
                         r.lastKnownDO(), r.state()).encode(), null);
             }
 
             case STAT_CHUNK -> {
                 var m = Messages.StatChunk.decode(h);
-                var r = store.stat(m.chunkId());
+                var r = store.stat(m.namespace(), m.chunkId());
                 yield ScpServer.ok(req, new Messages.StatResp(r.state(), r.localEndOffset(), r.lastKnownDO(),
                         r.writeEpoch(), r.fenceEpoch(), r.sealedLength(), r.dataCrc()).encode(), null);
             }
 
             case SEAL_CHUNK -> {
                 var m = Messages.SealChunk.decode(h);
-                var r = store.seal(m.chunkId(), m.writeEpoch(), m.dataLength(),
+                var r = store.seal(m.namespace(), m.chunkId(), m.writeEpoch(), m.dataLength(),
                         req.payloadLength() > 0 ? req.payloadSlice() : null);
                 yield ScpServer.ok(req, new Messages.SealResp(r.finalLength(), r.dataCrc()).encode(), null);
             }
@@ -100,20 +100,20 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case DELETE_CHUNKS -> {
                 var m = Messages.DeleteChunks.decode(h);
                 List<Short> codes = new ArrayList<>(m.chunkIds().size());
-                for (var id : m.chunkIds()) codes.add(store.delete(id).code);
+                for (var id : m.chunkIds()) codes.add(store.delete(m.namespace(), id).code);
                 yield ScpServer.ok(req, new Messages.DeleteChunksResp(m.chunkIds(), codes).encode(), null);
             }
 
             case FETCH_CHUNK -> {
                 var m = Messages.FetchChunk.decode(h);
-                var r = store.fetch(m.chunkId(), m.offset(), m.maxBytes());
+                var r = store.fetch(m.namespace(), m.chunkId(), m.offset(), m.maxBytes());
                 yield ScpServer.ok(req, new Messages.FetchResp(r.fileLength(), r.state()).encode(),
                         ByteBuffer.wrap(r.bytes()));
             }
 
             case READ_LEDGER -> {
                 var m = Messages.ReadLedger.decode(h);
-                List<ChunkFormats.LedgerEntry> entries = store.readLedger(m.chunkId(), m.fromOffset());
+                List<ChunkFormats.LedgerEntry> entries = store.readLedger(m.namespace(), m.chunkId(), m.fromOffset());
                 List<Messages.LedgerEntry> wire = new ArrayList<>(entries.size());
                 for (var e : entries) wire.add(new Messages.LedgerEntry(e.endOffset(), e.payloadCrc(), e.writeEpoch()));
                 yield ScpServer.ok(req, new Messages.ReadLedgerResp(wire).encode(), null);

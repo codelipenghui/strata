@@ -131,17 +131,22 @@ public final class Messages {
         }
     }
 
-    public record Append(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset) {
+    public record Append(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset,
+                         StrataNamespace namespace) {
+        public Append {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
-            // fixed 41 bytes: chunkId 20 + i32 4 + u64 8 + u64 8 + noTags 1 — size exactly so the
-            // per-append writer never over-allocates (this runs once per record, for all 3 replicas)
-            BufWriter w = new BufWriter(41);
-            w.chunkId(chunkId).i32(writeEpoch).u64(baseOffset).u64(durableOffset).noTags();
+            BufWriter w = new BufWriter();
+            w.chunkId(chunkId).i32(writeEpoch).u64(baseOffset).u64(durableOffset)
+                    .string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static Append decode(ByteBuffer b) {
-            Append m = new Append(ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong());
+            Append m = new Append(ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong(),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -162,15 +167,20 @@ public final class Messages {
         }
     }
 
-    public record Read(ChunkId chunkId, long offset, int maxBytes) {
+    public record Read(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace) {
+        public Read {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(offset).u32(maxBytes).noTags();
+            w.chunkId(chunkId).u64(offset).u32(maxBytes).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static Read decode(ByteBuffer b) {
-            Read m = new Read(ChunkId.readFrom(b), b.getLong(), b.getInt());
+            Read m = new Read(ChunkId.readFrom(b), b.getLong(), b.getInt(),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -191,15 +201,20 @@ public final class Messages {
         }
     }
 
-    public record Fence(ChunkId chunkId, int fenceEpoch) {
+    public record Fence(ChunkId chunkId, int fenceEpoch, StrataNamespace namespace) {
+        public Fence {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(fenceEpoch).noTags();
+            w.chunkId(chunkId).i32(fenceEpoch).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static Fence decode(ByteBuffer b) {
-            Fence m = new Fence(ChunkId.readFrom(b), b.getInt());
+            Fence m = new Fence(ChunkId.readFrom(b), b.getInt(),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -220,15 +235,20 @@ public final class Messages {
         }
     }
 
-    public record StatChunk(ChunkId chunkId) {
+    public record StatChunk(ChunkId chunkId, StrataNamespace namespace) {
+        public StatChunk {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).noTags();
+            w.chunkId(chunkId).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static StatChunk decode(ByteBuffer b) {
-            StatChunk m = new StatChunk(ChunkId.readFrom(b));
+            StatChunk m = new StatChunk(ChunkId.readFrom(b),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -252,15 +272,20 @@ public final class Messages {
         }
     }
 
-    public record SealChunk(ChunkId chunkId, int writeEpoch, long dataLength) {
+    public record SealChunk(ChunkId chunkId, int writeEpoch, long dataLength, StrataNamespace namespace) {
+        public SealChunk {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(writeEpoch).u64(dataLength).noTags();
+            w.chunkId(chunkId).i32(writeEpoch).u64(dataLength).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static SealChunk decode(ByteBuffer b) {
-            SealChunk m = new SealChunk(ChunkId.readFrom(b), b.getInt(), b.getLong());
+            SealChunk m = new SealChunk(ChunkId.readFrom(b), b.getInt(), b.getLong(),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -281,16 +306,17 @@ public final class Messages {
         }
     }
 
-    public record DeleteChunks(List<ChunkId> chunkIds) {
+    public record DeleteChunks(List<ChunkId> chunkIds, StrataNamespace namespace) {
         public DeleteChunks {
             chunkIds = List.copyOf(chunkIds);
+            namespace = Objects.requireNonNull(namespace, "namespace");
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.varint(chunkIds.size());
             for (ChunkId c : chunkIds) w.chunkId(c);
-            w.noTags();
+            w.string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
@@ -298,8 +324,9 @@ public final class Messages {
             int n = count(b);
             List<ChunkId> ids = new ArrayList<>(n);
             for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
+            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             TaggedFields.readFrom(b);
-            return new DeleteChunks(ids);
+            return new DeleteChunks(ids, namespace);
         }
     }
 
@@ -336,15 +363,20 @@ public final class Messages {
         }
     }
 
-    public record FetchChunk(ChunkId chunkId, long offset, int maxBytes) {
+    public record FetchChunk(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace) {
+        public FetchChunk {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(offset).u32(maxBytes).noTags();
+            w.chunkId(chunkId).u64(offset).u32(maxBytes).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static FetchChunk decode(ByteBuffer b) {
-            FetchChunk m = new FetchChunk(ChunkId.readFrom(b), b.getLong(), b.getInt());
+            FetchChunk m = new FetchChunk(ChunkId.readFrom(b), b.getLong(), b.getInt(),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -365,15 +397,20 @@ public final class Messages {
         }
     }
 
-    public record ReadLedger(ChunkId chunkId, long fromOffset) {
+    public record ReadLedger(ChunkId chunkId, long fromOffset, StrataNamespace namespace) {
+        public ReadLedger {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(fromOffset).noTags();
+            w.chunkId(chunkId).u64(fromOffset).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static ReadLedger decode(ByteBuffer b) {
-            ReadLedger m = new ReadLedger(ChunkId.readFrom(b), b.getLong());
+            ReadLedger m = new ReadLedger(ChunkId.readFrom(b), b.getLong(),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -530,6 +567,7 @@ public final class Messages {
                 case DeleteCmd d -> {
                     w.u8(2).varint(d.chunkIds().size());
                     for (ChunkId id : d.chunkIds()) w.chunkId(id);
+                    w.string(d.namespace().toString());
                 }
                 case DrainCmd dr -> w.u8(3);
             }
@@ -552,7 +590,8 @@ public final class Messages {
                     int n = count(b);
                     List<ChunkId> ids = new ArrayList<>(n);
                     for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
-                    yield new DeleteCmd(id, ids);
+                    StrataNamespace delNs = StrataNamespace.of(Varint.readString(b));
+                    yield new DeleteCmd(id, ids, delNs);
                 }
                 case 3 -> new DrainCmd(id);
                 default -> throw new IllegalArgumentException("unknown command type " + type);
@@ -569,9 +608,10 @@ public final class Messages {
         }
     }
 
-    public record DeleteCmd(long commandId, List<ChunkId> chunkIds) implements Command {
+    public record DeleteCmd(long commandId, List<ChunkId> chunkIds, StrataNamespace namespace) implements Command {
         public DeleteCmd {
             chunkIds = List.copyOf(chunkIds);
+            namespace = Objects.requireNonNull(namespace, "namespace");
         }
     }
 
@@ -602,7 +642,12 @@ public final class Messages {
         }
     }
 
-    public record InventoryEntry(ChunkId chunkId, ChunkState state, long length, int crc) {}
+    public record InventoryEntry(ChunkId chunkId, ChunkState state, long length, int crc,
+                                 StrataNamespace namespace) {
+        public InventoryEntry {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+    }
 
     public record InventoryReport(int nodeId, long incMsb, long incLsb, long sessionEpoch,
                                   int shardIndex, int shardCount, List<InventoryEntry> entries) {
@@ -615,7 +660,8 @@ public final class Messages {
             w.u32(nodeId).u64(incMsb).u64(incLsb).u64(sessionEpoch).u32(shardIndex).u32(shardCount);
             w.varint(entries.size());
             for (InventoryEntry e : entries) {
-                w.chunkId(e.chunkId()).u8(e.state().value).u64(e.length()).u32(e.crc());
+                w.chunkId(e.chunkId()).u8(e.state().value).u64(e.length()).u32(e.crc())
+                 .string(e.namespace().toString());
             }
             w.noTags();
             return w.toBytes();
@@ -628,7 +674,12 @@ public final class Messages {
             int n = count(b);
             List<InventoryEntry> es = new ArrayList<>(n);
             for (int i = 0; i < n; i++) {
-                es.add(new InventoryEntry(ChunkId.readFrom(b), ChunkState.fromValue(b.get()), b.getLong(), b.getInt()));
+                ChunkId chunkId = ChunkId.readFrom(b);
+                ChunkState state = ChunkState.fromValue(b.get());
+                long length = b.getLong();
+                int crc = b.getInt();
+                StrataNamespace ns = StrataNamespace.of(Varint.readString(b));
+                es.add(new InventoryEntry(chunkId, state, length, crc, ns));
             }
             TaggedFields.readFrom(b);
             return new InventoryReport(nodeId, incMsb, incLsb, sessionEpoch, shard, shardCount, es);

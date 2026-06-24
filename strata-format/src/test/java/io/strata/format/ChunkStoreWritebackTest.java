@@ -53,7 +53,7 @@ class ChunkStoreWritebackTest {
         byte[] out = new byte[len];
         int off = 0;
         while (off < len) {
-            byte[] chunk = store.read(id, off, len - off).bytes();
+            byte[] chunk = store.read(TEST_NS, id, off, len - off).bytes();
             if (chunk.length == 0) {
                 break;
             }
@@ -69,13 +69,13 @@ class ChunkStoreWritebackTest {
         byte[] all = randomBytes(1, 8 * MIB);            // two 4 MiB ranges
         try (ChunkStore store = new ChunkStore(dir)) {
             store.open(TEST_NS, id, false, 1, 1718000000000L);
-            store.append(id, 1, 0, 0, ByteBuffer.wrap(all, 0, 6 * MIB)); // > 4 MiB threshold
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(all, 0, 6 * MIB)); // > 4 MiB threshold
 
             store.backgroundFlushOnce();
             assertTrue(store.backgroundFlushes() >= 1, "an open chunk past the threshold must be flushed");
 
-            store.append(id, 1, 6 * MIB, 6 * MIB, ByteBuffer.wrap(all, 6 * MIB, 2 * MIB));
-            ChunkStore.SealResult sealed = store.seal(id, 1, all.length, null);
+            store.append(TEST_NS, id, 1, 6 * MIB, 6 * MIB, ByteBuffer.wrap(all, 6 * MIB, 2 * MIB));
+            ChunkStore.SealResult sealed = store.seal(TEST_NS, id, 1, all.length, null);
             assertEquals(wholeCrc(all), sealed.dataCrc(), "background flush must not affect the sealed CRC");
             assertArrayEquals(all, readAllVerified(store, all.length));
         }
@@ -85,7 +85,7 @@ class ChunkStoreWritebackTest {
     void skipsAckOnFsyncChunks() throws IOException {
         try (ChunkStore store = new ChunkStore(dir)) {
             store.open(TEST_NS, id, true, 1, 1718000000000L); // ack-on-fsync: its committer already forces
-            store.append(id, 1, 0, 0, ByteBuffer.wrap(new byte[6 * MIB]));
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(new byte[6 * MIB]));
             store.backgroundFlushOnce();
             assertEquals(0, store.backgroundFlushes(), "ack-on-fsync chunks are flushed by their committer");
         }
@@ -95,7 +95,7 @@ class ChunkStoreWritebackTest {
     void skipsChunksBelowThreshold() throws IOException {
         try (ChunkStore store = new ChunkStore(dir)) {
             store.open(TEST_NS, id, false, 1, 1718000000000L);
-            store.append(id, 1, 0, 0, ByteBuffer.wrap(new byte[1 * MIB])); // < 4 MiB threshold
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(new byte[1 * MIB])); // < 4 MiB threshold
             store.backgroundFlushOnce();
             assertEquals(0, store.backgroundFlushes(), "a chunk below the threshold should not be flushed");
         }
@@ -106,7 +106,7 @@ class ChunkStoreWritebackTest {
         ChunkStore store = new ChunkStore(dir);
         try {
             store.open(TEST_NS, id, false, 1, 1718000000000L);
-            store.append(id, 1, 0, 0, ByteBuffer.wrap(new byte[6 * MIB]));
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(new byte[6 * MIB]));
 
             String rel = ChunkFormats.chunkRelativePath(TEST_NS, id);
             Path shardDir = dir.resolve(rel + ".chunk").getParent();
@@ -115,7 +115,7 @@ class ChunkStoreWritebackTest {
             Files.delete(dir.resolve(rel + ".j"));
             Files.delete(shardDir);
 
-            assertEquals(ErrorCode.OK, store.delete(id),
+            assertEquals(ErrorCode.OK, store.delete(TEST_NS, id),
                     "delete should remove the closed handle even when files disappeared first");
             assertEquals(0, store.backgroundFlushes());
             assertDoesNotThrow(store::backgroundFlushOnce,

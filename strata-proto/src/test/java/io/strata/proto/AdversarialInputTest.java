@@ -9,6 +9,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -63,7 +64,7 @@ class AdversarialInputTest {
         assertTrue(e.getMessage().contains("count"), "got: " + e.getMessage());
 
         // sane messages still decode
-        var del = new Messages.DeleteChunks(java.util.List.of(new ChunkId(FileId.of(1), 0)));
+        var del = new Messages.DeleteChunks(java.util.List.of(new ChunkId(FileId.of(1), 0)), StrataNamespace.of("test"));
         assertEquals(del, Messages.DeleteChunks.decode(ByteBuffer.wrap(del.encode())));
     }
 

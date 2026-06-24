@@ -29,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * be re-issued — never suppressed forever by the in-flight marker.
  */
 class RepairReliabilityTest {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     private TestingServer zk;
     private Controller service;
@@ -204,14 +205,14 @@ class RepairReliabilityTest {
 
         // a CORRECT inventory report changes nothing
         client.call(Opcode.INVENTORY_REPORT, inventory(replica,
-                List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xC0FFEE)))
+                List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xC0FFEE, TEST_NS)))
                 .encode(), null, 5000);
         assertEquals(3, lookup(file.fileId()).chunks().get(0).replicas().size());
 
         // a report with the right id but the WRONG crc means corrupt bytes: the replica must be
         // dropped from the descriptor so it stops being a read/repair source
         client.call(Opcode.INVENTORY_REPORT, inventory(replica,
-                List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD)))
+                List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD, TEST_NS)))
                 .encode(), null, 5000);
         var replicas = lookup(file.fileId()).chunks().get(0).replicas();
         assertEquals(2, replicas.size(), "corrupt replica must be dropped from the descriptor");
@@ -281,7 +282,7 @@ class RepairReliabilityTest {
         // catastrophic: every replica reports a corrupt copy — all three get dropped
         for (var replica : chunk.replicas()) {
             client.call(Opcode.INVENTORY_REPORT, inventory(nodeById(nodes, replica.nodeId()),
-                    List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD)))
+                    List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD, TEST_NS)))
                     .encode(), null, 5000);
         }
 
@@ -312,7 +313,7 @@ class RepairReliabilityTest {
 
         for (var replica : chunk.replicas()) {
             client.call(Opcode.INVENTORY_REPORT, inventory(nodeById(nodes, replica.nodeId()),
-                    List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD)))
+                    List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD, TEST_NS)))
                     .encode(), null, 5000);
         }
         assertEquals(0, lookup(file.fileId()).chunks().get(0).replicas().size());
@@ -396,7 +397,7 @@ class RepairReliabilityTest {
         // re-seals it, FETCH from it fails, and reads to it return short — it must be dropped
         int straggler = chunk.replicas().get(0).nodeId();
         client.call(Opcode.INVENTORY_REPORT, inventory(nodeById(nodes, straggler),
-                List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.OPEN, 40, 0)))
+                List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.OPEN, 40, 0, TEST_NS)))
                 .encode(), null, 5000);
 
         var replicas = lookup(file.fileId()).chunks().get(0).replicas();
@@ -465,7 +466,7 @@ class RepairReliabilityTest {
 
         int droppedNode = chunk.replicas().get(0).nodeId();
         client.call(Opcode.INVENTORY_REPORT, inventory(nodeById(nodes, droppedNode),
-                List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD)))
+                List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD, TEST_NS)))
                 .encode(), null, 5000);
         assertEquals(2, lookup(file.fileId()).chunks().get(0).replicas().size());
 
@@ -543,7 +544,7 @@ class RepairReliabilityTest {
         ChunkId orphan = new ChunkId(FileId.of(1), 0);
 
         client.call(Opcode.INVENTORY_REPORT, inventory(node,
-                List.of(new Messages.InventoryEntry(orphan, ChunkState.SEALED, 100, 0x1234)))
+                List.of(new Messages.InventoryEntry(orphan, ChunkState.SEALED, 100, 0x1234, TEST_NS)))
                 .encode(), null, 5000);
 
         node.heartbeat();
@@ -683,7 +684,7 @@ class RepairReliabilityTest {
 
         int droppedNode = chunk.replicas().get(0).nodeId();
         client.call(Opcode.INVENTORY_REPORT, inventory(nodeById(nodes, droppedNode),
-                List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD)))
+                List.of(new Messages.InventoryEntry(chunk.chunkId(), ChunkState.SEALED, 100, 0xBAD, TEST_NS)))
                 .encode(), null, 5000);
         assertEquals(2, lookup(file.fileId()).chunks().get(0).replicas().size());
 

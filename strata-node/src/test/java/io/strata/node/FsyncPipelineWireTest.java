@@ -47,7 +47,7 @@ class FsyncPipelineWireTest {
             long offset = 0;
             for (int i = 0; i < appends; i++) {
                 futures.add(client.send(Opcode.APPEND,
-                        new Messages.Append(id, 1, offset, offset).encode(), ByteBuffer.wrap(payload)));
+                        new Messages.Append(id, 1, offset, offset, StrataNamespace.of("test")).encode(), ByteBuffer.wrap(payload)));
                 offset += payload.length;
             }
             for (CompletableFuture<Frame> f : futures) {

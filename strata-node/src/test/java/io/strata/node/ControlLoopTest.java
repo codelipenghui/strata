@@ -427,7 +427,7 @@ class ControlLoopTest {
             ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
 
             commands.add(new Messages.DrainCmd(1));
-            commands.add(new Messages.DeleteCmd(2, List.of(new ChunkId(FileId.of(1), 0))));
+            commands.add(new Messages.DeleteCmd(2, List.of(new ChunkId(FileId.of(1), 0)), TEST_NS));
             commands.add(new Messages.ReplicateCmd(3, new ChunkId(FileId.of(2), 1),
                     List.of(), (byte) 0, 0, 0, TEST_NS));
 
@@ -459,10 +459,16 @@ class ControlLoopTest {
             LinkedBlockingQueue<Messages.Command> commands = get(loop, "commandQueue");
             ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
             ChunkId id = new ChunkId(FileId.of(3), 0);
-            Set<ChunkId> creating = getField(node.store(), "creating");
-            creating.add(id);
+            // Simulate a chunk mid-creation: add to the package-private NsChunkId set via reflection.
+            // NsChunkId is package-private in io.strata.format so we construct it reflectively.
+            Set<Object> creating = getField(node.store(), "creating");
+            Class<?> nsChunkIdClass = Class.forName("io.strata.format.NsChunkId");
+            java.lang.reflect.Constructor<?> ctor =
+                    nsChunkIdClass.getDeclaredConstructor(StrataNamespace.class, ChunkId.class);
+            ctor.setAccessible(true);
+            creating.add(ctor.newInstance(TEST_NS, id));
 
-            commands.add(new Messages.DeleteCmd(55, List.of(id)));
+            commands.add(new Messages.DeleteCmd(55, List.of(id), TEST_NS));
 
             Thread worker = Thread.ofVirtual().name("control-loop-test-delete-failure").start(() -> {
                 try {
@@ -511,36 +517,36 @@ class ControlLoopTest {
             ChunkId valid = new ChunkId(FileId.of(4), 0);
             byte[] data = "valid".getBytes();
             store.open(TEST_NS, valid, false, 1, 1L);
-            store.append(valid, 1, 0, 0, ByteBuffer.wrap(data));
-            var sealed = store.seal(valid, 1, data.length, null);
+            store.append(TEST_NS, valid, 1, 0, 0, ByteBuffer.wrap(data));
+            var sealed = store.seal(TEST_NS, valid, 1, data.length, null);
 
             invokeReplicate(loop, new Messages.ReplicateCmd(10, valid, List.of(), (byte) 0,
                     sealed.dataCrc(), data.length, TEST_NS));
-            assertTrue(store.contains(valid));
+            assertTrue(store.contains(TEST_NS, valid));
 
             ChunkId stale = new ChunkId(FileId.of(5), 1);
             store.open(TEST_NS, stale, false, 1, 1L);
-            store.append(stale, 1, 0, 0, ByteBuffer.wrap(data));
-            store.seal(stale, 1, data.length, null);
+            store.append(TEST_NS, stale, 1, 0, 0, ByteBuffer.wrap(data));
+            store.seal(TEST_NS, stale, 1, data.length, null);
 
             ScpException e = assertThrows(ScpException.class,
                     () -> invokeReplicate(loop, new Messages.ReplicateCmd(11, stale, List.of(), (byte) 0,
                             sealed.dataCrc(), data.length + 1, TEST_NS)));
             assertEquals(ErrorCode.INTERNAL, e.code());
-            assertFalse(store.contains(stale), "mismatched local replay copy must be deleted before retrying sources");
+            assertFalse(store.contains(TEST_NS, stale), "mismatched local replay copy must be deleted before retrying sources");
 
             ChunkId crcZeroDescriptor = new ChunkId(FileId.of(6), 2);
             byte[] crcData = "crc-must-not-be-wildcard".getBytes();
             store.open(TEST_NS, crcZeroDescriptor, false, 1, 1L);
-            store.append(crcZeroDescriptor, 1, 0, 0, ByteBuffer.wrap(crcData));
-            int localCrc = store.seal(crcZeroDescriptor, 1, crcData.length, null).dataCrc();
+            store.append(TEST_NS, crcZeroDescriptor, 1, 0, 0, ByteBuffer.wrap(crcData));
+            int localCrc = store.seal(TEST_NS, crcZeroDescriptor, 1, crcData.length, null).dataCrc();
             assertTrue(localCrc != 0, "test payload must exercise the nonzero-local/zero-expected path");
 
             ScpException crcMismatch = assertThrows(ScpException.class,
                     () -> invokeReplicate(loop, new Messages.ReplicateCmd(12, crcZeroDescriptor, List.of(),
                             (byte) 0, 0, crcData.length, TEST_NS)));
             assertEquals(ErrorCode.INTERNAL, crcMismatch.code());
-            assertFalse(store.contains(crcZeroDescriptor),
+            assertFalse(store.contains(TEST_NS, crcZeroDescriptor),
                     "expected CRC zero must not be treated as a wildcard for local replay");
         }
     }
@@ -557,7 +563,7 @@ class ControlLoopTest {
                             (byte) 0, 0, 0, TEST_NS)));
 
             assertEquals(ErrorCode.INTERNAL, e.code());
-            assertFalse(node.store().contains(open));
+            assertFalse(node.store().contains(TEST_NS, open));
         }
     }
 
@@ -584,14 +590,14 @@ class ControlLoopTest {
         try (ChunkStore sourceStore = new ChunkStore(dir.resolve("source-io"));
              DataNode node = new DataNode(DataNodeConfig.standalone(dir.resolve("target-io")))) {
             sourceStore.open(TEST_NS, chunkId, false, 1, 1L);
-            sourceStore.append(chunkId, 1, 0, 0, ByteBuffer.wrap(data));
-            int crc = sourceStore.seal(chunkId, 1, data.length, null).dataCrc();
+            sourceStore.append(TEST_NS, chunkId, 1, 0, 0, ByteBuffer.wrap(data));
+            int crc = sourceStore.seal(TEST_NS, chunkId, 1, data.length, null).dataCrc();
 
             try (ScpServer source = new ScpServer(0, 77, 0, 0, req -> {
                 Opcode op = Opcode.fromCode(req.opcode());
                 if (op == Opcode.FETCH_CHUNK) {
                     Messages.FetchChunk fetch = Messages.FetchChunk.decode(req.headerSlice());
-                    var result = sourceStore.fetch(fetch.chunkId(), fetch.offset(), fetch.maxBytes());
+                    var result = sourceStore.fetch(fetch.namespace(), fetch.chunkId(), fetch.offset(), fetch.maxBytes());
                     return ScpServer.ok(req, new Messages.FetchResp(result.fileLength(), result.state()).encode(),
                             ByteBuffer.wrap(result.bytes()));
                 }
@@ -602,7 +608,7 @@ class ControlLoopTest {
                         new Messages.Replica(11, "127.0.0.1:1"),
                         new Messages.Replica(77, endpoint(source))), (byte) 0, crc, data.length, TEST_NS));
 
-                assertTrue(node.store().contains(chunkId), "repair should continue after a source connection failure");
+                assertTrue(node.store().contains(TEST_NS, chunkId), "repair should continue after a source connection failure");
             }
         }
     }
@@ -614,14 +620,14 @@ class ControlLoopTest {
         try (ChunkStore sourceStore = new ChunkStore(dir.resolve("source"));
              DataNode node = new DataNode(DataNodeConfig.standalone(dir.resolve("target")))) {
             sourceStore.open(TEST_NS, chunkId, false, 1, 1L);
-            sourceStore.append(chunkId, 1, 0, 0, ByteBuffer.wrap(data));
-            int crc = sourceStore.seal(chunkId, 1, data.length, null).dataCrc();
+            sourceStore.append(TEST_NS, chunkId, 1, 0, 0, ByteBuffer.wrap(data));
+            int crc = sourceStore.seal(TEST_NS, chunkId, 1, data.length, null).dataCrc();
 
             try (ScpServer source = new ScpServer(0, 77, 0, 0, req -> {
                 Opcode op = Opcode.fromCode(req.opcode());
                 if (op == Opcode.FETCH_CHUNK) {
                     Messages.FetchChunk fetch = Messages.FetchChunk.decode(req.headerSlice());
-                    var result = sourceStore.fetch(fetch.chunkId(), fetch.offset(), fetch.maxBytes());
+                    var result = sourceStore.fetch(fetch.namespace(), fetch.chunkId(), fetch.offset(), fetch.maxBytes());
                     return ScpServer.ok(req, new Messages.FetchResp(result.fileLength(), result.state()).encode(),
                             ByteBuffer.wrap(result.bytes()));
                 }
@@ -632,7 +638,7 @@ class ControlLoopTest {
                         new Messages.Replica(11, "malformed-source"),
                         new Messages.Replica(77, endpoint(source))), (byte) 0, crc, data.length, TEST_NS));
 
-                assertTrue(node.store().contains(chunkId), "repair should continue to the valid source");
+                assertTrue(node.store().contains(TEST_NS, chunkId), "repair should continue to the valid source");
             }
         }
     }

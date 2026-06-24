@@ -27,6 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class FsyncEndToEndTest {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     private MiniCluster cluster;
     private StrataClient client;
@@ -88,7 +89,7 @@ class FsyncEndToEndTest {
         String[] hp = endpoint.split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "hdr")) {
             var frame = direct.callFrame(Opcode.FETCH_CHUNK,
-                    new Messages.FetchChunk(chunkId, 0, ChunkFormats.HEADER_SIZE).encode(), null, 5000);
+                    new Messages.FetchChunk(chunkId, 0, ChunkFormats.HEADER_SIZE, TEST_NS).encode(), null, 5000);
             ByteBuffer h = frame.headerSlice();
             Resp.check(h);
             byte[] bytes = new byte[frame.payloadLength()];

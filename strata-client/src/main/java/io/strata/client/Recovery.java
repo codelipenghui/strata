@@ -126,7 +126,7 @@ final class Recovery {
             if (r.endpoint().isEmpty()) continue;
             try {
                 ByteBuffer h = appendPool.get(r.endpoint()).call(Opcode.FENCE,
-                        new Messages.Fence(chunkId, writerEpoch).encode(), null, config.callTimeoutMs());
+                        new Messages.Fence(chunkId, writerEpoch, namespace).encode(), null, config.callTimeoutMs());
                 Messages.FenceResp fence = Messages.FenceResp.decode(h);
                 validateFenceResp(chunkId, r, fence);
                 reachable.add(new ReplicaState(r, fence));
@@ -184,7 +184,7 @@ final class Recovery {
         for (ReplicaState rs : reachable) {
             try {
                 ByteBuffer h = readPool.get(rs.replica.endpoint()).call(Opcode.READ_LEDGER,
-                        new Messages.ReadLedger(chunkId, p).encode(), null, config.callTimeoutMs());
+                        new Messages.ReadLedger(chunkId, p, namespace).encode(), null, config.callTimeoutMs());
                 long previousEnd = p;
                 for (Messages.LedgerEntry e : Messages.ReadLedgerResp.decode(h).entries()) {
                     boundaries.computeIfAbsent(e.endOffset(), ignored -> new ArrayList<>())
@@ -375,7 +375,7 @@ final class Recovery {
             // READ_RECOVERY (not client READ): recovery must see the never-acked tail above the
             // donor's durable high watermark — that is exactly the range it is re-proving for seal.
             Frame frame = readPool.get(source.replica.endpoint()).callFrame(Opcode.READ_RECOVERY,
-                    new Messages.Read(chunkId, from, (int) len).encode(), null,
+                    new Messages.Read(chunkId, from, (int) len, namespace).encode(), null,
                     config.callTimeoutMs());
             ByteBuffer h = frame.headerSlice();
             Resp.check(h);
@@ -409,7 +409,7 @@ final class Recovery {
     private void appendAndVerify(ChunkId chunkId, int epoch, ReplicaState target, long durableOffset,
                                  ByteBuffer payload, long expectedEnd) {
         ByteBuffer h = appendPool.get(target.replica.endpoint()).call(Opcode.APPEND,
-                new Messages.Append(chunkId, epoch, target.end, durableOffset).encode(),
+                new Messages.Append(chunkId, epoch, target.end, durableOffset, namespace).encode(),
                 payload, config.callTimeoutMs());
         long actualEnd;
         try {
@@ -445,7 +445,7 @@ final class Recovery {
             Messages.SealResp resp;
             try {
                 ByteBuffer h = appendPool.get(rs.replica.endpoint()).call(Opcode.SEAL_CHUNK,
-                        new Messages.SealChunk(chunkId, epoch, dataLength).encode(), null,
+                        new Messages.SealChunk(chunkId, epoch, dataLength, namespace).encode(), null,
                         config.callTimeoutMs());
                 resp = Messages.SealResp.decode(h);
             } catch (ScpException e) {

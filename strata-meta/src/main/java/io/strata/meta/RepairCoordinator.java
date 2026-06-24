@@ -643,10 +643,10 @@ class RepairCoordinator implements AutoCloseable {
      * non-controller owner has no heartbeat command channel, so it deletes its own namespaces' chunks
      * this way. True if the node acked the chunk gone (deleted, or already absent).
      */
-    private boolean execDelete(Records.NodeRecord node, ChunkId chunkId) {
+    private boolean execDelete(Records.NodeRecord node, ChunkId chunkId, io.strata.common.StrataNamespace ns) {
         return directNodeCall(node, chunkId, "owner-delete", (client, timeoutMs) -> {
             ByteBuffer resp = client.call(Opcode.DELETE_CHUNKS,
-                    new Messages.DeleteChunks(List.of(chunkId)).encode(), null, timeoutMs);
+                    new Messages.DeleteChunks(List.of(chunkId), ns).encode(), null, timeoutMs);
             Messages.DeleteChunksResp r = Messages.DeleteChunksResp.decode(resp);
             short code = r.codes().isEmpty() ? ErrorCode.OK.code : r.codes().get(0);
             return code == ErrorCode.OK.code || code == ErrorCode.CHUNK_NOT_FOUND.code;
@@ -747,7 +747,7 @@ class RepairCoordinator implements AutoCloseable {
                     long cmdId = commandIds.incrementAndGet();
                     inflight.put(cmdId, new DeleteAction(file.fileId(), chunkId, nodeId,
                             System.currentTimeMillis()));
-                    registry.enqueue(nodeId, new Messages.DeleteCmd(cmdId, List.of(chunkId)));
+                    registry.enqueue(nodeId, new Messages.DeleteCmd(cmdId, List.of(chunkId), file.namespace()));
                 }
             }
         }
@@ -781,7 +781,7 @@ class RepairCoordinator implements AutoCloseable {
                 if (node == null || node.state() == Records.NodeState.DEAD) {
                     // node gone/dead — its data is unreachable; drop the replica so deletion can converge
                     applyDeleteConfirmed(file.fileId(), chunkId, nodeId);
-                } else if (execDelete(node, chunkId)) {
+                } else if (execDelete(node, chunkId, file.namespace())) {
                     applyDeleteConfirmed(file.fileId(), chunkId, nodeId);
                 }
                 // else: still present — a later ownerRepairPass retries
@@ -982,7 +982,8 @@ class RepairCoordinator implements AutoCloseable {
             // fetch every file a second time (reconciliation already tolerates a stale snapshot)
             Map<FileId, Optional<MetadataStore.Versioned<Records.FileRecord>>> records = new java.util.HashMap<>();
             // orphan detection
-            List<ChunkId> orphans = new ArrayList<>();
+            // orphansByNs: namespace -> list of orphan chunkIds in that namespace
+            java.util.Map<io.strata.common.StrataNamespace, List<ChunkId>> orphansByNs = new java.util.LinkedHashMap<>();
             for (Messages.InventoryEntry e : report.entries()) {
                 Optional<MetadataStore.Versioned<Records.FileRecord>> opt = cachedFile(records, e.chunkId().fileId());
                 boolean known = false;
@@ -1000,14 +1001,15 @@ class RepairCoordinator implements AutoCloseable {
                 // namespace owned by another controller node — deleting it would destroy that owner's data.
                 if (!known && !isRepairProtected(e.chunkId(), report.nodeId())
                         && (ownsAll.getAsBoolean() || opt.isPresent())) {
-                    orphans.add(e.chunkId());
+                    orphansByNs.computeIfAbsent(e.namespace(), k -> new ArrayList<>()).add(e.chunkId());
                 }
             }
-            if (!orphans.isEmpty()) {
+            for (var nsOrphans : orphansByNs.entrySet()) {
                 long cmdId = commandIds.incrementAndGet();
                 // no inflight action needed: orphan deletion has no descriptor effect
-                registry.enqueue(report.nodeId(), new Messages.DeleteCmd(cmdId, orphans));
-                log.info("node {}: {} orphan chunk(s) scheduled for deletion", report.nodeId(), orphans.size());
+                registry.enqueue(report.nodeId(), new Messages.DeleteCmd(cmdId, nsOrphans.getValue(), nsOrphans.getKey()));
+                log.info("node {}: {} orphan chunk(s) in ns={} scheduled for deletion",
+                        report.nodeId(), nsOrphans.getValue().size(), nsOrphans.getKey());
             }
             // missing or corrupt detection: a sealed chunk this node should hold must be reported
             // with the descriptor's exact length and crc — right id with wrong bytes is corruption
@@ -1047,7 +1049,7 @@ class RepairCoordinator implements AutoCloseable {
                                 replicaMissingSince.remove(missKey);
                                 applyDeleteConfirmed(fileId, chunkId, report.nodeId());
                                 registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
-                                        commandIds.incrementAndGet(), List.of(chunkId)));
+                                        commandIds.incrementAndGet(), List.of(chunkId), file.namespace()));
                             }
                         } else if (entry.length() != c.length() || entry.crc() != c.crc()) {
                             replicaMissingSince.remove(missKey); // definitely reported; this copy is corrupt
@@ -1059,7 +1061,7 @@ class RepairCoordinator implements AutoCloseable {
                             // node as the add-repair target, and the corrupt bytes must be gone first
                             // (FIFO command delivery guarantees delete-before-replicate)
                             registry.enqueue(report.nodeId(), new Messages.DeleteCmd(
-                                    commandIds.incrementAndGet(), List.of(chunkId)));
+                                    commandIds.incrementAndGet(), List.of(chunkId), file.namespace()));
                         } else {
                             replicaMissingSince.remove(missKey); // healthy report — clear any pending anomaly
                         }

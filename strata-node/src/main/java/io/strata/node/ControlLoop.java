@@ -191,7 +191,7 @@ final class ControlLoop implements AutoCloseable {
                     case Messages.ReplicateCmd r -> replicate(r);
                     case Messages.DeleteCmd d -> {
                         for (var id : d.chunkIds()) {
-                            ErrorCode result = store.delete(id);
+                            ErrorCode result = store.delete(d.namespace(), id);
                             if (result != ErrorCode.OK && result != ErrorCode.CHUNK_NOT_FOUND) {
                                 throw new ScpException(result, "delete " + id + " failed");
                             }
@@ -211,10 +211,10 @@ final class ControlLoop implements AutoCloseable {
     }
 
     void replicate(Messages.ReplicateCmd cmd) throws IOException {
-        if (store.contains(cmd.chunkId())) {
+        if (store.contains(cmd.namespace(), cmd.chunkId())) {
             // command replay — but only a VALID copy counts: a local chunk whose seal state or
             // crc/length mismatch the descriptor is corrupt and must be replaced, not trusted
-            var stat = store.stat(cmd.chunkId());
+            var stat = store.stat(cmd.namespace(), cmd.chunkId());
             if (stat.state() == io.strata.common.ChunkState.SEALED
                     && stat.sealedLength() == cmd.expectedLength()
                     && stat.dataCrc() == cmd.expectedCrc()) {
@@ -222,7 +222,7 @@ final class ControlLoop implements AutoCloseable {
             }
             log.warn("local copy of {} mismatches descriptor (state={} len={} crc={}) — re-pulling",
                     cmd.chunkId(), stat.state(), stat.sealedLength(), stat.dataCrc());
-            ErrorCode deleteResult = store.delete(cmd.chunkId());
+            ErrorCode deleteResult = store.delete(cmd.namespace(), cmd.chunkId());
             if (deleteResult != ErrorCode.OK && deleteResult != ErrorCode.CHUNK_NOT_FOUND) {
                 throw new ScpException(deleteResult, "delete stale local copy of " + cmd.chunkId() + " failed");
             }
@@ -265,7 +265,7 @@ final class ControlLoop implements AutoCloseable {
         try (FileChannel out = FileChannel.open(output,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
             while (fileLength < 0 || offset < fileLength) {
-                var fetch = new Messages.FetchChunk(cmd.chunkId(), offset, FETCH_CHUNK_BYTES);
+                var fetch = new Messages.FetchChunk(cmd.chunkId(), offset, FETCH_CHUNK_BYTES, cmd.namespace());
                 var frame = src.callFrame(Opcode.FETCH_CHUNK, fetch.encode(), null, CALL_TIMEOUT_MS);
                 Messages.FetchResp resp;
                 try {
@@ -348,7 +348,7 @@ final class ControlLoop implements AutoCloseable {
                 if (m == null || sessionEpoch < 0) continue;
                 List<Messages.InventoryEntry> entries = new ArrayList<>();
                 for (var item : store.inventory()) {
-                    entries.add(new Messages.InventoryEntry(item.chunkId(), item.state(), item.length(), item.crc()));
+                    entries.add(new Messages.InventoryEntry(item.chunkId(), item.state(), item.length(), item.crc(), item.namespace()));
                 }
                 var report = new Messages.InventoryReport(node.nodeId(),
                         node.incarnation().getMostSignificantBits(), node.incarnation().getLeastSignificantBits(),

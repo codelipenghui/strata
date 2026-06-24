@@ -36,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * always the same: NO ACKED BYTE IS EVER LOST, and no fenced writer can ack again.
  */
 class FailureRecoveryTest {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     private MiniCluster cluster;
     private StrataClient client;
@@ -433,7 +434,7 @@ class FailureRecoveryTest {
         String[] hp = fencedReplica.endpoint().split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                 ScpClient.KIND_BROKER, "fence")) {
-            direct.call(Opcode.FENCE, new Messages.Fence(openChunk.chunkId(), 3).encode(), null, 5000);
+            direct.call(Opcode.FENCE, new Messages.Fence(openChunk.chunkId(), 3, TEST_NS).encode(), null, 5000);
         }
 
         ScpException e = assertThrows(ScpException.class, () -> client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal());
@@ -617,7 +618,7 @@ class FailureRecoveryTest {
             cluster.restartZooKeeper();
         }
         cluster.startControllers();
-        cluster.startDataNodes(hosts);
+        cluster.startDataNodes(hosts, nodeIds);
         for (int i = 0; i < nodeIds.size(); i++) {
             waitForNodeId(cluster.nodes.get(i), nodeIds.get(i));
         }
@@ -647,7 +648,7 @@ class FailureRecoveryTest {
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                 ScpClient.KIND_TOOL, "dirty-open-tail")) {
             ByteBuffer h = direct.call(Opcode.APPEND,
-                    new Messages.Append(chunk.chunkId(), chunk.writeEpoch(), baseOffset, durableOffset).encode(),
+                    new Messages.Append(chunk.chunkId(), chunk.writeEpoch(), baseOffset, durableOffset, TEST_NS).encode(),
                     ByteBuffer.wrap(payload), 5000);
             assertEquals(baseOffset + payload.length, Messages.AppendResp.decode(h).endOffset());
         }

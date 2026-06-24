@@ -187,6 +187,16 @@ final class MiniCluster implements AutoCloseable {
         }
     }
 
+    /** Restarts data nodes on their original data dirs with the supplied node IDs (for cold-restart tests). */
+    void startDataNodes(List<String> hosts, List<Integer> nodeIds) throws IOException {
+        for (int i = 0; i < hosts.size(); i++) {
+            Path dir = root.resolve(hosts.get(i));
+            DataNode node = new DataNode(
+                    DataNodeConfig.withMetadata(dir, metaEndpoints(), hosts.get(i)).withNodeId(nodeIds.get(i)));
+            nodes.add(node);
+        }
+    }
+
     void awaitRegistered(int count) throws Exception {
         try (ZkMetadataStore store = new ZkMetadataStore(zkConnect)) {
             long deadline = System.currentTimeMillis() + 15_000;

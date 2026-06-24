@@ -148,9 +148,9 @@ class DataNodeWireTest {
             // pipelined appends
             byte[] a = "first-batch-".getBytes(), b = "second-batch".getBytes();
             CompletableFuture<Frame> f1 = client.send(Opcode.APPEND,
-                    new Messages.Append(id, 1, 0, 0).encode(), ByteBuffer.wrap(a));
+                    new Messages.Append(id, 1, 0, 0, TEST_NS).encode(), ByteBuffer.wrap(a));
             CompletableFuture<Frame> f2 = client.send(Opcode.APPEND,
-                    new Messages.Append(id, 1, a.length, 0).encode(), ByteBuffer.wrap(b));
+                    new Messages.Append(id, 1, a.length, 0, TEST_NS).encode(), ByteBuffer.wrap(b));
             ByteBuffer h1 = f1.get().headerSlice();
             Resp.check(h1);
             assertEquals(a.length, Messages.AppendResp.decode(h1).endOffset());
@@ -158,13 +158,13 @@ class DataNodeWireTest {
             Resp.check(h2);
             assertEquals(a.length + b.length, Messages.AppendResp.decode(h2).endOffset());
             ByteBuffer h3 = client.call(Opcode.APPEND,
-                    new Messages.Append(id, 1, a.length + b.length, a.length + b.length).encode(),
+                    new Messages.Append(id, 1, a.length + b.length, a.length + b.length, TEST_NS).encode(),
                     ByteBuffer.allocate(0), 5000);
             assertEquals(a.length + b.length, Messages.AppendResp.decode(h3).endOffset());
 
             // read with payload
             Frame readFrame = client.callFrame(Opcode.READ,
-                    new Messages.Read(id, 0, 1 << 20).encode(), null, 5000);
+                    new Messages.Read(id, 0, 1 << 20, TEST_NS).encode(), null, 5000);
             ByteBuffer rh = readFrame.headerSlice();
             Resp.check(rh);
             var readResp = Messages.ReadResp.decode(rh);
@@ -174,40 +174,40 @@ class DataNodeWireTest {
             assertArrayEquals("first-batch-second-batch".getBytes(), got);
 
             // ledger over the wire
-            ByteBuffer lh = client.call(Opcode.READ_LEDGER, new Messages.ReadLedger(id, 0).encode(), null, 5000);
+            ByteBuffer lh = client.call(Opcode.READ_LEDGER, new Messages.ReadLedger(id, 0, TEST_NS).encode(), null, 5000);
             var ledger = Messages.ReadLedgerResp.decode(lh);
             assertEquals(2, ledger.entries().size());
             assertEquals(a.length, ledger.entries().get(0).endOffset());
 
             // fence at 2 -> epoch-1 append rejected with typed error
-            client.call(Opcode.FENCE, new Messages.Fence(id, 2).encode(), null, 5000);
+            client.call(Opcode.FENCE, new Messages.Fence(id, 2, TEST_NS).encode(), null, 5000);
             ScpException fenced = assertThrows(ScpException.class, () -> client.call(Opcode.APPEND,
-                    new Messages.Append(id, 1, a.length + b.length, 0).encode(),
+                    new Messages.Append(id, 1, a.length + b.length, 0, TEST_NS).encode(),
                     ByteBuffer.wrap("x".getBytes()), 5000));
             assertEquals(ErrorCode.FENCED_EPOCH, fenced.code());
             assertEquals(2, fenced.detail());
 
             // seal with the post-fence epoch
             ByteBuffer sh = client.call(Opcode.SEAL_CHUNK,
-                    new Messages.SealChunk(id, 2, a.length + b.length).encode(), null, 5000);
+                    new Messages.SealChunk(id, 2, a.length + b.length, TEST_NS).encode(), null, 5000);
             var sealResp = Messages.SealResp.decode(sh);
             assertEquals(a.length + b.length, sealResp.finalLength());
 
             // stat reflects sealed state
-            ByteBuffer sth = client.call(Opcode.STAT_CHUNK, new Messages.StatChunk(id).encode(), null, 5000);
+            ByteBuffer sth = client.call(Opcode.STAT_CHUNK, new Messages.StatChunk(id, TEST_NS).encode(), null, 5000);
             var stat = Messages.StatResp.decode(sth);
             assertEquals(ChunkState.SEALED, stat.state());
             assertEquals(a.length + b.length, stat.sealedLength());
 
             // fetch whole file and delete
             Frame fetch = client.callFrame(Opcode.FETCH_CHUNK,
-                    new Messages.FetchChunk(id, 0, Integer.MAX_VALUE).encode(), null, 5000);
+                    new Messages.FetchChunk(id, 0, Integer.MAX_VALUE, TEST_NS).encode(), null, 5000);
             ByteBuffer fh = fetch.headerSlice();
             Resp.check(fh);
             assertEquals(Messages.FetchResp.decode(fh).fileLength(), fetch.payloadLength());
 
             ByteBuffer dh = client.call(Opcode.DELETE_CHUNKS,
-                    new Messages.DeleteChunks(List.of(id)).encode(), null, 5000);
+                    new Messages.DeleteChunks(List.of(id), TEST_NS).encode(), null, 5000);
             var del = Messages.DeleteChunksResp.decode(dh);
             assertEquals((short) 0, del.codes().get(0));
         }
@@ -219,13 +219,13 @@ class DataNodeWireTest {
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
                     1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
-            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0).encode(),
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
                     ByteBuffer.wrap("SAFE".getBytes()), 5000);
-            client.call(Opcode.APPEND, new Messages.Append(id, 1, 4, 4).encode(),
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 4, 4, TEST_NS).encode(),
                     ByteBuffer.wrap("TAIL".getBytes()), 5000);
 
             Frame prefix = client.callFrame(Opcode.READ,
-                    new Messages.Read(id, 0, 1024).encode(), null, 5000);
+                    new Messages.Read(id, 0, 1024, TEST_NS).encode(), null, 5000);
             ByteBuffer header = prefix.headerSlice();
             Resp.check(header);
             var resp = Messages.ReadResp.decode(header);
@@ -236,7 +236,7 @@ class DataNodeWireTest {
             assertArrayEquals("SAFE".getBytes(), got);
 
             Frame tail = client.callFrame(Opcode.READ,
-                    new Messages.Read(id, 4, 1024).encode(), null, 5000);
+                    new Messages.Read(id, 4, 1024, TEST_NS).encode(), null, 5000);
             ByteBuffer tailHeader = tail.headerSlice();
             Resp.check(tailHeader);
             var tailResp = Messages.ReadResp.decode(tailHeader);
@@ -255,14 +255,14 @@ class DataNodeWireTest {
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_TOOL, "recovery")) {
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
                     1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
-            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0).encode(),
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
                     ByteBuffer.wrap("SAFE".getBytes()), 5000);
-            client.call(Opcode.APPEND, new Messages.Append(id, 1, 4, 4).encode(),
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 4, 4, TEST_NS).encode(),
                     ByteBuffer.wrap("TAIL".getBytes()), 5000);
 
             // recovery reads the un-acked tail [4,8) that the clamped client READ refuses to serve
             Frame tail = client.callFrame(Opcode.READ_RECOVERY,
-                    new Messages.Read(id, 4, 1024).encode(), null, 5000);
+                    new Messages.Read(id, 4, 1024, TEST_NS).encode(), null, 5000);
             ByteBuffer tailHeader = tail.headerSlice();
             Resp.check(tailHeader);
             var tailResp = Messages.ReadResp.decode(tailHeader);
@@ -274,7 +274,7 @@ class DataNodeWireTest {
 
             // and the full range is served from offset 0, verified against the integrity ledger
             Frame full = client.callFrame(Opcode.READ_RECOVERY,
-                    new Messages.Read(id, 0, 1024).encode(), null, 5000);
+                    new Messages.Read(id, 0, 1024, TEST_NS).encode(), null, 5000);
             Resp.check(full.headerSlice());
             byte[] all = new byte[full.payloadLength()];
             full.payloadSlice().get(all);
@@ -293,25 +293,25 @@ class DataNodeWireTest {
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
                     1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
-            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0).encode(),
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
                     ByteBuffer.wrap(payload), 5000);
-            client.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(id, 1, payload.length).encode(), null, 5000);
+            client.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(id, 1, payload.length, TEST_NS).encode(), null, 5000);
 
             corruptChunkDataByte(dir.resolve("chunks"), id, 3);
 
             // the verified materialize path still rejects corruption at read time
             assertEquals(ErrorCode.CRC_MISMATCH,
-                    assertThrows(ScpException.class, () -> node.store().read(id, 0, payload.length)).code());
+                    assertThrows(ScpException.class, () -> node.store().read(TEST_NS, id, 0, payload.length)).code());
 
             // zero-copy readRegion does NOT verify — it returns a channel region over the bytes
-            try (var region = node.store().readRegion(id, 0, payload.length)) {
+            try (var region = node.store().readRegion(TEST_NS, id, 0, payload.length)) {
                 assertEquals(payload.length, region.length());
                 assertNotNull(region.channel(), "sealed readRegion must be a zero-copy channel region");
             }
 
             // the wire READ (zero-copy) succeeds without a read-time CRC error
             Frame frame = client.callFrame(Opcode.READ,
-                    new Messages.Read(id, 0, payload.length).encode(), null, 5000);
+                    new Messages.Read(id, 0, payload.length, TEST_NS).encode(), null, 5000);
             Resp.check(frame.headerSlice());
         }
     }
@@ -354,7 +354,7 @@ class DataNodeWireTest {
                     1 << 20, 1L, TEST_NS).encode(), null, 5000);
 
             ScpException malformedFooter = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK,
-                    new Messages.SealChunk(chunk, 1, 0).encode(), ByteBuffer.wrap(new byte[] {1}), 5000));
+                    new Messages.SealChunk(chunk, 1, 0, TEST_NS).encode(), ByteBuffer.wrap(new byte[] {1}), 5000));
             assertEquals(ErrorCode.PRECONDITION_FAILED, malformedFooter.code());
         }
     }
@@ -367,12 +367,12 @@ class DataNodeWireTest {
             incarnation = node.incarnation();
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
                     1 << 20, 1L, TEST_NS).encode(), null, 5000);
-            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0).encode(),
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
                     ByteBuffer.wrap("persistent".getBytes()), 5000);
         }
         try (DataNode node2 = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node2.port(), ScpClient.KIND_BROKER, "t")) {
-            ByteBuffer sth = client.call(Opcode.STAT_CHUNK, new Messages.StatChunk(id).encode(), null, 5000);
+            ByteBuffer sth = client.call(Opcode.STAT_CHUNK, new Messages.StatChunk(id, TEST_NS).encode(), null, 5000);
             var stat = Messages.StatResp.decode(sth);
             assertEquals(ChunkState.OPEN, stat.state());
             assertEquals("persistent".length(), stat.localEndOffset());

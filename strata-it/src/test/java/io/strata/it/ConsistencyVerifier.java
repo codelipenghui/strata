@@ -26,6 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Shared black-box consistency checks for integration and fault tests. */
 final class ConsistencyVerifier {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
     private static final int CALL_TIMEOUT_MS = 5_000;
     private static final int FETCH_CHUNK_BYTES = 4 * 1024 * 1024;
 
@@ -286,7 +287,7 @@ final class ConsistencyVerifier {
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                 ScpClient.KIND_TOOL, "fault-seal")) {
             ByteBuffer h = direct.call(Opcode.SEAL_CHUNK,
-                    new Messages.SealChunk(chunk.chunkId(), chunk.writeEpoch(), dataLength).encode(),
+                    new Messages.SealChunk(chunk.chunkId(), chunk.writeEpoch(), dataLength, TEST_NS).encode(),
                     null, CALL_TIMEOUT_MS);
             return Messages.SealResp.decode(h);
         }
@@ -389,7 +390,7 @@ final class ConsistencyVerifier {
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                 ScpClient.KIND_TOOL, "consistency-stat")) {
             ByteBuffer h = direct.call(Opcode.STAT_CHUNK,
-                    new Messages.StatChunk(chunk.chunkId()).encode(), null, CALL_TIMEOUT_MS);
+                    new Messages.StatChunk(chunk.chunkId(), TEST_NS).encode(), null, CALL_TIMEOUT_MS);
             return Messages.StatResp.decode(h);
         }
     }
@@ -453,7 +454,7 @@ final class ConsistencyVerifier {
             long offset = 0;
             while (expectedFileLength < 0 || offset < expectedFileLength) {
                 var frame = direct.callFrame(Opcode.FETCH_CHUNK,
-                        new Messages.FetchChunk(chunk.chunkId(), offset, FETCH_CHUNK_BYTES).encode(), null,
+                        new Messages.FetchChunk(chunk.chunkId(), offset, FETCH_CHUNK_BYTES, TEST_NS).encode(), null,
                         CALL_TIMEOUT_MS);
                 ByteBuffer h = frame.headerSlice();
                 Resp.check(h);

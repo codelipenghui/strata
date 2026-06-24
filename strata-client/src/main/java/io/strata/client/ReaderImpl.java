@@ -93,7 +93,7 @@ final class ReaderImpl implements StrataFile.Reader {
             throw new ScpException(ErrorCode.INTERNAL, "no readable replica");
         }
         int start = ThreadLocalRandom.current().nextInt(replicas.size());
-        byte[] readHeader = new Messages.Read(chunk.chunkId(), offset, maxBytes).encode();
+        byte[] readHeader = new Messages.Read(chunk.chunkId(), offset, maxBytes, namespace).encode();
         ScpException last = null;
         for (int i = 0; i < replicas.size(); i++) {
             Messages.Replica r = replicas.get((start + i) % replicas.size());

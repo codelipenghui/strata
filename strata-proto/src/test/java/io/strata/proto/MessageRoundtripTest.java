@@ -28,28 +28,28 @@ class MessageRoundtripTest {
         var open = new Messages.OpenChunk(c, 5, true, 1 << 30, 1718000000000L, ns);
         assertEquals(open, Messages.OpenChunk.decode(buf(open.encode())));
 
-        var append = new Messages.Append(c, 5, 1024, 512);
+        var append = new Messages.Append(c, 5, 1024, 512, ns);
         assertEquals(append, Messages.Append.decode(buf(append.encode())));
 
-        var read = new Messages.Read(c, 99, 65536);
+        var read = new Messages.Read(c, 99, 65536, ns);
         assertEquals(read, Messages.Read.decode(buf(read.encode())));
 
-        var fence = new Messages.Fence(c, 6);
+        var fence = new Messages.Fence(c, 6, ns);
         assertEquals(fence, Messages.Fence.decode(buf(fence.encode())));
 
-        var stat = new Messages.StatChunk(c);
+        var stat = new Messages.StatChunk(c, ns);
         assertEquals(stat, Messages.StatChunk.decode(buf(stat.encode())));
 
-        var seal = new Messages.SealChunk(c, 5, 4096);
+        var seal = new Messages.SealChunk(c, 5, 4096, ns);
         assertEquals(seal, Messages.SealChunk.decode(buf(seal.encode())));
 
-        var del = new Messages.DeleteChunks(List.of(c, new ChunkId(f, 4)));
+        var del = new Messages.DeleteChunks(List.of(c, new ChunkId(f, 4)), ns);
         assertEquals(del, Messages.DeleteChunks.decode(buf(del.encode())));
 
-        var fetch = new Messages.FetchChunk(c, 0, Integer.MAX_VALUE);
+        var fetch = new Messages.FetchChunk(c, 0, Integer.MAX_VALUE, ns);
         assertEquals(fetch, Messages.FetchChunk.decode(buf(fetch.encode())));
 
-        var rl = new Messages.ReadLedger(c, 2048);
+        var rl = new Messages.ReadLedger(c, 2048, ns);
         assertEquals(rl, Messages.ReadLedger.decode(buf(rl.encode())));
     }
 
@@ -100,12 +100,12 @@ class MessageRoundtripTest {
 
         var hbResp = new Messages.HeartbeatResp(123456, List.of(
                 new Messages.ReplicateCmd(1, c, List.of(new Messages.Replica(7, "h7:9000")), (byte) 1, 0xAA, 4096, ns),
-                new Messages.DeleteCmd(2, List.of(c)),
+                new Messages.DeleteCmd(2, List.of(c), ns),
                 new Messages.DrainCmd(3)));
         assertEquals(hbResp, decodeResp(hbResp.encode(), Messages.HeartbeatResp::decode));
 
         var inv = new Messages.InventoryReport(42, 1, 2, 9, 0, 1,
-                List.of(new Messages.InventoryEntry(c, ChunkState.SEALED, 4096, 0xAB)));
+                List.of(new Messages.InventoryEntry(c, ChunkState.SEALED, 4096, 0xAB, ns)));
         assertEquals(inv, Messages.InventoryReport.decode(buf(inv.encode())));
     }
 

@@ -108,7 +108,7 @@ class OpenQuorumFailureTest {
                 boolean hasExpectedNode = chunk.replicas().stream()
                         .anyMatch(replica -> replica.nodeId() == expectedNodeId);
                 boolean allPresent = chunk.replicas().stream()
-                        .allMatch(replica -> nodeById(cluster, replica.nodeId()).store().contains(chunkId));
+                        .allMatch(replica -> nodeById(cluster, replica.nodeId()).store().contains(StrataNamespace.of("test"), chunkId));
                 if (chunk.replicas().size() == 3 && hasExpectedNode && allPresent) {
                     return;
                 }

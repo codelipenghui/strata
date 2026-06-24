@@ -285,7 +285,7 @@ class MetadataFailoverTest {
     private static void assertNoNodeContains(MiniCluster cluster, List<ChunkId> chunkIds) {
         for (DataNode node : cluster.nodes) {
             for (ChunkId id : chunkIds) {
-                assertTrue(!node.store().contains(id),
+                assertTrue(!node.store().contains(StrataNamespace.of("test"), id),
                         "node " + node.nodeId() + " still holds deleted chunk " + id);
             }
         }

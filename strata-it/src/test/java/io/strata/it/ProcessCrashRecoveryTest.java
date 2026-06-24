@@ -35,6 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @Tag("chaos")
 class ProcessCrashRecoveryTest {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
     private static final String PROCESS_CRASH_CASE_PROPERTY = "strata.processCrash.case";
     private static final List<CrashCase> CRASH_CASES = List.of(
             new CrashCase("rf3-aq2", StrataClient.WritePolicy.replicated(3, 2), 1, 3),
@@ -737,7 +738,7 @@ class ProcessCrashRecoveryTest {
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                 ScpClient.KIND_TOOL, "process-direct-delete")) {
             var resp = Messages.DeleteChunksResp.decode(direct.call(Opcode.DELETE_CHUNKS,
-                    new Messages.DeleteChunks(List.of(chunkId)).encode(), null, 5_000));
+                    new Messages.DeleteChunks(List.of(chunkId), TEST_NS).encode(), null, 5_000));
             assertEquals(ErrorCode.OK.code, resp.codes().get(0).shortValue(),
                     "direct delete failed for " + chunkId + " on node " + node.nodeId());
         }
@@ -750,7 +751,7 @@ class ProcessCrashRecoveryTest {
         String[] hp = node.endpoint().split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                 ScpClient.KIND_TOOL, "process-stat")) {
-            direct.call(Opcode.STAT_CHUNK, new Messages.StatChunk(chunkId).encode(), null, 5_000);
+            direct.call(Opcode.STAT_CHUNK, new Messages.StatChunk(chunkId, TEST_NS).encode(), null, 5_000);
             return true;
         } catch (ScpException e) {
             if (e.code() == ErrorCode.CHUNK_NOT_FOUND) {

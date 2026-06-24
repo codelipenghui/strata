@@ -157,7 +157,7 @@ final class AppenderImpl implements StrataFile.Appender {
             CompletableFuture<StrataFile.AppendAck> callerFuture = new CompletableFuture<>();
             s.pending.addLast(new Pending(newEnd, callerFuture));
 
-            byte[] header = new Messages.Append(s.chunkId, epoch, base, s.durable).encode();
+            byte[] header = new Messages.Append(s.chunkId, epoch, base, s.durable, namespace).encode();
             for (int i = 0; i < s.replicas.size(); i++) {
                 if (dead) break;
                 if (s.failed[i]) continue;
@@ -427,7 +427,7 @@ final class AppenderImpl implements StrataFile.Appender {
 
     /** Network calls are made WITHOUT the lock held — blocked callbacks must never wait on us. */
     private void sealChunkLocked(ChunkSession s, long dataLength) {
-        byte[] header = new Messages.SealChunk(s.chunkId, epoch, dataLength).encode();
+        byte[] header = new Messages.SealChunk(s.chunkId, epoch, dataLength, namespace).encode();
         ScpException lastErr = null;
         SealVotes votes = new SealVotes();
         for (int i = 0; i < s.replicas.size(); i++) {
@@ -670,7 +670,7 @@ final class AppenderImpl implements StrataFile.Appender {
             dieLocked(abortErr);
             return;
         }
-        byte[] deleteHeader = new Messages.DeleteChunks(List.of(chunkId)).encode();
+        byte[] deleteHeader = new Messages.DeleteChunks(List.of(chunkId), namespace).encode();
         for (Messages.Replica r : opened) {
             lock.unlock();
             try {

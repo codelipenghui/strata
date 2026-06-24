@@ -28,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * After recovery, EVERY descriptor replica must serve the full sealed chunk, byte-identical.
  */
 class RecoveryCatchUpTest {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     @Test
     void laggingReplicaIsCaughtUpBeforeSeal() throws Exception {
@@ -53,14 +54,13 @@ class RecoveryCatchUpTest {
                 String[] nhp = replica.endpoint().split(":");
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "w")) {
-                    node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1,
-                            false, 1 << 20, 1L).encode(), null, 5000);
-                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0).encode(),
+                    node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1, false, 1 << 20, 1L, TEST_NS).encode(), null, 5000);
+                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0, TEST_NS).encode(),
                             ByteBuffer.wrap(a), 5000);
                     if (i < 2) {
-                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 4, 4).encode(),
+                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 4, 4, TEST_NS).encode(),
                                 ByteBuffer.wrap(b), 5000);
-                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 8, 8).encode(),
+                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 8, 8, TEST_NS).encode(),
                                 ByteBuffer.wrap(c), 5000);
                     }
                 }
@@ -76,13 +76,13 @@ class RecoveryCatchUpTest {
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "v")) {
                     var stat = Messages.StatResp.decode(node.call(Opcode.STAT_CHUNK,
-                            new Messages.StatChunk(chunk.chunkId()).encode(), null, 5000));
+                            new Messages.StatChunk(chunk.chunkId(), TEST_NS).encode(), null, 5000));
                     assertEquals(ChunkState.SEALED, stat.state(),
                             "replica " + replica.nodeId() + " must be sealed after recovery");
                     assertEquals(12, stat.sealedLength());
 
                     var frame = node.callFrame(Opcode.FETCH_CHUNK,
-                            new Messages.FetchChunk(chunk.chunkId(), 0, Integer.MAX_VALUE).encode(),
+                            new Messages.FetchChunk(chunk.chunkId(), 0, Integer.MAX_VALUE, TEST_NS).encode(),
                             null, 5000);
                     ByteBuffer h = frame.headerSlice();
                     Resp.check(h);
@@ -121,17 +121,16 @@ class RecoveryCatchUpTest {
                 String[] nhp = replica.endpoint().split(":");
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "w")) {
-                    node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1,
-                            false, 1 << 20, 1L).encode(), null, 5000);
-                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0).encode(),
+                    node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1, false, 1 << 20, 1L, TEST_NS).encode(), null, 5000);
+                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0, TEST_NS).encode(),
                             ByteBuffer.wrap(a), 5000);
                     if (i == 0) {
-                        node.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(chunk.chunkId(), 1, 4).encode(),
+                        node.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(chunk.chunkId(), 1, 4, TEST_NS).encode(),
                                 null, 5000);
                     } else {
-                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 4, 4).encode(),
+                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 4, 4, TEST_NS).encode(),
                                 ByteBuffer.wrap(b), 5000);
-                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 8, 8).encode(),
+                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 8, 8, TEST_NS).encode(),
                                 ByteBuffer.allocate(0), 5000);
                     }
                 }
@@ -186,13 +185,12 @@ class RecoveryCatchUpTest {
                 String[] nhp = replica.endpoint().split(":");
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "w")) {
-                    node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1,
-                            false, 1 << 20, 1L).encode(), null, 5000);
-                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0).encode(),
+                    node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1, false, 1 << 20, 1L, TEST_NS).encode(), null, 5000);
+                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0, TEST_NS).encode(),
                             ByteBuffer.wrap(a), 5000);
-                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 4, 4).encode(),
+                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 4, 4, TEST_NS).encode(),
                             ByteBuffer.wrap(b), 5000);
-                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 8, 8).encode(),
+                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 8, 8, TEST_NS).encode(),
                             ByteBuffer.wrap(i < 2 ? full : partial), 5000);
                 }
             }
@@ -206,7 +204,7 @@ class RecoveryCatchUpTest {
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "v")) {
                     var frame = node.callFrame(Opcode.READ,
-                            new Messages.Read(chunk.chunkId(), 0, 64).encode(), null, 5000);
+                            new Messages.Read(chunk.chunkId(), 0, 64, TEST_NS).encode(), null, 5000);
                     ByteBuffer h = frame.headerSlice();
                     Resp.check(h);
                     byte[] bytes = new byte[frame.payloadLength()];
