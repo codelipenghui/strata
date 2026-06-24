@@ -21,7 +21,7 @@ final class NamespaceMetadataSnapshotCodec {
 
     static byte[] encode(NamespaceMetadataState.Snapshot snapshot) {
         BufWriter w = new BufWriter(256);
-        w.u8(1).u64(snapshot.nextLogStartOffset()).varint(snapshot.files().size());
+        w.u8(1).u64(snapshot.nextFileId()).u64(snapshot.nextLogStartOffset()).varint(snapshot.files().size());
         for (Records.FileRecord f : snapshot.files()) {
             byte[] rec = f.encode();
             w.varint(rec.length).raw(rec);
@@ -48,6 +48,7 @@ final class NamespaceMetadataSnapshotCodec {
         if (version != 1) {
             throw new IllegalArgumentException("snapshot version " + version);
         }
+        long nextFid = b.getLong();
         long nextOffset = b.getLong();
         int fileCount = Varint.readCount(b, "file");
         List<Records.FileRecord> files = new ArrayList<>(fileCount);
@@ -63,6 +64,6 @@ final class NamespaceMetadataSnapshotCodec {
             FileId id = FileId.readFrom(b);
             tombstones.put(id, b.getLong());
         }
-        return new NamespaceMetadataState.Snapshot(nextOffset, files, tombstones);
+        return new NamespaceMetadataState.Snapshot(nextFid, nextOffset, files, tombstones);
     }
 }

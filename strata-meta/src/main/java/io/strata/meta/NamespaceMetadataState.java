@@ -30,6 +30,7 @@ import java.util.function.UnaryOperator;
  */
 final class NamespaceMetadataState {
     private final StrataNamespace namespace;
+    private long nextFileId = 0;
     private final Map<FileId, Records.FileRecord> files = new HashMap<>();
     private final Map<FileId, Long> tombstones = new HashMap<>();        // DELETED fileId -> deletedAtMs
     private final Map<StrataPath, FileId> pathBindings = new HashMap<>();
@@ -44,12 +45,17 @@ final class NamespaceMetadataState {
         return namespace;
     }
 
+    /** Allocates and returns the next file id, advancing the high-water mark. */
+    FileId assignFileId() {
+        return FileId.of(nextFileId++);
+    }
+
     /**
      * The compacted serialized form of this state at a log cut offset (design §9, §10). Path bindings
      * and {@code node -> chunks} are derived on restore (a path binds exactly to its OPEN/SEALED file),
      * so only the file table and tombstone deletion timestamps are kept.
      */
-    record Snapshot(long nextLogStartOffset, List<Records.FileRecord> files, Map<FileId, Long> tombstones) {
+    record Snapshot(long nextFileId, long nextLogStartOffset, List<Records.FileRecord> files, Map<FileId, Long> tombstones) {
         Snapshot {
             files = List.copyOf(files);
             tombstones = Map.copyOf(tombstones);
@@ -58,11 +64,12 @@ final class NamespaceMetadataState {
 
     /** Captures the current state for a compaction snapshot cut at {@code nextLogStartOffset}. */
     Snapshot exportSnapshot(long nextLogStartOffset) {
-        return new Snapshot(nextLogStartOffset, new ArrayList<>(files.values()), new HashMap<>(tombstones));
+        return new Snapshot(nextFileId, nextLogStartOffset, new ArrayList<>(files.values()), new HashMap<>(tombstones));
     }
 
     /** Replaces this state with a snapshot's tables, re-deriving path bindings and the node index. */
     void restore(Snapshot snapshot) {
+        nextFileId = snapshot.nextFileId();
         files.clear();
         tombstones.clear();
         pathBindings.clear();
@@ -82,6 +89,7 @@ final class NamespaceMetadataState {
     void apply(MetadataLogRecord record) {
         switch (record) {
             case MetadataLogRecord.FileCreated r -> {
+                nextFileId = Math.max(nextFileId, r.fileId().id() + 1);
                 putFile(new Records.FileRecord(r.fileId(), r.namespace(), r.path(),
                         r.replicationFactor(), r.ackQuorum(), r.fsyncOnAck(), FileState.OPEN,
                         r.createdAtMs(), List.of(), r.createOpMsb(), r.createOpLsb()));

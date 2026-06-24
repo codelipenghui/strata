@@ -106,6 +106,27 @@ class NamespaceMetadataStateTest {
     }
 
     @Test
+    void nextFileIdIsMonotonicAndSurvivesTombstoneSweepViaSnapshot() {
+        FileId a = state.assignFileId();   // 0
+        FileId b = state.assignFileId();   // 1
+        assertEquals(FileId.of(0), a);
+        assertEquals(FileId.of(1), b);
+        // simulate: create+delete+sweep file 1, then snapshot/restore; next id must still be 2, never reuse 1
+        var snap = state.exportSnapshot(123);
+        assertEquals(2, snap.nextFileId());
+        NamespaceMetadataState restored = new NamespaceMetadataState(NS);
+        restored.restore(snap);
+        assertEquals(FileId.of(2), restored.assignFileId());
+    }
+
+    @Test
+    void applyAdvancesHighWaterFromReplayedCreate() {
+        state.apply(new MetadataLogRecord.FileCreated(FileId.of(41), NS,
+                StrataPath.of("/p"), 3, 2, true, 1000, 7, 8));
+        assertEquals(FileId.of(42), state.assignFileId());
+    }
+
+    @Test
     void chunkAbortRemovesTheTailChunk() {
         state.apply(fileCreated());
         state.apply(new MetadataLogRecord.ChunkCreated(F, 0, 1, List.of(1, 2, 3), 7, 8));

@@ -32,6 +32,7 @@ class NamespaceMetadataSnapshotCodecTest {
         byte[] bytes = NamespaceMetadataSnapshotCodec.encode(snapshot);
         NamespaceMetadataState.Snapshot decoded = NamespaceMetadataSnapshotCodec.decode(bytes);
         assertEquals(12_345, decoded.nextLogStartOffset());
+        assertEquals(snapshot.nextFileId(), decoded.nextFileId(), "nextFileId survives the codec roundtrip");
 
         NamespaceMetadataState restored = new NamespaceMetadataState(NS);
         restored.restore(decoded);
@@ -49,6 +50,7 @@ class NamespaceMetadataSnapshotCodecTest {
         NamespaceMetadataState.Snapshot snapshot = new NamespaceMetadataState(NS).exportSnapshot(0);
         NamespaceMetadataState.Snapshot decoded =
                 NamespaceMetadataSnapshotCodec.decode(NamespaceMetadataSnapshotCodec.encode(snapshot));
+        assertEquals(0, decoded.nextFileId());
         assertEquals(0, decoded.nextLogStartOffset());
         assertTrue(decoded.files().isEmpty());
         assertTrue(decoded.tombstones().isEmpty());
