@@ -1,6 +1,7 @@
 package io.strata.meta;
 
 import io.strata.common.ErrorCode;
+import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
 import io.strata.common.FileState;
 import io.strata.common.ScpException;
@@ -164,8 +165,10 @@ final class NamespaceLogBackend implements AutoCloseable {
      * Owner-assigned create: the server assigns the file id, with opId-keyed idempotency.
      *
      * <p>For the system namespace, id is allocated via the ZK root's {@code nextSystemFileId()} counter
-     * (low-volume; lives in the consensus root). For user namespaces, id is assigned by the owner's
-     * {@link NamespaceMetadataState#assignFileId()} (per-namespace monotonic counter, log-recovered).
+     * (low-volume; lives in the consensus root). For user namespaces, id is read from the owner's
+     * {@link NamespaceMetadataState#peekNextFileId()} (no-advance peek; {@code apply(FileCreated)} inside
+     * {@code repo.append} advances the counter, so a crash before the append leaves nextFileId unchanged
+     * in durable state and the successor re-issues the same id safely — no reuse of a durable file id).
      *
      * <p>Idempotency: if a live (non-DELETING) file already carries the same {@code (namespace, opId)},
      * the existing file id is returned immediately — {@code sameCreateRequest} guards that the path and
@@ -219,7 +222,12 @@ final class NamespaceLogBackend implements AutoCloseable {
                         "path " + template.namespace() + ":" + template.path());
             }
             // --- assign id and append ---
-            FileId id = state.assignFileId();
+            // Peek (no advance): nextFileId is advanced only by apply(FileCreated) inside repo.append(),
+            // so a crash between peek and append leaves nextFileId unchanged in durable state and the
+            // successor re-issues the same id — which is safe because no FileCreated record existed.
+            // See NamespaceFileIdRecoveryInjectionTest window (a).
+            FileId id = state.peekNextFileId();
+            FailureInjector.point("meta.log.afterAssignBeforeAppend");
             repo.append(new MetadataLogRecord.FileCreated(id, template.namespace(),
                     template.path(), template.replicationFactor(), template.ackQuorum(), template.fsyncOnAck(),
                     template.createdAtMs(), template.createOpMsb(), template.createOpLsb()));

@@ -51,7 +51,23 @@ final class NamespaceMetadataState {
         return namespace;
     }
 
-    /** Allocates and returns the next file id, advancing the high-water mark. */
+    /**
+     * Returns the next file id to be assigned WITHOUT advancing the high-water mark. The caller must
+     * follow this immediately with an {@code append(FileCreated(id, ...))} whose {@link #apply} will
+     * advance {@code nextFileId} via {@code max(nextFileId, id+1)}. This ordering ensures that a crash
+     * between peek and append does NOT leave {@code nextFileId} advanced in persistent state, so a
+     * successor recovers with the same id available — the id is only "consumed" once its
+     * {@code FileCreated} record lands durably in the log. The test
+     * {@code NamespaceFileIdRecoveryInjectionTest} verifies window (a): crash after peek before append.
+     */
+    FileId peekNextFileId() {
+        return FileId.of(nextFileId);
+    }
+
+    /**
+     * @deprecated Use {@link #peekNextFileId()} and let {@code apply(FileCreated)} advance the counter.
+     *             Keeping this method for tests that test the monotonicity of the counter directly.
+     */
     FileId assignFileId() {
         return FileId.of(nextFileId++);
     }
