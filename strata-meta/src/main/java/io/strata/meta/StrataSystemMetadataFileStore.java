@@ -4,12 +4,12 @@ import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
@@ -51,8 +51,8 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
     }
 
     @Override
-    public FileId createLogFile() {
-        StrataFile file = client().create(systemFileSpec("log"));
+    public FileId createLogFile(StrataNamespace ns, long generation) {
+        StrataFile file = client().create(systemFileSpec(ns, generation, "log"));
         openLogAppenders.put(file.id(), file.openForAppend());
         return file.id();
     }
@@ -73,8 +73,8 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
     }
 
     @Override
-    public FileId writeSnapshot(byte[] snapshotBytes) throws Exception {
-        StrataFile file = client().create(systemFileSpec("snapshot"));
+    public FileId writeSnapshot(StrataNamespace ns, long generation, byte[] snapshotBytes) throws Exception {
+        StrataFile file = client().create(systemFileSpec(ns, generation, "snapshot"));
         try (StrataFile.Appender appender = file.openForAppend()) {
             if (snapshotBytes.length > 0) {
                 appender.append(ByteBuffer.wrap(snapshotBytes)).get();
@@ -134,9 +134,10 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
         return out.toByteArray();
     }
 
-    private StrataClient.FileSpec systemFileSpec(String kind) {
+    private StrataClient.FileSpec systemFileSpec(StrataNamespace ns, long generation, String kind) {
+        // Path encodes (ns, generation, kind) for human-readable traceability; the server assigns the FileId.
         return new StrataClient.FileSpec(NamespaceLogBackend.SYSTEM_NAMESPACE,
-                StrataPath.of("/metadata-log/" + kind + "/" + UUID.randomUUID()), policy);
+                StrataPath.of("/metadata-log/" + ns + "/gen-" + generation + "/" + kind), policy);
     }
 
     private StrataClient client() {

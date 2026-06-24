@@ -1,6 +1,7 @@
 package io.strata.meta;
 
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 
 import java.io.ByteArrayOutputStream;
 import java.util.Map;
@@ -17,7 +18,7 @@ final class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore
     private final AtomicLong ids = new AtomicLong(1);
 
     @Override
-    public FileId createLogFile() {
+    public FileId createLogFile(StrataNamespace ns, long generation) {
         FileId id = nextId();
         logs.put(id, new ByteArrayOutputStream());
         return id;
@@ -35,7 +36,7 @@ final class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore
     }
 
     @Override
-    public FileId writeSnapshot(byte[] snapshotBytes) {
+    public FileId writeSnapshot(StrataNamespace ns, long generation, byte[] snapshotBytes) {
         FileId id = nextId();
         snapshots.put(id, snapshotBytes.clone());
         return id;
@@ -66,6 +67,8 @@ final class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore
     }
 
     private FileId nextId() {
-        return FileId.of(0x5354524D4554413FL); // distinct high bits for system files
+        // High bits (0x5354524D45544100L = "STRMETA\0") keep system-file ids visually distinct from
+        // user-file ids (low positive longs) in test output; the low byte is a unique counter.
+        return FileId.of(0x5354524D45544100L | ids.getAndIncrement());
     }
 }

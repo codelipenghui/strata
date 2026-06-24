@@ -47,8 +47,8 @@ class NamespaceLogPerNamespaceLockTest {
         }
 
         @Override
-        public FileId createLogFile() throws Exception {
-            FileId id = delegate.createLogFile();
+        public FileId createLogFile(StrataNamespace ns, long generation) throws Exception {
+            FileId id = delegate.createLogFile(ns, generation);
             blockLogId.compareAndSet(null, id); // arm on A's first log, race-free
             return id;
         }
@@ -68,8 +68,8 @@ class NamespaceLogPerNamespaceLockTest {
         }
 
         @Override
-        public FileId writeSnapshot(byte[] snapshotBytes) throws Exception {
-            return delegate.writeSnapshot(snapshotBytes);
+        public FileId writeSnapshot(StrataNamespace ns, long generation, byte[] snapshotBytes) throws Exception {
+            return delegate.writeSnapshot(ns, generation, snapshotBytes);
         }
 
         @Override

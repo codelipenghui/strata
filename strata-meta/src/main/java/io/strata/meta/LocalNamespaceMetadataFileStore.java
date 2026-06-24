@@ -1,6 +1,7 @@
 package io.strata.meta;
 
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -27,8 +28,8 @@ final class LocalNamespaceMetadataFileStore implements NamespaceMetadataFileStor
     }
 
     @Override
-    public FileId createLogFile() throws IOException {
-        FileId id = FileId.of(0); // TASK3: owner assigns id
+    public FileId createLogFile(StrataNamespace ns, long generation) throws IOException {
+        FileId id = SystemFileIds.of(ns, generation, 0);
         Files.write(logPath(id), new byte[0], StandardOpenOption.CREATE_NEW);
         return id;
     }
@@ -45,8 +46,8 @@ final class LocalNamespaceMetadataFileStore implements NamespaceMetadataFileStor
     }
 
     @Override
-    public FileId writeSnapshot(byte[] snapshotBytes) throws IOException {
-        FileId id = FileId.of(0); // TASK3: owner assigns id
+    public FileId writeSnapshot(StrataNamespace ns, long generation, byte[] snapshotBytes) throws IOException {
+        FileId id = SystemFileIds.of(ns, generation, 1);
         Files.write(snapPath(id), snapshotBytes, StandardOpenOption.CREATE_NEW);
         return id;
     }

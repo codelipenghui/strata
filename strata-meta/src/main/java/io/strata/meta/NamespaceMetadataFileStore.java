@@ -1,6 +1,7 @@
 package io.strata.meta;
 
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 
 /**
  * The physical byte-store boundary for one namespace's metadata system files (design §8). The metadata
@@ -11,8 +12,13 @@ import io.strata.common.FileId;
  */
 interface NamespaceMetadataFileStore {
 
-    /** Creates a fresh, empty open-log file and returns its id. */
-    FileId createLogFile() throws Exception;
+    /**
+     * Creates a fresh, empty open-log file and returns its id.
+     *
+     * @param ns         the user namespace whose metadata this log belongs to
+     * @param generation the manifest generation that this log file will be published under
+     */
+    FileId createLogFile(StrataNamespace ns, long generation) throws Exception;
 
     /** Durably appends pre-framed bytes to the open log file {@code logFileId}. */
     void appendLog(FileId logFileId, byte[] frameBytes) throws Exception;
@@ -20,8 +26,13 @@ interface NamespaceMetadataFileStore {
     /** All durable bytes of {@code logFileId} (empty if the file has no bytes yet). */
     byte[] readLog(FileId logFileId) throws Exception;
 
-    /** Writes {@code snapshotBytes} as a new immutable snapshot file and returns its id. */
-    FileId writeSnapshot(byte[] snapshotBytes) throws Exception;
+    /**
+     * Writes {@code snapshotBytes} as a new immutable snapshot file and returns its id.
+     *
+     * @param ns         the user namespace whose metadata this snapshot captures
+     * @param generation the manifest generation that this snapshot will be published under
+     */
+    FileId writeSnapshot(StrataNamespace ns, long generation, byte[] snapshotBytes) throws Exception;
 
     /** All bytes of the snapshot file {@code snapshotFileId}. */
     byte[] readSnapshot(FileId snapshotFileId) throws Exception;

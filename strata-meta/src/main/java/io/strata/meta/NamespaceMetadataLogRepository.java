@@ -141,10 +141,10 @@ final class NamespaceMetadataLogRepository {
     }
 
     private void publishCompacted(long cut, int expectedVersion) throws Exception {
-        FileId newSnapshot = fileStore.writeSnapshot(
-                NamespaceMetadataSnapshotCodec.encode(state.exportSnapshot(cut)));
-        FileId newLog = fileStore.createLogFile();
         long newGeneration = generation + 1;
+        FileId newSnapshot = fileStore.writeSnapshot(namespace, newGeneration,
+                NamespaceMetadataSnapshotCodec.encode(state.exportSnapshot(cut)));
+        FileId newLog = fileStore.createLogFile(namespace, newGeneration);
         Records.NamespaceManifest published = new Records.NamespaceManifest(namespace, metadataEpoch,
                 newGeneration, cut, cut, Optional.of(newSnapshot), Optional.of(newLog));
         // Crash window: the new snapshot/log files exist but the manifest still points at the old
