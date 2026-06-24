@@ -6,6 +6,7 @@ import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -56,8 +57,22 @@ class ChunkStoreTest {
         return new ChunkStore(dir);
     }
 
+    static final StrataNamespace TEST_NS = StrataNamespace.of("test");
+
+    /** Returns the sharded relative path (no extension) for a chunk in TEST_NS. */
+    private String rel(ChunkId chunkId) {
+        return ChunkFormats.chunkRelativePath(TEST_NS, chunkId);
+    }
+
+    /** Ensures the shard directory for a chunk in TEST_NS exists and returns the rel path. */
+    private String relMkdirs(ChunkId chunkId) throws IOException {
+        String r = rel(chunkId);
+        Files.createDirectories(dir.resolve(r + ".chunk").getParent());
+        return r;
+    }
+
     private void open(ChunkStore store, ChunkId id, int epoch) throws IOException {
-        store.open(id, false, epoch, 1718000000000L);
+        store.open(TEST_NS, id, false, epoch, 1718000000000L);
     }
 
     private byte[] sealedBytes(ChunkStore store, ChunkId chunkId, String payload) throws IOException {
@@ -121,15 +136,34 @@ class ChunkStoreTest {
     private static void assertImportFails(ChunkStore store, ChunkId chunkId, ErrorCode code,
                                           byte[] fileBytes, long expectedLength, int expectedCrc) {
         assertEquals(code, assertThrows(ScpException.class,
-                () -> store.importSealed(chunkId, fileBytes, expectedLength, expectedCrc)).code());
+                () -> store.importSealed(TEST_NS, chunkId, fileBytes, expectedLength, expectedCrc)).code());
+    }
+
+    @Test
+    void openPlacesChunkInNamespaceShardedDirectory() throws Exception {
+        // TDD: open() must place chunks/<ns>/<L1>/<L2>/<fileId>.<index>.{chunk,meta,j}
+        // Using FileId.of(0): ns=test, L1=0x00, L2=0x00 → test/00/00/0000000000000000.0
+        ChunkId zeroChunk = new ChunkId(FileId.of(0), 0);
+        StrataNamespace ns = StrataNamespace.of("test");
+        try (ChunkStore store = newStore()) {
+            store.open(ns, zeroChunk, false, 1, 1718000000000L);
+            store.append(zeroChunk, 1, 0, 0, bytes("hello"));
+            store.seal(zeroChunk, 1, 5, null);
+        }
+        String expected = "test/00/00/0000000000000000.0";
+        assertTrue(Files.exists(dir.resolve(expected + ".chunk")),
+                "chunk file must be at chunks/<ns>/<L1>/<L2>/<fileId>.<index>.chunk");
+        assertTrue(Files.exists(dir.resolve(expected + ".meta")),
+                "sidecar must be at the same sharded path");
     }
 
     @Test
     void failedOpenCleansOwnedFilesAndReservation() throws Exception {
         ChunkId chunk = new ChunkId(FileId.of(2), 0);
-        Path dataPath = dir.resolve(ChunkFormats.baseName(chunk) + ".chunk");
-        Path ledgerPath = dir.resolve(ChunkFormats.baseName(chunk) + ".j");
-        Files.createDirectories(dir);
+        String rel = ChunkFormats.chunkRelativePath(TEST_NS, chunk);
+        Path dataPath = dir.resolve(rel + ".chunk");
+        Path ledgerPath = dir.resolve(rel + ".j");
+        Files.createDirectories(dataPath.getParent());
         Files.write(ledgerPath, new byte[] {1});
 
         try (ChunkStore store = newStore()) {
@@ -156,10 +190,10 @@ class ChunkStoreTest {
             store.append(id, 1, 0, 0, ByteBuffer.wrap(payload));
             store.seal(id, 1, payload.length, null);
 
-            String base = ChunkFormats.baseName(id);
-            long physicalBytes = sizeIfExists(dir.resolve(base + ".chunk"))
-                    + sizeIfExists(dir.resolve(base + ".meta"))
-                    + sizeIfExists(dir.resolve(base + ".j"));
+            String rel = ChunkFormats.chunkRelativePath(TEST_NS, id);
+            long physicalBytes = sizeIfExists(dir.resolve(rel + ".chunk"))
+                    + sizeIfExists(dir.resolve(rel + ".meta"))
+                    + sizeIfExists(dir.resolve(rel + ".j"));
 
             assertTrue(store.usedBytes() >= physicalBytes,
                     "capacity reporting must include physical chunk overhead, not only logical data bytes");
@@ -202,9 +236,10 @@ class ChunkStoreTest {
 
     private static Object newHandle(ChunkStore store, ChunkId chunkId) throws Exception {
         Class<?> type = Class.forName("io.strata.format.ChunkStore$Handle");
-        Constructor<?> ctor = type.getDeclaredConstructor(ChunkStore.class, ChunkId.class, ChunkFormats.Header.class);
+        // Handle(ChunkId id, ChunkFormats.Header header, StrataNamespace ns)
+        Constructor<?> ctor = type.getDeclaredConstructor(ChunkStore.class, ChunkId.class, ChunkFormats.Header.class, StrataNamespace.class);
         ctor.setAccessible(true);
-        return ctor.newInstance(store, chunkId, new ChunkFormats.Header(chunkId, false, 1, 1718000000000L, 0, 0, 0));
+        return ctor.newInstance(store, chunkId, new ChunkFormats.Header(chunkId, false, 1, 1718000000000L, 0, 0, 0), TEST_NS);
     }
 
     private static int checkedFooterLength(ChunkFormats.Trailer trailer, long fileLen) throws Exception {
@@ -559,7 +594,7 @@ class ChunkStoreTest {
     @Test
     void malformedCallerFooterDoesNotStopOpenFsyncCommitter() throws Exception {
         try (ChunkStore store = newStore()) {
-            store.open(id, true, 1, 1718000000000L);
+            store.open(TEST_NS, id, true, 1, 1718000000000L);
 
             assertEquals(ErrorCode.PRECONDITION_FAILED, assertThrows(ScpException.class,
                     () -> store.seal(id, 1, 0, ByteBuffer.wrap(new byte[] {1, 2, 3}))).code());
@@ -609,7 +644,7 @@ class ChunkStoreTest {
     void closeReportsSidecarPersistenceFailureAndKeepsChunkForRetry() throws Exception {
         ChunkStore store = newStore();
         open(store, id, 1);
-        Path metaPath = dir.resolve(ChunkFormats.baseName(id) + ".meta");
+        Path metaPath = dir.resolve(rel(id) + ".meta");
         Files.delete(metaPath);
         Files.createDirectory(metaPath);
 
@@ -716,7 +751,7 @@ class ChunkStoreTest {
 
         ChunkId blocked = new ChunkId(FileId.of(3), 0);
         try (ChunkStore store = newStore()) {
-            java.nio.file.Files.write(dir.resolve(ChunkFormats.baseName(blocked) + ".chunk"), new byte[]{1});
+            java.nio.file.Files.write(dir.resolve(relMkdirs(blocked) + ".chunk"), new byte[]{1});
             assertEquals(ErrorCode.CHUNK_ALREADY_EXISTS,
                     assertThrows(ScpException.class, () -> open(store, blocked, 1)).code());
         }
@@ -817,7 +852,7 @@ class ChunkStoreTest {
             store.append(id, 1, 0, 0, bytes("verified-open"));
             store.append(id, 1, 13, 13, ByteBuffer.allocate(0)); // make the full range readable
 
-            Path data = dir.resolve(ChunkFormats.baseName(id) + ".chunk");
+            Path data = dir.resolve(rel(id) + ".chunk");
             try (FileChannel ch = FileChannel.open(data, java.nio.file.StandardOpenOption.WRITE)) {
                 ch.write(ByteBuffer.wrap(new byte[] {'X'}), ChunkFormats.DATA_START + 4);
             }
@@ -919,7 +954,7 @@ class ChunkStoreTest {
             fileBytes = fetched.bytes();
         }
         try (ChunkStore other = new ChunkStore(otherDir)) {
-            other.importSealed(id, fileBytes, sealedLen, crc);
+            other.importSealed(TEST_NS, id, fileBytes, sealedLen, crc);
             var fetched2 = other.fetch(id, 0, Integer.MAX_VALUE);
             assertArrayEquals(fileBytes, fetched2.bytes()); // invariant §14.6: byte-identical replicas
             var r = other.read(id, 0, 10);
@@ -939,7 +974,7 @@ class ChunkStoreTest {
         }
 
         try (ChunkStore other = new ChunkStore(otherDir)) {
-            other.importSealed(id, fileBytes, 0, crc);
+            other.importSealed(TEST_NS, id, fileBytes, 0, crc);
             assertTrue(other.contains(id));
             assertArrayEquals(new byte[0], other.read(id, 0, 1).bytes());
         }
@@ -983,7 +1018,7 @@ class ChunkStoreTest {
         fileBytes[ChunkFormats.HEADER_SIZE + 3] ^= 1; // corrupt data region
         try (ChunkStore other = new ChunkStore(otherDir)) {
             assertEquals(ErrorCode.CRC_MISMATCH,
-                    assertThrows(ScpException.class, () -> other.importSealed(id, fileBytes, 15, dataCrc)).code());
+                    assertThrows(ScpException.class, () -> other.importSealed(TEST_NS, id, fileBytes, 15, dataCrc)).code());
         }
     }
 
@@ -996,7 +1031,7 @@ class ChunkStoreTest {
 
         try (ChunkStore other = new ChunkStore(otherDir)) {
             assertEquals(ErrorCode.CRC_MISMATCH,
-                    assertThrows(ScpException.class, () -> other.importSealed(id, fileBytes, 15, 0)).code());
+                    assertThrows(ScpException.class, () -> other.importSealed(TEST_NS, id, fileBytes, 15, 0)).code());
         }
     }
 
@@ -1013,10 +1048,12 @@ class ChunkStoreTest {
         }
 
         try (ChunkStore other = new ChunkStore(otherDir)) {
-            Files.write(otherDir.resolve(ChunkFormats.baseName(id) + ".chunk"), new byte[] {1});
+            Path shardedPath = otherDir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, id) + ".chunk");
+            Files.createDirectories(shardedPath.getParent());
+            Files.write(shardedPath, new byte[] {1});
             assertEquals(ErrorCode.CHUNK_ALREADY_EXISTS,
                     assertThrows(ScpException.class,
-                            () -> other.importSealed(id, fileBytes, sealedLength, dataCrc)).code());
+                            () -> other.importSealed(TEST_NS, id, fileBytes, sealedLength, dataCrc)).code());
         }
     }
 
@@ -1032,23 +1069,23 @@ class ChunkStoreTest {
             dataCrc = trailer.dataCrc();
         }
 
-        String base = ChunkFormats.baseName(id);
-        Path dataPath = otherDir.resolve(base + ".chunk");
-        Path tmpPath = otherDir.resolve(base + ".chunk.tmp");
-        Path metaPath = otherDir.resolve(base + ".meta");
+        String rel = ChunkFormats.chunkRelativePath(TEST_NS, id);
+        Path dataPath = otherDir.resolve(rel + ".chunk");
+        Path metaPath = otherDir.resolve(rel + ".meta");
+        Files.createDirectories(dataPath.getParent());
+        // Block the sidecar path by placing a directory there
         Files.createDirectory(metaPath);
         Files.write(metaPath.resolve("blocker"), new byte[] {1});
 
         try (ChunkStore other = new ChunkStore(otherDir)) {
-            assertThrows(IOException.class, () -> other.importSealed(id, fileBytes, sealedLength, dataCrc));
+            assertThrows(IOException.class, () -> other.importSealed(TEST_NS, id, fileBytes, sealedLength, dataCrc));
             assertTrue(Files.notExists(dataPath));
-            assertTrue(Files.notExists(tmpPath));
             assertEquals(ErrorCode.CHUNK_NOT_FOUND,
                     assertThrows(ScpException.class, () -> other.stat(id)).code());
 
             Files.delete(metaPath.resolve("blocker"));
             Files.delete(metaPath);
-            other.importSealed(id, fileBytes, sealedLength, dataCrc);
+            other.importSealed(TEST_NS, id, fileBytes, sealedLength, dataCrc);
             assertTrue(other.contains(id));
         }
     }
@@ -1291,9 +1328,8 @@ class ChunkStoreTest {
 
             // bit-rot in the data region: the STORED crc still matches the descriptor, so only
             // recomputation can catch it
-            String base = ChunkFormats.baseName(id);
             try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(
-                    dir.resolve(base + ".chunk"), java.nio.file.StandardOpenOption.WRITE)) {
+                    dir.resolve(rel(id) + ".chunk"), java.nio.file.StandardOpenOption.WRITE)) {
                 ch.write(ByteBuffer.wrap(new byte[]{0x7F}), ChunkFormats.DATA_START + 3);
             }
             assertEquals(sealed.dataCrc(), store.inventory().get(0).crc(),
@@ -1314,8 +1350,7 @@ class ChunkStoreTest {
     @Test
     void recoveryLoadsSealedChunksAndDeletesLedgerRemnants() throws Exception {
         ChunkId chunkId = new ChunkId(FileId.of(6), 0);
-        String base = ChunkFormats.baseName(chunkId);
-        Path ledgerPath = dir.resolve(base + ".j");
+        Path ledgerPath = dir.resolve(rel(chunkId) + ".j");
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
             store.append(chunkId, 1, 0, 0, bytes("sealed"));
@@ -1341,8 +1376,7 @@ class ChunkStoreTest {
                 "guarantee under test is specific to the no-seal-fsync durability path");
 
         ChunkId chunkId = new ChunkId(FileId.of(7), 0);
-        String base = ChunkFormats.baseName(chunkId);
-        Path metaPath = dir.resolve(base + ".meta");
+        Path metaPath = dir.resolve(rel(chunkId) + ".meta");
         byte[] payload = "important-acknowledged-data".getBytes(StandardCharsets.UTF_8);
         int len = payload.length;
 
@@ -1368,7 +1402,7 @@ class ChunkStoreTest {
         assumeTrue(!ChunkStore.booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false),
                 "ledger retention is specific to the no-seal-fsync durability path");
         ChunkId chunkId = new ChunkId(FileId.of(8), 0);
-        Path ledgerPath = dir.resolve(ChunkFormats.baseName(chunkId) + ".j");
+        Path ledgerPath = dir.resolve(rel(chunkId) + ".j");
         byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
@@ -1394,7 +1428,7 @@ class ChunkStoreTest {
     @Test
     void sealWithSealFsyncDropsLedgerImmediatelyWithoutReclaim() throws Exception {
         ChunkId chunkId = new ChunkId(FileId.of(9), 0);
-        Path ledgerPath = dir.resolve(ChunkFormats.baseName(chunkId) + ".j");
+        Path ledgerPath = dir.resolve(rel(chunkId) + ".j");
         byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
         try (ChunkStore store = new ChunkStore(dir, true)) { // seal fsync ON
             open(store, chunkId, 1);
@@ -1456,18 +1490,26 @@ class ChunkStoreTest {
         Files.write(invalidName, new byte[] {1});
 
         ChunkId truncated = new ChunkId(FileId.of(11), 0);
-        String base = ChunkFormats.baseName(truncated);
-        Files.write(dir.resolve(base + ".chunk"), new byte[] {1, 2, 3});
-        Files.write(dir.resolve(base + ".meta"),
+        String trel = relMkdirs(truncated);
+        Files.write(dir.resolve(trel + ".chunk"), new byte[] {1, 2, 3});
+        Files.write(dir.resolve(trel + ".meta"),
                 new ChunkFormats.Sidecar(1, -1, 0, ChunkState.OPEN).encode());
 
         try (ChunkStore recovered = newStore()) {
             assertEquals(0, recovered.inventory().size());
+            // the invalid-name flat file is quarantined in dir
             assertTrue(Files.notExists(invalidName));
-            assertTrue(Files.notExists(dir.resolve(base + ".chunk")));
-            assertTrue(Files.notExists(dir.resolve(base + ".meta")));
-            try (Stream<Path> files = Files.list(dir)) {
-                assertEquals(3, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count());
+            try (Stream<Path> dirFiles = Files.list(dir)) {
+                assertEquals(1, dirFiles.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
+                        "invalid-name chunk must be quarantined in the store root");
+            }
+            // the truncated chunk's files are quarantined in their shard dir
+            assertTrue(Files.notExists(dir.resolve(trel + ".chunk")));
+            assertTrue(Files.notExists(dir.resolve(trel + ".meta")));
+            Path shardDir = dir.resolve(trel + ".chunk").getParent();
+            try (Stream<Path> shardFiles = Files.list(shardDir)) {
+                assertEquals(2, shardFiles.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
+                        "truncated chunk's chunk+meta must be quarantined in their shard dir");
             }
         }
     }
@@ -1475,12 +1517,11 @@ class ChunkStoreTest {
     @Test
     void recoveryTruncatesLedgerEntryBeyondDataSize() throws Exception {
         ChunkId chunkId = new ChunkId(FileId.of(12), 0);
-        String base = ChunkFormats.baseName(chunkId);
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
             store.append(chunkId, 1, 0, 0, bytes("abcd"));
         }
-        Files.write(dir.resolve(base + ".j"),
+        Files.write(dir.resolve(rel(chunkId) + ".j"),
                 new ChunkFormats.LedgerEntry(5, Crc.of("abcde".getBytes()), 1).encode());
 
         try (ChunkStore recovered = newStore()) {
@@ -1496,7 +1537,7 @@ class ChunkStoreTest {
             open(store, chunkId, 1);
         }
 
-        Files.write(dir.resolve(ChunkFormats.baseName(chunkId) + ".j"),
+        Files.write(dir.resolve(rel(chunkId) + ".j"),
                 new ChunkFormats.LedgerEntry(Long.MAX_VALUE, 0, 1).encode());
 
         try (ChunkStore recovered = newStore()) {
@@ -1510,9 +1551,9 @@ class ChunkStoreTest {
     @Test
     void recoveryRemovesChunkCreatedBeforeSidecarWasPersisted() throws Exception {
         ChunkId chunkId = new ChunkId(FileId.of(14), 0);
-        String base = ChunkFormats.baseName(chunkId);
-        Path dataPath = dir.resolve(base + ".chunk");
-        Path ledgerPath = dir.resolve(base + ".j");
+        String r = relMkdirs(chunkId);
+        Path dataPath = dir.resolve(r + ".chunk");
+        Path ledgerPath = dir.resolve(r + ".j");
         Files.write(dataPath, new byte[] {1, 2, 3});
         Files.write(ledgerPath, new byte[] {4, 5, 6});
 
@@ -1531,7 +1572,7 @@ class ChunkStoreTest {
             store.append(chunkId, 1, 0, 0, bytes("payload"));
         }
 
-        Files.delete(dir.resolve(ChunkFormats.baseName(chunkId) + ".j"));
+        Files.delete(dir.resolve(rel(chunkId) + ".j"));
 
         try (ChunkStore recovered = newStore()) {
             assertTrue(recovered.contains(chunkId));
@@ -1547,7 +1588,7 @@ class ChunkStoreTest {
             open(store, chunkId, 1);
         }
 
-        Files.delete(dir.resolve(ChunkFormats.baseName(chunkId) + ".j"));
+        Files.delete(dir.resolve(rel(chunkId) + ".j"));
 
         try (ChunkStore recovered = newStore()) {
             assertTrue(recovered.contains(chunkId));
@@ -1563,7 +1604,7 @@ class ChunkStoreTest {
             open(store, zeroExtent, 1);
             store.append(zeroExtent, 1, 0, 0, bytes("abcd"));
         }
-        Files.write(dir.resolve(ChunkFormats.baseName(zeroExtent) + ".j"),
+        Files.write(dir.resolve(rel(zeroExtent) + ".j"),
                 new ChunkFormats.LedgerEntry(0, 0, 1).encode());
 
         try (ChunkStore recovered = newStore()) {
@@ -1575,7 +1616,7 @@ class ChunkStoreTest {
             open(store, badCrc, 1);
             store.append(badCrc, 1, 0, 0, bytes("abcd"));
         }
-        Files.write(dir.resolve(ChunkFormats.baseName(badCrc) + ".j"),
+        Files.write(dir.resolve(rel(badCrc) + ".j"),
                 new ChunkFormats.LedgerEntry(4, 0x12345678, 1).encode());
 
         try (ChunkStore recovered = newStore()) {
@@ -1670,6 +1711,7 @@ class ChunkStoreTest {
             Files.write(tmp.resolve("blocker"), new byte[] {1});
 
             Path dataPath = (Path) getObject(failedHandle, "dataPath");
+            Files.createDirectories(dataPath.getParent());
             Files.createDirectory(dataPath);
             Files.write(dataPath.resolve("blocker"), new byte[] {1});
 

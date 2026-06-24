@@ -5,6 +5,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
@@ -41,6 +42,7 @@ class DataNodeWireTest {
     Path dir;
 
     private final ChunkId id = new ChunkId(FileId.of(1), 0);
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     @Test
     void failedServerBindLeavesDataDirReusable() throws Exception {
@@ -141,7 +143,7 @@ class DataNodeWireTest {
 
             // open
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
-                    1 << 20, 1718000000000L).encode(), null, 5000);
+                    1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
 
             // pipelined appends
             byte[] a = "first-batch-".getBytes(), b = "second-batch".getBytes();
@@ -216,7 +218,7 @@ class DataNodeWireTest {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
-                    1 << 20, 1718000000000L).encode(), null, 5000);
+                    1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
             client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0).encode(),
                     ByteBuffer.wrap("SAFE".getBytes()), 5000);
             client.call(Opcode.APPEND, new Messages.Append(id, 1, 4, 4).encode(),
@@ -252,7 +254,7 @@ class DataNodeWireTest {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_TOOL, "recovery")) {
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
-                    1 << 20, 1718000000000L).encode(), null, 5000);
+                    1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
             client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0).encode(),
                     ByteBuffer.wrap("SAFE".getBytes()), 5000);
             client.call(Opcode.APPEND, new Messages.Append(id, 1, 4, 4).encode(),
@@ -290,7 +292,7 @@ class DataNodeWireTest {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
-                    1 << 20, 1718000000000L).encode(), null, 5000);
+                    1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
             client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0).encode(),
                     ByteBuffer.wrap(payload), 5000);
             client.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(id, 1, payload.length).encode(), null, 5000);
@@ -328,7 +330,7 @@ class DataNodeWireTest {
             node.setDraining(true);
             ScpException draining = assertThrows(ScpException.class, () -> client.call(Opcode.OPEN_CHUNK,
                     new Messages.OpenChunk(new ChunkId(FileId.of(2), 0), 1, false,
-                            1 << 20, 1L).encode(), null, 5000));
+                            1 << 20, 1L, TEST_NS).encode(), null, 5000));
             assertEquals(ErrorCode.NO_CAPACITY, draining.code());
 
             ScpException metadataOpcode = assertThrows(ScpException.class,
@@ -349,7 +351,7 @@ class DataNodeWireTest {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk, 1, false,
-                    1 << 20, 1L).encode(), null, 5000);
+                    1 << 20, 1L, TEST_NS).encode(), null, 5000);
 
             ScpException malformedFooter = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK,
                     new Messages.SealChunk(chunk, 1, 0).encode(), ByteBuffer.wrap(new byte[] {1}), 5000));
@@ -364,7 +366,7 @@ class DataNodeWireTest {
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "t")) {
             incarnation = node.incarnation();
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
-                    1 << 20, 1L).encode(), null, 5000);
+                    1 << 20, 1L, TEST_NS).encode(), null, 5000);
             client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0).encode(),
                     ByteBuffer.wrap("persistent".getBytes()), 5000);
         }
@@ -393,7 +395,7 @@ class DataNodeWireTest {
              ScpClient src = new ScpClient("127.0.0.1", source.port(),
                      ScpClient.KIND_DATA_NODE, "repair-test")) {
             ControlLoop loop = new ControlLoop(null, null, null);
-            var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4);
+            var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS);
             Path output = dir.resolve("oversized-repair-fetch.chunk");
 
             ScpException e = assertThrows(ScpException.class, () -> loop.fetchWholeFile(src, cmd, output));
@@ -412,7 +414,7 @@ class DataNodeWireTest {
              ScpClient src = new ScpClient("127.0.0.1", source.port(),
                      ScpClient.KIND_DATA_NODE, "repair-test")) {
             ControlLoop loop = new ControlLoop(null, null, null);
-            var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4);
+            var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS);
             Path output = dir.resolve("valid-repair-fetch.chunk");
 
             assertEquals(fileBytes.length, loop.fetchWholeFile(src, cmd, output));
@@ -424,7 +426,7 @@ class DataNodeWireTest {
     void repairFetchRejectsMalformedSourceProgress() throws Exception {
         ChunkId repairChunk = new ChunkId(FileId.of(6), 0);
         ControlLoop loop = new ControlLoop(null, null, null);
-        var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4);
+        var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS);
 
         try (ScpServer openSource = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
                 new Messages.FetchResp(4096 + 4 + 64, ChunkState.OPEN).encode(),
@@ -499,15 +501,15 @@ class DataNodeWireTest {
 
         assertEquals(ErrorCode.CORRUPT_CHUNK,
                 assertThrows(ScpException.class, () -> loop.fetchWholeFile(null,
-                        new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, -1), output)).code());
+                        new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, -1, TEST_NS), output)).code());
         assertEquals(ErrorCode.CORRUPT_CHUNK,
                 assertThrows(ScpException.class, () -> loop.fetchWholeFile(null,
                         new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0,
-                                Long.MAX_VALUE), output)).code());
+                                Long.MAX_VALUE, TEST_NS), output)).code());
     }
 
     private static void corruptChunkDataByte(Path dir, ChunkId chunkId, long dataOffset) throws IOException {
-        Path dataPath = dir.resolve(ChunkFormats.baseName(chunkId) + ".chunk");
+        Path dataPath = dir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, chunkId) + ".chunk");
         try (FileChannel channel = FileChannel.open(dataPath, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
             ByteBuffer one = ByteBuffer.allocate(1);
             channel.read(one, ChunkFormats.DATA_START + dataOffset);

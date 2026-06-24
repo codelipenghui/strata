@@ -7,6 +7,7 @@ import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
 import io.strata.format.ChunkStore;
 import io.strata.proto.Messages;
@@ -39,6 +40,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ControlLoopTest {
+
+    static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     @TempDir
     Path dir;
@@ -426,7 +429,7 @@ class ControlLoopTest {
             commands.add(new Messages.DrainCmd(1));
             commands.add(new Messages.DeleteCmd(2, List.of(new ChunkId(FileId.of(1), 0))));
             commands.add(new Messages.ReplicateCmd(3, new ChunkId(FileId.of(2), 1),
-                    List.of(), (byte) 0, 0, 0));
+                    List.of(), (byte) 0, 0, 0, TEST_NS));
 
             Thread worker = Thread.ofVirtual().name("control-loop-test-exec").start(() -> {
                 try {
@@ -507,35 +510,35 @@ class ControlLoopTest {
 
             ChunkId valid = new ChunkId(FileId.of(4), 0);
             byte[] data = "valid".getBytes();
-            store.open(valid, false, 1, 1L);
+            store.open(TEST_NS, valid, false, 1, 1L);
             store.append(valid, 1, 0, 0, ByteBuffer.wrap(data));
             var sealed = store.seal(valid, 1, data.length, null);
 
             invokeReplicate(loop, new Messages.ReplicateCmd(10, valid, List.of(), (byte) 0,
-                    sealed.dataCrc(), data.length));
+                    sealed.dataCrc(), data.length, TEST_NS));
             assertTrue(store.contains(valid));
 
             ChunkId stale = new ChunkId(FileId.of(5), 1);
-            store.open(stale, false, 1, 1L);
+            store.open(TEST_NS, stale, false, 1, 1L);
             store.append(stale, 1, 0, 0, ByteBuffer.wrap(data));
             store.seal(stale, 1, data.length, null);
 
             ScpException e = assertThrows(ScpException.class,
                     () -> invokeReplicate(loop, new Messages.ReplicateCmd(11, stale, List.of(), (byte) 0,
-                            sealed.dataCrc(), data.length + 1)));
+                            sealed.dataCrc(), data.length + 1, TEST_NS)));
             assertEquals(ErrorCode.INTERNAL, e.code());
             assertFalse(store.contains(stale), "mismatched local replay copy must be deleted before retrying sources");
 
             ChunkId crcZeroDescriptor = new ChunkId(FileId.of(6), 2);
             byte[] crcData = "crc-must-not-be-wildcard".getBytes();
-            store.open(crcZeroDescriptor, false, 1, 1L);
+            store.open(TEST_NS, crcZeroDescriptor, false, 1, 1L);
             store.append(crcZeroDescriptor, 1, 0, 0, ByteBuffer.wrap(crcData));
             int localCrc = store.seal(crcZeroDescriptor, 1, crcData.length, null).dataCrc();
             assertTrue(localCrc != 0, "test payload must exercise the nonzero-local/zero-expected path");
 
             ScpException crcMismatch = assertThrows(ScpException.class,
                     () -> invokeReplicate(loop, new Messages.ReplicateCmd(12, crcZeroDescriptor, List.of(),
-                            (byte) 0, 0, crcData.length)));
+                            (byte) 0, 0, crcData.length, TEST_NS)));
             assertEquals(ErrorCode.INTERNAL, crcMismatch.code());
             assertFalse(store.contains(crcZeroDescriptor),
                     "expected CRC zero must not be treated as a wildcard for local replay");
@@ -547,11 +550,11 @@ class ControlLoopTest {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             ChunkId open = new ChunkId(FileId.of(7), 0);
-            node.store().open(open, false, 1, 1L);
+            node.store().open(TEST_NS, open, false, 1, 1L);
 
             ScpException e = assertThrows(ScpException.class,
                     () -> invokeReplicate(loop, new Messages.ReplicateCmd(15, open, List.of(),
-                            (byte) 0, 0, 0)));
+                            (byte) 0, 0, 0, TEST_NS)));
 
             assertEquals(ErrorCode.INTERNAL, e.code());
             assertFalse(node.store().contains(open));
@@ -567,7 +570,7 @@ class ControlLoopTest {
             ScpException e = assertThrows(ScpException.class,
                     () -> invokeReplicate(loop, new Messages.ReplicateCmd(16, chunkId,
                             List.of(new Messages.Replica(77, "malformed-source")),
-                            (byte) 0, 0, 1)));
+                            (byte) 0, 0, 1, TEST_NS)));
 
             assertEquals(ErrorCode.INTERNAL, e.code());
             assertTrue(e.getMessage().contains("invalid endpoint"));
@@ -580,7 +583,7 @@ class ControlLoopTest {
         byte[] data = "repair-source".getBytes();
         try (ChunkStore sourceStore = new ChunkStore(dir.resolve("source-io"));
              DataNode node = new DataNode(DataNodeConfig.standalone(dir.resolve("target-io")))) {
-            sourceStore.open(chunkId, false, 1, 1L);
+            sourceStore.open(TEST_NS, chunkId, false, 1, 1L);
             sourceStore.append(chunkId, 1, 0, 0, ByteBuffer.wrap(data));
             int crc = sourceStore.seal(chunkId, 1, data.length, null).dataCrc();
 
@@ -597,7 +600,7 @@ class ControlLoopTest {
                 ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
                 invokeReplicate(loop, new Messages.ReplicateCmd(13, chunkId, List.of(
                         new Messages.Replica(11, "127.0.0.1:1"),
-                        new Messages.Replica(77, endpoint(source))), (byte) 0, crc, data.length));
+                        new Messages.Replica(77, endpoint(source))), (byte) 0, crc, data.length, TEST_NS));
 
                 assertTrue(node.store().contains(chunkId), "repair should continue after a source connection failure");
             }
@@ -610,7 +613,7 @@ class ControlLoopTest {
         byte[] data = "repair-source".getBytes();
         try (ChunkStore sourceStore = new ChunkStore(dir.resolve("source"));
              DataNode node = new DataNode(DataNodeConfig.standalone(dir.resolve("target")))) {
-            sourceStore.open(chunkId, false, 1, 1L);
+            sourceStore.open(TEST_NS, chunkId, false, 1, 1L);
             sourceStore.append(chunkId, 1, 0, 0, ByteBuffer.wrap(data));
             int crc = sourceStore.seal(chunkId, 1, data.length, null).dataCrc();
 
@@ -627,7 +630,7 @@ class ControlLoopTest {
                 ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
                 invokeReplicate(loop, new Messages.ReplicateCmd(12, chunkId, List.of(
                         new Messages.Replica(11, "malformed-source"),
-                        new Messages.Replica(77, endpoint(source))), (byte) 0, crc, data.length));
+                        new Messages.Replica(77, endpoint(source))), (byte) 0, crc, data.length, TEST_NS));
 
                 assertTrue(node.store().contains(chunkId), "repair should continue to the valid source");
             }
@@ -643,7 +646,7 @@ class ControlLoopTest {
             ScpException e = assertThrows(ScpException.class,
                     () -> invokeReplicate(loop, new Messages.ReplicateCmd(14, chunkId,
                             List.of(new Messages.Replica(node.nodeId(), "127.0.0.1:1")),
-                            (byte) 0, 0, 1)));
+                            (byte) 0, 0, 1, TEST_NS)));
             assertEquals(ErrorCode.INTERNAL, e.code());
         }
     }
@@ -674,12 +677,12 @@ class ControlLoopTest {
 
             ScpException negative = assertThrows(ScpException.class,
                     () -> loop.fetchWholeFile(null, new Messages.ReplicateCmd(20, chunkId, List.of(),
-                            (byte) 0, 0, -1), output));
+                            (byte) 0, 0, -1, TEST_NS), output));
             assertEquals(ErrorCode.CORRUPT_CHUNK, negative.code());
 
             ScpException overflow = assertThrows(ScpException.class,
                     () -> loop.fetchWholeFile(null, new Messages.ReplicateCmd(22, chunkId, List.of(),
-                            (byte) 0, 0, Long.MAX_VALUE), output));
+                            (byte) 0, 0, Long.MAX_VALUE, TEST_NS), output));
             assertEquals(ErrorCode.CORRUPT_CHUNK, overflow.code());
         }
     }
@@ -701,7 +704,7 @@ class ControlLoopTest {
 
             ScpException e = assertThrows(ScpException.class,
                     () -> loop.fetchWholeFile(client, new Messages.ReplicateCmd(21, new ChunkId(FileId.of(13), 0),
-                            List.of(), (byte) 0, 0, Integer.MAX_VALUE), output));
+                            List.of(), (byte) 0, 0, Integer.MAX_VALUE, TEST_NS), output));
 
             assertEquals(ErrorCode.INTERNAL, e.code());
             assertEquals(1, calls.get(),
@@ -761,7 +764,7 @@ class ControlLoopTest {
             Path output = dir.resolve("fetch-multipart.chunk");
 
             long fetchedLength = loop.fetchWholeFile(client, new Messages.ReplicateCmd(23, chunkId,
-                    List.of(), (byte) 0, 0, 1), output);
+                    List.of(), (byte) 0, 0, 1, TEST_NS), output);
             byte[] fetched = Files.readAllBytes(output);
 
             assertEquals(file.length, fetchedLength);
@@ -923,7 +926,7 @@ class ControlLoopTest {
             Path output = Files.createTempFile(dir, "fetch-failure.", ".chunk");
             ScpException e = assertThrows(ScpException.class,
                     () -> loop.fetchWholeFile(client, new Messages.ReplicateCmd(22,
-                            new ChunkId(FileId.of(15), 0), List.of(), (byte) 0, 0, 1), output));
+                            new ChunkId(FileId.of(15), 0), List.of(), (byte) 0, 0, 1, TEST_NS), output));
             assertEquals(expectedCode, e.code());
             Files.deleteIfExists(output);
         }

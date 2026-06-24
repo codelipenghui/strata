@@ -3,6 +3,7 @@ package io.strata.format;
 import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -34,6 +35,7 @@ class ChunkStoreWritebackTest {
     Path dir;
 
     private final ChunkId id = new ChunkId(FileId.of(1), 0);
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     private static int wholeCrc(byte[] data) {
         CRC32C c = new CRC32C();
@@ -66,7 +68,7 @@ class ChunkStoreWritebackTest {
     void flushesEligibleChunkAndPreservesSealCorrectness() throws IOException {
         byte[] all = randomBytes(1, 8 * MIB);            // two 4 MiB ranges
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, false, 1, 1718000000000L);
+            store.open(TEST_NS, id, false, 1, 1718000000000L);
             store.append(id, 1, 0, 0, ByteBuffer.wrap(all, 0, 6 * MIB)); // > 4 MiB threshold
 
             store.backgroundFlushOnce();
@@ -82,7 +84,7 @@ class ChunkStoreWritebackTest {
     @Test
     void skipsAckOnFsyncChunks() throws IOException {
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, true, 1, 1718000000000L); // ack-on-fsync: its committer already forces
+            store.open(TEST_NS, id, true, 1, 1718000000000L); // ack-on-fsync: its committer already forces
             store.append(id, 1, 0, 0, ByteBuffer.wrap(new byte[6 * MIB]));
             store.backgroundFlushOnce();
             assertEquals(0, store.backgroundFlushes(), "ack-on-fsync chunks are flushed by their committer");
@@ -92,7 +94,7 @@ class ChunkStoreWritebackTest {
     @Test
     void skipsChunksBelowThreshold() throws IOException {
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, false, 1, 1718000000000L);
+            store.open(TEST_NS, id, false, 1, 1718000000000L);
             store.append(id, 1, 0, 0, ByteBuffer.wrap(new byte[1 * MIB])); // < 4 MiB threshold
             store.backgroundFlushOnce();
             assertEquals(0, store.backgroundFlushes(), "a chunk below the threshold should not be flushed");
@@ -103,14 +105,15 @@ class ChunkStoreWritebackTest {
     void deleteDoesNotLeaveClosedOpenHandleEligibleForWriteback() throws IOException {
         ChunkStore store = new ChunkStore(dir);
         try {
-            store.open(id, false, 1, 1718000000000L);
+            store.open(TEST_NS, id, false, 1, 1718000000000L);
             store.append(id, 1, 0, 0, ByteBuffer.wrap(new byte[6 * MIB]));
 
-            String base = ChunkFormats.baseName(id);
-            Files.delete(dir.resolve(base + ".chunk"));
-            Files.delete(dir.resolve(base + ".meta"));
-            Files.delete(dir.resolve(base + ".j"));
-            Files.delete(dir);
+            String rel = ChunkFormats.chunkRelativePath(TEST_NS, id);
+            Path shardDir = dir.resolve(rel + ".chunk").getParent();
+            Files.delete(dir.resolve(rel + ".chunk"));
+            Files.delete(dir.resolve(rel + ".meta"));
+            Files.delete(dir.resolve(rel + ".j"));
+            Files.delete(shardDir);
 
             assertEquals(ErrorCode.OK, store.delete(id),
                     "delete should remove the closed handle even when files disappeared first");

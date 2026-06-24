@@ -488,7 +488,8 @@ class RepairCoordinator implements AutoCloseable {
         inflight.put(cmdId, new ReplicateAction(fileId, chunkId, deadNode, target.record.nodeId(),
                 System.currentTimeMillis()));
         registry.enqueue(target.record.nodeId(),
-                new Messages.ReplicateCmd(cmdId, chunkId, sources, (byte) 1, chunk.crc(), chunk.length()));
+                new Messages.ReplicateCmd(cmdId, chunkId, sources, (byte) 1, chunk.crc(), chunk.length(),
+                        file.namespace()));
         recordRepairIssued(trigger);
         log.info("repair: {} dead={} -> target={} (cmd {})", chunkId, deadNode, target.record.nodeId(), cmdId);
     }
@@ -583,7 +584,7 @@ class RepairCoordinator implements AutoCloseable {
         try {
             long cmdId = commandIds.incrementAndGet();
             Messages.ReplicateCmd cmd = new Messages.ReplicateCmd(cmdId, chunkId, sources,
-                    (byte) 1, chunk.crc(), chunk.length());
+                    (byte) 1, chunk.crc(), chunk.length(), ns);
             if (execReplicate(target, cmd)
                     && applyOwnerRepair(file.fileId(), chunkId, deadNode, target.record.nodeId())) {
                 recordRepairIssued(trigger);

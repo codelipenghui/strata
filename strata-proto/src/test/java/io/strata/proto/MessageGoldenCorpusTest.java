@@ -158,11 +158,11 @@ class MessageGoldenCorpusTest {
                                 + "010100010102000101030001020100010202000102030001020400010205"
                                 + "000102060001020700010208000102090001020a000100"),
                 request("openChunk",
-                        new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L),
-                        () -> new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L).encode(),
+                        new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L, NS),
+                        () -> new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L, NS).encode(),
                         Messages.OpenChunk::decode,
                         "11111111222233330000000300000005010000000040000000"
-                                + "0000019000c79c0000"),
+                                + "0000019000c79c000474657374" + "00"),
                 request("append",
                         new Messages.Append(CHUNK_ID, 5, 1024, 512),
                         () -> new Messages.Append(CHUNK_ID, 5, 1024, 512).encode(),
@@ -285,18 +285,18 @@ class MessageGoldenCorpusTest {
                         new Messages.HeartbeatResp(123_456, List.of(
                                 new Messages.ReplicateCmd(1, CHUNK_ID,
                                         List.of(new Messages.Replica(7, "h7:9000")),
-                                        (byte) 1, 0xAA, 4096),
+                                        (byte) 1, 0xAA, 4096, NS),
                                 new Messages.DeleteCmd(2, List.of(CHUNK_ID)),
                                 new Messages.DrainCmd(3))),
                         () -> new Messages.HeartbeatResp(123_456, List.of(
                                 new Messages.ReplicateCmd(1, CHUNK_ID,
                                         List.of(new Messages.Replica(7, "h7:9000")),
-                                        (byte) 1, 0xAA, 4096),
+                                        (byte) 1, 0xAA, 4096, NS),
                                 new Messages.DeleteCmd(2, List.of(CHUNK_ID)),
                                 new Messages.DrainCmd(3))).encode(),
                         Messages.HeartbeatResp::decode,
                         "0000000000000001e240030000000000000001011111111122223333000000030100000007"
-                                + "0768373a3930303001000000aa0000000000001000"
+                                + "0768373a3930303001000000aa00000000000010000474657374"
                                 + "0000000000000002020111111111222233330000000300000000000000030300"),
                 request("inventoryReport",
                         new Messages.InventoryReport(42, 1, 2, 9, 0, 1,

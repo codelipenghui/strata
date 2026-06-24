@@ -182,9 +182,9 @@ class ScpV0CompatibilityTest {
                 exchange("ping", Opcode.PING, EMPTY_REQUEST, PING_PAYLOAD, "empty-request", ScpV0CompatibilityTest::decodeEmptyRequest,
                         OK_RESPONSE, PING_PAYLOAD, "ok", ScpV0CompatibilityTest::decodeOkResponse),
                 exchange("openChunk", Opcode.OPEN_CHUNK,
-                        "111111112222333300000003000000050100000000400000000000019000c79c0000",
+                        "111111112222333300000003000000050100000000400000000000019000c79c000474657374" + "00",
                         null,
-                        new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L),
+                        new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L, NS),
                         b -> Messages.OpenChunk.decode(b),
                         OK_RESPONSE, null, "ok", ScpV0CompatibilityTest::decodeOkResponse),
                 exchange("append", Opcode.APPEND,
@@ -272,12 +272,14 @@ class ScpV0CompatibilityTest {
                                 List.of(new Messages.StorageUsage(100, 900)), 3,
                                 List.of(new Messages.CompletedCommand(7, (short) 0))),
                         b -> Messages.NodeHeartbeat.decode(b),
-                        "0000000000000001e2400300000000000000010111111111222233330000000301000000070768373a3930303001000000aa00000000000010000000000000000002020111111111222233330000000300000000000000030300",
+                        "0000000000000001e2400300000000000000010111111111222233330000000301000000070768373a3930303001000000aa0000000000001000"
+                                + "0474657374"
+                                + "0000000000000002020111111111222233330000000300000000000000030300",
                         null,
                         new Messages.HeartbeatResp(123_456, List.of(
                                 new Messages.ReplicateCmd(1, CHUNK_ID,
                                         List.of(new Messages.Replica(7, "h7:9000")),
-                                        (byte) 1, 0xAA, 4096),
+                                        (byte) 1, 0xAA, 4096, NS),
                                 new Messages.DeleteCmd(2, List.of(CHUNK_ID)),
                                 new Messages.DrainCmd(3))),
                         b -> decodeResp(b, Messages.HeartbeatResp::decode)),

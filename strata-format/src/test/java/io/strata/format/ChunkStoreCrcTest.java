@@ -2,6 +2,7 @@ package io.strata.format;
 
 import io.strata.common.ChunkId;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -76,7 +77,7 @@ class ChunkStoreCrcTest {
 
     private void assertSealCrcMatchesScan(byte[] data, int[] pieces) throws IOException {
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, false, 1, 1718000000000L);
+            store.open(StrataNamespace.of("test"), id, false, 1, 1718000000000L);
             appendInPieces(store, data, pieces);
             ChunkStore.SealResult sealed = store.seal(id, 1, data.length, null);
             assertEquals(wholeCrc(data), sealed.dataCrc(), "sealed dataCrc must equal CRC32C over all bytes");
@@ -121,7 +122,7 @@ class ChunkStoreCrcTest {
         System.arraycopy(part2, 0, all, part1.length, part2.length);
 
         ChunkStore store = new ChunkStore(dir);
-        store.open(id, false, 1, 1718000000000L);
+        store.open(StrataNamespace.of("test"), id, false, 1, 1718000000000L);
         appendInPieces(store, part1, new int[]{2_000_000, 1_234_567});
         store.close(); // reopen before sealing — the in-memory running CRC state is gone
 
@@ -138,7 +139,7 @@ class ChunkStoreCrcTest {
     void failedLedgerAppendDoesNotFoldIntoRunningCrc() throws Exception {
         byte[] committed = "AAAA".getBytes(StandardCharsets.UTF_8);
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, false, 1, 1718000000000L);
+            store.open(StrataNamespace.of("test"), id, false, 1, 1718000000000L);
             store.append(id, 1, 0, 0, ByteBuffer.wrap(committed)); // written, logged, folded
 
             // Make the next ledger append fail (closed channel), then attempt an append: its data write

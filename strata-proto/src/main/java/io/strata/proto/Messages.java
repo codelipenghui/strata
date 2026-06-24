@@ -107,19 +107,27 @@ public final class Messages {
     /* ---------- data plane ---------- */
 
     public record OpenChunk(ChunkId chunkId, int writeEpoch, boolean fsyncOnAck,
-                            long expectedMaxBytes, long createdAtMs) {
+                            long expectedMaxBytes, long createdAtMs, StrataNamespace namespace) {
+        public OpenChunk {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.chunkId(chunkId).i32(writeEpoch).u8(fsyncOnAck ? 1 : 0)
-                    .u64(expectedMaxBytes).u64(createdAtMs).noTags();
+                    .u64(expectedMaxBytes).u64(createdAtMs).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static OpenChunk decode(ByteBuffer b) {
-            OpenChunk m = new OpenChunk(ChunkId.readFrom(b), b.getInt(), Varint.readBoolean(b),
-                    b.getLong(), b.getLong());
+            ChunkId chunkId = ChunkId.readFrom(b);
+            int writeEpoch = b.getInt();
+            boolean fsyncOnAck = Varint.readBoolean(b);
+            long expectedMaxBytes = b.getLong();
+            long createdAtMs = b.getLong();
+            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             TaggedFields.readFrom(b);
-            return m;
+            return new OpenChunk(chunkId, writeEpoch, fsyncOnAck, expectedMaxBytes, createdAtMs, namespace);
         }
     }
 
@@ -516,7 +524,8 @@ public final class Messages {
                 case ReplicateCmd r -> {
                     w.u8(1).chunkId(r.chunkId());
                     writeReplicas(w, r.sources());
-                    w.u8(r.priority()).u32(r.expectedCrc()).u64(r.expectedLength());
+                    w.u8(r.priority()).u32(r.expectedCrc()).u64(r.expectedLength())
+                     .string(r.namespace().toString());
                 }
                 case DeleteCmd d -> {
                     w.u8(2).varint(d.chunkIds().size());
@@ -530,7 +539,15 @@ public final class Messages {
             long id = b.getLong();
             byte type = b.get();
             return switch (type) {
-                case 1 -> new ReplicateCmd(id, ChunkId.readFrom(b), readReplicas(b), b.get(), b.getInt(), b.getLong());
+                case 1 -> {
+                    ChunkId chunkId = ChunkId.readFrom(b);
+                    List<Replica> sources = readReplicas(b);
+                    byte priority = b.get();
+                    int expectedCrc = b.getInt();
+                    long expectedLength = b.getLong();
+                    StrataNamespace ns = StrataNamespace.of(Varint.readString(b));
+                    yield new ReplicateCmd(id, chunkId, sources, priority, expectedCrc, expectedLength, ns);
+                }
                 case 2 -> {
                     int n = count(b);
                     List<ChunkId> ids = new ArrayList<>(n);
@@ -544,9 +561,11 @@ public final class Messages {
     }
 
     public record ReplicateCmd(long commandId, ChunkId chunkId, List<Replica> sources,
-                               byte priority, int expectedCrc, long expectedLength) implements Command {
+                               byte priority, int expectedCrc, long expectedLength,
+                               StrataNamespace namespace) implements Command {
         public ReplicateCmd {
             sources = List.copyOf(sources);
+            namespace = Objects.requireNonNull(namespace, "namespace");
         }
     }
 

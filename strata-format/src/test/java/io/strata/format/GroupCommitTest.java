@@ -4,6 +4,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.ChunkId;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -36,12 +37,13 @@ class GroupCommitTest {
     Path dir;
 
     private final ChunkId id = new ChunkId(FileId.of(1), 0);
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     @Test
     void pipelinedFsyncAppendsCoalesceForces() throws Exception {
         int appends = 400;
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, true, 1, 1L);
+            store.open(TEST_NS, id, true, 1, 1L);
 
             List<CompletableFuture<ChunkStore.AppendResult>> futures = new ArrayList<>(appends);
             byte[] payload = "group-commit-payload".getBytes();
@@ -75,7 +77,7 @@ class GroupCommitTest {
         // sequential (non-pipelined) appends: each future completion implies a covering force;
         // crash-recovery must retain everything acked even with no clean close
         ChunkStore store = new ChunkStore(dir);
-        store.open(id, true, 1, 1L);
+        store.open(TEST_NS, id, true, 1, 1L);
         byte[] payload = "durable!".getBytes();
         long offset = 0;
         for (int i = 0; i < 20; i++) {
@@ -97,7 +99,7 @@ class GroupCommitTest {
     @Test
     void sealWithPipelinedFsyncAppendsDrainsCleanly() throws Exception {
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, true, 1, 1L);
+            store.open(TEST_NS, id, true, 1, 1L);
             byte[] payload = "drain-me".getBytes();
             List<CompletableFuture<ChunkStore.AppendResult>> futures = new ArrayList<>();
             long offset = 0;
@@ -115,7 +117,7 @@ class GroupCommitTest {
     @Test
     void replicateModeDoesNotForce() throws Exception {
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, false, 1, 1L);
+            store.open(TEST_NS, id, false, 1, 1L);
             byte[] payload = "fast".getBytes();
             long offset = 0;
             for (int i = 0; i < 50; i++) {

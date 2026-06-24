@@ -6,6 +6,7 @@ import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -37,20 +38,22 @@ class CrashRecoveryTest {
 
     private final ChunkId id = new ChunkId(FileId.of(1), 0);
 
+    static final StrataNamespace TEST_NS = StrataNamespace.of("test");
+
     private void open(ChunkStore store) throws IOException {
-        store.open(id, false, 1, 1718000000000L);
+        store.open(TEST_NS, id, false, 1, 1718000000000L);
     }
 
     private Path dataPath() {
-        return dir.resolve(ChunkFormats.baseName(id) + ".chunk");
+        return dir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, id) + ".chunk");
     }
 
     private Path ledgerPath() {
-        return dir.resolve(ChunkFormats.baseName(id) + ".j");
+        return dir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, id) + ".j");
     }
 
     private Path metaPath() {
-        return dir.resolve(ChunkFormats.baseName(id) + ".meta");
+        return dir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, id) + ".meta");
     }
 
     @Test
@@ -175,14 +178,15 @@ class CrashRecoveryTest {
             assertEquals(0, recovered.inventory().size(),
                     "corrupt-footer chunk must not be recovered as healthy");
             assertFalse(Files.exists(dataPath()), "live chunk name must be free for repair import");
-            try (Stream<Path> files = Files.list(dir)) {
+            Path shardDir = dataPath().getParent();
+            try (Stream<Path> files = Files.list(shardDir)) {
                 // .chunk + .meta + the retained integrity ledger (.j) — under STRATA_SEAL_FSYNC=false
                 // seal keeps the ledger until the SEALED state is forced durable, so it is still present
                 // at recovery and quarantined alongside the chunk as corrupt evidence.
                 assertEquals(3, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
                         "quarantine must preserve the corrupt evidence under a non-live name");
             }
-            recovered.importSealed(id, repairImage, 11, dataCrc);
+            recovered.importSealed(TEST_NS, id, repairImage, 11, dataCrc);
             assertArrayEquals("sealed-data".getBytes(), recovered.read(id, 0, 100).bytes());
         }
     }
@@ -192,7 +196,7 @@ class CrashRecoveryTest {
         ChunkStore store = new ChunkStore(dir);
         open(store);
         store.append(id, 1, 0, 0, ByteBuffer.wrap("x".getBytes()));
-        Files.delete(dir.resolve(ChunkFormats.baseName(id) + ".meta"));
+        Files.delete(metaPath());
         try (ChunkStore recovered = new ChunkStore(dir)) {
             assertEquals(0, recovered.inventory().size());
             assertFalse(Files.exists(dataPath()));
@@ -203,7 +207,7 @@ class CrashRecoveryTest {
     void ackedFsyncChunkSurvivesMissingSidecarNameAfterCrash() throws Exception {
         byte[] payload = "acked-fsync".getBytes();
         ChunkStore store = new ChunkStore(dir);
-        store.open(id, true, 1, 1718000000000L);
+        store.open(TEST_NS, id, true, 1, 1718000000000L);
         store.appendAsync(id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
         store.close();
 
@@ -221,7 +225,7 @@ class CrashRecoveryTest {
     void missingSidecarOpenChunkWithFooterShapedPayloadRecoversFromLedger() throws Exception {
         byte[] payload = footerShapedPayload("live".getBytes());
         ChunkStore store = new ChunkStore(dir);
-        store.open(id, true, 1, 1718000000000L);
+        store.open(TEST_NS, id, true, 1, 1718000000000L);
         store.appendAsync(id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
         store.close();
 
@@ -240,7 +244,7 @@ class CrashRecoveryTest {
     void missingSidecarFsyncOpenChunkRequiresFreshFenceBeforeAppend() throws Exception {
         byte[] payload = "acked-fsync".getBytes();
         ChunkStore store = new ChunkStore(dir);
-        store.open(id, true, 1, 1718000000000L);
+        store.open(TEST_NS, id, true, 1, 1718000000000L);
         store.appendAsync(id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
         store.close();
 

@@ -56,7 +56,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 if (node.isDraining()) {
                     throw new ScpException(ErrorCode.NO_CAPACITY, "node draining");
                 }
-                store.open(m.chunkId(), m.fsyncOnAck(), m.writeEpoch(), m.createdAtMs());
+                store.open(m.namespace(), m.chunkId(), m.fsyncOnAck(), m.writeEpoch(), m.createdAtMs());
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
 

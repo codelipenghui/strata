@@ -234,10 +234,10 @@ final class ControlLoop implements AutoCloseable {
                 Endpoint hp = Endpoint.parse(source.endpoint(), "endpoint", ErrorCode.INTERNAL);
                 try (ScpClient src = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_DATA_NODE,
                         "repair-" + node.nodeId())) {
-                    Path tmp = store.createImportTemp(cmd.chunkId());
+                    Path tmp = store.createImportTemp(cmd.namespace(), cmd.chunkId());
                     try {
                         long fileLength = fetchWholeFile(src, cmd, tmp);
-                        store.importSealed(cmd.chunkId(), tmp, cmd.expectedLength(), cmd.expectedCrc());
+                        store.importSealed(cmd.namespace(), cmd.chunkId(), tmp, cmd.expectedLength(), cmd.expectedCrc());
                         tmp = null; // importSealed consumes the temp file by moving it into place.
                         log.info("replicated {} from node {} ({} bytes)", cmd.chunkId(), source.nodeId(), fileLength);
                     } finally {

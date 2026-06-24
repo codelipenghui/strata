@@ -4,6 +4,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -18,7 +19,7 @@ import java.nio.channels.FileChannel;
 public final class ChunkFormats {
     private ChunkFormats() {}
 
-    public static final int FORMAT_VERSION = 1;
+    public static final int FORMAT_VERSION = 2;
     public static final int HEADER_SIZE = 4096;
     public static final long DATA_START = HEADER_SIZE;
     public static final int TRAILER_SIZE = 64;
@@ -220,6 +221,28 @@ public final class ChunkFormats {
 
     public static String baseName(ChunkId id) {
         return id.fileId().toString() + "." + id.index();
+    }
+
+    /**
+     * Namespace-sharded relative path for a chunk file (without extension).
+     *
+     * Layout: {@code <ns>/<L1>/<L2>/<fileId>.<index>} where
+     * {@code L1 = fileId & 0xFF} (low byte) and {@code L2 = (fileId >> 8) & 0xFF} (next byte).
+     * Low-bits-first ensures sequential file IDs spread across shards rather than filling a
+     * single shard linearly.
+     *
+     * <p>Examples:
+     * <ul>
+     *   <li>{@code perf-0/00/00/0000000000000000.0} — FileId 0, index 0
+     *   <li>{@code perf-0/ff/00/00000000000000ff.0} — FileId 255, index 0
+     *   <li>{@code perf-0/00/01/0000000000000100.2} — FileId 256, index 2
+     * </ul>
+     */
+    public static String chunkRelativePath(StrataNamespace ns, ChunkId id) {
+        long fid = id.fileId().id();
+        int l1 = (int) (fid & 0xFF);
+        int l2 = (int) ((fid >> 8) & 0xFF);
+        return String.format("%s/%02x/%02x/%s", ns, l1, l2, baseName(id));
     }
 
     public static ChunkId parseBaseName(String base) {

@@ -25,7 +25,7 @@ class MessageRoundtripTest {
 
     @Test
     void dataPlaneRoundtrips() {
-        var open = new Messages.OpenChunk(c, 5, true, 1 << 30, 1718000000000L);
+        var open = new Messages.OpenChunk(c, 5, true, 1 << 30, 1718000000000L, ns);
         assertEquals(open, Messages.OpenChunk.decode(buf(open.encode())));
 
         var append = new Messages.Append(c, 5, 1024, 512);
@@ -99,7 +99,7 @@ class MessageRoundtripTest {
         assertEquals(hbEmpty, Messages.NodeHeartbeat.decode(buf(hbEmpty.encode())));
 
         var hbResp = new Messages.HeartbeatResp(123456, List.of(
-                new Messages.ReplicateCmd(1, c, List.of(new Messages.Replica(7, "h7:9000")), (byte) 1, 0xAA, 4096),
+                new Messages.ReplicateCmd(1, c, List.of(new Messages.Replica(7, "h7:9000")), (byte) 1, 0xAA, 4096, ns),
                 new Messages.DeleteCmd(2, List.of(c)),
                 new Messages.DrainCmd(3)));
         assertEquals(hbResp, decodeResp(hbResp.encode(), Messages.HeartbeatResp::decode));

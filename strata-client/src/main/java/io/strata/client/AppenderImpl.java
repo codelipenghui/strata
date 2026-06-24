@@ -577,7 +577,7 @@ final class AppenderImpl implements StrataFile.Appender {
         }
         ChunkSession s = new ChunkSession(created.chunkId(), created.replicas());
         byte[] header = new Messages.OpenChunk(created.chunkId(), epoch, fsyncOnAck,
-                config.chunkRollBytes(), System.currentTimeMillis()).encode();
+                config.chunkRollBytes(), System.currentTimeMillis(), namespace).encode();
         int ok = 0;
         List<Messages.Replica> opened = new ArrayList<>(s.replicas.size());
         Set<Integer> failedNodeIds = new HashSet<>();

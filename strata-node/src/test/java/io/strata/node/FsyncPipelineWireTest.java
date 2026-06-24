@@ -2,6 +2,7 @@ package io.strata.node;
 
 import io.strata.common.ChunkId;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -39,7 +40,7 @@ class FsyncPipelineWireTest {
 
             ChunkId id = new ChunkId(FileId.of(1), 0);
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, true /* fsync */,
-                    1 << 24, 1L).encode(), null, 5000);
+                    1 << 24, 1L, StrataNamespace.of("test")).encode(), null, 5000);
 
             long start = System.nanoTime();
             List<CompletableFuture<Frame>> futures = new ArrayList<>(appends);
