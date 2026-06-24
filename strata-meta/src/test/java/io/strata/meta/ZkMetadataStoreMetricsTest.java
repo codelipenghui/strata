@@ -34,7 +34,7 @@ class ZkMetadataStoreMetricsTest {
             assertTrue(store.zkOps("nodes", false) >= 1, "getNode must count a nodes read");
 
             // files + namespaces subtrees: createFile writes the file record and the namespace marker
-            FileId fileId = FileId.random();
+            FileId fileId = FileId.of(1);
             Records.FileRecord file = new Records.FileRecord(
                     fileId, "test", "/test-file", 3, 2, false, FileState.OPEN, System.currentTimeMillis(), List.of());
             store.createFile(file);

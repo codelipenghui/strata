@@ -26,7 +26,7 @@ class FrameGoldenTest {
 
     @Test
     void appendFrameGoldenBytes() throws IOException {
-        FileId f = new FileId(0x0102030405060708L, 0x090A0B0C0D0E0F10L);
+        FileId f = FileId.of(0x0102030405060708L);
         var append = new Messages.Append(new ChunkId(f, 2), 5, 100, 50);
         ByteBuffer payload = ByteBuffer.wrap(new byte[]{(byte) 0xDE, (byte) 0xAD});
 
@@ -74,7 +74,7 @@ class FrameGoldenTest {
     @Test
     void corruptPayloadRejected() throws IOException {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        var append = new Messages.Append(new ChunkId(new FileId(1, 2), 0), 1, 0, 0);
+        var append = new Messages.Append(new ChunkId(FileId.of(1), 0), 1, 0, 0);
         FrameIO.write(new DataOutputStream(bos), Frame.request(Opcode.APPEND, append.encode(),
                 ByteBuffer.wrap(new byte[]{1, 2, 3, 4}), 1));
         byte[] wire = bos.toByteArray();
@@ -95,7 +95,7 @@ class FrameGoldenTest {
     void unknownTaggedFieldsIgnored() {
         // a future writer adds tag 99 to Append — current reader must ignore it
         BufWriter w = new BufWriter();
-        FileId f = new FileId(1, 2);
+        FileId f = FileId.of(1);
         w.chunkId(new ChunkId(f, 0)).i32(1).u64(0).u64(0);
         TaggedFields.of(java.util.Map.of(99, new byte[]{1, 2, 3})).writeTo(w);
         var decoded = Messages.Append.decode(ByteBuffer.wrap(w.toBytes()));

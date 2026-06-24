@@ -35,7 +35,7 @@ class GroupCommitTest {
     @TempDir
     Path dir;
 
-    private final ChunkId id = new ChunkId(FileId.random(), 0);
+    private final ChunkId id = new ChunkId(FileId.of(1), 0);
 
     @Test
     void pipelinedFsyncAppendsCoalesceForces() throws Exception {

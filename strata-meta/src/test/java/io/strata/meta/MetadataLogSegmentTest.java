@@ -13,7 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class MetadataLogSegmentTest {
 
-    private static final FileId F = new FileId(1, 2);
+    private static final FileId F = FileId.of(1);
 
     private static MetadataLogRecord rec(int i) {
         return new MetadataLogRecord.ChunkSealed(F, i, 4096, 0xABCD0000 + i, 1, List.of(1, 2, 3));

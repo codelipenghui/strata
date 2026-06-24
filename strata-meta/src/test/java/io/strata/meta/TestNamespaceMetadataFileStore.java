@@ -66,6 +66,6 @@ final class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore
     }
 
     private FileId nextId() {
-        return new FileId(0x5354524D4554413FL, ids.getAndIncrement()); // distinct high bits for system files
+        return FileId.of(0x5354524D4554413FL); // distinct high bits for system files
     }
 }

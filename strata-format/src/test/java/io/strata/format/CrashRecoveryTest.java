@@ -35,7 +35,7 @@ class CrashRecoveryTest {
     @TempDir
     Path dir;
 
-    private final ChunkId id = new ChunkId(FileId.random(), 0);
+    private final ChunkId id = new ChunkId(FileId.of(1), 0);
 
     private void open(ChunkStore store) throws IOException {
         store.open(id, false, 1, 1718000000000L);

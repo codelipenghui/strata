@@ -31,7 +31,7 @@ class NamespaceMetadataLogRepositoryTest {
             TestNamespaceMetadataFileStore fs = new TestNamespaceMetadataFileStore();
             NamespaceMetadataLogRepository repo = NamespaceMetadataLogRepository.open(NS, fs, root, 1);
 
-            FileId f = new FileId(1, 1);
+            FileId f = FileId.of(1);
             repo.append(fileCreated(f, "/a", 1));
             repo.append(new MetadataLogRecord.ChunkCreated(f, 0, 1, List.of(1, 2, 3), 1, 1));
             repo.append(new MetadataLogRecord.ChunkSealed(f, 0, 4096, 7, 1, List.of(1, 2, 3)));
@@ -54,13 +54,13 @@ class NamespaceMetadataLogRepositoryTest {
             TestNamespaceMetadataFileStore fs = new TestNamespaceMetadataFileStore();
             NamespaceMetadataLogRepository repo = NamespaceMetadataLogRepository.open(NS, fs, root, 1);
 
-            FileId f = new FileId(1, 1);
+            FileId f = FileId.of(1);
             repo.append(fileCreated(f, "/a", 1));
             long genBefore = repo.generation();
             repo.compactAndPublish();                 // snapshot f, roll a new open log
             assertTrue(repo.generation() > genBefore, "compaction advances the snapshot generation");
 
-            FileId g = new FileId(2, 2);
+            FileId g = FileId.of(2);
             repo.append(fileCreated(g, "/b", 2));      // appended only to the post-compaction log
 
             // A successor must see BOTH: f from the snapshot and g from the new open log.
@@ -77,12 +77,12 @@ class NamespaceMetadataLogRepositoryTest {
             TestNamespaceMetadataFileStore fs = new TestNamespaceMetadataFileStore();
 
             NamespaceMetadataLogRepository leader = NamespaceMetadataLogRepository.open(NS, fs, root, 1);
-            leader.append(fileCreated(new FileId(1, 1), "/a", 1));
+            leader.append(fileCreated(FileId.of(1), "/a", 1));
 
             // A new leader recovers under a higher epoch — its open republishes the manifest, fencing
             // the old leader (whose cached manifest version is now stale).
             NamespaceMetadataLogRepository successor = NamespaceMetadataLogRepository.open(NS, fs, root, 2);
-            successor.append(fileCreated(new FileId(2, 2), "/b", 2));
+            successor.append(fileCreated(FileId.of(2), "/b", 2));
 
             assertThrows(IllegalStateException.class, leader::compactAndPublish,
                     "the fenced leader's manifest CAS must lose");

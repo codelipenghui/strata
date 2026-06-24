@@ -272,7 +272,7 @@ public final class ZkMetadataStore implements MetadataStore {
         }
         record(NAMESPACES, false, 0);
         for (String child : children) {
-            FileId id = FileId.fromString(child);
+            FileId id = FileId.fromHex(child);
             if (getFile(id).isPresent()) {  // skip DELETED tombstones (index entry not yet swept)
                 out.add(id);
             }
@@ -330,7 +330,7 @@ public final class ZkMetadataStore implements MetadataStore {
                 record(FILES, true, 0);
                 // also drop any lingering per-namespace index entry (e.g. if deleteFile's best-effort
                 // cleanup didn't run); harmless if already gone
-                dropNamespaceFileIndex(decoded.namespace(), FileId.fromString(child));
+                dropNamespaceFileIndex(decoded.namespace(), FileId.fromHex(child));
                 reaped++;
             } catch (KeeperException.BadVersionException | KeeperException.NoNodeException ignored) {
                 // raced with another mutation/sweeper; leave it for the next pass

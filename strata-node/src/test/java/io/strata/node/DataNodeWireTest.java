@@ -40,7 +40,7 @@ class DataNodeWireTest {
     @TempDir
     Path dir;
 
-    private final ChunkId id = new ChunkId(FileId.random(), 0);
+    private final ChunkId id = new ChunkId(FileId.of(1), 0);
 
     @Test
     void failedServerBindLeavesDataDirReusable() throws Exception {
@@ -327,7 +327,7 @@ class DataNodeWireTest {
 
             node.setDraining(true);
             ScpException draining = assertThrows(ScpException.class, () -> client.call(Opcode.OPEN_CHUNK,
-                    new Messages.OpenChunk(new ChunkId(FileId.random(), 0), 1, false,
+                    new Messages.OpenChunk(new ChunkId(FileId.of(2), 0), 1, false,
                             1 << 20, 1L).encode(), null, 5000));
             assertEquals(ErrorCode.NO_CAPACITY, draining.code());
 
@@ -345,7 +345,7 @@ class DataNodeWireTest {
 
     @Test
     void sealChunkPassesPayloadFooterToStore() throws Exception {
-        ChunkId chunk = new ChunkId(FileId.random(), 0);
+        ChunkId chunk = new ChunkId(FileId.of(3), 0);
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk, 1, false,
@@ -381,7 +381,7 @@ class DataNodeWireTest {
 
     @Test
     void repairFetchRejectsSourceThatAdvertisesOversizedFile() throws Exception {
-        ChunkId repairChunk = new ChunkId(FileId.random(), 0);
+        ChunkId repairChunk = new ChunkId(FileId.of(4), 0);
         try (ScpServer source = new ScpServer(0, 1, 0, 0, req -> {
             if (Opcode.fromCode(req.opcode()) != Opcode.FETCH_CHUNK) {
                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
@@ -403,7 +403,7 @@ class DataNodeWireTest {
 
     @Test
     void repairFetchAcceptsValidSealedFileBytes() throws Exception {
-        ChunkId repairChunk = new ChunkId(FileId.random(), 0);
+        ChunkId repairChunk = new ChunkId(FileId.of(5), 0);
         byte[] fileBytes = new byte[4096 + 4 + 64];
         for (int i = 0; i < fileBytes.length; i++) fileBytes[i] = (byte) i;
         try (ScpServer source = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
@@ -422,7 +422,7 @@ class DataNodeWireTest {
 
     @Test
     void repairFetchRejectsMalformedSourceProgress() throws Exception {
-        ChunkId repairChunk = new ChunkId(FileId.random(), 0);
+        ChunkId repairChunk = new ChunkId(FileId.of(6), 0);
         ControlLoop loop = new ControlLoop(null, null, null);
         var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4);
 
@@ -494,7 +494,7 @@ class DataNodeWireTest {
     @Test
     void repairFetchRejectsInvalidExpectedLengthsBeforeNetworkUse() {
         ControlLoop loop = new ControlLoop(null, null, null);
-        ChunkId repairChunk = new ChunkId(FileId.random(), 0);
+        ChunkId repairChunk = new ChunkId(FileId.of(7), 0);
         Path output = dir.resolve("invalid-expected-length-fetch.chunk");
 
         assertEquals(ErrorCode.CORRUPT_CHUNK,

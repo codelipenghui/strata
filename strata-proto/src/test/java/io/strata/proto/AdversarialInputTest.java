@@ -63,7 +63,7 @@ class AdversarialInputTest {
         assertTrue(e.getMessage().contains("count"), "got: " + e.getMessage());
 
         // sane messages still decode
-        var del = new Messages.DeleteChunks(java.util.List.of(new ChunkId(FileId.random(), 0)));
+        var del = new Messages.DeleteChunks(java.util.List.of(new ChunkId(FileId.of(1), 0)));
         assertEquals(del, Messages.DeleteChunks.decode(ByteBuffer.wrap(del.encode())));
     }
 

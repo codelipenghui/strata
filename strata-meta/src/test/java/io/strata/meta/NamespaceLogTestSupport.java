@@ -40,6 +40,6 @@ final class NamespaceLogTestSupport {
      */
     static Records.FileRecord fileRecord(FileId fileId, StrataNamespace ns, StrataPath path) {
         return new Records.FileRecord(fileId, ns, path, 3, 2, true,
-                FileState.OPEN, 1_000, List.of(), fileId.msb(), fileId.lsb());
+                FileState.OPEN, 1_000, List.of(), fileId.id(), 0L);
     }
 }

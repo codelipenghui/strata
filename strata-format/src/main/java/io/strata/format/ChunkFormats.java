@@ -224,7 +224,7 @@ public final class ChunkFormats {
 
     public static ChunkId parseBaseName(String base) {
         int lastDot = base.lastIndexOf('.');
-        FileId f = FileId.fromString(base.substring(0, lastDot));
+        FileId f = FileId.fromHex(base.substring(0, lastDot));
         return new ChunkId(f, Integer.parseInt(base.substring(lastDot + 1)));
     }
 }

@@ -28,9 +28,9 @@ class NamespaceLogMetricsTest {
             NamespaceLogMetadataStore store = new NamespaceLogMetadataStore(backend);
 
             // create files in two distinct namespaces — each namespace is recovered once on first touch
-            store.createFile(file(new FileId(1, 1), "tenant-a", "/topic-0"));
-            store.createFile(file(new FileId(2, 2), "tenant-a", "/topic-1"));
-            store.createFile(file(new FileId(3, 3), "tenant-b", "/topic-0"));
+            store.createFile(file(FileId.of(1), "tenant-a", "/topic-0"));
+            store.createFile(file(FileId.of(2), "tenant-a", "/topic-1"));
+            store.createFile(file(FileId.of(3), "tenant-b", "/topic-0"));
 
             NamespaceLogMetrics m = store.metrics();
             assertTrue(m.appendRecords() >= 3, "each createFile appends at least one log record");
@@ -46,7 +46,7 @@ class NamespaceLogMetricsTest {
     @Test
     void recoveryCounterIncrementsAcrossARestart() throws Exception {
         StrataNamespace ns = StrataNamespace.of("tenant-a");
-        FileId fileId = new FileId(7, 7);
+        FileId fileId = FileId.of(7);
         TestNamespaceMetadataFileStore fileStore = new TestNamespaceMetadataFileStore();
 
         try (TestingServer zk = new TestingServer(true)) {

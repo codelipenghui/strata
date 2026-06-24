@@ -20,7 +20,7 @@ class NamespaceMetadataStateTest {
 
     private static final StrataNamespace NS = StrataNamespace.of("tenant-a");
     private static final StrataPath P = StrataPath.of("/logs/seg-0");
-    private static final FileId F = new FileId(1, 1);
+    private static final FileId F = FileId.of(1);
 
     private NamespaceMetadataState state;
 

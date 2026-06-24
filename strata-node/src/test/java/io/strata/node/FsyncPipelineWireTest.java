@@ -37,7 +37,7 @@ class FsyncPipelineWireTest {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "perf")) {
 
-            ChunkId id = new ChunkId(FileId.random(), 0);
+            ChunkId id = new ChunkId(FileId.of(1), 0);
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, true /* fsync */,
                     1 << 24, 1L).encode(), null, 5000);
 

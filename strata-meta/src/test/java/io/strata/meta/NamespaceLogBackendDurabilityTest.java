@@ -28,7 +28,7 @@ class NamespaceLogBackendDurabilityTest {
     void backendRecoversFilesFromDiskAndManifestAfterRestart() throws Exception {
         StrataNamespace ns = StrataNamespace.of("tenant-a");
         StrataPath path = StrataPath.of("/logs/seg-0");
-        FileId fileId = new FileId(7, 7);
+        FileId fileId = FileId.of(7);
 
         try (TestingServer zk = new TestingServer(true)) {
             // session 1: create a file through the namespace-log backend (durable to disk + ZK manifest)
@@ -63,7 +63,7 @@ class NamespaceLogBackendDurabilityTest {
         // not been loaded. Eager recovery must still resolve it (without it, getFile would return empty).
         StrataNamespace ns = StrataNamespace.of("tenant-b");
         StrataPath path = StrataPath.of("/logs/seg-9");
-        FileId fileId = new FileId(9, 9);
+        FileId fileId = FileId.of(9);
 
         try (TestingServer zk = new TestingServer(true)) {
             try (ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {

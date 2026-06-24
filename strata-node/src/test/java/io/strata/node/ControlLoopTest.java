@@ -424,8 +424,8 @@ class ControlLoopTest {
             ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
 
             commands.add(new Messages.DrainCmd(1));
-            commands.add(new Messages.DeleteCmd(2, List.of(new ChunkId(FileId.random(), 0))));
-            commands.add(new Messages.ReplicateCmd(3, new ChunkId(FileId.random(), 1),
+            commands.add(new Messages.DeleteCmd(2, List.of(new ChunkId(FileId.of(1), 0))));
+            commands.add(new Messages.ReplicateCmd(3, new ChunkId(FileId.of(2), 1),
                     List.of(), (byte) 0, 0, 0));
 
             Thread worker = Thread.ofVirtual().name("control-loop-test-exec").start(() -> {
@@ -455,7 +455,7 @@ class ControlLoopTest {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             LinkedBlockingQueue<Messages.Command> commands = get(loop, "commandQueue");
             ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
-            ChunkId id = new ChunkId(FileId.random(), 0);
+            ChunkId id = new ChunkId(FileId.of(3), 0);
             Set<ChunkId> creating = getField(node.store(), "creating");
             creating.add(id);
 
@@ -505,7 +505,7 @@ class ControlLoopTest {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
             ChunkStore store = node.store();
 
-            ChunkId valid = new ChunkId(FileId.random(), 0);
+            ChunkId valid = new ChunkId(FileId.of(4), 0);
             byte[] data = "valid".getBytes();
             store.open(valid, false, 1, 1L);
             store.append(valid, 1, 0, 0, ByteBuffer.wrap(data));
@@ -515,7 +515,7 @@ class ControlLoopTest {
                     sealed.dataCrc(), data.length));
             assertTrue(store.contains(valid));
 
-            ChunkId stale = new ChunkId(FileId.random(), 1);
+            ChunkId stale = new ChunkId(FileId.of(5), 1);
             store.open(stale, false, 1, 1L);
             store.append(stale, 1, 0, 0, ByteBuffer.wrap(data));
             store.seal(stale, 1, data.length, null);
@@ -526,7 +526,7 @@ class ControlLoopTest {
             assertEquals(ErrorCode.INTERNAL, e.code());
             assertFalse(store.contains(stale), "mismatched local replay copy must be deleted before retrying sources");
 
-            ChunkId crcZeroDescriptor = new ChunkId(FileId.random(), 2);
+            ChunkId crcZeroDescriptor = new ChunkId(FileId.of(6), 2);
             byte[] crcData = "crc-must-not-be-wildcard".getBytes();
             store.open(crcZeroDescriptor, false, 1, 1L);
             store.append(crcZeroDescriptor, 1, 0, 0, ByteBuffer.wrap(crcData));
@@ -546,7 +546,7 @@ class ControlLoopTest {
     void replicateDeletesOpenLocalReplayBeforeTryingSources() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
-            ChunkId open = new ChunkId(FileId.random(), 0);
+            ChunkId open = new ChunkId(FileId.of(7), 0);
             node.store().open(open, false, 1, 1L);
 
             ScpException e = assertThrows(ScpException.class,
@@ -562,7 +562,7 @@ class ControlLoopTest {
     void replicateThrowsLastSourceFailureWhenAllSourcesFail() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
-            ChunkId chunkId = new ChunkId(FileId.random(), 0);
+            ChunkId chunkId = new ChunkId(FileId.of(8), 0);
 
             ScpException e = assertThrows(ScpException.class,
                     () -> invokeReplicate(loop, new Messages.ReplicateCmd(16, chunkId,
@@ -576,7 +576,7 @@ class ControlLoopTest {
 
     @Test
     void replicateSkipsConnectionFailureAndUsesNextSource() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(9), 0);
         byte[] data = "repair-source".getBytes();
         try (ChunkStore sourceStore = new ChunkStore(dir.resolve("source-io"));
              DataNode node = new DataNode(DataNodeConfig.standalone(dir.resolve("target-io")))) {
@@ -606,7 +606,7 @@ class ControlLoopTest {
 
     @Test
     void replicateSkipsMalformedSourceEndpointAndUsesNextSource() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(10), 0);
         byte[] data = "repair-source".getBytes();
         try (ChunkStore sourceStore = new ChunkStore(dir.resolve("source"));
              DataNode node = new DataNode(DataNodeConfig.standalone(dir.resolve("target")))) {
@@ -638,7 +638,7 @@ class ControlLoopTest {
     void replicateIgnoresSelfSourcesBeforeReportingNoUsableSource() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
-            ChunkId chunkId = new ChunkId(FileId.random(), 0);
+            ChunkId chunkId = new ChunkId(FileId.of(11), 0);
 
             ScpException e = assertThrows(ScpException.class,
                     () -> invokeReplicate(loop, new Messages.ReplicateCmd(14, chunkId,
@@ -669,7 +669,7 @@ class ControlLoopTest {
     void fetchWholeFileRejectsInvalidRepairLengthBeforeUsingSource() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
-            ChunkId chunkId = new ChunkId(FileId.random(), 0);
+            ChunkId chunkId = new ChunkId(FileId.of(12), 0);
             Path output = dir.resolve("invalid-repair-fetch.chunk");
 
             ScpException negative = assertThrows(ScpException.class,
@@ -700,7 +700,7 @@ class ControlLoopTest {
             Path output = dir.resolve("large-repair-fetch.chunk");
 
             ScpException e = assertThrows(ScpException.class,
-                    () -> loop.fetchWholeFile(client, new Messages.ReplicateCmd(21, new ChunkId(FileId.random(), 0),
+                    () -> loop.fetchWholeFile(client, new Messages.ReplicateCmd(21, new ChunkId(FileId.of(13), 0),
                             List.of(), (byte) 0, 0, Integer.MAX_VALUE), output));
 
             assertEquals(ErrorCode.INTERNAL, e.code());
@@ -742,7 +742,7 @@ class ControlLoopTest {
 
     @Test
     void fetchWholeFileAcceptsConsistentMultiPartSource() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(14), 0);
         byte[] file = new byte[(4 * 1024 * 1024) + 1];
         for (int i = 0; i < file.length; i++) {
             file[i] = (byte) i;
@@ -923,7 +923,7 @@ class ControlLoopTest {
             Path output = Files.createTempFile(dir, "fetch-failure.", ".chunk");
             ScpException e = assertThrows(ScpException.class,
                     () -> loop.fetchWholeFile(client, new Messages.ReplicateCmd(22,
-                            new ChunkId(FileId.random(), 0), List.of(), (byte) 0, 0, 1), output));
+                            new ChunkId(FileId.of(15), 0), List.of(), (byte) 0, 0, 1), output));
             assertEquals(expectedCode, e.code());
             Files.deleteIfExists(output);
         }

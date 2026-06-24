@@ -15,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class MessageRoundtripTest {
 
-    private final FileId f = FileId.fromString("11111111-2222-3333-4444-555555555555");
+    private final FileId f = FileId.fromHex("1111111122223333");
     private final ChunkId c = new ChunkId(f, 3);
     private final StrataNamespace ns = StrataNamespace.of("test");
 

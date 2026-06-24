@@ -55,7 +55,7 @@ class ZkMetadataStoreCasTest {
         try (TestingServer zk = new TestingServer(true)) {
             try (ZkMetadataStore leaderA = new ZkMetadataStore(zk.getConnectString());
                  ZkMetadataStore leaderB = new ZkMetadataStore(zk.getConnectString())) {
-                FileId fileId = FileId.random();
+                FileId fileId = FileId.of(1);
                 Records.FileRecord file = new Records.FileRecord(fileId, "test", "/test-file", 3, 2, false, FileState.OPEN, System.currentTimeMillis(), List.of());
                 leaderA.createFile(file);
                 int v0 = leaderA.getFile(fileId).orElseThrow().version();
@@ -97,12 +97,12 @@ class ZkMetadataStoreCasTest {
     void pathMarkersMustContainAFullFileIdAndMatchDeleteExpectation() throws Exception {
         try (TestingServer zk = new TestingServer(true)) {
             try (ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
-                FileId fileId = FileId.random();
+                FileId fileId = FileId.of(2);
                 Records.FileRecord file = new Records.FileRecord(fileId, "test", "/marker-owner", 3, 2, false, FileState.OPEN,
                         System.currentTimeMillis(), List.of());
                 store.createFile(file);
 
-                FileId other = FileId.random();
+                FileId other = FileId.of(3);
                 store.curator().setData().forPath(markerPath("test", "/marker-owner"), fileIdBytes(other));
                 assertEquals(other, store.resolvePath(file.namespace(), file.path()).orElseThrow());
                 assertFalse(store.deletePath(file.namespace(), file.path(), fileId));
@@ -118,6 +118,6 @@ class ZkMetadataStoreCasTest {
     }
 
     private static byte[] fileIdBytes(FileId id) {
-        return ByteBuffer.allocate(16).putLong(id.msb()).putLong(id.lsb()).array();
+        return ByteBuffer.allocate(8).putLong(id.id()).array();
     }
 }

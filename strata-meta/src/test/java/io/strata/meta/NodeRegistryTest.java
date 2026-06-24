@@ -233,7 +233,7 @@ class NodeRegistryTest {
         assertEquals("new-host", registry.hostOf(9));
 
         for (int i = 0; i < 18; i++) {
-            registry.enqueue(9, new Messages.DeleteCmd(i, List.of(new ChunkId(new FileId(i, i + 1), 0))));
+            registry.enqueue(9, new Messages.DeleteCmd(i, List.of(new ChunkId(FileId.of(i), 0))));
         }
         Messages.HeartbeatResp first = registry.heartbeat(new Messages.NodeHeartbeat(
                 9, 11, 12, registered.sessionEpoch(),
@@ -591,7 +591,7 @@ class NodeRegistryTest {
         Messages.RegisterResp first = registry.register(new Messages.RegisterNode(
                 1, incMsb, incLsb, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
-        registry.enqueue(first.nodeId(), new Messages.DeleteCmd(99, List.of(new ChunkId(FileId.random(), 0))));
+        registry.enqueue(first.nodeId(), new Messages.DeleteCmd(99, List.of(new ChunkId(FileId.of(1), 0))));
 
         Messages.RegisterResp second = registry.register(new Messages.RegisterNode(
                 1, incMsb, incLsb, List.of("node-new:9000"), "z", "r", "h",

@@ -28,7 +28,7 @@ final class LocalNamespaceMetadataFileStore implements NamespaceMetadataFileStor
 
     @Override
     public FileId createLogFile() throws IOException {
-        FileId id = FileId.random();
+        FileId id = FileId.of(0); // TASK3: owner assigns id
         Files.write(logPath(id), new byte[0], StandardOpenOption.CREATE_NEW);
         return id;
     }
@@ -46,7 +46,7 @@ final class LocalNamespaceMetadataFileStore implements NamespaceMetadataFileStor
 
     @Override
     public FileId writeSnapshot(byte[] snapshotBytes) throws IOException {
-        FileId id = FileId.random();
+        FileId id = FileId.of(0); // TASK3: owner assigns id
         Files.write(snapPath(id), snapshotBytes, StandardOpenOption.CREATE_NEW);
         return id;
     }

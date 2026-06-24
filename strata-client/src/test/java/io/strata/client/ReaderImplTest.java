@@ -32,7 +32,7 @@ class ReaderImplTest {
 
     @Test
     void sealedMetadataLengthOverflowIsTypedCorruption() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(1);
         Messages.LookupFileResp lookup = new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1,
                 List.of(chunk(new ChunkId(fileId, 0), ChunkState.SEALED, Long.MAX_VALUE,
                                 new Messages.Replica(1, "")),
@@ -52,7 +52,7 @@ class ReaderImplTest {
 
     @Test
     void emptyFileReadUsesMetadataFileStateForEof() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(2);
         AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>(
                 new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1, List.of()));
 
@@ -76,7 +76,7 @@ class ReaderImplTest {
 
     @Test
     void sealedReadOnOpenFileDoesNotReportEof() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(3);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer replica = readReplica(new Messages.ReadResp(3, 3), new byte[] {1, 2, 3});
@@ -98,7 +98,7 @@ class ReaderImplTest {
 
     @Test
     void sealedReplicaShorterThanDescriptorIsRejected() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(4);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer shortReplica = readReplica(new Messages.ReadResp(3, 3), new byte[] {1, 2, 3});
@@ -118,7 +118,7 @@ class ReaderImplTest {
 
     @Test
     void replicaScpExceptionIsPropagatedAfterReplicaAttemptsAreExhausted() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(5);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer failingReplica = new ScpServer(0, 1, 0, 0, req -> {
@@ -144,7 +144,7 @@ class ReaderImplTest {
 
     @Test
     void openReadKeepsPayloadWhenDurableOffsetCoversIt() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(6);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer replica = readReplica(new Messages.ReadResp(4, 4), new byte[] {1, 2, 3, 4});
@@ -166,7 +166,7 @@ class ReaderImplTest {
 
     @Test
     void readerPinsEndpointConnectionAcrossReads() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(7);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer replica = readReplica(new Messages.ReadResp(1, 1), new byte[] {7});
@@ -199,7 +199,7 @@ class ReaderImplTest {
 
     @Test
     void independentReadersCanUseDifferentEndpointPoolConnections() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(8);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer replica = readReplica(new Messages.ReadResp(1, 1), new byte[] {9});
@@ -230,7 +230,7 @@ class ReaderImplTest {
 
     @Test
     void negativeReplicaOffsetsAreRejected() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(9);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer negativeLocalEnd = readReplica(new Messages.ReadResp(-1, 0), new byte[0]);
@@ -252,7 +252,7 @@ class ReaderImplTest {
 
     @Test
     void malformedReplicaReadResponseIsTypedFailure() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(10);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer badReplica = new ScpServer(0, 1, 0, 0, req -> {
@@ -291,7 +291,7 @@ class ReaderImplTest {
 
     @Test
     void borrowedReadReleasesPooledBufferOnClose() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(11);
         ChunkId chunkId = new ChunkId(fileId, 0);
         try (ScpServer replica = readReplica(new Messages.ReadResp(3, 3), new byte[] {1, 2, 3});
              ScpServer metaServer = metadataServer(new AtomicReference<>(
@@ -316,7 +316,7 @@ class ReaderImplTest {
 
     @Test
     void readFailsOverToHealthyReplicaWhenAnotherIsUnreachable() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(12);
         ChunkId chunkId = new ChunkId(fileId, 0);
         String deadEndpoint = unusedEndpoint(); // nothing listening -> Connection refused
         try (ScpServer replica = readReplica(new Messages.ReadResp(3, 3), new byte[] {1, 2, 3});

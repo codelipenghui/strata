@@ -46,7 +46,7 @@ class ChunkStoreTest {
     @TempDir
     Path dir;
 
-    private final ChunkId id = new ChunkId(FileId.random(), 0);
+    private final ChunkId id = new ChunkId(FileId.of(1), 0);
 
     private static ByteBuffer bytes(String s) {
         return ByteBuffer.wrap(s.getBytes(StandardCharsets.UTF_8));
@@ -126,7 +126,7 @@ class ChunkStoreTest {
 
     @Test
     void failedOpenCleansOwnedFilesAndReservation() throws Exception {
-        ChunkId chunk = new ChunkId(FileId.random(), 0);
+        ChunkId chunk = new ChunkId(FileId.of(2), 0);
         Path dataPath = dir.resolve(ChunkFormats.baseName(chunk) + ".chunk");
         Path ledgerPath = dir.resolve(ChunkFormats.baseName(chunk) + ".j");
         Files.createDirectories(dir);
@@ -714,14 +714,14 @@ class ChunkStoreTest {
                     assertThrows(ScpException.class, () -> open(store, id, 1)).code());
         }
 
-        ChunkId blocked = new ChunkId(FileId.random(), 0);
+        ChunkId blocked = new ChunkId(FileId.of(3), 0);
         try (ChunkStore store = newStore()) {
             java.nio.file.Files.write(dir.resolve(ChunkFormats.baseName(blocked) + ".chunk"), new byte[]{1});
             assertEquals(ErrorCode.CHUNK_ALREADY_EXISTS,
                     assertThrows(ScpException.class, () -> open(store, blocked, 1)).code());
         }
 
-        ChunkId reserved = new ChunkId(FileId.random(), 0);
+        ChunkId reserved = new ChunkId(FileId.of(4), 0);
         try (ChunkStore store = newStore()) {
             creating(store).add(reserved);
             assertEquals(ErrorCode.CHUNK_ALREADY_EXISTS,
@@ -1061,7 +1061,7 @@ class ChunkStoreTest {
         int dataCrc;
         try (ChunkStore store = newStore()) {
             fileBytes = sealedBytes(store, id, "payload-payload");
-            ChunkId otherId = new ChunkId(FileId.random(), 0);
+            ChunkId otherId = new ChunkId(FileId.of(5), 0);
             otherFileBytes = sealedBytes(store, otherId, "payload-payload");
             var t = trailer(fileBytes);
             sealedLength = t.dataLength();
@@ -1313,7 +1313,7 @@ class ChunkStoreTest {
 
     @Test
     void recoveryLoadsSealedChunksAndDeletesLedgerRemnants() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(6), 0);
         String base = ChunkFormats.baseName(chunkId);
         Path ledgerPath = dir.resolve(base + ".j");
         try (ChunkStore store = newStore()) {
@@ -1340,7 +1340,7 @@ class ChunkStoreTest {
         assumeTrue(!ChunkStore.booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false),
                 "guarantee under test is specific to the no-seal-fsync durability path");
 
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(7), 0);
         String base = ChunkFormats.baseName(chunkId);
         Path metaPath = dir.resolve(base + ".meta");
         byte[] payload = "important-acknowledged-data".getBytes(StandardCharsets.UTF_8);
@@ -1367,7 +1367,7 @@ class ChunkStoreTest {
     void sealRetainsLedgerUntilReclaimedWhenSealFsyncDisabled() throws Exception {
         assumeTrue(!ChunkStore.booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false),
                 "ledger retention is specific to the no-seal-fsync durability path");
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(8), 0);
         Path ledgerPath = dir.resolve(ChunkFormats.baseName(chunkId) + ".j");
         byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
         try (ChunkStore store = newStore()) {
@@ -1393,7 +1393,7 @@ class ChunkStoreTest {
 
     @Test
     void sealWithSealFsyncDropsLedgerImmediatelyWithoutReclaim() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(9), 0);
         Path ledgerPath = dir.resolve(ChunkFormats.baseName(chunkId) + ".j");
         byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
         try (ChunkStore store = new ChunkStore(dir, true)) { // seal fsync ON
@@ -1415,7 +1415,7 @@ class ChunkStoreTest {
 
     @Test
     void recoveryReadServesUndurableTailThatClientReadClampsAway() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(10), 0);
         byte[] durable = "durable-prefix".getBytes(StandardCharsets.UTF_8);
         byte[] tail = "undurable-tail".getBytes(StandardCharsets.UTF_8);
         int d = durable.length;
@@ -1455,7 +1455,7 @@ class ChunkStoreTest {
         Path invalidName = dir.resolve("not-a-valid-chunk-name.chunk");
         Files.write(invalidName, new byte[] {1});
 
-        ChunkId truncated = new ChunkId(FileId.random(), 0);
+        ChunkId truncated = new ChunkId(FileId.of(11), 0);
         String base = ChunkFormats.baseName(truncated);
         Files.write(dir.resolve(base + ".chunk"), new byte[] {1, 2, 3});
         Files.write(dir.resolve(base + ".meta"),
@@ -1474,7 +1474,7 @@ class ChunkStoreTest {
 
     @Test
     void recoveryTruncatesLedgerEntryBeyondDataSize() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(12), 0);
         String base = ChunkFormats.baseName(chunkId);
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
@@ -1491,7 +1491,7 @@ class ChunkStoreTest {
 
     @Test
     void recoveryTruncatesImpossibleLedgerEndOffset() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(13), 0);
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
         }
@@ -1509,7 +1509,7 @@ class ChunkStoreTest {
 
     @Test
     void recoveryRemovesChunkCreatedBeforeSidecarWasPersisted() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(14), 0);
         String base = ChunkFormats.baseName(chunkId);
         Path dataPath = dir.resolve(base + ".chunk");
         Path ledgerPath = dir.resolve(base + ".j");
@@ -1525,7 +1525,7 @@ class ChunkStoreTest {
 
     @Test
     void recoveryDiscardsOpenDataWhenLedgerIsMissing() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(15), 0);
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
             store.append(chunkId, 1, 0, 0, bytes("payload"));
@@ -1542,7 +1542,7 @@ class ChunkStoreTest {
 
     @Test
     void recoveryKeepsEmptyOpenChunkWhenLedgerIsMissing() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(16), 0);
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
         }
@@ -1558,7 +1558,7 @@ class ChunkStoreTest {
 
     @Test
     void recoveryTruncatesZeroLengthAndCorruptLedgerTails() throws Exception {
-        ChunkId zeroExtent = new ChunkId(FileId.random(), 0);
+        ChunkId zeroExtent = new ChunkId(FileId.of(17), 0);
         try (ChunkStore store = newStore()) {
             open(store, zeroExtent, 1);
             store.append(zeroExtent, 1, 0, 0, bytes("abcd"));
@@ -1570,7 +1570,7 @@ class ChunkStoreTest {
             assertEquals(0, recovered.stat(zeroExtent).localEndOffset());
         }
 
-        ChunkId badCrc = new ChunkId(FileId.random(), 0);
+        ChunkId badCrc = new ChunkId(FileId.of(18), 0);
         try (ChunkStore store = newStore()) {
             open(store, badCrc, 1);
             store.append(badCrc, 1, 0, 0, bytes("abcd"));
@@ -1661,7 +1661,7 @@ class ChunkStoreTest {
     @Test
     void failedImportCleanupContinuesWhenCleanupOperationsFail() throws Exception {
         try (ChunkStore store = newStore()) {
-            ChunkId failed = new ChunkId(FileId.random(), 0);
+            ChunkId failed = new ChunkId(FileId.of(19), 0);
             Object failedHandle = newHandle(store, failed);
             setObject(failedHandle, "data", new ZeroProgressFileChannel(true, false, false));
 

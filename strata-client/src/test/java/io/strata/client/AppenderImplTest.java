@@ -365,7 +365,7 @@ class AppenderImplTest {
     @Test
     void synchronousReplicaFailuresStopFanoutAfterQuorumLost() throws Exception {
         CountDownLatch unexpectedAppend = new CountDownLatch(1);
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(1);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer shouldNotReceive = new ScpServer(0, 3, 0, 0, req -> {
@@ -472,7 +472,7 @@ class AppenderImplTest {
     void appendRejectsChunkOffsetOverflowBeforeSending() throws Exception {
         AppenderImpl appender = new AppenderImpl(null, null,
                 new ClientConfig(List.of("127.0.0.1:1"), Long.MAX_VALUE, 100),
-                FileId.random(), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+                FileId.of(2), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
         Object session = chunkSession();
         setSession(appender, session);
         setLong(session, "end", Long.MAX_VALUE - 1);
@@ -486,7 +486,7 @@ class AppenderImplTest {
     void appendAckFileOffsetOverflowKillsAppender() throws Exception {
         AppenderImpl appender = new AppenderImpl(null, null,
                 new ClientConfig(List.of("127.0.0.1:1"), 1024, 100),
-                FileId.random(), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, Long.MAX_VALUE - 1);
+                FileId.of(3), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, Long.MAX_VALUE - 1);
         Object session = chunkSession();
         setSession(appender, session);
         setLong(session, "end", 2);
@@ -505,7 +505,7 @@ class AppenderImplTest {
     void rollTimesOutDrainingPendingAppendAndDies() throws Exception {
         AppenderImpl appender = new AppenderImpl(null, null,
                 new ClientConfig(List.of("127.0.0.1:1"), 1024, 5),
-                FileId.random(), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+                FileId.of(4), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
         Object session = chunkSession();
         setSession(appender, session);
         setLong(session, "end", 1);
@@ -526,7 +526,7 @@ class AppenderImplTest {
     void rollInterruptedWhileDrainingRestoresInterruptAndDies() throws Exception {
         AppenderImpl appender = new AppenderImpl(null, null,
                 new ClientConfig(List.of("127.0.0.1:1"), 1024, 100),
-                FileId.random(), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+                FileId.of(5), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
         Object session = chunkSession();
         setSession(appender, session);
         setLong(session, "end", 1);
@@ -550,7 +550,7 @@ class AppenderImplTest {
 
     @Test
     void rollStopsWhenSealChunkDies() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(6);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer s1 = dataNodeServer(1, 123, false);
@@ -578,7 +578,7 @@ class AppenderImplTest {
 
     @Test
     void openQuorumFailureAbortsMetadataAndDeletesOpenedReplica() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(7);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
         AtomicBoolean deletedOpenedReplica = new AtomicBoolean();
@@ -628,7 +628,7 @@ class AppenderImplTest {
 
     @Test
     void openQuorumFailureKeepsOriginalFailureWhenCleanupDeleteFails() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(8);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
         AtomicBoolean cleanupDeleteAttempted = new AtomicBoolean();
@@ -679,7 +679,7 @@ class AppenderImplTest {
 
     @Test
     void openRetryWithExclusionsKeepsOriginalQuorumFailureWhenPlacementRunsOut() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(9);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
         AtomicInteger createCalls = new AtomicInteger();
@@ -743,7 +743,7 @@ class AppenderImplTest {
 
     @Test
     void createChunkWithWrongReplicaSetIsAbortedBeforeOpeningDataNode() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(10);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
 
@@ -778,8 +778,8 @@ class AppenderImplTest {
 
     @Test
     void createChunkWithWrongFileIdIsAbortedBeforeOpeningDataNode() throws Exception {
-        FileId fileId = FileId.random();
-        ChunkId wrongChunkId = new ChunkId(FileId.random(), 0);
+        FileId fileId = FileId.of(11);
+        ChunkId wrongChunkId = new ChunkId(FileId.of(12), 0);
         AtomicBoolean aborted = new AtomicBoolean();
         AtomicBoolean openedDataNode = new AtomicBoolean();
 
@@ -815,7 +815,7 @@ class AppenderImplTest {
 
     @Test
     void createChunkWithDuplicateNodeIdIsAbortedBeforeOpeningDataNode() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(13);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
         AtomicBoolean openedDataNode = new AtomicBoolean();
@@ -852,7 +852,7 @@ class AppenderImplTest {
 
     @Test
     void createChunkWithBlankEndpointIsAbortedBeforeOpeningDataNode() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(14);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
         AtomicBoolean openedDataNode = new AtomicBoolean();
@@ -897,7 +897,7 @@ class AppenderImplTest {
 
     @Test
     void createChunkWithDuplicateEndpointIsAbortedBeforeOpeningDataNode() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(15);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
 
@@ -931,7 +931,7 @@ class AppenderImplTest {
 
     @Test
     void createChunkWithInvalidNodeIdIsAbortedBeforeOpeningDataNode() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(16);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
         AtomicBoolean openedDataNode = new AtomicBoolean();
@@ -968,7 +968,7 @@ class AppenderImplTest {
 
     @Test
     void createChunkWithMismatchedEpochIsAbortedBeforeOpeningDataNode() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(17);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
         AtomicBoolean openedDataNode = new AtomicBoolean();
@@ -1005,7 +1005,7 @@ class AppenderImplTest {
 
     @Test
     void createChunkFailureKillsAppenderWithoutOpeningDataNode() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(18);
         AtomicBoolean openedDataNode = new AtomicBoolean();
 
         try (ScpServer dataNode = openTrackingDataNode(1, openedDataNode);
@@ -1031,7 +1031,7 @@ class AppenderImplTest {
 
     @Test
     void abortMetadataFailureBecomesAppenderDeathCause() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(19);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
@@ -1064,7 +1064,7 @@ class AppenderImplTest {
 
     @Test
     void fencedOpenAbortsCreatedChunkAndKillsAppender() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(20);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean aborted = new AtomicBoolean();
         AtomicBoolean deletedOpenedReplica = new AtomicBoolean();
@@ -1116,7 +1116,7 @@ class AppenderImplTest {
 
     @Test
     void closeDuringChunkCreateAbortsMetadataBeforeOpeningDataNode() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(21);
         ChunkId chunkId = new ChunkId(fileId, 0);
         CountDownLatch createStarted = new CountDownLatch(1);
         CountDownLatch releaseCreate = new CountDownLatch(1);
@@ -1172,7 +1172,7 @@ class AppenderImplTest {
 
     @Test
     void sealCommitsOnlyMatchingQuorumAndThenSealsFile() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(22);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
         AtomicReference<Long> sealedFileLength = new AtomicReference<>();
@@ -1202,7 +1202,7 @@ class AppenderImplTest {
 
     @Test
     void replacedReplicaConnectionFailsReplicaWithoutReplayingAppend() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(23);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
         AtomicReference<Long> sealedFileLength = new AtomicReference<>();
@@ -1241,7 +1241,7 @@ class AppenderImplTest {
 
     @Test
     void appendPinsReplicaConnectionWhenEndpointHasMultipleConnections() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(24);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
         AtomicReference<Long> sealedFileLength = new AtomicReference<>();
@@ -1286,7 +1286,7 @@ class AppenderImplTest {
 
     @Test
     void sealQuorumLossFromSkippedReplicasUsesGenericCause() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(25);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer s1 = dataNodeServer(1, 123, false);
@@ -1317,7 +1317,7 @@ class AppenderImplTest {
 
     @Test
     void sealRejectsQuorumThatReportsWrongFinalLength() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(26);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
 
@@ -1342,7 +1342,7 @@ class AppenderImplTest {
 
     @Test
     void sealQuorumLossKillsAppender() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(27);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer s1 = dataNodeServer(1, 123, false);
@@ -1370,7 +1370,7 @@ class AppenderImplTest {
 
     @Test
     void sealDivergenceWithoutAnyAgreeingQuorumKillsAppender() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(28);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
 
@@ -1396,7 +1396,7 @@ class AppenderImplTest {
 
     @Test
     void malformedSealResponseCountsAgainstSealQuorum() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(29);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer s1 = dataNodeServer(1, 123, false);
@@ -1424,7 +1424,7 @@ class AppenderImplTest {
 
     @Test
     void sealFencedEpochKillsAppender() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(30);
         ChunkId chunkId = new ChunkId(fileId, 0);
 
         try (ScpServer fencedSeal = new ScpServer(0, 1, 0, 0, req -> {
@@ -1463,7 +1463,7 @@ class AppenderImplTest {
 
     @Test
     void sealChunkMetadataFailureKillsAppenderAfterReplicaSeal() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(31);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean sealFileCalled = new AtomicBoolean();
 
@@ -1504,7 +1504,7 @@ class AppenderImplTest {
 
     @Test
     void sealDetectsFileOffsetOverflowAfterChunkSeal() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(32);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
 
@@ -1536,7 +1536,7 @@ class AppenderImplTest {
 
     @Test
     void rollDetectsFileOffsetOverflowAfterChunkSeal() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(33);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
 
@@ -1570,7 +1570,7 @@ class AppenderImplTest {
 
     @Test
     void sealFileMetadataFailureKillsAppenderAfterChunkSeal() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(34);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
         AtomicReference<Long> sealedFileLength = new AtomicReference<>();
@@ -1628,11 +1628,11 @@ class AppenderImplTest {
 
     private static AppenderImpl appender() {
         return new AppenderImpl(null, null, new ClientConfig(List.of("127.0.0.1:1"), 1024, 100),
-                FileId.random(), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+                FileId.of(35), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
     }
 
     private static Object chunkSession() throws Exception {
-        return chunkSession(new ChunkId(FileId.random(), 0),
+        return chunkSession(new ChunkId(FileId.of(36), 0),
                 new Messages.Replica(1, "n1"),
                 new Messages.Replica(2, "n2"),
                 new Messages.Replica(3, "n3"));

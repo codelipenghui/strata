@@ -32,7 +32,7 @@ class ChunkStoreCrcTest {
     @TempDir
     Path dir;
 
-    private final ChunkId id = new ChunkId(FileId.random(), 0);
+    private final ChunkId id = new ChunkId(FileId.of(1), 0);
 
     private static int wholeCrc(byte[] data) {
         CRC32C c = new CRC32C();

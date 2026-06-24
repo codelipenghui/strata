@@ -12,7 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class MetadataLogCodecTest {
 
-    private static final FileId F = new FileId(0x1122334455667788L, 0x99AABBCCDDEEFF00L);
+    private static final FileId F = FileId.of(0x1122334455667788L);
 
     @Test
     void roundTripsEveryRecordType() {

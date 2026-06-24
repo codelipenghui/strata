@@ -95,7 +95,7 @@ class ZkMetadataRootTest {
              ZkMetadataStore b = new ZkMetadataStore(zk.getConnectString())) {
             StrataNamespace ns = StrataNamespace.of("tenant-a");
             Records.NamespaceManifest v0 = new Records.NamespaceManifest(ns, 1, 0, 0, 0,
-                    Optional.empty(), Optional.of(new FileId(10, 20)));
+                    Optional.empty(), Optional.of(FileId.of(10)));
             assertEquals(0, a.putNamespaceManifest(v0, -1).orElseThrow(), "first publish creates at version 0");
             assertTrue(a.putNamespaceManifest(v0, -1).isEmpty(), "re-create must fail");
 
@@ -104,7 +104,7 @@ class ZkMetadataRootTest {
             assertEquals(v0, read.value());
 
             Records.NamespaceManifest v1 = new Records.NamespaceManifest(ns, 2, 1, 4096, 8192,
-                    Optional.of(new FileId(11, 22)), Optional.of(new FileId(33, 44)));
+                    Optional.of(FileId.of(11)), Optional.of(FileId.of(33)));
             assertTrue(b.putNamespaceManifest(v1, read.version()).isPresent(), "the epoch-2 leader publishes");
             assertTrue(a.putNamespaceManifest(v0, read.version()).isEmpty(),
                     "a fenced (stale-version) publish must lose the CAS");

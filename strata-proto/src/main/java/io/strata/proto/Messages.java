@@ -653,7 +653,7 @@ public final class Messages {
         }
 
         public CreateFile(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy) {
-            this(namespace, path, writePolicy, FileId.random(), UUID.randomUUID());
+            this(namespace, path, writePolicy, FileId.of(0), UUID.randomUUID()); // TASK3: owner assigns id
         }
 
         public CreateFile(String namespace, String path) {

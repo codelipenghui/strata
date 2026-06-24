@@ -956,7 +956,7 @@ class RepairCoordinatorTest {
     }
 
     private static FileId fileId(long lsb) {
-        return new FileId(0, lsb);
+        return FileId.of(0);
     }
 
     private static void markDead(NodeRegistry registry, int nodeId) throws Exception {

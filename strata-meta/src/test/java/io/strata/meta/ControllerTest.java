@@ -242,7 +242,7 @@ class ControllerTest {
 
     @Test
     void missingFileOperationsReturnTypedErrorsOrIdempotentSuccess() {
-        FileId missing = FileId.random();
+        FileId missing = FileId.of(1);
 
         ScpException createChunk = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(StrataNamespace.of("test"), missing, 1).encode(), null, 5000));
@@ -704,7 +704,7 @@ class ControllerTest {
     void fileAndChunkCreatesAreIdempotentByOperationId() {
         registerTrio("idemHost");
 
-        FileId requested = FileId.random();
+        FileId requested = FileId.of(2);
         var createFile = new Messages.CreateFile("test", "/idem", requested, 100, 200);
         var file1 = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 createFile.encode(), null, 5000));
@@ -733,9 +733,9 @@ class ControllerTest {
     }
 
     private void assertCreateReplayConflict(String path, String replayNamespace, String replayPath) {
-        FileId requested = FileId.random();
-        long opMsb = requested.msb();
-        long opLsb = requested.lsb();
+        FileId requested = FileId.of(3);
+        long opMsb = requested.id();
+        long opLsb = 0L;
         client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", path, requested, opMsb, opLsb).encode(),
                 null, 5000);
@@ -748,7 +748,7 @@ class ControllerTest {
 
     @Test
     void createFileReplayAfterDeleteCannotReturnOldFileOrClearReplacementPath() {
-        FileId requested = FileId.random();
+        FileId requested = FileId.of(4);
         var create = new Messages.CreateFile("test", "/idem-after-delete", requested, 1200, 1300);
         var created = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 create.encode(), null, 5000));
@@ -1062,7 +1062,7 @@ class ControllerTest {
 
     @Test
     void sealFileRejectsCorruptCommittedChunkLengths() throws Exception {
-        FileId negative = FileId.random();
+        FileId negative = FileId.of(5);
         metadataStore().createFile(new Records.FileRecord(negative, "test", "/negative-length", 3, 2, false, FileState.OPEN, System.currentTimeMillis(),
                 List.of(new Records.ChunkRecord(0, ChunkState.SEALED, -1, 0, 1, List.of()))));
 
@@ -1070,7 +1070,7 @@ class ControllerTest {
                 new Messages.SealFile(StrataNamespace.of("test"), negative, 0).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, negativeLength.code());
 
-        FileId overflow = FileId.random();
+        FileId overflow = FileId.of(6);
         metadataStore().createFile(new Records.FileRecord(overflow, "test", "/overflow-length", 3, 2, false, FileState.OPEN, System.currentTimeMillis(),
                 List.of(
                         new Records.ChunkRecord(0, ChunkState.SEALED, Long.MAX_VALUE, 0, 1, List.of()),

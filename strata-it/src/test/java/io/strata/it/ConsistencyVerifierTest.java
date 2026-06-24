@@ -16,7 +16,7 @@ class ConsistencyVerifierTest {
 
     @Test
     void liveDescriptorAcceptsSealedPrefixWithOpenTail() {
-        FileId fileId = new FileId(1, 2);
+        FileId fileId = FileId.of(1);
         Messages.LookupFileResp descriptor = descriptor(fileId, FileState.OPEN, List.of(
                 chunk(fileId, 0, ChunkState.SEALED, 128, 1, 2, 3),
                 chunk(fileId, 1, ChunkState.OPEN, 0, 1, 2, 3)));
@@ -26,7 +26,7 @@ class ConsistencyVerifierTest {
 
     @Test
     void liveDescriptorRejectsOpenChunkBeforeTail() {
-        FileId fileId = new FileId(1, 2);
+        FileId fileId = FileId.of(1);
         Messages.LookupFileResp descriptor = descriptor(fileId, FileState.OPEN, List.of(
                 chunk(fileId, 0, ChunkState.OPEN, 0, 1, 2, 3),
                 chunk(fileId, 1, ChunkState.SEALED, 128, 1, 2, 3)));
@@ -37,7 +37,7 @@ class ConsistencyVerifierTest {
 
     @Test
     void liveDescriptorRejectsDuplicateReplicaNode() {
-        FileId fileId = new FileId(1, 2);
+        FileId fileId = FileId.of(1);
         Messages.LookupFileResp descriptor = descriptor(fileId, FileState.SEALED, List.of(
                 chunk(fileId, 0, ChunkState.SEALED, 128,
                         replica(1, "127.0.0.1:10001"),
@@ -49,7 +49,7 @@ class ConsistencyVerifierTest {
 
     @Test
     void liveDescriptorRejectsChunkBelowAckQuorum() {
-        FileId fileId = new FileId(1, 2);
+        FileId fileId = FileId.of(1);
         Messages.LookupFileResp descriptor = descriptor(fileId, FileState.SEALED, List.of(
                 chunk(fileId, 0, ChunkState.SEALED, 128, 1)));
 
@@ -59,7 +59,7 @@ class ConsistencyVerifierTest {
 
     @Test
     void liveDescriptorRejectsNonContiguousChunkIndex() {
-        FileId fileId = new FileId(1, 2);
+        FileId fileId = FileId.of(1);
         Messages.LookupFileResp descriptor = descriptor(fileId, FileState.SEALED, List.of(
                 chunk(fileId, 0, ChunkState.SEALED, 128, 1, 2, 3),
                 chunk(fileId, 2, ChunkState.SEALED, 128, 1, 2, 3)));
@@ -70,7 +70,7 @@ class ConsistencyVerifierTest {
 
     @Test
     void liveDescriptorRejectsOpenChunkWithCommittedLength() {
-        FileId fileId = new FileId(1, 2);
+        FileId fileId = FileId.of(1);
         Messages.LookupFileResp descriptor = descriptor(fileId, FileState.OPEN, List.of(
                 chunkWithCrc(fileId, 0, ChunkState.OPEN, 64, 0, 1, 2, 3)));
 
@@ -80,7 +80,7 @@ class ConsistencyVerifierTest {
 
     @Test
     void liveDescriptorRejectsOpenChunkWithSealedCrc() {
-        FileId fileId = new FileId(1, 2);
+        FileId fileId = FileId.of(1);
         Messages.LookupFileResp descriptor = descriptor(fileId, FileState.OPEN, List.of(
                 chunkWithCrc(fileId, 0, ChunkState.OPEN, 0, 1234, 1, 2, 3)));
 

@@ -100,7 +100,7 @@ class RepairAndRetentionTest {
     void orphanChunkIsReconciledAway() throws Exception {
         // plant an orphan: a sealed chunk on a node that metadata knows nothing about
         DataNode node = cluster.nodes.get(0);
-        ChunkId orphan = new ChunkId(FileId.random(), 0);
+        ChunkId orphan = new ChunkId(FileId.of(1), 0);
         try (ScpClient direct = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_TOOL, "planter")) {
             direct.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(orphan, 1, false, 1 << 20, System.currentTimeMillis()).encode(), null, 5000);
             direct.call(Opcode.APPEND, new Messages.Append(orphan, 1, 0, 0).encode(),

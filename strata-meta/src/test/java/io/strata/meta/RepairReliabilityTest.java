@@ -540,7 +540,7 @@ class RepairReliabilityTest {
         FakeNode node = new FakeNode("orphanInvA");
         node.register();
         node.heartbeat();
-        ChunkId orphan = new ChunkId(FileId.random(), 0);
+        ChunkId orphan = new ChunkId(FileId.of(1), 0);
 
         client.call(Opcode.INVENTORY_REPORT, inventory(node,
                 List.of(new Messages.InventoryEntry(orphan, ChunkState.SEALED, 100, 0x1234)))

@@ -38,7 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * client/server code is tested against independently materialized v0 frames.
  */
 class ScpV0CompatibilityTest {
-    private static final FileId FILE_ID = FileId.fromString("11111111-2222-3333-4444-555555555555");
+    private static final FileId FILE_ID = FileId.fromHex("1111111122223333");
     private static final ChunkId CHUNK_ID = new ChunkId(FILE_ID, 3);
     private static final long OP_ID_MSB = 0x0123456789abcdefL;
     private static final long OP_ID_LSB = 0xfedcba9876543210L;

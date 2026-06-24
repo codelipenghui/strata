@@ -12,7 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class MessagesNamespaceRoundTripTest {
     private static final StrataNamespace NS = StrataNamespace.of("tenant-a");
-    private static final FileId FID = FileId.random();
+    private static final FileId FID = FileId.of(1);
     private static final ChunkId CID = new ChunkId(FID, 3);
 
     @Test

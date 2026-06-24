@@ -18,8 +18,8 @@ class NamespaceMetadataSnapshotCodecTest {
     @Test
     void roundTripsAndRestoresObservableState() {
         NamespaceMetadataState state = new NamespaceMetadataState(NS);
-        FileId live = new FileId(1, 1);
-        FileId dead = new FileId(2, 2);
+        FileId live = FileId.of(1);
+        FileId dead = FileId.of(2);
         state.apply(new MetadataLogRecord.FileCreated(live, NS, StrataPath.of("/a"), 3, 2, true, 100, 1, 1));
         state.apply(new MetadataLogRecord.ChunkCreated(live, 0, 1, List.of(1, 2, 3), 1, 1));
         state.apply(new MetadataLogRecord.ChunkSealed(live, 0, 4096, 7, 1, List.of(1, 2, 3)));
@@ -57,7 +57,7 @@ class NamespaceMetadataSnapshotCodecTest {
     @Test
     void detectsCrcCorruption() {
         NamespaceMetadataState state = new NamespaceMetadataState(NS);
-        state.apply(new MetadataLogRecord.FileCreated(new FileId(1, 1), NS, StrataPath.of("/a"),
+        state.apply(new MetadataLogRecord.FileCreated(FileId.of(1), NS, StrataPath.of("/a"),
                 3, 2, true, 1, 1, 1));
         byte[] bytes = NamespaceMetadataSnapshotCodec.encode(state.exportSnapshot(0));
         bytes[5] ^= 0xFF;

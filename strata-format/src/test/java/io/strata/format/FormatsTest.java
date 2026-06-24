@@ -14,7 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class FormatsTest {
 
-    private final ChunkId id = new ChunkId(FileId.fromString("11111111-2222-3333-4444-555555555555"), 9);
+    private final ChunkId id = new ChunkId(FileId.fromHex("1111111122223333"), 9);
 
     private static void refreshHeaderCrc(byte[] bytes) {
         ByteBuffer.wrap(bytes).putInt(ChunkFormats.HEADER_SIZE - 4,

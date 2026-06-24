@@ -38,11 +38,11 @@ class NamespaceMetadataLogFailureInjectionTest {
             TestNamespaceMetadataFileStore fileStore = new TestNamespaceMetadataFileStore();
             NamespaceMetadataLogRepository repo = NamespaceMetadataLogRepository.open(NS, fileStore, root, 1);
 
-            FileId f = new FileId(1, 1);
+            FileId f = FileId.of(1);
             repo.append(fileCreated(f, "/a", 1)); // applied normally
 
             // Crash AFTER the durable append, BEFORE the in-memory apply, for the next record.
-            FileId g = new FileId(2, 2);
+            FileId g = FileId.of(2);
             FailureInjector.arm("meta.log.afterDurableAppend",
                     p -> { throw new RuntimeException("injected crash after durable append"); });
             assertThrows(RuntimeException.class, () -> repo.append(fileCreated(g, "/b", 2)));
@@ -68,7 +68,7 @@ class NamespaceMetadataLogFailureInjectionTest {
             TestNamespaceMetadataFileStore fileStore = new TestNamespaceMetadataFileStore();
             NamespaceMetadataLogRepository repo = NamespaceMetadataLogRepository.open(NS, fileStore, root, 1);
 
-            FileId f = new FileId(1, 1);
+            FileId f = FileId.of(1);
             repo.append(fileCreated(f, "/a", 1));
             long generationBefore = repo.generation();
 

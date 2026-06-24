@@ -42,8 +42,8 @@ class StrataClientBehaviorTest {
 
     @Test
     void createAndDeletePropagateMetadataResponses() throws Exception {
-        FileId created = FileId.random();
-        FileId denied = FileId.random();
+        FileId created = FileId.of(1);
+        FileId denied = FileId.of(2);
         try (ScpServer meta = new ScpServer(0, 0, 0, 0, req -> {
             Opcode op = Opcode.fromCode(req.opcode());
             if (op == Opcode.CREATE_FILE) {
@@ -69,7 +69,7 @@ class StrataClientBehaviorTest {
 
     @Test
     void openByPathResolvesFileAndExposesPathOnHandle() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(3);
         try (ScpServer meta = new ScpServer(0, 0, 0, 0, req -> {
             Opcode op = Opcode.fromCode(req.opcode());
             if (op == Opcode.LOOKUP_PATH) {
@@ -91,7 +91,7 @@ class StrataClientBehaviorTest {
 
     @Test
     void deleteByPathResolvesCurrentPathBinding() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(4);
         AtomicInteger deletes = new AtomicInteger();
         try (ScpServer meta = new ScpServer(0, 0, 0, 0, req -> {
             Opcode op = Opcode.fromCode(req.opcode());
@@ -118,7 +118,7 @@ class StrataClientBehaviorTest {
 
     @Test
     void deleteFileHandleUsesImmutableFileId() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(5);
         AtomicInteger deletes = new AtomicInteger();
         try (ScpServer meta = new ScpServer(0, 0, 0, 0, req -> {
             Opcode op = Opcode.fromCode(req.opcode());
@@ -160,8 +160,8 @@ class StrataClientBehaviorTest {
 
     @Test
     void deleteRejectsMetadataResponsesThatDoNotMatchTheRequest() throws Exception {
-        FileId first = FileId.random();
-        FileId second = FileId.random();
+        FileId first = FileId.of(6);
+        FileId second = FileId.of(7);
         try (ScpServer meta = new ScpServer(0, 0, 0, 0, req -> {
             Opcode op = Opcode.fromCode(req.opcode());
             if (op == Opcode.DELETE_FILES) {
@@ -181,8 +181,8 @@ class StrataClientBehaviorTest {
 
     @Test
     void deleteRejectsCodeCountMismatches() throws Exception {
-        FileId first = FileId.random();
-        FileId second = FileId.random();
+        FileId first = FileId.of(8);
+        FileId second = FileId.of(9);
         try (ScpServer meta = new ScpServer(0, 0, 0, 0, req -> {
             Opcode op = Opcode.fromCode(req.opcode());
             if (op == Opcode.DELETE_FILES) {
@@ -202,7 +202,7 @@ class StrataClientBehaviorTest {
 
     @Test
     void openForAppendRejectsCorruptOrIncompatibleDescriptors() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(10);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
         try (ScpServer meta = metadataServer(lookup);
@@ -231,7 +231,7 @@ class StrataClientBehaviorTest {
 
     @Test
     void readerHandlesSealedOpenAndUnreadableReplicaCases() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(11);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
         try (ScpServer dataNode = new ScpServer(0, 1, 0, 0, req -> {
@@ -277,7 +277,7 @@ class StrataClientBehaviorTest {
 
     @Test
     void readerRejectsCorruptDescriptorLengths() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(12);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
         try (ScpServer meta = metadataServer(lookup);
@@ -294,7 +294,7 @@ class StrataClientBehaviorTest {
 
     @Test
     void readerRejectsNegativeArgumentsBeforeCallingDataNode() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(13);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
         AtomicInteger reads = new AtomicInteger();
@@ -319,7 +319,7 @@ class StrataClientBehaviorTest {
 
     @Test
     void readerRejectsMalformedReplicaReadResponses() throws Exception {
-        FileId fileId = FileId.random();
+        FileId fileId = FileId.of(14);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<Messages.LookupFileResp> lookup = new AtomicReference<>();
         try (ScpServer overlong = new ScpServer(0, 1, 0, 0, req ->

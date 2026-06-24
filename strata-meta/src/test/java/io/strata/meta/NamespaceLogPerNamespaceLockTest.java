@@ -98,7 +98,7 @@ class NamespaceLogPerNamespaceLockTest {
                     new BlockingFileStore(NamespaceLogTestSupport.inMemoryFileStore());
             try (NamespaceLogBackend backend = new NamespaceLogBackend(root, blocking, false)) {
                 // A's createFile creates A's repo+log first, then its first append blocks on the latch.
-                FileId fA = FileId.random();
+                FileId fA = FileId.of(1);
                 CompletableFuture<Void> aCreate = CompletableFuture.runAsync(() -> sneaky(() ->
                         backend.createFile(NamespaceLogTestSupport.fileRecord(fA, nsA, StrataPath.of("/a")))));
                 CompletableFuture<Void> bCreate = null;
@@ -106,7 +106,7 @@ class NamespaceLogPerNamespaceLockTest {
                     assertTrue(blocking.entered.await(2, TimeUnit.SECONDS), "A's append should be in flight");
 
                     // While A is blocked mid-append (holding A's lock), B must proceed.
-                    FileId fB = FileId.random();
+                    FileId fB = FileId.of(2);
                     bCreate = CompletableFuture.runAsync(() -> sneaky(() -> backend.createFile(
                             NamespaceLogTestSupport.fileRecord(fB, nsB, StrataPath.of("/b")))));
                     // FAILS (times out) under the global lock; PASSES per-namespace.
@@ -135,12 +135,12 @@ class NamespaceLogPerNamespaceLockTest {
             blocking.armed = false; // let the setup appends that produce A's tombstone run unblocked
             try (NamespaceLogBackend backend = new NamespaceLogBackend(root, blocking, false)) {
                 // A: create then delete a file -> a sweepable DELETED tombstone on A's log.
-                FileId fA = FileId.random();
+                FileId fA = FileId.of(3);
                 backend.createFile(NamespaceLogTestSupport.fileRecord(fA, nsA, StrataPath.of("/a")));
                 int versionA = backend.getFile(fA).orElseThrow().version();
                 assertTrue(backend.deleteFile(fA, versionA), "delete should tombstone A's file");
                 // B: a live file so B's repo is loaded and B's lock is independently acquirable.
-                FileId fB = FileId.random();
+                FileId fB = FileId.of(4);
                 backend.createFile(NamespaceLogTestSupport.fileRecord(fB, nsB, StrataPath.of("/b")));
 
                 // Arm: appends to A's log (captured as the first createLogFile) now block.
@@ -155,7 +155,7 @@ class NamespaceLogPerNamespaceLockTest {
                     assertTrue(blocking.entered.await(2, TimeUnit.SECONDS),
                             "A's tombstone-sweep append should be in flight");
                     // While the sweep holds A's lock mid-append, a mutation on B must proceed.
-                    FileId fB2 = FileId.random();
+                    FileId fB2 = FileId.of(5);
                     bCreate = CompletableFuture.runAsync(() -> sneaky(() -> backend.createFile(
                             NamespaceLogTestSupport.fileRecord(fB2, nsB, StrataPath.of("/b2")))));
                     // FAILS (times out) under the old single global lock; PASSES per-namespace.

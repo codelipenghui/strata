@@ -221,7 +221,7 @@ class RepairCoordinatorEventTest {
     }
 
     private static FileId fileId(long lsb) {
-        return new FileId(0, lsb);
+        return FileId.of(0);
     }
 
     private record Registered(int nodeId, long incMsb, long incLsb, long sessionEpoch) {}
