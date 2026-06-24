@@ -45,9 +45,9 @@ public record StrataNamespace(String value) implements Comparable<StrataNamespac
         }
         for (int i = 0; i < raw.length(); i++) {
             char c = raw.charAt(i);
-            boolean ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-                    || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
-            if (!ok) throw new IllegalArgumentException("namespace has unsafe char '" + c + "': " + raw);
+            if (!Names.isNameChar(c)) {
+                throw new IllegalArgumentException("namespace has unsafe char '" + c + "': " + raw);
+            }
         }
         return raw;
     }

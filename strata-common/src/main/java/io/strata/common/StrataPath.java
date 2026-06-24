@@ -75,9 +75,7 @@ public record StrataPath(String value) implements Comparable<StrataPath> {
         }
         for (int i = 0; i < segment.length(); i++) {
             char c = segment.charAt(i);
-            boolean ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-                    || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
-            if (!ok) {
+            if (!Names.isNameChar(c)) {
                 throw new IllegalArgumentException("invalid path character '" + c + "' in " + raw);
             }
         }
