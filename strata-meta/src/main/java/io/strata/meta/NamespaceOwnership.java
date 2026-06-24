@@ -24,6 +24,13 @@ public final class NamespaceOwnership {
                              int generation, int replicaCount) {
         this.localEndpoint = Objects.requireNonNull(localEndpoint, "localEndpoint");
         this.eligibleEndpoints = List.copyOf(eligibleEndpoints);
+        // A single-endpoint membership means "this node owns every namespace" (ownsAll). If that lone
+        // endpoint is NOT this node, ownsAll() would silently route all namespaces here instead of
+        // redirecting — a misconfiguration; fail loudly at startup rather than mis-serve.
+        if (this.eligibleEndpoints.size() == 1 && !this.eligibleEndpoints.get(0).equals(localEndpoint)) {
+            throw new IllegalArgumentException("single-endpoint membership must name this node ("
+                    + localEndpoint + "); got " + this.eligibleEndpoints.get(0));
+        }
         this.generation = generation;
         this.replicaCount = replicaCount;
     }

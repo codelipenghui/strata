@@ -8,7 +8,6 @@ import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.api.transaction.CuratorOp;
 import org.apache.curator.retry.ExponentialBackoffRetry;
-import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.data.Stat;
 import org.slf4j.Logger;
@@ -20,6 +19,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
@@ -31,14 +31,13 @@ import java.util.concurrent.atomic.LongAdder;
  * /strata/namespaces/<namespace>/paths/<path segments>/__file (FileId binding or empty tombstone),
  * /strata/namespaces/<namespace>/files/<fileId> (per-namespace file index for namespace-scoped
  * enumeration without a global /strata/files scan),
- * /strata/nodes/<nodeId>, /strata/ids/seq- (sequential, node-id allocation).
+ * /strata/nodes/<nodeId> (node identity record; ids are externally supplied via STRATA_NODE_ID).
  */
 public final class ZkMetadataStore implements MetadataStore {
     private static final Logger log = LoggerFactory.getLogger(ZkMetadataStore.class);
     private static final String FILES = "/strata/files";
     private static final String NAMESPACES = "/strata/namespaces";
     private static final String NODES = "/strata/nodes";
-    private static final String IDS = "/strata/ids";
     private static final String FILE_MARKER = "__file";
     private static final byte[] DELETED_FILE_MARKER = new byte[0];
     // Namespace-sharding consensus root (design §5, §6.1): a single global metadata-epoch counter
@@ -49,7 +48,7 @@ public final class ZkMetadataStore implements MetadataStore {
     private static final String META_EPOCH = META + "/epoch";
     private static final String META_LIVE_NODES = META + "/live-nodes";
     /** The next-level znodes under {@code /strata}, used to tag per-subtree ZK request metrics. */
-    public static final List<String> SUBTREES = List.of("files", "namespaces", "nodes", "ids");
+    public static final List<String> SUBTREES = List.of("files", "namespaces", "nodes");
 
     private final CuratorFramework curator;
     private final boolean ownsCurator;
@@ -108,7 +107,7 @@ public final class ZkMetadataStore implements MetadataStore {
 
     private void init() {
         try {
-            for (String path : new String[]{FILES, NAMESPACES, NODES, IDS, META, META_NAMESPACES}) {
+            for (String path : new String[]{FILES, NAMESPACES, NODES, META, META_NAMESPACES}) {
                 try {
                     if (curator.checkExists().forPath(path) == null) {
                         curator.create().creatingParentsIfNeeded().forPath(path);
@@ -430,14 +429,6 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     @Override
-    public int nextNodeId() throws Exception {
-        String path = curator.create().withMode(CreateMode.PERSISTENT_SEQUENTIAL).forPath(IDS + "/seq-");
-        record(IDS, true, 0);
-        String seq = path.substring(path.lastIndexOf('-') + 1);
-        return Integer.parseInt(seq) + 1; // node ids start at 1
-    }
-
-    @Override
     public boolean putNode(Records.NodeRecord record, int expectedVersion) throws Exception {
         String path = NODES + "/" + record.nodeId();
         try {
@@ -523,18 +514,26 @@ public final class ZkMetadataStore implements MetadataStore {
     @Override
     public boolean putNamespaceAssignment(Records.NamespaceAssignment assignment, int expectedVersion)
             throws Exception {
-        String path = assignmentPath(assignment.namespace());
+        return casCreateOrSet(assignmentPath(assignment.namespace()), assignment.encode(), expectedVersion)
+                .isPresent();
+    }
+
+    /**
+     * Creates the znode ({@code expectedVersion < 0}) or CAS-sets it at the expected version; returns the
+     * new znode data-version on success, or empty on a create/version conflict (node already exists, stale
+     * version, or vanished). Returning the version lets the caller chain the next CAS without a read-back.
+     */
+    private OptionalInt casCreateOrSet(String path, byte[] enc, int expectedVersion) throws Exception {
         try {
-            byte[] enc = assignment.encode();
             if (expectedVersion < 0) {
                 curator.create().creatingParentsIfNeeded().forPath(path, enc);
-            } else {
-                curator.setData().withVersion(expectedVersion).forPath(path, enc);
+                return OptionalInt.of(0); // a freshly created znode has data version 0
             }
-            return true;
+            Stat stat = curator.setData().withVersion(expectedVersion).forPath(path, enc);
+            return OptionalInt.of(stat.getVersion());
         } catch (KeeperException.NodeExistsException | KeeperException.BadVersionException
                  | KeeperException.NoNodeException e) {
-            return false;
+            return OptionalInt.empty();
         }
     }
 
@@ -569,21 +568,9 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     @Override
-    public boolean putNamespaceManifest(Records.NamespaceManifest manifest, int expectedVersion)
+    public OptionalInt putNamespaceManifest(Records.NamespaceManifest manifest, int expectedVersion)
             throws Exception {
-        String path = manifestPath(manifest.namespace());
-        try {
-            byte[] enc = manifest.encode();
-            if (expectedVersion < 0) {
-                curator.create().creatingParentsIfNeeded().forPath(path, enc);
-            } else {
-                curator.setData().withVersion(expectedVersion).forPath(path, enc);
-            }
-            return true;
-        } catch (KeeperException.NodeExistsException | KeeperException.BadVersionException
-                 | KeeperException.NoNodeException e) {
-            return false;
-        }
+        return casCreateOrSet(manifestPath(manifest.namespace()), manifest.encode(), expectedVersion);
     }
 
     private static String manifestPath(StrataNamespace namespace) {
@@ -652,9 +639,6 @@ public final class ZkMetadataStore implements MetadataStore {
         }
         if (path.startsWith(NODES)) {
             return "nodes";
-        }
-        if (path.startsWith(IDS)) {
-            return "ids";
         }
         return "other";
     }

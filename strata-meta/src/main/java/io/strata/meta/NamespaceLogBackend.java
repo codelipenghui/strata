@@ -85,10 +85,18 @@ final class NamespaceLogBackend implements AutoCloseable {
 
     /** Per-namespace stats for the namespaces this node owns: {@code namespace -> [liveFiles, openLogBytes]}. */
     Map<StrataNamespace, long[]> namespaceStats() {
-        // Best-effort gauges over the ConcurrentHashMap; a momentarily-stale per-namespace read is fine.
+        // Best-effort gauges over the ConcurrentHashMap; each per-namespace read is taken under that repo's
+        // lock — liveFileCount() iterates a plain HashMap that append() mutates under the same lock, so a
+        // lock-free read would race into a ConcurrentModificationException.
         Map<StrataNamespace, long[]> out = new HashMap<>(repos.size());
         for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
-            out.put(e.getKey(), new long[]{e.getValue().liveFileCount(), e.getValue().openLogBytes()});
+            NamespaceMetadataLogRepository repo = e.getValue();
+            repo.lock();
+            try {
+                out.put(e.getKey(), new long[]{repo.liveFileCount(), repo.openLogBytes()});
+            } finally {
+                repo.unlock();
+            }
         }
         return out;
     }
@@ -304,10 +312,19 @@ final class NamespaceLogBackend implements AutoCloseable {
 
     List<StrataNamespace> listNamespaces() throws Exception {
         // System (metadata-log) namespaces come from the root; user namespaces from the loaded repos.
-        // Best-effort listing over the ConcurrentHashMap (lock-free); a stale live-files snapshot is fine.
+        // The per-repo live-files read is taken under that repo's lock: state().liveFiles() iterates a plain
+        // HashMap that append() mutates under the same lock, so a lock-free read would race into a CME.
         Set<StrataNamespace> out = new LinkedHashSet<>(root.listNamespaces());
         for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
-            if (!e.getValue().state().liveFiles().isEmpty()) {
+            NamespaceMetadataLogRepository repo = e.getValue();
+            boolean hasLive;
+            repo.lock();
+            try {
+                hasLive = !repo.state().liveFiles().isEmpty();
+            } finally {
+                repo.unlock();
+            }
+            if (hasLive) {
                 out.add(e.getKey());
             }
         }

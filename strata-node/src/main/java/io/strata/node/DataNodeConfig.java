@@ -10,6 +10,10 @@ import java.util.Objects;
 /**
  * Data node configuration. controllerEndpoints empty = standalone mode (no registration loop) —
  * used by data-plane tests; production always registers.
+ *
+ * <p>{@code nodeId} is the externally-supplied, volume-bound node identity (set via
+ * {@code STRATA_NODE_ID}); {@code -1} means standalone/unregistered (data-plane tests). The id is
+ * validated against the volume's {@code identity.properties} on startup.
  */
 public record DataNodeConfig(
         Path dataDir,
@@ -22,13 +26,14 @@ public record DataNodeConfig(
         String host,
         long capacityBytes,
         int inventoryIntervalMs,
-        ConnectionPolicy connectionPolicy
+        ConnectionPolicy connectionPolicy,
+        int nodeId                       // -1 = standalone/unregistered; otherwise >= 1
 ) {
     public DataNodeConfig(Path dataDir, int listenPort, String advertisedHost, String advertisedEndpointOverride,
                       List<String> controllerEndpoints, String zone, String rack, String host,
                       long capacityBytes, int inventoryIntervalMs) {
         this(dataDir, listenPort, advertisedHost, advertisedEndpointOverride, controllerEndpoints,
-                zone, rack, host, capacityBytes, inventoryIntervalMs, ConnectionPolicy.DEFAULT);
+                zone, rack, host, capacityBytes, inventoryIntervalMs, ConnectionPolicy.DEFAULT, -1);
     }
 
     public DataNodeConfig {
@@ -58,6 +63,9 @@ public record DataNodeConfig(
         if (inventoryIntervalMs <= 0) {
             throw new IllegalArgumentException("inventoryIntervalMs must be positive: " + inventoryIntervalMs);
         }
+        if (nodeId != -1 && nodeId < 1) {
+            throw new IllegalArgumentException("nodeId must be -1 (standalone) or >= 1: " + nodeId);
+        }
         connectionPolicy = Objects.requireNonNull(connectionPolicy, "connectionPolicy");
     }
 
@@ -83,16 +91,21 @@ public record DataNodeConfig(
 
     public DataNodeConfig withListenPort(int port) {
         return new DataNodeConfig(dataDir, port, advertisedHost, advertisedEndpointOverride,
-                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy);
+                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy, nodeId);
     }
 
     public DataNodeConfig withAdvertisedEndpoint(String endpoint) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, endpoint,
-                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy);
+                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy, nodeId);
     }
 
     public DataNodeConfig withConnectionPolicy(ConnectionPolicy policy) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
-                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, policy);
+                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, policy, nodeId);
+    }
+
+    public DataNodeConfig withNodeId(int id) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy, id);
     }
 }

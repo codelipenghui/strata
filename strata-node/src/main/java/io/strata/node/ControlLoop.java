@@ -138,16 +138,20 @@ final class ControlLoop implements AutoCloseable {
         }
         if (sessionEpoch < 0) {
             var reg = new Messages.RegisterNode(
+                    node.nodeId(),
                     node.incarnation().getMostSignificantBits(), node.incarnation().getLeastSignificantBits(),
                     List.of(node.endpoint()), config.zone(), config.rack(), config.host(),
                     List.of(new Messages.StorageCapacity(config.capacityBytes())),
                     1, 0);
             ByteBuffer resp = controller.call(Opcode.REGISTER_NODE, reg.encode(), null, CALL_TIMEOUT_MS);
             var r = Messages.RegisterResp.decode(resp);
-            node.nodeIdAssigned(r.nodeId());
+            if (r.nodeId() != node.nodeId()) {
+                // the node owns its id (volume-bound, STRATA_NODE_ID); the leader only echoes it back
+                log.warn("controller echoed nodeId {} but this node is {}", r.nodeId(), node.nodeId());
+            }
             sessionEpoch = r.sessionEpoch();
             heartbeatIntervalMs = Math.max(100, r.heartbeatIntervalMs());
-            log.info("registered: nodeId={} session={} hb={}ms", r.nodeId(), r.sessionEpoch(), r.heartbeatIntervalMs());
+            log.info("registered: nodeId={} session={} hb={}ms", node.nodeId(), r.sessionEpoch(), r.heartbeatIntervalMs());
         }
     }
 

@@ -6,6 +6,7 @@ import io.strata.common.StrataPath;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 
 /**
  * MetadataStore SPI (tech design §4.4): persistence behind the controller. v0 backend is
@@ -58,8 +59,6 @@ public interface MetadataStore extends AutoCloseable {
     int sweepDeletedFiles(long olderThanMs) throws Exception;
 
     /* ---- node registry ---- */
-
-    int nextNodeId() throws Exception;
 
     /**
      * CAS write of a node record: expectedVersion -1 creates (fails if present), otherwise
@@ -117,9 +116,10 @@ public interface MetadataStore extends AutoCloseable {
     /**
      * CAS-publishes a namespace metadata-log manifest — the linearizable cutover barrier (design §9).
      * {@code expectedVersion -1} creates (fails if present), otherwise updates only if the stored
-     * version matches; returns false on a version conflict so a fenced leader's publish loses.
+     * version matches. Returns the new znode version on success (so the caller can do the next CAS
+     * without a read-back), or empty on a version conflict so a fenced leader's publish loses.
      */
-    default boolean putNamespaceManifest(Records.NamespaceManifest manifest, int expectedVersion)
+    default OptionalInt putNamespaceManifest(Records.NamespaceManifest manifest, int expectedVersion)
             throws Exception {
         throw new UnsupportedOperationException("namespace manifest requires a consensus-root backend");
     }

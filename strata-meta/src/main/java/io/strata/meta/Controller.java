@@ -205,6 +205,7 @@ public final class Controller implements AutoCloseable {
         try {
             return Integer.parseInt(value.trim());
         } catch (NumberFormatException e) {
+            log.warn("ignoring non-numeric {}/{}='{}', using default {}", envName, propName, value, fallback);
             return fallback;
         }
     }

@@ -180,14 +180,6 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
         }
 
         @Override
-        public int nextNodeId() {
-            synchronized (state) {
-                ensureOpen();
-                return state.nextNodeId++;
-            }
-        }
-
-        @Override
         public boolean putNode(Records.NodeRecord record, int expectedVersion) {
             synchronized (state) {
                 ensureOpen();
@@ -245,7 +237,6 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
             private final Map<FileId, Long> deletedAtMs = new HashMap<>();
             private final Map<PathKey, PathMarker> paths = new HashMap<>();
             private final Map<Integer, Versioned<Records.NodeRecord>> nodes = new HashMap<>();
-            private int nextNodeId = 1;
         }
 
         private record PathKey(StrataNamespace namespace, StrataPath path) {

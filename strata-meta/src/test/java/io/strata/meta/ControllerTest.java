@@ -32,6 +32,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -46,9 +47,15 @@ class ControllerTest {
     private Controller service;
     private ScpClient client;
 
+    // Node ids are now externally supplied (no leader-side allocator). One monotonic sequence per test
+    // run hands every registration a globally-unique id, so distinct nodes never collide across the
+    // shared service or the per-test local services.
+    private static final AtomicInteger NODE_ID_SEQ = new AtomicInteger(1);
+
     /** A fake data node: registers and heartbeats but executes nothing for real. */
     private class FakeNode {
         final UUID inc = UUID.randomUUID();
+        final int assignedNodeId = NODE_ID_SEQ.getAndIncrement();
         final String host;
         final ScpClient controlClient;
         int nodeId = -1;
@@ -67,7 +74,7 @@ class ControllerTest {
 
         void register() {
             var resp = Messages.RegisterResp.decode(controlClient.call(Opcode.REGISTER_NODE,
-                    new Messages.RegisterNode(inc.getMostSignificantBits(), inc.getLeastSignificantBits(),
+                    new Messages.RegisterNode(assignedNodeId, inc.getMostSignificantBits(), inc.getLeastSignificantBits(),
                             List.of(host + ":9000"), "z1", "r1", host,
                             List.of(new Messages.StorageCapacity(1L << 40)), 1, 0).encode(),
                     null, 5000));
@@ -370,7 +377,7 @@ class ControllerTest {
             @Override
             void register() {
                 var resp = Messages.RegisterResp.decode(client.call(Opcode.REGISTER_NODE,
-                        new Messages.RegisterNode(inc.getMostSignificantBits(), inc.getLeastSignificantBits(),
+                        new Messages.RegisterNode(assignedNodeId, inc.getMostSignificantBits(), inc.getLeastSignificantBits(),
                                 List.of(host + ":9000"), "z1", "r1", host,
                                 List.of(new Messages.StorageCapacity(1L << 40)), 1, 0).encode(),
                         null, 5000));
@@ -398,7 +405,8 @@ class ControllerTest {
     void registrationRejectsNodesWithoutUsableEndpointOrCapacity() {
         UUID noEndpoint = UUID.randomUUID();
         ScpException missingEndpoint = assertThrows(ScpException.class, () -> client.call(Opcode.REGISTER_NODE,
-                new Messages.RegisterNode(noEndpoint.getMostSignificantBits(), noEndpoint.getLeastSignificantBits(),
+                new Messages.RegisterNode(NODE_ID_SEQ.getAndIncrement(),
+                        noEndpoint.getMostSignificantBits(), noEndpoint.getLeastSignificantBits(),
                         List.of(), "z1", "r1", "badEndpoint",
                         List.of(new Messages.StorageCapacity(100)), 1, 0).encode(),
                 null, 5000));
@@ -406,14 +414,15 @@ class ControllerTest {
 
         UUID noCapacity = UUID.randomUUID();
         ScpException missingCapacity = assertThrows(ScpException.class, () -> client.call(Opcode.REGISTER_NODE,
-                new Messages.RegisterNode(noCapacity.getMostSignificantBits(), noCapacity.getLeastSignificantBits(),
+                new Messages.RegisterNode(NODE_ID_SEQ.getAndIncrement(),
+                        noCapacity.getMostSignificantBits(), noCapacity.getLeastSignificantBits(),
                         List.of("noCapacity:9000"), "z1", "r1", "noCapacity",
                         List.of(), 1, 0).encode(), null, 5000));
         assertEquals(ErrorCode.PRECONDITION_FAILED, missingCapacity.code());
 
         UUID zeroCapacity = UUID.randomUUID();
         ScpException unusableCapacity = assertThrows(ScpException.class, () -> client.call(Opcode.REGISTER_NODE,
-                new Messages.RegisterNode(zeroCapacity.getMostSignificantBits(),
+                new Messages.RegisterNode(NODE_ID_SEQ.getAndIncrement(), zeroCapacity.getMostSignificantBits(),
                         zeroCapacity.getLeastSignificantBits(), List.of("zeroCapacity:9000"),
                         "z1", "r1", "zeroCapacity",
                         List.of(new Messages.StorageCapacity(0)), 1, 0).encode(),
@@ -459,7 +468,8 @@ class ControllerTest {
         for (String host : List.of(hostPrefix + "A", hostPrefix + "B", hostPrefix + "C")) {
             UUID inc = UUID.randomUUID();
             client.call(Opcode.REGISTER_NODE,
-                    new Messages.RegisterNode(inc.getMostSignificantBits(), inc.getLeastSignificantBits(),
+                    new Messages.RegisterNode(NODE_ID_SEQ.getAndIncrement(),
+                            inc.getMostSignificantBits(), inc.getLeastSignificantBits(),
                             List.of(host + ":9000"), "z1", "r1", host,
                             List.of(new Messages.StorageCapacity(1L << 40)), 1, 0).encode(),
                     null, 5000);
@@ -480,7 +490,8 @@ class ControllerTest {
                 UUID inc = UUID.randomUUID();
                 incarnations.add(inc);
                 var resp = Messages.RegisterResp.decode(localClient.call(Opcode.REGISTER_NODE,
-                        new Messages.RegisterNode(inc.getMostSignificantBits(), inc.getLeastSignificantBits(),
+                        new Messages.RegisterNode(NODE_ID_SEQ.getAndIncrement(),
+                                inc.getMostSignificantBits(), inc.getLeastSignificantBits(),
                                 List.of(host + ":9000"), "z1", "r1", host,
                                 List.of(new Messages.StorageCapacity(100)), 1, 0).encode(),
                         null, 5000));
@@ -612,11 +623,6 @@ class ControllerTest {
         @Override
         public List<io.strata.common.StrataNamespace> listNamespaces() throws Exception {
             return delegate.listNamespaces();
-        }
-
-        @Override
-        public int nextNodeId() throws Exception {
-            return delegate.nextNodeId();
         }
 
         @Override
@@ -1186,7 +1192,8 @@ class ControllerTest {
         for (String host : List.of("hugeA", "hugeB", "hugeC")) {
             UUID inc = UUID.randomUUID();
             client.call(Opcode.REGISTER_NODE,
-                    new Messages.RegisterNode(inc.getMostSignificantBits(), inc.getLeastSignificantBits(),
+                    new Messages.RegisterNode(NODE_ID_SEQ.getAndIncrement(),
+                            inc.getMostSignificantBits(), inc.getLeastSignificantBits(),
                             List.of(host + ":9000"), "z1", "r1", host,
                             List.of(new Messages.StorageCapacity(Long.MAX_VALUE)), 1, 0).encode(),
                     null, 5000);

@@ -67,10 +67,10 @@ public final class StrataServer {
                 .withAdvertisedHost(env("STRATA_ADVERTISED_HOST", hostname()))
                 .withReconcileIntervalMs(intEnv("STRATA_REPAIR_RECONCILE_INTERVAL_MS", 60_000));
         // Namespace sharding is OPT-IN (default off = single global leader). When enabled, namespaces are
-        // rendezvous-assigned across STRATA_CONTROLLER_ENDPOINTS so each controller node owns a shard. EXPERIMENTAL:
-        // the client holds one metadata connection with a single preferred endpoint, so concurrent ops on
-        // namespaces owned by different nodes thrash that connection (redirect storm). Making it load-safe
-        // needs server-side owner forwarding or a sharding-aware client — until then, leave this off.
+        // rendezvous-assigned across STRATA_CONTROLLER_ENDPOINTS so each controller node owns a shard. The
+        // client (ControllerClient) is sharding-aware: it keeps one connection per owner and routes each op
+        // to its namespace's owner, learning owners from NOT_LEADER redirect hints — so concurrent ops
+        // across owners do not thrash a single connection. Off by default to gate fleet-wide rollout.
         if (Boolean.parseBoolean(env("STRATA_CONTROLLER_SHARDING", "false"))) {
             config = config.withControllerEndpoints(endpoints(required("STRATA_CONTROLLER_ENDPOINTS")),
                     intEnv("STRATA_CONTROLLER_REPLICA_COUNT", 3));
@@ -104,7 +104,8 @@ public final class StrataServer {
                 env("STRATA_RACK", "r0"),
                 env("STRATA_HOST", hostname),
                 longEnv("STRATA_CAPACITY_BYTES", 1L << 40),  // 1 TiB
-                intEnv("STRATA_INVENTORY_INTERVAL_MS", 30_000));
+                intEnv("STRATA_INVENTORY_INTERVAL_MS", 30_000))
+                .withNodeId(requiredIntEnv("STRATA_NODE_ID"));
         DataNode node = new DataNode(config);
         log.info("data node started: endpoint={} dataDir={} controller={}",
                 node.endpoint(), config.dataDir(), config.controllerEndpoints());
@@ -144,9 +145,10 @@ public final class StrataServer {
                 intEnv("STRATA_REPAIR_COMMAND_TIMEOUT_MS", 30_000))
                 .withAdvertisedHost(advertisedHost)
                 .withReconcileIntervalMs(intEnv("STRATA_REPAIR_RECONCILE_INTERVAL_MS", 60_000));
-        // Namespace sharding is OPT-IN (default off = single global leader). EXPERIMENTAL and not yet
-        // load-safe (the client thrashes its single metadata connection across per-namespace owners);
-        // needs server-side owner forwarding or a sharding-aware client. See runController / STRATA_CONTROLLER_SHARDING.
+        // Namespace sharding is OPT-IN (default off = single global leader). The sharding-aware client
+        // (ControllerClient) keeps one connection per owner and routes each op to its namespace's owner,
+        // so it does not thrash a single connection. Off by default to gate rollout. See runController /
+        // STRATA_CONTROLLER_SHARDING.
         if (Boolean.parseBoolean(env("STRATA_CONTROLLER_SHARDING", "false"))) {
             controllerConfig = controllerConfig.withControllerEndpoints(endpoints(required("STRATA_CONTROLLER_ENDPOINTS")),
                     intEnv("STRATA_CONTROLLER_REPLICA_COUNT", 3));
@@ -161,7 +163,8 @@ public final class StrataServer {
                 env("STRATA_RACK", "r0"),
                 env("STRATA_HOST", hostname),
                 longEnv("STRATA_CAPACITY_BYTES", 1L << 40),  // 1 TiB
-                intEnv("STRATA_INVENTORY_INTERVAL_MS", 30_000));
+                intEnv("STRATA_INVENTORY_INTERVAL_MS", 30_000))
+                .withNodeId(requiredIntEnv("STRATA_NODE_ID"));
         Combined combined = startCombined(controllerConfig, nodeConfig);
         log.info("combined node started: scp={} zk={}", combined.node().endpoint(), controllerConfig.zkConnect());
         awaitShutdown("combined node", combined);
@@ -315,6 +318,10 @@ public final class StrataServer {
     private static int intEnv(String key, int def) {
         String v = env(key, null);
         return v == null ? def : Integer.parseInt(v);
+    }
+
+    private static int requiredIntEnv(String key) {
+        return Integer.parseInt(required(key));
     }
 
     private static long longEnv(String key, long def) {

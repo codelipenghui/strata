@@ -45,6 +45,14 @@ class DataNodeConfigTest {
 
         ConnectionPolicy policy = ConnectionPolicy.DEFAULT.withIdleTimeoutMs(1234);
         assertEquals(policy, base.withConnectionPolicy(policy).connectionPolicy());
+
+        assertEquals(-1, base.nodeId(), "convenience constructor defaults to the standalone sentinel");
+        DataNodeConfig withNodeId = base.withNodeId(42);
+        assertEquals(42, withNodeId.nodeId());
+        assertEquals(base.dataDir(), withNodeId.dataDir());
+        assertEquals(base.controllerEndpoints(), withNodeId.controllerEndpoints());
+        assertEquals(base.host(), withNodeId.host());
+        assertEquals(base.connectionPolicy(), withNodeId.connectionPolicy());
     }
 
     @Test
@@ -100,6 +108,6 @@ class DataNodeConfigTest {
         assertThrows(IllegalArgumentException.class, () -> new DataNodeConfig(Path.of("data"), 0, "127.0.0.1",
                 null, List.of(), "zone", "rack", "host", 1, 0));
         assertThrows(NullPointerException.class, () -> new DataNodeConfig(Path.of("data"), 0, "127.0.0.1",
-                null, List.of(), "zone", "rack", "host", 1, 1, null));
+                null, List.of(), "zone", "rack", "host", 1, 1, null, -1));
     }
 }

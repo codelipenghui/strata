@@ -38,7 +38,8 @@ class CombinedServerTest {
             ControllerConfig controllerConfig = ControllerConfig.forTests(zk.getConnectString());
             DataNodeConfig nodeConfig = DataNodeConfig
                     .withMetadata(dataDir, List.of("127.0.0.1:" + port), "host-0")
-                    .withListenPort(port);
+                    .withListenPort(port)
+                    .withNodeId(1);  // node id is now externally supplied (STRATA_NODE_ID)
 
             try (StrataServer.Combined combined = StrataServer.startCombined(controllerConfig, nodeConfig)) {
                 // Both planes share ONE listener: the co-resident node registers with the co-resident

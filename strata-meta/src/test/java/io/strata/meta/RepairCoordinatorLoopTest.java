@@ -110,11 +110,6 @@ class RepairCoordinatorLoopTest {
         }
 
         @Override
-        public int nextNodeId() {
-            return 1;
-        }
-
-        @Override
         public boolean putNode(Records.NodeRecord record, int expectedVersion) {
             return false;
         }

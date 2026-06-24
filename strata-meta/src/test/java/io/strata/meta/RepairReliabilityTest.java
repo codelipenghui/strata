@@ -36,7 +36,10 @@ class RepairReliabilityTest {
 
     /** Minimal fake data node: registers, heartbeats, auto-acks received commands. */
     private final class FakeNode {
+        private static final java.util.concurrent.atomic.AtomicInteger ID_SEQ =
+                new java.util.concurrent.atomic.AtomicInteger(1);
         final UUID inc = UUID.randomUUID();
+        final int assignedNodeId = ID_SEQ.getAndIncrement();
         final String host;
         int nodeId = -1;
         long session = -1;
@@ -50,7 +53,8 @@ class RepairReliabilityTest {
 
         void register() {
             var resp = Messages.RegisterResp.decode(client.call(Opcode.REGISTER_NODE,
-                    new Messages.RegisterNode(inc.getMostSignificantBits(), inc.getLeastSignificantBits(),
+                    new Messages.RegisterNode(assignedNodeId, inc.getMostSignificantBits(),
+                            inc.getLeastSignificantBits(),
                             List.of(host + ":9000"), "z1", "r1", host,
                             List.of(new Messages.StorageCapacity(1L << 40)), 1, 0).encode(),
                     null, 5000));

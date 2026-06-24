@@ -21,20 +21,21 @@ import java.util.function.Function;
 /**
  * Owner-aware client-side metadata access (v0: SCP 0x02xx opcodes). The metadata plane is sharded — each
  * namespace has exactly one controller owner — so this client connects to ANY controller and routes each
- * op directly to the namespace's owner, caching {@code namespace -> owner} and {@code fileId -> owner}.
- * A miss (cold cache, or an ownership change) surfaces as a {@code NOT_LEADER} redirect carrying the owner
- * endpoint; the client updates its cache and retries there. This keeps one connection per owner the client
- * actually talks to (lazily opened from the seed endpoints + learned redirect hints), so concurrent ops
- * across owners never thrash a single connection.
+ * op directly to the namespace's owner, caching {@code namespace -> owner}. A miss (cold cache, or an
+ * ownership change) surfaces as a {@code NOT_LEADER} redirect carrying the owner endpoint; the client
+ * updates its cache and retries there. This keeps one connection per owner the client actually talks to
+ * (lazily opened from the seed endpoints + learned redirect hints), so concurrent ops across owners never
+ * thrash a single connection.
  *
- * <p>Routing key per op: namespace for namespace-scoped ops (CREATE_FILE, LOOKUP_PATH), fileId for
- * file-scoped ops (CREATE_CHUNK, SEAL, LOOKUP_FILE, ...). A created file inherits its namespace's owner.
+ * <p>Routing key per op: the <b>namespace</b>, for every op. File-scoped ops (CREATE_CHUNK, SEAL,
+ * LOOKUP_FILE, ...) carry their namespace explicitly — the per-file {@code fileId -> namespace} ZK index
+ * was removed, so a file is routed by the namespace it was created/opened in.
  */
 final class ControllerClient implements AutoCloseable {
     private final ClientConfig config;
     private final List<String> seeds;                       // configured controllers used to bootstrap/round-robin
     private final Map<String, ManagedScpConnection> conns = new ConcurrentHashMap<>();
-    private final Map<Object, String> ownerByKey = new ConcurrentHashMap<>(); // namespace|fileId -> owner endpoint
+    private final Map<Object, String> ownerByKey = new ConcurrentHashMap<>(); // namespace -> owner endpoint
     private final AtomicInteger seedCursor = new AtomicInteger();
 
     ControllerClient(ClientConfig config) {

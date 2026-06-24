@@ -570,6 +570,9 @@ class ChaosTest {
         command.add(cluster.nodeDir(host).toString());
         command.add(String.join(",", cluster.metaEndpoints()));
         command.add(host);
+        // Node ids are externally supplied now; derive a stable, positive id from the host so a
+        // respawn on the same dataDir reuses the same id (the volume identity is bound to it).
+        command.add(Integer.toString(DataNodeProcessMain.nodeIdForHost(host)));
         command.add(readyFile.toString());
         if (advertisedEndpoint != null) {
             command.add(Integer.toString(listenPort));

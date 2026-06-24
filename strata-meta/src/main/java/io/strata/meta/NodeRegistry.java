@@ -118,6 +118,16 @@ final class NodeRegistry {
     private final java.util.concurrent.locks.ReentrantLock registerLock =
             new java.util.concurrent.locks.ReentrantLock();
 
+    /**
+     * True while a REGISTERED node is still within its dead-grace window (lease not yet expired past
+     * {@code deadGraceMs}) — the same window expiry and placement use. A node id may only be taken over
+     * by a different incarnation once its prior holder is no longer within grace.
+     */
+    private boolean withinDeadGrace(LiveNode n, long now) {
+        return n.record.state() == Records.NodeState.REGISTERED
+                && n.leaseUntil + config.deadGraceMs() >= now;
+    }
+
     Messages.RegisterResp register(Messages.RegisterNode msg) throws Exception {
         registerLock.lock();
         try {
@@ -129,34 +139,35 @@ final class NodeRegistry {
 
     private Messages.RegisterResp registerLocked(Messages.RegisterNode msg) throws Exception {
         validateRegistration(msg);
-        // identity = incarnation persisted on the node's volumes; same incarnation -> same nodeId
-        Integer nodeIdFound = null;
-        int existingVersion = -1;
-        for (LiveNode n : live.values()) {
-            if (n.record.incMsb() == msg.incMsb() && n.record.incLsb() == msg.incLsb()) {
-                nodeIdFound = n.record.nodeId();
-                existingVersion = n.recordVersion;
-                break;
+        int nodeId = msg.nodeId();
+        // The node supplies its own stable, volume-bound id (validated node-side against identity.properties).
+        // The leader no longer allocates ids — it rejects a collision (a different LIVE incarnation already
+        // holding this id, i.e. a STRATA_NODE_ID misconfiguration) and CAS-updates the id's registry record.
+        LiveNode existing = live.get(nodeId);
+        int existingVersion;
+        if (existing != null) {
+            boolean sameIncarnation = existing.record.incMsb() == msg.incMsb()
+                    && existing.record.incLsb() == msg.incLsb();
+            // A different incarnation may take this id over only once the prior holder is fully past its
+            // dead-grace window (mirroring placement/expiry). Gating on the lease alone would open a
+            // post-failover hole: a freshly elected leader warms persisted records with an already-expired
+            // lease, so a still-alive node that has not yet re-registered would look free to be stolen.
+            if (!sameIncarnation && withinDeadGrace(existing, System.currentTimeMillis())) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "nodeId " + nodeId + " is already held by a live node — check STRATA_NODE_ID uniqueness");
             }
+            // same incarnation re-registering (restart/failover), or the prior holder is fully dead-graced
+            // (a replacement node taking the id over): both proceed and open a fresh session.
+            existingVersion = existing.recordVersion;
+        } else {
+            // not in this leader's memory (e.g. just after a metadata failover): recover the persisted
+            // record's version for the CAS. The in-memory live check above is the collision authority.
+            existingVersion = store.getNode(nodeId).map(MetadataStore.Versioned::version).orElse(-1);
         }
-        if (nodeIdFound == null) {
-            // not in this leader's memory — a node that registered with a PREVIOUS leader after
-            // this instance booted. The persistent store is the identity source of truth:
-            // re-registration across metadata failover must keep the nodeId stable.
-            for (MetadataStore.Versioned<Records.NodeRecord> v : store.listNodes()) {
-                if (v.value().incMsb() == msg.incMsb() && v.value().incLsb() == msg.incLsb()) {
-                    nodeIdFound = v.value().nodeId();
-                    existingVersion = v.version();
-                    break;
-                }
-            }
-        }
-        int nodeId = nodeIdFound != null ? nodeIdFound : store.nextNodeId();
         long capacity = msg.capacities().isEmpty() ? 0 : msg.capacities().get(0).capacityBytes();
         Records.NodeRecord record = new Records.NodeRecord(nodeId, msg.incMsb(), msg.incLsb(),
                 msg.endpoints(), msg.zone(), msg.rack(), msg.host(), capacity, Records.NodeState.REGISTERED);
 
-        LiveNode existing = live.get(nodeId);
         Lock sessionWrite = existing == null ? null : existing.sessionGate.writeLock();
         if (sessionWrite != null) {
             sessionWrite.lock();
@@ -209,6 +220,10 @@ final class NodeRegistry {
     }
 
     private static void validateRegistration(Messages.RegisterNode msg) {
+        if (msg.nodeId() < 1) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                    "node registration requires a positive nodeId — set STRATA_NODE_ID");
+        }
         if (msg.endpoints().isEmpty() || msg.endpoints().stream().anyMatch(e -> e == null || e.isBlank())) {
             throw new ScpException(ErrorCode.PRECONDITION_FAILED, "node registration requires an endpoint");
         }

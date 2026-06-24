@@ -14,7 +14,9 @@ import io.strata.proto.ScpClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -192,6 +194,14 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     private long leaderSince;
+    /**
+     * Serializes the descriptor-mutating reconcile passes — scanOnce() (leader), ownerRepairPass()
+     * (non-leader owner), and driveDeletionNow() (prompt delete) — against each other (replaces a
+     * {@code synchronized(this)} monitor). A ReentrantLock does not pin the virtual-thread carrier across
+     * the blocking store/ZK and node-RPC I/O these methods perform, unlike {@code synchronized} on Java 21.
+     */
+    private final java.util.concurrent.locks.ReentrantLock reconcileLock =
+            new java.util.concurrent.locks.ReentrantLock();
 
     private void scanLoop() {
         long lastReconcile = 0;
@@ -359,7 +369,9 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /** One reconciliation pass over all files. Idempotent; safe to call while serving. */
-    synchronized void scanOnce() throws Exception {
+    void scanOnce() throws Exception {
+        reconcileLock.lock();
+        try {
         // The controller refreshes the shared live-node snapshot each pass so non-controller namespace
         // owners have a current placement view (design §11). Leader-gated: a standby must not publish.
         if (isLeader.getAsBoolean()) {
@@ -409,6 +421,9 @@ class RepairCoordinator implements AutoCloseable {
         repairs.sort(java.util.Comparator.comparingInt(Repair::liveReplicas));
         for (Repair r : repairs) {
             issueReplicate(r.fileId(), r.file(), r.chunk(), RepairTrigger.RECONCILE);
+        }
+        } finally {
+            reconcileLock.unlock();
         }
     }
 
@@ -490,28 +505,40 @@ class RepairCoordinator implements AutoCloseable {
         if (ownsAll.getAsBoolean()) {
             return;
         }
-        Set<Integer> dead = new HashSet<>();
-        for (MetadataStore.Versioned<Records.NodeRecord> v : store.listNodes()) {
-            if (v.value().state() == Records.NodeState.DEAD) {
-                dead.add(v.value().nodeId());
+        reconcileLock.lock();
+        try {
+            Map<Integer, Records.NodeRecord> nodes = nodesById();
+            Set<Integer> dead = new HashSet<>();
+            for (Records.NodeRecord n : nodes.values()) {
+                if (n.state() == Records.NodeState.DEAD) {
+                    dead.add(n.nodeId());
+                }
             }
-        }
-        for (StrataNamespace ns : store.listNamespaces()) {
-            if (!ownsNamespace.test(ns)) {
-                continue;
-            }
-            for (FileId fileId : store.listFiles(ns)) {
-                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
-                if (opt.isEmpty() || opt.get().value().state() == FileState.DELETING) {
+            for (StrataNamespace ns : store.listNamespaces()) {
+                if (!ownsNamespace.test(ns)) {
                     continue;
                 }
-                Records.FileRecord file = opt.get().value();
-                for (Records.ChunkRecord chunk : file.chunks()) {
-                    if (chunk.state() == ChunkState.SEALED) {
-                        ownerRepairChunk(ns, file, chunk, dead, RepairTrigger.RECONCILE);
+                for (FileId fileId : store.listFiles(ns)) {
+                    Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
+                    if (opt.isEmpty()) {
+                        continue;
+                    }
+                    Records.FileRecord file = opt.get().value();
+                    if (file.state() == FileState.DELETING) {
+                        // the owner reclaims its own deleted files: the leader's heartbeat command channel
+                        // cannot reach a non-leader-owned namespace's chunks, so without this they leak.
+                        ownerDriveDeletion(file, opt.get().version(), nodes);
+                        continue;
+                    }
+                    for (Records.ChunkRecord chunk : file.chunks()) {
+                        if (chunk.state() == ChunkState.SEALED) {
+                            ownerRepairChunk(ns, file, chunk, dead, RepairTrigger.RECONCILE);
+                        }
                     }
                 }
             }
+        } finally {
+            reconcileLock.unlock();
         }
     }
 
@@ -546,6 +573,7 @@ class RepairCoordinator implements AutoCloseable {
         try {
             targets = Placement.choose(ns, registry, 1, new HashSet<>(chunk.replicas()), usedHosts);
         } catch (Exception e) {
+            log.warn("no repair target for {} (owner repair): {}", chunkId, e.getMessage());
             return; // no placement capacity right now; a later pass retries
         }
         NodeRegistry.LiveNode target = targets.get(0);
@@ -556,8 +584,8 @@ class RepairCoordinator implements AutoCloseable {
             long cmdId = commandIds.incrementAndGet();
             Messages.ReplicateCmd cmd = new Messages.ReplicateCmd(cmdId, chunkId, sources,
                     (byte) 1, chunk.crc(), chunk.length());
-            if (execReplicate(target, cmd)) {
-                applyOwnerRepair(file.fileId(), chunkId, deadNode, target.record.nodeId());
+            if (execReplicate(target, cmd)
+                    && applyOwnerRepair(file.fileId(), chunkId, deadNode, target.record.nodeId())) {
                 recordRepairIssued(trigger);
                 log.info("owner repair: {} dead={} -> target={} (cmd {})", chunkId, deadNode,
                         target.record.nodeId(), cmdId);
@@ -569,35 +597,72 @@ class RepairCoordinator implements AutoCloseable {
         }
     }
 
-    /** Synchronously tells {@code target} to pull the chunk (EXEC_REPLICATE); true if it acked OK. */
-    private boolean execReplicate(NodeRegistry.LiveNode target, Messages.ReplicateCmd cmd) {
+    @FunctionalInterface
+    private interface NodeCall {
+        boolean run(ScpClient client, int timeoutMs) throws Exception;
+    }
+
+    /**
+     * Shared owner-direct transport: opens a one-shot tool connection to {@code node} and runs {@code call},
+     * returning its result. Logs and returns false on a bad endpoint or any RPC failure. Both owner lanes —
+     * repair ({@link #execReplicate}) and delete ({@link #execDelete}) — route through here so endpoint
+     * parsing, timeout, connection lifecycle, and failure logging stay in one place.
+     */
+    private boolean directNodeCall(Records.NodeRecord node, ChunkId chunkId, String label, NodeCall call) {
         Endpoint endpoint;
         try {
-            endpoint = Endpoint.parse(target.record.endpoint(), "node endpoint", ErrorCode.INTERNAL);
+            endpoint = Endpoint.parse(node.endpoint(), "node endpoint", ErrorCode.INTERNAL);
         } catch (Exception e) {
+            log.warn("{}: bad endpoint '{}' for node {} (chunk {}): {}",
+                    label, node.endpoint(), node.nodeId(), chunkId, e.getMessage());
             return false;
         }
-        BufWriter w = new BufWriter();
-        Messages.Command.write(w, cmd);
         int timeoutMs = Math.max(30_000, config.repairCommandTimeoutMs());
-        try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(),
-                ScpClient.KIND_TOOL, "owner-repair")) {
-            client.call(Opcode.EXEC_REPLICATE, w.toBytes(), null, timeoutMs);
-            return true;
+        try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(), ScpClient.KIND_TOOL, label)) {
+            return call.run(client, timeoutMs);
         } catch (Exception e) {
-            log.warn("EXEC_REPLICATE to node {} for {} failed: {}", target.record.nodeId(),
-                    cmd.chunkId(), e.getMessage());
+            log.warn("{} to node {} for {} failed: {}", label, node.nodeId(), chunkId, e.getMessage());
             return false;
         }
     }
 
-    /** Writes the owner-repair replica change: swap the dead replica for the target, or add the target. */
-    private void applyOwnerRepair(FileId fileId, ChunkId chunkId, int deadNode, int targetNode)
+    /** Synchronously tells {@code target} to pull the chunk (EXEC_REPLICATE); true if it acked OK. */
+    private boolean execReplicate(NodeRegistry.LiveNode target, Messages.ReplicateCmd cmd) {
+        BufWriter w = new BufWriter();
+        Messages.Command.write(w, cmd);
+        return directNodeCall(target.record, cmd.chunkId(), "owner-repair", (client, timeoutMs) -> {
+            client.call(Opcode.EXEC_REPLICATE, w.toBytes(), null, timeoutMs);
+            return true;
+        });
+    }
+
+    /**
+     * Synchronously tells {@code node} to physically delete {@code chunkId} via a direct DELETE_CHUNKS
+     * call — the owner-direct deletion transport, mirroring {@link #execReplicate} for repair. A sharded
+     * non-controller owner has no heartbeat command channel, so it deletes its own namespaces' chunks
+     * this way. True if the node acked the chunk gone (deleted, or already absent).
+     */
+    private boolean execDelete(Records.NodeRecord node, ChunkId chunkId) {
+        return directNodeCall(node, chunkId, "owner-delete", (client, timeoutMs) -> {
+            ByteBuffer resp = client.call(Opcode.DELETE_CHUNKS,
+                    new Messages.DeleteChunks(List.of(chunkId)).encode(), null, timeoutMs);
+            Messages.DeleteChunksResp r = Messages.DeleteChunksResp.decode(resp);
+            short code = r.codes().isEmpty() ? ErrorCode.OK.code : r.codes().get(0);
+            return code == ErrorCode.OK.code || code == ErrorCode.CHUNK_NOT_FOUND.code;
+        });
+    }
+
+    /**
+     * Writes the owner-repair replica change: swap the dead replica for the target, or add the target.
+     * Returns true if the descriptor swap landed; false if the file vanished or every CAS attempt lost
+     * (so the caller does not log success or bump the repair metric for a swap that never committed).
+     */
+    private boolean applyOwnerRepair(FileId fileId, ChunkId chunkId, int deadNode, int targetNode)
             throws Exception {
         for (int attempt = 0; attempt < Controller.CAS_RETRIES; attempt++) {
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
             if (opt.isEmpty()) {
-                return;
+                return false;
             }
             Records.FileRecord file = opt.get().value();
             List<Records.ChunkRecord> chunks = new ArrayList<>();
@@ -615,9 +680,11 @@ class RepairCoordinator implements AutoCloseable {
                 }
             }
             if (store.updateFile(file.withChunks(chunks), opt.get().version())) {
-                return;
+                return true;
             }
         }
+        log.warn("owner repair descriptor swap for {} kept failing CAS — next scan reconciles", chunkId);
+        return false;
     }
 
     /**
@@ -625,14 +692,25 @@ class RepairCoordinator implements AutoCloseable {
      * background scan (which is slow under heavy churn), so physical space is reclaimed promptly and the
      * disk stays bounded under sustained delete load. Synchronized with the scan so they don't race.
      */
-    synchronized void driveDeletionNow(FileId fileId) {
+    void driveDeletionNow(FileId fileId) {
+        reconcileLock.lock();
         try {
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(fileId);
-            if (opt.isPresent() && opt.get().value().state() == FileState.DELETING) {
-                driveDeletion(opt.get().value(), opt.get().version());
+            if (opt.isEmpty() || opt.get().value().state() != FileState.DELETING) {
+                return;
+            }
+            MetadataStore.Versioned<Records.FileRecord> vf = opt.get();
+            if (isLeader.getAsBoolean()) {
+                driveDeletion(vf.value(), vf.version());
+            } else {
+                // a sharded non-leader owner has no heartbeat command channel to the data nodes,
+                // so it reclaims its own namespace's chunks directly via DELETE_CHUNKS.
+                ownerDriveDeletion(vf.value(), vf.version(), nodesById());
             }
         } catch (Exception e) {
             log.warn("prompt delete dispatch for {} failed — background scan will retry", fileId, e);
+        } finally {
+            reconcileLock.unlock();
         }
     }
 
@@ -680,6 +758,47 @@ class RepairCoordinator implements AutoCloseable {
                 log.info("file {} fully deleted", file.fileId());
             }
         }
+    }
+
+    /**
+     * Owner-direct physical deletion of a DELETING file's chunks: a sharded non-controller owner deletes
+     * each replica via a direct DELETE_CHUNKS ({@link #execDelete}) — not the leader-only heartbeat command
+     * channel — then converges the descriptor with {@link #applyDeleteConfirmed}. Synchronous, mirroring
+     * {@link #driveDeletion}, just as {@code ownerRepairChunk} mirrors the leader's {@code issueReplicate}.
+     * Without this, deleted files in non-leader-owned namespaces never have their physical chunks reclaimed.
+     */
+    private void ownerDriveDeletion(Records.FileRecord file, int version,
+                                    Map<Integer, Records.NodeRecord> nodes) throws Exception {
+        for (Records.ChunkRecord chunk : file.chunks()) {
+            ChunkId chunkId = file.chunkId(chunk.index());
+            if (chunk.replicas().isEmpty()) {
+                applyDeleteConfirmed(file.fileId(), chunkId, -1);
+                continue;
+            }
+            for (int nodeId : chunk.replicas()) {
+                Records.NodeRecord node = nodes.get(nodeId);
+                if (node == null || node.state() == Records.NodeState.DEAD) {
+                    // node gone/dead — its data is unreachable; drop the replica so deletion can converge
+                    applyDeleteConfirmed(file.fileId(), chunkId, nodeId);
+                } else if (execDelete(node, chunkId)) {
+                    applyDeleteConfirmed(file.fileId(), chunkId, nodeId);
+                }
+                // else: still present — a later ownerRepairPass retries
+            }
+        }
+        // a chunkless DELETING file has no replica to confirm; delete the record directly (version still
+        // valid since no chunk was mutated in this pass), matching driveDeletion.
+        if (file.chunks().isEmpty() && store.deleteFile(file.fileId(), version)) {
+            log.info("file {} fully deleted (owner)", file.fileId());
+        }
+    }
+
+    private Map<Integer, Records.NodeRecord> nodesById() throws Exception {
+        Map<Integer, Records.NodeRecord> nodes = new HashMap<>();
+        for (MetadataStore.Versioned<Records.NodeRecord> v : store.listNodes()) {
+            nodes.put(v.value().nodeId(), v.value());
+        }
+        return nodes;
     }
 
     /**

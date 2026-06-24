@@ -188,9 +188,6 @@ abstract class MetadataStoreConformanceTest {
         try (Backend backend = startBackend();
              MetadataStore leaderA = backend.openStore();
              MetadataStore leaderB = backend.openStore()) {
-            assertEquals(1, leaderA.nextNodeId());
-            assertEquals(2, leaderA.nextNodeId());
-
             Records.NodeRecord node = new Records.NodeRecord(7, 101, 202,
                     List.of("host-a:9000", "host-a:9001"), "z1", "r1", "host-a",
                     1L << 40, Records.NodeState.REGISTERED);
@@ -243,7 +240,6 @@ abstract class MetadataStoreConformanceTest {
             int fileVersion;
             int nodeVersion;
             try (MetadataStore writer = backend.openStore()) {
-                assertEquals(1, writer.nextNodeId());
                 writer.createFile(file);
                 fileVersion = writer.getFile(fileId).orElseThrow().version();
                 assertTrue(writer.putNode(node, -1));
@@ -263,8 +259,6 @@ abstract class MetadataStoreConformanceTest {
                 assertEquals(node, reopenedNode.value());
                 assertEquals(nodeVersion, reopenedNode.version());
                 assertEquals(Set.of(node), nodes(reopened));
-                assertEquals(2, reopened.nextNodeId(),
-                        "node id allocation must not rewind after a store handle is reopened");
 
                 assertTrue(reopened.updateFile(file.withWriterEpoch(2), fileVersion));
             }

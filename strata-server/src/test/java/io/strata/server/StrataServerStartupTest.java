@@ -32,6 +32,7 @@ class StrataServerStartupTest {
             builder.redirectErrorStream(true);
             builder.redirectOutput(output.toFile());
             builder.environment().put("STRATA_DATA_DIR", dir.resolve("node-data").toString());
+            builder.environment().put("STRATA_NODE_ID", "1");
             builder.environment().put("STRATA_LISTEN_PORT", Integer.toString(nodePort));
             builder.environment().put("STRATA_CONTROLLER_ENDPOINTS", "127.0.0.1:1");
             builder.environment().put("STRATA_METRICS_PORT", Integer.toString(metricsBlocker.getLocalPort()));

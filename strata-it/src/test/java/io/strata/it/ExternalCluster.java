@@ -124,6 +124,9 @@ final class ExternalCluster implements AutoCloseable {
         command.add(dataDir.toString());
         command.add(String.join(",", controllerEndpoints));
         command.add(host);
+        // Externally-supplied node id: derive a stable positive id from the host so restartDataNode
+        // (which reuses old.host()/old.dataDir()) gets the same id bound to the volume identity.
+        command.add(Integer.toString(DataNodeProcessMain.nodeIdForHost(host)));
         command.add(readyFile.toString());
         if (advertisedEndpoint != null) {
             command.add(Integer.toString(listenPort));

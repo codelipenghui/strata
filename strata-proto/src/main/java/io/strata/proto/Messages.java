@@ -401,7 +401,7 @@ public final class Messages {
 
     public record StorageCapacity(long capacityBytes) {}
 
-    public record RegisterNode(long incMsb, long incLsb, List<String> endpoints,
+    public record RegisterNode(int nodeId, long incMsb, long incLsb, List<String> endpoints,
                                String zone, String rack, String host,
                                List<StorageCapacity> capacities, int onDiskFormatMax, long featureBits) {
         public RegisterNode {
@@ -411,7 +411,7 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.u64(incMsb).u64(incLsb);
+            w.u32(nodeId).u64(incMsb).u64(incLsb);
             w.varint(endpoints.size());
             for (String e : endpoints) w.string(e);
             w.string(zone).string(rack).string(host);
@@ -422,6 +422,7 @@ public final class Messages {
         }
 
         public static RegisterNode decode(ByteBuffer b) {
+            int nodeId = b.getInt();
             long msb = b.getLong(), lsb = b.getLong();
             int ne = count(b);
             List<String> eps = new ArrayList<>(ne);
@@ -433,7 +434,7 @@ public final class Messages {
             int fmt = b.getInt();
             long features = b.getLong();
             TaggedFields.readFrom(b);
-            return new RegisterNode(msb, lsb, eps, zone, rack, host, caps, fmt, features);
+            return new RegisterNode(nodeId, msb, lsb, eps, zone, rack, host, caps, fmt, features);
         }
     }
 
@@ -711,6 +712,7 @@ public final class Messages {
         public static final int TAG_EXCLUDED_NODE_IDS = 0;
 
         public CreateChunk {
+            namespace = Objects.requireNonNull(namespace, "namespace");
             excludedNodeIds = List.copyOf(excludedNodeIds);
         }
 
@@ -790,6 +792,7 @@ public final class Messages {
         public static final byte FOR_RECOVERY = 2;
 
         public AllocateWriterEpoch {
+            namespace = Objects.requireNonNull(namespace, "namespace");
             fileId = Objects.requireNonNull(fileId, "fileId");
             if (purpose != FOR_APPEND && purpose != FOR_RECOVERY) {
                 throw new IllegalArgumentException("unknown writer epoch purpose " + (purpose & 0xFF));
@@ -841,6 +844,7 @@ public final class Messages {
     public record SealChunkMeta(StrataNamespace namespace, ChunkId chunkId, int writeEpoch, long length, int crc,
                                 List<Integer> sealedReplicas) {
         public SealChunkMeta {
+            namespace = Objects.requireNonNull(namespace, "namespace");
             sealedReplicas = List.copyOf(sealedReplicas);
         }
 
@@ -868,6 +872,10 @@ public final class Messages {
     }
 
     public record AbortChunkMeta(StrataNamespace namespace, ChunkId chunkId, int writeEpoch, long opIdMsb, long opIdLsb) {
+        public AbortChunkMeta {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.string(namespace.toString()).chunkId(chunkId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb).noTags();
@@ -883,6 +891,10 @@ public final class Messages {
     }
 
     public record LookupFile(StrataNamespace namespace, FileId fileId) {
+        public LookupFile {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.string(namespace.toString()).fileId(fileId).noTags();
@@ -993,6 +1005,7 @@ public final class Messages {
 
     public record DeleteFiles(StrataNamespace namespace, List<FileId> fileIds) {
         public DeleteFiles {
+            namespace = Objects.requireNonNull(namespace, "namespace");
             fileIds = List.copyOf(fileIds);
         }
 
@@ -1049,6 +1062,10 @@ public final class Messages {
     }
 
     public record SealFile(StrataNamespace namespace, FileId fileId, long totalLength) {
+        public SealFile {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.string(namespace.toString()).fileId(fileId).u64(totalLength).noTags();

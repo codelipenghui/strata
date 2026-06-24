@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class NamespaceOwnershipTest {
@@ -29,6 +30,13 @@ class NamespaceOwnershipTest {
         assertTrue(own.ownsAll());
         assertTrue(own.isOwner(StrataNamespace.of("tenant-a")));
         assertEquals("m1:9301", own.ownerOf(StrataNamespace.of("tenant-a")));
+    }
+
+    @Test
+    void singleEndpointMembershipMustNameThisNode() {
+        // a lone endpoint that is NOT this node would silently route everything here (ownsAll) — reject it
+        assertThrows(IllegalArgumentException.class,
+                () -> new NamespaceOwnership("m1:9301", List.of("m2:9301"), 0, 3));
     }
 
     @Test

@@ -85,38 +85,53 @@ class DataNodeWireTest {
     }
 
     @Test
-    void nodeIdentityAndAdvertisedEndpointAreVolumeBound() throws Exception {
+    void standaloneNodeIdentityAndAdvertisedEndpointAreVolumeBound() throws Exception {
         DataNodeConfig config = DataNodeConfig.standalone(dir).withAdvertisedEndpoint("published-node:19000");
         UUID incarnation;
         try (DataNode node = new DataNode(config)) {
             assertEquals("published-node:19000", node.endpoint());
-            assertEquals(-1, node.nodeId());
+            assertEquals(-1, node.nodeId(), "standalone volume has no externally-supplied id");
             assertFalse(node.isDraining());
             assertEquals(config, node.config());
             assertNotNull(node.store());
-
-            node.nodeIdAssigned(-1);
-            node.nodeIdAssigned(42);
-            assertEquals(42, node.nodeId());
             incarnation = node.incarnation();
         }
 
+        // the standalone identity (id -1, incarnation) is volume-bound and survives a reopen
         try (DataNode reopened = new DataNode(DataNodeConfig.standalone(dir))) {
-            assertEquals(42, reopened.nodeId());
+            assertEquals(-1, reopened.nodeId());
             assertEquals(incarnation, reopened.incarnation());
         }
     }
 
     @Test
-    void nodeIdAssignmentDoesNotPublishBeforeIdentityPersistenceSucceeds() throws Exception {
-        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            Files.createDirectory(dir.resolve("identity.properties.tmp"));
-
-            IOException e = assertThrows(IOException.class, () -> node.nodeIdAssigned(42));
-
-            assertTrue(e.getMessage().contains("identity.properties.tmp"));
-            assertEquals(-1, node.nodeId(), "node id must not change until the volume identity is durable");
+    void configuredNodeIdIsPersistedAndVolumeBound() throws Exception {
+        // A fresh volume started with STRATA_NODE_ID=42 persists (42, incarnation)...
+        UUID incarnation;
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir).withNodeId(42))) {
+            assertEquals(42, node.nodeId());
+            incarnation = node.incarnation();
         }
+
+        // ...and reopening with the same id resolves to the same id AND the same incarnation.
+        try (DataNode reopened = new DataNode(DataNodeConfig.standalone(dir).withNodeId(42))) {
+            assertEquals(42, reopened.nodeId());
+            assertEquals(incarnation, reopened.incarnation(),
+                    "incarnation is minted once and stays volume-bound across restarts");
+        }
+    }
+
+    @Test
+    void reopeningVolumeWithDifferentConfiguredNodeIdRefusesToStart() throws Exception {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir).withNodeId(42))) {
+            assertEquals(42, node.nodeId());
+        }
+
+        // A configured id that disagrees with the volume's recorded id would let this process
+        // impersonate another node — the constructor must refuse to start.
+        IOException e = assertThrows(IOException.class,
+                () -> new DataNode(DataNodeConfig.standalone(dir).withNodeId(43)));
+        assertTrue(e.getMessage().contains("does not match this volume's recorded node id"));
     }
 
     @Test

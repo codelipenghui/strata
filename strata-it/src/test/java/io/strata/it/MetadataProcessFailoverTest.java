@@ -53,7 +53,7 @@ class MetadataProcessFailoverTest {
             String firstLeader = awaitLeader(controllerEndpoints);
             for (int i = 0; i < 3; i++) {
                 nodes.add(new DataNode(DataNodeConfig.withMetadata(root.resolve("host-" + i),
-                        controllerEndpoints, "host-" + i)));
+                        controllerEndpoints, "host-" + i).withNodeId(i + 1)));
             }
             awaitRegistered(zk.getConnectString(), 3);
 
@@ -506,6 +506,9 @@ class MetadataProcessFailoverTest {
                 dataDir.toString(),
                 String.join(",", controllerEndpoints),
                 host,
+                // Externally-supplied node id, stable per host: a failover restart reuses the same
+                // host/dataDir and so reuses the same id (bound to the volume identity).
+                Integer.toString(DataNodeProcessMain.nodeIdForHost(host)),
                 readyFile.toString());
         builder.redirectErrorStream(true);
         builder.redirectOutput(logFile.toFile());

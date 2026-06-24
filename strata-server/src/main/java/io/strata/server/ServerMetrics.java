@@ -62,7 +62,7 @@ final class ServerMetrics {
 
         // Per-subtree metadata-store request load: rate(strata_controller_store_ops_total) = requests/s and
         // rate(strata_controller_store_bytes_total) = throughput, tagged by `backend` (e.g. zk), the /strata
-        // child the op touched (files/namespaces/nodes/ids), and op=read|write. Backend-neutral name +
+        // child the op touched (files/namespaces/nodes), and op=read|write. Backend-neutral name +
         // label so a future non-ZK metadata store surfaces on the same Cluster/Node dashboard panels.
         String backend = s.metadataBackend();
         for (String subtree : ZkMetadataStore.SUBTREES) {

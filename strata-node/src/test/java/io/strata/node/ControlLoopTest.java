@@ -296,7 +296,9 @@ class ControlLoopTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
-             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
+             // nodeId is now externally supplied (STRATA_NODE_ID): the node registers under its own
+             // volume-bound id 7, and the controller's RegisterResp just echoes it back.
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir).withNodeId(7))) {
             ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
 
             invoke(loop, "ensureRegistered");
@@ -862,7 +864,7 @@ class ControlLoopTest {
     private static DataNodeConfig config(List<String> controllerEndpoints, int inventoryIntervalMs) {
         ConnectionPolicy testPolicy = new ConnectionPolicy(1_000, 1_000, 100, 1_000, 1, 1);
         return new DataNodeConfig(Path.of("."), 0, "127.0.0.1", null, controllerEndpoints,
-                "z", "r", "h", 1L << 20, inventoryIntervalMs, testPolicy);
+                "z", "r", "h", 1L << 20, inventoryIntervalMs, testPolicy, -1);
     }
 
     private static DataNodeConfig configWithoutMetadata() {

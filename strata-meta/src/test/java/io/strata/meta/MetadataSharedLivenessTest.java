@@ -135,7 +135,10 @@ class MetadataSharedLivenessTest {
 
     /** A data node that registers and heartbeats but executes nothing. */
     private static final class FakeDataNode {
+        private static final java.util.concurrent.atomic.AtomicInteger ID_SEQ =
+                new java.util.concurrent.atomic.AtomicInteger(1);
         private final UUID inc = UUID.randomUUID();
+        private final int assignedNodeId = ID_SEQ.getAndIncrement();
         private final String host;
         private final ScpClient client;
         private int nodeId = -1;
@@ -148,7 +151,8 @@ class MetadataSharedLivenessTest {
 
         void register() {
             var resp = Messages.RegisterResp.decode(client.call(Opcode.REGISTER_NODE,
-                    new Messages.RegisterNode(inc.getMostSignificantBits(), inc.getLeastSignificantBits(),
+                    new Messages.RegisterNode(assignedNodeId, inc.getMostSignificantBits(),
+                            inc.getLeastSignificantBits(),
                             List.of(host + ":9000"), "z1", "r1", host,
                             List.of(new Messages.StorageCapacity(1L << 40)), 1, 0).encode(),
                     null, 5_000));

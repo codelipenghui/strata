@@ -81,13 +81,11 @@ class ZkMetadataStoreCasTest {
             curator.start();
             try {
                 try (ZkMetadataStore store = new ZkMetadataStore(curator)) {
-                    assertEquals(1, store.nextNodeId());
                 }
 
                 assertTrue(curator.getZookeeperClient().isConnected(), "store.close must not close external curator");
                 try (ZkMetadataStore second = new ZkMetadataStore(curator)) {
                     assertEquals(List.of(), second.listNamespaces());
-                    assertEquals(2, second.nextNodeId());
                 }
             } finally {
                 curator.close();

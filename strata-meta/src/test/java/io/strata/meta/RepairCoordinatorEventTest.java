@@ -188,7 +188,7 @@ class RepairCoordinatorEventTest {
     private static Registered register(NodeRegistry registry, long incMsb, String host) throws Exception {
         long incLsb = incMsb + 1;
         Messages.RegisterResp resp = registry.register(new Messages.RegisterNode(
-                incMsb, incLsb, List.of(host + ":9000"), "zone", "rack", host,
+                (int) incMsb, incMsb, incLsb, List.of(host + ":9000"), "zone", "rack", host,
                 List.of(new Messages.StorageCapacity(1_000_000)), 1, 0));
         return new Registered(resp.nodeId(), incMsb, incLsb, resp.sessionEpoch());
     }
@@ -231,7 +231,6 @@ class RepairCoordinatorEventTest {
         private final Map<FileId, Versioned<Records.FileRecord>> files = new LinkedHashMap<>();
         private final Map<Integer, Versioned<Records.NodeRecord>> nodes = new LinkedHashMap<>();
         private volatile byte[] clusterLiveNodes;
-        private int nextNodeId = 1;
 
         @Override
         public void putClusterLiveNodes(byte[] snapshot) {
@@ -302,11 +301,6 @@ class RepairCoordinatorEventTest {
         @Override
         public int sweepDeletedFiles(long olderThanMs) {
             return 0;
-        }
-
-        @Override
-        public int nextNodeId() {
-            return nextNodeId++;
         }
 
         @Override

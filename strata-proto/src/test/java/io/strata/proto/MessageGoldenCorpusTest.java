@@ -253,14 +253,14 @@ class MessageGoldenCorpusTest {
                         "0000020000000000000064000000010000000500000000000000c800000002"
                                 + "0000000500"),
                 request("registerDataNode",
-                        new Messages.RegisterNode(1, 2, List.of("h1:9000", "h2:9000"), "z1",
+                        new Messages.RegisterNode(7, 1, 2, List.of("h1:9000", "h2:9000"), "z1",
                                 "r1", "host1", List.of(new Messages.StorageCapacity(1L << 40)),
                                 1, 0),
-                        () -> new Messages.RegisterNode(1, 2, List.of("h1:9000", "h2:9000"),
+                        () -> new Messages.RegisterNode(7, 1, 2, List.of("h1:9000", "h2:9000"),
                                 "z1", "r1", "host1",
                                 List.of(new Messages.StorageCapacity(1L << 40)), 1, 0).encode(),
                         Messages.RegisterNode::decode,
-                        "00000000000000010000000000000002020768313a393030300768323a39303030"
+                        "0000000700000000000000010000000000000002020768313a393030300768323a39303030"
                                 + "027a3102723105686f73743101000001000000000000000001000000000000000000"),
                 response("registerResp",
                         new Messages.RegisterResp(42, 9, 1000, 10_000),

@@ -23,6 +23,19 @@ public record ControllerConfig(
         int controllerReplicaCount   // metadata replica-set size per namespace (design §6.1)
 ) {
     public ControllerConfig {
+        if (zkConnect == null || zkConnect.isBlank()) {
+            throw new IllegalArgumentException("zkConnect must be non-null/non-blank");
+        }
+        if (heartbeatIntervalMs <= 0) {
+            throw new IllegalArgumentException("heartbeatIntervalMs must be > 0: " + heartbeatIntervalMs);
+        }
+        // A node renews its lease every heartbeatIntervalMs; DEAD only fires at leaseMs + deadGraceMs, so
+        // the heartbeat must be shorter than that window — otherwise nodes expire before they can heartbeat,
+        // causing continuous spurious DEAD markings and repair storms.
+        if (heartbeatIntervalMs >= (long) leaseMs + deadGraceMs) {
+            throw new IllegalArgumentException("heartbeatIntervalMs (" + heartbeatIntervalMs
+                    + ") must be < leaseMs + deadGraceMs (" + ((long) leaseMs + deadGraceMs) + ")");
+        }
         if (advertisedHost == null || advertisedHost.isBlank()) {
             advertisedHost = "127.0.0.1";
         }

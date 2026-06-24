@@ -45,7 +45,7 @@ ZooKeeper/root MetadataStore
   -> namespace assignment records
   -> namespace metadata manifest records
   -> metadata-log system-file descriptors and chunk locations
-  -> node registry and compact node-id allocation state
+  -> node registry (identity records; ids are externally supplied via STRATA_NODE_ID)
 
 Strata metadata-log files
   -> user-file ids, names, lifecycle state, chunk descriptors, tombstones
@@ -124,12 +124,14 @@ The v0 implementation persists file/chunk metadata directly in ZooKeeper through
 /strata/files/<fileId>
 /strata/namespaces/<namespace>/paths/<path>/__file
 /strata/nodes/<nodeId>
-/strata/ids/...
 ```
 
-The `/strata/ids` subtree is the current node-id allocator. It is not the
-target design for user file ids, and the metadata-log design does not add a
-ZooKeeper-generated file-id sequence.
+Node ids are no longer allocated in ZooKeeper: the `/strata/ids` sequential
+allocator has been removed. Each data node supplies its own id via the
+`STRATA_NODE_ID` environment variable (`DataNodeConfig.nodeId()`), validated
+against the volume's `identity.properties` on startup; the controller validates
+uniqueness at registration instead of minting ids. The metadata-log design does
+not add a ZooKeeper-generated file-id sequence either.
 
 This is acceptable for bootstrap, but prototype-scale at the intended target:
 

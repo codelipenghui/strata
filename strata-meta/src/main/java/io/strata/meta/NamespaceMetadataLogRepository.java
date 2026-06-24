@@ -5,6 +5,7 @@ import io.strata.common.FileId;
 import io.strata.common.StrataNamespace;
 
 import java.util.Optional;
+import java.util.OptionalInt;
 
 /**
  * Owns one namespace's metadata log: recovery, durable append, snapshot compaction, and manifest
@@ -150,7 +151,8 @@ final class NamespaceMetadataLogRepository {
         // generation. A crash here must leave the OLD manifest fully recoverable — compaction is atomic
         // at the manifest CAS (design §10) — see the failure-injection test.
         FailureInjector.point("meta.log.beforeManifestPublish");
-        if (!rootStore.putNamespaceManifest(published, expectedVersion)) {
+        OptionalInt newVersion = rootStore.putNamespaceManifest(published, expectedVersion);
+        if (newVersion.isEmpty()) {
             // Best-effort cleanup of the files we just wrote but could not publish.
             deleteQuietly(newSnapshot);
             deleteQuietly(newLog);
@@ -164,9 +166,9 @@ final class NamespaceMetadataLogRepository {
         this.logStartOffset = cut;
         this.appliedOffset = cut;
         this.generation = newGeneration;
-        this.manifestVersion = rootStore.getNamespaceManifest(namespace)
-                .map(MetadataStore.Versioned::version)
-                .orElseThrow(() -> new IllegalStateException("manifest vanished after publish"));
+        // The CAS returns the new znode version directly — no read-back round-trip, and no window where a
+        // transient read failure leaves manifestVersion stale (which would fence the namespace on next CAS).
+        this.manifestVersion = newVersion.getAsInt();
         deleteQuietly(oldSnapshot);
         deleteQuietly(oldLog);
     }

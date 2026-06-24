@@ -527,6 +527,9 @@ class ProcessCrashRecoveryTest {
                 dataDir.toString(),
                 String.join(",", cluster.metaEndpoints()),
                 host,
+                // Externally-supplied node id, stable per host: a crash-recovery restart passes the
+                // same host/dataDir and so reuses the same id (bound to the volume identity).
+                Integer.toString(DataNodeProcessMain.nodeIdForHost(host)),
                 readyFile.toString());
         builder.redirectErrorStream(true);
         builder.redirectOutput(logFile.toFile());

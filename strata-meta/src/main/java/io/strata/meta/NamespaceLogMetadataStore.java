@@ -6,6 +6,7 @@ import io.strata.common.StrataPath;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 
 /**
  * The namespace-log {@link MetadataStore} backend (design §8, §16 Step 3). User file/path metadata is
@@ -92,11 +93,6 @@ public final class NamespaceLogMetadataStore implements MetadataStore {
     /* ---- node registry + sharding root: delegated to the consensus root store ---- */
 
     @Override
-    public int nextNodeId() throws Exception {
-        return backend.root().nextNodeId();
-    }
-
-    @Override
     public boolean putNode(Records.NodeRecord record, int expectedVersion) throws Exception {
         return backend.root().putNode(record, expectedVersion);
     }
@@ -140,7 +136,7 @@ public final class NamespaceLogMetadataStore implements MetadataStore {
     }
 
     @Override
-    public boolean putNamespaceManifest(Records.NamespaceManifest manifest, int expectedVersion)
+    public OptionalInt putNamespaceManifest(Records.NamespaceManifest manifest, int expectedVersion)
             throws Exception {
         return backend.root().putNamespaceManifest(manifest, expectedVersion);
     }

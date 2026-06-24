@@ -83,7 +83,7 @@ class MessageRoundtripTest {
 
     @Test
     void controlPlaneRoundtrips() {
-        var reg = new Messages.RegisterNode(1L, 2L, List.of("h1:9000", "h2:9000"), "z1", "r1", "host1",
+        var reg = new Messages.RegisterNode(7, 1L, 2L, List.of("h1:9000", "h2:9000"), "z1", "r1", "host1",
                 List.of(new Messages.StorageCapacity(1L << 40)), 1, 0);
         assertEquals(reg, Messages.RegisterNode.decode(buf(reg.encode())));
 

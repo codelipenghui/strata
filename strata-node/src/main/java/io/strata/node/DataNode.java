@@ -31,7 +31,7 @@ public final class DataNode implements AutoCloseable {
     private final ControlLoop controlLoop;
     private final AtomicBoolean draining = new AtomicBoolean(false);
 
-    private volatile int nodeId;
+    private final int nodeId;
     private final UUID incarnation;
 
     public DataNode(DataNodeConfig config) throws IOException {
@@ -46,7 +46,7 @@ public final class DataNode implements AutoCloseable {
     public DataNode(DataNodeConfig config, ScpServer.Handler controllerHandler) throws IOException {
         this.config = config;
         Files.createDirectories(config.dataDir());
-        Identity identity = loadIdentity(config.dataDir());
+        Identity identity = loadOrCreateIdentity(config.dataDir(), config.nodeId());
         this.nodeId = identity.nodeId;
         this.incarnation = identity.incarnation;
         ChunkStore openedStore = null;
@@ -194,44 +194,63 @@ public final class DataNode implements AutoCloseable {
         draining.set(v);
     }
 
-    /** Called by the control loop once the metadata plane assigns/confirms our node id. */
-    void nodeIdAssigned(int id) throws IOException {
-        if (this.nodeId != id) {
-            persistIdentity(config.dataDir(), new Identity(id, incarnation));
-            this.nodeId = id;
-            server.setNodeId(id); // HELLO responses must announce the real id, not -1
-        }
-    }
-
     /* ---------------- volume-bound identity ---------------- */
 
     record Identity(int nodeId, UUID incarnation) {}
 
-    private static Identity loadIdentity(Path dataDir) throws IOException {
+    /**
+     * Resolves this node's identity, binding the externally-supplied {@code configuredNodeId}
+     * ({@code STRATA_NODE_ID}, or -1 for standalone/data-plane tests) to the volume:
+     * <ul>
+     *   <li>existing volume: the recorded id must match the configured id, else we refuse to start —
+     *       a misconfigured id would let this process impersonate another node and corrupt placement;
+     *       a previously-standalone volume (recorded -1) adopts the configured id, keeping its incarnation;</li>
+     *   <li>fresh volume: persist {@code (configuredNodeId, new incarnation)}.</li>
+     * </ul>
+     * The incarnation is minted once and stays volume-bound across restarts.
+     */
+    private static Identity loadOrCreateIdentity(Path dataDir, int configuredNodeId) throws IOException {
         Path f = dataDir.resolve("identity.properties");
         if (Files.exists(f)) {
-            Properties p = new Properties();
-            try (var in = Files.newInputStream(f)) {
-                p.load(in);
-            }
-            String nodeIdText = p.getProperty("nodeId");
-            String incarnationText = p.getProperty("incarnation");
-            if (nodeIdText == null || incarnationText == null) {
-                throw new IOException("data node identity is missing nodeId or incarnation: " + f);
-            }
-            try {
-                int nodeId = Integer.parseInt(nodeIdText);
-                if (nodeId < -1) {
-                    throw new IllegalArgumentException("nodeId " + nodeId + " < -1");
+            Identity onVolume = readIdentity(f);
+            if (configuredNodeId >= 1 && onVolume.nodeId() != configuredNodeId) {
+                if (onVolume.nodeId() != -1) {
+                    throw new IOException("configured STRATA_NODE_ID " + configuredNodeId
+                            + " does not match this volume's recorded node id " + onVolume.nodeId()
+                            + " — refusing to start (this data volume belongs to node " + onVolume.nodeId() + ")");
                 }
-                return new Identity(nodeId, UUID.fromString(incarnationText));
-            } catch (IllegalArgumentException e) {
-                throw new IOException("invalid data node identity: " + f, e);
+                // a previously-standalone volume adopts the configured id, keeping its incarnation
+                Identity adopted = new Identity(configuredNodeId, onVolume.incarnation());
+                persistIdentity(dataDir, adopted);
+                return adopted;
             }
+            return onVolume;
         }
-        Identity fresh = new Identity(-1, UUID.randomUUID());
+        // configuredNodeId is already validated to be -1 (standalone) or >= 1 by DataNodeConfig.
+        Identity fresh = new Identity(configuredNodeId, UUID.randomUUID());
         persistIdentity(dataDir, fresh);
         return fresh;
+    }
+
+    private static Identity readIdentity(Path f) throws IOException {
+        Properties p = new Properties();
+        try (var in = Files.newInputStream(f)) {
+            p.load(in);
+        }
+        String nodeIdText = p.getProperty("nodeId");
+        String incarnationText = p.getProperty("incarnation");
+        if (nodeIdText == null || incarnationText == null) {
+            throw new IOException("data node identity is missing nodeId or incarnation: " + f);
+        }
+        try {
+            int nodeId = Integer.parseInt(nodeIdText);
+            if (nodeId < -1) {
+                throw new IllegalArgumentException("nodeId " + nodeId + " < -1");
+            }
+            return new Identity(nodeId, UUID.fromString(incarnationText));
+        } catch (IllegalArgumentException e) {
+            throw new IOException("invalid data node identity: " + f, e);
+        }
     }
 
     private static void persistIdentity(Path dataDir, Identity id) throws IOException {

@@ -28,6 +28,10 @@ final class MiniCluster implements AutoCloseable {
     private final Function<String, ControllerConfig> metaConfigFactory;
     private final int metadataServiceCount;
     private String zkConnect;
+    // Node ids are now externally supplied (the ZK allocator was removed); each registering node
+    // needs a unique id >= 1, stable across restarts on the same dataDir. We hand out ids from a
+    // monotonic counter so two concurrently-live nodes never collide; restartNode reuses the old id.
+    private int nextNodeId = 1;
 
     MiniCluster(int nodeCount) throws Exception {
         this(nodeCount, null, 1);
@@ -123,12 +127,18 @@ final class MiniCluster implements AutoCloseable {
 
     DataNode addNode(String host) throws IOException {
         Path dir = root.resolve(host);
-        DataNode node = new DataNode(DataNodeConfig.withMetadata(dir, metaEndpoints(), host));
+        DataNode node = new DataNode(
+                DataNodeConfig.withMetadata(dir, metaEndpoints(), host).withNodeId(nextNodeId++));
         nodes.add(node);
         return node;
     }
 
     DataNode addNode(DataNodeConfig config) throws IOException {
+        // Callers that build a config via withMetadata(...) leave nodeId == -1; assign a unique
+        // positive id so registration succeeds (a node with a real id never collides with these).
+        if (config.nodeId() < 1) {
+            config = config.withNodeId(nextNodeId++);
+        }
         DataNode node = new DataNode(config);
         nodes.add(node);
         return node;
@@ -146,8 +156,10 @@ final class MiniCluster implements AutoCloseable {
             old.close();
         } catch (IOException ignored) {
         }
+        // A restarted node MUST reuse its id: the dataDir's identity.properties already records it,
+        // so a mismatched id would make the DataNode constructor refuse to start.
         DataNode fresh = new DataNode(DataNodeConfig.withMetadata(cfg.dataDir(),
-                cfg.controllerEndpoints(), cfg.host()));
+                cfg.controllerEndpoints(), cfg.host()).withNodeId(cfg.nodeId()));
         nodes.set(index, fresh);
         return fresh;
     }
