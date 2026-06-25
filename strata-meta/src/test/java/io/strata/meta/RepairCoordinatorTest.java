@@ -867,6 +867,73 @@ class RepairCoordinatorTest {
                 "a deleted file whose only replica is dead is reclaimed without an RPC");
     }
 
+    /**
+     * Regression test for the per-file liveness bug in ownerRepairPass: a poison file (getFile throws)
+     * must not abort the whole pass — the DELETING file that follows it must still be processed.
+     * Pre-fix: the exception propagates out of the loop and the DELETING file is never reached.
+     * Post-fix: the poison file is logged-and-skipped, the DELETING file is driven to DELETED.
+     */
+    @Test
+    void ownerRepairPassContinuesAfterPoisonFileThrows() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        // poison file — listed by the store but getFile throws; placed first in iteration order
+        FileId poisonFile = fileId(9001);
+        store.createFile(file(poisonFile, FileState.SEALED,
+                List.of(sealed(0, 128, 1111, List.of(777)))));
+
+        // DELETING file that must still be processed after the poison file
+        FileId deletingFile = fileId(9002);
+        store.createFile(file(deletingFile, FileState.DELETING, List.of()));
+
+        // mark the node as DEAD in the store (required by ownerRepairPass's nodesById path)
+        // (no live nodes needed: the DELETING file has no chunks so it converges immediately)
+
+        // arm the poison: getFile for poisonFile now throws
+        store.throwOnGetFileId = poisonFile;
+
+        // non-controller owner of the namespace
+        RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                () -> false, () -> false, ns -> true);
+        owner.ownerRepairPass();
+
+        // the DELETING file must have been reclaimed (no chunks → deleteFile was called)
+        assertFalse(store.files.containsKey(deletingFile),
+                "DELETING file must be reclaimed even when a preceding file's getFile throws");
+    }
+
+    /**
+     * Regression test for the per-file liveness bug in scanOnce (leader path): a poison file
+     * must not abort the whole pass — the DELETING file that follows it must still be processed.
+     * Pre-fix: the exception propagates out of the loop and the DELETING file is never reached.
+     * Post-fix: the poison file is logged-and-skipped, the DELETING file is driven to DELETED.
+     */
+    @Test
+    void scanOnceContinuesAfterPoisonFileThrows() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        // poison file — listed by the store but getFile throws; placed first in iteration order
+        FileId poisonFile = fileId(9003);
+        store.createFile(file(poisonFile, FileState.SEALED,
+                List.of(sealed(0, 128, 2222, List.of(888)))));
+
+        // DELETING file (no chunks) that must be driven to DELETED by the same pass
+        FileId deletingFile = fileId(9004);
+        store.createFile(file(deletingFile, FileState.DELETING, List.of()));
+
+        // arm the poison: getFile for poisonFile now throws
+        store.throwOnGetFileId = poisonFile;
+
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
+        coordinator.scanOnce();
+
+        // the DELETING file must have been reclaimed (no chunks → deleteFile was called)
+        assertFalse(store.files.containsKey(deletingFile),
+                "DELETING file must be reclaimed even when a preceding file's getFile throws");
+    }
+
     private static Registered registerAt(NodeRegistry registry, long incMsb, String host, String endpoint)
             throws Exception {
         long incLsb = incMsb + 1;
@@ -988,6 +1055,8 @@ class RepairCoordinatorTest {
         private int failDeleteFileAttempts;
         private boolean throwOnGetFile;
         private boolean throwOnListFiles;
+        /** If non-null, getFile throws for this specific fileId (poison-file injection). */
+        private FileId throwOnGetFileId;
 
         @Override
         public void createFile(Records.FileRecord record) {
@@ -1010,6 +1079,9 @@ class RepairCoordinatorTest {
         public Optional<Versioned<Records.FileRecord>> getFile(io.strata.common.StrataNamespace namespace, FileId id) {
             if (throwOnGetFile) {
                 throw new IllegalStateException("getFile failure");
+            }
+            if (throwOnGetFileId != null && throwOnGetFileId.equals(id)) {
+                throw new IllegalStateException("poison file getFile failure for " + id);
             }
             return Optional.ofNullable(files.get(id));
         }

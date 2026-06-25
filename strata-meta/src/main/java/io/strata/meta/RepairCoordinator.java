@@ -395,6 +395,7 @@ class RepairCoordinator implements AutoCloseable {
         for (NsFileKey entry : allFilesByNamespace()) {
             FileId fileId = entry.fileId();
             StrataNamespace ns = entry.namespace();
+            try {
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
             if (opt.isEmpty()) continue;
             Records.FileRecord file = opt.get().value();
@@ -423,6 +424,13 @@ class RepairCoordinator implements AutoCloseable {
                 } else if (live == 0) {
                     log.error("chunk {} has NO live replicas — data loss exposure, cannot repair", chunkId);
                 }
+            }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw ie;
+            } catch (Exception e) {
+                log.warn("scanOnce: skipping ns={} fileId={} due to error — repair pass continues",
+                        ns, fileId, e);
             }
         }
         underReplicatedChunks = under;
@@ -532,6 +540,7 @@ class RepairCoordinator implements AutoCloseable {
                     continue;
                 }
                 for (FileId fileId : store.listFiles(ns)) {
+                    try {
                     Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
                     if (opt.isEmpty()) {
                         continue;
@@ -547,6 +556,13 @@ class RepairCoordinator implements AutoCloseable {
                         if (chunk.state() == ChunkState.SEALED) {
                             ownerRepairChunk(ns, file, chunk, dead, RepairTrigger.RECONCILE);
                         }
+                    }
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw ie;
+                    } catch (Exception e) {
+                        log.warn("ownerRepairPass: skipping ns={} fileId={} due to error — repair pass continues",
+                                ns, fileId, e);
                     }
                 }
             }
