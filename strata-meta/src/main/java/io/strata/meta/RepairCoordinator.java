@@ -109,6 +109,7 @@ class RepairCoordinator implements AutoCloseable {
     // the chunksBeingRepaired dedup add succeeds — never on a dedup-skip, placement miss, or failure.
     private final AtomicLong eventRepairs = new AtomicLong();
     private final AtomicLong reconcileRepairs = new AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong reconcileSkippedFiles = new java.util.concurrent.atomic.AtomicLong();
     private volatile Thread scanThread;
 
     // A deleted file's record is kept as a DELETED tombstone (fencing a delayed CREATE replay from
@@ -158,6 +159,11 @@ class RepairCoordinator implements AutoCloseable {
     /** Repairs issued by the reconcile backstop lane since start — monotonic. */
     long reconcileRepairs() {
         return reconcileRepairs.get();
+    }
+
+    /** Files skipped due to per-file errors in the reconcile pass — monotonic. */
+    long reconcileSkippedFiles() {
+        return reconcileSkippedFiles.get();
     }
 
     /** Bumps the counter for {@code trigger}'s lane — called once per repair actually issued. */
@@ -459,6 +465,7 @@ class RepairCoordinator implements AutoCloseable {
         } catch (Exception e) {
             log.warn("{}: skipping ns={} fileId={} due to error — repair pass continues",
                     pass, ns, fileId, e);
+            reconcileSkippedFiles.incrementAndGet();
         }
     }
 
@@ -686,6 +693,10 @@ class RepairCoordinator implements AutoCloseable {
                     new Messages.DeleteChunks(List.of(chunkId), ns).encode(), null, timeoutMs);
             Messages.DeleteChunksResp r = Messages.DeleteChunksResp.decode(resp);
             short code = r.codes().isEmpty() ? ErrorCode.OK.code : r.codes().get(0);
+            if (code != ErrorCode.OK.code && code != ErrorCode.CHUNK_NOT_FOUND.code) {
+                log.warn("owner-delete of {} on node {} returned {} — will retry next pass",
+                        chunkId, node.nodeId(), code);
+            }
             return code == ErrorCode.OK.code || code == ErrorCode.CHUNK_NOT_FOUND.code;
         });
     }
@@ -905,6 +916,9 @@ class RepairCoordinator implements AutoCloseable {
             } else if (action instanceof DeleteAction d) {
                 if (completion.status() == 0) {
                     applyDeleteConfirmed(d.namespace(), d.fileId(), d.chunkId(), d.nodeId());
+                } else {
+                    log.warn("delete cmd {} for {} failed with {} — next scan retries",
+                            completion.commandId(), d.chunkId(), completion.status());
                 }
             }
         } catch (Exception e) {
@@ -996,6 +1010,7 @@ class RepairCoordinator implements AutoCloseable {
             }
             if (store.updateFile(updated, opt.get().version())) return;
         }
+        log.warn("delete-confirm descriptor update for {} kept failing CAS — next scan reconciles", chunkId);
     }
 
     /**

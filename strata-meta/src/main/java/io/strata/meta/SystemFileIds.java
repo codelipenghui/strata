@@ -49,6 +49,9 @@ final class SystemFileIds {
      * @param kind       0 for an open-log segment; 1 for a snapshot
      */
     static FileId of(StrataNamespace ns, long generation, int kind) {
+        if (kind != 0 && kind != 1) {
+            throw new IllegalArgumentException("kind must be 0 (log) or 1 (snapshot): " + kind);
+        }
         long h = fnv1a64(ns.value().getBytes(StandardCharsets.UTF_8));
         // Merge generation and kind into the hash seed.
         // Shift generation left by 1 so bit-0 is dedicated to kind → no overlap for adjacent generations.

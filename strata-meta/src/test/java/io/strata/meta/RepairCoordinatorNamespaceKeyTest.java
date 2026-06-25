@@ -47,19 +47,6 @@ class RepairCoordinatorNamespaceKeyTest {
      */
     @Test
     void inventoryDoesNotDropHealthyReplicaWhenTwoNamespacesShareSameChunkId() throws Exception {
-        // Both files live under the same FileId value (simulating per-namespace id reuse).
-        // We use distinct FileId values here to avoid the FakeStore's bare-FileId key collision,
-        // while still triggering the RepairCoordinator's namespace-key bug via the ChunkId path.
-        // The ChunkId collision IS the bug: both chunks produce ChunkId(fileId,0) with the SAME
-        // numeric index but different len/crc, and the reported map uses the chunkId as the key.
-        FileId fileIdA = FileId.of(0);
-        FileId fileIdB = FileId.of(1); // different FileId so the FakeStore can hold both
-        // BUT we wire nsA to fileIdA and nsB to fileIdB so that both map to ChunkId(*.lsb=0, index=0).
-        // The collision happens at the ChunkId.fileId level — ChunkId(FileId(0), 0) vs
-        // ChunkId(FileId(1), 0) are DIFFERENT chunkIds, so this isn't the numeric collision path.
-        //
-        // To trigger the actual numeric collision (same FileId *value* in different namespaces)
-        // we need a FakeStore that supports namespace-qualified keys. Use NsFakeStore below.
         NsFakeStore store = new NsFakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
 
@@ -155,10 +142,10 @@ class RepairCoordinatorNamespaceKeyTest {
         coordinator.scanOnce();
 
         // Both under-replicated chunks should have triggered repair commands — backlog should be 2
-        // (one per namespace). Without the fix, allFilesByNamespace collapses FileId(0) to a single
-        // entry and only one repair is issued.
+        // (one per namespace). Without the fix, the bare-ChunkId-keyed chunksBeingRepaired set let
+        // the first namespace's repair suppress the second's, so only one repair was issued.
         assertEquals(2, coordinator.repairBacklog(),
-                "both namespaces' FileId(0) should be under repair — fix collapses only one");
+                "both namespaces' FileId(0) should be under repair — without the fix, only one would be detected");
     }
 
     // ---- helpers ----

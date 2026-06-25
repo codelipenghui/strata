@@ -347,6 +347,11 @@ public final class Controller implements AutoCloseable {
         return repair.reconcileRepairs();
     }
 
+    /** Files skipped due to per-file errors in the reconcile pass since start — monotonic. */
+    public long reconcileSkippedFiles() {
+        return repair.reconcileSkippedFiles();
+    }
+
     public int aliveNodes() {
         return registry.livenessCounts().alive();
     }
