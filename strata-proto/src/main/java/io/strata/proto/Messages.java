@@ -138,7 +138,8 @@ public final class Messages {
         }
 
         public byte[] encode() {
-            BufWriter w = new BufWriter();
+            int len = namespace.value().length(); // ASCII namespace: UTF-8 length == char length
+            BufWriter w = new BufWriter(33 + (len < 128 ? 1 : 2) + len);
             w.chunkId(chunkId).i32(writeEpoch).u64(baseOffset).u64(durableOffset)
                     .string(namespace.toString()).noTags();
             return w.toBytes();

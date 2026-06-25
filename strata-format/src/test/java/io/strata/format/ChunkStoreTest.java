@@ -5,6 +5,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;

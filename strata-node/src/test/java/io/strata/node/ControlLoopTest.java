@@ -459,10 +459,9 @@ class ControlLoopTest {
             LinkedBlockingQueue<Messages.Command> commands = get(loop, "commandQueue");
             ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
             ChunkId id = new ChunkId(FileId.of(3), 0);
-            // Simulate a chunk mid-creation: add to the package-private NsChunkId set via reflection.
-            // NsChunkId is package-private in io.strata.format so we construct it reflectively.
+            // Simulate a chunk mid-creation: add to the NsChunkId set via reflection.
             Set<Object> creating = getField(node.store(), "creating");
-            Class<?> nsChunkIdClass = Class.forName("io.strata.format.NsChunkId");
+            Class<?> nsChunkIdClass = Class.forName("io.strata.common.NsChunkId");
             java.lang.reflect.Constructor<?> ctor =
                     nsChunkIdClass.getDeclaredConstructor(StrataNamespace.class, ChunkId.class);
             ctor.setAccessible(true);

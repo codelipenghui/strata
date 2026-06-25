@@ -1,11 +1,12 @@
 package io.strata.meta;
 
-import io.strata.common.Endpoint;
-import io.strata.common.ErrorCode;
-import io.strata.common.FileState;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
+import io.strata.common.Endpoint;
+import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.FileState;
+import io.strata.common.NsChunkId;
 import io.strata.common.StrataNamespace;
 import io.strata.proto.BufWriter;
 import io.strata.proto.Messages;
@@ -163,10 +164,6 @@ class RepairCoordinator implements AutoCloseable {
     private void recordRepairIssued(RepairTrigger trigger) {
         (trigger == RepairTrigger.EVENT ? eventRepairs : reconcileRepairs).incrementAndGet();
     }
-
-    // Namespace-qualified chunk id — prevents cross-namespace collisions when the same numeric
-    // ChunkId (e.g. FileId(0)/index 0) exists in multiple namespaces (design §Task-9 final review).
-    private record NsChunkId(StrataNamespace namespace, ChunkId chunkId) {}
 
     private record ReplicaKey(StrataNamespace namespace, ChunkId chunkId, int nodeId) {}
 
@@ -390,52 +387,47 @@ class RepairCoordinator implements AutoCloseable {
         record Repair(StrataNamespace ns, FileId fileId, Records.FileRecord file,
                       Records.ChunkRecord chunk, int liveReplicas) {}
         List<Repair> repairs = new ArrayList<>();
-        int under = 0, unavailable = 0, atMin = 0; // durability census, published to gauges at the end
+        // durability census, published to gauges at the end; int[] lets lambdas increment them
+        int[] under = {0}, unavailable = {0}, atMin = {0};
 
         for (NsFileKey entry : allFilesByNamespace()) {
             FileId fileId = entry.fileId();
             StrataNamespace ns = entry.namespace();
-            try {
-            Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
-            if (opt.isEmpty()) continue;
-            Records.FileRecord file = opt.get().value();
+            perFileIsolated(ns, fileId, "scanOnce", () -> {
+                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
+                if (opt.isEmpty()) return;
+                Records.FileRecord file = opt.get().value();
 
-            if (file.state() == FileState.DELETING) {
-                driveDeletion(file, opt.get().version());
-                continue;
-            }
-            for (Records.ChunkRecord chunk : file.chunks()) {
-                if (chunk.state() != ChunkState.SEALED) continue; // open chunks belong to their writer
-                ChunkId chunkId = file.chunkId(chunk.index());
-                int live = 0;
-                for (int nodeId : chunk.replicas()) {
-                    if (!registry.isDead(nodeId)) live++;
+                if (file.state() == FileState.DELETING) {
+                    driveDeletion(file, opt.get().version());
+                    return;
                 }
-                // durability census — counted for every sealed chunk regardless of in-flight repair
-                if (live == 0) {
-                    unavailable++;
-                } else if (live < file.replicationFactor()) {
-                    under++;
-                    if (live == 1) atMin++;
+                for (Records.ChunkRecord chunk : file.chunks()) {
+                    if (chunk.state() != ChunkState.SEALED) continue; // open chunks belong to their writer
+                    ChunkId chunkId = file.chunkId(chunk.index());
+                    int live = 0;
+                    for (int nodeId : chunk.replicas()) {
+                        if (!registry.isDead(nodeId)) live++;
+                    }
+                    // durability census — counted for every sealed chunk regardless of in-flight repair
+                    if (live == 0) {
+                        unavailable[0]++;
+                    } else if (live < file.replicationFactor()) {
+                        under[0]++;
+                        if (live == 1) atMin[0]++;
+                    }
+                    if (chunksBeingRepaired.contains(new NsChunkId(ns, chunkId))) continue;
+                    if (live < file.replicationFactor() && live > 0) {
+                        repairs.add(new Repair(ns, fileId, file, chunk, live));
+                    } else if (live == 0) {
+                        log.error("chunk {} has NO live replicas — data loss exposure, cannot repair", chunkId);
+                    }
                 }
-                if (chunksBeingRepaired.contains(new NsChunkId(ns, chunkId))) continue;
-                if (live < file.replicationFactor() && live > 0) {
-                    repairs.add(new Repair(ns, fileId, file, chunk, live));
-                } else if (live == 0) {
-                    log.error("chunk {} has NO live replicas — data loss exposure, cannot repair", chunkId);
-                }
-            }
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                throw ie;
-            } catch (Exception e) {
-                log.warn("scanOnce: skipping ns={} fileId={} due to error — repair pass continues",
-                        ns, fileId, e);
-            }
+            });
         }
-        underReplicatedChunks = under;
-        unavailableChunks = unavailable;
-        chunksAtMinRedundancy = atMin;
+        underReplicatedChunks = under[0];
+        unavailableChunks = unavailable[0];
+        chunksAtMinRedundancy = atMin[0];
 
         // exposure priority: fewest live replicas first (tech design §7.2)
         repairs.sort(java.util.Comparator.comparingInt(Repair::liveReplicas));
@@ -444,6 +436,29 @@ class RepairCoordinator implements AutoCloseable {
         }
         } finally {
             reconcileLock.unlock();
+        }
+    }
+
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
+    }
+
+    /**
+     * Runs {@code body} for a single (ns, fileId) pair, isolating per-file failures: an
+     * {@link InterruptedException} is re-thrown so that close()/shutdown() can interrupt the outer
+     * loop; any other exception is logged as a warning and swallowed so the pass continues.
+     */
+    private void perFileIsolated(StrataNamespace ns, FileId fileId, String pass,
+                                 ThrowingRunnable body) throws InterruptedException {
+        try {
+            body.run();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw ie;
+        } catch (Exception e) {
+            log.warn("{}: skipping ns={} fileId={} due to error — repair pass continues",
+                    pass, ns, fileId, e);
         }
     }
 
@@ -540,30 +555,24 @@ class RepairCoordinator implements AutoCloseable {
                     continue;
                 }
                 for (FileId fileId : store.listFiles(ns)) {
-                    try {
-                    Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
-                    if (opt.isEmpty()) {
-                        continue;
-                    }
-                    Records.FileRecord file = opt.get().value();
-                    if (file.state() == FileState.DELETING) {
-                        // the owner reclaims its own deleted files: the leader's heartbeat command channel
-                        // cannot reach a non-leader-owned namespace's chunks, so without this they leak.
-                        ownerDriveDeletion(file, opt.get().version(), nodes);
-                        continue;
-                    }
-                    for (Records.ChunkRecord chunk : file.chunks()) {
-                        if (chunk.state() == ChunkState.SEALED) {
-                            ownerRepairChunk(ns, file, chunk, dead, RepairTrigger.RECONCILE);
+                    perFileIsolated(ns, fileId, "ownerRepairPass", () -> {
+                        Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
+                        if (opt.isEmpty()) {
+                            return;
                         }
-                    }
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        throw ie;
-                    } catch (Exception e) {
-                        log.warn("ownerRepairPass: skipping ns={} fileId={} due to error — repair pass continues",
-                                ns, fileId, e);
-                    }
+                        Records.FileRecord file = opt.get().value();
+                        if (file.state() == FileState.DELETING) {
+                            // the owner reclaims its own deleted files: the leader's heartbeat command channel
+                            // cannot reach a non-leader-owned namespace's chunks, so without this they leak.
+                            ownerDriveDeletion(file, opt.get().version(), nodes);
+                            return;
+                        }
+                        for (Records.ChunkRecord chunk : file.chunks()) {
+                            if (chunk.state() == ChunkState.SEALED) {
+                                ownerRepairChunk(ns, file, chunk, dead, RepairTrigger.RECONCILE);
+                            }
+                        }
+                    });
                 }
             }
         } finally {

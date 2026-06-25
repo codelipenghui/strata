@@ -513,19 +513,22 @@ public final class ZkMetadataStore implements MetadataStore {
         return out;
     }
 
-    @Override
-    public long allocateMetadataEpoch() throws Exception {
-        // ZK atomic counter: read-modify-CAS with retry. Each successful step increments by exactly
-        // one, so concurrent allocators see distinct, strictly-monotonic values with no gaps here.
+    /**
+     * Atomically increments the long counter stored at {@code zkPath}, creating the znode at 1 if
+     * it does not yet exist. Uses a CAS-with-retry loop: on BadVersion the read-modify-write is
+     * retried; on NoNode the znode is created at 1 (and if another writer wins the create race,
+     * the loop retries the CAS).
+     */
+    private long casIncrementZkCounter(String zkPath) throws Exception {
         while (true) {
             try {
                 Stat stat = new Stat();
-                byte[] data = curator.getData().storingStatIn(stat).forPath(META_EPOCH);
+                byte[] data = curator.getData().storingStatIn(stat).forPath(zkPath);
                 long current = data.length == 8 ? ByteBuffer.wrap(data).getLong() : 0L;
                 long next = current + 1;
                 try {
                     curator.setData().withVersion(stat.getVersion())
-                            .forPath(META_EPOCH, ByteBuffer.allocate(8).putLong(next).array());
+                            .forPath(zkPath, ByteBuffer.allocate(8).putLong(next).array());
                     return next;
                 } catch (KeeperException.BadVersionException retry) {
                     // lost the CAS race; re-read and try again
@@ -533,7 +536,7 @@ public final class ZkMetadataStore implements MetadataStore {
             } catch (KeeperException.NoNodeException e) {
                 try {
                     curator.create().creatingParentsIfNeeded()
-                            .forPath(META_EPOCH, ByteBuffer.allocate(8).putLong(1L).array());
+                            .forPath(zkPath, ByteBuffer.allocate(8).putLong(1L).array());
                     return 1L;
                 } catch (KeeperException.NodeExistsException created) {
                     // another writer created it first; loop to CAS-increment off its value
@@ -543,33 +546,13 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     @Override
+    public long allocateMetadataEpoch() throws Exception {
+        return casIncrementZkCounter(META_EPOCH);
+    }
+
+    @Override
     public long nextSystemFileId() throws Exception {
-        // ZK atomic counter: same CAS-with-retry pattern as allocateMetadataEpoch.
-        // System namespace creates are low-volume (a handful of meta-log segment/snapshot files),
-        // so the single-znode CAS cost is negligible.
-        while (true) {
-            try {
-                Stat stat = new Stat();
-                byte[] data = curator.getData().storingStatIn(stat).forPath(META_SYS_FILE_ID);
-                long current = data.length == 8 ? ByteBuffer.wrap(data).getLong() : 0L;
-                long next = current + 1;
-                try {
-                    curator.setData().withVersion(stat.getVersion())
-                            .forPath(META_SYS_FILE_ID, ByteBuffer.allocate(8).putLong(next).array());
-                    return next;
-                } catch (KeeperException.BadVersionException retry) {
-                    // lost the CAS race; re-read and try again
-                }
-            } catch (KeeperException.NoNodeException e) {
-                try {
-                    curator.create().creatingParentsIfNeeded()
-                            .forPath(META_SYS_FILE_ID, ByteBuffer.allocate(8).putLong(1L).array());
-                    return 1L;
-                } catch (KeeperException.NodeExistsException created) {
-                    // another writer created it first; loop to CAS-increment off its value
-                }
-            }
-        }
+        return casIncrementZkCounter(META_SYS_FILE_ID);
     }
 
     @Override
@@ -745,32 +728,9 @@ public final class ZkMetadataStore implements MetadataStore {
     /**
      * Global monotonic file-id counter. The ZK backend stores all file records under the shared
      * {@code /strata/files/<id>} flat space, so ids must be globally unique regardless of namespace.
-     * Same CAS-with-retry pattern as {@link #allocateMetadataEpoch()}.
      */
     private long nextGlobalFileId() throws Exception {
-        while (true) {
-            try {
-                Stat stat = new Stat();
-                byte[] data = curator.getData().storingStatIn(stat).forPath(META_GLOBAL_FILE_ID);
-                long current = data.length == 8 ? ByteBuffer.wrap(data).getLong() : 0L;
-                long next = current + 1;
-                try {
-                    curator.setData().withVersion(stat.getVersion())
-                            .forPath(META_GLOBAL_FILE_ID, ByteBuffer.allocate(8).putLong(next).array());
-                    return next;
-                } catch (KeeperException.BadVersionException retry) {
-                    // lost the CAS race; re-read and try again
-                }
-            } catch (KeeperException.NoNodeException e) {
-                try {
-                    curator.create().creatingParentsIfNeeded()
-                            .forPath(META_GLOBAL_FILE_ID, ByteBuffer.allocate(8).putLong(1L).array());
-                    return 1L;
-                } catch (KeeperException.NodeExistsException created) {
-                    // another writer created it first; loop to CAS-increment off its value
-                }
-            }
-        }
+        return casIncrementZkCounter(META_GLOBAL_FILE_ID);
     }
 
     @Override

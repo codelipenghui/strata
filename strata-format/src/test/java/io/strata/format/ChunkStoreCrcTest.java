@@ -2,6 +2,7 @@ package io.strata.format;
 
 import io.strata.common.ChunkId;
 import io.strata.common.FileId;
+import io.strata.common.NsChunkId;
 import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;

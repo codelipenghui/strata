@@ -5,12 +5,14 @@ import io.strata.common.ChunkState;
 import io.strata.common.Closeables;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
+import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -22,8 +24,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
@@ -35,13 +39,6 @@ import static io.strata.format.ChunkFormats.HEADER_SIZE;
 import static io.strata.format.ChunkFormats.TRAILER_SIZE;
 import static io.strata.format.ChunkFormats.readFully;
 import static io.strata.format.ChunkFormats.writeFully;
-
-/**
- * Composite key for the in-memory chunk map: namespace + ChunkId. Two namespaces may have
- * files with the same per-namespace long fileId; this key prevents collisions. Java records
- * provide correct equals/hashCode automatically.
- */
-record NsChunkId(StrataNamespace namespace, ChunkId chunkId) {}
 
 /**
  * Node-local chunk engine (tech design §5, §11): epoch-fenced appends, integrity-ledger crash
@@ -256,7 +253,7 @@ public final class ChunkStore implements AutoCloseable {
                 data.force(false); // footer/trailer durable before the sidecar may claim SEALED on disk
             } catch (IOException | RuntimeException e) {
                 synchronized (h) {
-                    if (chunks.get(new NsChunkId(h.ns, h.id)) != h || h.data != data || !h.sealedLedgerPending) {
+                    if (chunks.get(h.nsKey) != h || h.data != data || !h.sealedLedgerPending) {
                         continue; // delete()/close() won the race after we snapshotted — not ours to log
                     }
                 }
@@ -266,7 +263,7 @@ public final class ChunkStore implements AutoCloseable {
             boolean reclaimed = false;
             try {
                 synchronized (h) {
-                    if (chunks.get(new NsChunkId(h.ns, h.id)) != h || h.data != data
+                    if (chunks.get(h.nsKey) != h || h.data != data
                             || h.state != ChunkState.SEALED || !h.sealedLedgerPending) {
                         continue; // superseded after the force — leave it to the winner
                     }
@@ -313,7 +310,7 @@ public final class ChunkStore implements AutoCloseable {
                 data.force(false); // flushes all currently-dirty pages (>= flushTo)
             } catch (IOException | RuntimeException e) {
                 synchronized (h) {
-                    if (chunks.get(new NsChunkId(h.ns, h.id)) != h || h.state != ChunkState.OPEN || h.data != data) {
+                    if (chunks.get(h.nsKey) != h || h.state != ChunkState.OPEN || h.data != data) {
                         // delete()/close()/seal() won the race after we snapshotted the channel.
                         // The handle is no longer eligible for background writeback, so do not log
                         // and do not retry this stale closed channel every period.
@@ -325,7 +322,7 @@ public final class ChunkStore implements AutoCloseable {
             }
             boolean credited = false;
             synchronized (h) {
-                if (chunks.get(new NsChunkId(h.ns, h.id)) == h && h.state == ChunkState.OPEN
+                if (chunks.get(h.nsKey) == h && h.state == ChunkState.OPEN
                         && h.data == data && h.bgFlushedOffset < flushTo) {
                     h.bgFlushedOffset = flushTo;
                     credited = true;
@@ -342,6 +339,7 @@ public final class ChunkStore implements AutoCloseable {
     private final class Handle {
         final ChunkId id;
         final StrataNamespace ns;
+        final NsChunkId nsKey;  // pre-computed map key — avoids per-iteration allocation in background loops
         final ChunkFormats.Header header;
         final Path shardDir;   // dir/<ns>/<l1>/<l2> — durability target for chunk-file mutations
         final Path dataPath;
@@ -411,6 +409,7 @@ public final class ChunkStore implements AutoCloseable {
         Handle(ChunkId id, ChunkFormats.Header header, StrataNamespace ns) {
             this.id = id;
             this.ns = ns;
+            this.nsKey = new NsChunkId(ns, id);
             this.header = header;
             String rel = ChunkFormats.chunkRelativePath(ns, id);
             Path chunkFile = dir.resolve(rel + ".chunk");
@@ -428,6 +427,7 @@ public final class ChunkStore implements AutoCloseable {
         Handle(ChunkId id, ChunkFormats.Header header, Path dataPath, StrataNamespace ns) {
             this.id = id;
             this.ns = ns;
+            this.nsKey = new NsChunkId(ns, id);
             this.header = header;
             this.dataPath = dataPath;
             this.shardDir = dataPath.getParent();
@@ -638,10 +638,6 @@ public final class ChunkStore implements AutoCloseable {
         } catch (IOException e) {
             log.warn("failed to delete {} {}", description, path, e);
         }
-    }
-
-    private void forceDirectory() throws IOException {
-        forceDirectory(dir);
     }
 
     private static void forceDirectory(Path d) throws IOException {
@@ -1151,7 +1147,7 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     /** Creates a temp file in the chunk store root for a streaming sealed-chunk import. */
-    public Path createImportTemp(StrataNamespace ns, ChunkId id) throws IOException {
+    public Path createImportTemp(ChunkId id) throws IOException {
         Files.createDirectories(dir);
         return Files.createTempFile(dir, ChunkFormats.baseName(id) + ".", ".import");
     }
@@ -1159,7 +1155,7 @@ public final class ChunkStore implements AutoCloseable {
     /** Imports a sealed chunk from raw file bytes (tests/simple callers). Validates everything. */
     public void importSealed(StrataNamespace ns, ChunkId id, byte[] fileBytes,
                              long expectedLength, int expectedCrc) throws IOException {
-        Path tmp = createImportTemp(ns, id);
+        Path tmp = createImportTemp(id);
         try {
             Files.write(tmp, fileBytes);
             importSealed(ns, id, tmp, expectedLength, expectedCrc);
@@ -1417,43 +1413,37 @@ public final class ChunkStore implements AutoCloseable {
     /**
      * Startup recovery: walks the namespace-sharded directory tree in parallel, recovering every
      * {@code .chunk} file found under {@code dir/<ns>/<shard>/}. Each top-level namespace directory
-     * is recovered concurrently (one thread per namespace, bounded by available processors) via
-     * {@link #recoverNamespace}. Any unexpected flat {@code .chunk} files sitting directly in the
-     * store root (outside a namespace directory) are quarantined and logged as errors.
+     * is recovered concurrently via virtual threads. Any unexpected flat {@code .chunk} files sitting
+     * directly in the store root (outside a namespace directory) are quarantined and logged as errors.
      */
     private void recoverAll() throws IOException {
         if (!Files.isDirectory(dir)) return;
 
+        // Single pass: partition store-root entries into namespace dirs and stray .chunk files.
+        List<Path> nsDirs = new ArrayList<>();
+        List<Path> rootChunks = new ArrayList<>();
+        try (Stream<Path> stream = Files.list(dir)) {
+            stream.forEach(p -> {
+                if (Files.isDirectory(p)) {
+                    nsDirs.add(p);
+                } else if (p.getFileName().toString().endsWith(".chunk")) {
+                    rootChunks.add(p);
+                }
+            });
+        }
         // Quarantine any unexpected flat .chunk files placed directly in the store root
         // (they cannot belong to any namespace directory and indicate corruption or misplaced files).
-        List<Path> rootChunks;
-        try (Stream<Path> stream = Files.list(dir)) {
-            rootChunks = stream
-                    .filter(p -> !Files.isDirectory(p) && p.getFileName().toString().endsWith(".chunk"))
-                    .collect(java.util.stream.Collectors.toList());
-        }
         for (Path p : rootChunks) {
             log.error("unexpected flat .chunk file in store root — quarantined: {}", p);
             quarantineRecoveredFiles(p);
         }
 
-        // Enumerate top-level namespace dirs
-        List<Path> nsDirs;
-        try (Stream<Path> stream = Files.list(dir)) {
-            nsDirs = stream.filter(Files::isDirectory).collect(java.util.stream.Collectors.toList());
-        }
-
         if (nsDirs.isEmpty()) return;
 
-        // Recover each namespace in parallel (bounded executor)
-        int threads = Math.min(nsDirs.size(), Runtime.getRuntime().availableProcessors());
-        ExecutorService executor = Executors.newFixedThreadPool(threads, r -> {
-            Thread t = new Thread(r, "recovery-" + dir.getFileName());
-            t.setDaemon(true);
-            return t;
-        });
+        // Recover each namespace in parallel via virtual threads
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
         try {
-            List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+            List<Future<?>> futures = new ArrayList<>();
             for (Path nsDir : nsDirs) {
                 String nsName = nsDir.getFileName().toString();
                 StrataNamespace ns = StrataNamespace.of(nsName);
@@ -1461,16 +1451,16 @@ public final class ChunkStore implements AutoCloseable {
                     try {
                         recoverNamespace(ns, nsDir);
                     } catch (IOException e) {
-                        throw new java.io.UncheckedIOException(e);
+                        throw new UncheckedIOException(e);
                     }
                 }));
             }
-            for (java.util.concurrent.Future<?> f : futures) {
+            for (Future<?> f : futures) {
                 try {
                     f.get();
-                } catch (java.util.concurrent.ExecutionException e) {
+                } catch (ExecutionException e) {
                     Throwable cause = e.getCause();
-                    if (cause instanceof java.io.UncheckedIOException uioe) throw uioe.getCause();
+                    if (cause instanceof UncheckedIOException uioe) throw uioe.getCause();
                     if (cause instanceof IOException ioe) throw ioe;
                     throw new IOException("recovery failed", cause);
                 } catch (InterruptedException e) {
@@ -1487,8 +1477,7 @@ public final class ChunkStore implements AutoCloseable {
         // Collect all .chunk files first (crash-safety: avoid delete-during-walk)
         List<Path> chunkFiles;
         try (Stream<Path> files = Files.walk(nsDir)) {
-            chunkFiles = files.filter(p -> p.getFileName().toString().endsWith(".chunk"))
-                    .collect(java.util.stream.Collectors.toList());
+            chunkFiles = files.filter(p -> p.getFileName().toString().endsWith(".chunk")).toList();
         }
         for (Path p : chunkFiles) {
             String name = p.getFileName().toString();
