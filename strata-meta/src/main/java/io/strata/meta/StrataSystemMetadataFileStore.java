@@ -140,8 +140,9 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
         // A unique token (UUID) is appended to the leaf so every create attempt uses a fresh path — retried
         // or raced compactions (same ns/generation/kind) therefore never collide at the ZK path level and
         // cannot trigger NodeExistsException. Readers always look up files by FileId via openById(), not by
-        // path, so the unique leaf does not affect correctness; any orphan left by a failed attempt is
-        // reclaimed by the normal orphan-GC path.
+        // path, so the unique leaf does not affect correctness. A retried/raced compaction leaves at most one
+        // orphan snapshot+log; the failed-CAS case is cleaned up in-process by deleteQuietly, but an orphan
+        // from a crash between file-create and manifest-CAS is not yet GC'd — deferred to orphan-GC work.
         return new StrataClient.FileSpec(NamespaceLogBackend.SYSTEM_NAMESPACE,
                 StrataPath.of("/metadata-log/" + ns + "/gen-" + generation + "/" + kind + "-"
                         + UUID.randomUUID()), policy);

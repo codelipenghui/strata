@@ -9,8 +9,6 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Method;
-import java.util.HashSet;
-import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -34,11 +32,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *       tokens. <b>FAILS before the UUID-suffix fix</b> (both paths are identical), passes after.
  *   <li>{@link #successorAfterPreCasCrashSucceedsWithUniqueIdStore()} — integration: the
  *       crash+retry scenario completes without error when the file store assigns unique ids per
- *       create call (mimicking the UUID-path production fix). Always passes.
- *   <li>{@link #successorAfterPreCasCrashWedgesWithCollisionRejectingStore()} — documents the bug:
- *       the crash+retry scenario FAILS when the store rejects duplicate {@code (ns, generation)}
- *       creates — exactly what the old deterministic ZK path triggered. Always passes (confirms the
- *       bug scenario exists).
+ *       create call (mimicking the UUID-path production fix). Provides coverage for the post-fix
+ *       scenario.
  * </ol>
  */
 class SystemMetadataFilePathUniquenessTest {
@@ -118,111 +113,5 @@ class SystemMetadataFilePathUniquenessTest {
         }
     }
 
-    /**
-     * Bug documentation: the crash+retry scenario FAILS (wedges) when the file store rejects a
-     * second {@code (ns, generation)} create — reproducing ZK's {@code NodeExistsException} on a
-     * deterministic path. This test asserts the collision IS detected, confirming the pre-fix bug
-     * scenario is real.
-     */
-    @Test
-    void successorAfterPreCasCrashWedgesWithCollisionRejectingStore() throws Exception {
-        try (TestingServer zk = new TestingServer(true);
-             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
 
-            CollisionRejectingFileStore fs = new CollisionRejectingFileStore();
-
-            // Owner opens the namespace (publishes gen=1 → locks gen=1 in the store).
-            NamespaceMetadataLogRepository.open(NS, fs, root, 1);
-
-            // Arm crash before manifest CAS for gen=2. The crash leaves orphaned gen=2 files
-            // locked in the store but the manifest still at gen=1.
-            FailureInjector.arm("meta.log.beforeManifestPublish",
-                    p -> { throw new RuntimeException("simulated pre-CAS crash"); });
-            try {
-                // Need a fresh open to attempt compaction from gen=1.
-                // (compactAndPublish on the already-opened repo would attempt gen=2.)
-                NamespaceMetadataLogRepository owner2 = NamespaceMetadataLogRepository.open(NS, fs, root, 2);
-                // Now arm the crash and try compactAndPublish on owner2 to orphan gen=3 files...
-                // Actually: simpler — just re-open after disarming, but with locked gen=2.
-            } catch (IllegalStateException expected) {
-                // The collision-rejecting store blocks gen=2 for the successor.
-            } catch (RuntimeException ignored) {
-                // crash point firing is also expected
-            }
-            FailureInjector.reset();
-
-            // Successor open must fail because gen=2 is locked in the store
-            // (the orphaned attempt created gen=2 files before the crash).
-            boolean wedged = false;
-            try {
-                NamespaceMetadataLogRepository.open(NS, fs, root, 3);
-            } catch (IllegalStateException e) {
-                if (e.getMessage() != null && e.getMessage().contains("already created")) {
-                    wedged = true;
-                } else {
-                    throw e;
-                }
-            }
-            // Note: wedged may or may not be true depending on how many opens succeeded;
-            // the important assertion is that the collision-rejecting store CAN cause wedges.
-            // The real documentation is in the test comment above.
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
-
-    /**
-     * A {@link NamespaceMetadataFileStore} that throws on a second {@code createLogFile} or
-     * {@code writeSnapshot} call for the same {@code (ns, generation)} — exactly reproducing ZK's
-     * {@code NodeExistsException} on a deterministic (non-unique) path.
-     *
-     * <p>Delegates non-colliding calls to an inner {@link TestNamespaceMetadataFileStore}.
-     */
-    private static final class CollisionRejectingFileStore implements NamespaceMetadataFileStore {
-        private final TestNamespaceMetadataFileStore delegate = new TestNamespaceMetadataFileStore();
-        private final Set<String> usedLogKeys  = new HashSet<>();
-        private final Set<String> usedSnapKeys = new HashSet<>();
-
-        @Override
-        public FileId createLogFile(StrataNamespace ns, long generation) throws Exception {
-            String key = ns.value() + ":" + generation;
-            if (!usedLogKeys.add(key)) {
-                throw new IllegalStateException("already created log for " + key
-                        + " — NodeExistsException-equivalent (pre-fix deterministic path)");
-            }
-            return delegate.createLogFile(ns, generation);
-        }
-
-        @Override
-        public void appendLog(FileId logFileId, byte[] frameBytes) throws Exception {
-            delegate.appendLog(logFileId, frameBytes);
-        }
-
-        @Override
-        public byte[] readLog(FileId logFileId) throws Exception {
-            return delegate.readLog(logFileId);
-        }
-
-        @Override
-        public FileId writeSnapshot(StrataNamespace ns, long generation, byte[] bytes) throws Exception {
-            String key = ns.value() + ":" + generation;
-            if (!usedSnapKeys.add(key)) {
-                throw new IllegalStateException("already created snapshot for " + key
-                        + " — NodeExistsException-equivalent (pre-fix deterministic path)");
-            }
-            return delegate.writeSnapshot(ns, generation, bytes);
-        }
-
-        @Override
-        public byte[] readSnapshot(FileId snapshotFileId) throws Exception {
-            return delegate.readSnapshot(snapshotFileId);
-        }
-
-        @Override
-        public void deleteFile(FileId fileId) throws Exception {
-            delegate.deleteFile(fileId);
-        }
-    }
 }
