@@ -161,6 +161,20 @@ final class ServerMetrics {
                 .description("client READ payload bytes served (rate() = read throughput)").register(reg);
         FunctionCounter.builder("strata_data_node_background_flush", n, DataNode::backgroundFlushes)
                 .description("background-writeback fsyncs of open chunks").register(reg);
+
+        Gauge.builder("strata_data_node_filechannel_cache_size", n, DataNode::cachedChannels)
+                .description("open cached sealed-chunk file channels").register(reg);
+        Gauge.builder("strata_data_node_filechannel_cache_capacity", n, DataNode::channelCacheCapacity)
+                .description("configured channel-cache capacity").register(reg);
+        Gauge.builder("strata_data_node_open_fds", n, DataNode::openFds)
+                .description("process open file descriptors (-1 if unavailable)").register(reg);
+
+        FunctionCounter.builder("strata_data_node_filechannel_cache", n, DataNode::channelCacheHits)
+                .tag("event", "hit").description("sealed-chunk channel cache events").register(reg);
+        FunctionCounter.builder("strata_data_node_filechannel_cache", n, DataNode::channelCacheMisses)
+                .tag("event", "miss").register(reg);
+        FunctionCounter.builder("strata_data_node_filechannel_cache", n, DataNode::channelCacheEvictions)
+                .tag("event", "eviction").register(reg);
     }
 
     /**

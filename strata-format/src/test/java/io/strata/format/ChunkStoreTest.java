@@ -27,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -40,6 +41,9 @@ import java.util.stream.Stream;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -156,6 +160,20 @@ class ChunkStoreTest {
                 "chunk file must be at chunks/<ns>/<L1>/<L2>/<fileId>.<index>.chunk");
         assertTrue(Files.exists(dir.resolve(expected + ".meta")),
                 "sidecar must be at the same sharded path");
+    }
+
+    @Test
+    void defaultChannelCacheCapacityIsPositive() {
+        assertTrue(ChunkStore.defaultChannelCacheCapacity() >= 128,
+                "auto-sized cache capacity must be a sane floor");
+    }
+
+    @Test
+    void openFdsIsNonNegativeOnUnixOrMinusOne() throws Exception {
+        try (ChunkStore store = newStore()) {
+            long fds = store.openFds();
+            assertTrue(fds >= 0 || fds == -1, "openFds() is the live count or -1 when unavailable");
+        }
     }
 
     @Test
@@ -1889,6 +1907,188 @@ class ChunkStoreTest {
             assertArrayEquals(data0, store.read(ns0, same, 0, Integer.MAX_VALUE).bytes());
             assertArrayEquals(data1, store.read(ns1, same, 0, Integer.MAX_VALUE).bytes());
             assertEquals(2, store.inventory().size());
+        }
+    }
+
+    @Test
+    void exposesChannelCacheAccessorsAndClosesCleanly() throws Exception {
+        try (ChunkStore store = newStore()) {
+            assertEquals(0, store.cachedChannels());
+            assertEquals(0, store.channelCacheHits());
+            assertEquals(0, store.channelCacheMisses());
+            assertEquals(0, store.channelCacheEvictions());
+            assertTrue(store.channelCacheCapacity() >= 128);
+        }
+    }
+
+    @Test
+    void sealedVerifiedReadGoesThroughChannelCache() throws Exception {
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, id, "cache-me-please");
+            store.reclaimSealedLedgersOnce(); // become evictable (h.data nulled in Task 8; harmless here)
+            assertArrayEquals("cache".getBytes(),
+                    store.read(TEST_NS, id, 0, 5).bytes());
+            assertTrue(store.channelCacheMisses() + store.channelCacheHits() >= 1,
+                    "a sealed read must consult the channel cache");
+            assertTrue(store.cachedChannels() >= 1, "the sealed channel is cached after a read");
+        }
+    }
+
+    @Test
+    void sealedFetchGoesThroughChannelCache() throws Exception {
+        try (ChunkStore store = newStore()) {
+            byte[] full = sealedBytes(store, id, "fetch-via-cache");
+            long missesBefore = store.channelCacheMisses() + store.channelCacheHits();
+            byte[] got = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE).bytes();
+            assertArrayEquals(full, got);
+            assertTrue(store.channelCacheMisses() + store.channelCacheHits() > missesBefore,
+                    "fetch of a sealed chunk must consult the channel cache");
+        }
+    }
+
+    @Test
+    void scrubReadsSealedDataThroughCache() throws Exception {
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, id, "scrub-me");
+            assertEquals(0, store.scrubOnce(), "clean chunk has no corruption");
+            assertTrue(store.cachedChannels() >= 1);
+        }
+    }
+
+    @Test
+    void sealedConcurrentReadRegionsUseExclusiveFds() throws Exception {
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, id, "shared-zero-copy");
+            ChunkStore.ReadRegionResult r1 = store.readRegion(TEST_NS, id, 0, 6);
+            ChunkStore.ReadRegionResult r2 = store.readRegion(TEST_NS, id, 6, 4);
+            try {
+                assertTrue(r1.channel() != null && r2.channel() != null, "sealed reads are zero-copy");
+                assertNotSame(r1.channel(), r2.channel(),
+                        "concurrent sealed readers must get exclusive FDs (interrupt-safety), not one shared FD");
+                assertArrayEquals("shared".getBytes(), consumeRegion(r1));
+                assertArrayEquals("-zer".getBytes(), consumeRegion(r2));
+            } finally {
+                r1.close();
+                r2.close();
+            }
+            // after both leases return, the channels are pooled for reuse, bounded by capacity
+            assertTrue(store.cachedChannels() >= 1 && store.cachedChannels() <= store.channelCacheCapacity());
+        }
+    }
+
+    @Test
+    void sealedReadRegionLeaseKeepsFdOpenUntilReleased() throws Exception {
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, id, "lease-lifetime");
+            ChunkStore.ReadRegionResult r = store.readRegion(TEST_NS, id, 0, 5);
+            FileChannel ch = r.channel();
+            assertTrue(ch.isOpen());
+            r.close(); // releases the lease; channel stays cached/open
+            assertTrue(ch.isOpen(), "release returns the FD to the cache, does not close it");
+        }
+    }
+
+    @Test
+    void recoveryOpensNoPersistentFdPerSealedChunk() throws Exception {
+        ChunkId a = new ChunkId(FileId.of(101), 0);
+        ChunkId b = new ChunkId(FileId.of(102), 0);
+        try (ChunkStore store = new ChunkStore(dir, true)) { // seal-fsync on: sealed + durable immediately
+            sealedBytes(store, a, "alpha");
+            sealedBytes(store, b, "bravo");
+        }
+        try (ChunkStore recovered = new ChunkStore(dir, true)) {
+            assertEquals(2, recovered.sealedChunks());
+            assertNull(handleData(recovered, a), "recovery must keep no persistent data FD for a sealed chunk");
+            assertNull(handleData(recovered, b), "recovery must keep no persistent data FD for a sealed chunk");
+            assertEquals(0, recovered.cachedChannels(),
+                    "recovery must not open a persistent data FD per sealed chunk");
+            // a read lazily opens (and caches) exactly one channel
+            assertArrayEquals("alpha".getBytes(), recovered.read(TEST_NS, a, 0, 5).bytes());
+            assertEquals(1, recovered.cachedChannels());
+        }
+    }
+
+    @Test
+    void sealClosesPersistentDataFdWhenSealFsyncOn() throws Exception {
+        try (ChunkStore store = new ChunkStore(dir, true)) {
+            open(store, id, 1);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("durable-seal"));
+            store.seal(TEST_NS, id, 1, "durable-seal".length(), null);
+            assertNull(handleData(store, id), "seal-fsync=on must drop the writable FD at seal");
+            assertArrayEquals("durable-seal".getBytes(), store.read(TEST_NS, id, 0, 12).bytes());
+        }
+    }
+
+    @Test
+    void reclaimClosesPersistentDataFdWhenSealFsyncOff() throws Exception {
+        try (ChunkStore store = newStore()) { // seal-fsync off
+            open(store, id, 1);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("reclaim-me"));
+            store.seal(TEST_NS, id, 1, "reclaim-me".length(), null);
+            assertNotNull(handleData(store, id), "seal-fsync=off keeps the FD until reclaim");
+            store.reclaimSealedLedgersOnce();
+            assertNull(handleData(store, id), "reclaim drops the writable FD once durable");
+            assertArrayEquals("reclaim-me".getBytes(), store.read(TEST_NS, id, 0, 10).bytes());
+        }
+    }
+
+    @Test
+    void deleteInvalidatesCachedChannel() throws Exception {
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, id, "delete-me");
+            store.read(TEST_NS, id, 0, 4); // caches the channel
+            assertEquals(1, store.cachedChannels());
+            assertEquals(ErrorCode.OK, store.delete(TEST_NS, id));
+            assertEquals(0, store.cachedChannels(), "delete must invalidate the cached channel");
+        }
+    }
+
+    @Test
+    void readRegionLeaseSurvivesConcurrentDelete() throws Exception {
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, id, "inode-alive");
+            ChunkStore.ReadRegionResult region = store.readRegion(TEST_NS, id, 0, 5);
+            try {
+                assertEquals(ErrorCode.OK, store.delete(TEST_NS, id)); // unlinks file; leased FD keeps inode alive
+                assertArrayEquals("inode".getBytes(), consumeRegion(region),
+                        "an in-flight leased transfer still reads correct bytes after delete");
+            } finally {
+                region.close();
+            }
+        }
+    }
+
+    /** Reflectively reads the private Handle.data field for the given chunk (test-only). */
+    private static FileChannel handleData(ChunkStore store, ChunkId chunkId) throws Exception {
+        Object handle = handle(store, TEST_NS, chunkId);
+        if (handle == null) return null;
+        Field dataField = handle.getClass().getDeclaredField("data");
+        dataField.setAccessible(true);
+        return (FileChannel) dataField.get(handle);
+    }
+
+    @Test
+    void cachedChannelsStayBoundedAsSealedCountExceedsCapacity() throws Exception {
+        // Use a tiny explicit capacity so the bound is observable without thousands of files.
+        // CHANNEL_CACHE_MAX_SIZE is static-final (read once at class load), so setting a system
+        // property inside a test is unreliable once the class is already loaded by earlier tests.
+        // The package-private ChunkStore(dir, sealFsync, capacity) constructor sidesteps that.
+        int tinyCapacity = 4;
+        int n = 32; // >> tinyCapacity, guarantees eviction
+        try (ChunkStore store = new ChunkStore(dir, true, tinyCapacity)) {
+            List<ChunkId> ids = new ArrayList<>();
+            for (int i = 0; i < n; i++) {
+                ChunkId c = new ChunkId(FileId.of(200 + i), 0);
+                ids.add(c);
+                sealedBytes(store, c, "payload-" + i);
+            }
+            // read every chunk once: misses open channels, eviction keeps the open set bounded
+            for (ChunkId c : ids) {
+                store.read(TEST_NS, c, 0, 3);
+            }
+            assertTrue(store.cachedChannels() <= store.channelCacheCapacity(),
+                    "open cached channels must not exceed capacity when no leases are held");
+            assertTrue(store.channelCacheEvictions() > 0, "eviction must have fired");
         }
     }
 }

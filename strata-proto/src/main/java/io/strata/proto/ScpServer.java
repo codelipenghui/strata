@@ -441,8 +441,9 @@ public final class ScpServer implements AutoCloseable {
     }
 
     /** Convenience for handlers: success response whose payload is streamed from a file region. */
-    public static Frame okFileRegion(Frame req, byte[] header, FileChannel channel, long position, int length) {
-        return Frame.fileResponse(req, header, new Frame.FilePayload(channel, position, length));
+    public static Frame okFileRegion(Frame req, byte[] header, FileChannel channel, long position,
+                                     int length, Runnable releaser) {
+        return Frame.fileResponse(req, header, new Frame.FilePayload(channel, position, length, releaser));
     }
 
     @Override

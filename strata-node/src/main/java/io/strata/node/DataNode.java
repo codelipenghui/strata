@@ -169,6 +169,13 @@ public final class DataNode implements AutoCloseable {
         return store.backgroundFlushes();
     }
 
+    public long channelCacheHits() { return store.channelCacheHits(); }
+    public long channelCacheMisses() { return store.channelCacheMisses(); }
+    public long channelCacheEvictions() { return store.channelCacheEvictions(); }
+    public int cachedChannels() { return store.cachedChannels(); }
+    public int channelCacheCapacity() { return store.channelCacheCapacity(); }
+    public long openFds() { return store.openFds(); }
+
     /** Installs a per-request latency observer on the data-plane server (used by the metrics layer). */
     public void setRequestObserver(io.strata.proto.RequestObserver observer) {
         server.setRequestObserver(observer);

@@ -19,6 +19,21 @@ class ServerMetricsTest {
     Path dir;
 
     @Test
+    void registerNodeExposesChannelCacheAndFdMeters() throws Exception {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
+            SimpleMeterRegistry registry = new SimpleMeterRegistry();
+            ServerMetrics.registerDataNode(registry, node);
+
+            assertNotNull(registry.find("strata_data_node_filechannel_cache").tag("event", "hit").functionCounter());
+            assertNotNull(registry.find("strata_data_node_filechannel_cache").tag("event", "miss").functionCounter());
+            assertNotNull(registry.find("strata_data_node_filechannel_cache").tag("event", "eviction").functionCounter());
+            assertNotNull(registry.find("strata_data_node_filechannel_cache_size").gauge());
+            assertNotNull(registry.find("strata_data_node_filechannel_cache_capacity").gauge());
+            assertNotNull(registry.find("strata_data_node_open_fds").gauge());
+        }
+    }
+
+    @Test
     void registerNodeExposesReadCounterMeters() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             SimpleMeterRegistry registry = new SimpleMeterRegistry();

@@ -891,6 +891,47 @@
           "sort": "desc"
         }
       }
+    },
+    {
+      "id": 50,
+      "type": "stat",
+      "title": "Open file descriptors",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 102 },
+      "targets": [
+        { "expr": "max(strata_data_node_open_fds{instance=~\"$node\"})", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        }
+      },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 51,
+      "type": "timeseries",
+      "title": "Channel cache size vs capacity & hit rate",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 4, "y": 102 },
+      "targets": [
+        { "expr": "strata_data_node_filechannel_cache_size{instance=~\"$node\"}", "refId": "A", "legendFormat": "{{instance}} size" },
+        { "expr": "strata_data_node_filechannel_cache_capacity{instance=~\"$node\"}", "refId": "B", "legendFormat": "{{instance}} capacity" },
+        { "expr": "rate(strata_data_node_filechannel_cache_total{instance=~\"$node\",event=\"eviction\"}[5m])", "refId": "C", "legendFormat": "{{instance}} evict/s" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 10, "showPoints": "never" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
     }
   ]
 }
