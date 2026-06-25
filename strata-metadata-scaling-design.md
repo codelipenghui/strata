@@ -814,6 +814,30 @@ an `appliedOffset >= readOffset` rule and extra freshness semantics.
 Old leaders may still have open network connections, but they cannot publish a
 new manifest or append to the metadata log after being fenced.
 
+### Stale-epoch owner re-acquire
+
+The recovery barrier (section 13) fences previous writers by CAS-incrementing the
+epoch and republishing the manifest. Before per-namespace leadership is fully in
+place, ownership is decided by the static assignment policy (section 6.1) and a
+namespace's repository is opened lazily — opening allocates a fresh `metadataEpoch`
+and republishes the manifest, which itself fences any prior writer. During a
+membership settle two controllers can therefore briefly open the same namespace;
+the later opener's higher epoch fences the earlier one's open-log writer.
+
+A controller that still maps to the namespace under the assignment policy keeps a
+cached repository at the now-stale epoch. Left alone, its every metadata-log append
+fences (`FENCED_EPOCH`, append epoch < durable epoch) and it retries forever: the
+in-flight file never finalizes and the owner repair pass skips it on each scan — a
+permanent wedge. To converge instead of wedging, a fenced append makes the owner
+**re-acquire**: it evicts the stale cached repository and re-opens the namespace,
+which allocates a new epoch and re-runs the recovery barrier (recovering the latest
+durable state and republishing the manifest), then replays the mutation once. The
+retry is bounded to a single attempt, so a genuine ownership disagreement surfaces
+as the fence rather than an epoch-thrash loop. Only a controller that still owns the
+namespace reaches the append (owner-routed creates; ownership-gated repair), so
+re-acquire reclaims the metadata log for the rightful owner rather than stealing it
+from another.
+
 ### Consensus outage
 
 Existing open-chunk appends and reads continue because they do not require
@@ -970,3 +994,118 @@ The full TLA gate runs all configured models:
   rebalancing.
 - Metrics that should trigger optional intra-namespace sharding.
 - Security model for namespace root ACLs and system metadata namespace access.
+
+## 20. Namespace in the data plane and long file ids
+
+This section is the data-plane realization of the sharding model. A chunk's global
+identity becomes the triple `(namespace, fileId, index)`: `fileId` is a `long`
+unique *within a namespace*, assigned by that namespace's authority (the owner for
+user namespaces; the consensus root for the system `strata-meta` namespace). On
+disk the namespace is the parent directory, so storage shards by directory and a
+walk yields the namespace for free; durability reconciliation moves from a central
+inventory push to owner-driven verification plus node-local, confirm-before-delete
+orphan GC. It is staged as three dependent phases (data model → owner verify →
+orphan GC); only the data-model phase has landed so far.
+
+**Locked decisions.**
+
+1. The namespace lives on disk as a **directory** (`chunks/<ns>/…`), not a header
+   field — free `du`/`ls`/`rm -rf`, namespace-for-free during walks, and no on-disk
+   record-format change for the namespace.
+2. `fileId` is a **per-namespace owner-assigned `long`** (BookKeeper `ledgerId`
+   model), not a UUID. `(namespace, fileId, index)` is the global identity; a bare
+   `(fileId, index)` is *not* globally unique (e.g. `fileId 0` exists in every
+   namespace).
+3. The directory shard splits **low bits first** so sequential ids spread evenly
+   from the first file, rather than clustering early ids under `00/00/…`.
+4. Clean break: bump `FORMAT_VERSION`, no migration or dual-read.
+
+### 20.1 File id generation (two layers)
+
+| Layer | Whose files | Generator |
+|---|---|---|
+| User | per-namespace user files | the owner's monotonic `nextFileId` (no consensus round) |
+| System | `strata-meta` log segments + snapshots | a small consensus-root counter |
+
+- **User (owner) generation.** Each namespace owner keeps a monotonic `nextFileId`
+  and `createFile` assigns the next value, riding the existing single-writer
+  manifest fence — no new global coordination. It is a **high-water field in the
+  namespace snapshot** (and in-memory state), *not* a separate log (which would
+  double appends) and *not* derived from `max(live files)` (a swept tombstone would
+  forget its id and risk reuse). It only ever increases. On failover the successor
+  loads the snapshot's `nextFileId` and replays the tail; assign-then-append is
+  safe because if the owner crashes after assigning N but before `FileCreated(N)`
+  is durable, no file exists at N and reissuing N is harmless.
+- **System generation.** A user namespace's `nextFileId` lives inside its meta-log,
+  which is itself stored as `strata-meta` files — so the system namespace cannot
+  host its own counter (it would recurse). System file ids come from a small
+  CAS counter in the consensus root scoped to `strata-meta` (low volume; does not
+  reintroduce a high-volume id allocator on the user path).
+
+### 20.2 On-disk layout and low-bit shard
+
+```text
+<dataDir>/chunks/<namespace>/<L1>/<L2>/<fileId-16hex>.<index>.{chunk,meta,j}
+```
+
+- `<namespace>` is the tenant directory — free `du -sh chunks/<ns>`, `rm -rf
+  chunks/<ns>` for namespace deletion, and the namespace for free on any walk
+  (which powers the reconcile and orphan-GC routing below). The namespace charset is
+  constrained at the control plane (`[A-Za-z0-9._-]`, bounded length) so the
+  directory name *is* the namespace verbatim — no escaping.
+- `<L1>/<L2>` is a low-bit split of the long (`L1 = fileId & 0xFF`,
+  `L2 = (fileId>>8) & 0xFF`; 256-way fan-out, tunable). Sequential ids round-robin
+  across `L1` from the first file; a file's chunks share its `fileId` and so share
+  the shard directory (locality).
+- `<fileId-16hex>` is zero-padded hex so lexical sort equals numeric sort. The
+  header still carries the 12-byte `chunkId` for self-identification; the namespace
+  is **not** in the header (it is the directory). Recovery walks
+  `chunks/<ns>/<L1>/<L2>/*`, derives `(namespace, fileId, index)` from the path, and
+  recovers namespaces in parallel.
+
+### 20.3 Owner-driven reconcile (replaces the inventory push) — *planned*
+
+Replace "every node pushes its full chunk list to the leader every 30s" with
+owner-pull batched verification: a `VERIFY_CHUNKS` RPC where each owner iterates its
+own namespaces' files and asks each expected replica node, in bounded batches,
+`present-ok / missing / corrupt`; `missing|corrupt` drops the replica and the
+owner's under-replication repair re-replicates within its namespace. Node-side
+`scrubOnce` (full re-CRC every 5 min) becomes a rolling re-CRC of a fraction of
+sealed chunks per cycle. Node-death under-replication stays on the reconcile scan;
+the node records "last verified by which owner, when" to feed orphan GC. Payload is
+bounded by batch size, not by the node's total chunk count, and the work shards
+across owners.
+
+### 20.4 Orphan GC (node-local: grace → owner confirm → fail-safe) — *planned*
+
+A chunk not verified by any owner within a grace window becomes a *suspect* (not a
+delete). Before deleting, the node derives the namespace from the chunk's directory,
+routes to `ownerOf(namespace)`, and asks "does chunk X's descriptor still list me as
+a replica?":
+
+| owner answer | node action |
+|---|---|
+| no / file gone / no such namespace | confirmed orphan → delete the three files |
+| yes, you should have it | not orphan → reset timer, keep |
+| unreachable / error | do **not** delete; retry later (fail-safe) |
+
+Worst case is delayed reclamation, never data loss. The node may trust "no owner
+verified" only after hearing ≥1 verify from every current owner (membership-epoch
+grace, reset on owner-set change). This confirm step is the unique justification for
+putting the namespace on the node: owner-driven verify alone does not need it; safe
+node-local GC does.
+
+### 20.5 Correctness anchors
+
+- **Id reuse on owner failover** (corruption guard) — the highest risk. The
+  high-water-in-snapshot plus tail-replay recovery, and a failure-injection test
+  across the assign/append/snapshot/compaction crash windows, assert no file id is
+  ever reassigned.
+- **Orphan false-positive fail-safe** (data-loss guard) — an owner unreachable
+  during confirm must not trigger a delete; the node retries and keeps the chunk on
+  "you should have it".
+- This design **reverses the earlier namespace-scope-preference** (namespace was
+  metadata/control-plane only): the namespace now lives in the data plane,
+  justified by self-describing storage, ops visibility, and safe node-local GC.
+- For how an owner fenced on a stale epoch reclaims its meta-log rather than
+  wedging, see §14 "Stale-epoch owner re-acquire".

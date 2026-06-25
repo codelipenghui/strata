@@ -8,6 +8,8 @@ import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 import org.apache.zookeeper.KeeperException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -45,6 +47,8 @@ import java.util.function.Predicate;
  * {@code listNamespaces}) run lock-free over the {@link ConcurrentHashMap} of repos.
  */
 final class NamespaceLogBackend implements AutoCloseable {
+
+    private static final Logger log = LoggerFactory.getLogger(NamespaceLogBackend.class);
 
     /** Reserved namespace holding the metadata-log/snapshot system files; routed to the ZK root. */
     static final StrataNamespace SYSTEM_NAMESPACE = StrataNamespace.of("strata-meta");
@@ -127,14 +131,82 @@ final class NamespaceLogBackend implements AutoCloseable {
         }
     }
 
+    @FunctionalInterface
+    private interface RepoTxn<T> {
+        T run(NamespaceMetadataLogRepository repo) throws Exception;
+    }
+
+    /**
+     * Runs a mutating transaction against this node's repository for {@code namespace}, re-acquiring the
+     * meta-log and retrying ONCE if the append is fenced ({@link ErrorCode#FENCED_EPOCH}) because another
+     * opener republished the manifest at a higher epoch.
+     *
+     * <p>Without this, a controller that briefly co-owned a namespace during a membership settle keeps a
+     * cached repository at the stale epoch, so every meta-log append fences forever — the file never
+     * finalizes and {@code ownerRepairPass} skips it every scan (the observed permanent wedge). The retry
+     * evicts the stale repo and re-opens it ({@link #reacquire}), which allocates a fresh epoch and
+     * recovers the latest durable state, then replays the transaction against it. Callers reach this only
+     * for namespaces this node owns (owner-routed creates; ownsNamespace-gated repair), so re-acquiring
+     * reclaims the meta-log for the rightful owner rather than stealing it; the retry is bounded to one
+     * attempt, so a genuine ownership disagreement surfaces as the fence rather than looping.
+     */
+    private <T> T withRepoReacquiringOnFence(StrataNamespace namespace, RepoTxn<T> txn) throws Exception {
+        NamespaceMetadataLogRepository repo = repo(namespace);
+        try {
+            return runLocked(repo, txn);
+        } catch (Exception e) {
+            if (!isFencedEpoch(e)) {
+                throw e;
+            }
+            log.warn("namespace {} meta-log append fenced (stale epoch) — re-acquiring and retrying once",
+                    namespace, e);
+            metrics.recordReacquire();
+        }
+        return runLocked(reacquire(namespace, repo), txn);
+    }
+
+    private static <T> T runLocked(NamespaceMetadataLogRepository repo, RepoTxn<T> txn) throws Exception {
+        repo.lock();
+        try {
+            return txn.run(repo);
+        } finally {
+            repo.unlock();
+        }
+    }
+
+    /**
+     * Evicts {@code stale} (the repo we were fenced on) and re-opens this namespace at a fresh epoch.
+     * The conditional remove lets a concurrent re-acquire win: if another thread already replaced the
+     * cache entry, its fresh repo is reused rather than churning yet another epoch.
+     */
+    private NamespaceMetadataLogRepository reacquire(StrataNamespace namespace,
+            NamespaceMetadataLogRepository stale) throws Exception {
+        repoCreateLock.lock();
+        try {
+            repos.remove(namespace, stale); // no-op if another thread already re-acquired
+            return repo(namespace);          // re-opens at a fresh epoch (recovers latest state) if we evicted
+        } finally {
+            repoCreateLock.unlock();
+        }
+    }
+
+    /** True if {@code FENCED_EPOCH} appears anywhere in the cause chain — the append wraps it in an
+     *  {@code ExecutionException} on the real Strata-file store, raw on the in-memory test store. */
+    private static boolean isFencedEpoch(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof ScpException se && se.code() == ErrorCode.FENCED_EPOCH) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void createFile(Records.FileRecord record) throws Exception {
         if (isSystem(record.namespace())) {
             root.createFile(record); // metadata-log system file — lives in the ZK root (lock-free)
             return;
         }
-        NamespaceMetadataLogRepository repo = repo(record.namespace());
-        repo.lock();
-        try {
+        withRepoReacquiringOnFence(record.namespace(), repo -> {
             NamespaceMetadataState state = repo.state();
             if (state.hasTombstone(record.fileId()) || state.file(record.fileId()).isPresent()) {
                 throw new KeeperException.NodeExistsException("file " + record.fileId());
@@ -150,9 +222,8 @@ final class NamespaceLogBackend implements AutoCloseable {
             for (MetadataLogRecord r : MetadataLogDiff.diff(created, record)) {
                 repo.append(r);
             }
-        } finally {
-            repo.unlock();
-        }
+            return null;
+        });
     }
 
     /**
@@ -184,9 +255,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             root.createFile(sysRecord);
             return sysRecord.fileId();
         }
-        NamespaceMetadataLogRepository repo = repo(template.namespace());
-        repo.lock();
-        try {
+        return withRepoReacquiringOnFence(template.namespace(), repo -> {
             NamespaceMetadataState state = repo.state();
             // --- opId-keyed idempotency (O(1) index lookup) ---
             Optional<FileId> existing = state.fileIdForOpId(template.createOpMsb(), template.createOpLsb());
@@ -226,9 +295,7 @@ final class NamespaceLogBackend implements AutoCloseable {
                     template.path(), template.replicationFactor(), template.ackQuorum(), template.fsyncOnAck(),
                     template.createdAtMs(), template.createOpMsb(), template.createOpLsb()));
             return id;
-        } finally {
-            repo.unlock();
-        }
+        });
     }
 
     /** True if the existing file's write policy matches the template. */
@@ -283,9 +350,7 @@ final class NamespaceLogBackend implements AutoCloseable {
         if (isSystem(record.namespace())) {
             return root.updateFile(record, expectedVersion);
         }
-        NamespaceMetadataLogRepository repo = repo(record.namespace());
-        repo.lock();
-        try {
+        return withRepoReacquiringOnFence(record.namespace(), repo -> {
             NamespaceMetadataState state = repo.state();
             Optional<Records.FileRecord> current = state.file(record.fileId());
             if (current.isEmpty() || state.version(record.fileId()) != expectedVersion) {
@@ -295,18 +360,14 @@ final class NamespaceLogBackend implements AutoCloseable {
                 repo.append(r);
             }
             return true;
-        } finally {
-            repo.unlock();
-        }
+        });
     }
 
     boolean deletePath(StrataNamespace namespace, StrataPath path, FileId expectedFileId) throws Exception {
         if (isSystem(namespace)) {
             return root.deletePath(namespace, path, expectedFileId);
         }
-        NamespaceMetadataLogRepository repo = repo(namespace);
-        repo.lock();
-        try {
+        return withRepoReacquiringOnFence(namespace, repo -> {
             Optional<FileId> bound = repo.state().resolvePath(path);
             if (bound.isEmpty()) {
                 return true; // already unbound — idempotent
@@ -316,9 +377,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             }
             repo.append(new MetadataLogRecord.PathUnbound(namespace, path, expectedFileId));
             return true;
-        } finally {
-            repo.unlock();
-        }
+        });
     }
 
     boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) throws Exception {
@@ -326,9 +385,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             // metadata-log system file lives in the root — lock-free
             return root.deleteFile(namespace, id, expectedVersion);
         }
-        NamespaceMetadataLogRepository repo = repo(namespace);
-        repo.lock();
-        try {
+        return withRepoReacquiringOnFence(namespace, repo -> {
             NamespaceMetadataState state = repo.state();
             Optional<Records.FileRecord> current = state.file(id);
             if (current.isEmpty()) {
@@ -343,9 +400,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             }
             repo.append(new MetadataLogRecord.FileDeleted(id, System.currentTimeMillis()));
             return true;
-        } finally {
-            repo.unlock();
-        }
+        });
     }
 
     List<FileId> listFiles(StrataNamespace namespace) throws Exception {

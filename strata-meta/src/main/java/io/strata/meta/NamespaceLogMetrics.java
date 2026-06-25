@@ -25,6 +25,7 @@ final class NamespaceLogMetrics {
     private final LongAdder appendBytes = new LongAdder();
     private final LongAdder compactions = new LongAdder();
     private final LongAdder recoveries = new LongAdder();
+    private final LongAdder reacquisitions = new LongAdder();
 
     void recordAppend(long bytes) {
         appendRecords.increment();
@@ -37,6 +38,11 @@ final class NamespaceLogMetrics {
 
     void recordRecovery() {
         recoveries.increment();
+    }
+
+    /** A fenced (stale-epoch) meta-log append forced this node to re-acquire and retry — owner churn. */
+    void recordReacquire() {
+        reacquisitions.increment();
     }
 
     long appendRecords() {
@@ -53,5 +59,9 @@ final class NamespaceLogMetrics {
 
     long recoveries() {
         return recoveries.sum();
+    }
+
+    long reacquisitions() {
+        return reacquisitions.sum();
     }
 }
