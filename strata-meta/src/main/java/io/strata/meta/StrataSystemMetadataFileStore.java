@@ -10,6 +10,7 @@ import io.strata.common.StrataPath;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
@@ -136,8 +137,14 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
 
     private StrataClient.FileSpec systemFileSpec(StrataNamespace ns, long generation, String kind) {
         // Path encodes (ns, generation, kind) for human-readable traceability; the server assigns the FileId.
+        // A unique token (UUID) is appended to the leaf so every create attempt uses a fresh path — retried
+        // or raced compactions (same ns/generation/kind) therefore never collide at the ZK path level and
+        // cannot trigger NodeExistsException. Readers always look up files by FileId via openById(), not by
+        // path, so the unique leaf does not affect correctness; any orphan left by a failed attempt is
+        // reclaimed by the normal orphan-GC path.
         return new StrataClient.FileSpec(NamespaceLogBackend.SYSTEM_NAMESPACE,
-                StrataPath.of("/metadata-log/" + ns + "/gen-" + generation + "/" + kind), policy);
+                StrataPath.of("/metadata-log/" + ns + "/gen-" + generation + "/" + kind + "-"
+                        + UUID.randomUUID()), policy);
     }
 
     private StrataClient client() {
