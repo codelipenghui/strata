@@ -33,8 +33,9 @@ public enum Opcode {
     ALLOCATE_WRITER_EPOCH(0x0209),
     // direct metadata-owner -> data-node repair: a non-controller namespace owner, which has no heartbeat
     // command channel, tells a target node to pull a chunk from a live source (reuses the proven
-    // ControlLoop.replicate path). Append-only — kept last (design §11).
-    EXEC_REPLICATE(0x020A);
+    // ControlLoop.replicate path). Data-plane opcode (< 0x0100) so the combined-node router sends it to
+    // DataNodeHandlers, not the Controller. Append-only — kept last in the data-plane block (design §11).
+    EXEC_REPLICATE(0x001B);
 
     public final short code;
 
