@@ -904,6 +904,64 @@ class RepairCoordinatorTest {
     }
 
     /**
+     * Regression test for the cross-namespace DeleteAction in-flight dedup collision.
+     *
+     * Pre-fix: the alreadyInflight predicate in driveDeletion matched on (chunkId, nodeId) only, with no
+     * namespace check. FileId values are per-namespace and ChunkId = (FileId, index) carries no namespace,
+     * so two DELETING files in different namespaces with the same numeric FileId and chunk index produce the
+     * same ChunkId. The second namespace's DeleteAction was suppressed by the first's in-flight entry, so
+     * its physical chunk delete was never enqueued and the file stayed DELETING forever.
+     *
+     * Post-fix: && d.namespace().equals(ns) is added to the predicate, so the dedup is per-namespace.
+     *
+     * Setup: one coordinator, one store. scanOnce drives nsA/fileId(2001)/chunk(0) into inflight.
+     * Then driveDeletion is called reflectively for nsB/fileId(2001)/chunk(0) — same ChunkId, different
+     * namespace. The nsB DeleteCmd must be enqueued. Pre-fix: suppressed → assertion fails.
+     */
+    @Test
+    void driveDeletionEnqueuesDeleteForBothNamespacesWhenChunkIdsCollide() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Registered node = register(registry, 9200, "collision-node");
+
+        StrataNamespace nsA = StrataNamespace.of("ns-a");
+        StrataNamespace nsB = StrataNamespace.of("ns-b");
+        FileId sharedFileId = fileId(2001); // same numeric id in both namespaces → same ChunkId
+
+        // nsA file in the store so scanOnce picks it up and populates inflight.
+        store.createFile(new Records.FileRecord(sharedFileId, nsA,
+                io.strata.common.StrataPath.of("/da"), 3, 2, false,
+                FileState.DELETING, 1,
+                List.of(sealed(0, 64, 0xAA, List.of(node.nodeId())))));
+
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
+
+        // scanOnce drives nsA's deletion: enqueues DeleteCmd(nsA/sharedFileId/chunk0, node) into inflight.
+        coordinator.scanOnce();
+
+        // Drain nsA's DeleteCmd from the registry queue (heartbeat without completions — action stays inflight).
+        Messages.HeartbeatResp afterNsA = heartbeat(registry, coordinator, node, List.of());
+        assertEquals(1, afterNsA.commands().size(), "nsA DeleteCmd must be enqueued");
+        assertInstanceOf(Messages.DeleteCmd.class, afterNsA.commands().get(0));
+
+        // Drive driveDeletion for nsB with the SAME fileId and chunk index (identical ChunkId, different ns).
+        // driveDeletion is private; call it reflectively, same pattern as issueReplicate above.
+        Records.FileRecord fileBRecord = new Records.FileRecord(sharedFileId, nsB,
+                io.strata.common.StrataPath.of("/db"), 3, 2, false,
+                FileState.DELETING, 1,
+                List.of(sealed(0, 64, 0xBB, List.of(node.nodeId()))));
+        invokeDriveDeletion(coordinator, fileBRecord, 0 /* store version */);
+
+        // Post-fix: nsB's DeleteCmd must be enqueued (namespace-aware dedup does not suppress it).
+        // Pre-fix: nsB's DeleteCmd is suppressed because (chunkId, nodeId) matches nsA's inflight entry
+        //          → assertEquals fails with 0 commands.
+        Messages.HeartbeatResp afterNsB = heartbeat(registry, coordinator, node, List.of());
+        assertEquals(1, afterNsB.commands().size(),
+                "nsB DeleteCmd must be enqueued; namespace-blind dedup suppressed it (pre-fix bug)");
+        assertInstanceOf(Messages.DeleteCmd.class, afterNsB.commands().get(0));
+    }
+
+    /**
      * Regression test for the per-file liveness bug in scanOnce (leader path): a poison file
      * must not abort the whole pass — the DELETING file that follows it must still be processed.
      * Pre-fix: the exception propagates out of the loop and the DELETING file is never reached.
@@ -1013,6 +1071,15 @@ class RepairCoordinatorTest {
                 "applyDeleteConfirmed", StrataNamespace.class, FileId.class, ChunkId.class, int.class);
         method.setAccessible(true);
         method.invoke(coordinator, TEST_NS, fileId, chunkId, nodeId);
+    }
+
+    /** Calls the private driveDeletion(FileRecord, int) on the coordinator via reflection. */
+    private static void invokeDriveDeletion(RepairCoordinator coordinator,
+                                            Records.FileRecord file, int version) throws Exception {
+        Method method = RepairCoordinator.class.getDeclaredMethod(
+                "driveDeletion", Records.FileRecord.class, int.class);
+        method.setAccessible(true);
+        method.invoke(coordinator, file, version);
     }
 
     private static Records.FileRecord file(FileId fileId, FileState state,

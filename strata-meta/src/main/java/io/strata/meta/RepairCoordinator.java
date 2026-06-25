@@ -771,7 +771,8 @@ class RepairCoordinator implements AutoCloseable {
                 }
                 boolean alreadyInflight = inflight.values().stream()
                         .anyMatch(a -> a instanceof DeleteAction d
-                                && d.chunkId().equals(chunkId) && d.nodeId() == nodeId);
+                                && d.chunkId().equals(chunkId) && d.nodeId() == nodeId
+                                && d.namespace().equals(ns));
                 if (!alreadyInflight) {
                     long cmdId = commandIds.incrementAndGet();
                     inflight.put(cmdId, new DeleteAction(ns, file.fileId(), chunkId, nodeId,
