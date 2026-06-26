@@ -97,10 +97,10 @@ class RepairCoordinator implements AutoCloseable {
     // tick() thread so a slow per-namespace enumeration can never stall lease expiry / command sweeping.
     private final ExecutorService repairEventExecutor = Executors.newSingleThreadExecutor(
             Thread.ofVirtual().name("meta-repair-event-", 0).factory());
-    // (nodeId:chunkId) -> first time the node's inventory reported a sealed replica unhealthy
-    // (missing or still locally OPEN/DELETING). A just-sealed chunk can race with an in-flight
-    // inventory snapshot; only drop the replica if it stays unhealthy past the grace, so churn can't
-    // falsely remove every good replica and trigger a re-replication storm.
+    // (nodeId:chunkId) -> first time an owner-pull VERIFY_CHUNKS report showed a sealed replica
+    // unhealthy (missing or still locally OPEN/DELETING). A just-sealed chunk can race with an
+    // in-flight verify pass; only drop the replica if it stays unhealthy past the grace, so churn
+    // can't falsely remove every good replica and trigger a re-replication storm.
     private final Map<String, Long> replicaMissingSince = new ConcurrentHashMap<>();
     private final Set<NsChunkId> chunksBeingRepaired = ConcurrentHashMap.newKeySet();
     private final Map<ReplicaKey, Long> recentlyCommittedReplicas = new ConcurrentHashMap<>();
@@ -1221,7 +1221,7 @@ class RepairCoordinator implements AutoCloseable {
         if (committedAt == null) {
             return false;
         }
-        long graceMs = inventoryStalenessGraceMs();
+        long graceMs = verifyStalenessGraceMs();
         if (System.currentTimeMillis() - committedAt <= graceMs) {
             return true;
         }
@@ -1241,7 +1241,7 @@ class RepairCoordinator implements AutoCloseable {
         return false;
     }
 
-    private long inventoryStalenessGraceMs() {
+    private long verifyStalenessGraceMs() {
         return Math.max(config.repairCommandTimeoutMs(), config.leaseMs() + config.deadGraceMs());
     }
 

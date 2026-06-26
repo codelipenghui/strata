@@ -19,7 +19,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Data node process: ChunkStore engine + SCP server + control loop (register/heartbeat/
- * inventory/commands) against the metadata plane. Identity is bound to the data volume
+ * scrub/commands; durability via owner-pull VERIFY_CHUNKS) against the metadata plane.
+ * Identity is bound to the data volume
  * (tech design §10.4): nodeId + incarnationId persist in an identity file.
  */
 public final class DataNode implements AutoCloseable {

@@ -175,7 +175,7 @@ class CrashRecoveryTest {
         }
         try (ChunkStore recovered = new ChunkStore(dir)) {
             // a sealed chunk whose footer fails its CRC must be quarantined, not served
-            assertEquals(0, recovered.inventory().size(),
+            assertEquals(0, recovered.describeChunks().size(),
                     "corrupt-footer chunk must not be recovered as healthy");
             assertFalse(Files.exists(dataPath()), "live chunk name must be free for repair import");
             Path shardDir = dataPath().getParent();
@@ -198,7 +198,7 @@ class CrashRecoveryTest {
         store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("x".getBytes()));
         Files.delete(metaPath());
         try (ChunkStore recovered = new ChunkStore(dir)) {
-            assertEquals(0, recovered.inventory().size());
+            assertEquals(0, recovered.describeChunks().size());
             assertFalse(Files.exists(dataPath()));
         }
     }

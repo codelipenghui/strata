@@ -1454,13 +1454,16 @@ public final class ChunkStore implements AutoCloseable {
         return ErrorCode.OK;
     }
 
-    public record InventoryItem(StrataNamespace namespace, ChunkId chunkId, ChunkState state, long length, int crc) {}
+    /** A point-in-time view of one stored chunk — for tests/diagnostics that inspect the store's contents. */
+    public record ChunkSummary(StrataNamespace namespace, ChunkId chunkId, ChunkState state, long length, int crc) {}
 
-    public List<InventoryItem> inventory() {
-        List<InventoryItem> out = new ArrayList<>();
+    /** Snapshots every chunk this store holds. No longer pushed anywhere (Phase 2 replaced the inventory
+     *  push with owner-pull VERIFY_CHUNKS); retained as a store-inspection accessor. */
+    public List<ChunkSummary> describeChunks() {
+        List<ChunkSummary> out = new ArrayList<>();
         for (Handle h : chunks.values()) {
             synchronized (h) {
-                out.add(new InventoryItem(h.ns, h.id, h.state, h.currentEnd(), h.dataCrc));
+                out.add(new ChunkSummary(h.ns, h.id, h.state, h.currentEnd(), h.dataCrc));
             }
         }
         return out;
@@ -1540,9 +1543,9 @@ public final class ChunkStore implements AutoCloseable {
     /**
      * Re-verifies sealed chunks' data regions against their trailer CRC (tech design §16
      * crash-safety / the read-path's deferred verification). On rot, the handle's dataCrc is
-     * updated to the RECOMPUTED value so the next inventory report mismatches the descriptor —
-     * the coordinator's existing corrupt-replica path then drops and re-repairs this copy.
-     * Returns the number of corrupt chunks found.
+     * updated to the RECOMPUTED value so the next owner-pull VERIFY_CHUNKS reports a crc that
+     * mismatches the descriptor — the coordinator's corrupt-replica path then drops and
+     * re-repairs this copy. Returns the number of corrupt chunks found.
      */
     public int scrubOnce() throws IOException {
         int corrupt = 0;
@@ -1564,7 +1567,7 @@ public final class ChunkStore implements AutoCloseable {
                 synchronized (h) {
                     if (h.state == ChunkState.SEALED && h.dataCrc == storedCrc) {
                         log.error("scrub: sealed chunk {} data rot — stored crc {} actual {}; "
-                                + "exposing via inventory for re-repair", h.id, storedCrc, actual);
+                                + "updating reported crc so the next owner verify re-repairs", h.id, storedCrc, actual);
                         h.dataCrc = actual;
                         corrupt++;
                     }

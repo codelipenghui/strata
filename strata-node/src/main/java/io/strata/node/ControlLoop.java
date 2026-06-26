@@ -31,7 +31,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Data-node control plane (tech design §10.4): register, heartbeat (commands ride the
- * responses), inventory reports, and the REPLICATE executor (pull via FETCH_CHUNK).
+ * responses), the periodic scrub (durability reconciles via owner-pull VERIFY_CHUNKS, not a
+ * node inventory push), and the REPLICATE executor (pull via FETCH_CHUNK).
  * Data nodes never read cluster metadata — everything here is self-reporting and obedience.
  */
 final class ControlLoop implements AutoCloseable {

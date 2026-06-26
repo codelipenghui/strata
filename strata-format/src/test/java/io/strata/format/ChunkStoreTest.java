@@ -1372,7 +1372,7 @@ class ChunkStoreTest {
             var sealed = store.seal(TEST_NS, id, 1, 8, null);
 
             assertEquals(0, store.scrubOnce());
-            assertEquals(sealed.dataCrc(), store.inventory().get(0).crc());
+            assertEquals(sealed.dataCrc(), store.describeChunks().get(0).crc());
         }
     }
 
@@ -1388,14 +1388,14 @@ class ChunkStoreTest {
     }
 
     @Test
-    void scrubDetectsDataRotAndExposesItThroughInventory() throws Exception {
+    void scrubDetectsDataRotAndExposesItThroughReportedCrc() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
             store.append(TEST_NS, id, 1, 0, 0, bytes("pristine-data!"));
             var sealed = store.seal(TEST_NS, id, 1, 14, null);
 
-            // inventory reports the seal-time CRC — descriptor and node agree
-            assertEquals(sealed.dataCrc(), store.inventory().get(0).crc());
+            // the chunk reports the seal-time CRC — descriptor and node agree
+            assertEquals(sealed.dataCrc(), store.describeChunks().get(0).crc());
 
             // bit-rot in the data region: the STORED crc still matches the descriptor, so only
             // recomputation can catch it
@@ -1403,18 +1403,18 @@ class ChunkStoreTest {
                     dir.resolve(rel(id) + ".chunk"), java.nio.file.StandardOpenOption.WRITE)) {
                 ch.write(ByteBuffer.wrap(new byte[]{0x7F}), ChunkFormats.DATA_START + 3);
             }
-            assertEquals(sealed.dataCrc(), store.inventory().get(0).crc(),
-                    "before scrub inventory still reports the seal-time crc");
+            assertEquals(sealed.dataCrc(), store.describeChunks().get(0).crc(),
+                    "before scrub the chunk still reports the seal-time crc");
             assertEquals(ErrorCode.CRC_MISMATCH,
                     assertThrows(ScpException.class, () -> store.read(TEST_NS, id, 0, 14)).code(),
                     "sealed reads must validate the covering CRC range before returning bytes");
 
             int corrupt = store.scrubOnce();
             assertEquals(1, corrupt, "scrub must detect the rotted chunk");
-            // inventory now exposes the RECOMPUTED crc — the coordinator's existing
+            // the reported crc now exposes the RECOMPUTED value — the coordinator's owner-pull verify
             // corrupt-mismatch path drops this replica and re-repairs from good copies
-            assertTrue(store.inventory().get(0).crc() != sealed.dataCrc(),
-                    "inventory must reflect the actual bytes after scrub");
+            assertTrue(store.describeChunks().get(0).crc() != sealed.dataCrc(),
+                    "the reported crc must reflect the actual bytes after scrub");
         }
     }
 
@@ -1567,7 +1567,7 @@ class ChunkStoreTest {
                 new ChunkFormats.Sidecar(1, -1, 0, ChunkState.OPEN).encode());
 
         try (ChunkStore recovered = newStore()) {
-            assertEquals(0, recovered.inventory().size());
+            assertEquals(0, recovered.describeChunks().size());
             // the invalid-name flat file is quarantined in dir
             assertTrue(Files.notExists(invalidName));
             try (Stream<Path> dirFiles = Files.list(dir)) {
@@ -1704,7 +1704,7 @@ class ChunkStoreTest {
             assertEquals(ErrorCode.CHUNK_NOT_FOUND, store.delete(TEST_NS, id));
             assertEquals(ErrorCode.CHUNK_NOT_FOUND,
                     assertThrows(ScpException.class, () -> store.read(TEST_NS, id, 0, 1)).code());
-            assertEquals(0, store.inventory().size());
+            assertEquals(0, store.describeChunks().size());
         }
     }
 
@@ -1917,7 +1917,7 @@ class ChunkStoreTest {
             assumeTrue(result != ErrorCode.OK, "delete failure not reproducible on this filesystem");
             assertEquals(ErrorCode.INTERNAL, result);
             assertTrue(store.contains(TEST_NS, id));
-            assertEquals(1, store.inventory().size());
+            assertEquals(1, store.describeChunks().size());
             assertEquals(ErrorCode.OK, store.delete(TEST_NS, id));
             assertEquals(ErrorCode.CHUNK_NOT_FOUND, store.delete(TEST_NS, id));
         }
@@ -1953,7 +1953,7 @@ class ChunkStoreTest {
         try (ChunkStore store = new ChunkStore(dir)) {
             assertArrayEquals(data0, store.read(ns0, same, 0, Integer.MAX_VALUE).bytes());
             assertArrayEquals(data1, store.read(ns1, same, 0, Integer.MAX_VALUE).bytes());
-            assertEquals(2, store.inventory().size());
+            assertEquals(2, store.describeChunks().size());
         }
     }
 
