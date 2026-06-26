@@ -15,38 +15,47 @@ import org.junit.jupiter.api.Test;
  */
 class RepairCoordinatorLoopTest {
     @Test
-    void tickRunsEachIntervalReconcileRunsOnReconcileInterval() throws Exception {
+    void tickAndReconcileRunEachIntervalTombstoneSweepIsThrottled() throws Exception {
         AtomicInteger ticks = new AtomicInteger();
         AtomicInteger reconciles = new AtomicInteger();
-        RepairCoordinator coord = newCountingCoordinator(ticks, reconciles, /*scanMs*/ 20, /*reconcileMs*/ 60);
+        AtomicInteger sweeps = new AtomicInteger();
+        RepairCoordinator coord = newCountingCoordinator(ticks, reconciles, sweeps,
+                /*scanMs*/ 20, /*reconcileMs*/ 60);
         coord.start();
         try {
-            // ~7 fast intervals -> ~7 ticks; reconcile fires roughly every 3rd -> ~2 reconciles
+            // ~7 fast intervals -> ~7 ticks and ~7 reconciles; the tombstone sweep fires roughly every
+            // 3rd interval -> ~2-3 sweeps.
             Thread.sleep(140);
         } finally {
             coord.close();
         }
         int t = ticks.get();
         int r = reconciles.get();
-        // Tolerant ranges: a sleeping virtual thread is not a precise clock. The load-bearing
-        // invariants are (a) tick fires far more often than reconcile, and (b) reconcile fires at
-        // least once but is clearly throttled below the fast cadence.
+        int s = sweeps.get();
+        // Tolerant ranges: a sleeping virtual thread is not a precise clock. The load-bearing invariants
+        // are (a) the full repair pass runs every fast interval alongside tick — so a delete/repair an
+        // interruption stranded re-drives within a tick, not a whole reconcile interval — and (b) only
+        // the tombstone sweep is throttled below that cadence.
         assertTrue(t >= 5, "ticks=" + t);
-        assertTrue(r >= 1 && r <= 3, "reconciles=" + r);
-        assertTrue(t > r, "tick must run more often than reconcile: ticks=" + t + " reconciles=" + r);
+        assertTrue(r >= 5, "reconciles=" + r);
+        assertTrue(s >= 1 && s < t,
+                "tombstone sweep must be throttled below the fast cadence: sweeps=" + s + " ticks=" + t);
     }
 
     /**
      * A coordinator whose {@code tick()}/{@code reconcile()} only bump counters. It is always leader
      * and owns every namespace, so the loop takes the leader path; the overrides replace the real
-     * housekeeping/backstop bodies, isolating this test to the loop's cadence decision.
+     * housekeeping/repair bodies, isolating this test to the loop's cadence decision. The tombstone
+     * sweep is not overridable (it is a {@code store} call straight from the loop), so the fake store
+     * counts it.
      */
     private static RepairCoordinator newCountingCoordinator(AtomicInteger ticks, AtomicInteger reconciles,
-                                                            int scanMs, int reconcileMs) throws Exception {
+                                                            AtomicInteger sweeps, int scanMs, int reconcileMs)
+            throws Exception {
         ControllerConfig config = new ControllerConfig("unused", 0, 1, 60_000, 0, scanMs, 1)
                 .withReconcileIntervalMs(reconcileMs)
                 .withReplicaMissingGraceMs(0);
-        FakeStore store = new FakeStore();
+        FakeStore store = new FakeStore(sweeps);
         NodeRegistry registry = new NodeRegistry(store, config);
         return new RepairCoordinator(store, registry, config, () -> true) {
             @Override
@@ -61,14 +70,21 @@ class RepairCoordinatorLoopTest {
         };
     }
 
-    /** Minimal store: the counting coordinator never touches it, so every method is a no-op stub. */
+    /** Minimal store: the counting coordinator never touches it but the loop sweeps tombstones. */
     private static final class FakeStore implements MetadataStore {
+        private final AtomicInteger sweeps;
+
+        FakeStore(AtomicInteger sweeps) {
+            this.sweeps = sweeps;
+        }
+
         @Override
         public void createFile(Records.FileRecord record) {
         }
 
         @Override
         public int sweepDeletedFiles(long olderThanMs) {
+            sweeps.incrementAndGet();
             return 0;
         }
 

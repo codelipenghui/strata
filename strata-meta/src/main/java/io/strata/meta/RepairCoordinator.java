@@ -211,21 +211,29 @@ class RepairCoordinator implements AutoCloseable {
             new java.util.concurrent.locks.ReentrantLock();
 
     private void scanLoop() {
-        long lastReconcile = 0;
+        long lastTombstoneSweep = 0;
         while (!closed.get()) {
             try {
                 Thread.sleep(config.repairScanIntervalMs());
-                // Lane A — cheap in-memory housekeeping every fast interval (leader-gated inside).
+                // Lane A — cheap in-memory housekeeping: lease expiry plus event-driven repair of
+                // newly-dead nodes (leader-gated inside).
                 tick();
-                // Lane C — full backstop pass on the slow cadence. Until the event path lands, repair
-                // correctness still rests entirely on this (now slower) reconcile.
+                // Lane C — the full under-replication repair and DELETING re-drive pass, run every
+                // fast interval (self-gates on leader + settle). Convergence needs *repeated* passes: a
+                // pass drives the outstanding deletes/repairs, the holders re-register and confirm over
+                // a heartbeat cycle, and a later pass finalizes. The event path only re-drives newly-dead
+                // nodes — not a delete/repair a metadata failover or node crash interrupted mid-flight —
+                // so a single slow pass would strand that work until the next interval, outlasting every
+                // convergence deadline. Until the event path also covers missing replicas and delete
+                // finalization, this pass carries that correctness.
+                reconcile();
+                // Tombstone GC is the one genuinely periodic chore and does not gate convergence (a file
+                // reads as deleted the moment it reaches DELETED, well before its tombstone is swept), so
+                // it stays on the slow reconcileIntervalMs cadence instead of running every tick.
                 long now = System.currentTimeMillis();
-                if (now - lastReconcile >= config.reconcileIntervalMs()) {
-                    reconcile();
-                    // Advance the cadence clock only after a reconcile that actually ran to completion:
-                    // if reconcile() throws (e.g. a transient store outage), the backstop did no work, so
-                    // the next fast tick retries it promptly instead of waiting a whole reconcile interval.
-                    lastReconcile = now;
+                if (isLeader.getAsBoolean() && now - lastTombstoneSweep >= config.reconcileIntervalMs()) {
+                    store.sweepDeletedFiles(DELETED_TOMBSTONE_TTL_MS);
+                    lastTombstoneSweep = now;
                 }
             } catch (InterruptedException e) {
                 return;
@@ -361,7 +369,6 @@ class RepairCoordinator implements AutoCloseable {
             return;
         }
         scanOnce();
-        store.sweepDeletedFiles(DELETED_TOMBSTONE_TTL_MS);
     }
 
     /**
