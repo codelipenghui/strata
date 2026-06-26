@@ -19,6 +19,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -79,5 +80,81 @@ class OrphanGcTest {
             assertTrue(store.contains(NS, chunk),
                     "an unreachable owner must never trigger a delete (fail-safe data-loss guard, §20.5)");
         }
+    }
+
+    @Test
+    void confirmSkipsNotLeaderControllersAndTrustsTheOwningController() throws Exception {
+        ChunkId orphan = new ChunkId(FileId.of(1), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer notOwner = notLeaderServer();
+             ScpServer owner = fileNotFoundServer()) {
+            seal(store, orphan);
+            // the non-owner is listed FIRST: confirm must redirect past its NOT_LEADER to the real owner.
+            OrphanGc gc = new OrphanGc(store, NODE_ID,
+                    List.of("127.0.0.1:" + notOwner.port(), "127.0.0.1:" + owner.port()), 0, 60_000, 0);
+            gc.gcOnce();
+
+            assertFalse(store.contains(NS, orphan),
+                    "confirm must skip the NOT_LEADER controller and act on the owner's authoritative FILE_NOT_FOUND");
+        }
+    }
+
+    @Test
+    void keepsSuspectWhenEveryControllerRedirectsNotLeaderFailSafe() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer a = notLeaderServer();
+             ScpServer b = notLeaderServer()) {
+            seal(store, chunk);
+            OrphanGc gc = new OrphanGc(store, NODE_ID,
+                    List.of("127.0.0.1:" + a.port(), "127.0.0.1:" + b.port()), 0, 60_000, 0);
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, chunk),
+                    "all controllers redirect (NOT_LEADER) and none owns the namespace → no definitive answer → keep");
+        }
+    }
+
+    @Test
+    void startupGraceSuppressesGcUntilWarmupElapses() throws Exception {
+        ChunkId orphan = new ChunkId(FileId.of(1), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileNotFoundServer()) {
+            seal(store, orphan);
+            String endpoint = "127.0.0.1:" + owner.port();
+            // grace 0 makes the chunk an immediate suspect and the owner would confirm it an orphan, but a
+            // 600ms node-startup grace must suppress the GC loop (scanning every 30ms) until warm-up elapses.
+            try (OrphanGc gc = new OrphanGc(store, NODE_ID, List.of(endpoint), 0, 30, 600)) {
+                gc.start();
+                Thread.sleep(200); // several scan intervals in, still inside the 600ms startup grace
+                assertTrue(store.contains(NS, orphan),
+                        "the node-startup grace must defer GC until the owner-pull verify has had a cycle to attest");
+
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                while (store.contains(NS, orphan) && System.nanoTime() < deadline) {
+                    Thread.sleep(20);
+                }
+                assertFalse(store.contains(NS, orphan),
+                        "once the startup grace elapses the confirmed orphan is GC'd by the loop");
+            }
+        }
+    }
+
+    private static ScpServer notLeaderServer() throws Exception {
+        return new ScpServer(0, 0, 0, 0, req -> {
+            if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+            }
+            throw new ScpException(ErrorCode.NOT_LEADER, "not the owner of this namespace");
+        });
+    }
+
+    private static ScpServer fileNotFoundServer() throws Exception {
+        return new ScpServer(0, 0, 0, 0, req -> {
+            if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+            }
+            throw new ScpException(ErrorCode.FILE_NOT_FOUND, "no such file");
+        });
     }
 }
