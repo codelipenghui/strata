@@ -739,6 +739,20 @@ class RepairCoordinator implements AutoCloseable {
             return;
         }
         String key = nodeId + ":" + ns + ":" + chunkId;
+        boolean healthy = r.present() && r.state() == ChunkState.SEALED
+                && r.length() == exp.length() && r.crc() == exp.crc();
+        // Last-live-replica guard (data-loss hardening): never let a verdict drop the only remaining
+        // live replica of a chunk. A false-positive verdict — a transient miss or a bogus crc — must not
+        // turn a recoverable degraded chunk into an unavailable one (0 live replicas). The reconcile scan
+        // re-replicates once a healthy peer exists; until then keeping the (possibly bad) last copy
+        // referenced is strictly safer than dropping it. The anomaly stays tracked, so the drop fires as
+        // soon as another live replica exists.
+        if (!healthy && exp.replicas().stream().filter(n -> n != nodeId && !registry.isDead(n)).count() == 0) {
+            log.warn("verify: keeping last live replica {} of chunk {} despite verdict "
+                            + "(present={} state={}) — dropping it would leave 0 live replicas",
+                    nodeId, chunkId, r.present(), r.state());
+            return;
+        }
         if (!r.present()) {
             if (replicaUnhealthyPastGrace(key, now)) {
                 log.warn("verify: node {} missing sealed chunk {} (>= {}ms) — dropping replica for re-repair",

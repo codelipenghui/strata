@@ -104,7 +104,7 @@ public final class StrataServer {
                 env("STRATA_RACK", "r0"),
                 env("STRATA_HOST", hostname),
                 longEnv("STRATA_CAPACITY_BYTES", 1L << 40),  // 1 TiB
-                intEnv("STRATA_SCRUB_INTERVAL_MS", 30_000))
+                intEnv("STRATA_SCRUB_INTERVAL_MS", 300_000)) // full re-CRC every 5 min (was 30s push x10)
                 .withNodeId(requiredIntEnv("STRATA_NODE_ID"));
         DataNode node = new DataNode(config);
         log.info("data node started: endpoint={} dataDir={} controller={}",
@@ -163,7 +163,7 @@ public final class StrataServer {
                 env("STRATA_RACK", "r0"),
                 env("STRATA_HOST", hostname),
                 longEnv("STRATA_CAPACITY_BYTES", 1L << 40),  // 1 TiB
-                intEnv("STRATA_SCRUB_INTERVAL_MS", 30_000))
+                intEnv("STRATA_SCRUB_INTERVAL_MS", 300_000)) // full re-CRC every 5 min (was 30s push x10)
                 .withNodeId(requiredIntEnv("STRATA_NODE_ID"));
         Combined combined = startCombined(controllerConfig, nodeConfig);
         log.info("combined node started: scp={} zk={}", combined.node().endpoint(), controllerConfig.zkConnect());
