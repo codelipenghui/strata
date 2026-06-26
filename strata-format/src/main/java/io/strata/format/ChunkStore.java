@@ -1492,6 +1492,27 @@ public final class ChunkStore implements AutoCloseable {
         return out;
     }
 
+    /** A locally-held sealed chunk no owner has verified within the grace window (orphan-GC candidate). */
+    public record SuspectChunk(StrataNamespace namespace, ChunkId chunkId) {}
+
+    /**
+     * Node-local orphan-GC candidates (design §20.4): sealed chunks no owner has attested within
+     * {@code olderThanMs} (via {@link #verify}). Open chunks (in-flight writes) and freshly-known chunks
+     * (still inside grace) are excluded. Returns a snapshot; the caller confirms each with the owner
+     * before deleting — a suspect is not yet a confirmed orphan.
+     */
+    public List<SuspectChunk> orphanSuspects(long olderThanMs, long now) {
+        List<SuspectChunk> out = new ArrayList<>();
+        for (Handle h : chunks.values()) {
+            synchronized (h) {
+                if (h.state == ChunkState.SEALED && now - h.lastVerifiedAtMs >= olderThanMs) {
+                    out.add(new SuspectChunk(h.ns, h.id));
+                }
+            }
+        }
+        return out;
+    }
+
     public long usedBytes() {
         long total = 0;
         for (Handle h : chunks.values()) {

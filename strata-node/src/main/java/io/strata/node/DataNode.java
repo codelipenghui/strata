@@ -29,6 +29,7 @@ public final class DataNode implements AutoCloseable {
     private final ChunkStore store;
     private final ScpServer server;
     private final ControlLoop controlLoop;
+    private final OrphanGc orphanGc; // node-local orphan GC (design §20.4); null in standalone mode
     private final AtomicBoolean draining = new AtomicBoolean(false);
 
     private final int nodeId;
@@ -57,6 +58,7 @@ public final class DataNode implements AutoCloseable {
         ChunkStore openedStore = null;
         ScpServer openedServer = null;
         ControlLoop startedLoop = null;
+        OrphanGc startedGc = null;
         try {
             openedStore = new ChunkStore(config.dataDir().resolve("chunks"));
             DataNodeHandlers dataHandler = new DataNodeHandlers(openedStore, this);
@@ -72,11 +74,18 @@ public final class DataNode implements AutoCloseable {
                 this.controlLoop = startedLoop;
                 dataHandler.controlLoop(startedLoop); // serve direct owner-repair EXEC_REPLICATE
                 startedLoop.start();
+                // Node-local orphan GC (design §20.4): reclaim sealed chunks no owner references, after
+                // confirming with the namespace owner. Only a registered node runs it (it needs a nodeId
+                // to recognise itself in a descriptor and controller endpoints to ask).
+                startedGc = new OrphanGc(openedStore, nodeId, config.controllerEndpoints());
+                this.orphanGc = startedGc;
+                startedGc.start();
             } else {
                 this.controlLoop = null; // null in standalone data-plane tests
+                this.orphanGc = null;
             }
         } catch (IOException | RuntimeException e) {
-            Throwable closeFailure = closeAll(startedLoop, openedServer, openedStore);
+            Throwable closeFailure = closeAll(startedLoop, startedGc, openedServer, openedStore);
             if (closeFailure != null) {
                 e.addSuppressed(closeFailure);
             }
@@ -86,11 +95,18 @@ public final class DataNode implements AutoCloseable {
     }
 
     /** Closes whatever subset of the node's resources exists; returns the accumulated failure. */
-    private static Throwable closeAll(ControlLoop loop, ScpServer server, ChunkStore store) {
+    private static Throwable closeAll(ControlLoop loop, OrphanGc orphanGc, ScpServer server, ChunkStore store) {
         Throwable failure = null;
         if (loop != null) {
             try {
                 loop.close();
+            } catch (RuntimeException e) {
+                failure = Closeables.suppress(failure, e);
+            }
+        }
+        if (orphanGc != null) {
+            try {
+                orphanGc.close();
             } catch (RuntimeException e) {
                 failure = Closeables.suppress(failure, e);
             }
@@ -301,6 +317,6 @@ public final class DataNode implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
-        Closeables.throwIfFailed(closeAll(controlLoop, server, store));
+        Closeables.throwIfFailed(closeAll(controlLoop, orphanGc, server, store));
     }
 }

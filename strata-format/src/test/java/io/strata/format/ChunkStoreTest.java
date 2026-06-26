@@ -112,6 +112,29 @@ class ChunkStoreTest {
         }
     }
 
+    @Test
+    void orphanSuspectsListsOnlyUnverifiedSealedChunks() throws Exception {
+        try (ChunkStore store = newStore()) {
+            ChunkId sealed = new ChunkId(FileId.of(1), 0);
+            sealedBytes(store, sealed, "hello");
+            ChunkId open = new ChunkId(FileId.of(2), 0);
+            open(store, open, 1); // OPEN — an in-flight write is never a suspect
+
+            long now = System.currentTimeMillis();
+            // grace not yet elapsed (chunks just learned) -> no suspects
+            assertTrue(store.orphanSuspects(60_000, now).isEmpty(), "fresh chunks are inside grace");
+
+            // grace elapsed for everything -> only the SEALED chunk is a suspect, never the OPEN one
+            List<ChunkStore.SuspectChunk> suspects = store.orphanSuspects(0, now + 1);
+            assertEquals(List.of(new ChunkStore.SuspectChunk(TEST_NS, sealed)), suspects);
+
+            // a verify stamps the sealed chunk -> within grace it drops out of the suspect set
+            store.verify(TEST_NS, List.of(sealed));
+            assertTrue(store.orphanSuspects(60_000, System.currentTimeMillis()).isEmpty(),
+                    "a just-verified chunk is not a suspect");
+        }
+    }
+
     private static ChunkFormats.Trailer trailer(byte[] fileBytes) {
         return ChunkFormats.Trailer.decode(Arrays.copyOfRange(
                 fileBytes, fileBytes.length - ChunkFormats.TRAILER_SIZE, fileBytes.length));
