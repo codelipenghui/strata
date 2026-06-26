@@ -3,6 +3,7 @@ package io.strata.meta;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
@@ -19,26 +20,34 @@ class RepairCoordinatorLoopTest {
         AtomicInteger ticks = new AtomicInteger();
         AtomicInteger reconciles = new AtomicInteger();
         AtomicInteger sweeps = new AtomicInteger();
+        // reconcileMs = 20 * scanMs: a wide ratio so the throttle invariant (sweeps < ticks) holds even if
+        // load slows the loop thread by up to ~20x — only at that pathological skew could a single tick span
+        // a whole reconcile interval and let the sweep fire every tick.
         RepairCoordinator coord = newCountingCoordinator(ticks, reconciles, sweeps,
-                /*scanMs*/ 20, /*reconcileMs*/ 60);
+                /*scanMs*/ 10, /*reconcileMs*/ 200);
         coord.start();
         try {
-            // ~7 fast intervals -> ~7 ticks and ~7 reconciles; the tombstone sweep fires roughly every
-            // 3rd interval -> ~2-3 sweeps.
-            Thread.sleep(140);
+            // POLL for the counts rather than sleeping a fixed time and assuming a fixed number of ticks —
+            // a sleeping virtual thread is not a precise clock, and under CI load a fixed sleep yields too
+            // few ticks. Wait until the loop has ticked enough AND the throttled sweep has fired at least
+            // once, so the invariants below are evaluated on a meaningful sample regardless of scheduling.
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while ((ticks.get() < 20 || sweeps.get() < 1) && System.nanoTime() < deadline) {
+                Thread.sleep(5);
+            }
         } finally {
             coord.close();
         }
         int t = ticks.get();
         int r = reconciles.get();
         int s = sweeps.get();
-        // Tolerant ranges: a sleeping virtual thread is not a precise clock. The load-bearing invariants
-        // are (a) the full repair pass runs every fast interval alongside tick — so a delete/repair an
-        // interruption stranded re-drives within a tick, not a whole reconcile interval — and (b) only
-        // the tombstone sweep is throttled below that cadence.
-        assertTrue(t >= 5, "ticks=" + t);
-        assertTrue(r >= 5, "reconciles=" + r);
-        assertTrue(s >= 1 && s < t,
+        // The load-bearing invariants: (a) the full repair pass (reconcile) runs every fast interval
+        // alongside tick — so an interrupted delete/repair re-drives within a tick, not a whole reconcile
+        // interval — and (b) only the tombstone sweep is throttled below that cadence.
+        assertTrue(t >= 20, "ticks=" + t);
+        assertTrue(r >= t - 1, "reconcile runs every tick: reconciles=" + r + " ticks=" + t);
+        assertTrue(s >= 1, "the tombstone sweep ran at least once: sweeps=" + s);
+        assertTrue(s < t,
                 "tombstone sweep must be throttled below the fast cadence: sweeps=" + s + " ticks=" + t);
     }
 
