@@ -65,7 +65,7 @@ public final class StrataServer {
                 // hostname() default is the container/pod id — set STRATA_ADVERTISED_HOST to a name
                 // clients can resolve (the service/DNS name) whenever more than one replica runs.
                 .withAdvertisedHost(env("STRATA_ADVERTISED_HOST", hostname()))
-                .withReconcileIntervalMs(intEnv("STRATA_REPAIR_RECONCILE_INTERVAL_MS", 60_000));
+                .withReconcileIntervalMs(intEnv("STRATA_REPAIR_RECONCILE_INTERVAL_MS", 15_000));
         // Namespace sharding is OPT-IN (default off = single global leader). When enabled, namespaces are
         // rendezvous-assigned across STRATA_CONTROLLER_ENDPOINTS so each controller node owns a shard. The
         // client (ControllerClient) is sharding-aware: it keeps one connection per owner and routes each op
@@ -144,7 +144,7 @@ public final class StrataServer {
                 intEnv("STRATA_REPAIR_SCAN_INTERVAL_MS", 5_000),
                 intEnv("STRATA_REPAIR_COMMAND_TIMEOUT_MS", 30_000))
                 .withAdvertisedHost(advertisedHost)
-                .withReconcileIntervalMs(intEnv("STRATA_REPAIR_RECONCILE_INTERVAL_MS", 60_000));
+                .withReconcileIntervalMs(intEnv("STRATA_REPAIR_RECONCILE_INTERVAL_MS", 15_000));
         // Namespace sharding is OPT-IN (default off = single global leader). The sharding-aware client
         // (ControllerClient) keeps one connection per owner and routes each op to its namespace's owner,
         // so it does not thrash a single connection. Off by default to gate rollout. See runController /

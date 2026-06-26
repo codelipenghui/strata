@@ -97,7 +97,7 @@ public record ControllerConfig(
     }
 
     public static ControllerConfig forTests(String zkConnect) {
-        return new ControllerConfig(zkConnect, 0, 200, 1_000, 1_500, 300, 3_000, 60_000, 5_000, 20_000, "127.0.0.1",
+        return new ControllerConfig(zkConnect, 0, 200, 1_000, 1_500, 300, 3_000, 5_000, 5_000, 20_000, "127.0.0.1",
                 90_000, List.of(), 3);
     }
 }
