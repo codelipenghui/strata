@@ -643,50 +643,6 @@ public final class Messages {
         }
     }
 
-    public record InventoryEntry(ChunkId chunkId, ChunkState state, long length, int crc,
-                                 StrataNamespace namespace) {
-        public InventoryEntry {
-            namespace = Objects.requireNonNull(namespace, "namespace");
-        }
-    }
-
-    public record InventoryReport(int nodeId, long incMsb, long incLsb, long sessionEpoch,
-                                  int shardIndex, int shardCount, List<InventoryEntry> entries) {
-        public InventoryReport {
-            entries = List.copyOf(entries);
-        }
-
-        public byte[] encode() {
-            BufWriter w = new BufWriter();
-            w.u32(nodeId).u64(incMsb).u64(incLsb).u64(sessionEpoch).u32(shardIndex).u32(shardCount);
-            w.varint(entries.size());
-            for (InventoryEntry e : entries) {
-                w.chunkId(e.chunkId()).u8(e.state().value).u64(e.length()).u32(e.crc())
-                 .string(e.namespace().toString());
-            }
-            w.noTags();
-            return w.toBytes();
-        }
-
-        public static InventoryReport decode(ByteBuffer b) {
-            int nodeId = b.getInt();
-            long incMsb = b.getLong(), incLsb = b.getLong(), sessionEpoch = b.getLong();
-            int shard = b.getInt(), shardCount = b.getInt();
-            int n = count(b);
-            List<InventoryEntry> es = new ArrayList<>(n);
-            for (int i = 0; i < n; i++) {
-                ChunkId chunkId = ChunkId.readFrom(b);
-                ChunkState state = ChunkState.fromValue(b.get());
-                long length = b.getLong();
-                int crc = b.getInt();
-                StrataNamespace ns = StrataNamespace.of(Varint.readString(b));
-                es.add(new InventoryEntry(chunkId, state, length, crc, ns));
-            }
-            TaggedFields.readFrom(b);
-            return new InventoryReport(nodeId, incMsb, incLsb, sessionEpoch, shard, shardCount, es);
-        }
-    }
-
     /* ---------- owner-pull chunk verification (design §20.3) ---------- */
 
     /**

@@ -1005,7 +1005,9 @@ disk the namespace is the parent directory, so storage shards by directory and a
 walk yields the namespace for free; durability reconciliation moves from a central
 inventory push to owner-driven verification plus node-local, confirm-before-delete
 orphan GC. It is staged as three dependent phases (data model → owner verify →
-orphan GC); only the data-model phase has landed so far.
+orphan GC); **all three phases have landed**. The central inventory push has been
+removed — durability reconciliation is now owner-pull `VERIFY_CHUNKS` plus
+node-local, confirm-before-delete orphan GC.
 
 **Locked decisions.**
 
@@ -1063,20 +1065,25 @@ orphan GC); only the data-model phase has landed so far.
   `chunks/<ns>/<L1>/<L2>/*`, derives `(namespace, fileId, index)` from the path, and
   recovers namespaces in parallel.
 
-### 20.3 Owner-driven reconcile (replaces the inventory push) — *planned*
+### 20.3 Owner-driven reconcile (replaces the inventory push) — *implemented*
 
-Replace "every node pushes its full chunk list to the leader every 30s" with
-owner-pull batched verification: a `VERIFY_CHUNKS` RPC where each owner iterates its
-own namespaces' files and asks each expected replica node, in bounded batches,
-`present-ok / missing / corrupt`; `missing|corrupt` drops the replica and the
-owner's under-replication repair re-replicates within its namespace. Node-side
-`scrubOnce` (full re-CRC every 5 min) becomes a rolling re-CRC of a fraction of
-sealed chunks per cycle. Node-death under-replication stays on the reconcile scan;
-the node records "last verified by which owner, when" to feed orphan GC. Payload is
-bounded by batch size, not by the node's total chunk count, and the work shards
-across owners.
+Replaces "every node pushes its full chunk list to the leader every 30s" with
+owner-pull batched verification: a `VERIFY_CHUNKS` RPC (opcode `0x001c`) where each
+owner's verify thread (`RepairCoordinator.verifyPass`, settle-gated for a fresh
+leader) iterates its own namespaces' files and asks each expected replica node, in
+bounded batches, for the local state of each chunk; the owner judges
+`present-ok / missing / corrupt` against its descriptor (reusing the grace +
+`isRepairProtected` guards), `missing|corrupt` drops the replica, and the
+under-replication scan re-replicates within its namespace. Fail-safe: an unreachable
+node yields no verdict, never a drop. Node-death under-replication stays on the
+reconcile scan; the node stamps `lastVerifiedAtMs` per chunk to feed orphan GC.
+`INVENTORY_REPORT` and its messages are removed.
 
-### 20.4 Orphan GC (node-local: grace → owner confirm → fail-safe) — *planned*
+*Deferred (pure scale optimization):* node-side `scrubOnce` is still a full re-CRC
+of all sealed chunks per cycle (it keeps its deterministic single-call behavior).
+The rolling-fraction re-CRC remains a follow-up.
+
+### 20.4 Orphan GC (node-local: grace → owner confirm → fail-safe) — *implemented*
 
 A chunk not verified by any owner within a grace window becomes a *suspect* (not a
 delete). Before deleting, the node derives the namespace from the chunk's directory,
@@ -1089,11 +1096,19 @@ a replica?":
 | yes, you should have it | not orphan → reset timer, keep |
 | unreachable / error | do **not** delete; retry later (fail-safe) |
 
-Worst case is delayed reclamation, never data loss. The node may trust "no owner
-verified" only after hearing ≥1 verify from every current owner (membership-epoch
-grace, reset on owner-set change). This confirm step is the unique justification for
-putting the namespace on the node: owner-driven verify alone does not need it; safe
-node-local GC does.
+Worst case is delayed reclamation, never data loss. This confirm step is the unique
+justification for putting the namespace on the node: owner-driven verify alone does
+not need it; safe node-local GC does.
+
+*Implementation note (deviation):* the spec's strict "trust no-owner-verified only
+after hearing a verify from **every** owner" would deadlock when an owner has no
+described chunks on a node (it never contacts the node) — exactly the all-orphan
+case the test plants. Because the per-chunk `LOOKUP_FILE` confirm is **authoritative**
+(the owner recovers its meta-log before answering, §14, so a `FILE_NOT_FOUND` is
+never a stale empty-state false positive) and fail-safe (unreachable ⇒ keep),
+`OrphanGc` instead uses a time-based **node-startup grace** plus that confirm —
+deadlock-free and equally safe. A dynamic owner-set change resets the startup grace;
+the v0 owner set is static.
 
 ### 20.5 Correctness anchors
 

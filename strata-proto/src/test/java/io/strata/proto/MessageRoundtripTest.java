@@ -103,10 +103,6 @@ class MessageRoundtripTest {
                 new Messages.DeleteCmd(2, List.of(c), ns),
                 new Messages.DrainCmd(3)));
         assertEquals(hbResp, decodeResp(hbResp.encode(), Messages.HeartbeatResp::decode));
-
-        var inv = new Messages.InventoryReport(42, 1, 2, 9, 0, 1,
-                List.of(new Messages.InventoryEntry(c, ChunkState.SEALED, 4096, 0xAB, ns)));
-        assertEquals(inv, Messages.InventoryReport.decode(buf(inv.encode())));
     }
 
     @Test

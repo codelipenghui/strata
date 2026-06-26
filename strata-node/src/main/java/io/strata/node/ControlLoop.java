@@ -73,7 +73,7 @@ final class ControlLoop implements AutoCloseable {
     void start() {
         threads.add(Thread.ofVirtual().name("node-control-" + node.incarnation()).start(this::run));
         threads.add(Thread.ofVirtual().name("node-cmd-exec-" + node.incarnation()).start(this::executeCommands));
-        threads.add(Thread.ofVirtual().name("node-inventory-" + node.incarnation()).start(this::inventoryLoop));
+        threads.add(Thread.ofVirtual().name("node-scrub-" + node.incarnation()).start(this::scrubLoop));
     }
 
     private void run() {
@@ -333,29 +333,19 @@ final class ControlLoop implements AutoCloseable {
         return max;
     }
 
-    private void inventoryLoop() {
-        int cycle = 0;
+    /**
+     * Periodic local data scrub (design §20.3). With durability reconciliation now owner-driven (the
+     * owner pulls VERIFY_CHUNKS), there is no inventory push; the node only re-CRCs its sealed chunks so
+     * data rot surfaces in the next VERIFY_CHUNKS answer and the owner drops + re-repairs the replica.
+     */
+    private void scrubLoop() {
         while (!closed.get()) {
-            sleepQuiet(config.inventoryIntervalMs());
+            sleepQuiet(config.scrubIntervalMs());
             if (closed.get()) return;
             try {
-                // periodic scrub (every 10th cycle): recompute sealed data CRCs so rot shows up
-                // in the NEXT report's crc and the coordinator drops + re-repairs the replica
-                if (++cycle % 10 == 0) {
-                    store.scrubOnce();
-                }
-                ManagedScpConnection m = controller;
-                if (m == null || sessionEpoch < 0) continue;
-                List<Messages.InventoryEntry> entries = new ArrayList<>();
-                for (var item : store.inventory()) {
-                    entries.add(new Messages.InventoryEntry(item.chunkId(), item.state(), item.length(), item.crc(), item.namespace()));
-                }
-                var report = new Messages.InventoryReport(node.nodeId(),
-                        node.incarnation().getMostSignificantBits(), node.incarnation().getLeastSignificantBits(),
-                        sessionEpoch, 0, 1, entries);
-                m.call(Opcode.INVENTORY_REPORT, report.encode(), null, CALL_TIMEOUT_MS);
+                store.scrubOnce();
             } catch (Exception e) {
-                log.debug("inventory report failed: {}", e.toString());
+                log.debug("scrub failed: {}", e.toString());
             }
         }
     }

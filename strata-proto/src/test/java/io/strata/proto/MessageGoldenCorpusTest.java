@@ -52,7 +52,6 @@ class MessageGoldenCorpusTest {
                 "READ_RECOVERY=0x001a",
                 "REGISTER_NODE=0x0101",
                 "NODE_HEARTBEAT=0x0102",
-                "INVENTORY_REPORT=0x0103",
                 "CREATE_FILE=0x0201",
                 "CREATE_CHUNK=0x0202",
                 "SEAL_CHUNK_META=0x0203",
@@ -154,14 +153,14 @@ class MessageGoldenCorpusTest {
                                 0x5555666677778888L, FrameIO.MAX_FRAME_BYTES, 1L << 30).encode(),
                         Messages.HelloResp::decode,
                         // EXEC_REPLICATE moved from 0x020a (control-plane range) to 0x001b (data-plane)
-                        // to fix combined-node routing: opcodes >= 0x0100 route to Controller,
-                        // but EXEC_REPLICATE is handled by DataNodeHandlers (Bug B fix). VERIFY_CHUNKS
-                        // (0x001c) appended for owner-pull verification (design §20.3) — count 0x19 -> 0x1a.
+                        // to fix combined-node routing: opcodes >= 0x0100 route to Controller, but
+                        // EXEC_REPLICATE is handled by DataNodeHandlers (Bug B fix). VERIFY_CHUNKS (0x001c)
+                        // appended (§20.3); INVENTORY_REPORT (0x0103) removed (§20.3) — count back to 0x19.
                         "0000000101020304050607080000002a11112222333344445555666677778888"
-                                + "0400000000000000400000001a000100010010000100110001001200010013"
-                                + "0001001400010015000100160001001700010018000100190001001a0001"
-                                + "010100010102000101030001020100010202000102030001020400010205"
-                                + "000102060001020700010208000102090001001b0001001c000100"),
+                                + "040000000000000040000000190001000100100001001100010012000100130001"
+                                + "001400010015000100160001001700010018000100190001001a000101010001"
+                                + "0102000102010001020200010203000102040001020500010206000102070001"
+                                + "0208000102090001001b0001001c000100"),
                 request("openChunk",
                         new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L, NS),
                         () -> new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L, NS).encode(),
@@ -303,17 +302,6 @@ class MessageGoldenCorpusTest {
                         "0000000000000001e240030000000000000001011111111122223333000000030100000007"
                                 + "0768373a3930303001000000aa00000000000010000474657374"
                                 + "000000000000000202011111111122223333000000030474657374" + "0000000000000003" + "03" + "00"),
-                request("inventoryReport",
-                        new Messages.InventoryReport(42, 1, 2, 9, 0, 1,
-                                List.of(new Messages.InventoryEntry(CHUNK_ID, ChunkState.SEALED,
-                                        4096, 0xAB, NS))),
-                        () -> new Messages.InventoryReport(42, 1, 2, 9, 0, 1,
-                                List.of(new Messages.InventoryEntry(CHUNK_ID, ChunkState.SEALED,
-                                        4096, 0xAB, NS))).encode(),
-                        Messages.InventoryReport::decode,
-                        "0000002a000000000000000100000000000000020000000000000009000000000000"
-                                + "000101111111112222333300000003010000000000001000"
-                                + "000000ab" + "0474657374" + "00"),
                 request("createFile",
                         new Messages.CreateFile("test", "/kafka/topicA/0/00000000000000000000",
                                 OP_ID_MSB, OP_ID_LSB),

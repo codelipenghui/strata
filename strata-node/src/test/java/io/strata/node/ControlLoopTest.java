@@ -804,67 +804,6 @@ class ControlLoopTest {
         }
     }
 
-    @Test
-    void inventoryLoopReportsInventoryAndContinuesAfterReportFailure() throws Exception {
-        AtomicInteger inventoryReports = new AtomicInteger();
-        try (ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
-            Opcode op = Opcode.fromCode(req.opcode());
-            if (op == Opcode.REGISTER_NODE) {
-                Messages.RegisterNode.decode(req.headerSlice());
-                return ScpServer.ok(req, new Messages.RegisterResp(9, 12, 1, 1_000).encode(), null);
-            }
-            if (op == Opcode.INVENTORY_REPORT) {
-                Messages.InventoryReport.decode(req.headerSlice());
-                if (inventoryReports.incrementAndGet() == 1) {
-                    throw new ScpException(ErrorCode.INTERNAL, "temporary inventory failure");
-                }
-                return ScpServer.ok(req, Messages.okHeader(), null);
-            }
-            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
-        });
-             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, config(metaServer, 1), node.store());
-            invoke(loop, "ensureRegistered");
-
-            Thread worker = Thread.ofVirtual().name("control-loop-test-inventory").start(() -> {
-                try {
-                    invoke(loop, "inventoryLoop");
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
-            });
-            waitFor(() -> inventoryReports.get() >= 10);
-            getClosed(loop).set(true);
-            worker.interrupt();
-            worker.join(2_000);
-
-            assertTrue(inventoryReports.get() >= 10);
-            loop.close();
-        }
-    }
-
-    @Test
-    void inventoryLoopSkipsWhenNotRegistered() throws Exception {
-        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
-
-            Thread worker = Thread.ofVirtual().name("control-loop-test-inventory-unregistered").start(() -> {
-                try {
-                    invoke(loop, "inventoryLoop");
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
-            });
-            Thread.sleep(20);
-            getClosed(loop).set(true);
-            worker.interrupt();
-            worker.join(2_000);
-
-            assertFalse(worker.isAlive());
-            loop.close();
-        }
-    }
-
     private static DataNodeConfig config(ScpServer metaServer, int inventoryIntervalMs) {
         return config(List.of(endpoint(metaServer)), inventoryIntervalMs);
     }

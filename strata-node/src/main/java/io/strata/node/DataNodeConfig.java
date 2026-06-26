@@ -25,15 +25,15 @@ public record DataNodeConfig(
         String rack,
         String host,
         long capacityBytes,
-        int inventoryIntervalMs,
+        int scrubIntervalMs,             // cadence of the node-local sealed-chunk re-CRC scrub (design §20.3)
         ConnectionPolicy connectionPolicy,
         int nodeId                       // -1 = standalone/unregistered; otherwise >= 1
 ) {
     public DataNodeConfig(Path dataDir, int listenPort, String advertisedHost, String advertisedEndpointOverride,
                       List<String> controllerEndpoints, String zone, String rack, String host,
-                      long capacityBytes, int inventoryIntervalMs) {
+                      long capacityBytes, int scrubIntervalMs) {
         this(dataDir, listenPort, advertisedHost, advertisedEndpointOverride, controllerEndpoints,
-                zone, rack, host, capacityBytes, inventoryIntervalMs, ConnectionPolicy.DEFAULT, -1);
+                zone, rack, host, capacityBytes, scrubIntervalMs, ConnectionPolicy.DEFAULT, -1);
     }
 
     public DataNodeConfig {
@@ -60,8 +60,8 @@ public record DataNodeConfig(
         if (capacityBytes <= 0) {
             throw new IllegalArgumentException("capacityBytes must be positive: " + capacityBytes);
         }
-        if (inventoryIntervalMs <= 0) {
-            throw new IllegalArgumentException("inventoryIntervalMs must be positive: " + inventoryIntervalMs);
+        if (scrubIntervalMs <= 0) {
+            throw new IllegalArgumentException("scrubIntervalMs must be positive: " + scrubIntervalMs);
         }
         if (nodeId != -1 && nodeId < 1) {
             throw new IllegalArgumentException("nodeId must be -1 (standalone) or >= 1: " + nodeId);
@@ -86,26 +86,26 @@ public record DataNodeConfig(
 
     public static DataNodeConfig withMetadata(Path dataDir, List<String> controllerEndpoints, String host) {
         return new DataNodeConfig(dataDir, 0, "127.0.0.1", null, controllerEndpoints, "z0", "r0",
-                host, 1L << 40, 5_000);
+                host, 1L << 40, 30_000);
     }
 
     public DataNodeConfig withListenPort(int port) {
         return new DataNodeConfig(dataDir, port, advertisedHost, advertisedEndpointOverride,
-                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy, nodeId);
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId);
     }
 
     public DataNodeConfig withAdvertisedEndpoint(String endpoint) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, endpoint,
-                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy, nodeId);
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId);
     }
 
     public DataNodeConfig withConnectionPolicy(ConnectionPolicy policy) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
-                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, policy, nodeId);
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, policy, nodeId);
     }
 
     public DataNodeConfig withNodeId(int id) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
-                controllerEndpoints, zone, rack, host, capacityBytes, inventoryIntervalMs, connectionPolicy, id);
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, id);
     }
 }

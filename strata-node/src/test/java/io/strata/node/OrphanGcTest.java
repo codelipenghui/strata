@@ -1,0 +1,83 @@
+package io.strata.node;
+
+import io.strata.common.ChunkId;
+import io.strata.common.ChunkState;
+import io.strata.common.ErrorCode;
+import io.strata.common.FileId;
+import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
+import io.strata.format.ChunkStore;
+import io.strata.proto.Messages;
+import io.strata.proto.Opcode;
+import io.strata.proto.ScpServer;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/** Node-local orphan GC (design §20.4/§20.5): confirm-before-delete and the fail-safe data-loss guard. */
+class OrphanGcTest {
+    private static final StrataNamespace NS = StrataNamespace.of("test");
+    private static final int NODE_ID = 7;
+
+    @TempDir
+    Path dir;
+
+    private void seal(ChunkStore store, ChunkId id) throws IOException {
+        byte[] bytes = "orphan-bytes".getBytes(StandardCharsets.UTF_8);
+        store.open(NS, id, false, 1, 1_700_000_000_000L);
+        store.append(NS, id, 1, 0, 0, ByteBuffer.wrap(bytes));
+        store.seal(NS, id, 1, bytes.length, null);
+    }
+
+    @Test
+    void deletesConfirmedOrphanButKeepsAChunkTheOwnerStillLists() throws Exception {
+        ChunkId orphan = new ChunkId(FileId.of(1), 0); // owner answers FILE_NOT_FOUND
+        ChunkId listed = new ChunkId(FileId.of(2), 0); // owner still lists this node for the chunk
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 Messages.LookupFile m = Messages.LookupFile.decode(req.headerSlice());
+                 if (m.fileId().id() == 1) {
+                     throw new ScpException(ErrorCode.FILE_NOT_FOUND, "no such file");
+                 }
+                 Messages.ChunkInfo ci = new Messages.ChunkInfo(listed, ChunkState.SEALED, 12, 0, 1,
+                         List.of(new Messages.Replica(NODE_ID, "127.0.0.1:1")));
+                 return ScpServer.ok(req, new Messages.LookupFileResp(NS, StrataPath.of("/f2"),
+                         Messages.WritePolicy.DEFAULT, (byte) 0, List.of(ci)).encode(), null);
+             })) {
+            seal(store, orphan);
+            seal(store, listed);
+            String endpoint = "127.0.0.1:" + owner.port();
+            // grace 0 + startup 0 → every sealed chunk is an immediate suspect; gcOnce confirms each.
+            OrphanGc gc = new OrphanGc(store, NODE_ID, List.of(endpoint), 0, 60_000, 0);
+            gc.gcOnce();
+
+            assertFalse(store.contains(NS, orphan), "an unreferenced chunk (FILE_NOT_FOUND) must be GC'd");
+            assertTrue(store.contains(NS, listed), "a chunk the owner still lists must be kept");
+        }
+    }
+
+    @Test
+    void keepsSuspectWhenOwnerUnreachableFailSafe() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"))) {
+            seal(store, chunk);
+            // a controller endpoint with nothing listening — the confirm cannot complete.
+            OrphanGc gc = new OrphanGc(store, NODE_ID, List.of("127.0.0.1:1"), 0, 60_000, 0);
+            gc.gcOnce();
+            assertTrue(store.contains(NS, chunk),
+                    "an unreachable owner must never trigger a delete (fail-safe data-loss guard, §20.5)");
+        }
+    }
+}

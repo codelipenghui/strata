@@ -170,46 +170,6 @@ class MetadataFailoverTest {
         }
     }
 
-    @Test
-    void staleInventoryAfterLeaderFailoverCannotDropHealthyReplica() throws Exception {
-        try (MiniCluster cluster = new MiniCluster(3, null, 2)) {
-            ClientConfig cfg = new ClientConfig(cluster.metaEndpoints(), 1 << 16, 5_000)
-                    .withDataNodeConnectionsPerEndpoint(2);
-            try (StrataClient client = StrataClient.connect(cfg)) {
-                FileId fileId = client.create(StrataClient.FileSpec.log("test",
-                        "/failover-stale-inventory")).id();
-                Workload workload = new Workload();
-                StrataFile.SealInfo sealed;
-                try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
-                    workload.appendAcked(appender, 0, 160);
-                    sealed = appender.seal();
-                }
-
-                Messages.LookupFileResp before =
-                        ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
-                                sealed.sealedLength());
-                Messages.Replica replica = before.chunks().get(0).replicas().get(0);
-                DataNode node = nodeById(cluster, replica.nodeId());
-
-                cluster.killMeta(leaderIndex(cluster));
-                cluster.awaitAnyLeader();
-
-                sendInventoryThroughAnyEndpoint(cluster, new Messages.InventoryReport(replica.nodeId(),
-                        node.incarnation().getMostSignificantBits(),
-                        node.incarnation().getLeastSignificantBits(),
-                        -1, 0, 1, List.of()));
-
-                Messages.LookupFileResp after = ConsistencyVerifier.lookupFile(cluster, fileId);
-                assertTrue(after.chunks().get(0).replicas().stream()
-                                .anyMatch(r -> r.nodeId() == replica.nodeId()),
-                        "stale inventory on the new leader must not drop a healthy replica");
-                workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
-                ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
-                        sealed.sealedLength());
-            }
-        }
-    }
-
     private static Messages.ChunkInfo latestChunk(MiniCluster cluster, FileId fileId) throws Exception {
         Messages.LookupFileResp lookup = ConsistencyVerifier.lookupFile(cluster, fileId);
         return lookup.chunks().get(lookup.chunks().size() - 1);
@@ -256,23 +216,6 @@ class MetadataFailoverTest {
                 ByteBuffer h = direct.call(Opcode.LOOKUP_FILE,
                         new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, 5_000);
                 return Messages.LookupFileResp.decode(h);
-            } catch (ScpException e) {
-                last = e;
-            } catch (Exception e) {
-                last = new ScpException(ErrorCode.INTERNAL, e.toString());
-            }
-        }
-        throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no controller endpoint");
-    }
-
-    private static void sendInventoryThroughAnyEndpoint(MiniCluster cluster, Messages.InventoryReport report) {
-        ScpException last = null;
-        for (String endpoint : cluster.metaEndpoints()) {
-            String[] hp = endpoint.split(":");
-            try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
-                    ScpClient.KIND_TOOL, "failover-inventory")) {
-                direct.call(Opcode.INVENTORY_REPORT, report.encode(), null, 5_000);
-                return;
             } catch (ScpException e) {
                 last = e;
             } catch (Exception e) {

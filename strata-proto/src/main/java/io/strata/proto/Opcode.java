@@ -20,7 +20,7 @@ public enum Opcode {
     // control plane (data node -> metadata)
     REGISTER_NODE(0x0101),
     NODE_HEARTBEAT(0x0102),
-    INVENTORY_REPORT(0x0103),
+    // (0x0103 INVENTORY_REPORT removed: durability reconciliation is owner-pull VERIFY_CHUNKS, §20.3)
     // v0 client -> metadata (v1 moves broker-facing APIs to Kafka RPC)
     CREATE_FILE(0x0201),
     CREATE_CHUNK(0x0202),

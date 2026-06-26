@@ -461,13 +461,6 @@ public final class Controller implements AutoCloseable {
                 yield ScpServer.ok(req, registry.heartbeat(m, repair::onCommandCompletedAsync).encode(), null);
             }
 
-            case INVENTORY_REPORT -> {
-                requireLeader();
-                var m = Messages.InventoryReport.decode(h);
-                repair.onInventory(m);
-                yield ScpServer.ok(req, Messages.okHeader(), null);
-            }
-
             /* ---- v0 client APIs (v1: Kafka RPC on the controller) ---- */
 
             case CREATE_FILE -> {

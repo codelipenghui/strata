@@ -94,57 +94,6 @@ class RepairCoordinatorTest {
     }
 
     @Test
-    void inventoryDoesNotDeleteRepairTargetCopyWhileCommandIsInFlight() throws Exception {
-        FakeStore store = new FakeStore();
-        NodeRegistry registry = new NodeRegistry(store, config());
-        Registered source = register(registry, 301, "source");
-        Registered target = register(registry, 401, "target");
-        FileId fileId = fileId(301);
-        ChunkId chunkId = new ChunkId(fileId, 0);
-        store.createFile(file(fileId, FileState.SEALED,
-                List.of(sealed(0, 512, 3001, List.of(source.nodeId())))));
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
-
-        coordinator.scanOnce();
-        Messages.ReplicateCmd replicate = assertInstanceOf(Messages.ReplicateCmd.class,
-                onlyCommand(heartbeat(registry, coordinator, target, List.of())));
-        coordinator.onInventory(inventory(target, List.of(
-                new Messages.InventoryEntry(chunkId, ChunkState.SEALED, 512, 3001, TEST_NS))));
-        assertTrue(heartbeat(registry, coordinator, target, List.of()).commands().isEmpty());
-        registry.enqueue(target.nodeId(), new Messages.DeleteCmd(123, List.of(chunkId), TEST_NS));
-
-        Messages.HeartbeatResp afterCompletion = heartbeat(registry, coordinator, target,
-                List.of(new Messages.CompletedCommand(replicate.commandId(), (short) 0)));
-
-        assertTrue(afterCompletion.commands().isEmpty());
-        assertEquals(List.of(source.nodeId(), target.nodeId()),
-                store.files.get(fileId).value().chunks().get(0).replicas());
-    }
-
-    @Test
-    void staleMissingInventoryAfterRepairSwapDoesNotDropNewReplica() throws Exception {
-        FakeStore store = new FakeStore();
-        NodeRegistry registry = new NodeRegistry(store, config());
-        Registered source = register(registry, 302, "source");
-        Registered target = register(registry, 402, "target");
-        FileId fileId = fileId(302);
-        store.createFile(file(fileId, FileState.SEALED,
-                List.of(sealed(0, 512, 3002, List.of(source.nodeId())))));
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
-
-        coordinator.scanOnce();
-        Messages.ReplicateCmd replicate = assertInstanceOf(Messages.ReplicateCmd.class,
-                onlyCommand(heartbeat(registry, coordinator, target, List.of())));
-        coordinator.onCommandCompleted(target.nodeId(),
-                new Messages.CompletedCommand(replicate.commandId(), (short) 0));
-        coordinator.onInventory(inventory(target, List.of()));
-
-        assertEquals(List.of(source.nodeId(), target.nodeId()),
-                store.files.get(fileId).value().chunks().get(0).replicas());
-        assertTrue(heartbeat(registry, coordinator, target, List.of()).commands().isEmpty());
-    }
-
-    @Test
     void duplicateReplicateIssueIsSuppressedByChunkMarker() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
@@ -506,131 +455,6 @@ class RepairCoordinatorTest {
     }
 
     @Test
-    void inventoryDropsMissingCorruptOpenAndDeletingReplicasAndDeletesOrphans() throws Exception {
-        FakeStore store = new FakeStore();
-        NodeRegistry registry = new NodeRegistry(store, config());
-        Registered node = register(registry, 150, "node");
-        FileId fileId = fileId(10);
-        ChunkId missing = new ChunkId(fileId, 0);
-        ChunkId corrupt = new ChunkId(fileId, 1);
-        ChunkId open = new ChunkId(fileId, 2);
-        ChunkId deleting = new ChunkId(fileId, 3);
-        ChunkId orphan = new ChunkId(fileId(11), 0);
-        store.createFile(file(fileId, FileState.SEALED, List.of(
-                sealed(0, 100, 100, List.of(node.nodeId())),
-                sealed(1, 200, 200, List.of(node.nodeId())),
-                sealed(2, 300, 300, List.of(node.nodeId())),
-                sealed(3, 400, 400, List.of(node.nodeId())))));
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
-
-        coordinator.onInventory(inventory(node, List.of(
-                new Messages.InventoryEntry(corrupt, ChunkState.SEALED, 201, 200, TEST_NS),
-                new Messages.InventoryEntry(open, ChunkState.OPEN, 300, 300, TEST_NS),
-                new Messages.InventoryEntry(deleting, ChunkState.DELETING, 400, 400, TEST_NS),
-                new Messages.InventoryEntry(orphan, ChunkState.SEALED, 1, 1, TEST_NS))));
-
-        Records.FileRecord file = store.files.get(fileId).value();
-        assertEquals(List.of(List.of(), List.of(), List.of(), List.of()),
-                file.chunks().stream().map(Records.ChunkRecord::replicas).toList());
-        Messages.HeartbeatResp heartbeat = heartbeat(registry, coordinator, node, List.of());
-        assertEquals(4, heartbeat.commands().size());
-        assertEquals(List.of(orphan),
-                assertInstanceOf(Messages.DeleteCmd.class, heartbeat.commands().get(0)).chunkIds());
-        assertEquals(List.of(corrupt),
-                assertInstanceOf(Messages.DeleteCmd.class, heartbeat.commands().get(1)).chunkIds());
-        assertEquals(List.of(open),
-                assertInstanceOf(Messages.DeleteCmd.class, heartbeat.commands().get(2)).chunkIds());
-        assertEquals(List.of(deleting),
-                assertInstanceOf(Messages.DeleteCmd.class, heartbeat.commands().get(3)).chunkIds());
-        assertEquals(missing, file.chunkId(0));
-    }
-
-    @Test
-    void inventoryGracesStaleOpenReportForJustSealedReplica() throws Exception {
-        FakeStore store = new FakeStore();
-        ControllerConfig graceConfig = config().withReplicaMissingGraceMs(60_000);
-        NodeRegistry registry = new NodeRegistry(store, graceConfig);
-        Registered node = register(registry, 151, "node");
-        FileId fileId = fileId(12);
-        ChunkId chunkId = new ChunkId(fileId, 0);
-        store.createFile(file(fileId, FileState.SEALED,
-                List.of(sealed(0, 100, 100, List.of(node.nodeId())))));
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, graceConfig, () -> true);
-
-        coordinator.onInventory(inventory(node, List.of(
-                new Messages.InventoryEntry(chunkId, ChunkState.OPEN, 100, 100, TEST_NS))));
-
-        assertEquals(List.of(node.nodeId()), store.files.get(fileId).value().chunks().get(0).replicas());
-        assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
-
-        coordinator.onInventory(inventory(node, List.of(
-                new Messages.InventoryEntry(chunkId, ChunkState.SEALED, 100, 100, TEST_NS))));
-
-        assertEquals(List.of(node.nodeId()), store.files.get(fileId).value().chunks().get(0).replicas());
-        assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
-    }
-
-    @Test
-    void inventoryIgnoresNonLiveNodesAndContinuesAfterStoreFailure() throws Exception {
-        FakeStore store = new FakeStore();
-        NodeRegistry registry = new NodeRegistry(store, config());
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
-
-        coordinator.onInventory(new Messages.InventoryReport(999, 1, 2, 3, 0, 1,
-                List.of(new Messages.InventoryEntry(new ChunkId(fileId(85), 0), ChunkState.SEALED, 1, 1, TEST_NS))));
-
-        Registered node = register(registry, 146, "node");
-        store.throwOnListFiles = true;
-        coordinator.onInventory(inventory(node, List.of()));
-        store.throwOnListFiles = false;
-
-        assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
-    }
-
-    @Test
-    void inventoryIgnoresStaleSessionForLiveNode() throws Exception {
-        FakeStore store = new FakeStore();
-        NodeRegistry registry = new NodeRegistry(store, config());
-        Registered node = register(registry, 1461, "node");
-        FileId fileId = fileId(851);
-        store.createFile(file(fileId, FileState.SEALED,
-                List.of(sealed(0, 10, 100, List.of(node.nodeId())))));
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
-
-        coordinator.onInventory(new Messages.InventoryReport(node.nodeId(), node.incMsb(), node.incLsb(),
-                node.sessionEpoch() - 1, 0, 1, List.of()));
-
-        assertEquals(List.of(node.nodeId()), store.files.get(fileId).value().chunks().get(0).replicas());
-        assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
-    }
-
-    @Test
-    void inventoryLeavesKnownHealthyDeletingAndOpenEntriesAlone() throws Exception {
-        FakeStore store = new FakeStore();
-        NodeRegistry registry = new NodeRegistry(store, config());
-        Registered node = register(registry, 147, "node");
-        FileId healthyFile = fileId(86);
-        ChunkId healthy = new ChunkId(healthyFile, 0);
-        FileId deletingFile = fileId(87);
-        FileId openFile = fileId(88);
-        store.createFile(file(healthyFile, FileState.SEALED,
-                List.of(sealed(0, 10, 100, List.of(node.nodeId())))));
-        store.createFile(file(deletingFile, FileState.DELETING,
-                List.of(sealed(0, 20, 200, List.of(node.nodeId())))));
-        store.createFile(new Records.FileRecord(openFile, "test", "/open-file", 3, 2, true, FileState.OPEN, 1234,
-                List.of(new Records.ChunkRecord(0, ChunkState.OPEN, 0, 0, 1, List.of(node.nodeId())))));
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
-
-        coordinator.onInventory(inventory(node, List.of(
-                new Messages.InventoryEntry(healthy, ChunkState.SEALED, 10, 100, TEST_NS))));
-
-        assertEquals(List.of(node.nodeId()), store.files.get(healthyFile).value().chunks().get(0).replicas());
-        assertEquals(List.of(node.nodeId()), store.files.get(deletingFile).value().chunks().get(0).replicas());
-        assertEquals(List.of(node.nodeId()), store.files.get(openFile).value().chunks().get(0).replicas());
-        assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
-    }
-
-    @Test
     void closeInterruptsStartedScannerAndRestoresInterrupt() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config(60_000));
@@ -679,36 +503,6 @@ class RepairCoordinatorTest {
         } finally {
             coordinator.close();
         }
-    }
-
-    @Test
-    void shardedControllerDoesNotOrphanDeleteAChunkItDoesNotOwn() throws Exception {
-        // A sealed chunk reported by a node whose file this node cannot see. Under sharding the file may
-        // belong to a namespace owned by another controller node, so it must NOT be deleted as an orphan.
-        FileId foreignFile = fileId(7777);
-        ChunkId foreignChunk = new ChunkId(foreignFile, 0);
-        Messages.InventoryEntry entry =
-                new Messages.InventoryEntry(foreignChunk, ChunkState.SEALED, 4096, 0xAB, TEST_NS);
-
-        // sharded (ownsAll = false): the unknown chunk is left alone (no delete command).
-        FakeStore shardedStore = new FakeStore();
-        NodeRegistry shardedRegistry = new NodeRegistry(shardedStore, config());
-        Registered shardedTarget = register(shardedRegistry, 900, "target");
-        RepairCoordinator sharded = new RepairCoordinator(shardedStore, shardedRegistry, config(),
-                () -> true, () -> false);
-        sharded.onInventory(inventory(shardedTarget, List.of(entry)));
-        assertTrue(heartbeat(shardedRegistry, sharded, shardedTarget, List.of()).commands().isEmpty(),
-                "a sharded controller must not orphan-delete another owner's chunk");
-
-        // non-sharded (ownsAll = true): the same unknown chunk is a genuine orphan and is deleted.
-        FakeStore ownsAllStore = new FakeStore();
-        NodeRegistry ownsAllRegistry = new NodeRegistry(ownsAllStore, config());
-        Registered ownsAllTarget = register(ownsAllRegistry, 901, "target");
-        RepairCoordinator ownsAll = new RepairCoordinator(ownsAllStore, ownsAllRegistry, config(), () -> true);
-        ownsAll.onInventory(inventory(ownsAllTarget, List.of(entry)));
-        assertInstanceOf(Messages.DeleteCmd.class,
-                onlyCommand(heartbeat(ownsAllRegistry, ownsAll, ownsAllTarget, List.of())),
-                "a non-sharded controller deletes a genuine orphan");
     }
 
     @Test
@@ -1029,11 +823,6 @@ class RepairCoordinatorTest {
                     coordinator.onCommandCompleted(nodeId, completion);
                     return CompletableFuture.completedFuture(null);
                 });
-    }
-
-    private static Messages.InventoryReport inventory(Registered node, List<Messages.InventoryEntry> entries) {
-        return new Messages.InventoryReport(node.nodeId(), node.incMsb(), node.incLsb(),
-                node.sessionEpoch(), 0, 1, entries);
     }
 
     private static Messages.Command onlyCommand(Messages.HeartbeatResp heartbeat) {

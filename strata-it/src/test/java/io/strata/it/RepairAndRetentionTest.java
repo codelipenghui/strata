@@ -283,30 +283,6 @@ class RepairAndRetentionTest {
         }
     }
 
-    @Test
-    void staleInventoryForLiveNodeDoesNotDropHealthyReplica() throws Exception {
-        FileId fileId = client.create(StrataClient.FileSpec.log("test", "/stale-inventory")).id();
-        Workload workload = new Workload();
-        StrataFile.SealInfo sealed;
-        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
-            workload.appendAcked(appender, 0, 200);
-            sealed = appender.seal();
-        }
-
-        var lookup = lookupFile(fileId);
-        var replica = lookup.chunks().get(0).replicas().get(0);
-        DataNode node = nodeById(replica.nodeId());
-        sendInventory(new Messages.InventoryReport(replica.nodeId(),
-                node.incarnation().getMostSignificantBits(), node.incarnation().getLeastSignificantBits(),
-                -1, 0, 1, List.of()));
-
-        var after = lookupFile(fileId);
-        assertTrue(after.chunks().get(0).replicas().stream().anyMatch(r -> r.nodeId() == replica.nodeId()),
-                "stale inventory must not drop a healthy live replica");
-        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
-        ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
-    }
-
     private Messages.LookupFileResp lookupFile(FileId fileId) throws Exception {
         String[] hp = cluster.metaEndpoint().split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
@@ -315,12 +291,6 @@ class RepairAndRetentionTest {
         }
     }
 
-    private void sendInventory(Messages.InventoryReport report) throws Exception {
-        String[] hp = cluster.metaEndpoint().split(":");
-        try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
-            direct.call(Opcode.INVENTORY_REPORT, report.encode(), null, 5000);
-        }
-    }
 
     private DataNode nodeById(int nodeId) {
         for (DataNode node : cluster.nodes) {

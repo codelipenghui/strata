@@ -28,7 +28,7 @@ class DataNodeConfigTest {
         assertEquals(base.rack(), withPort.rack());
         assertEquals(base.host(), withPort.host());
         assertEquals(base.capacityBytes(), withPort.capacityBytes());
-        assertEquals(base.inventoryIntervalMs(), withPort.inventoryIntervalMs());
+        assertEquals(base.scrubIntervalMs(), withPort.scrubIntervalMs());
         assertEquals(base.connectionPolicy(), withPort.connectionPolicy());
 
         DataNodeConfig withEndpoint = withPort.withAdvertisedEndpoint("proxy:19000");
@@ -40,7 +40,7 @@ class DataNodeConfigTest {
         assertEquals(base.rack(), withEndpoint.rack());
         assertEquals(base.host(), withEndpoint.host());
         assertEquals(base.capacityBytes(), withEndpoint.capacityBytes());
-        assertEquals(base.inventoryIntervalMs(), withEndpoint.inventoryIntervalMs());
+        assertEquals(base.scrubIntervalMs(), withEndpoint.scrubIntervalMs());
         assertEquals(base.connectionPolicy(), withEndpoint.connectionPolicy());
 
         ConnectionPolicy policy = ConnectionPolicy.DEFAULT.withIdleTimeoutMs(1234);
