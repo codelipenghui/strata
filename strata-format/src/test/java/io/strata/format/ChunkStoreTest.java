@@ -88,6 +88,30 @@ class ChunkStoreTest {
         return store.fetch(TEST_NS, chunkId, 0, Integer.MAX_VALUE).bytes();
     }
 
+    @Test
+    void verifyReportsPresentSealedFactsAndMissingAbsent() throws Exception {
+        try (ChunkStore store = newStore()) {
+            ChunkId present = new ChunkId(FileId.of(1), 0);
+            sealedBytes(store, present, "hello");
+            ChunkStore.StatResult st = store.stat(TEST_NS, present);
+            ChunkId absent = new ChunkId(FileId.of(2), 0);
+
+            List<ChunkStore.VerifyResult> results = store.verify(TEST_NS, List.of(present, absent));
+
+            assertEquals(2, results.size());
+            ChunkStore.VerifyResult pr = results.get(0);
+            assertEquals(present, pr.chunkId());
+            assertTrue(pr.present(), "sealed chunk must report present");
+            assertEquals(ChunkState.SEALED, pr.state());
+            assertEquals(st.sealedLength(), pr.length());
+            assertEquals(st.dataCrc(), pr.crc());
+
+            ChunkStore.VerifyResult ar = results.get(1);
+            assertEquals(absent, ar.chunkId());
+            assertEquals(false, ar.present(), "absent chunk must report missing");
+        }
+    }
+
     private static ChunkFormats.Trailer trailer(byte[] fileBytes) {
         return ChunkFormats.Trailer.decode(Arrays.copyOfRange(
                 fileBytes, fileBytes.length - ChunkFormats.TRAILER_SIZE, fileBytes.length));

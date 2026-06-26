@@ -33,6 +33,11 @@ public final class DataNode implements AutoCloseable {
 
     private final int nodeId;
     private final UUID incarnation;
+    // Owners (by advertised endpoint) this node has heard a VERIFY_CHUNKS from. Node-local orphan GC
+    // (design §20.4) only trusts "no owner verified" once it has heard from every current owner, so it
+    // never deletes a chunk whose owner simply has not gotten around to verifying it yet. Populated here
+    // by the VERIFY_CHUNKS handler; consumed by the orphan-GC loop.
+    private final java.util.Set<String> verifiersHeardFrom = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public DataNode(DataNodeConfig config) throws IOException {
         this(config, null);
@@ -195,6 +200,16 @@ public final class DataNode implements AutoCloseable {
 
     public boolean isDraining() {
         return draining.get();
+    }
+
+    /** Records that owner {@code verifierEndpoint} issued a VERIFY_CHUNKS to this node (design §20.4). */
+    void noteVerifiedBy(String verifierEndpoint) {
+        verifiersHeardFrom.add(verifierEndpoint);
+    }
+
+    /** The set of owner endpoints this node has heard a VERIFY_CHUNKS from (orphan-GC membership grace). */
+    java.util.Set<String> verifiersHeardFrom() {
+        return verifiersHeardFrom;
     }
 
     void setDraining(boolean v) {

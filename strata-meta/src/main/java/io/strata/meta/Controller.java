@@ -119,6 +119,9 @@ public final class Controller implements AutoCloseable {
                 namespaceLog.setOwnership(openedOwnership::isOwner);
             }
 
+            // The owner-pull verifier identifies itself by its advertised endpoint (design §20.4) so a
+            // node can record which owner attested each chunk; it is also this node's rendezvous identity.
+            openedRepair.advertisedEndpoint(this.advertisedEndpoint);
             openedLatch.start();
             openedRepair.start();
         } catch (Exception e) {

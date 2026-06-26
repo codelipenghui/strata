@@ -62,7 +62,8 @@ class MessageGoldenCorpusTest {
                 "ABORT_CHUNK_META=0x0207",
                 "LOOKUP_PATH=0x0208",
                 "ALLOCATE_WRITER_EPOCH=0x0209",
-                "EXEC_REPLICATE=0x001b"),
+                "EXEC_REPLICATE=0x001b",
+                "VERIFY_CHUNKS=0x001c"),
                 Arrays.stream(Opcode.values())
                         .map(op -> op.name() + "=0x" + String.format("%04x", op.code & 0xFFFF))
                         .toList());
@@ -154,12 +155,13 @@ class MessageGoldenCorpusTest {
                         Messages.HelloResp::decode,
                         // EXEC_REPLICATE moved from 0x020a (control-plane range) to 0x001b (data-plane)
                         // to fix combined-node routing: opcodes >= 0x0100 route to Controller,
-                        // but EXEC_REPLICATE is handled by DataNodeHandlers (Bug B fix).
+                        // but EXEC_REPLICATE is handled by DataNodeHandlers (Bug B fix). VERIFY_CHUNKS
+                        // (0x001c) appended for owner-pull verification (design §20.3) — count 0x19 -> 0x1a.
                         "0000000101020304050607080000002a11112222333344445555666677778888"
-                                + "04000000000000004000000019000100010010000100110001001200010013"
+                                + "0400000000000000400000001a000100010010000100110001001200010013"
                                 + "0001001400010015000100160001001700010018000100190001001a0001"
                                 + "010100010102000101030001020100010202000102030001020400010205"
-                                + "000102060001020700010208000102090001001b000100"),
+                                + "000102060001020700010208000102090001001b0001001c000100"),
                 request("openChunk",
                         new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L, NS),
                         () -> new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L, NS).encode(),

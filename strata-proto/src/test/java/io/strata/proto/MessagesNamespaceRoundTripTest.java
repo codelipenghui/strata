@@ -1,6 +1,7 @@
 package io.strata.proto;
 
 import io.strata.common.ChunkId;
+import io.strata.common.ChunkState;
 import io.strata.common.FileId;
 import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
@@ -41,6 +42,27 @@ class MessagesNamespaceRoundTripTest {
         assertEquals(NS, d.namespace());
         assertEquals(FID, d.fileId());
         assertEquals(Messages.AllocateWriterEpoch.FOR_APPEND, d.purpose());
+    }
+
+    @Test
+    void verifyChunksRequestRoundTrips() {
+        var m = new Messages.VerifyChunks(NS, "127.0.0.1:9301", List.of(CID, new ChunkId(FileId.of(8), 0)));
+        var d = Messages.VerifyChunks.decode(ByteBuffer.wrap(m.encode()));
+        assertEquals(NS, d.namespace());
+        assertEquals("127.0.0.1:9301", d.verifierEndpoint());
+        assertEquals(List.of(CID, new ChunkId(FileId.of(8), 0)), d.chunkIds());
+    }
+
+    @Test
+    void verifyChunksResponseRoundTrips() {
+        var results = List.of(
+                new Messages.VerifyChunkResult(CID, true, ChunkState.SEALED, 1234L, 0x55aa55aa),
+                new Messages.VerifyChunkResult(new ChunkId(FileId.of(8), 0), false, ChunkState.OPEN, 0L, 0));
+        var enc = new Messages.VerifyChunksResp(results).encode();
+        var b = ByteBuffer.wrap(enc);
+        Resp.check(b); // strip the OK status the framing layer would have consumed
+        var d = Messages.VerifyChunksResp.decode(b);
+        assertEquals(results, d.results());
     }
 
     @Test

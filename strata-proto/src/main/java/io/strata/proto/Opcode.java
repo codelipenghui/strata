@@ -35,7 +35,12 @@ public enum Opcode {
     // command channel, tells a target node to pull a chunk from a live source (reuses the proven
     // ControlLoop.replicate path). Data-plane opcode (< 0x0100) so the combined-node router sends it to
     // DataNodeHandlers, not the Controller. Append-only — kept last in the data-plane block (design §11).
-    EXEC_REPLICATE(0x001B);
+    EXEC_REPLICATE(0x001B),
+    // owner-pull durability verification (design §20.3): a namespace owner asks a data node, in bounded
+    // batches, for the local state of the chunks it expects that node to hold (present/missing/corrupt).
+    // Replaces the central inventory push. Owner -> node, so a data-plane opcode (< 0x0100) routed to
+    // DataNodeHandlers. Append-only — kept last in the data-plane block.
+    VERIFY_CHUNKS(0x001C);
 
     public final short code;
 

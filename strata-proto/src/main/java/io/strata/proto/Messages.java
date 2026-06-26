@@ -687,6 +687,82 @@ public final class Messages {
         }
     }
 
+    /* ---------- owner-pull chunk verification (design §20.3) ---------- */
+
+    /**
+     * Owner -> node: verify the listed chunks of one namespace. The node answers with the actual local
+     * state of each (see {@link VerifyChunkResult}); the owner compares against its descriptor to decide
+     * present-ok / missing / corrupt. {@code verifierEndpoint} is the asking owner's advertised endpoint,
+     * so the node can record "last verified by which owner, when" for node-local orphan GC (design §20.4).
+     */
+    public record VerifyChunks(StrataNamespace namespace, String verifierEndpoint, List<ChunkId> chunkIds) {
+        public VerifyChunks {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+            verifierEndpoint = Objects.requireNonNull(verifierEndpoint, "verifierEndpoint");
+            chunkIds = List.copyOf(chunkIds);
+        }
+
+        public byte[] encode() {
+            BufWriter w = new BufWriter();
+            w.string(namespace.toString()).string(verifierEndpoint).varint(chunkIds.size());
+            for (ChunkId c : chunkIds) w.chunkId(c);
+            w.noTags();
+            return w.toBytes();
+        }
+
+        public static VerifyChunks decode(ByteBuffer b) {
+            StrataNamespace ns = StrataNamespace.of(Varint.readString(b));
+            String verifier = Varint.readString(b);
+            int n = count(b);
+            List<ChunkId> ids = new ArrayList<>(n);
+            for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
+            TaggedFields.readFrom(b);
+            return new VerifyChunks(ns, verifier, ids);
+        }
+    }
+
+    /**
+     * One chunk's local verification fact. {@code present == false} means the node holds no such chunk
+     * (a missing replica); otherwise {@code state/length/crc} are the node's actual values for the owner
+     * to compare against the descriptor (a length/crc mismatch on a SEALED chunk is corruption).
+     */
+    public record VerifyChunkResult(ChunkId chunkId, boolean present, ChunkState state, long length, int crc) {
+    }
+
+    /** Node -> owner reply to {@link VerifyChunks}, one result per requested chunk (order-independent). */
+    public record VerifyChunksResp(List<VerifyChunkResult> results) {
+        public VerifyChunksResp {
+            results = List.copyOf(results);
+        }
+
+        public byte[] encode() {
+            BufWriter w = new BufWriter();
+            Resp.writeOk(w);
+            w.varint(results.size());
+            for (VerifyChunkResult r : results) {
+                w.chunkId(r.chunkId()).u8(r.present() ? 1 : 0).u8(r.state().value)
+                        .u64(r.length()).u32(r.crc());
+            }
+            w.noTags();
+            return w.toBytes();
+        }
+
+        public static VerifyChunksResp decode(ByteBuffer b) {
+            int n = count(b);
+            List<VerifyChunkResult> rs = new ArrayList<>(n);
+            for (int i = 0; i < n; i++) {
+                ChunkId chunkId = ChunkId.readFrom(b);
+                boolean present = Varint.readBoolean(b);
+                ChunkState state = ChunkState.fromValue(b.get());
+                long length = b.getLong();
+                int crc = b.getInt();
+                rs.add(new VerifyChunkResult(chunkId, present, state, length, crc));
+            }
+            TaggedFields.readFrom(b);
+            return new VerifyChunksResp(rs);
+        }
+    }
+
     /* ---------- v0 client <-> metadata ---------- */
 
     public record WritePolicy(int replicationFactor, int ackQuorum, boolean fsyncOnAck) {

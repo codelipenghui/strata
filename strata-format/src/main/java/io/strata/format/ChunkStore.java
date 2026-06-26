@@ -418,6 +418,10 @@ public final class ChunkStore implements AutoCloseable {
         long sealedLength = -1;
         int dataCrc;
         List<Integer> sealedRangeCrcs = List.of();
+        // Last time an owner attested this replica via VERIFY_CHUNKS (design §20.3); seeded to when this
+        // node first learned of the chunk so a freshly-created/recovered chunk gets the full orphan grace
+        // (§20.4) before it can be considered a suspect. In-memory only: a restart re-earns verification.
+        volatile long lastVerifiedAtMs = System.currentTimeMillis();
 
         // Running CRC state for an OPEN chunk: the whole-chunk CRC and the per-CRC_RANGE_SIZE range
         // CRCs are folded as bytes are appended (and rebuilt from the verified prefix on recovery),
@@ -1457,6 +1461,32 @@ public final class ChunkStore implements AutoCloseable {
         for (Handle h : chunks.values()) {
             synchronized (h) {
                 out.add(new InventoryItem(h.ns, h.id, h.state, h.currentEnd(), h.dataCrc));
+            }
+        }
+        return out;
+    }
+
+    /** One chunk's local verification fact for {@link #verify}; {@code present == false} means absent. */
+    public record VerifyResult(ChunkId chunkId, boolean present, ChunkState state, long length, int crc) {}
+
+    /**
+     * Owner-pull verification (design §20.3): report the local state of each requested chunk and stamp
+     * the present ones as freshly verified — which both refreshes the orphan-GC grace (§20.4) and lets
+     * the owner compare state/length/crc against its descriptor to find missing/corrupt replicas. An
+     * absent chunk reports {@code present == false} (a missing replica). Read-only on the data itself.
+     */
+    public List<VerifyResult> verify(StrataNamespace ns, List<ChunkId> chunkIds) {
+        long now = System.currentTimeMillis();
+        List<VerifyResult> out = new ArrayList<>(chunkIds.size());
+        for (ChunkId id : chunkIds) {
+            Handle h = chunks.get(new NsChunkId(ns, id));
+            if (h == null) {
+                out.add(new VerifyResult(id, false, ChunkState.OPEN, 0, 0));
+                continue;
+            }
+            synchronized (h) {
+                h.lastVerifiedAtMs = now;
+                out.add(new VerifyResult(id, true, h.state, h.currentEnd(), h.dataCrc));
             }
         }
         return out;

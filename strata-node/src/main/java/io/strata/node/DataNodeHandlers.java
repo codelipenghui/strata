@@ -134,6 +134,20 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
 
+            case VERIFY_CHUNKS -> {
+                // Owner-pull durability verification (design §20.3): report the local state of each
+                // requested chunk (present/state/length/crc) and stamp the present ones as freshly
+                // verified, feeding node-local orphan GC (§20.4). The owner judges missing/corrupt.
+                var m = Messages.VerifyChunks.decode(h);
+                node.noteVerifiedBy(m.verifierEndpoint());
+                List<Messages.VerifyChunkResult> results = new ArrayList<>(m.chunkIds().size());
+                for (ChunkStore.VerifyResult r : store.verify(m.namespace(), m.chunkIds())) {
+                    results.add(new Messages.VerifyChunkResult(r.chunkId(), r.present(), r.state(),
+                            r.length(), r.crc()));
+                }
+                yield ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
+            }
+
             default -> throw new ScpException(ErrorCode.UNKNOWN_OPCODE, op + " not served by data node");
         };
     }

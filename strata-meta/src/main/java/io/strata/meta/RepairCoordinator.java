@@ -198,9 +198,27 @@ class RepairCoordinator implements AutoCloseable {
 
     void start() {
         scanThread = Thread.ofVirtual().name("meta-repair-scan").start(this::scanLoop);
+        verifyThread = Thread.ofVirtual().name("meta-verify-scan").start(this::verifyLoop);
     }
 
-    private long leaderSince;
+    /** This owner's advertised endpoint, sent as the {@code verifierEndpoint} in VERIFY_CHUNKS so a node
+     *  can record which owner attested it (design §20.4). Set by the controller before {@link #start}. */
+    private volatile String advertisedEndpoint = "";
+
+    void advertisedEndpoint(String endpoint) {
+        this.advertisedEndpoint = endpoint == null ? "" : endpoint;
+    }
+
+    private volatile Thread verifyThread;
+    // Owner-pull verification cadence (design §20.3). A constant for now — the project does not ship to
+    // prod, and this is the only missing/corrupt-replica detection path once the inventory push is gone,
+    // so it stays brisk enough that detection + repair lands well inside the integration deadlines.
+    private static final long VERIFY_INTERVAL_MS = 2_000;
+    private static final int VERIFY_BATCH_SIZE = 256;
+
+    // leaderSince is written by the scan thread (tick/reconcile) and read by the verify thread's settle
+    // gate, so it must publish safely across threads.
+    private volatile long leaderSince;
     /**
      * Serializes the descriptor-mutating reconcile passes — scanOnce() (leader), ownerRepairPass()
      * (non-leader owner), and driveDeletionNow() (prompt delete) — against each other (replaces a
@@ -591,6 +609,159 @@ class RepairCoordinator implements AutoCloseable {
             }
         } finally {
             reconcileLock.unlock();
+        }
+    }
+
+    /* ---------- owner-pull verification (design §20.3): replaces the central inventory push ---------- */
+
+    private void verifyLoop() {
+        while (!closed.get()) {
+            try {
+                Thread.sleep(VERIFY_INTERVAL_MS);
+                verifyPass();
+            } catch (InterruptedException e) {
+                return;
+            } catch (Exception e) {
+                if (!closed.get()) {
+                    log.warn("verify pass failed", e);
+                }
+            }
+        }
+    }
+
+    /**
+     * Owner-pull verification (design §20.3): for each namespace this controller owns, ask every live
+     * node that should hold a sealed chunk to report its local state, and compare against the descriptor
+     * — missing/corrupt drops the replica so the under-replication scan re-replicates within the
+     * namespace. Replaces "every node pushes its full chunk list to the leader". Runs off the repair
+     * thread (the verify RPCs block); never holds the reconcile lock — the descriptor drops are
+     * CAS-idempotent, exactly as the old push reconciliation was.
+     */
+    void verifyPass() throws Exception {
+        if (isLeader.getAsBoolean()) {
+            // A just-elected leader's node-liveness view is stale until nodes re-register; a missing
+            // verdict in that window could falsely drop a healthy replica, so wait out the settle period.
+            long since = leaderSince;
+            if (since == 0
+                    || System.currentTimeMillis() - since < (long) config.leaseMs() + config.deadGraceMs()) {
+                return;
+            }
+        }
+        long now = System.currentTimeMillis();
+        Map<Integer, Records.NodeRecord> nodes = nodesById();
+        for (StrataNamespace ns : store.listNamespaces()) {
+            if (!ownsNamespace.test(ns)) {
+                continue;
+            }
+            for (FileId fileId : store.listFiles(ns)) {
+                perFileIsolated(ns, fileId, "verifyPass", () -> verifyFile(ns, fileId, nodes, now));
+            }
+        }
+    }
+
+    private void verifyFile(StrataNamespace ns, FileId fileId, Map<Integer, Records.NodeRecord> nodes, long now)
+            throws Exception {
+        Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
+        if (opt.isEmpty() || opt.get().value().state() == FileState.DELETING) {
+            return; // deletion, not verification, drives a DELETING file's chunks
+        }
+        Records.FileRecord file = opt.get().value();
+        Map<Integer, List<ChunkId>> byNode = new java.util.LinkedHashMap<>();
+        Map<ChunkId, Records.ChunkRecord> expected = new HashMap<>();
+        for (Records.ChunkRecord c : file.chunks()) {
+            if (c.state() != ChunkState.SEALED) {
+                continue;
+            }
+            ChunkId chunkId = file.chunkId(c.index());
+            expected.put(chunkId, c);
+            for (int nodeId : c.replicas()) {
+                // A dead node's replicas are healed by the node-death event/reconcile path, not verify.
+                if (registry.isDead(nodeId)) {
+                    continue;
+                }
+                byNode.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(chunkId);
+            }
+        }
+        for (var e : byNode.entrySet()) {
+            Records.NodeRecord node = nodes.get(e.getKey());
+            if (node == null) {
+                continue;
+            }
+            List<ChunkId> ids = e.getValue();
+            for (int i = 0; i < ids.size(); i += VERIFY_BATCH_SIZE) {
+                List<ChunkId> batch = ids.subList(i, Math.min(i + VERIFY_BATCH_SIZE, ids.size()));
+                List<Messages.VerifyChunkResult> results = execVerify(node, ns, batch);
+                // Empty == the RPC could not reach the node: no verdict, so we never drop a replica on an
+                // unreachable owner-verify (fail-safe). A truly dead node is handled by the reconcile scan.
+                for (Messages.VerifyChunkResult r : results) {
+                    Records.ChunkRecord exp = expected.get(r.chunkId());
+                    if (exp != null) {
+                        applyVerifyVerdict(ns, fileId, exp, e.getKey(), node, r, now);
+                    }
+                }
+            }
+        }
+    }
+
+    /** Synchronous VERIFY_CHUNKS to {@code node}; empty list on any RPC failure (treated as no verdict). */
+    private List<Messages.VerifyChunkResult> execVerify(Records.NodeRecord node, StrataNamespace ns,
+                                                        List<ChunkId> chunkIds) {
+        Endpoint endpoint;
+        try {
+            endpoint = Endpoint.parse(node.endpoint(), "node endpoint", ErrorCode.INTERNAL);
+        } catch (Exception e) {
+            log.warn("owner-verify: bad endpoint '{}' for node {}: {}",
+                    node.endpoint(), node.nodeId(), e.getMessage());
+            return List.of();
+        }
+        try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(), ScpClient.KIND_TOOL, "owner-verify")) {
+            ByteBuffer resp = client.call(Opcode.VERIFY_CHUNKS,
+                    new Messages.VerifyChunks(ns, advertisedEndpoint, chunkIds).encode(), null,
+                    config.repairCommandTimeoutMs());
+            return Messages.VerifyChunksResp.decode(resp).results();
+        } catch (Exception e) {
+            log.debug("owner-verify to node {} failed: {}", node.nodeId(), e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * Compares one VERIFY_CHUNKS result against the descriptor and drops the replica when it is missing,
+     * non-SEALED past grace, or corrupt — the owner-pull equivalent of the inventory-push reconciliation.
+     * A freshly-repaired replica is protected from a stale verdict; corrupt/bad bytes are physically
+     * deleted now so a re-pick of this node cannot read them (the under-replication scan re-replicates).
+     */
+    private void applyVerifyVerdict(StrataNamespace ns, FileId fileId, Records.ChunkRecord exp, int nodeId,
+                                    Records.NodeRecord node, Messages.VerifyChunkResult r, long now)
+            throws Exception {
+        ChunkId chunkId = r.chunkId();
+        if (isRepairProtected(ns, chunkId, nodeId)) {
+            return;
+        }
+        String key = nodeId + ":" + ns + ":" + chunkId;
+        if (!r.present()) {
+            if (replicaUnhealthyPastGrace(key, now)) {
+                log.warn("verify: node {} missing sealed chunk {} (>= {}ms) — dropping replica for re-repair",
+                        nodeId, chunkId, config.replicaMissingGraceMs());
+                replicaMissingSince.remove(key);
+                applyDeleteConfirmed(ns, fileId, chunkId, nodeId);
+            }
+        } else if (r.state() != ChunkState.SEALED) {
+            if (replicaUnhealthyPastGrace(key, now)) {
+                log.warn("verify: node {} holds {} copy of sealed chunk {} (>= {}ms) — dropping replica",
+                        nodeId, r.state(), chunkId, config.replicaMissingGraceMs());
+                replicaMissingSince.remove(key);
+                applyDeleteConfirmed(ns, fileId, chunkId, nodeId);
+                execDelete(node, chunkId, ns);
+            }
+        } else if (r.length() != exp.length() || r.crc() != exp.crc()) {
+            replicaMissingSince.remove(key);
+            log.warn("verify: node {} holds corrupt sealed chunk {} (len {}/{} crc {}/{}) — dropping replica",
+                    nodeId, chunkId, r.length(), exp.length(), r.crc(), exp.crc());
+            applyDeleteConfirmed(ns, fileId, chunkId, nodeId);
+            execDelete(node, chunkId, ns);
+        } else {
+            replicaMissingSince.remove(key); // healthy attestation — clear any pending anomaly
         }
     }
 
@@ -1202,13 +1373,14 @@ class RepairCoordinator implements AutoCloseable {
     @Override
     public void close() {
         closed.set(true);
-        Thread t = scanThread;
-        if (t != null) {
-            t.interrupt();
-            try {
-                t.join(2_000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+        for (Thread t : new Thread[] {scanThread, verifyThread}) {
+            if (t != null) {
+                t.interrupt();
+                try {
+                    t.join(2_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
         deleteDispatchExecutor.shutdown();
