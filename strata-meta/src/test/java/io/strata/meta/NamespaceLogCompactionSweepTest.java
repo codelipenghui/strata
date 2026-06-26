@@ -63,8 +63,9 @@ class NamespaceLogCompactionSweepTest {
              ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
             NamespaceLogBackend backend = new NamespaceLogBackend(root, new TestNamespaceMetadataFileStore(), false);
             NamespaceLogMetadataStore store = new NamespaceLogMetadataStore(backend);
-            // tiny threshold + fast interval: the very first appended record trips the sweep.
-            backend.startBackgroundCompaction(1, 25);
+            // tiny threshold + fast interval: the very first appended record trips the sweep. Orphan GC is
+            // off: this test uses an in-memory file store, so there are no SYSTEM-namespace root files.
+            backend.startBackgroundCompaction(1, 25, false);
 
             for (int i = 0; i < 5; i++) {
                 store.createFile(file(i + 1, "/topic-" + i));

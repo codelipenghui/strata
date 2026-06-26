@@ -4,13 +4,16 @@ import io.strata.client.StrataClient;
 import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
 import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Method;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -63,6 +66,30 @@ class SystemMetadataFilePathUniquenessTest {
         Method systemFileSpec = StrataSystemMetadataFileStore.class.getDeclaredMethod(
                 "systemFileSpec", StrataNamespace.class, long.class, String.class);
         systemFileSpec.setAccessible(true);
+
+        // The orphan GC reaps by generation, so its path parser MUST invert systemFileSpec. If the path
+        // format ever changes, this round-trip fails — forcing parseSystemFilePath to be updated in lockstep
+        // (otherwise the GC silently fails safe and stops reaping). A non-system path must parse to null.
+        StrataClient.FileSpec genSpec = (StrataClient.FileSpec) systemFileSpec.invoke(store, NS, 42L, "snapshot");
+        StrataSystemMetadataFileStore.SystemFileCoord coord =
+                StrataSystemMetadataFileStore.parseSystemFilePath(genSpec.path());
+        assertNotNull(coord, "the parser must recognize a path the builder produced");
+        assertEquals(NS, coord.namespace(), "round-trip namespace");
+        assertEquals(42L, coord.generation(), "round-trip generation");
+        assertNull(StrataSystemMetadataFileStore.parseSystemFilePath(StrataPath.of("/some/user/file")),
+                "a non-system path must parse to null so the GC keeps it (fail-safe)");
+        // ADVERSARIAL namespace names that collide with the path literals ("metadata-log", "gen-N") are
+        // legal (only "strata-meta"/"__"-prefixed are reserved) and MUST parse positionally, not by scanning
+        // — a misparse here would let the generation GC reap a live in-flight file for that namespace.
+        for (String adversarial : new String[]{"metadata-log", "gen-8"}) {
+            StrataNamespace advNs = StrataNamespace.of(adversarial);
+            StrataClient.FileSpec advSpec = (StrataClient.FileSpec) systemFileSpec.invoke(store, advNs, 5L, "log");
+            StrataSystemMetadataFileStore.SystemFileCoord advCoord =
+                    StrataSystemMetadataFileStore.parseSystemFilePath(advSpec.path());
+            assertNotNull(advCoord, "must parse a path for namespace '" + adversarial + "'");
+            assertEquals(advNs, advCoord.namespace(), "namespace '" + adversarial + "' must not be misparsed");
+            assertEquals(5L, advCoord.generation(), "generation for namespace '" + adversarial + "'");
+        }
 
         StrataClient.FileSpec spec1 = (StrataClient.FileSpec) systemFileSpec.invoke(store, NS, 2L, "log");
         StrataClient.FileSpec spec2 = (StrataClient.FileSpec) systemFileSpec.invoke(store, NS, 2L, "log");

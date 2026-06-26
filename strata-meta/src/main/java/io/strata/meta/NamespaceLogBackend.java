@@ -113,23 +113,30 @@ final class NamespaceLogBackend implements AutoCloseable {
         this.ownsNamespace = ownsNamespace;
     }
 
+    /** Run the SYSTEM-namespace orphan GC once every N compaction ticks — far rarer than compaction. */
+    private static final long ORPHAN_GC_EVERY_TICKS = 10;
+
     /**
      * Starts the periodic open-log compaction sweep (design §8/§10 bounded-storage maintenance). Without
      * it, a per-namespace repo compacts only at open/failover ({@link NamespaceMetadataLogRepository#open}),
      * so a stable long-lived owner's open log grows unbounded between failovers. The sweep snapshot+rolls
      * every owned namespace whose open log has passed {@code thresholdBytes}, bounding steady-state storage
-     * by snapshot cadence rather than by total historical mutations. No-op if already started, if either
-     * bound is non-positive (compaction disabled — the default for unit tests), or if already closed.
+     * by snapshot cadence rather than by total historical mutations. The same thread also runs the
+     * SYSTEM-namespace orphan GC (every {@link #ORPHAN_GC_EVERY_TICKS} ticks) when {@code runOrphanGc} is
+     * set, reaping snapshot/log files left behind by a crash between file-create and manifest CAS.
+     * No-op if already started, if either compaction bound is non-positive (compaction disabled — the
+     * default for unit tests), or if already closed.
      */
-    synchronized void startBackgroundCompaction(long thresholdBytes, long intervalMs) {
+    synchronized void startBackgroundCompaction(long thresholdBytes, long intervalMs, boolean runOrphanGc) {
         if (compactionThread != null || thresholdBytes <= 0 || intervalMs <= 0 || closed) {
             return;
         }
         compactionThread = Thread.ofVirtual().name("meta-log-compaction")
-                .start(() -> compactionLoop(thresholdBytes, intervalMs));
+                .start(() -> compactionLoop(thresholdBytes, intervalMs, runOrphanGc));
     }
 
-    private void compactionLoop(long thresholdBytes, long intervalMs) {
+    private void compactionLoop(long thresholdBytes, long intervalMs, boolean runOrphanGc) {
+        long ticks = 0;
         while (!closed) {
             try {
                 Thread.sleep(intervalMs);
@@ -138,7 +145,81 @@ final class NamespaceLogBackend implements AutoCloseable {
                 return;
             }
             compactOversizedRepos(thresholdBytes);
+            if (runOrphanGc && ++ticks % ORPHAN_GC_EVERY_TICKS == 0) {
+                try {
+                    gcOrphanedSystemFiles();
+                } catch (Exception e) {
+                    if (!closed) {
+                        log.warn("metadata system-file orphan GC failed; will retry next sweep", e);
+                    }
+                }
+            }
         }
+    }
+
+    /**
+     * Reclaims metadata SYSTEM-namespace files (snapshot/log) orphaned by a crash between writing a new
+     * generation's files and the manifest CAS (design §8/§10): such a file has a valid descriptor but is
+     * referenced by NO published manifest, so neither repair nor the per-namespace deletion path reaps it.
+     *
+     * <p>Safe BY CONSTRUCTION, not by timing. {@code publishCompacted} writes the files for generation
+     * {@code G+1} BEFORE publishing the manifest at {@code G+1}, so an in-flight (not-yet-published) file is
+     * always at a generation STRICTLY GREATER than its namespace's currently-published generation. A file is
+     * therefore reaped only when it is (a) referenced by no current manifest AND (b) its path-encoded
+     * generation is {@code <=} its namespace's currently-published generation — which proves a higher
+     * generation has already been published, so it can never become referenced. No wall clock is consulted,
+     * so cross-controller clock skew and an arbitrarily long in-flight publish stall are both irrelevant
+     * (the earlier age-based guard was unsafe under both). A file whose path cannot be parsed, or whose
+     * namespace has no published manifest yet, is KEPT (fail-safe). Returns the number reaped.
+     * Package-private so a test can drive a sweep deterministically.
+     */
+    int gcOrphanedSystemFiles() throws Exception {
+        Map<StrataNamespace, Long> publishedGen = new HashMap<>();
+        Set<FileId> referenced = new LinkedHashSet<>();
+        // Enumerate by METADATA namespaces (every namespace with a manifest), NOT listNamespaces() (which
+        // only reports namespaces that still have live USER files): a namespace whose user files were all
+        // deleted keeps its manifest + system files, so missing it here would wrongly reap a live snapshot/log.
+        for (StrataNamespace ns : root.listAssignedNamespaces()) {
+            root.getNamespaceManifest(ns).map(MetadataStore.Versioned::value).ifPresent(m -> {
+                publishedGen.put(ns, m.generation());
+                m.snapshotFileId().ifPresent(referenced::add);
+                m.logFileId().ifPresent(referenced::add);
+            });
+        }
+        int reaped = 0;
+        for (FileId id : root.listFiles(SYSTEM_NAMESPACE)) {
+            if (referenced.contains(id)) {
+                continue; // referenced by a currently-published manifest — live
+            }
+            Optional<MetadataStore.Versioned<Records.FileRecord>> rec = root.getFile(SYSTEM_NAMESPACE, id);
+            if (rec.isEmpty()) {
+                continue; // already gone
+            }
+            Records.FileRecord file = rec.get().value();
+            if (file.state() == FileState.DELETING || file.state() == FileState.DELETED) {
+                continue; // a prior sweep already started reclaiming it
+            }
+            StrataSystemMetadataFileStore.SystemFileCoord coord =
+                    StrataSystemMetadataFileStore.parseSystemFilePath(file.path());
+            if (coord == null) {
+                continue; // unrecognized path — cannot judge its generation, so never reap (fail-safe)
+            }
+            Long published = publishedGen.get(coord.namespace());
+            if (published == null || coord.generation() > published) {
+                continue; // no manifest yet, or a not-yet-published in-flight/future generation — keep
+            }
+            try {
+                fileStore.deleteFile(id);
+                reaped++;
+                log.info("system-file GC: reaped orphaned metadata file {} (ns={}, gen={} <= published {})",
+                        id, coord.namespace(), coord.generation(), published);
+            } catch (Exception e) {
+                // isolate a poison file — the rest of the sweep proceeds; this one retries next pass
+                log.warn("system-file GC: failed to delete orphan {} ({}); will retry next sweep",
+                        id, file.path(), e);
+            }
+        }
+        return reaped;
     }
 
     /**

@@ -135,6 +135,42 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
         return out.toByteArray();
     }
 
+    /** The (namespace, generation) a system-file path encodes; the orphan GC reaps by generation. */
+    record SystemFileCoord(StrataNamespace namespace, long generation) {}
+
+    /**
+     * Inverse of {@link #systemFileSpec}: recovers {@code (namespace, generation)} from a system-file path
+     * {@code /metadata-log/<ns>/gen-<N>/<kind>-<uuid>}. Returns {@code null} for any path that does not match
+     * the expected shape — callers MUST treat that as "cannot judge, keep the file" so a path-format change
+     * can never cause a wrongful delete. Kept next to {@code systemFileSpec} so the two evolve together.
+     */
+    static SystemFileCoord parseSystemFilePath(StrataPath path) {
+        // systemFileSpec ALWAYS builds exactly "/metadata-log/<ns>/gen-<N>/<kind>-<uuid>", which splits to
+        // ["", "metadata-log", <ns>, "gen-<N>", <leaf>]. Parse POSITIONALLY against that fixed shape rather
+        // than scanning for substrings: a namespace is legally allowed to be named "metadata-log" or
+        // "gen-7" (only "strata-meta"/"__"-prefixed names are reserved), and a scanning parser would
+        // misattribute those, letting the generation GC reap a live in-flight file. Any deviation from the
+        // exact shape returns null so the caller keeps the file (fail-closed).
+        String[] parts = path.toString().split("/");
+        if (parts.length != 5 || !parts[0].isEmpty() || !parts[1].equals("metadata-log")
+                || !parts[3].startsWith("gen-")) {
+            return null;
+        }
+        StrataNamespace ns;
+        try {
+            ns = StrataNamespace.of(parts[2]);
+        } catch (RuntimeException malformed) {
+            return null;
+        }
+        long generation;
+        try {
+            generation = Long.parseLong(parts[3].substring("gen-".length()));
+        } catch (NumberFormatException malformed) {
+            return null;
+        }
+        return generation >= 0 ? new SystemFileCoord(ns, generation) : null;
+    }
+
     private StrataClient.FileSpec systemFileSpec(StrataNamespace ns, long generation, String kind) {
         // Path encodes (ns, generation, kind) for human-readable traceability; the server assigns the FileId.
         // A unique token (UUID) is appended to the leaf so every create attempt uses a fresh path — retried

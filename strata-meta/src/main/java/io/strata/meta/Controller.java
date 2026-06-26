@@ -194,10 +194,15 @@ public final class Controller implements AutoCloseable {
                 "strata.controller.log.compact.bytes", 4 * 1024 * 1024);
         int compactIntervalMs = intSetting("STRATA_CONTROLLER_LOG_COMPACT_INTERVAL_MS",
                 "strata.controller.log.compact.interval.ms", 30_000);
+        // Reap snapshot/log system files orphaned by a crash between file-create and manifest CAS. Safe by
+        // construction: a file is reaped only if no manifest references it AND its generation is <= its
+        // namespace's currently-published generation (an in-flight publish is always at a higher generation).
+        boolean orphanGc = boolSetting("STRATA_CONTROLLER_LOG_ORPHAN_GC",
+                "strata.controller.log.orphan.gc", true);
         return (root, endpoint) -> {
             NamespaceLogBackend logBackend = new NamespaceLogBackend(root,
                     new StrataSystemMetadataFileStore(() -> endpoint, replicationFactor, ackQuorum, logFsync), true);
-            logBackend.startBackgroundCompaction(compactBytes, compactIntervalMs);
+            logBackend.startBackgroundCompaction(compactBytes, compactIntervalMs, orphanGc);
             return new NamespaceLogMetadataStore(logBackend);
         };
     }
