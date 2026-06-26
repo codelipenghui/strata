@@ -1263,15 +1263,22 @@ class AppenderImplTest {
                         StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 assertEquals(1, appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS).endOffset());
+                int s1AfterFirst = s1Appends.get(); // DIAG: localize a double-send to the 1st vs 2nd append
                 Object session = currentSession(appender);
                 ManagedScpConnection pinnedFirstReplica = connections(session)[0];
                 assertNotNull(pinnedFirstReplica);
                 assertNotSame(pinnedFirstReplica, pool.get(endpoint(s1)));
 
+                long genBefore = pinnedFirstReplica.generation();
                 pinnedFirstReplica.disconnect();
+                long genAfter = pinnedFirstReplica.generation();
+                boolean sameRef = connections(currentSession(appender))[0] == pinnedFirstReplica;
                 assertEquals(2, appender.append(ByteBuffer.wrap(new byte[] {2})).get(1, TimeUnit.SECONDS).endOffset());
 
-                assertEquals(1, s1Appends.get(), "replaced pinned connection must fail without replaying append");
+                assertEquals(1, s1Appends.get(), "replaced pinned connection must fail without replaying append"
+                        + " [DIAG s1AfterFirst=" + s1AfterFirst + " s1Final=" + s1Appends.get()
+                        + " genBefore=" + genBefore + " genAfter=" + genAfter + " sameRef=" + sameRef
+                        + " s2=" + s2Appends.get() + " s3=" + s3Appends.get() + "]");
                 assertEquals(2, s2Appends.get());
                 assertEquals(2, s3Appends.get());
                 assertTrue(booleanField(currentSession(appender), "needRoll"));
