@@ -192,7 +192,16 @@ public final class ManagedScpConnection implements AutoCloseable {
     public void disconnect() {
         lock.lock();
         try {
+            long before = generation;
             closeCurrentLocked();
+            // A disconnect is a generation boundary: any pinned caller holding the prior generation must
+            // fail rather than transparently reconnect+replay. closeCurrentLocked() only advances the
+            // generation when it actually had a live client to close, so if the client was already gone
+            // (e.g. invalidated by a completed call) the generation would not move and a pinned
+            // acquire(oldGeneration) could slip through — advance it here to close that race.
+            if (generation == before) {
+                generation++;
+            }
             maintainConnection = false;
         } finally {
             lock.unlock();
