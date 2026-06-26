@@ -10,9 +10,10 @@ import org.apache.curator.test.TestingServer;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.net.ServerSocket;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Function;
+import java.util.function.BiFunction;
 
 /**
  * In-process cluster for integration tests: embedded ZooKeeper + controller + N data nodes
@@ -25,7 +26,7 @@ final class MiniCluster implements AutoCloseable {
     Controller meta;         // the first instance (initial leader) — legacy accessor
     final List<DataNode> nodes = new ArrayList<>();
     final Path root;
-    private final Function<String, ControllerConfig> metaConfigFactory;
+    private final BiFunction<String, Integer, ControllerConfig> metaConfigFactory;
     private final int metadataServiceCount;
     private String zkConnect;
     // Node ids are now externally supplied (the ZK allocator was removed); each registering node
@@ -43,12 +44,37 @@ final class MiniCluster implements AutoCloseable {
 
     /** zkConnectOverride lets chaos tests supply a containerized ZooKeeper. */
     MiniCluster(int nodeCount, String zkConnectOverride, int metaCount) throws Exception {
-        this(nodeCount, zkConnectOverride, metaCount, ControllerConfig::forTests);
+        this(nodeCount, zkConnectOverride, metaCount, (zk, idx) -> ControllerConfig.forTests(zk));
+    }
+
+    /**
+     * A namespace-SHARDED cluster: {@code controllerCount} controllers on fixed ports, each configured with
+     * the full eligible-endpoint set and replica-count 1, so each namespace is owned by exactly one
+     * controller (rendezvous) and a non-owner answers NOT_LEADER carrying the owner endpoint. Exercises the
+     * owner-aware client's redirect/routing over the real write+read data path.
+     */
+    static MiniCluster sharded(int dataNodeCount, int controllerCount) throws Exception {
+        int[] ports = new int[controllerCount];
+        List<String> endpoints = new ArrayList<>(controllerCount);
+        for (int i = 0; i < controllerCount; i++) {
+            ports[i] = freePort();
+            endpoints.add("127.0.0.1:" + ports[i]);
+        }
+        List<String> eligible = List.copyOf(endpoints);
+        return new MiniCluster(dataNodeCount, null, controllerCount, (zk, idx) ->
+                new ControllerConfig(zk, ports[idx], 200, 1_000, 1_500, 300, 3_000, 60_000, 5_000, 20_000,
+                        "127.0.0.1", 90_000, eligible, 1));
+    }
+
+    private static int freePort() throws IOException {
+        try (ServerSocket s = new ServerSocket(0)) {
+            return s.getLocalPort();
+        }
     }
 
     /** Allows fault tests to alter timing without changing production service wiring. */
     MiniCluster(int nodeCount, String zkConnectOverride, int metaCount,
-                Function<String, ControllerConfig> metaConfigFactory) throws Exception {
+                BiFunction<String, Integer, ControllerConfig> metaConfigFactory) throws Exception {
         this.root = Files.createTempDirectory("strata-it");
         this.metaConfigFactory = metaConfigFactory;
         this.metadataServiceCount = metaCount;
@@ -106,7 +132,7 @@ final class MiniCluster implements AutoCloseable {
 
     void startControllers() throws Exception {
         for (int i = 0; i < metadataServiceCount; i++) {
-            metas.add(new Controller(metaConfigFactory.apply(zkConnect)));
+            metas.add(new Controller(metaConfigFactory.apply(zkConnect, i)));
         }
         this.meta = metas.get(0);
         awaitAnyLeader();

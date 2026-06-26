@@ -37,7 +37,7 @@ class NamespaceLogMetaFailoverTest {
         System.setProperty("strata.controller.log.ack", "2");
         int metaPort = freePort();
         cluster = new MiniCluster(3, null, 1,
-                zk -> new ControllerConfig(zk, metaPort, 200, 1_000, 1_500, 300, 3_000));
+                (zk, idx) -> new ControllerConfig(zk, metaPort, 200, 1_000, 1_500, 300, 3_000));
     }
 
     @AfterAll

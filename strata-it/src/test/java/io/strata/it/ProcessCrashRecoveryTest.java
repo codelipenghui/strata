@@ -504,7 +504,7 @@ class ProcessCrashRecoveryTest {
         // metadata drops that replica within seconds (the 90s production default would outlast the
         // missing-replica deadline). The in-process metadata can't see a static-field override.
         return new MiniCluster(0, null, metadataServiceCount,
-                zkConnect -> new ControllerConfig(zkConnect, 0, 5_000, 9_000, 1_000, 250, 9_000)
+                (zkConnect, idx) -> new ControllerConfig(zkConnect, 0, 5_000, 9_000, 1_000, 250, 9_000)
                         .withReplicaMissingGraceMs(2_000));
     }
 
