@@ -1223,7 +1223,10 @@ class AppenderImplTest {
                         StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 assertEquals(1, appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS).endOffset());
-                waitFor(() -> s1Appends.get() == 1 && s2Appends.get() == 1 && s3Appends.get() == 1);
+                // Quiesce before disconnect so the disconnect cannot lose s1's in-flight first-append
+                // response and trigger a roll that re-opens s1 (see the multi-connection variant below).
+                waitFor(() -> s1Appends.get() == 1 && s2Appends.get() == 1 && s3Appends.get() == 1
+                        && appendsQuiesced(appender));
                 pool.get(endpoint(s1)).disconnect();
 
                 assertEquals(2, appender.append(ByteBuffer.wrap(new byte[] {2})).get(1, TimeUnit.SECONDS).endOffset());
@@ -1263,22 +1266,22 @@ class AppenderImplTest {
                         StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
                 assertEquals(1, appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS).endOffset());
-                int s1AfterFirst = s1Appends.get(); // DIAG: localize a double-send to the 1st vs 2nd append
+                // append(...).get() returns on the s2+s3 ack quorum, so s1's first append can still be in
+                // flight client-side (its response not yet processed). Wait until the pipeline is fully
+                // quiesced before disconnecting s1's pinned connection: otherwise the disconnect can lose
+                // s1's in-flight first-append response, fail s1, and trigger a roll that re-opens s1 on a
+                // fresh connection — legitimately re-replicating to s1 and defeating this gen-gate check.
+                waitFor(() -> s1Appends.get() == 1 && s2Appends.get() == 1 && s3Appends.get() == 1
+                        && appendsQuiesced(appender));
                 Object session = currentSession(appender);
                 ManagedScpConnection pinnedFirstReplica = connections(session)[0];
                 assertNotNull(pinnedFirstReplica);
                 assertNotSame(pinnedFirstReplica, pool.get(endpoint(s1)));
 
-                long genBefore = pinnedFirstReplica.generation();
                 pinnedFirstReplica.disconnect();
-                long genAfter = pinnedFirstReplica.generation();
-                boolean sameRef = connections(currentSession(appender))[0] == pinnedFirstReplica;
                 assertEquals(2, appender.append(ByteBuffer.wrap(new byte[] {2})).get(1, TimeUnit.SECONDS).endOffset());
 
-                assertEquals(1, s1Appends.get(), "replaced pinned connection must fail without replaying append"
-                        + " [DIAG s1AfterFirst=" + s1AfterFirst + " s1Final=" + s1Appends.get()
-                        + " genBefore=" + genBefore + " genAfter=" + genAfter + " sameRef=" + sameRef
-                        + " s2=" + s2Appends.get() + " s3=" + s3Appends.get() + "]");
+                assertEquals(1, s1Appends.get(), "replaced pinned connection must fail without replaying append");
                 assertEquals(2, s2Appends.get());
                 assertEquals(2, s3Appends.get());
                 assertTrue(booleanField(currentSession(appender), "needRoll"));
@@ -1810,6 +1813,26 @@ class AppenderImplTest {
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
+    }
+
+    /** True once the appender's current chunk session has no in-flight replica requests (all acked). */
+    private static boolean appendsQuiesced(AppenderImpl appender) {
+        try {
+            Object session = currentSession(appender);
+            if (session == null) {
+                return false;
+            }
+            Field f = session.getClass().getDeclaredField("inFlight");
+            f.setAccessible(true);
+            for (int n : (int[]) f.get(session)) {
+                if (n != 0) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private static ScpServer dataNodeServer(int nodeId, int sealCrc, boolean failSeal) throws Exception {
