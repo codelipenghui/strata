@@ -99,6 +99,8 @@ final class ServerMetrics {
                 .tag("backend", backend).description("metadata-log snapshot+roll compactions").register(reg);
         FunctionCounter.builder("strata_controller_log_recoveries", s, Controller::metadataLogRecoveries)
                 .tag("backend", backend).description("namespace repositories (re)opened from a manifest (failover/restart churn)").register(reg);
+        FunctionCounter.builder("strata_controller_log_reacquisitions", s, Controller::metadataLogReacquisitions)
+                .tag("backend", backend).description("stale-epoch meta-log re-acquisitions (ownership contention / membership churn)").register(reg);
 
         registerPerNamespace(reg, s);
     }

@@ -160,11 +160,18 @@ final class NamespaceLogBackend implements AutoCloseable {
                 repo.compactAndPublish();
                 compacted++;
             } catch (IllegalStateException fenced) {
+                // The only IllegalStateException compactAndPublish raises in steady state is a lost manifest
+                // CAS — another node owns this namespace now; drop the stale repo so the next op re-acquires.
                 repos.remove(e.getKey(), repo);
-                log.warn("namespace {} open-log compaction fenced — evicting stale repo", e.getKey(), fenced);
+                if (!closed) {
+                    log.warn("namespace {} open-log compaction fenced — evicting stale repo", e.getKey(), fenced);
+                }
             } catch (Exception ex) {
-                // transient (file store / I/O) — leave the repo and retry on the next sweep
-                log.warn("namespace {} open-log compaction failed; will retry next sweep", e.getKey(), ex);
+                // transient (file store / I/O), or the backend was closed mid-sweep — leave the repo and
+                // retry on the next sweep; suppress the warning once closed (shutdown is not a failure).
+                if (!closed) {
+                    log.warn("namespace {} open-log compaction failed; will retry next sweep", e.getKey(), ex);
+                }
             } finally {
                 repo.unlock();
             }

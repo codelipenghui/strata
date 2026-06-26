@@ -108,9 +108,14 @@ final class OrphanGc implements AutoCloseable {
             }
             switch (confirm(s.namespace(), s.chunkId())) {
                 case ORPHAN -> {
-                    store.delete(s.namespace(), s.chunkId());
-                    log.info("orphan GC: deleted unreferenced sealed chunk {} in ns={}",
-                            s.chunkId(), s.namespace());
+                    ErrorCode result = store.delete(s.namespace(), s.chunkId());
+                    if (result == ErrorCode.OK) {
+                        log.info("orphan GC: deleted unreferenced sealed chunk {} in ns={}",
+                                s.chunkId(), s.namespace());
+                    } else {
+                        log.warn("orphan GC: confirmed orphan {} in ns={} failed to delete: {}",
+                                s.chunkId(), s.namespace(), result);
+                    }
                 }
                 case KEEP, UNREACHABLE -> { /* fail-safe: never delete a kept or unconfirmed suspect */ }
             }

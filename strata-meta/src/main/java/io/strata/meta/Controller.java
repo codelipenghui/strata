@@ -317,6 +317,12 @@ public final class Controller implements AutoCloseable {
         return store instanceof NamespaceLogMetadataStore log ? log.metrics().recoveries() : 0L;
     }
 
+    /** Stale-epoch meta-log re-acquisitions (a fenced append re-opened the namespace); a spike = ownership
+     *  contention / membership churn; 0 under ZK. */
+    public long metadataLogReacquisitions() {
+        return store instanceof NamespaceLogMetadataStore log ? log.metrics().reacquisitions() : 0L;
+    }
+
     /** Consensus-root requests this service has issued against a {@code /strata} subtree, by op kind. */
     public long metadataStoreOps(String subtree, boolean write) {
         return rootZk.zkOps(subtree, write);
