@@ -67,7 +67,8 @@ final class NamespaceLogBackend implements AutoCloseable {
     // Only namespaces this node OWNS may be opened here — opening another owner's namespace would
     // republish its manifest and fence the real owner. Default ns->true for single-node / tests.
     private volatile Predicate<StrataNamespace> ownsNamespace = ns -> true;
-    private boolean closed;
+    private volatile boolean closed;
+    private volatile Thread compactionThread;
 
     NamespaceLogBackend(MetadataStore root, NamespaceMetadataFileStore fileStore, boolean ownsRoot) {
         this.root = root;
@@ -110,6 +111,65 @@ final class NamespaceLogBackend implements AutoCloseable {
     /** Restricts eager recovery to the namespaces this node owns (wired from Controller). */
     void setOwnership(Predicate<StrataNamespace> ownsNamespace) {
         this.ownsNamespace = ownsNamespace;
+    }
+
+    /**
+     * Starts the periodic open-log compaction sweep (design §8/§10 bounded-storage maintenance). Without
+     * it, a per-namespace repo compacts only at open/failover ({@link NamespaceMetadataLogRepository#open}),
+     * so a stable long-lived owner's open log grows unbounded between failovers. The sweep snapshot+rolls
+     * every owned namespace whose open log has passed {@code thresholdBytes}, bounding steady-state storage
+     * by snapshot cadence rather than by total historical mutations. No-op if already started, if either
+     * bound is non-positive (compaction disabled — the default for unit tests), or if already closed.
+     */
+    synchronized void startBackgroundCompaction(long thresholdBytes, long intervalMs) {
+        if (compactionThread != null || thresholdBytes <= 0 || intervalMs <= 0 || closed) {
+            return;
+        }
+        compactionThread = Thread.ofVirtual().name("meta-log-compaction")
+                .start(() -> compactionLoop(thresholdBytes, intervalMs));
+    }
+
+    private void compactionLoop(long thresholdBytes, long intervalMs) {
+        while (!closed) {
+            try {
+                Thread.sleep(intervalMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            compactOversizedRepos(thresholdBytes);
+        }
+    }
+
+    /**
+     * Compacts every owned repository whose open log has grown past {@code thresholdBytes}. Each compaction
+     * runs under that namespace's mutation lock (same as open-time compaction; non-blocking COW compaction
+     * is design-deferred). A fenced manifest CAS means another node now owns the namespace, so the stale
+     * repo is evicted and the next op re-acquires under a fresh epoch rather than fencing forever. Returns
+     * the number of namespaces compacted. Package-private so a test can drive a sweep deterministically.
+     */
+    int compactOversizedRepos(long thresholdBytes) {
+        int compacted = 0;
+        for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
+            NamespaceMetadataLogRepository repo = e.getValue();
+            repo.lock();
+            try {
+                if (repo.openLogBytes() < thresholdBytes) {
+                    continue;
+                }
+                repo.compactAndPublish();
+                compacted++;
+            } catch (IllegalStateException fenced) {
+                repos.remove(e.getKey(), repo);
+                log.warn("namespace {} open-log compaction fenced — evicting stale repo", e.getKey(), fenced);
+            } catch (Exception ex) {
+                // transient (file store / I/O) — leave the repo and retry on the next sweep
+                log.warn("namespace {} open-log compaction failed; will retry next sweep", e.getKey(), ex);
+            } finally {
+                repo.unlock();
+            }
+        }
+        return compacted;
     }
 
     private NamespaceMetadataLogRepository repo(StrataNamespace namespace) throws Exception {
@@ -464,6 +524,10 @@ final class NamespaceLogBackend implements AutoCloseable {
                 return;
             }
             closed = true;
+            Thread sweeper = compactionThread;
+            if (sweeper != null) {
+                sweeper.interrupt(); // best-effort; the loop also self-exits on the closed flag
+            }
             try {
                 fileStore.close();
             } catch (RuntimeException ignore) {

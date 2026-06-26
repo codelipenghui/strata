@@ -187,9 +187,19 @@ public final class Controller implements AutoCloseable {
         int ackQuorum = intSetting("STRATA_CONTROLLER_LOG_ACK", "strata.controller.log.ack", 2);
         // Durability by replication (RF/ack); per-append fsync off by default — see StrataSystemMetadataFileStore.
         boolean logFsync = boolSetting("STRATA_CONTROLLER_LOG_FSYNC", "strata.controller.log.fsync", false);
-        return (root, endpoint) -> new NamespaceLogMetadataStore(new NamespaceLogBackend(
-                root, new StrataSystemMetadataFileStore(() -> endpoint, replicationFactor, ackQuorum, logFsync),
-                true));
+        // Steady-state open-log compaction: snapshot+roll an owned namespace once its open log passes this
+        // size, so a stable leader's log is bounded by snapshot cadence (design §8/§10) rather than only
+        // compacting at open/failover. <=0 on either knob disables the background sweep.
+        int compactBytes = intSetting("STRATA_CONTROLLER_LOG_COMPACT_BYTES",
+                "strata.controller.log.compact.bytes", 4 * 1024 * 1024);
+        int compactIntervalMs = intSetting("STRATA_CONTROLLER_LOG_COMPACT_INTERVAL_MS",
+                "strata.controller.log.compact.interval.ms", 30_000);
+        return (root, endpoint) -> {
+            NamespaceLogBackend logBackend = new NamespaceLogBackend(root,
+                    new StrataSystemMetadataFileStore(() -> endpoint, replicationFactor, ackQuorum, logFsync), true);
+            logBackend.startBackgroundCompaction(compactBytes, compactIntervalMs);
+            return new NamespaceLogMetadataStore(logBackend);
+        };
     }
 
     /** Reads an environment variable, falling back to a JVM system property (settable in tests). */

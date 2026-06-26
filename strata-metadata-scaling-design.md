@@ -494,15 +494,19 @@ replaying. `NamespaceMetadataLogRepository` now pairs
 recovery, publish, rotation, and synchronous snapshot compaction with
 `MetadataStore.putNamespaceManifest` CAS so a recovered leader publishes the new
 open tail before accepting metadata writes, and later appends remain recoverable
-from the compact manifest even before the next explicit publish. Repository
-maintenance can now apply bounded policies for open-segment rotation,
-uncompacted-record compaction, and manifest-referenced old-file deletion after a
-retention cutoff. The repository is deliberately independent from the physical
-metadata-file implementation: tests can use an in-memory store, while the
-service runtime uses `StrataSystemMetadataFileStore` to write metadata-log bytes
-as replicated Strata chunks and publish only the system-file descriptors in the
-root store. Background scheduling, production old-file garbage collection, and
-multi-chunk metadata system files remain separate hardening work.
+from the compact manifest even before the next explicit publish. A background
+sweep (`NamespaceLogBackend.startBackgroundCompaction`) bounds steady-state
+open-log growth: on a fixed interval it runs the synchronous `compactAndPublish`
+cycle for any owned namespace whose open log has passed a configured byte
+threshold, so a stable long-lived leader's log is bounded by snapshot cadence
+rather than only compacting at open/failover. The repository is deliberately
+independent from the physical metadata-file implementation: tests can use an
+in-memory store, while the service runtime uses `StrataSystemMetadataFileStore`
+to write metadata-log bytes as replicated Strata chunks and publish only the
+system-file descriptors in the root store. Non-blocking (copy-on-write)
+compaction, retention-cutoff garbage collection of older superseded system files
+(only the single just-superseded snapshot/log pair is reclaimed inline today),
+and multi-chunk metadata system files remain separate hardening work.
 
 `NamespaceLogMetadataStore` is the current bridge from the existing
 `MetadataStore` SPI to the namespace-log backend. It delegates node registry,
@@ -613,14 +617,17 @@ cycle for one namespace: `compactAndPublish` writes a new snapshot file at the
 current applied offset, opens a new empty metadata-log segment at that same
 offset, and CAS-publishes a manifest whose `logStartOffset` equals the snapshot
 offset. If that CAS loses, the caller must discard the loaded log and recover
-again; the old manifest remains recoverable because old snapshot/log files are
-not deleted by compaction. `maintainAndPublish` can choose compaction before
-rotation when the replay window crosses the policy limit, otherwise rotate when
-the active open segment crosses the byte or record limit. `deleteUnreferencedFiles`
-deletes only metadata system files not referenced by the currently published
-manifest and only when their creation time is before the caller-provided
-retention cutoff. Background scheduling, production old-file garbage collection,
-and multi-chunk metadata system files are still future work; the service path is
+again; on a lost CAS the just-written snapshot/log are cleaned up and the old
+manifest and its files are left intact, and on a winning CAS the superseded
+snapshot/log pair is deleted only after the new manifest is durably published, so
+exactly one prior generation is ever reclaimed inline. A background sweep
+(`NamespaceLogBackend.startBackgroundCompaction` → `compactOversizedRepos`) drives
+this cycle in steady state: on the `STRATA_CONTROLLER_LOG_COMPACT_INTERVAL_MS`
+cadence it compacts any owned namespace whose open log exceeds
+`STRATA_CONTROLLER_LOG_COMPACT_BYTES`, bounding open-log size for a stable leader.
+A rotation-vs-compaction policy chooser, retention-cutoff deletion of older
+superseded generations, non-blocking (copy-on-write) compaction, and multi-chunk
+metadata system files are still future work; the service path is
 already wired to a Strata-backed metadata file store for metadata-log bytes.
 
 The compacted snapshot contains the latest state, not the full mutation history:
