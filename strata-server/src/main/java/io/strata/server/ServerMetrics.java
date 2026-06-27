@@ -62,18 +62,18 @@ final class ServerMetrics {
         Gauge.builder("strata_data_nodes", s, Controller::deadNodes)
                 .tag("state", "dead").register(reg);
 
-        // Per-subtree metadata-store request load: rate(strata_controller_store_ops_total) = requests/s and
-        // rate(strata_controller_store_bytes_total) = throughput, tagged by `backend` (e.g. zk), the /strata
+        // Per-subtree metadata-store request load: rate(strata_metadata_store_ops_total) = requests/s and
+        // rate(strata_metadata_store_bytes_total) = throughput, tagged by `backend` (e.g. zk), the /strata
         // child the op touched (files/namespaces/nodes), and op=read|write. Backend-neutral name +
         // label so a future non-ZK metadata store surfaces on the same Cluster/Node dashboard panels.
         String backend = s.metadataBackend();
         for (String subtree : ZkMetadataStore.SUBTREES) {
             for (boolean write : new boolean[]{false, true}) {
                 String op = write ? "write" : "read";
-                FunctionCounter.builder("strata_controller_store_ops", s, m -> m.metadataStoreOps(subtree, write))
+                FunctionCounter.builder("strata_metadata_store_ops", s, m -> m.metadataStoreOps(subtree, write))
                         .tag("backend", backend).tag("subtree", subtree).tag("op", op)
                         .description("metadata-store requests issued, by backend, /strata subtree, and op").register(reg);
-                FunctionCounter.builder("strata_controller_store_bytes", s, m -> m.metadataStoreBytes(subtree, write))
+                FunctionCounter.builder("strata_metadata_store_bytes", s, m -> m.metadataStoreBytes(subtree, write))
                         .tag("backend", backend).tag("subtree", subtree).tag("op", op)
                         .description("metadata-store payload bytes read/written, by backend, /strata subtree, and op").register(reg);
             }
@@ -82,7 +82,7 @@ final class ServerMetrics {
         // Namespace-log backend: user file/path metadata is stored as replicated Strata files, sharded
         // one owner per namespace. These read 0 under the ZK backend, so the same panels work for both;
         // the metadata log's OWN chunk durability is already counted in strata_chunks_* (the reserved
-        // strata-meta namespace is in the repair scan). The `backend` tag matches strata_controller_store_*.
+        // strata-meta namespace is in the repair scan). The `backend` tag matches strata_metadata_store_*.
         Gauge.builder("strata_controller_namespace_log_active", s, m -> m.namespaceLogActive() ? 1 : 0)
                 .description("1 if the namespace-log backend is active (metadata stored as Strata files)").register(reg);
         Gauge.builder("strata_controller_namespaces_loaded", s, Controller::loadedNamespaces)

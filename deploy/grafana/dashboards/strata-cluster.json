@@ -632,7 +632,7 @@
     {
       "id": 16,
       "type": "stat",
-      "title": "ZK store ops/s",
+      "title": "Metadata store ops/s",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -645,7 +645,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(strata_controller_store_ops_total[$__rate_interval]))",
+          "expr": "sum(rate(strata_metadata_store_ops_total[$__rate_interval]))",
           "refId": "A",
           "instant": true
         }

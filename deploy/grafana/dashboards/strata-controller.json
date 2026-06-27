@@ -724,7 +724,7 @@
     {
       "id": 31,
       "type": "timeseries",
-      "title": "ZK request rate by subtree",
+      "title": "Metadata store request rate by subtree",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -737,7 +737,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (subtree,op)(rate(strata_controller_store_ops_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum by (subtree,op)(rate(strata_metadata_store_ops_total{instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "{{subtree}} {{op}}"
         }
@@ -771,7 +771,7 @@
     {
       "id": 32,
       "type": "timeseries",
-      "title": "ZK throughput by subtree",
+      "title": "Metadata store throughput by subtree",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -784,7 +784,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (subtree,op)(rate(strata_controller_store_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum by (subtree,op)(rate(strata_metadata_store_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "{{subtree}} {{op}}"
         }
