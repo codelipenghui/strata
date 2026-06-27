@@ -124,9 +124,10 @@ compatibility matrix to the compatibility job.
 
 ## Known Remaining Gaps
 
-- KRaft backend parity is not proven because the KRaft backend is not implemented yet. The shared
-  `MetadataStore` conformance suite now runs against the v0 ZooKeeper backend and an independent
-  in-memory reference backend, and is the required parity harness for future KRaft work.
+- The metadata plane is the Strata `MetadataStore` over a ZooKeeper consensus root (plus per-namespace
+  metadata logs); there is no other consensus backend planned. The shared `MetadataStore` conformance
+  suite runs against three implementations — the ZooKeeper-direct store, the namespace-log store, and
+  an independent in-memory reference — which keeps the SPI honest and backend-swappable.
 - Current SCP compatibility and metadata-store conformance run as a CI gate. Released-artifact SCP
   compatibility is additive when a version is supplied, but no historical release version has been
   exercised yet because the project has not published a stable protocol artifact.

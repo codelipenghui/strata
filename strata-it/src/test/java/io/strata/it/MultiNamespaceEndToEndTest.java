@@ -27,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p><b>Backend:</b> namespace-log (the production/docker-compose default). This is required:
  * only the namespace-log backend gives per-namespace owner-assigned ids that start at 0.
- * The ZK v0 backend would hand out globally-unique IDs that do NOT start at 0 per namespace.
+ * The ZK-direct backend would hand out globally-unique IDs that do NOT start at 0 per namespace.
  *
  * <p><b>What is tested:</b>
  * <ol>

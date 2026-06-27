@@ -16,7 +16,7 @@ This file is the durable source of truth for the development loop — update the
   - `NODE_HEARTBEAT` request gains tagged field `completedCommands` (commandId → status) so the repair coordinator learns copy completion.
   - `SEAL_CHUNK` (0x0015): footer sections from caller are optional; the node always computes CRC_RANGES + STATS itself so recovery-sealed chunks are byte-identical across replicas.
   - Error codes added: 15 NOT_LEADER (tagged leader hint), 16 NO_CAPACITY (placement cannot find 3 nodes).
-- **v0 epoch source:** metadata allocates a monotonic writer epoch per file. v1 can map this to Kafka controller leader epochs; storage layer is agnostic.
+- **Epoch source:** metadata allocates a monotonic writer epoch per file; the storage layer is agnostic to how the controller sources it.
 - **v0 controller:** single active instance in tests (Curator leader election implemented); leases in leader memory, registrations + file/chunk records in ZK (CAS via znode versions, leader-only writes).
 - **File naming:** every file has a first-class `StrataNamespace` plus `StrataPath`. `FileId` is globally unique; `(namespace, path)` is unique only while a file is live. The v0 ZK backend stores path bindings under `/strata/namespaces/<namespace>/paths/<path>/__file`, leaving that namespace node as the future ACL/quota root.
 

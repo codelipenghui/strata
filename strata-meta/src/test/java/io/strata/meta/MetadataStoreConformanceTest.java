@@ -17,8 +17,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Backend-neutral MetadataStore contract. Every future metadata backend, including KRaft, should
- * pass these tests before being considered semantically equivalent to the v0 ZooKeeper store.
+ * Backend-neutral MetadataStore contract. Every MetadataStore backend must pass these tests before
+ * being considered semantically equivalent to the ZooKeeper store (the in-memory reference backend
+ * is the standing parity check).
  */
 abstract class MetadataStoreConformanceTest {
 

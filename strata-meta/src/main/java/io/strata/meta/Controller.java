@@ -27,9 +27,10 @@ import java.util.UUID;
 import java.util.function.BiFunction;
 
 /**
- * v0 controller (tech design §4.4): ZooKeeper-backed MetadataStore behind the same SCP
- * surface the v1 KRaft backend will serve. Single active leader (Curator LeaderLatch);
- * non-leaders answer NOT_LEADER. Placement, leases, repair, and retention orchestration live here.
+ * Controller (tech design §4): the metadata plane — a ZooKeeper-backed MetadataStore behind the SCP
+ * control surface, plus the per-namespace metadata logs. Single active cluster leader (Curator
+ * LeaderLatch); a controller that does not own a namespace answers NOT_LEADER with the owner's hint.
+ * Placement, leases, repair, and retention orchestration live here.
  */
 public final class Controller implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(Controller.class);

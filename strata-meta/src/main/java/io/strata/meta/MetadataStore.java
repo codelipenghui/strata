@@ -9,9 +9,9 @@ import java.util.Optional;
 import java.util.OptionalInt;
 
 /**
- * MetadataStore SPI (tech design §4.4): persistence behind the controller. v0 backend is
- * ZooKeeper; v1 is the KRaft chunk-map state machine. The SCP surface and service semantics are
- * identical across backends — this interface is the swap line.
+ * MetadataStore SPI (tech design §4.4): the consensus root behind the controller. The shipped backend
+ * is ZooKeeper; an in-memory reference backend exercises the same contract. The SCP surface and service
+ * semantics are identical across backends — this interface is the swap line.
  *
  * Versioned reads + compare-and-set writes; the service leader is the only writer, CAS guards
  * against stale leaders racing across failover.
@@ -32,7 +32,7 @@ public interface MetadataStore extends AutoCloseable {
     /**
      * Namespace-scoped file lookup. For the namespace-log backend, file ids are per-namespace
      * (each namespace's owner assigns 0, 1, 2, …), so the namespace is required to route to the
-     * correct repo. For the ZK v0 backend file ids are globally unique and the namespace satisfies
+     * correct repo. For the ZK-direct backend file ids are globally unique and the namespace satisfies
      * the signature but does not change the lookup.
      */
     Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) throws Exception;
