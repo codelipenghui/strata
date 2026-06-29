@@ -675,8 +675,12 @@ class RepairCoordinator implements AutoCloseable {
             ChunkId chunkId = file.chunkId(c.index());
             expected.put(chunkId, c);
             for (int nodeId : c.replicas()) {
-                // A dead node's replicas are healed by the node-death event/reconcile path, not verify.
-                if (registry.isDead(nodeId)) {
+                // A dead node's replicas are healed by the node-death/reconcile path, not verify. Liveness
+                // comes from the persisted snapshot, NOT registry.isDead: a non-leader namespace owner does
+                // not receive heartbeats (they are leader-gated), so its in-memory registry is frozen at boot
+                // and would report every post-boot-registered node as dead — silently skipping verification
+                // of their replicas. The persisted snapshot is the leader-written authoritative view.
+                if (!isPersistedLive(nodeId, nodes)) {
                     continue;
                 }
                 byNode.computeIfAbsent(nodeId, k -> new ArrayList<>()).add(chunkId);
@@ -696,7 +700,7 @@ class RepairCoordinator implements AutoCloseable {
                 for (Messages.VerifyChunkResult r : results) {
                     Records.ChunkRecord exp = expected.get(r.chunkId());
                     if (exp != null) {
-                        applyVerifyVerdict(ns, fileId, exp, e.getKey(), node, r, now);
+                        applyVerifyVerdict(ns, fileId, exp, e.getKey(), node, r, now, nodes);
                     }
                 }
             }
@@ -732,7 +736,8 @@ class RepairCoordinator implements AutoCloseable {
      * deleted now so a re-pick of this node cannot read them (the under-replication scan re-replicates).
      */
     private void applyVerifyVerdict(StrataNamespace ns, FileId fileId, Records.ChunkRecord exp, int nodeId,
-                                    Records.NodeRecord node, Messages.VerifyChunkResult r, long now)
+                                    Records.NodeRecord node, Messages.VerifyChunkResult r, long now,
+                                    Map<Integer, Records.NodeRecord> nodes)
             throws Exception {
         ChunkId chunkId = r.chunkId();
         if (isRepairProtected(ns, chunkId, nodeId)) {
@@ -746,8 +751,10 @@ class RepairCoordinator implements AutoCloseable {
         // turn a recoverable degraded chunk into an unavailable one (0 live replicas). The reconcile scan
         // re-replicates once a healthy peer exists; until then keeping the (possibly bad) last copy
         // referenced is strictly safer than dropping it. The anomaly stays tracked, so the drop fires as
-        // soon as another live replica exists.
-        if (!healthy && exp.replicas().stream().filter(n -> n != nodeId && !registry.isDead(n)).count() == 0) {
+        // soon as another live replica exists. Liveness is judged from the persisted snapshot (not
+        // registry.isDead), so a non-leader owner with a frozen in-memory registry does not miscount a
+        // genuinely-DEAD peer as live and drop the last actually-live copy.
+        if (!healthy && exp.replicas().stream().filter(n -> n != nodeId && isPersistedLive(n, nodes)).count() == 0) {
             log.warn("verify: keeping last live replica {} of chunk {} despite verdict "
                             + "(present={} state={}) — dropping it would leave 0 live replicas",
                     nodeId, chunkId, r.present(), r.state());
@@ -1043,6 +1050,18 @@ class RepairCoordinator implements AutoCloseable {
             nodes.put(v.value().nodeId(), v.value());
         }
         return nodes;
+    }
+
+    /**
+     * Liveness as judged from the persisted node snapshot ({@link #nodesById()}), the leader-written
+     * authoritative view. Used by the verify lane instead of {@code registry.isDead}: a non-leader namespace
+     * owner does not receive heartbeats (leader-gated), so its in-memory registry is frozen at boot and would
+     * misreport node liveness. A node is live iff it has a persisted record that is not DEAD (REGISTERED or
+     * DRAINING both still hold their data). This mirrors the dead-set the owner-repair lane already derives.
+     */
+    private static boolean isPersistedLive(int nodeId, Map<Integer, Records.NodeRecord> nodes) {
+        Records.NodeRecord n = nodes.get(nodeId);
+        return n != null && n.state() != Records.NodeState.DEAD;
     }
 
     /**

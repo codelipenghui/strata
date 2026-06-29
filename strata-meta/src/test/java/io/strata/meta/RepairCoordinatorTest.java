@@ -551,6 +551,143 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void nonLeaderOwnerVerifiesNodeAbsentFromItsFrozenRegistry() throws Exception {
+        // A non-leader namespace owner does not receive heartbeats (they are leader-gated), so its in-memory
+        // registry is frozen at boot: a data node that (re-)registered AFTER it booted is absent from
+        // registry.live and reads as isDead. The verify lane must judge liveness from the persisted snapshot,
+        // not registry.isDead — otherwise it silently skips VERIFY_CHUNKS for that node's replicas (a
+        // missing/corrupt-copy detection blind spot, since verify is the only physical-integrity check).
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        List<Messages.VerifyChunks> verifies = new CopyOnWriteArrayList<>();
+        UUID inc = UUID.randomUUID();
+        try (ScpServer node = new ScpServer(0, 777, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                        Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                        verifies.add(vc);
+                        List<Messages.VerifyChunkResult> results = new ArrayList<>();
+                        for (ChunkId id : vc.chunkIds()) {
+                            results.add(new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096, 0xCAFE));
+                        }
+                        return ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
+                    }
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
+                })) {
+            // Persist the node in the store (with the stub endpoint), then drop it from the registry's live
+            // map to simulate a non-leader owner that never warmed/heard this (post-boot) node.
+            Registered late = registerAt(registry, 880, "late-host", "127.0.0.1:" + node.port());
+            liveNodes(registry).remove(late.nodeId());
+            assertTrue(registry.isDead(late.nodeId()),
+                    "premise: the node is absent from the frozen registry (the old liveness source reads it dead)");
+
+            FileId fileId = fileId(0x5151);
+            Records.ChunkRecord chunk = sealed(0, 4096, 0xCAFE, List.of(late.nodeId()));
+            store.createFile(file(fileId, FileState.SEALED, List.of(chunk)));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                    () -> false, () -> false, ns -> true);
+            owner.verifyPass();
+
+            assertEquals(1, verifies.size(),
+                    "owner issued VERIFY_CHUNKS for a node present only in the persisted snapshot");
+            assertEquals(List.of(new ChunkId(fileId, 0)), verifies.get(0).chunkIds());
+        }
+    }
+
+    @Test
+    void nonLeaderOwnerKeepsLastLiveReplicaWhenPeerIsDeadInPersistedState() throws Exception {
+        // The last-live-replica guard must judge survivors from the persisted snapshot. A peer the leader
+        // declared DEAD (persisted) but still stale-REGISTERED in a non-leader owner's frozen registry must
+        // NOT count as a live survivor — else an unhealthy verdict on the only actually-live replica would
+        // drop it, leaving 0 live copies (data loss).
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        UUID inc = UUID.randomUUID();
+        try (ScpServer node = new ScpServer(0, 778, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                        Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                        List<Messages.VerifyChunkResult> results = new ArrayList<>();
+                        for (ChunkId id : vc.chunkIds()) {
+                            // corrupt: present + SEALED but a crc that mismatches the descriptor (0xCAFE)
+                            results.add(new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096, 0xBAD));
+                        }
+                        return ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
+                    }
+                    // a destructive delete must never reach the last live replica; reject so any attempt is loud
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode " + req.opcode());
+                })) {
+            Registered verified = registerAt(registry, 980, "verified-host", "127.0.0.1:" + node.port());
+            Registered peer = register(registry, 990, "peer-host");
+            // leader's authoritative view: the peer is DEAD in the persisted store, but the non-leader owner's
+            // frozen registry still lists it as live (we do NOT mark it dead in the registry).
+            Optional<MetadataStore.Versioned<Records.NodeRecord>> peerRec = store.getNode(peer.nodeId());
+            store.putNode(peerRec.orElseThrow().value().withState(Records.NodeState.DEAD), peerRec.get().version());
+            assertFalse(registry.isDead(peer.nodeId()),
+                    "premise: the dead peer is stale-live in the frozen registry");
+
+            FileId fileId = fileId(0x6262);
+            Records.ChunkRecord chunk = sealed(0, 4096, 0xCAFE, List.of(verified.nodeId(), peer.nodeId()));
+            store.createFile(file(fileId, FileState.SEALED, List.of(chunk)));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                    () -> false, () -> false, ns -> true);
+            owner.verifyPass();
+
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertTrue(replicas.contains(verified.nodeId()),
+                    "the last actually-live replica was kept (guard counted survivors from the persisted view)");
+            assertEquals(2, replicas.size(), "the corrupt verdict did not drop the last live replica");
+        }
+    }
+
+    @Test
+    void lastLiveGuardCountsDrainingPeerAsSurvivor() throws Exception {
+        // A DRAINING node still holds its bytes, so it counts as a live survivor: a corrupt verdict on
+        // another replica IS dropped (the draining copy + reconcile re-replicate). This pins DRAINING != DEAD
+        // so the persisted-liveness predicate can't be silently narrowed to state == REGISTERED.
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        UUID inc = UUID.randomUUID();
+        try (ScpServer node = new ScpServer(0, 779, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                        Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                        List<Messages.VerifyChunkResult> results = new ArrayList<>();
+                        for (ChunkId id : vc.chunkIds()) {
+                            results.add(new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096, 0xBAD));
+                        }
+                        return ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
+                    }
+                    // the corrupt replica's delete is expected (a draining survivor exists); ack via failure is
+                    // fine — applyDeleteConfirmed has already mutated the descriptor, which is what we assert.
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode " + req.opcode());
+                })) {
+            Registered verified = registerAt(registry, 981, "verified2-host", "127.0.0.1:" + node.port());
+            Registered draining = register(registry, 991, "draining-host");
+            Optional<MetadataStore.Versioned<Records.NodeRecord>> rec = store.getNode(draining.nodeId());
+            store.putNode(rec.orElseThrow().value().withState(Records.NodeState.DRAINING), rec.get().version());
+
+            FileId fileId = fileId(0x7373);
+            Records.ChunkRecord chunk = sealed(0, 4096, 0xCAFE, List.of(verified.nodeId(), draining.nodeId()));
+            store.createFile(file(fileId, FileState.SEALED, List.of(chunk)));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                    () -> false, () -> false, ns -> true);
+            owner.verifyPass();
+
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertFalse(replicas.contains(verified.nodeId()),
+                    "the corrupt replica was dropped because a DRAINING peer counts as a live survivor");
+            assertEquals(List.of(draining.nodeId()), replicas, "only the draining survivor remains");
+        }
+    }
+
+    @Test
     void ownerRepairThatLosesEveryCasDoesNotReportFalseSuccess() throws Exception {
         FakeStore store = new FakeStore();
         store.failUpdateFileAttempts = 10; // > CAS_RETRIES: every descriptor-swap CAS loses
