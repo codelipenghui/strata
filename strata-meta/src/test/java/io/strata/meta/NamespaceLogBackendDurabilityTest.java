@@ -83,4 +83,25 @@ class NamespaceLogBackendDurabilityTest {
             }
         }
     }
+
+    @Test
+    void systemNamespaceCreateIsIdempotentOnLostResponseRetry() throws Exception {
+        // C3: the system (strata-meta) create path must be idempotent like the user path. A lost-response
+        // retry re-sends the identical (path, opId); it must return the already-committed system-file id
+        // rather than allocating a second id and failing on the bound path marker (NodeExistsException).
+        try (TestingServer zk = NamespaceLogTestSupport.testingServer();
+             ZkMetadataStore root = NamespaceLogTestSupport.inMemoryRoot(zk)) {
+            NamespaceLogBackend backend = new NamespaceLogBackend(root,
+                    NamespaceLogTestSupport.inMemoryFileStore(), false);
+            Records.FileRecord sysTemplate = NamespaceLogTestSupport.fileRecord(
+                    FileId.of(1), NamespaceLogBackend.SYSTEM_NAMESPACE,
+                    StrataPath.of("/metadata-log/tenant-a/gen-1/log-abc"));
+
+            FileId first = backend.createFileOwnerAssigned(sysTemplate);
+            FileId retry = backend.createFileOwnerAssigned(sysTemplate);
+
+            assertEquals(first, retry, "system create returns the committed id on a lost-response retry");
+            backend.close();
+        }
+    }
 }

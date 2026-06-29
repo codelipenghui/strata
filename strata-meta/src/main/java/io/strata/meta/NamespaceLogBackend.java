@@ -393,14 +393,32 @@ final class NamespaceLogBackend implements AutoCloseable {
      */
     FileId createFileOwnerAssigned(Records.FileRecord template) throws Exception {
         if (isSystem(template.namespace())) {
-            // System files live in the ZK root; use the dedicated system-file-id counter.
+            // System files live in the ZK root, keyed for idempotency on PATH (each system path carries a
+            // unique UUID leaf, so the path identifies the logical create). A lost-response retry re-sends the
+            // identical path, so if it is already bound, return the committed id instead of allocating a fresh
+            // system-file id and colliding on the existing path marker (which would fail the retry rather than
+            // returning the already-committed id).
+            Optional<FileId> bound = root.resolvePath(template.namespace(), template.path());
+            if (bound.isPresent()) {
+                return bound.get();
+            }
             long sysId = root.nextSystemFileId();
             Records.FileRecord sysRecord = new Records.FileRecord(
                     FileId.of(sysId), template.namespace(), template.path(),
                     template.replicationFactor(), template.ackQuorum(), template.fsyncOnAck(),
                     template.state(), template.createdAtMs(), template.chunks(),
                     template.createOpMsb(), template.createOpLsb());
-            root.createFile(sysRecord);
+            try {
+                root.createFile(sysRecord);
+            } catch (KeeperException.NodeExistsException e) {
+                // Raced with a concurrent/retried create that bound the path between resolve and create:
+                // return the now-committed id rather than failing the retry (one system-file id is burned).
+                Optional<FileId> raced = root.resolvePath(template.namespace(), template.path());
+                if (raced.isPresent()) {
+                    return raced.get();
+                }
+                throw e;
+            }
             return sysRecord.fileId();
         }
         return withRepoReacquiringOnFence(template.namespace(), repo -> {
