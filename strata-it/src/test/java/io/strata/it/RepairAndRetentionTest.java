@@ -110,7 +110,7 @@ class RepairAndRetentionTest {
         }
         assertTrue(node.store().contains(TEST_NS, orphan));
 
-        // inventory report (5s interval) -> coordinator spots the orphan -> DELETE command
+        // node-local orphan GC (grace -> owner-confirm via LOOKUP_FILE -> delete) reaps the unreferenced chunk
         long deadline = System.currentTimeMillis() + 30_000;
         while (System.currentTimeMillis() < deadline && node.store().contains(TEST_NS, orphan)) {
             Thread.sleep(250);

@@ -57,14 +57,13 @@ own physical file descriptors. Their bytes are ordinary replicated Strata chunk
 data stored on data nodes. User Strata files use the namespace-log metadata
 store and do not create one root consensus record per user file.
 
-The current UUID-shaped `FileId` value stays unchanged. In code this is two
-`long` components, not the proposed single ZooKeeper-generated monotonic `long`.
-The earlier long-id block-allocation idea was only useful for the older
-direct-ZooKeeper design, where file-id-only routing needed a compact
-consensus-owned ownership map. With namespace-owned metadata logs, the scalable
-path is namespace routing: file metadata operations are sent by namespace or by
-a namespace-qualified file handle, while the file id remains ordinary user-file
-metadata inside the namespace log.
+`FileId` is a per-namespace owner-assigned `long` (a single 64-bit value rendered
+`%016x`), assigned under the namespace owner's lock — **not** a UUID. This replaced
+the earlier UUID-shaped id when the namespace moved into the data plane; see §20
+for id generation (the owner's snapshot high-water for user files, a small
+consensus-root counter for system files), the on-disk layout, and the
+`FORMAT_VERSION` bump. File metadata operations route by namespace or by a
+namespace-qualified file handle; `(namespace, fileId, index)` is the global identity.
 
 Sharding is namespace-based in the first scalable version:
 
@@ -105,9 +104,10 @@ leader; that is an explicit first-version tradeoff.
 - No automatic load-based metadata balancer in the first version. Namespace
   assignment is static after creation unless an operator explicitly moves it or
   the assigned replica set loses availability.
-- No `FileId` format change. The current UUID-shaped `FileId` remains the
-  user-file identity. This design does not add ZooKeeper sequential ids,
-  consensus-reserved long-id blocks, or a file-id ownership map.
+- `FileId` is a per-namespace owner-assigned `long` (changed when the namespace
+  moved into the data plane — see §20; supersedes the original "no format change"
+  goal). No ZooKeeper sequential ids or file-id ownership map — user ids come from
+  the owner's snapshot high-water, system-file ids from a small consensus counter.
 - No unbounded `ListFiles` response. Listing is always paged.
 - No repair or retention workflow that depends on scanning every file in a
   namespace on a fixed cadence.
@@ -321,11 +321,10 @@ is accepted in the first version to keep the control plane simple.
 
 ## 7. File identity and routing
 
-The current implementation represents `FileId` as a UUID-shaped 128-bit value
-implemented by two `long` fields. This design deliberately keeps that
-representation unchanged.
-A file id is globally unique and never reused, but it does not encode a metadata
-shard, namespace id, or routing hint.
+`FileId` is a per-namespace owner-assigned `long` (a single 64-bit value rendered
+`%016x`); see §20 for id generation and the on-disk layout. A file id is unique
+within its namespace and never reused there, but it does not encode a metadata
+shard or routing hint — `(namespace, fileId, index)` is the global identity.
 
 Authoritative file identity is stored in the namespace metadata log:
 

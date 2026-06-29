@@ -27,7 +27,7 @@ strata-common   ids (FileId/ChunkId/NodeId), Varint, Crc32C, ErrorCode, exceptio
 strata-proto    SCP frame codec, tagged fields, opcodes, message structs, Netty-backed ScpClient/ScpServer
 strata-format   chunk file header/footer/trailer, sidecar .meta, integrity ledger .j, ChunkStore engine + crash recovery
 strata-node     data node: SCP handlers → ChunkStore; register/heartbeat/inventory loop; REPLICATE executor (pull)
-strata-meta     MetadataStore SPI, ZkMetadataStore, MetadataService (SCP listener, placement, leases, repair, retention)
+strata-meta     MetadataStore SPI, ZkMetadataStore, Controller (SCP listener, placement, leases, repair, retention)
 strata-client   StrataClient/StrataFile/Appender/Reader per design §12 (quorum ack, DO, roll, create-ahead, recoverAndSeal)
 strata-it       integration tests: in-process cluster + embedded ZK (primary correctness layer); chaos via testcontainers
 tla/            ChunkReplication.tla + TLC config
@@ -95,7 +95,7 @@ scripts/        verify.sh (full pyramid), run helpers
     to agree on length+crc (the appender's check) — never commits metadata over divergent bytes
     (`RecoveryDivergenceTest` constructs same-length-different-bytes replicas).
   - P1 stuck repair: in-flight commands are swept when the executing node is DEAD or the command
-    aged past `repairCommandTimeoutMs` (new MetaConfig field) — the chunksBeingRepaired marker is
+    aged past `repairCommandTimeoutMs` (new ControllerConfig field) — the chunksBeingRepaired marker is
     released and the next scan re-issues (`RepairReliabilityTest`).
   - P2 SEAL_FILE validation: refuses unless every chunk is SEALED and lengths sum to the
     requested total (new error code 19 PRECONDITION_FAILED); also closes the no-epoch zombie
@@ -167,10 +167,10 @@ re-registration on a live connection (stateless RPC), one reviewer self-retracti
   open tail (appenders seal before rolling, recovery seals before new appenders open); racing
   same-epoch appenders could otherwise both claim file offset 0 in different chunks. Fence check
   keeps precedence. Same-epoch dual writers after a seal remain a caller-contract violation that
-  v1 controller-issued unique epochs eliminate. (`MetadataServiceTest`.)
+  v1 controller-issued unique epochs eliminate. (`ControllerTest`.)
 - **P1 DELETING files are immutable to writers** — seal-chunk and SEAL_FILE now reject DELETING
   (SEAL_FILE previously RESURRECTED a half-deleted file to SEALED, stopping deletion with chunks
-  missing). (`MetadataServiceTest`.)
+  missing). (`ControllerTest`.)
 - **P2 read/fetch clamped server-side** at 8 MB per request (allocation was data-bounded, not
   attacker-controlled, but a >64 MB response would die at the frame layer anyway; callers loop).
 - **P2 varint length validation before allocation** — a small frame advertising a huge/negative
