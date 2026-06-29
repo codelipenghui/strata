@@ -98,6 +98,11 @@ public final class NamespaceLogMetadataStore implements MetadataStore {
         return backend.sweepDeletedFiles(olderThanMs);
     }
 
+    @Override
+    public int sweepOwnedNamespaceTombstones(long olderThanMs) throws Exception {
+        return backend.sweepOwnedNamespaceTombstones(olderThanMs);
+    }
+
     /* ---- node registry + sharding root: delegated to the consensus root store ---- */
 
     @Override

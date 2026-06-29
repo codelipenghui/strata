@@ -580,8 +580,19 @@ final class NamespaceLogBackend implements AutoCloseable {
     }
 
     int sweepDeletedFiles(long olderThanMs) throws Exception {
-        int reaped = root.sweepDeletedFiles(olderThanMs); // metadata-log system-file tombstones
+        int reaped = root.sweepDeletedFiles(olderThanMs); // metadata-log system-file tombstones (shared root)
+        return reaped + sweepOwnedNamespaceTombstones(olderThanMs);
+    }
+
+    /**
+     * Reaps tombstones only in the loaded (owned) namespace repos — the system-file tombstones in the
+     * shared root are NOT touched here (the leader sweeps those globally via {@link #sweepDeletedFiles}).
+     * Each namespace owner calls this so its own namespaces' tombstones are reaped even when it does not
+     * hold the global leader latch.
+     */
+    int sweepOwnedNamespaceTombstones(long olderThanMs) throws Exception {
         long cutoff = System.currentTimeMillis() - olderThanMs;
+        int reaped = 0;
         // Iterate the repos lock-free, but lock EACH repo around its own sweep so the tombstone append
         // stays under that namespace's mutation lock (no cross-namespace head-of-line blocking).
         for (NamespaceMetadataLogRepository repo : repos.values()) {
