@@ -586,7 +586,10 @@ class RepairCoordinatorTest {
             Records.ChunkRecord chunk = sealed(0, 4096, 0xCAFE, List.of(late.nodeId()));
             store.createFile(file(fileId, FileState.SEALED, List.of(chunk)));
 
-            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+            // config(5000): give the stub VERIFY_CHUNKS RPC a generous timeout — the default config()'s 1ms
+            // repairCommandTimeoutMs is too tight for the real ScpClient round-trip under CI load, so the
+            // verdict would be lost (empty result) and the drop/keep decision would flake.
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
                     () -> false, () -> false, ns -> true);
             owner.verifyPass();
 
@@ -633,7 +636,10 @@ class RepairCoordinatorTest {
             Records.ChunkRecord chunk = sealed(0, 4096, 0xCAFE, List.of(verified.nodeId(), peer.nodeId()));
             store.createFile(file(fileId, FileState.SEALED, List.of(chunk)));
 
-            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+            // config(5000): give the stub VERIFY_CHUNKS RPC a generous timeout — the default config()'s 1ms
+            // repairCommandTimeoutMs is too tight for the real ScpClient round-trip under CI load, so the
+            // verdict would be lost (empty result) and the drop/keep decision would flake.
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
                     () -> false, () -> false, ns -> true);
             owner.verifyPass();
 
@@ -676,7 +682,10 @@ class RepairCoordinatorTest {
             Records.ChunkRecord chunk = sealed(0, 4096, 0xCAFE, List.of(verified.nodeId(), draining.nodeId()));
             store.createFile(file(fileId, FileState.SEALED, List.of(chunk)));
 
-            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+            // config(5000): give the stub VERIFY_CHUNKS RPC a generous timeout — the default config()'s 1ms
+            // repairCommandTimeoutMs is too tight for the real ScpClient round-trip under CI load, so the
+            // verdict would be lost (empty result) and the drop/keep decision would flake.
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
                     () -> false, () -> false, ns -> true);
             owner.verifyPass();
 
