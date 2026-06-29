@@ -68,6 +68,20 @@ public interface MetadataStore extends AutoCloseable {
      */
     int sweepDeletedFiles(long olderThanMs) throws Exception;
 
+    /**
+     * Reaps DELETED tombstones for only the namespaces this node owns — the sharded counterpart of
+     * {@link #sweepDeletedFiles}. A namespace's metadata-log tombstones live in its owner's loaded
+     * repository, which no other controller holds, so each owner must reap its own; gating the full
+     * sweep on the single global leader would leak tombstones in every non-leader-owned namespace.
+     *
+     * <p>Default is a no-op (returns 0): a non-sharded / consensus-root backend keeps every namespace's
+     * tombstones in the shared root, where the leader's {@link #sweepDeletedFiles} reaps them globally,
+     * so a non-leader owns no separate per-namespace tombstone storage to sweep. Returns the number reaped.
+     */
+    default int sweepOwnedNamespaceTombstones(long olderThanMs) throws Exception {
+        return 0;
+    }
+
     /* ---- node registry ---- */
 
     /**
