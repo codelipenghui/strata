@@ -944,10 +944,21 @@ public final class Messages {
      * Empty = keep all (compat). v0 fixed-field addition (pre-release; single apiVersion).
      */
     public record SealChunkMeta(StrataNamespace namespace, ChunkId chunkId, int writeEpoch, long length, int crc,
-                                List<Integer> sealedReplicas) {
+                                List<Integer> sealedReplicas, long opIdMsb, long opIdLsb) {
         public SealChunkMeta {
             namespace = Objects.requireNonNull(namespace, "namespace");
             sealedReplicas = List.copyOf(sealedReplicas);
+        }
+
+        /**
+         * Convenience for callers that do not pin a chunk incarnation. opId (0,0) is the sentinel
+         * "no incarnation pin": the controller then relies on the write-epoch fence alone. Seal
+         * recovery uses this — it seals at a strictly higher epoch and never reuses an incarnation,
+         * so the fence already separates it from any stale same-epoch seal.
+         */
+        public SealChunkMeta(StrataNamespace namespace, ChunkId chunkId, int writeEpoch, long length, int crc,
+                             List<Integer> sealedReplicas) {
+            this(namespace, chunkId, writeEpoch, length, crc, sealedReplicas, 0L, 0L);
         }
 
         public byte[] encode() {
@@ -955,7 +966,7 @@ public final class Messages {
             w.string(namespace.toString()).chunkId(chunkId).i32(writeEpoch).u64(length).u32(crc);
             w.varint(sealedReplicas.size());
             for (int id : sealedReplicas) w.u32(id);
-            w.noTags();
+            w.u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
@@ -968,8 +979,10 @@ public final class Messages {
             int n = count(b);
             List<Integer> sealed = new ArrayList<>(n);
             for (int i = 0; i < n; i++) sealed.add(b.getInt());
+            long opIdMsb = b.getLong();
+            long opIdLsb = b.getLong();
             TaggedFields.readFrom(b);
-            return new SealChunkMeta(namespace, id, epoch, length, crc, sealed);
+            return new SealChunkMeta(namespace, id, epoch, length, crc, sealed, opIdMsb, opIdLsb);
         }
     }
 

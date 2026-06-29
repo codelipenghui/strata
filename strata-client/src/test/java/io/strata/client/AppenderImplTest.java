@@ -1650,9 +1650,9 @@ class AppenderImplTest {
 
     private static Object chunkSession(ChunkId chunkId, Messages.Replica... replicas) throws Exception {
         Class<?> type = Class.forName("io.strata.client.AppenderImpl$ChunkSession");
-        Constructor<?> ctor = type.getDeclaredConstructor(ChunkId.class, List.class);
+        Constructor<?> ctor = type.getDeclaredConstructor(ChunkId.class, List.class, long.class, long.class);
         ctor.setAccessible(true);
-        return ctor.newInstance(chunkId, List.of(replicas));
+        return ctor.newInstance(chunkId, List.of(replicas), 0L, 0L);
     }
 
     private static void onReplicaResponse(AppenderImpl appender, Object session,

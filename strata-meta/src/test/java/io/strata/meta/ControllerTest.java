@@ -262,12 +262,32 @@ class ControllerTest {
                 new Messages.LookupFile(StrataNamespace.of("test"), missing).encode(), null, 5000));
         assertEquals(ErrorCode.FILE_NOT_FOUND, lookup.code());
 
+        // deleting a never-created (or already-deleted/swept) file is idempotent success, not an
+        // error: a delete retry whose first response was lost — or one that lands after the
+        // tombstone was reaped — must not surface FILE_NOT_FOUND. This mirrors abortChunk's
+        // idempotent-after-deletion semantics exercised just below.
         var delete = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
                 new Messages.DeleteFiles(StrataNamespace.of("test"), List.of(missing)).encode(), null, 5000));
-        assertEquals(ErrorCode.FILE_NOT_FOUND.code, delete.codes().get(0).shortValue());
+        assertEquals(ErrorCode.OK.code, delete.codes().get(0).shortValue());
 
         client.call(Opcode.ABORT_CHUNK_META,
                 new Messages.AbortChunkMeta(StrataNamespace.of("test"), new ChunkId(missing, 0), 1, 1, 2).encode(), null, 5000);
+    }
+
+    @Test
+    void deleteIsIdempotentAcrossRetries() {
+        var created = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", "/idempotent-delete-retry").encode(), null, 5000));
+        FileId id = created.fileId();
+
+        // first delete acks OK; a duplicate delete (lost response, or a retry across controller
+        // failover) must also ack OK rather than FILE_NOT_FOUND — the file is already gone from the
+        // caller's point of view, so a single logical deletion is observed.
+        for (int i = 0; i < 3; i++) {
+            var resp = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
+                    new Messages.DeleteFiles(StrataNamespace.of("test"), List.of(id)).encode(), null, 5000));
+            assertEquals(ErrorCode.OK.code, resp.codes().get(0).shortValue(), "delete attempt " + i);
+        }
     }
 
     @Test
@@ -941,6 +961,73 @@ class ControllerTest {
         assertEquals(2, lookup.fileState(), "file must remain DELETING");
         assertEquals(1, lookup.chunks().size(), "stale abort must not hide replicas from deletion");
         assertEquals(ChunkState.OPEN, lookup.chunks().get(0).state());
+    }
+
+    @Test
+    void sealChunkMetaFencesOpIdMismatchAtSameEpoch() {
+        registerTrio("sealPinHost");
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", "/seal-opid-pin").encode(), null, 5000));
+        // create the chunk under a known create-op (A) at epoch 1
+        var chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1, 0xA1L, 0xA2L).encode(),
+                null, 5000));
+
+        // a seal naming a different create-op (B) at the same epoch is a stale incarnation — it
+        // must be fenced, never applied to the live chunk (the write-epoch fence cannot tell two
+        // incarnations apart at equal epochs)
+        ScpException mismatch = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC,
+                        List.of(), 0xB1L, 0xB2L).encode(), null, 5000));
+        assertEquals(ErrorCode.FENCED_EPOCH, mismatch.code());
+
+        // the matching create-op seals, and a retry of that seal is idempotent
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC,
+                        List.of(), 0xA1L, 0xA2L).encode(), null, 5000);
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC,
+                        List.of(), 0xA1L, 0xA2L).encode(), null, 5000);
+
+        // a no-pin (0,0) seal still works against an already-sealed chunk with the same content
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), chunk.chunkId(), 1, 100, 0xC,
+                        List.of()).encode(), null, 5000);
+    }
+
+    @Test
+    void sealChunkMetaFencesStaleSealAfterSameEpochRecreate() {
+        registerTrio("sealRaceHost");
+        var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile("test", "/seal-incarnation-collision").encode(), null, 5000));
+        // incarnation A of chunk index 0 at epoch 1
+        var a = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1, 0xA1L, 0xA2L).encode(),
+                null, 5000));
+        // abort A, then recreate index 0 as incarnation B at the SAME epoch — the only window the
+        // write-epoch fence cannot separate
+        client.call(Opcode.ABORT_CHUNK_META,
+                new Messages.AbortChunkMeta(StrataNamespace.of("test"), a.chunkId(), 1, 0xA1L, 0xA2L).encode(),
+                null, 5000);
+        var b = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1, 0xB1L, 0xB2L).encode(),
+                null, 5000));
+        assertEquals(a.chunkId(), b.chunkId()); // same (fileId, index 0), different incarnation
+
+        // a delayed seal from incarnation A must NOT seal incarnation B with A's length/crc
+        ScpException stale = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), a.chunkId(), 1, 999, 0xDEAD,
+                        List.of(), 0xA1L, 0xA2L).encode(), null, 5000));
+        assertEquals(ErrorCode.FENCED_EPOCH, stale.code());
+
+        // the live incarnation B seals normally with its own length/crc
+        client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(StrataNamespace.of("test"), b.chunkId(), 1, 100, 0xC,
+                        List.of(), 0xB1L, 0xB2L).encode(), null, 5000);
+        var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
+                new Messages.LookupFile(StrataNamespace.of("test"), file.fileId()).encode(), null, 5000));
+        assertEquals(ChunkState.SEALED, lookup.chunks().get(0).state());
+        assertEquals(100L, lookup.chunks().get(0).length());
     }
 
     @Test

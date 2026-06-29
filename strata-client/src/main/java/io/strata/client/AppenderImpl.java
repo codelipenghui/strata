@@ -80,6 +80,10 @@ final class AppenderImpl implements StrataFile.Appender {
     private static final class ChunkSession {
         final ChunkId chunkId;
         final List<Messages.Replica> replicas;
+        // the create-op id this appender minted for this chunk incarnation; echoed on seal so the
+        // controller can reject a stale seal that survived an abort + same-epoch recreate.
+        final long createOpMsb;
+        final long createOpLsb;
         final ManagedScpConnection[] connections;
         final long[] acked;
         final long[] connectionGenerations;
@@ -90,9 +94,11 @@ final class AppenderImpl implements StrataFile.Appender {
         final ArrayDeque<Pending> pending = new ArrayDeque<>();
         boolean needRoll;
 
-        ChunkSession(ChunkId chunkId, List<Messages.Replica> replicas) {
+        ChunkSession(ChunkId chunkId, List<Messages.Replica> replicas, long createOpMsb, long createOpLsb) {
             this.chunkId = chunkId;
             this.replicas = replicas;
+            this.createOpMsb = createOpMsb;
+            this.createOpLsb = createOpLsb;
             this.connections = new ManagedScpConnection[replicas.size()];
             this.acked = new long[replicas.size()];
             this.connectionGenerations = new long[replicas.size()];
@@ -498,7 +504,7 @@ final class AppenderImpl implements StrataFile.Appender {
             // commit only the replicas that ACTUALLY sealed: a failed/skipped replica left in a
             // SEALED descriptor would serve short reads forever (alive, so repair never fires);
             // the under-replication scan add-repairs the descriptor back to RF afterwards
-            controller.sealChunkMeta(namespace, id, epoch, fl, fcrc, sealedReplicas);
+            controller.sealChunkMeta(namespace, id, epoch, fl, fcrc, sealedReplicas, s.createOpMsb, s.createOpLsb);
         } catch (ScpException e) {
             metaFailure = e; // handled under the lock below
         } finally {
@@ -575,7 +581,8 @@ final class AppenderImpl implements StrataFile.Appender {
             dieLocked(failure);
             return OpenChunkResult.failed(failure, Set.of());
         }
-        ChunkSession s = new ChunkSession(created.chunkId(), created.replicas());
+        ChunkSession s = new ChunkSession(created.chunkId(), created.replicas(),
+                createOp.getMostSignificantBits(), createOp.getLeastSignificantBits());
         byte[] header = new Messages.OpenChunk(created.chunkId(), epoch, fsyncOnAck,
                 config.chunkRollBytes(), System.currentTimeMillis(), namespace).encode();
         int ok = 0;
