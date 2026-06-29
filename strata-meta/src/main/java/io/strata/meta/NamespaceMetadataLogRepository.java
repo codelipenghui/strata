@@ -37,6 +37,11 @@ final class NamespaceMetadataLogRepository {
     private long appliedOffset;  // durable end offset
     private long generation;
     private int manifestVersion; // znode version for the next CAS publish
+    private boolean compacting;  // guarded by lock: one compaction in flight, blocks an overlapping one
+    // Guarded by lock: while a compaction is in flight, append() buffers each frame it writes here so the
+    // publish phase can carry the freeze→CAS-window tail into the new segment WITHOUT reading (and, on the
+    // production store, destructively sealing) the live open log. Cleared at each freeze and on completion.
+    private final java.util.List<byte[]> compactionTail = new java.util.ArrayList<>();
 
     private NamespaceMetadataLogRepository(StrataNamespace namespace, NamespaceMetadataFileStore fileStore,
                                            MetadataStore rootStore, long metadataEpoch,
@@ -118,14 +123,135 @@ final class NamespaceMetadataLogRepository {
         FailureInjector.point("meta.log.afterDurableAppend");
         state.apply(record);                    // then visible
         appliedOffset += frame.length;
+        if (compacting) {
+            // A compaction froze its snapshot at an earlier cut; this frame is in its freeze→CAS window.
+            // Buffer it so publishFrozen can carry it into the new segment without re-reading the open log.
+            compactionTail.add(frame);
+        }
         metrics.recordAppend(frame.length);
         return appliedOffset;
     }
 
-    /** Compacts the log: snapshot the current state, roll a new open log, and CAS-publish the manifest. */
+    /** Always-compact entry point for the threshold-free call sites (tests); see {@link #compact}. */
     void compactAndPublish() throws Exception {
-        publishCompacted(appliedOffset, manifestVersion);
-        metrics.recordCompaction();
+        compact(0);
+    }
+
+    /**
+     * Non-blocking (copy-on-write) open-log compaction (design §10). Splits compaction into a short locked
+     * freeze, a long UNLOCKED snapshot encode + write, and a short locked manifest CAS + pointer swap, so
+     * the namespace keeps accepting metadata writes for the (size-proportional) duration of its own
+     * compaction. Returns {@code true} if a manifest was published, {@code false} if the call was skipped
+     * (open log under {@code thresholdBytes}, or a compaction is already in flight for this repo).
+     *
+     * <p><b>Carry the tail, do not reset.</b> Appends that land in the freeze→CAS window go to the OLD open
+     * log (the currently-published one — so they survive a fencing failover, whose recovery replays the
+     * whole old open log). {@code append()} also buffers each such frame in {@code compactionTail}; the
+     * locked publish phase writes that buffered tail into the new segment so it physically starts at the
+     * snapshot cut (recovery reads the whole log file assuming {@code byte 0 == logStartOffset == cut}).
+     * Buffering — rather than reading the old log — is deliberate: the production store's
+     * {@code readLog} recover-and-seals the file, which would fence the still-live open log. {@code
+     * appliedOffset} is preserved (NOT reset to the cut — that would drop the carried tail's offsets).
+     *
+     * @throws IllegalStateException if the manifest CAS is lost — another node owns this namespace now
+     */
+    boolean compact(long thresholdBytes) throws Exception {
+        Frozen frozen;
+        lock();
+        try {
+            if (compacting || openLogBytes() < thresholdBytes) {
+                return false;
+            }
+            compacting = true;
+            compactionTail.clear();
+            frozen = freeze();
+        } catch (RuntimeException | Error t) {
+            // freeze() (exportSnapshot) does no I/O, but if it throws (e.g. OOM on a huge state) release the
+            // compaction claim so it is not stuck `true` forever, disabling all future compaction.
+            compacting = false;
+            throw t;
+        } finally {
+            unlock();
+        }
+        boolean published = false;
+        try {
+            // Off-lock: the expensive snapshot encode + durable (replicated) snapshot write, plus rolling
+            // the (empty) new log. Appends to this namespace run concurrently against the still-current open
+            // log during this phase and are buffered into compactionTail.
+            byte[] snapshotBytes = NamespaceMetadataSnapshotCodec.encode(frozen.snapshot());
+            FileId newSnapshot = fileStore.writeSnapshot(namespace, frozen.newGeneration(), snapshotBytes);
+            FileId newLog = fileStore.createLogFile(namespace, frozen.newGeneration());
+            lock();
+            try {
+                publishFrozen(frozen, newSnapshot, newLog);
+                published = true;
+            } finally {
+                unlock();
+            }
+        } finally {
+            lock();
+            try {
+                compacting = false;
+                compactionTail.clear();
+            } finally {
+                unlock();
+            }
+        }
+        if (published) {
+            metrics.recordCompaction();
+        }
+        return true;
+    }
+
+    /** Immutable freeze of the state to compact, captured under the mutation lock (the short locked phase). */
+    private record Frozen(long cut, int expectedVersion, long newGeneration,
+                          NamespaceMetadataState.Snapshot snapshot) {
+    }
+
+    /** Captures the cut, the manifest version to CAS against, and an immutable snapshot of the state. */
+    private Frozen freeze() {
+        long cut = appliedOffset;
+        return new Frozen(cut, manifestVersion, generation + 1, state.exportSnapshot(cut));
+    }
+
+    /**
+     * The short locked publish phase: carry the post-freeze tail into the (already-rolled) new open log,
+     * CAS-publish the manifest, then swap the in-memory pointers. Mirrors the crash-window invariants of
+     * {@link #publishCompacted}: the new files are written before the CAS, a lost CAS cleans up the new files
+     * and throws (fence), and the just-superseded generation is NOT deleted inline (issue #8) — it is retained
+     * and reclaimed by the retention-gated sweep. It never reads or seals the old open log, so a publish
+     * failure leaves that log writable for the next op / re-acquire.
+     */
+    private void publishFrozen(Frozen frozen, FileId newSnapshot, FileId newLog) throws Exception {
+        // Carry the freeze→CAS-window appends [cut, appliedOffset) — buffered by append() into
+        // compactionTail — into the new segment so it physically starts at the snapshot cut. The frames are
+        // already framed and quorum-durable in the old log; we re-append the bytes (a small, bounded write).
+        for (byte[] frame : compactionTail) {
+            fileStore.appendLog(newLog, frame);
+        }
+        Records.NamespaceManifest published = new Records.NamespaceManifest(namespace, metadataEpoch,
+                frozen.newGeneration(), frozen.cut(), appliedOffset, Optional.of(newSnapshot), Optional.of(newLog));
+        // Crash window (same as publishCompacted): the new snapshot/log exist but the manifest still points
+        // at the old generation; a crash here must leave the OLD manifest fully recoverable.
+        FailureInjector.point("meta.log.beforeManifestPublish");
+        OptionalInt newVersion = rootStore.putNamespaceManifest(published, frozen.expectedVersion());
+        if (newVersion.isEmpty()) {
+            // Best-effort cleanup of the files we just wrote but could not publish.
+            deleteQuietly(newSnapshot);
+            deleteQuietly(newLog);
+            throw new IllegalStateException("manifest CAS lost for namespace " + namespace
+                    + " — fenced; recover again under a new epoch");
+        }
+        this.snapshotFileId = newSnapshot;
+        this.logFileId = newLog;
+        this.logStartOffset = frozen.cut();
+        // appliedOffset is preserved: the tail [cut, appliedOffset) was carried into the new log, so the
+        // durable end is unchanged. (Do NOT reset to cut — that would drop the carried tail.)
+        this.generation = frozen.newGeneration();
+        this.manifestVersion = newVersion.getAsInt();
+        // The just-superseded generation (old snapshot/log) is NOT deleted inline (issue #8, design §10 step
+        // 6): it is retained as a rollback margin and reclaimed by the retention-gated sweep
+        // (NamespaceLogBackend.gcOrphanedSystemFiles) once STRATA_CONTROLLER_LOG_RETENTION_MS has elapsed.
     }
 
     private void recoverAndRepublish() throws Exception {

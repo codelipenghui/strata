@@ -266,26 +266,26 @@ final class NamespaceLogBackend implements AutoCloseable {
     }
 
     /**
-     * Compacts every owned repository whose open log has grown past {@code thresholdBytes}. Each compaction
-     * runs under that namespace's mutation lock (same as open-time compaction; non-blocking COW compaction
-     * is design-deferred). A fenced manifest CAS means another node now owns the namespace, so the stale
-     * repo is evicted and the next op re-acquires under a fresh epoch rather than fencing forever. Returns
-     * the number of namespaces compacted. Package-private so a test can drive a sweep deterministically.
+     * Compacts every owned repository whose open log has grown past {@code thresholdBytes}. Compaction is
+     * non-blocking ({@link NamespaceMetadataLogRepository#compact} — copy-on-write, design §10): it manages
+     * its own locking so the snapshot encode + write happen off the namespace's mutation lock, and a
+     * namespace keeps accepting writes for the duration of its own compaction. {@code compact()} skips a
+     * repo (returns {@code false}) that is under threshold or already compacting, so this sweep does NOT
+     * hold the lock across the call. A fenced manifest CAS means another node now owns the namespace, so
+     * the stale repo is evicted and the next op re-acquires under a fresh epoch rather than fencing forever.
+     * Returns the number of namespaces compacted. Package-private so a test can drive a sweep deterministically.
      */
     int compactOversizedRepos(long thresholdBytes) {
         int compacted = 0;
         for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
             NamespaceMetadataLogRepository repo = e.getValue();
-            repo.lock();
             try {
-                if (repo.openLogBytes() < thresholdBytes) {
-                    continue;
+                if (repo.compact(thresholdBytes)) {
+                    compacted++;
                 }
-                repo.compactAndPublish();
-                compacted++;
             } catch (IllegalStateException fenced) {
-                // The only IllegalStateException compactAndPublish raises in steady state is a lost manifest
-                // CAS — another node owns this namespace now; drop the stale repo so the next op re-acquires.
+                // The only IllegalStateException compact() raises in steady state is a lost manifest CAS —
+                // another node owns this namespace now; drop the stale repo so the next op re-acquires.
                 repos.remove(e.getKey(), repo);
                 if (!closed) {
                     log.warn("namespace {} open-log compaction fenced — evicting stale repo", e.getKey(), fenced);
@@ -296,8 +296,6 @@ final class NamespaceLogBackend implements AutoCloseable {
                 if (!closed) {
                     log.warn("namespace {} open-log compaction failed; will retry next sweep", e.getKey(), ex);
                 }
-            } finally {
-                repo.unlock();
             }
         }
         return compacted;
