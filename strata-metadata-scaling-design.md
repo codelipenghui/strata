@@ -502,10 +502,11 @@ rather than only compacting at open/failover. The repository is deliberately
 independent from the physical metadata-file implementation: tests can use an
 in-memory store, while the service runtime uses `StrataSystemMetadataFileStore`
 to write metadata-log bytes as replicated Strata chunks and publish only the
-system-file descriptors in the root store. Non-blocking (copy-on-write)
-compaction, retention-cutoff garbage collection of older superseded system files
-(only the single just-superseded snapshot/log pair is reclaimed inline today),
-and multi-chunk metadata system files remain separate hardening work.
+system-file descriptors in the root store. Retention-cutoff garbage collection of
+superseded system files is implemented (the inline delete is removed; superseded
+generations are reclaimed by the retention-gated sweep after
+`STRATA_CONTROLLER_LOG_RETENTION_MS`). Non-blocking (copy-on-write) compaction and
+multi-chunk metadata system files remain separate hardening work.
 
 `NamespaceLogMetadataStore` is the current bridge from the existing
 `MetadataStore` SPI to the namespace-log backend. It delegates node registry,
@@ -617,17 +618,21 @@ current applied offset, opens a new empty metadata-log segment at that same
 offset, and CAS-publishes a manifest whose `logStartOffset` equals the snapshot
 offset. If that CAS loses, the caller must discard the loaded log and recover
 again; on a lost CAS the just-written snapshot/log are cleaned up and the old
-manifest and its files are left intact, and on a winning CAS the superseded
-snapshot/log pair is deleted only after the new manifest is durably published, so
-exactly one prior generation is ever reclaimed inline. A background sweep
-(`NamespaceLogBackend.startBackgroundCompaction` → `compactOversizedRepos`) drives
-this cycle in steady state: on the `STRATA_CONTROLLER_LOG_COMPACT_INTERVAL_MS`
-cadence it compacts any owned namespace whose open log exceeds
-`STRATA_CONTROLLER_LOG_COMPACT_BYTES`, bounding open-log size for a stable leader.
-A rotation-vs-compaction policy chooser, retention-cutoff deletion of older
-superseded generations, non-blocking (copy-on-write) compaction, and multi-chunk
-metadata system files are still future work; the service path is
-already wired to a Strata-backed metadata file store for metadata-log bytes.
+manifest and its files are left intact. On a winning CAS the superseded
+snapshot/log pair is NOT deleted inline (step 6): it is retained as a rollback
+margin and reclaimed by the retention-gated sweep below. A background sweep
+(`NamespaceLogBackend.startBackgroundCompaction` → `compactOversizedRepos` +
+`gcOrphanedSystemFiles`) drives this cycle in steady state: on the
+`STRATA_CONTROLLER_LOG_COMPACT_INTERVAL_MS` cadence it compacts any owned namespace
+whose open log exceeds `STRATA_CONTROLLER_LOG_COMPACT_BYTES` (bounding open-log size
+for a stable leader) and, each tick, reclaims superseded/orphaned system
+generations whose retention window has elapsed. The retention window
+(`STRATA_CONTROLLER_LOG_RETENTION_MS`, step 6's "safety delay") is timed off the
+successor generation's durable `createdAtMs`, so it is honored across failover with
+no in-memory queue; with the default `0` a superseded generation is reclaimed on the
+next sweep. A rotation-vs-compaction policy chooser, non-blocking (copy-on-write)
+compaction, and multi-chunk metadata system files are still future work; the service
+path is already wired to a Strata-backed metadata file store for metadata-log bytes.
 
 The compacted snapshot contains the latest state, not the full mutation history:
 

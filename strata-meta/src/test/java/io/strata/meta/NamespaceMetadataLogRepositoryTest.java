@@ -71,6 +71,26 @@ class NamespaceMetadataLogRepositoryTest {
     }
 
     @Test
+    void compactionRetainsTheSupersededGenerationRatherThanDeletingItInline() throws Exception {
+        // Issue #8: publishCompacted must NOT delete the just-superseded snapshot/log pair inline the instant
+        // the new manifest is durable. The prior generation is retained as a rollback margin and reclaimed
+        // later by the retention-gated sweep (NamespaceLogBackend.gcOrphanedSystemFiles), not here.
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            TestNamespaceMetadataFileStore fs = new TestNamespaceMetadataFileStore();
+            NamespaceMetadataLogRepository repo = NamespaceMetadataLogRepository.open(NS, fs, root, 1);
+
+            repo.append(fileCreated(FileId.of(1), "/a", 1));
+            assertEquals(2, fs.liveFileCount(), "generation 1: one snapshot + one open log");
+
+            repo.compactAndPublish(); // publishes generation 2; generation 1 is now superseded
+
+            assertEquals(4, fs.liveFileCount(),
+                    "both the superseded (gen 1) and the new (gen 2) snapshot/log pairs are retained");
+        }
+    }
+
+    @Test
     void aFencedLeadersPublishLosesTheManifestCas() throws Exception {
         try (TestingServer zk = new TestingServer(true);
              ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
