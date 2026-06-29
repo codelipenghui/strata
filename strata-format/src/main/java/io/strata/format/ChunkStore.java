@@ -37,6 +37,7 @@ import java.util.zip.CRC32C;
 import static io.strata.common.Checks.checkedAdd;
 import static io.strata.format.ChunkFormats.DATA_START;
 import static io.strata.format.ChunkFormats.HEADER_SIZE;
+import static io.strata.common.Fsync.forceDirectory;
 import static io.strata.format.ChunkFormats.TRAILER_SIZE;
 import static io.strata.format.ChunkFormats.readFully;
 import static io.strata.format.ChunkFormats.writeFully;
@@ -699,12 +700,6 @@ public final class ChunkStore implements AutoCloseable {
             }
         } catch (IOException e) {
             log.warn("failed to delete {} {}", description, path, e);
-        }
-    }
-
-    private static void forceDirectory(Path d) throws IOException {
-        try (FileChannel ch = FileChannel.open(d, StandardOpenOption.READ)) {
-            ch.force(true);
         }
     }
 

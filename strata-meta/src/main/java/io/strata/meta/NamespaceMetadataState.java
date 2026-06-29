@@ -182,6 +182,16 @@ final class NamespaceMetadataState {
         return out;
     }
 
+    /** Whether any non-DELETED file exists — short-circuits without materializing {@link #liveFiles()}. */
+    boolean hasLiveFiles() {
+        for (Records.FileRecord f : files.values()) {
+            if (f.state() != FileState.DELETED) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * Returns the file id previously created by this opId, if any live (non-swept) record carries it.
      * Used for opId-keyed idempotency: a retried create with the same opId returns the same file id

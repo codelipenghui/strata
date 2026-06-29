@@ -471,27 +471,17 @@ final class NamespaceLogBackend implements AutoCloseable {
 
     private Optional<MetadataStore.Versioned<Records.FileRecord>> lockedFile(StrataNamespace ns, FileId id)
             throws Exception {
-        NamespaceMetadataLogRepository repo = repo(ns);
-        repo.lock();
-        try {
+        return runLocked(repo(ns), repo -> {
             NamespaceMetadataState state = repo.state();
             return state.file(id).map(f -> new MetadataStore.Versioned<>(f, state.version(id)));
-        } finally {
-            repo.unlock();
-        }
+        });
     }
 
     Optional<FileId> resolvePath(StrataNamespace namespace, StrataPath path) throws Exception {
         if (isSystem(namespace)) {
             return root.resolvePath(namespace, path);
         }
-        NamespaceMetadataLogRepository repo = repo(namespace);
-        repo.lock();
-        try {
-            return repo.state().resolvePath(path);
-        } finally {
-            repo.unlock();
-        }
+        return runLocked(repo(namespace), repo -> repo.state().resolvePath(path));
     }
 
     boolean updateFile(Records.FileRecord record, int expectedVersion) throws Exception {
@@ -555,30 +545,16 @@ final class NamespaceLogBackend implements AutoCloseable {
         if (isSystem(namespace)) {
             return root.listFiles(namespace);
         }
-        NamespaceMetadataLogRepository repo = repo(namespace);
-        repo.lock();
-        try {
-            return repo.state().liveFiles();
-        } finally {
-            repo.unlock();
-        }
+        return runLocked(repo(namespace), repo -> repo.state().liveFiles());
     }
 
     List<StrataNamespace> listNamespaces() throws Exception {
         // System (metadata-log) namespaces come from the root; user namespaces from the loaded repos.
-        // The per-repo live-files read is taken under that repo's lock: state().liveFiles() iterates a plain
+        // The per-repo live check is taken under that repo's lock: state().hasLiveFiles() iterates a plain
         // HashMap that append() mutates under the same lock, so a lock-free read would race into a CME.
         Set<StrataNamespace> out = new LinkedHashSet<>(root.listNamespaces());
         for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
-            NamespaceMetadataLogRepository repo = e.getValue();
-            boolean hasLive;
-            repo.lock();
-            try {
-                hasLive = !repo.state().liveFiles().isEmpty();
-            } finally {
-                repo.unlock();
-            }
-            if (hasLive) {
+            if (runLocked(e.getValue(), repo -> repo.state().hasLiveFiles())) {
                 out.add(e.getKey());
             }
         }

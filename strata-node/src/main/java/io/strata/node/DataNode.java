@@ -17,6 +17,8 @@ import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import static io.strata.common.Fsync.forceDirectory;
+
 /**
  * Data node process: ChunkStore engine + SCP server + control loop (register/heartbeat/
  * scrub/commands; durability via owner-pull VERIFY_CHUNKS) against the metadata plane.
@@ -308,12 +310,6 @@ public final class DataNode implements AutoCloseable {
         Files.move(tmp, f, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
                 java.nio.file.StandardCopyOption.ATOMIC_MOVE);
         forceDirectory(dataDir);
-    }
-
-    private static void forceDirectory(Path dir) throws IOException {
-        try (FileChannel ch = FileChannel.open(dir, StandardOpenOption.READ)) {
-            ch.force(true);
-        }
     }
 
     @Override

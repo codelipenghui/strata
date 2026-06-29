@@ -3,7 +3,9 @@ package io.strata.meta;
 import io.strata.common.StrataNamespace;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Resolves the controller owner of a namespace from a static membership of controller endpoints using
@@ -19,6 +21,12 @@ public final class NamespaceOwnership {
     private final List<String> eligibleEndpoints;
     private final int generation;
     private final int replicaCount;
+    // Membership (generation + endpoints + replicaCount) is immutable for this instance, so each
+    // namespace's rendezvous-hash assignment is a pure function — memoize it to keep the per-namespace
+    // SHA-256 off the repair/verify timer loops (isOwner runs on every owned namespace every pass).
+    // Bounded by the namespace count; a membership change builds a fresh NamespaceOwnership.
+    private final Map<StrataNamespace, NamespaceAssignmentPolicy.Assignment> assignmentCache =
+            new ConcurrentHashMap<>();
 
     public NamespaceOwnership(String localEndpoint, List<String> eligibleEndpoints,
                              int generation, int replicaCount) {
@@ -45,8 +53,7 @@ public final class NamespaceOwnership {
         if (ownsAll()) {
             return localEndpoint;
         }
-        return NamespaceAssignmentPolicy.assign(namespace, generation, eligibleEndpoints, replicaCount)
-                .preferredLeader();
+        return assignmentOf(namespace).preferredLeader();
     }
 
     /** Whether this node is the controller owner of {@code namespace}. */
@@ -59,7 +66,8 @@ public final class NamespaceOwnership {
         if (ownsAll()) {
             return new NamespaceAssignmentPolicy.Assignment(namespace, generation, List.of(localEndpoint));
         }
-        return NamespaceAssignmentPolicy.assign(namespace, generation, eligibleEndpoints, replicaCount);
+        return assignmentCache.computeIfAbsent(namespace,
+                ns -> NamespaceAssignmentPolicy.assign(ns, generation, eligibleEndpoints, replicaCount));
     }
 
     public String localEndpoint() {
