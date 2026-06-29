@@ -6,6 +6,7 @@ import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -35,39 +36,41 @@ class CrashRecoveryTest {
     @TempDir
     Path dir;
 
-    private final ChunkId id = new ChunkId(FileId.random(), 0);
+    private final ChunkId id = new ChunkId(FileId.of(1), 0);
+
+    static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     private void open(ChunkStore store) throws IOException {
-        store.open(id, false, 1, 1718000000000L);
+        store.open(TEST_NS, id, false, 1, 1718000000000L);
     }
 
     private Path dataPath() {
-        return dir.resolve(ChunkFormats.baseName(id) + ".chunk");
+        return dir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, id) + ".chunk");
     }
 
     private Path ledgerPath() {
-        return dir.resolve(ChunkFormats.baseName(id) + ".j");
+        return dir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, id) + ".j");
     }
 
     private Path metaPath() {
-        return dir.resolve(ChunkFormats.baseName(id) + ".meta");
+        return dir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, id) + ".meta");
     }
 
     @Test
     void cleanRestartPreservesOpenChunk() throws Exception {
         ChunkStore store = new ChunkStore(dir);
         open(store);
-        store.append(id, 1, 0, 0, ByteBuffer.wrap("hello".getBytes()));
-        store.append(id, 1, 5, 5, ByteBuffer.wrap("world".getBytes()));
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("hello".getBytes()));
+        store.append(TEST_NS, id, 1, 5, 5, ByteBuffer.wrap("world".getBytes()));
         // crash: no close()
 
         try (ChunkStore recovered = new ChunkStore(dir)) {
-            var stat = recovered.stat(id);
+            var stat = recovered.stat(TEST_NS, id);
             assertEquals(ChunkState.OPEN, stat.state());
             assertEquals(10, stat.localEndOffset());
-            assertArrayEquals("helloworld".getBytes(), recovered.read(id, 0, 100).bytes());
+            assertArrayEquals("helloworld".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
             // and the chunk remains appendable at the recovered end
-            assertEquals(11, recovered.append(id, 1, 10, 10, ByteBuffer.wrap("!".getBytes())).endOffset());
+            assertEquals(11, recovered.append(TEST_NS, id, 1, 10, 10, ByteBuffer.wrap("!".getBytes())).endOffset());
         }
     }
 
@@ -75,15 +78,15 @@ class CrashRecoveryTest {
     void tornDataTailTruncatedToLastVerifiedBoundary() throws Exception {
         ChunkStore store = new ChunkStore(dir);
         open(store);
-        store.append(id, 1, 0, 0, ByteBuffer.wrap("aaaa".getBytes()));
-        store.append(id, 1, 4, 0, ByteBuffer.wrap("bbbb".getBytes()));
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("aaaa".getBytes()));
+        store.append(TEST_NS, id, 1, 4, 0, ByteBuffer.wrap("bbbb".getBytes()));
         // torn write: data file lost the last 2 bytes of the second append
         try (FileChannel ch = FileChannel.open(dataPath(), StandardOpenOption.WRITE)) {
             ch.truncate(ChunkFormats.DATA_START + 6);
         }
         try (ChunkStore recovered = new ChunkStore(dir)) {
-            assertEquals(4, recovered.stat(id).localEndOffset());
-            assertArrayEquals("aaaa".getBytes(), recovered.read(id, 0, 100).bytes());
+            assertEquals(4, recovered.stat(TEST_NS, id).localEndOffset());
+            assertArrayEquals("aaaa".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
         }
     }
 
@@ -91,14 +94,14 @@ class CrashRecoveryTest {
     void corruptDataTailTruncated() throws Exception {
         ChunkStore store = new ChunkStore(dir);
         open(store);
-        store.append(id, 1, 0, 0, ByteBuffer.wrap("aaaa".getBytes()));
-        store.append(id, 1, 4, 0, ByteBuffer.wrap("bbbb".getBytes()));
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("aaaa".getBytes()));
+        store.append(TEST_NS, id, 1, 4, 0, ByteBuffer.wrap("bbbb".getBytes()));
         // bit rot / partial sector in the second append
         try (FileChannel ch = FileChannel.open(dataPath(), StandardOpenOption.WRITE)) {
             ch.write(ByteBuffer.wrap(new byte[]{0x7F}), ChunkFormats.DATA_START + 5);
         }
         try (ChunkStore recovered = new ChunkStore(dir)) {
-            assertEquals(4, recovered.stat(id).localEndOffset());
+            assertEquals(4, recovered.stat(TEST_NS, id).localEndOffset());
         }
     }
 
@@ -106,8 +109,8 @@ class CrashRecoveryTest {
     void tornLedgerEntryDiscarded() throws Exception {
         ChunkStore store = new ChunkStore(dir);
         open(store);
-        store.append(id, 1, 0, 0, ByteBuffer.wrap("aaaa".getBytes()));
-        store.append(id, 1, 4, 0, ByteBuffer.wrap("bbbb".getBytes()));
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("aaaa".getBytes()));
+        store.append(TEST_NS, id, 1, 4, 0, ByteBuffer.wrap("bbbb".getBytes()));
         // torn ledger: last entry half-written
         long ledgerSize = Files.size(ledgerPath());
         try (FileChannel ch = FileChannel.open(ledgerPath(), StandardOpenOption.WRITE)) {
@@ -115,8 +118,8 @@ class CrashRecoveryTest {
         }
         try (ChunkStore recovered = new ChunkStore(dir)) {
             // second append's ledger entry gone -> data beyond first boundary is untrusted
-            assertEquals(4, recovered.stat(id).localEndOffset());
-            assertEquals(1, recovered.readLedger(id, 0).size());
+            assertEquals(4, recovered.stat(TEST_NS, id).localEndOffset());
+            assertEquals(1, recovered.readLedger(TEST_NS, id, 0).size());
         }
     }
 
@@ -126,15 +129,15 @@ class CrashRecoveryTest {
         // exist in the data file but are not covered by any ledger entry
         ChunkStore store = new ChunkStore(dir);
         open(store);
-        store.append(id, 1, 0, 0, ByteBuffer.wrap("aaaa".getBytes()));
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("aaaa".getBytes()));
         try (FileChannel ch = FileChannel.open(dataPath(), StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
             ch.write(ByteBuffer.wrap("garbage-footer-bytes".getBytes()));
         }
         try (ChunkStore recovered = new ChunkStore(dir)) {
-            assertEquals(4, recovered.stat(id).localEndOffset());
+            assertEquals(4, recovered.stat(TEST_NS, id).localEndOffset());
             assertEquals(ChunkFormats.DATA_START + 4, Files.size(dataPath()));
             // chunk is still open and sealable — the client retries the seal
-            assertEquals(4, recovered.seal(id, 1, 4, null).finalLength());
+            assertEquals(4, recovered.seal(TEST_NS, id, 1, 4, null).finalLength());
         }
     }
 
@@ -142,16 +145,16 @@ class CrashRecoveryTest {
     void sealedChunkSurvivesRestartAndStragglerLedgerRemoved() throws Exception {
         ChunkStore store = new ChunkStore(dir);
         open(store);
-        store.append(id, 1, 0, 0, ByteBuffer.wrap("payload".getBytes()));
-        store.seal(id, 1, 7, null);
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("payload".getBytes()));
+        store.seal(TEST_NS, id, 1, 7, null);
         // simulate crash between sidecar update and ledger delete: recreate a stale ledger file
         Files.write(ledgerPath(), new ChunkFormats.LedgerEntry(7, 0, 1).encode());
 
         try (ChunkStore recovered = new ChunkStore(dir)) {
-            var stat = recovered.stat(id);
+            var stat = recovered.stat(TEST_NS, id);
             assertEquals(ChunkState.SEALED, stat.state());
             assertEquals(7, stat.sealedLength());
-            assertArrayEquals("payload".getBytes(), recovered.read(id, 0, 100).bytes());
+            assertArrayEquals("payload".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
             assertFalse(Files.exists(ledgerPath()), "stale ledger must be removed");
         }
     }
@@ -162,9 +165,9 @@ class CrashRecoveryTest {
         int dataCrc;
         try (ChunkStore store = new ChunkStore(dir)) {
             open(store);
-            store.append(id, 1, 0, 0, ByteBuffer.wrap("sealed-data".getBytes()));
-            dataCrc = store.seal(id, 1, 11, null).dataCrc();
-            repairImage = store.fetch(id, 0, Integer.MAX_VALUE).bytes();
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("sealed-data".getBytes()));
+            dataCrc = store.seal(TEST_NS, id, 1, 11, null).dataCrc();
+            repairImage = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE).bytes();
         }
         // bit-rot inside the footer section area (between data end and the 64B trailer)
         try (FileChannel ch = FileChannel.open(dataPath(), StandardOpenOption.WRITE)) {
@@ -172,18 +175,19 @@ class CrashRecoveryTest {
         }
         try (ChunkStore recovered = new ChunkStore(dir)) {
             // a sealed chunk whose footer fails its CRC must be quarantined, not served
-            assertEquals(0, recovered.inventory().size(),
+            assertEquals(0, recovered.describeChunks().size(),
                     "corrupt-footer chunk must not be recovered as healthy");
             assertFalse(Files.exists(dataPath()), "live chunk name must be free for repair import");
-            try (Stream<Path> files = Files.list(dir)) {
+            Path shardDir = dataPath().getParent();
+            try (Stream<Path> files = Files.list(shardDir)) {
                 // .chunk + .meta + the retained integrity ledger (.j) — under STRATA_SEAL_FSYNC=false
                 // seal keeps the ledger until the SEALED state is forced durable, so it is still present
                 // at recovery and quarantined alongside the chunk as corrupt evidence.
                 assertEquals(3, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
                         "quarantine must preserve the corrupt evidence under a non-live name");
             }
-            recovered.importSealed(id, repairImage, 11, dataCrc);
-            assertArrayEquals("sealed-data".getBytes(), recovered.read(id, 0, 100).bytes());
+            recovered.importSealed(TEST_NS, id, repairImage, 11, dataCrc);
+            assertArrayEquals("sealed-data".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
         }
     }
 
@@ -191,10 +195,10 @@ class CrashRecoveryTest {
     void chunkWithoutSidecarIsRemovedAsUnacked() throws Exception {
         ChunkStore store = new ChunkStore(dir);
         open(store);
-        store.append(id, 1, 0, 0, ByteBuffer.wrap("x".getBytes()));
-        Files.delete(dir.resolve(ChunkFormats.baseName(id) + ".meta"));
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("x".getBytes()));
+        Files.delete(metaPath());
         try (ChunkStore recovered = new ChunkStore(dir)) {
-            assertEquals(0, recovered.inventory().size());
+            assertEquals(0, recovered.describeChunks().size());
             assertFalse(Files.exists(dataPath()));
         }
     }
@@ -203,16 +207,16 @@ class CrashRecoveryTest {
     void ackedFsyncChunkSurvivesMissingSidecarNameAfterCrash() throws Exception {
         byte[] payload = "acked-fsync".getBytes();
         ChunkStore store = new ChunkStore(dir);
-        store.open(id, true, 1, 1718000000000L);
-        store.appendAsync(id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
+        store.open(TEST_NS, id, true, 1, 1718000000000L);
+        store.appendAsync(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
         store.close();
 
         Files.delete(metaPath());
 
         assertDoesNotThrow(() -> {
             try (ChunkStore recovered = new ChunkStore(dir)) {
-                assertEquals(ChunkState.OPEN, recovered.stat(id).state());
-                assertArrayEquals(payload, recovered.read(id, 0, 100).bytes());
+                assertEquals(ChunkState.OPEN, recovered.stat(TEST_NS, id).state());
+                assertArrayEquals(payload, recovered.read(TEST_NS, id, 0, 100).bytes());
             }
         });
     }
@@ -221,17 +225,17 @@ class CrashRecoveryTest {
     void missingSidecarOpenChunkWithFooterShapedPayloadRecoversFromLedger() throws Exception {
         byte[] payload = footerShapedPayload("live".getBytes());
         ChunkStore store = new ChunkStore(dir);
-        store.open(id, true, 1, 1718000000000L);
-        store.appendAsync(id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
+        store.open(TEST_NS, id, true, 1, 1718000000000L);
+        store.appendAsync(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
         store.close();
 
         Files.delete(metaPath());
 
         try (ChunkStore recovered = new ChunkStore(dir)) {
-            var stat = recovered.stat(id);
+            var stat = recovered.stat(TEST_NS, id);
             assertEquals(ChunkState.OPEN, stat.state());
             assertEquals(payload.length, stat.localEndOffset());
-            assertArrayEquals(payload, recovered.read(id, 0, payload.length).bytes());
+            assertArrayEquals(payload, recovered.read(TEST_NS, id, 0, payload.length).bytes());
             assertTrue(Files.exists(ledgerPath()), "ledger must not be deleted by false sealed recovery");
         }
     }
@@ -240,21 +244,21 @@ class CrashRecoveryTest {
     void missingSidecarFsyncOpenChunkRequiresFreshFenceBeforeAppend() throws Exception {
         byte[] payload = "acked-fsync".getBytes();
         ChunkStore store = new ChunkStore(dir);
-        store.open(id, true, 1, 1718000000000L);
-        store.appendAsync(id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
+        store.open(TEST_NS, id, true, 1, 1718000000000L);
+        store.appendAsync(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
         store.close();
 
         Files.delete(metaPath());
 
         try (ChunkStore recovered = new ChunkStore(dir)) {
-            assertEquals(ChunkState.OPEN, recovered.stat(id).state());
+            assertEquals(ChunkState.OPEN, recovered.stat(TEST_NS, id).state());
             ScpException stale = assertThrows(ScpException.class,
-                    () -> recovered.append(id, 1, payload.length, payload.length, ByteBuffer.wrap("stale".getBytes())));
+                    () -> recovered.append(TEST_NS, id, 1, payload.length, payload.length, ByteBuffer.wrap("stale".getBytes())));
             assertEquals(ErrorCode.FENCED_EPOCH, stale.code());
 
-            assertEquals(payload.length, recovered.fence(id, 2).localEndOffset());
+            assertEquals(payload.length, recovered.fence(TEST_NS, id, 2).localEndOffset());
             assertEquals(payload.length + 5,
-                    recovered.append(id, 2, payload.length, payload.length, ByteBuffer.wrap("fresh".getBytes()))
+                    recovered.append(TEST_NS, id, 2, payload.length, payload.length, ByteBuffer.wrap("fresh".getBytes()))
                             .endOffset());
         }
     }
@@ -281,13 +285,13 @@ class CrashRecoveryTest {
     void fenceEpochSurvivesCrash() throws Exception {
         ChunkStore store = new ChunkStore(dir);
         open(store);
-        store.append(id, 1, 0, 0, ByteBuffer.wrap("a".getBytes()));
-        store.fence(id, 9); // persists sidecar
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("a".getBytes()));
+        store.fence(TEST_NS, id, 9); // persists sidecar
         try (ChunkStore recovered = new ChunkStore(dir)) {
             assertEquals(io.strata.common.ErrorCode.FENCED_EPOCH,
                     org.junit.jupiter.api.Assertions.assertThrows(io.strata.common.ScpException.class,
-                            () -> recovered.append(id, 8, 1, 0, ByteBuffer.wrap("b".getBytes()))).code());
-            assertEquals(2, recovered.append(id, 9, 1, 0, ByteBuffer.wrap("b".getBytes())).endOffset());
+                            () -> recovered.append(TEST_NS, id, 8, 1, 0, ByteBuffer.wrap("b".getBytes()))).code());
+            assertEquals(2, recovered.append(TEST_NS, id, 9, 1, 0, ByteBuffer.wrap("b".getBytes())).endOffset());
         }
     }
 }

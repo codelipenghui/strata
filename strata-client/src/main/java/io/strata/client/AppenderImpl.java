@@ -3,6 +3,7 @@ package io.strata.client;
 import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Frame;
 import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.Messages;
@@ -55,10 +56,11 @@ final class AppenderImpl implements StrataFile.Appender {
                     "STRATA_APPEND_CONNECTION_PENDING_HIGH_WATERMARK",
                     DEFAULT_APPEND_CONNECTION_PENDING_HIGH_WATERMARK);
 
-    private final MetaClient meta;
+    private final ControllerClient controller;
     private final NodePool pool;
     private final ClientConfig config;
     private final io.strata.common.FileId fileId;
+    private final StrataNamespace namespace;
     private final int epoch;
     private final int replicationFactor;
     private final int ackQuorum;
@@ -108,12 +110,14 @@ final class AppenderImpl implements StrataFile.Appender {
 
     private record Pending(long chunkEnd, CompletableFuture<StrataFile.AppendAck> future) {}
 
-    AppenderImpl(MetaClient meta, NodePool pool, ClientConfig config, io.strata.common.FileId fileId,
-                 int epoch, Messages.WritePolicy writePolicy, long existingFileLength) {
-        this.meta = meta;
+    AppenderImpl(ControllerClient controller, NodePool pool, ClientConfig config, io.strata.common.FileId fileId,
+                 io.strata.common.StrataNamespace namespace, int epoch, Messages.WritePolicy writePolicy,
+                 long existingFileLength) {
+        this.controller = controller;
         this.pool = pool;
         this.config = config;
         this.fileId = fileId;
+        this.namespace = namespace;
         this.epoch = epoch;
         this.replicationFactor = writePolicy.replicationFactor();
         this.ackQuorum = writePolicy.ackQuorum();
@@ -153,7 +157,7 @@ final class AppenderImpl implements StrataFile.Appender {
             CompletableFuture<StrataFile.AppendAck> callerFuture = new CompletableFuture<>();
             s.pending.addLast(new Pending(newEnd, callerFuture));
 
-            byte[] header = new Messages.Append(s.chunkId, epoch, base, s.durable).encode();
+            byte[] header = new Messages.Append(s.chunkId, epoch, base, s.durable, namespace).encode();
             for (int i = 0; i < s.replicas.size(); i++) {
                 if (dead) break;
                 if (s.failed[i]) continue;
@@ -423,7 +427,7 @@ final class AppenderImpl implements StrataFile.Appender {
 
     /** Network calls are made WITHOUT the lock held — blocked callbacks must never wait on us. */
     private void sealChunkLocked(ChunkSession s, long dataLength) {
-        byte[] header = new Messages.SealChunk(s.chunkId, epoch, dataLength).encode();
+        byte[] header = new Messages.SealChunk(s.chunkId, epoch, dataLength, namespace).encode();
         ScpException lastErr = null;
         SealVotes votes = new SealVotes();
         for (int i = 0; i < s.replicas.size(); i++) {
@@ -494,7 +498,7 @@ final class AppenderImpl implements StrataFile.Appender {
             // commit only the replicas that ACTUALLY sealed: a failed/skipped replica left in a
             // SEALED descriptor would serve short reads forever (alive, so repair never fires);
             // the under-replication scan add-repairs the descriptor back to RF afterwards
-            meta.sealChunkMeta(id, epoch, fl, fcrc, sealedReplicas);
+            controller.sealChunkMeta(namespace, id, epoch, fl, fcrc, sealedReplicas);
         } catch (ScpException e) {
             metaFailure = e; // handled under the lock below
         } finally {
@@ -534,14 +538,14 @@ final class AppenderImpl implements StrataFile.Appender {
     }
 
     private OpenChunkResult tryOpenNewChunkLocked() {
-        // failover resilience lives in MetaClient.call (deadline-based retry); a failure here
+        // failover resilience lives in ControllerClient.call (deadline-based retry); a failure here
         // means the metadata plane stayed unreachable past the deadline
         Messages.CreateChunkResp created;
         UUID createOp = UUID.randomUUID();
         Set<Integer> placementExclusions = Set.copyOf(excludedPlacementNodes);
         lock.unlock();
         try {
-            created = meta.createChunk(fileId, epoch,
+            created = controller.createChunk(namespace, fileId, epoch,
                     createOp.getMostSignificantBits(), createOp.getLeastSignificantBits(),
                     placementExclusions);
         } catch (ScpException e) {
@@ -551,7 +555,7 @@ final class AppenderImpl implements StrataFile.Appender {
                 return OpenChunkResult.failed(e, Set.of());
             }
             try {
-                created = meta.createChunk(fileId, epoch,
+                created = controller.createChunk(namespace, fileId, epoch,
                         createOp.getMostSignificantBits(), createOp.getLeastSignificantBits());
             } catch (ScpException retryFailure) {
                 lock.lock();
@@ -573,7 +577,7 @@ final class AppenderImpl implements StrataFile.Appender {
         }
         ChunkSession s = new ChunkSession(created.chunkId(), created.replicas());
         byte[] header = new Messages.OpenChunk(created.chunkId(), epoch, fsyncOnAck,
-                config.chunkRollBytes(), System.currentTimeMillis()).encode();
+                config.chunkRollBytes(), System.currentTimeMillis(), namespace).encode();
         int ok = 0;
         List<Messages.Replica> opened = new ArrayList<>(s.replicas.size());
         Set<Integer> failedNodeIds = new HashSet<>();
@@ -656,7 +660,7 @@ final class AppenderImpl implements StrataFile.Appender {
         ScpException abortErr = null;
         lock.unlock();
         try {
-            meta.abortChunkMeta(chunkId, epoch, createOp.getMostSignificantBits(), createOp.getLeastSignificantBits());
+            controller.abortChunkMeta(namespace, chunkId, epoch, createOp.getMostSignificantBits(), createOp.getLeastSignificantBits());
         } catch (ScpException e) {
             abortErr = e;
         } finally {
@@ -666,7 +670,7 @@ final class AppenderImpl implements StrataFile.Appender {
             dieLocked(abortErr);
             return;
         }
-        byte[] deleteHeader = new Messages.DeleteChunks(List.of(chunkId)).encode();
+        byte[] deleteHeader = new Messages.DeleteChunks(List.of(chunkId), namespace).encode();
         for (Messages.Replica r : opened) {
             lock.unlock();
             try {
@@ -751,7 +755,7 @@ final class AppenderImpl implements StrataFile.Appender {
                 ScpException sealFileFailure = null;
                 lock.unlock();
                 try {
-                    meta.sealFile(fileId, t);
+                    controller.sealFile(namespace, fileId, t);
                 } catch (ScpException e) {
                     sealFileFailure = e;
                 } finally {

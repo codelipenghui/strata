@@ -7,7 +7,8 @@ import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
-import io.strata.node.StorageNode;
+import io.strata.common.StrataNamespace;
+import io.strata.node.DataNode;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -32,7 +33,7 @@ class OpenQuorumFailureTest {
             cluster.killNode(1);
             cluster.killNode(2);
 
-            try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+            try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                 ScpException e = assertThrows(ScpException.class,
                         () -> appender.append(ByteBuffer.wrap(new byte[]{1})));
                 assertEquals(ErrorCode.INTERNAL, e.code());
@@ -56,7 +57,7 @@ class OpenQuorumFailureTest {
 
             Workload workload = new Workload();
             StrataFile.SealInfo sealed;
-            try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+            try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                 workload.appendAcked(appender, 0, 1);
                 sealed = appender.seal();
             }
@@ -70,11 +71,11 @@ class OpenQuorumFailureTest {
             assertTrue(chunk.replicas().stream().noneMatch(replica -> replica.nodeId() == victimNodeId),
                     "failed-open replica must not remain in the sealed descriptor");
 
-            StorageNode restarted = cluster.restartNode(victimIndex);
+            DataNode restarted = cluster.restartNode(victimIndex);
             waitForNodeId(restarted, victimNodeId);
             waitForChunkRepaired(cluster, fileId, chunkId, victimNodeId);
 
-            workload.verifyAckedPrefix(client, fileId);
+            workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
             ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
         }
     }
@@ -82,12 +83,12 @@ class OpenQuorumFailureTest {
     private static Messages.LookupFileResp lookup(String endpoint, FileId fileId) throws Exception {
         String[] hp = endpoint.split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "lookup")) {
-            ByteBuffer h = direct.call(Opcode.LOOKUP_FILE, new Messages.LookupFile(fileId).encode(), null, 5000);
+            ByteBuffer h = direct.call(Opcode.LOOKUP_FILE, new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, 5000);
             return Messages.LookupFileResp.decode(h);
         }
     }
 
-    private static void waitForNodeId(StorageNode node, int expectedNodeId) throws Exception {
+    private static void waitForNodeId(DataNode node, int expectedNodeId) throws Exception {
         long deadline = System.currentTimeMillis() + 10_000;
         while (node.nodeId() != expectedNodeId && System.currentTimeMillis() < deadline) {
             Thread.sleep(50);
@@ -107,7 +108,7 @@ class OpenQuorumFailureTest {
                 boolean hasExpectedNode = chunk.replicas().stream()
                         .anyMatch(replica -> replica.nodeId() == expectedNodeId);
                 boolean allPresent = chunk.replicas().stream()
-                        .allMatch(replica -> nodeById(cluster, replica.nodeId()).store().contains(chunkId));
+                        .allMatch(replica -> nodeById(cluster, replica.nodeId()).store().contains(StrataNamespace.of("test"), chunkId));
                 if (chunk.replicas().size() == 3 && hasExpectedNode && allPresent) {
                     return;
                 }
@@ -117,8 +118,8 @@ class OpenQuorumFailureTest {
         throw new AssertionError("partial-open chunk was not repaired to RF=3");
     }
 
-    private static StorageNode nodeById(MiniCluster cluster, int nodeId) {
-        for (StorageNode node : cluster.nodes) {
+    private static DataNode nodeById(MiniCluster cluster, int nodeId) {
+        for (DataNode node : cluster.nodes) {
             if (node.nodeId() == nodeId) {
                 return node;
             }

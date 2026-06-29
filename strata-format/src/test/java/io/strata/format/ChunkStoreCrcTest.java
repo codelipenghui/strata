@@ -2,6 +2,8 @@ package io.strata.format;
 
 import io.strata.common.ChunkId;
 import io.strata.common.FileId;
+import io.strata.common.NsChunkId;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -32,7 +34,8 @@ class ChunkStoreCrcTest {
     @TempDir
     Path dir;
 
-    private final ChunkId id = new ChunkId(FileId.random(), 0);
+    private final ChunkId id = new ChunkId(FileId.of(1), 0);
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     private static int wholeCrc(byte[] data) {
         CRC32C c = new CRC32C();
@@ -50,11 +53,11 @@ class ChunkStoreCrcTest {
     private void appendInPieces(ChunkStore store, byte[] data, int[] sizes) throws IOException {
         int off = 0;
         for (int n : sizes) {
-            store.append(id, 1, off, off, ByteBuffer.wrap(data, off, n));
+            store.append(TEST_NS, id, 1, off, off, ByteBuffer.wrap(data, off, n));
             off += n;
         }
         if (off < data.length) {
-            store.append(id, 1, off, off, ByteBuffer.wrap(data, off, data.length - off));
+            store.append(TEST_NS, id, 1, off, off, ByteBuffer.wrap(data, off, data.length - off));
         }
     }
 
@@ -63,7 +66,7 @@ class ChunkStoreCrcTest {
         byte[] out = new byte[len];
         int off = 0;
         while (off < len) {
-            byte[] chunk = store.read(id, off, len - off).bytes();
+            byte[] chunk = store.read(TEST_NS, id, off, len - off).bytes();
             if (chunk.length == 0) {
                 break;
             }
@@ -76,9 +79,9 @@ class ChunkStoreCrcTest {
 
     private void assertSealCrcMatchesScan(byte[] data, int[] pieces) throws IOException {
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, false, 1, 1718000000000L);
+            store.open(StrataNamespace.of("test"), id, false, 1, 1718000000000L);
             appendInPieces(store, data, pieces);
-            ChunkStore.SealResult sealed = store.seal(id, 1, data.length, null);
+            ChunkStore.SealResult sealed = store.seal(TEST_NS, id, 1, data.length, null);
             assertEquals(wholeCrc(data), sealed.dataCrc(), "sealed dataCrc must equal CRC32C over all bytes");
             assertArrayEquals(data, readAllVerified(store, data.length), "read-back must verify against range CRCs");
         }
@@ -121,13 +124,13 @@ class ChunkStoreCrcTest {
         System.arraycopy(part2, 0, all, part1.length, part2.length);
 
         ChunkStore store = new ChunkStore(dir);
-        store.open(id, false, 1, 1718000000000L);
+        store.open(StrataNamespace.of("test"), id, false, 1, 1718000000000L);
         appendInPieces(store, part1, new int[]{2_000_000, 1_234_567});
         store.close(); // reopen before sealing — the in-memory running CRC state is gone
 
         try (ChunkStore recovered = new ChunkStore(dir)) {
-            recovered.append(id, 1, part1.length, part1.length, ByteBuffer.wrap(part2));
-            ChunkStore.SealResult sealed = recovered.seal(id, 1, all.length, null);
+            recovered.append(TEST_NS, id, 1, part1.length, part1.length, ByteBuffer.wrap(part2));
+            ChunkStore.SealResult sealed = recovered.seal(TEST_NS, id, 1, all.length, null);
             assertEquals(wholeCrc(all), sealed.dataCrc(),
                     "dataCrc after recovery + further appends must equal CRC32C over all bytes");
             assertArrayEquals(all, readAllVerified(recovered, all.length));
@@ -138,8 +141,8 @@ class ChunkStoreCrcTest {
     void failedLedgerAppendDoesNotFoldIntoRunningCrc() throws Exception {
         byte[] committed = "AAAA".getBytes(StandardCharsets.UTF_8);
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, false, 1, 1718000000000L);
-            store.append(id, 1, 0, 0, ByteBuffer.wrap(committed)); // written, logged, folded
+            store.open(StrataNamespace.of("test"), id, false, 1, 1718000000000L);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(committed)); // written, logged, folded
 
             // Make the next ledger append fail (closed channel), then attempt an append: its data write
             // lands but the ledger entry is rejected, so the append is NOT committed. The running CRC
@@ -148,9 +151,9 @@ class ChunkStoreCrcTest {
             closeLedgerChannel(store, id);
             byte[] rejected = "BBBB".getBytes(StandardCharsets.UTF_8);
             assertThrows(IOException.class,
-                    () -> store.append(id, 1, committed.length, committed.length, ByteBuffer.wrap(rejected)));
+                    () -> store.append(TEST_NS, id, 1, committed.length, committed.length, ByteBuffer.wrap(rejected)));
 
-            ChunkStore.SealResult sealed = store.seal(id, 1, committed.length, null);
+            ChunkStore.SealResult sealed = store.seal(TEST_NS, id, 1, committed.length, null);
             assertEquals(wholeCrc(committed), sealed.dataCrc(),
                     "a failed (uncommitted) ledger append must not fold its bytes into the running CRC");
             assertArrayEquals(committed, readAllVerified(store, committed.length));
@@ -162,7 +165,7 @@ class ChunkStoreCrcTest {
     private void closeLedgerChannel(ChunkStore store, ChunkId chunkId) throws Exception {
         Field chunksF = ChunkStore.class.getDeclaredField("chunks");
         chunksF.setAccessible(true);
-        Object handle = ((Map<ChunkId, ?>) chunksF.get(store)).get(chunkId);
+        Object handle = ((Map<NsChunkId, ?>) chunksF.get(store)).get(new NsChunkId(StrataNamespace.of("test"), chunkId));
         Field ledgerF = handle.getClass().getDeclaredField("ledger");
         ledgerF.setAccessible(true);
         Object ledger = ledgerF.get(handle);

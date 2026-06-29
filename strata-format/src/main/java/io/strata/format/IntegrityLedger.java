@@ -13,7 +13,7 @@ import static io.strata.format.ChunkFormats.LEDGER_ENTRY_SIZE;
 
 /**
  * Per-chunk integrity ledger `<chunk>.j` (tech design §11.3): one 24-byte entry per append.
- * Crash recovery reads the valid entry prefix and verifies tail data CRCs — the storage node
+ * Crash recovery reads the valid entry prefix and verifies tail data CRCs — the data node
  * never parses payload bytes, even to recover. Deleted at seal.
  */
 public final class IntegrityLedger implements AutoCloseable {

@@ -2,6 +2,7 @@ package io.strata.node;
 
 import io.strata.common.ChunkId;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -34,19 +35,19 @@ class FsyncPipelineWireTest {
     void pipelinedWireAppendsCoalesceForces() throws Exception {
         int appends = 300;
         byte[] payload = new byte[512];
-        try (StorageNode node = new StorageNode(NodeConfig.standalone(dir));
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "perf")) {
 
-            ChunkId id = new ChunkId(FileId.random(), 0);
+            ChunkId id = new ChunkId(FileId.of(1), 0);
             client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, true /* fsync */,
-                    1 << 24, 1L).encode(), null, 5000);
+                    1 << 24, 1L, StrataNamespace.of("test")).encode(), null, 5000);
 
             long start = System.nanoTime();
             List<CompletableFuture<Frame>> futures = new ArrayList<>(appends);
             long offset = 0;
             for (int i = 0; i < appends; i++) {
                 futures.add(client.send(Opcode.APPEND,
-                        new Messages.Append(id, 1, offset, offset).encode(), ByteBuffer.wrap(payload)));
+                        new Messages.Append(id, 1, offset, offset, StrataNamespace.of("test")).encode(), ByteBuffer.wrap(payload)));
                 offset += payload.length;
             }
             for (CompletableFuture<Frame> f : futures) {

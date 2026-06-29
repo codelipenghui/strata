@@ -6,11 +6,12 @@ import io.strata.common.StrataPath;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 
 /**
- * MetadataStore SPI (tech design §4.4): persistence behind the metadata service. v0 backend is
- * ZooKeeper; v1 is the KRaft chunk-map state machine. The SCP surface and service semantics are
- * identical across backends — this interface is the swap line.
+ * MetadataStore SPI (tech design §4.4): the consensus root behind the controller. The shipped backend
+ * is ZooKeeper; an in-memory reference backend exercises the same contract. The SCP surface and service
+ * semantics are identical across backends — this interface is the swap line.
  *
  * Versioned reads + compare-and-set writes; the service leader is the only writer, CAS guards
  * against stale leaders racing across failover.
@@ -28,7 +29,13 @@ public interface MetadataStore extends AutoCloseable {
      */
     void createFile(Records.FileRecord record) throws Exception;
 
-    Optional<Versioned<Records.FileRecord>> getFile(FileId id) throws Exception;
+    /**
+     * Namespace-scoped file lookup. For the namespace-log backend, file ids are per-namespace
+     * (each namespace's owner assigns 0, 1, 2, …), so the namespace is required to route to the
+     * correct repo. For the ZK-direct backend file ids are globally unique and the namespace satisfies
+     * the signature but does not change the lookup.
+     */
+    Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) throws Exception;
 
     Optional<FileId> resolvePath(StrataNamespace namespace, StrataPath path) throws Exception;
 
@@ -37,8 +44,12 @@ public interface MetadataStore extends AutoCloseable {
 
     boolean deletePath(StrataNamespace namespace, StrataPath path, FileId expectedFileId) throws Exception;
 
-    /** CAS delete; returns false on version conflict. */
-    boolean deleteFile(FileId id, int expectedVersion) throws Exception;
+    /**
+     * Namespace-scoped CAS delete; returns false on version conflict. For the namespace-log
+     * backend the namespace routes the delete to the correct per-namespace repo. For the ZK v0
+     * backend the namespace satisfies the signature but does not change the lookup.
+     */
+    boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) throws Exception;
 
     /** Live file ids within one namespace (excludes DELETED tombstones awaiting sweep). */
     List<FileId> listFiles(StrataNamespace namespace) throws Exception;
@@ -59,8 +70,6 @@ public interface MetadataStore extends AutoCloseable {
 
     /* ---- node registry ---- */
 
-    int nextNodeId() throws Exception;
-
     /**
      * CAS write of a node record: expectedVersion -1 creates (fails if present), otherwise
      * updates only if the stored version matches. A deposed leader's stale write must lose —
@@ -72,6 +81,94 @@ public interface MetadataStore extends AutoCloseable {
     Optional<Versioned<Records.NodeRecord>> getNode(int nodeId) throws Exception;
 
     List<Versioned<Records.NodeRecord>> listNodes() throws Exception;
+
+    /* ---- namespace sharding root (design §5, §6.1) ----
+     * Consensus-root capabilities: the global metadata-epoch fence and per-namespace assignment
+     * records. The namespace-log backend delegates these to the underlying root store, so they are
+     * not part of the backend-neutral file/path/node contract — backends that are not a consensus
+     * root inherit the safe defaults below. */
+
+    /**
+     * CAS-increments the global metadata epoch counter and returns the new value (design §5, §13
+     * step 2). Values are unique and strictly monotonic; gaps are allowed. A namespace leader
+     * allocates an epoch before activating and fences manifest publication with it.
+     */
+    default long allocateMetadataEpoch() throws Exception {
+        throw new UnsupportedOperationException("metadata epoch allocation requires a consensus-root backend");
+    }
+
+    /**
+     * Atomically allocates and returns the next file id for the system namespace ({@code strata-meta}).
+     * System files are low-volume (a handful of metadata-log segments/snapshots per namespace), so a
+     * single ZK CAS counter is adequate. Lives in the consensus root; non-root backends return a
+     * local AtomicLong (in-memory / test use only).
+     */
+    default long nextSystemFileId() throws Exception {
+        throw new UnsupportedOperationException("system file-id allocation requires a consensus-root backend");
+    }
+
+    /**
+     * Allocates the next file id for {@code namespace} and returns it. This is the server-side id
+     * assignment point: the client no longer mints file ids. The returned id is guaranteed unique
+     * within the namespace for this store's lifetime (per-namespace monotonic counter; gaps allowed).
+     */
+    default FileId assignFileId(StrataNamespace namespace) throws Exception {
+        throw new UnsupportedOperationException("file-id assignment requires a backend that tracks per-namespace counters");
+    }
+
+    /** The persisted rendezvous assignment for {@code namespace}, if one has been written (design §6.1). */
+    default Optional<Versioned<Records.NamespaceAssignment>> getNamespaceAssignment(StrataNamespace namespace)
+            throws Exception {
+        return Optional.empty();
+    }
+
+    /**
+     * CAS write of a namespace assignment: {@code expectedVersion -1} creates (fails if present),
+     * otherwise updates only if the stored version matches. Returns false on a version conflict.
+     */
+    default boolean putNamespaceAssignment(Records.NamespaceAssignment assignment, int expectedVersion)
+            throws Exception {
+        throw new UnsupportedOperationException("namespace assignment requires a consensus-root backend");
+    }
+
+    /** Namespaces that currently have a persisted assignment record (design §6.1). */
+    default List<StrataNamespace> listAssignedNamespaces() throws Exception {
+        return List.of();
+    }
+
+    /** The published metadata-log manifest for {@code namespace}, if any (design §5, §9). */
+    default Optional<Versioned<Records.NamespaceManifest>> getNamespaceManifest(StrataNamespace namespace)
+            throws Exception {
+        return Optional.empty();
+    }
+
+    /**
+     * CAS-publishes a namespace metadata-log manifest — the linearizable cutover barrier (design §9).
+     * {@code expectedVersion -1} creates (fails if present), otherwise updates only if the stored
+     * version matches. Returns the new znode version on success (so the caller can do the next CAS
+     * without a read-back), or empty on a version conflict so a fenced leader's publish loses.
+     */
+    default OptionalInt putNamespaceManifest(Records.NamespaceManifest manifest, int expectedVersion)
+            throws Exception {
+        throw new UnsupportedOperationException("namespace manifest requires a consensus-root backend");
+    }
+
+    /* ---- shared cluster liveness (design §11) ---- */
+
+    /**
+     * Publishes a compact snapshot of currently-live data nodes to the consensus root so a
+     * non-controller namespace owner — which has no heartbeat channel — can still place and repair
+     * replicas. Last-write-wins (the controller is the single publisher); root-store capability with
+     * a no-op default for non-root backends.
+     */
+    default void putClusterLiveNodes(byte[] snapshot) throws Exception {
+        // no-op for non-root backends / test doubles
+    }
+
+    /** The latest published live-node snapshot, if any (design §11). */
+    default Optional<byte[]> getClusterLiveNodes() throws Exception {
+        return Optional.empty();
+    }
 
     @Override
     void close();

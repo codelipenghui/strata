@@ -4,6 +4,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.ChunkId;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -35,19 +36,20 @@ class GroupCommitTest {
     @TempDir
     Path dir;
 
-    private final ChunkId id = new ChunkId(FileId.random(), 0);
+    private final ChunkId id = new ChunkId(FileId.of(1), 0);
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     @Test
     void pipelinedFsyncAppendsCoalesceForces() throws Exception {
         int appends = 400;
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, true, 1, 1L);
+            store.open(TEST_NS, id, true, 1, 1L);
 
             List<CompletableFuture<ChunkStore.AppendResult>> futures = new ArrayList<>(appends);
             byte[] payload = "group-commit-payload".getBytes();
             long offset = 0;
             for (int i = 0; i < appends; i++) {
-                futures.add(store.appendAsync(id, 1, offset, offset, ByteBuffer.wrap(payload)));
+                futures.add(store.appendAsync(TEST_NS, id, 1, offset, offset, ByteBuffer.wrap(payload)));
                 offset += payload.length;
             }
             CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).get(60, TimeUnit.SECONDS);
@@ -61,11 +63,11 @@ class GroupCommitTest {
             for (int i = 0; i < appends; i++) {
                 assertEquals((long) (i + 1) * payload.length, futures.get(i).join().endOffset());
             }
-            store.seal(id, 1, offset, null);
+            store.seal(TEST_NS, id, 1, offset, null);
         }
         // acked data survives restart
         try (ChunkStore recovered = new ChunkStore(dir)) {
-            var stat = recovered.stat(id);
+            var stat = recovered.stat(TEST_NS, id);
             assertEquals(appends * "group-commit-payload".length(), stat.sealedLength());
         }
     }
@@ -75,16 +77,16 @@ class GroupCommitTest {
         // sequential (non-pipelined) appends: each future completion implies a covering force;
         // crash-recovery must retain everything acked even with no clean close
         ChunkStore store = new ChunkStore(dir);
-        store.open(id, true, 1, 1L);
+        store.open(TEST_NS, id, true, 1, 1L);
         byte[] payload = "durable!".getBytes();
         long offset = 0;
         for (int i = 0; i < 20; i++) {
-            store.appendAsync(id, 1, offset, offset, ByteBuffer.wrap(payload)).get(10, TimeUnit.SECONDS);
+            store.appendAsync(TEST_NS, id, 1, offset, offset, ByteBuffer.wrap(payload)).get(10, TimeUnit.SECONDS);
             offset += payload.length;
         }
         // crash: no close()
         try (ChunkStore recovered = new ChunkStore(dir)) {
-            var r = recovered.read(id, 0, 1 << 20);
+            var r = recovered.read(TEST_NS, id, 0, 1 << 20);
             assertEquals(offset, r.localEndOffset(), "acked fsync appends lost across crash");
             byte[] expected = new byte[(int) offset];
             for (int i = 0; i < 20; i++) {
@@ -97,16 +99,16 @@ class GroupCommitTest {
     @Test
     void sealWithPipelinedFsyncAppendsDrainsCleanly() throws Exception {
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, true, 1, 1L);
+            store.open(TEST_NS, id, true, 1, 1L);
             byte[] payload = "drain-me".getBytes();
             List<CompletableFuture<ChunkStore.AppendResult>> futures = new ArrayList<>();
             long offset = 0;
             for (int i = 0; i < 50; i++) {
-                futures.add(store.appendAsync(id, 1, offset, offset, ByteBuffer.wrap(payload)));
+                futures.add(store.appendAsync(TEST_NS, id, 1, offset, offset, ByteBuffer.wrap(payload)));
                 offset += payload.length;
             }
             // seal immediately: the committer's final force must drain every waiter
-            var sealed = store.seal(id, 1, offset, null);
+            var sealed = store.seal(TEST_NS, id, 1, offset, null);
             assertEquals(offset, sealed.finalLength());
             CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).get(10, TimeUnit.SECONDS);
         }
@@ -115,11 +117,11 @@ class GroupCommitTest {
     @Test
     void replicateModeDoesNotForce() throws Exception {
         try (ChunkStore store = new ChunkStore(dir)) {
-            store.open(id, false, 1, 1L);
+            store.open(TEST_NS, id, false, 1, 1L);
             byte[] payload = "fast".getBytes();
             long offset = 0;
             for (int i = 0; i < 50; i++) {
-                store.appendAsync(id, 1, offset, offset, ByteBuffer.wrap(payload)).join();
+                store.appendAsync(TEST_NS, id, 1, offset, offset, ByteBuffer.wrap(payload)).join();
                 offset += payload.length;
             }
             assertEquals(0, store.fsyncForceCount(), "replicate mode must never group-commit");

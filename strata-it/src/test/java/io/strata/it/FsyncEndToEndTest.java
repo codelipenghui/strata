@@ -4,6 +4,7 @@ import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -26,6 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class FsyncEndToEndTest {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     private MiniCluster cluster;
     private StrataClient client;
@@ -35,7 +37,7 @@ class FsyncEndToEndTest {
         cluster = new MiniCluster(3);
         client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint())
                 .withChunkRollBytes(4 * 1024)
-                .withStorageConnectionsPerEndpoint(3));
+                .withDataNodeConnectionsPerEndpoint(3));
     }
 
     @AfterAll
@@ -49,11 +51,11 @@ class FsyncEndToEndTest {
         FileId fileId = client.create(fsyncSpec("/fsync-policy")).id();
         Workload workload = new Workload();
         StrataFile.SealInfo sealed;
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 500); // several rolls under fsync
             sealed = appender.seal();
         }
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
 
         // the policy must be burned into the chunk header on EVERY replica
         var lookup = ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
@@ -73,13 +75,13 @@ class FsyncEndToEndTest {
     void sealRecoveryWorksUnderFsyncMode() throws Exception {
         FileId fileId = client.create(fsyncSpec("/fsync-recovery")).id();
         Workload workload = new Workload();
-        StrataFile.Appender zombie = client.openById(fileId).openForAppend();
+        StrataFile.Appender zombie = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         workload.appendAcked(zombie, 0, 120);
 
-        var sealed = client.openById(fileId).recoverAndSeal();
+        var sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
         assertTrue(sealed.sealedLength() >= workload.ackedBytes());
         zombie.close();
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
     }
 
@@ -87,7 +89,7 @@ class FsyncEndToEndTest {
         String[] hp = endpoint.split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "hdr")) {
             var frame = direct.callFrame(Opcode.FETCH_CHUNK,
-                    new Messages.FetchChunk(chunkId, 0, ChunkFormats.HEADER_SIZE).encode(), null, 5000);
+                    new Messages.FetchChunk(chunkId, 0, ChunkFormats.HEADER_SIZE, TEST_NS).encode(), null, 5000);
             ByteBuffer h = frame.headerSlice();
             Resp.check(h);
             byte[] bytes = new byte[frame.payloadLength()];

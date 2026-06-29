@@ -5,7 +5,9 @@ import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -50,7 +52,7 @@ class ChunkStoreTest {
     @TempDir
     Path dir;
 
-    private final ChunkId id = new ChunkId(FileId.random(), 0);
+    private final ChunkId id = new ChunkId(FileId.of(1), 0);
 
     private static ByteBuffer bytes(String s) {
         return ByteBuffer.wrap(s.getBytes(StandardCharsets.UTF_8));
@@ -60,16 +62,77 @@ class ChunkStoreTest {
         return new ChunkStore(dir);
     }
 
+    static final StrataNamespace TEST_NS = StrataNamespace.of("test");
+
+    /** Returns the sharded relative path (no extension) for a chunk in TEST_NS. */
+    private String rel(ChunkId chunkId) {
+        return ChunkFormats.chunkRelativePath(TEST_NS, chunkId);
+    }
+
+    /** Ensures the shard directory for a chunk in TEST_NS exists and returns the rel path. */
+    private String relMkdirs(ChunkId chunkId) throws IOException {
+        String r = rel(chunkId);
+        Files.createDirectories(dir.resolve(r + ".chunk").getParent());
+        return r;
+    }
+
     private void open(ChunkStore store, ChunkId id, int epoch) throws IOException {
-        store.open(id, false, epoch, 1718000000000L);
+        store.open(TEST_NS, id, false, epoch, 1718000000000L);
     }
 
     private byte[] sealedBytes(ChunkStore store, ChunkId chunkId, String payload) throws IOException {
         byte[] bytes = payload.getBytes(StandardCharsets.UTF_8);
         open(store, chunkId, 1);
-        store.append(chunkId, 1, 0, 0, ByteBuffer.wrap(bytes));
-        store.seal(chunkId, 1, bytes.length, null);
-        return store.fetch(chunkId, 0, Integer.MAX_VALUE).bytes();
+        store.append(TEST_NS, chunkId, 1, 0, 0, ByteBuffer.wrap(bytes));
+        store.seal(TEST_NS, chunkId, 1, bytes.length, null);
+        return store.fetch(TEST_NS, chunkId, 0, Integer.MAX_VALUE).bytes();
+    }
+
+    @Test
+    void verifyReportsPresentSealedFactsAndMissingAbsent() throws Exception {
+        try (ChunkStore store = newStore()) {
+            ChunkId present = new ChunkId(FileId.of(1), 0);
+            sealedBytes(store, present, "hello");
+            ChunkStore.StatResult st = store.stat(TEST_NS, present);
+            ChunkId absent = new ChunkId(FileId.of(2), 0);
+
+            List<ChunkStore.VerifyResult> results = store.verify(TEST_NS, List.of(present, absent));
+
+            assertEquals(2, results.size());
+            ChunkStore.VerifyResult pr = results.get(0);
+            assertEquals(present, pr.chunkId());
+            assertTrue(pr.present(), "sealed chunk must report present");
+            assertEquals(ChunkState.SEALED, pr.state());
+            assertEquals(st.sealedLength(), pr.length());
+            assertEquals(st.dataCrc(), pr.crc());
+
+            ChunkStore.VerifyResult ar = results.get(1);
+            assertEquals(absent, ar.chunkId());
+            assertEquals(false, ar.present(), "absent chunk must report missing");
+        }
+    }
+
+    @Test
+    void orphanSuspectsListsOnlyUnverifiedSealedChunks() throws Exception {
+        try (ChunkStore store = newStore()) {
+            ChunkId sealed = new ChunkId(FileId.of(1), 0);
+            sealedBytes(store, sealed, "hello");
+            ChunkId open = new ChunkId(FileId.of(2), 0);
+            open(store, open, 1); // OPEN — an in-flight write is never a suspect
+
+            long now = System.currentTimeMillis();
+            // grace not yet elapsed (chunks just learned) -> no suspects
+            assertTrue(store.orphanSuspects(60_000, now).isEmpty(), "fresh chunks are inside grace");
+
+            // grace elapsed for everything -> only the SEALED chunk is a suspect, never the OPEN one
+            List<ChunkStore.SuspectChunk> suspects = store.orphanSuspects(0, now + 1);
+            assertEquals(List.of(new ChunkStore.SuspectChunk(TEST_NS, sealed)), suspects);
+
+            // a verify stamps the sealed chunk -> within grace it drops out of the suspect set
+            store.verify(TEST_NS, List.of(sealed));
+            assertTrue(store.orphanSuspects(60_000, System.currentTimeMillis()).isEmpty(),
+                    "a just-verified chunk is not a suspect");
+        }
     }
 
     private static ChunkFormats.Trailer trailer(byte[] fileBytes) {
@@ -125,7 +188,25 @@ class ChunkStoreTest {
     private static void assertImportFails(ChunkStore store, ChunkId chunkId, ErrorCode code,
                                           byte[] fileBytes, long expectedLength, int expectedCrc) {
         assertEquals(code, assertThrows(ScpException.class,
-                () -> store.importSealed(chunkId, fileBytes, expectedLength, expectedCrc)).code());
+                () -> store.importSealed(TEST_NS, chunkId, fileBytes, expectedLength, expectedCrc)).code());
+    }
+
+    @Test
+    void openPlacesChunkInNamespaceShardedDirectory() throws Exception {
+        // TDD: open() must place chunks/<ns>/<L1>/<L2>/<fileId>.<index>.{chunk,meta,j}
+        // Using FileId.of(0): ns=test, L1=0x00, L2=0x00 → test/00/00/0000000000000000.0
+        ChunkId zeroChunk = new ChunkId(FileId.of(0), 0);
+        StrataNamespace ns = StrataNamespace.of("test");
+        try (ChunkStore store = newStore()) {
+            store.open(ns, zeroChunk, false, 1, 1718000000000L);
+            store.append(TEST_NS, zeroChunk, 1, 0, 0, bytes("hello"));
+            store.seal(TEST_NS, zeroChunk, 1, 5, null);
+        }
+        String expected = "test/00/00/0000000000000000.0";
+        assertTrue(Files.exists(dir.resolve(expected + ".chunk")),
+                "chunk file must be at chunks/<ns>/<L1>/<L2>/<fileId>.<index>.chunk");
+        assertTrue(Files.exists(dir.resolve(expected + ".meta")),
+                "sidecar must be at the same sharded path");
     }
 
     @Test
@@ -144,10 +225,11 @@ class ChunkStoreTest {
 
     @Test
     void failedOpenCleansOwnedFilesAndReservation() throws Exception {
-        ChunkId chunk = new ChunkId(FileId.random(), 0);
-        Path dataPath = dir.resolve(ChunkFormats.baseName(chunk) + ".chunk");
-        Path ledgerPath = dir.resolve(ChunkFormats.baseName(chunk) + ".j");
-        Files.createDirectories(dir);
+        ChunkId chunk = new ChunkId(FileId.of(2), 0);
+        String rel = ChunkFormats.chunkRelativePath(TEST_NS, chunk);
+        Path dataPath = dir.resolve(rel + ".chunk");
+        Path ledgerPath = dir.resolve(rel + ".j");
+        Files.createDirectories(dataPath.getParent());
         Files.write(ledgerPath, new byte[] {1});
 
         try (ChunkStore store = newStore()) {
@@ -157,7 +239,7 @@ class ChunkStoreTest {
                     "failed open left behind a data file that would poison retries");
             assertEquals(true, Files.exists(ledgerPath),
                     "cleanup must not delete a pre-existing file it did not create");
-            assertEquals(false, creating(store).contains(chunk),
+            assertEquals(false, creating(store).contains(new NsChunkId(TEST_NS, chunk)),
                     "failed open left a stuck in-process reservation");
 
             Files.delete(ledgerPath);
@@ -171,13 +253,13 @@ class ChunkStoreTest {
         byte[] payload = "capacity-accounting".getBytes(StandardCharsets.UTF_8);
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, ByteBuffer.wrap(payload));
-            store.seal(id, 1, payload.length, null);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(TEST_NS, id, 1, payload.length, null);
 
-            String base = ChunkFormats.baseName(id);
-            long physicalBytes = sizeIfExists(dir.resolve(base + ".chunk"))
-                    + sizeIfExists(dir.resolve(base + ".meta"))
-                    + sizeIfExists(dir.resolve(base + ".j"));
+            String rel = ChunkFormats.chunkRelativePath(TEST_NS, id);
+            long physicalBytes = sizeIfExists(dir.resolve(rel + ".chunk"))
+                    + sizeIfExists(dir.resolve(rel + ".meta"))
+                    + sizeIfExists(dir.resolve(rel + ".j"));
 
             assertTrue(store.usedBytes() >= physicalBytes,
                     "capacity reporting must include physical chunk overhead, not only logical data bytes");
@@ -186,16 +268,21 @@ class ChunkStoreTest {
 
     @SuppressWarnings("unchecked")
     private static Object handle(ChunkStore store, ChunkId chunkId) throws Exception {
-        Field chunks = ChunkStore.class.getDeclaredField("chunks");
-        chunks.setAccessible(true);
-        return ((Map<ChunkId, ?>) chunks.get(store)).get(chunkId);
+        return handle(store, TEST_NS, chunkId);
     }
 
     @SuppressWarnings("unchecked")
-    private static Set<ChunkId> creating(ChunkStore store) throws Exception {
+    private static Object handle(ChunkStore store, StrataNamespace ns, ChunkId chunkId) throws Exception {
+        Field chunks = ChunkStore.class.getDeclaredField("chunks");
+        chunks.setAccessible(true);
+        return ((Map<NsChunkId, ?>) chunks.get(store)).get(new NsChunkId(ns, chunkId));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Set<NsChunkId> creating(ChunkStore store) throws Exception {
         Field creating = ChunkStore.class.getDeclaredField("creating");
         creating.setAccessible(true);
-        return (Set<ChunkId>) creating.get(store);
+        return (Set<NsChunkId>) creating.get(store);
     }
 
     private static void setHandleLong(ChunkStore store, ChunkId chunkId, String fieldName, long value)
@@ -220,9 +307,10 @@ class ChunkStoreTest {
 
     private static Object newHandle(ChunkStore store, ChunkId chunkId) throws Exception {
         Class<?> type = Class.forName("io.strata.format.ChunkStore$Handle");
-        Constructor<?> ctor = type.getDeclaredConstructor(ChunkStore.class, ChunkId.class, ChunkFormats.Header.class);
+        // Handle(ChunkId id, ChunkFormats.Header header, StrataNamespace ns)
+        Constructor<?> ctor = type.getDeclaredConstructor(ChunkStore.class, ChunkId.class, ChunkFormats.Header.class, StrataNamespace.class);
         ctor.setAccessible(true);
-        return ctor.newInstance(store, chunkId, new ChunkFormats.Header(chunkId, false, 1, 1718000000000L, 0, 0, 0));
+        return ctor.newInstance(store, chunkId, new ChunkFormats.Header(chunkId, false, 1, 1718000000000L, 0, 0, 0), TEST_NS);
     }
 
     private static int checkedFooterLength(ChunkFormats.Trailer trailer, long fileLen) throws Exception {
@@ -408,37 +496,37 @@ class ChunkStoreTest {
     void appendReadSealLifecycle() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            assertEquals(5, store.append(id, 1, 0, 0, bytes("hello")).endOffset());
-            assertEquals(11, store.append(id, 1, 5, 5, bytes(" world")).endOffset());
+            assertEquals(5, store.append(TEST_NS, id, 1, 0, 0, bytes("hello")).endOffset());
+            assertEquals(11, store.append(TEST_NS, id, 1, 5, 5, bytes(" world")).endOffset());
 
-            var r = store.read(id, 0, 1024);
+            var r = store.read(TEST_NS, id, 0, 1024);
             assertArrayEquals("hello world".getBytes(), r.bytes());
             assertEquals(11, r.localEndOffset());
             assertEquals(5, r.lastKnownDO()); // piggybacked DO from second append
 
-            var sealed = store.seal(id, 1, 11, null);
+            var sealed = store.seal(TEST_NS, id, 1, 11, null);
             assertEquals(11, sealed.finalLength());
             // idempotent re-seal returns same result
-            assertEquals(sealed, store.seal(id, 1, 11, null));
-            assertEquals(0, store.readLedger(id, 0).size());
+            assertEquals(sealed, store.seal(TEST_NS, id, 1, 11, null));
+            assertEquals(0, store.readLedger(TEST_NS, id, 0).size());
 
-            var r2 = store.read(id, 6, 1024);
+            var r2 = store.read(TEST_NS, id, 6, 1024);
             assertArrayEquals("world".getBytes(), r2.bytes());
 
-            try (var region = store.readRegion(id, 6, 1024)) {
+            try (var region = store.readRegion(TEST_NS, id, 6, 1024)) {
                 assertEquals(5, region.length());
                 assertEquals(11, region.localEndOffset());
                 // SEALED reads are zero-copy regions (bytes() == null); read via the channel.
                 assertArrayEquals("world".getBytes(), consumeRegion(region));
             }
 
-            var stat = store.stat(id);
+            var stat = store.stat(TEST_NS, id);
             assertEquals(ChunkState.SEALED, stat.state());
             assertEquals(11, stat.sealedLength());
 
             // append after seal rejected
             assertEquals(ErrorCode.CHUNK_SEALED,
-                    assertThrows(ScpException.class, () -> store.append(id, 1, 11, 0, bytes("x"))).code());
+                    assertThrows(ScpException.class, () -> store.append(TEST_NS, id, 1, 11, 0, bytes("x"))).code());
         }
     }
 
@@ -446,14 +534,14 @@ class ChunkStoreTest {
     void sealRejectsMalformedCallerFooterSectionsWithoutSealing() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("data"));
+            store.append(TEST_NS, id, 1, 0, 0, bytes("data"));
 
             ScpException tooShort = assertThrows(ScpException.class,
-                    () -> store.seal(id, 1, 4, ByteBuffer.wrap(new byte[] {1, 2, 3})));
+                    () -> store.seal(TEST_NS, id, 1, 4, ByteBuffer.wrap(new byte[] {1, 2, 3})));
             assertEquals(ErrorCode.PRECONDITION_FAILED, tooShort.code());
 
             ScpException negativeCount = assertThrows(ScpException.class,
-                    () -> store.seal(id, 1, 4, ByteBuffer.wrap(ByteBuffer.allocate(4).putInt(-1).array())));
+                    () -> store.seal(TEST_NS, id, 1, 4, ByteBuffer.wrap(ByteBuffer.allocate(4).putInt(-1).array())));
             assertEquals(ErrorCode.PRECONDITION_FAILED, negativeCount.code());
 
             byte[] trailingBytesPayload = ByteBuffer.allocate(Integer.BYTES + 1)
@@ -461,11 +549,11 @@ class ChunkStoreTest {
                     .put((byte) 1)
                     .array();
             ScpException trailingBytes = assertThrows(ScpException.class,
-                    () -> store.seal(id, 1, 4, ByteBuffer.wrap(trailingBytesPayload)));
+                    () -> store.seal(TEST_NS, id, 1, 4, ByteBuffer.wrap(trailingBytesPayload)));
             assertEquals(ErrorCode.PRECONDITION_FAILED, trailingBytes.code());
 
             ScpException countMismatch = assertThrows(ScpException.class,
-                    () -> store.seal(id, 1, 4, ByteBuffer.wrap(ByteBuffer.allocate(4).putInt(1).array())));
+                    () -> store.seal(TEST_NS, id, 1, 4, ByteBuffer.wrap(ByteBuffer.allocate(4).putInt(1).array())));
             assertEquals(ErrorCode.PRECONDITION_FAILED, countMismatch.code());
 
             byte[] badLengthPayload = ByteBuffer.allocate(Integer.BYTES + 12)
@@ -476,7 +564,7 @@ class ChunkStoreTest {
                     .putInt(0)
                     .array();
             ScpException badLength = assertThrows(ScpException.class,
-                    () -> store.seal(id, 1, 4, ByteBuffer.wrap(badLengthPayload)));
+                    () -> store.seal(TEST_NS, id, 1, 4, ByteBuffer.wrap(badLengthPayload)));
             assertEquals(ErrorCode.PRECONDITION_FAILED, badLength.code());
 
             byte[] negativeLengthPayload = ByteBuffer.allocate(Integer.BYTES + 12)
@@ -487,7 +575,7 @@ class ChunkStoreTest {
                     .putInt(0)
                     .array();
             ScpException negativeLength = assertThrows(ScpException.class,
-                    () -> store.seal(id, 1, 4, ByteBuffer.wrap(negativeLengthPayload)));
+                    () -> store.seal(TEST_NS, id, 1, 4, ByteBuffer.wrap(negativeLengthPayload)));
             assertEquals(ErrorCode.PRECONDITION_FAILED, negativeLength.code());
 
             byte[] badSectionCrc = section(ChunkFormats.SECTION_STATS,
@@ -498,7 +586,7 @@ class ChunkStoreTest {
                     .put(badSectionCrc)
                     .array();
             ScpException badCrc = assertThrows(ScpException.class,
-                    () -> store.seal(id, 1, 4, ByteBuffer.wrap(badCrcPayload)));
+                    () -> store.seal(TEST_NS, id, 1, 4, ByteBuffer.wrap(badCrcPayload)));
             assertEquals(ErrorCode.PRECONDITION_FAILED, badCrc.code());
 
             byte[] crcRanges = section(ChunkFormats.SECTION_CRC_RANGES,
@@ -506,12 +594,12 @@ class ChunkStoreTest {
             byte[] reservedPayload = ByteBuffer.allocate(Integer.BYTES + crcRanges.length)
                     .putInt(1).put(crcRanges).array();
             ScpException reserved = assertThrows(ScpException.class,
-                    () -> store.seal(id, 1, 4, ByteBuffer.wrap(reservedPayload)));
+                    () -> store.seal(TEST_NS, id, 1, 4, ByteBuffer.wrap(reservedPayload)));
             assertEquals(ErrorCode.PRECONDITION_FAILED, reserved.code());
 
-            assertEquals(ChunkState.OPEN, store.stat(id).state());
-            assertEquals(4, store.seal(id, 1, 4, null).finalLength());
-            assertEquals(ChunkState.SEALED, store.stat(id).state());
+            assertEquals(ChunkState.OPEN, store.stat(TEST_NS, id).state());
+            assertEquals(4, store.seal(TEST_NS, id, 1, 4, null).finalLength());
+            assertEquals(ChunkState.SEALED, store.stat(TEST_NS, id).state());
         }
     }
 
@@ -519,10 +607,10 @@ class ChunkStoreTest {
     void sealTreatsEmptyCallerSectionBufferLikeNoCallerSections() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("data"));
+            store.append(TEST_NS, id, 1, 0, 0, bytes("data"));
 
-            assertEquals(4, store.seal(id, 1, 4, ByteBuffer.allocate(0)).finalLength());
-            assertEquals(ChunkState.SEALED, store.stat(id).state());
+            assertEquals(4, store.seal(TEST_NS, id, 1, 4, ByteBuffer.allocate(0)).finalLength());
+            assertEquals(ChunkState.SEALED, store.stat(TEST_NS, id).state());
         }
     }
 
@@ -530,7 +618,7 @@ class ChunkStoreTest {
     void sealAcceptsValidCallerFooterSectionsAndPreservesCounts() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("data"));
+            store.append(TEST_NS, id, 1, 0, 0, bytes("data"));
 
             byte[] callerSection = section(ChunkFormats.SECTION_OFFSET_INDEX, "caller-index".getBytes());
             byte[] callerPayload = ByteBuffer.allocate(Integer.BYTES + callerSection.length)
@@ -538,8 +626,8 @@ class ChunkStoreTest {
                     .put(callerSection)
                     .array();
 
-            store.seal(id, 1, 4, ByteBuffer.wrap(callerPayload));
-            byte[] fileBytes = store.fetch(id, 0, Integer.MAX_VALUE).bytes();
+            store.seal(TEST_NS, id, 1, 4, ByteBuffer.wrap(callerPayload));
+            byte[] fileBytes = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE).bytes();
             ChunkFormats.Trailer trailer = trailer(fileBytes);
             assertEquals(3, trailer.sectionCount(), "caller section plus CRC_RANGES and STATS");
             byte[] footer = footerBytes(fileBytes);
@@ -561,12 +649,12 @@ class ChunkStoreTest {
             setHandleObject(store, id, "committer", failingCommitter);
             try {
                 ScpException appendFailure = assertThrows(ScpException.class,
-                        () -> store.append(id, 1, 0, 0, bytes("data")));
+                        () -> store.append(TEST_NS, id, 1, 0, 0, bytes("data")));
                 assertEquals(ErrorCode.INTERNAL, appendFailure.code());
 
-                IOException sealFailure = assertThrows(IOException.class, () -> store.seal(id, 1, 4, null));
+                IOException sealFailure = assertThrows(IOException.class, () -> store.seal(TEST_NS, id, 1, 4, null));
                 assertTrue(sealFailure.getMessage().contains("group-commit flusher failed"));
-                assertEquals(ChunkState.OPEN, store.stat(id).state());
+                assertEquals(ChunkState.OPEN, store.stat(TEST_NS, id).state());
             } finally {
                 failingCommitter.closeAndConfirm();
                 setHandleObject(store, id, "committer", null);
@@ -577,15 +665,15 @@ class ChunkStoreTest {
     @Test
     void malformedCallerFooterDoesNotStopOpenFsyncCommitter() throws Exception {
         try (ChunkStore store = newStore()) {
-            store.open(id, true, 1, 1718000000000L);
+            store.open(TEST_NS, id, true, 1, 1718000000000L);
 
             assertEquals(ErrorCode.PRECONDITION_FAILED, assertThrows(ScpException.class,
-                    () -> store.seal(id, 1, 0, ByteBuffer.wrap(new byte[] {1, 2, 3}))).code());
+                    () -> store.seal(TEST_NS, id, 1, 0, ByteBuffer.wrap(new byte[] {1, 2, 3}))).code());
 
-            assertEquals(ChunkState.OPEN, store.stat(id).state());
+            assertEquals(ChunkState.OPEN, store.stat(TEST_NS, id).state());
             assertTrue(getHandleObject(store, id, "committer") != null,
                     "malformed caller footer must not disable fsync acks on an open chunk");
-            assertEquals(0, store.seal(id, 1, 0, null).finalLength());
+            assertEquals(0, store.seal(TEST_NS, id, 1, 0, null).finalLength());
         }
     }
 
@@ -602,7 +690,7 @@ class ChunkStoreTest {
             setHandleObject(store, id, "committer", failingCommitter);
 
             ScpException e = assertThrows(ScpException.class,
-                    () -> store.append(id, 1, 0, 0, bytes("data")));
+                    () -> store.append(TEST_NS, id, 1, 0, 0, bytes("data")));
             assertEquals(ErrorCode.INTERNAL, e.code());
             failingCommitter.closeAndConfirm();
             setHandleObject(store, id, "committer", null);
@@ -617,17 +705,17 @@ class ChunkStoreTest {
 
         IOException failure = assertThrows(IOException.class, store::close);
         assertTrue(failure.getMessage().contains("close failed"));
-        assertTrue(store.contains(id), "failed close must not discard the handle needed for retry");
+        assertTrue(store.contains(TEST_NS, id), "failed close must not discard the handle needed for retry");
 
         store.close();
-        assertEquals(false, store.contains(id));
+        assertEquals(false, store.contains(TEST_NS, id));
     }
 
     @Test
     void closeReportsSidecarPersistenceFailureAndKeepsChunkForRetry() throws Exception {
         ChunkStore store = newStore();
         open(store, id, 1);
-        Path metaPath = dir.resolve(ChunkFormats.baseName(id) + ".meta");
+        Path metaPath = dir.resolve(rel(id) + ".meta");
         Files.delete(metaPath);
         Files.createDirectory(metaPath);
 
@@ -635,11 +723,11 @@ class ChunkStoreTest {
         assertTrue(failure.getMessage().contains("Is a directory")
                 || failure.getMessage().contains("is a directory")
                 || failure.getMessage().contains(metaPath.toString()), "got: " + failure.getMessage());
-        assertTrue(store.contains(id), "failed close must keep the chunk visible for retry");
+        assertTrue(store.contains(TEST_NS, id), "failed close must keep the chunk visible for retry");
 
         Files.delete(metaPath);
         store.close();
-        assertEquals(false, store.contains(id));
+        assertEquals(false, store.contains(TEST_NS, id));
     }
 
     @Test
@@ -655,16 +743,16 @@ class ChunkStoreTest {
         setHandleObject(store, id, "committer", failingCommitter);
 
         ScpException appendFailure = assertThrows(ScpException.class,
-                () -> store.append(id, 1, 0, 0, bytes("data")));
+                () -> store.append(TEST_NS, id, 1, 0, 0, bytes("data")));
         assertEquals(ErrorCode.INTERNAL, appendFailure.code());
 
         IOException closeFailure = assertThrows(IOException.class, store::close);
         assertTrue(closeFailure.getMessage().contains("group-commit flusher failed"));
         assertEquals(null, getHandleObject(store, id, "committer"));
-        assertTrue(store.contains(id), "failed close must keep the chunk visible for retry");
+        assertTrue(store.contains(TEST_NS, id), "failed close must keep the chunk visible for retry");
 
         store.close();
-        assertEquals(false, store.contains(id));
+        assertEquals(false, store.contains(TEST_NS, id));
     }
 
     @Test
@@ -674,9 +762,9 @@ class ChunkStoreTest {
             setHandleLong(store, id, "end", Long.MAX_VALUE - 1);
 
             ScpException overflow = assertThrows(ScpException.class,
-                    () -> store.append(id, 1, Long.MAX_VALUE - 1, 0, ByteBuffer.wrap(new byte[] {1, 2})));
+                    () -> store.append(TEST_NS, id, 1, Long.MAX_VALUE - 1, 0, ByteBuffer.wrap(new byte[] {1, 2})));
             assertEquals(ErrorCode.CORRUPT_CHUNK, overflow.code());
-            assertEquals(0, store.readLedger(id, 0).size());
+            assertEquals(0, store.readLedger(TEST_NS, id, 0).size());
         }
     }
 
@@ -684,32 +772,32 @@ class ChunkStoreTest {
     void epochFencingRules() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 5);
-            store.append(id, 5, 0, 0, bytes("aa"));
+            store.append(TEST_NS, id, 5, 0, 0, bytes("aa"));
 
             // lower epoch rejected
-            var e = assertThrows(ScpException.class, () -> store.append(id, 4, 2, 0, bytes("bb")));
+            var e = assertThrows(ScpException.class, () -> store.append(TEST_NS, id, 4, 2, 0, bytes("bb")));
             assertEquals(ErrorCode.FENCED_EPOCH, e.code());
             assertEquals(5, e.detail());
 
             // fence at 7: epoch 5,6 appends rejected; 7 accepted
-            var f = store.fence(id, 7);
+            var f = store.fence(TEST_NS, id, 7);
             assertEquals(7, f.persistedFenceEpoch());
             assertEquals(2, f.localEndOffset());
             assertEquals(ErrorCode.FENCED_EPOCH,
-                    assertThrows(ScpException.class, () -> store.append(id, 5, 2, 0, bytes("bb"))).code());
+                    assertThrows(ScpException.class, () -> store.append(TEST_NS, id, 5, 2, 0, bytes("bb"))).code());
             assertEquals(ErrorCode.FENCED_EPOCH,
-                    assertThrows(ScpException.class, () -> store.append(id, 6, 2, 0, bytes("bb"))).code());
-            assertEquals(4, store.append(id, 7, 2, 0, bytes("cc")).endOffset());
+                    assertThrows(ScpException.class, () -> store.append(TEST_NS, id, 6, 2, 0, bytes("bb"))).code());
+            assertEquals(4, store.append(TEST_NS, id, 7, 2, 0, bytes("cc")).endOffset());
 
             // fence is monotonic: lower fence is a no-op
-            assertEquals(7, store.fence(id, 3).persistedFenceEpoch());
+            assertEquals(7, store.fence(TEST_NS, id, 3).persistedFenceEpoch());
 
             // seal with fenced epoch rejected, with current epoch ok
             assertEquals(ErrorCode.FENCED_EPOCH,
-                    assertThrows(ScpException.class, () -> store.seal(id, 5, 4, null)).code());
-            assertEquals(4, store.seal(id, 7, 4, null).finalLength());
+                    assertThrows(ScpException.class, () -> store.seal(TEST_NS, id, 5, 4, null)).code());
+            assertEquals(4, store.seal(TEST_NS, id, 7, 4, null).finalLength());
             assertEquals(ErrorCode.FENCED_EPOCH,
-                    assertThrows(ScpException.class, () -> store.seal(id, 5, 4, null)).code());
+                    assertThrows(ScpException.class, () -> store.seal(TEST_NS, id, 5, 4, null)).code());
         }
     }
 
@@ -717,8 +805,8 @@ class ChunkStoreTest {
     void offsetGapRejectedWithExpectedDetail() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("abc"));
-            var e = assertThrows(ScpException.class, () -> store.append(id, 1, 5, 0, bytes("d")));
+            store.append(TEST_NS, id, 1, 0, 0, bytes("abc"));
+            var e = assertThrows(ScpException.class, () -> store.append(TEST_NS, id, 1, 5, 0, bytes("d")));
             assertEquals(ErrorCode.OFFSET_GAP, e.code());
             assertEquals(3, e.detail());
         }
@@ -732,32 +820,32 @@ class ChunkStoreTest {
                     assertThrows(ScpException.class, () -> open(store, id, 1)).code());
         }
 
-        ChunkId blocked = new ChunkId(FileId.random(), 0);
+        ChunkId blocked = new ChunkId(FileId.of(3), 0);
         try (ChunkStore store = newStore()) {
-            java.nio.file.Files.write(dir.resolve(ChunkFormats.baseName(blocked) + ".chunk"), new byte[]{1});
+            java.nio.file.Files.write(dir.resolve(relMkdirs(blocked) + ".chunk"), new byte[]{1});
             assertEquals(ErrorCode.CHUNK_ALREADY_EXISTS,
                     assertThrows(ScpException.class, () -> open(store, blocked, 1)).code());
         }
 
-        ChunkId reserved = new ChunkId(FileId.random(), 0);
+        ChunkId reserved = new ChunkId(FileId.of(4), 0);
         try (ChunkStore store = newStore()) {
-            creating(store).add(reserved);
+            creating(store).add(new NsChunkId(TEST_NS, reserved));
             assertEquals(ErrorCode.CHUNK_ALREADY_EXISTS,
                     assertThrows(ScpException.class, () -> open(store, reserved, 1)).code());
-            assertTrue(creating(store).contains(reserved));
+            assertTrue(creating(store).contains(new NsChunkId(TEST_NS, reserved)));
         }
     }
 
     @Test
     void deleteRetriesWhileChunkCreationIsReserved() throws Exception {
         try (ChunkStore store = newStore()) {
-            creating(store).add(id);
+            creating(store).add(new NsChunkId(TEST_NS, id));
             try {
-                assertEquals(ErrorCode.INTERNAL, store.delete(id));
+                assertEquals(ErrorCode.INTERNAL, store.delete(TEST_NS, id));
             } finally {
-                creating(store).remove(id);
+                creating(store).remove(new NsChunkId(TEST_NS, id));
             }
-            assertEquals(ErrorCode.CHUNK_NOT_FOUND, store.delete(id));
+            assertEquals(ErrorCode.CHUNK_NOT_FOUND, store.delete(TEST_NS, id));
         }
     }
 
@@ -765,11 +853,11 @@ class ChunkStoreTest {
     void sealTruncatesUnackedTail() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("aaaa"));
-            store.append(id, 1, 4, 0, bytes("bbbb")); // never quorum-acked, will be cut
-            var sealed = store.seal(id, 1, 4, null);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("aaaa"));
+            store.append(TEST_NS, id, 1, 4, 0, bytes("bbbb")); // never quorum-acked, will be cut
+            var sealed = store.seal(TEST_NS, id, 1, 4, null);
             assertEquals(4, sealed.finalLength());
-            var r = store.read(id, 0, 100);
+            var r = store.read(TEST_NS, id, 0, 100);
             assertArrayEquals("aaaa".getBytes(), r.bytes());
         }
     }
@@ -782,24 +870,24 @@ class ChunkStoreTest {
         // truncates the never-acked tail.
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("COMMITTED"));      // [0,9) survives the seal
-            store.append(id, 1, 9, 9, bytes("TAILTAILTAIL"));   // [9,21) never-acked, will be cut
-            assertEquals(21, store.stat(id).localEndOffset());
+            store.append(TEST_NS, id, 1, 0, 0, bytes("COMMITTED"));      // [0,9) survives the seal
+            store.append(TEST_NS, id, 1, 9, 9, bytes("TAILTAILTAIL"));   // [9,21) never-acked, will be cut
+            assertEquals(21, store.stat(TEST_NS, id).localEndOffset());
 
             // The uncommitted tail must not be served at all, even though it is locally present.
-            ChunkStore.ReadRegionResult tail = store.readRegion(id, 9, 1024);
+            ChunkStore.ReadRegionResult tail = store.readRegion(TEST_NS, id, 9, 1024);
             assertEquals(0, tail.length());
             assertEquals(21, tail.localEndOffset());
             assertEquals(9, tail.lastKnownDO());
 
             // The committed prefix is served as a zero-copy channel region over an independent FD.
-            ChunkStore.ReadRegionResult region = store.readRegion(id, 0, 1024);
+            ChunkStore.ReadRegionResult region = store.readRegion(TEST_NS, id, 0, 1024);
             assertEquals(9, region.length());
             assertTrue(region.channel() != null, "durable open read should use a zero-copy channel");
             assertEquals(null, region.bytes());
             try {
                 // a concurrent seal truncates the never-acked tail after this region was resolved
-                var sealed = store.seal(id, 1, 9, null);
+                var sealed = store.seal(TEST_NS, id, 1, 9, null);
                 assertEquals(9, sealed.finalLength());
 
                 // the region handed out BEFORE the seal must still yield the original committed bytes
@@ -816,15 +904,15 @@ class ChunkStoreTest {
     void sealCannotTruncateBelowDurableWatermark() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("SAFE"));
-            store.append(id, 1, 4, 4, bytes("TAIL"));
-            assertEquals(4, store.stat(id).lastKnownDO());
+            store.append(TEST_NS, id, 1, 0, 0, bytes("SAFE"));
+            store.append(TEST_NS, id, 1, 4, 4, bytes("TAIL"));
+            assertEquals(4, store.stat(TEST_NS, id).lastKnownDO());
 
-            ScpException e = assertThrows(ScpException.class, () -> store.seal(id, 1, 3, null));
+            ScpException e = assertThrows(ScpException.class, () -> store.seal(TEST_NS, id, 1, 3, null));
             assertEquals(ErrorCode.INTERNAL, e.code());
             assertEquals(4, e.detail());
 
-            assertEquals(4, store.seal(id, 1, 4, null).finalLength());
+            assertEquals(4, store.seal(TEST_NS, id, 1, 4, null).finalLength());
         }
     }
 
@@ -832,17 +920,17 @@ class ChunkStoreTest {
     void openReadRejectsLedgerCoveredDataRotButReadRegionIsZeroCopyUnverified() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("verified-open"));
-            store.append(id, 1, 13, 13, ByteBuffer.allocate(0)); // make the full range readable
+            store.append(TEST_NS, id, 1, 0, 0, bytes("verified-open"));
+            store.append(TEST_NS, id, 1, 13, 13, ByteBuffer.allocate(0)); // make the full range readable
 
-            Path data = dir.resolve(ChunkFormats.baseName(id) + ".chunk");
+            Path data = dir.resolve(rel(id) + ".chunk");
             try (FileChannel ch = FileChannel.open(data, java.nio.file.StandardOpenOption.WRITE)) {
                 ch.write(ByteBuffer.wrap(new byte[] {'X'}), ChunkFormats.DATA_START + 4);
             }
 
             assertEquals(ErrorCode.CRC_MISMATCH,
-                    assertThrows(ScpException.class, () -> store.read(id, 0, 13)).code());
-            try (var region = store.readRegion(id, 0, 13)) {
+                    assertThrows(ScpException.class, () -> store.read(TEST_NS, id, 0, 13)).code());
+            try (var region = store.readRegion(TEST_NS, id, 0, 13)) {
                 assertEquals(13, region.length());
                 assertTrue(region.channel() != null, "client open readRegion should be zero-copy");
                 byte[] got = consumeRegion(region);
@@ -868,13 +956,13 @@ class ChunkStoreTest {
     void sealRejectsInvalidLengthsAndConflictingReseal() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("abcd"));
+            store.append(TEST_NS, id, 1, 0, 0, bytes("abcd"));
 
             assertEquals(ErrorCode.INTERNAL,
-                    assertThrows(ScpException.class, () -> store.seal(id, 1, 5, null)).code());
+                    assertThrows(ScpException.class, () -> store.seal(TEST_NS, id, 1, 5, null)).code());
 
-            store.seal(id, 1, 4, null);
-            ScpException e = assertThrows(ScpException.class, () -> store.seal(id, 1, 3, null));
+            store.seal(TEST_NS, id, 1, 4, null);
+            ScpException e = assertThrows(ScpException.class, () -> store.seal(TEST_NS, id, 1, 3, null));
             assertEquals(ErrorCode.CHUNK_SEALED, e.code());
             assertEquals(4, e.detail());
         }
@@ -884,12 +972,12 @@ class ChunkStoreTest {
     void emptyAppendIsDoBeacon() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("data"));
-            store.append(id, 1, 4, 4, ByteBuffer.allocate(0)); // beacon advances DO only
-            var stat = store.stat(id);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("data"));
+            store.append(TEST_NS, id, 1, 4, 4, ByteBuffer.allocate(0)); // beacon advances DO only
+            var stat = store.stat(TEST_NS, id);
             assertEquals(4, stat.localEndOffset());
             assertEquals(4, stat.lastKnownDO());
-            assertEquals(1, store.readLedger(id, 0).size()); // beacon adds no ledger entry
+            assertEquals(1, store.readLedger(TEST_NS, id, 0).size()); // beacon adds no ledger entry
         }
     }
 
@@ -899,11 +987,11 @@ class ChunkStoreTest {
             open(store, id, 1);
             // a DO claim can only cover previously acked data — it is clamped to the
             // pre-append end (0 here), never to the bytes carried by this very append
-            store.append(id, 1, 0, 999, bytes("ab"));
-            assertEquals(0, store.stat(id).lastKnownDO());
+            store.append(TEST_NS, id, 1, 0, 999, bytes("ab"));
+            assertEquals(0, store.stat(TEST_NS, id).lastKnownDO());
             // next append may legitimately claim the previous bytes as durable
-            store.append(id, 1, 2, 2, bytes("cd"));
-            assertEquals(2, store.stat(id).lastKnownDO());
+            store.append(TEST_NS, id, 1, 2, 2, bytes("cd"));
+            assertEquals(2, store.stat(TEST_NS, id).lastKnownDO());
         }
     }
 
@@ -914,7 +1002,7 @@ class ChunkStoreTest {
             setHandleLong(store, id, "end", Long.MAX_VALUE);
 
             ScpException overflow = assertThrows(ScpException.class,
-                    () -> store.read(id, Long.MAX_VALUE - 1, 1));
+                    () -> store.read(TEST_NS, id, Long.MAX_VALUE - 1, 1));
             assertEquals(ErrorCode.CORRUPT_CHUNK, overflow.code());
         }
     }
@@ -928,19 +1016,19 @@ class ChunkStoreTest {
             open(store, id, 1);
             byte[] big = new byte[100_000];
             for (int i = 0; i < big.length; i++) big[i] = (byte) (i % 251);
-            store.append(id, 1, 0, 0, ByteBuffer.wrap(big));
-            var sealed = store.seal(id, 1, big.length, null);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(big));
+            var sealed = store.seal(TEST_NS, id, 1, big.length, null);
             sealedLen = sealed.finalLength();
             crc = sealed.dataCrc();
-            var fetched = store.fetch(id, 0, Integer.MAX_VALUE);
+            var fetched = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE);
             assertEquals(fetched.fileLength(), fetched.bytes().length);
             fileBytes = fetched.bytes();
         }
         try (ChunkStore other = new ChunkStore(otherDir)) {
-            other.importSealed(id, fileBytes, sealedLen, crc);
-            var fetched2 = other.fetch(id, 0, Integer.MAX_VALUE);
+            other.importSealed(TEST_NS, id, fileBytes, sealedLen, crc);
+            var fetched2 = other.fetch(TEST_NS, id, 0, Integer.MAX_VALUE);
             assertArrayEquals(fileBytes, fetched2.bytes()); // invariant §14.6: byte-identical replicas
-            var r = other.read(id, 0, 10);
+            var r = other.read(TEST_NS, id, 0, 10);
             assertArrayEquals(new byte[]{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, r.bytes());
         }
     }
@@ -951,15 +1039,15 @@ class ChunkStoreTest {
         int crc;
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            var sealed = store.seal(id, 1, 0, null);
+            var sealed = store.seal(TEST_NS, id, 1, 0, null);
             crc = sealed.dataCrc();
-            fileBytes = store.fetch(id, 0, Integer.MAX_VALUE).bytes();
+            fileBytes = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE).bytes();
         }
 
         try (ChunkStore other = new ChunkStore(otherDir)) {
-            other.importSealed(id, fileBytes, 0, crc);
-            assertTrue(other.contains(id));
-            assertArrayEquals(new byte[0], other.read(id, 0, 1).bytes());
+            other.importSealed(TEST_NS, id, fileBytes, 0, crc);
+            assertTrue(other.contains(TEST_NS, id));
+            assertArrayEquals(new byte[0], other.read(TEST_NS, id, 0, 1).bytes());
         }
     }
 
@@ -967,21 +1055,21 @@ class ChunkStoreTest {
     void readAndFetchBoundaryConditions() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("payload"));
+            store.append(TEST_NS, id, 1, 0, 0, bytes("payload"));
 
-            var endRead = store.read(id, 7, 100);
+            var endRead = store.read(TEST_NS, id, 7, 100);
             assertEquals(0, endRead.bytes().length);
             assertEquals(7, endRead.localEndOffset());
 
             assertEquals(ErrorCode.INTERNAL,
-                    assertThrows(ScpException.class, () -> store.fetch(id, 0, 100)).code());
+                    assertThrows(ScpException.class, () -> store.fetch(TEST_NS, id, 0, 100)).code());
 
-            var sealed = store.seal(id, 1, 7, null);
-            var file = store.fetch(id, 0, Integer.MAX_VALUE);
-            assertEquals(sealed.finalLength(), store.stat(id).sealedLength());
-            assertEquals(0, store.read(id, 0, 0).bytes().length);
+            var sealed = store.seal(TEST_NS, id, 1, 7, null);
+            var file = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE);
+            assertEquals(sealed.finalLength(), store.stat(TEST_NS, id).sealedLength());
+            assertEquals(0, store.read(TEST_NS, id, 0, 0).bytes().length);
 
-            var emptyFetch = store.fetch(id, file.fileLength(), 100);
+            var emptyFetch = store.fetch(TEST_NS, id, file.fileLength(), 100);
             assertEquals(0, emptyFetch.bytes().length);
             assertEquals(file.fileLength(), emptyFetch.fileLength());
         }
@@ -993,15 +1081,15 @@ class ChunkStoreTest {
         int dataCrc;
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("payload-payload"));
-            store.seal(id, 1, 15, null);
-            fileBytes = store.fetch(id, 0, Integer.MAX_VALUE).bytes();
+            store.append(TEST_NS, id, 1, 0, 0, bytes("payload-payload"));
+            store.seal(TEST_NS, id, 1, 15, null);
+            fileBytes = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE).bytes();
             dataCrc = trailer(fileBytes).dataCrc();
         }
         fileBytes[ChunkFormats.HEADER_SIZE + 3] ^= 1; // corrupt data region
         try (ChunkStore other = new ChunkStore(otherDir)) {
             assertEquals(ErrorCode.CRC_MISMATCH,
-                    assertThrows(ScpException.class, () -> other.importSealed(id, fileBytes, 15, dataCrc)).code());
+                    assertThrows(ScpException.class, () -> other.importSealed(TEST_NS, id, fileBytes, 15, dataCrc)).code());
         }
     }
 
@@ -1014,7 +1102,7 @@ class ChunkStoreTest {
 
         try (ChunkStore other = new ChunkStore(otherDir)) {
             assertEquals(ErrorCode.CRC_MISMATCH,
-                    assertThrows(ScpException.class, () -> other.importSealed(id, fileBytes, 15, 0)).code());
+                    assertThrows(ScpException.class, () -> other.importSealed(TEST_NS, id, fileBytes, 15, 0)).code());
         }
     }
 
@@ -1031,10 +1119,12 @@ class ChunkStoreTest {
         }
 
         try (ChunkStore other = new ChunkStore(otherDir)) {
-            Files.write(otherDir.resolve(ChunkFormats.baseName(id) + ".chunk"), new byte[] {1});
+            Path shardedPath = otherDir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, id) + ".chunk");
+            Files.createDirectories(shardedPath.getParent());
+            Files.write(shardedPath, new byte[] {1});
             assertEquals(ErrorCode.CHUNK_ALREADY_EXISTS,
                     assertThrows(ScpException.class,
-                            () -> other.importSealed(id, fileBytes, sealedLength, dataCrc)).code());
+                            () -> other.importSealed(TEST_NS, id, fileBytes, sealedLength, dataCrc)).code());
         }
     }
 
@@ -1050,24 +1140,24 @@ class ChunkStoreTest {
             dataCrc = trailer.dataCrc();
         }
 
-        String base = ChunkFormats.baseName(id);
-        Path dataPath = otherDir.resolve(base + ".chunk");
-        Path tmpPath = otherDir.resolve(base + ".chunk.tmp");
-        Path metaPath = otherDir.resolve(base + ".meta");
+        String rel = ChunkFormats.chunkRelativePath(TEST_NS, id);
+        Path dataPath = otherDir.resolve(rel + ".chunk");
+        Path metaPath = otherDir.resolve(rel + ".meta");
+        Files.createDirectories(dataPath.getParent());
+        // Block the sidecar path by placing a directory there
         Files.createDirectory(metaPath);
         Files.write(metaPath.resolve("blocker"), new byte[] {1});
 
         try (ChunkStore other = new ChunkStore(otherDir)) {
-            assertThrows(IOException.class, () -> other.importSealed(id, fileBytes, sealedLength, dataCrc));
+            assertThrows(IOException.class, () -> other.importSealed(TEST_NS, id, fileBytes, sealedLength, dataCrc));
             assertTrue(Files.notExists(dataPath));
-            assertTrue(Files.notExists(tmpPath));
             assertEquals(ErrorCode.CHUNK_NOT_FOUND,
-                    assertThrows(ScpException.class, () -> other.stat(id)).code());
+                    assertThrows(ScpException.class, () -> other.stat(TEST_NS, id)).code());
 
             Files.delete(metaPath.resolve("blocker"));
             Files.delete(metaPath);
-            other.importSealed(id, fileBytes, sealedLength, dataCrc);
-            assertTrue(other.contains(id));
+            other.importSealed(TEST_NS, id, fileBytes, sealedLength, dataCrc);
+            assertTrue(other.contains(TEST_NS, id));
         }
     }
 
@@ -1079,7 +1169,7 @@ class ChunkStoreTest {
         int dataCrc;
         try (ChunkStore store = newStore()) {
             fileBytes = sealedBytes(store, id, "payload-payload");
-            ChunkId otherId = new ChunkId(FileId.random(), 0);
+            ChunkId otherId = new ChunkId(FileId.of(5), 0);
             otherFileBytes = sealedBytes(store, otherId, "payload-payload");
             var t = trailer(fileBytes);
             sealedLength = t.dataLength();
@@ -1209,23 +1299,23 @@ class ChunkStoreTest {
     void negativeWireValuesAreRejectedWithoutDamage() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("payload"));
+            store.append(TEST_NS, id, 1, 0, 0, bytes("payload"));
 
             // a negative seal length passes naive range checks (-5 is not > end) and
             // truncate(DATA_START - 5) would DESTROY the header before anything throws
             assertEquals(ErrorCode.INTERNAL,
-                    assertThrows(ScpException.class, () -> store.seal(id, 1, -5, null)).code());
+                    assertThrows(ScpException.class, () -> store.seal(TEST_NS, id, 1, -5, null)).code());
             // negative read/append/fetch offsets likewise must be typed rejections
-            assertThrows(ScpException.class, () -> store.read(id, -1, 10));
-            assertThrows(ScpException.class, () -> store.read(id, 0, -10));
-            assertThrows(ScpException.class, () -> store.fetch(id, 0, -10));
-            assertThrows(ScpException.class, () -> store.readLedger(id, -1));
-            assertThrows(ScpException.class, () -> store.append(id, 1, -3, 0, bytes("x")));
+            assertThrows(ScpException.class, () -> store.read(TEST_NS, id, -1, 10));
+            assertThrows(ScpException.class, () -> store.read(TEST_NS, id, 0, -10));
+            assertThrows(ScpException.class, () -> store.fetch(TEST_NS, id, 0, -10));
+            assertThrows(ScpException.class, () -> store.readLedger(TEST_NS, id, -1));
+            assertThrows(ScpException.class, () -> store.append(TEST_NS, id, 1, -3, 0, bytes("x")));
 
             // and the chunk must be UNDAMAGED: header intact, still appendable, still sealable
-            assertEquals(7, store.stat(id).localEndOffset());
-            assertEquals(8, store.append(id, 1, 7, 7, bytes("!")).endOffset());
-            assertEquals(8, store.seal(id, 1, 8, null).finalLength());
+            assertEquals(7, store.stat(TEST_NS, id).localEndOffset());
+            assertEquals(8, store.append(TEST_NS, id, 1, 7, 7, bytes("!")).endOffset());
+            assertEquals(8, store.seal(TEST_NS, id, 1, 8, null).finalLength());
         }
     }
 
@@ -1233,12 +1323,12 @@ class ChunkStoreTest {
     void sealedReadRejectsMissingCrcRangeMetadata() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("payload"));
-            store.seal(id, 1, 7, null);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("payload"));
+            store.seal(TEST_NS, id, 1, 7, null);
 
             setHandleObject(store, id, "sealedRangeCrcs", List.of());
             assertEquals(ErrorCode.CORRUPT_CHUNK,
-                    assertThrows(ScpException.class, () -> store.read(id, 0, 1)).code());
+                    assertThrows(ScpException.class, () -> store.read(TEST_NS, id, 0, 1)).code());
         }
     }
 
@@ -1247,13 +1337,13 @@ class ChunkStoreTest {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
             byte[] payload = new byte[ChunkFormats.CRC_RANGE_SIZE + 1];
-            store.append(id, 1, 0, 0, ByteBuffer.wrap(payload));
-            store.seal(id, 1, payload.length, null);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(TEST_NS, id, 1, payload.length, null);
 
             setHandleObject(store, id, "sealedRangeCrcs", List.of(Crc.of(payload, 0, ChunkFormats.CRC_RANGE_SIZE)));
             assertEquals(ErrorCode.CORRUPT_CHUNK,
                     assertThrows(ScpException.class,
-                            () -> store.read(id, ChunkFormats.CRC_RANGE_SIZE, 1)).code());
+                            () -> store.read(TEST_NS, id, ChunkFormats.CRC_RANGE_SIZE, 1)).code());
         }
     }
 
@@ -1262,14 +1352,14 @@ class ChunkStoreTest {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
             byte[] big = new byte[9 << 20]; // 9 MB > the 8 MB per-request cap
-            store.append(id, 1, 0, 0, ByteBuffer.wrap(big));
-            store.seal(id, 1, big.length, null);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(big));
+            store.seal(TEST_NS, id, 1, big.length, null);
 
             // a request asking for "everything" must be clamped, not answered with one
             // chunk-sized allocation (callers loop; the frame layer caps at 64 MB anyway)
-            var r = store.read(id, 0, Integer.MAX_VALUE);
+            var r = store.read(TEST_NS, id, 0, Integer.MAX_VALUE);
             assertEquals(ChunkStore.MAX_REQUEST_BYTES, r.bytes().length);
-            var f = store.fetch(id, 0, Integer.MAX_VALUE);
+            var f = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE);
             assertEquals(ChunkStore.MAX_REQUEST_BYTES, f.bytes().length);
         }
     }
@@ -1278,11 +1368,11 @@ class ChunkStoreTest {
     void scrubKeepsCleanSealedChunksHealthy() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("pristine"));
-            var sealed = store.seal(id, 1, 8, null);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("pristine"));
+            var sealed = store.seal(TEST_NS, id, 1, 8, null);
 
             assertEquals(0, store.scrubOnce());
-            assertEquals(sealed.dataCrc(), store.inventory().get(0).crc());
+            assertEquals(sealed.dataCrc(), store.describeChunks().get(0).crc());
         }
     }
 
@@ -1290,60 +1380,58 @@ class ChunkStoreTest {
     void scrubSkipsOpenChunks() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("open"));
+            store.append(TEST_NS, id, 1, 0, 0, bytes("open"));
 
             assertEquals(0, store.scrubOnce());
-            assertEquals(ChunkState.OPEN, store.stat(id).state());
+            assertEquals(ChunkState.OPEN, store.stat(TEST_NS, id).state());
         }
     }
 
     @Test
-    void scrubDetectsDataRotAndExposesItThroughInventory() throws Exception {
+    void scrubDetectsDataRotAndExposesItThroughReportedCrc() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("pristine-data!"));
-            var sealed = store.seal(id, 1, 14, null);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("pristine-data!"));
+            var sealed = store.seal(TEST_NS, id, 1, 14, null);
 
-            // inventory reports the seal-time CRC — descriptor and node agree
-            assertEquals(sealed.dataCrc(), store.inventory().get(0).crc());
+            // the chunk reports the seal-time CRC — descriptor and node agree
+            assertEquals(sealed.dataCrc(), store.describeChunks().get(0).crc());
 
             // bit-rot in the data region: the STORED crc still matches the descriptor, so only
             // recomputation can catch it
-            String base = ChunkFormats.baseName(id);
             try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(
-                    dir.resolve(base + ".chunk"), java.nio.file.StandardOpenOption.WRITE)) {
+                    dir.resolve(rel(id) + ".chunk"), java.nio.file.StandardOpenOption.WRITE)) {
                 ch.write(ByteBuffer.wrap(new byte[]{0x7F}), ChunkFormats.DATA_START + 3);
             }
-            assertEquals(sealed.dataCrc(), store.inventory().get(0).crc(),
-                    "before scrub inventory still reports the seal-time crc");
+            assertEquals(sealed.dataCrc(), store.describeChunks().get(0).crc(),
+                    "before scrub the chunk still reports the seal-time crc");
             assertEquals(ErrorCode.CRC_MISMATCH,
-                    assertThrows(ScpException.class, () -> store.read(id, 0, 14)).code(),
+                    assertThrows(ScpException.class, () -> store.read(TEST_NS, id, 0, 14)).code(),
                     "sealed reads must validate the covering CRC range before returning bytes");
 
             int corrupt = store.scrubOnce();
             assertEquals(1, corrupt, "scrub must detect the rotted chunk");
-            // inventory now exposes the RECOMPUTED crc — the coordinator's existing
+            // the reported crc now exposes the RECOMPUTED value — the coordinator's owner-pull verify
             // corrupt-mismatch path drops this replica and re-repairs from good copies
-            assertTrue(store.inventory().get(0).crc() != sealed.dataCrc(),
-                    "inventory must reflect the actual bytes after scrub");
+            assertTrue(store.describeChunks().get(0).crc() != sealed.dataCrc(),
+                    "the reported crc must reflect the actual bytes after scrub");
         }
     }
 
     @Test
     void recoveryLoadsSealedChunksAndDeletesLedgerRemnants() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
-        String base = ChunkFormats.baseName(chunkId);
-        Path ledgerPath = dir.resolve(base + ".j");
+        ChunkId chunkId = new ChunkId(FileId.of(6), 0);
+        Path ledgerPath = dir.resolve(rel(chunkId) + ".j");
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
-            store.append(chunkId, 1, 0, 0, bytes("sealed"));
-            store.seal(chunkId, 1, 6, null);
+            store.append(TEST_NS, chunkId, 1, 0, 0, bytes("sealed"));
+            store.seal(TEST_NS, chunkId, 1, 6, null);
         }
         Files.write(ledgerPath, new byte[] {1, 2, 3});
 
         try (ChunkStore recovered = newStore()) {
-            assertTrue(recovered.contains(chunkId));
-            assertArrayEquals("sealed".getBytes(), recovered.read(chunkId, 0, 100).bytes());
+            assertTrue(recovered.contains(TEST_NS, chunkId));
+            assertArrayEquals("sealed".getBytes(), recovered.read(TEST_NS, chunkId, 0, 100).bytes());
             assertTrue(Files.notExists(ledgerPath));
         }
     }
@@ -1358,16 +1446,15 @@ class ChunkStoreTest {
         assumeTrue(!ChunkStore.booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false),
                 "guarantee under test is specific to the no-seal-fsync durability path");
 
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
-        String base = ChunkFormats.baseName(chunkId);
-        Path metaPath = dir.resolve(base + ".meta");
+        ChunkId chunkId = new ChunkId(FileId.of(7), 0);
+        Path metaPath = dir.resolve(rel(chunkId) + ".meta");
         byte[] payload = "important-acknowledged-data".getBytes(StandardCharsets.UTF_8);
         int len = payload.length;
 
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
-            store.append(chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
-            store.seal(chunkId, 1, len, null);
+            store.append(TEST_NS, chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(TEST_NS, chunkId, 1, len, null);
         }
 
         // Simulate the crash window: the unforced SEALED sidecar write never reached disk, so on
@@ -1375,8 +1462,8 @@ class ChunkStoreTest {
         Files.write(metaPath, new ChunkFormats.Sidecar(1, -1, len, ChunkState.OPEN).encode());
 
         try (ChunkStore recovered = newStore()) {
-            assertTrue(recovered.contains(chunkId), "sealed chunk must survive recovery");
-            assertArrayEquals(payload, recovered.read(chunkId, 0, len).bytes(),
+            assertTrue(recovered.contains(TEST_NS, chunkId), "sealed chunk must survive recovery");
+            assertArrayEquals(payload, recovered.read(TEST_NS, chunkId, 0, len).bytes(),
                     "acknowledged data must be recovered from the retained ledger, not truncated to zero");
         }
     }
@@ -1385,13 +1472,13 @@ class ChunkStoreTest {
     void sealRetainsLedgerUntilReclaimedWhenSealFsyncDisabled() throws Exception {
         assumeTrue(!ChunkStore.booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false),
                 "ledger retention is specific to the no-seal-fsync durability path");
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
-        Path ledgerPath = dir.resolve(ChunkFormats.baseName(chunkId) + ".j");
+        ChunkId chunkId = new ChunkId(FileId.of(8), 0);
+        Path ledgerPath = dir.resolve(rel(chunkId) + ".j");
         byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
-            store.append(chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
-            store.seal(chunkId, 1, payload.length, null);
+            store.append(TEST_NS, chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(TEST_NS, chunkId, 1, payload.length, null);
 
             assertTrue(Files.exists(ledgerPath),
                     "seal must retain the integrity ledger until the SEALED state is durable");
@@ -1401,7 +1488,7 @@ class ChunkStoreTest {
             assertTrue(Files.notExists(ledgerPath),
                     "reclaim must drop the ledger once the SEALED state is forced durable");
             assertEquals(1, store.sealedLedgerReclaims());
-            assertArrayEquals(payload, store.read(chunkId, 0, payload.length).bytes(),
+            assertArrayEquals(payload, store.read(TEST_NS, chunkId, 0, payload.length).bytes(),
                     "chunk must stay readable from its durable trailer after reclaim");
 
             store.reclaimSealedLedgersOnce(); // idempotent: nothing left pending
@@ -1411,13 +1498,13 @@ class ChunkStoreTest {
 
     @Test
     void sealWithSealFsyncDropsLedgerImmediatelyWithoutReclaim() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
-        Path ledgerPath = dir.resolve(ChunkFormats.baseName(chunkId) + ".j");
+        ChunkId chunkId = new ChunkId(FileId.of(9), 0);
+        Path ledgerPath = dir.resolve(rel(chunkId) + ".j");
         byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
         try (ChunkStore store = new ChunkStore(dir, true)) { // seal fsync ON
             open(store, chunkId, 1);
-            store.append(chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
-            store.seal(chunkId, 1, payload.length, null);
+            store.append(TEST_NS, chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(TEST_NS, chunkId, 1, payload.length, null);
 
             // With seal fsync on, the SEALED footer/sidecar are forced durable at seal time, so the
             // ledger is dropped immediately (async) rather than retained for background reclamation.
@@ -1426,14 +1513,14 @@ class ChunkStoreTest {
             store.reclaimSealedLedgersOnce();
             assertEquals(0, store.sealedLedgerReclaims(),
                     "no ledger should be pending reclaim when seal fsync is on");
-            assertArrayEquals(payload, store.read(chunkId, 0, payload.length).bytes(),
+            assertArrayEquals(payload, store.read(TEST_NS, chunkId, 0, payload.length).bytes(),
                     "chunk must remain readable after a seal-fsync seal");
         }
     }
 
     @Test
     void recoveryReadServesUndurableTailThatClientReadClampsAway() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(10), 0);
         byte[] durable = "durable-prefix".getBytes(StandardCharsets.UTF_8);
         byte[] tail = "undurable-tail".getBytes(StandardCharsets.UTF_8);
         int d = durable.length;
@@ -1444,15 +1531,15 @@ class ChunkStoreTest {
 
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
-            store.append(chunkId, 1, 0, 0, ByteBuffer.wrap(durable)); // below the durable high watermark
-            store.append(chunkId, 1, d, d, ByteBuffer.wrap(tail));    // above it: end=total, lastKnownDO=d
+            store.append(TEST_NS, chunkId, 1, 0, 0, ByteBuffer.wrap(durable)); // below the durable high watermark
+            store.append(TEST_NS, chunkId, 1, d, d, ByteBuffer.wrap(tail));    // above it: end=total, lastKnownDO=d
 
             // Client read is clamped to the durable high watermark and never exposes the never-acked tail.
-            try (ChunkStore.ReadRegionResult clientTail = store.readRegion(chunkId, d, total)) {
+            try (ChunkStore.ReadRegionResult clientTail = store.readRegion(TEST_NS, chunkId, d, total)) {
                 assertEquals(0, clientTail.length(),
                         "client read must clamp away the never-acked tail above the durable watermark");
             }
-            try (ChunkStore.ReadRegionResult clientPrefix = store.readRegion(chunkId, 0, total)) {
+            try (ChunkStore.ReadRegionResult clientPrefix = store.readRegion(TEST_NS, chunkId, 0, total)) {
                 assertEquals(d, clientPrefix.length(), "client read serves only the durable prefix");
                 assertTrue(clientPrefix.bytes() == null,
                         "durable-prefix open read is zero-copy (a channel, not materialized bytes)");
@@ -1460,7 +1547,7 @@ class ChunkStoreTest {
 
             // Recovery read includes the undurable tail, materialized + integrity-verified (not a
             // zero-copy channel), so seal recovery sees quorum-durable bytes instead of sealing short.
-            try (ChunkStore.ReadRegionResult recovery = store.readRegionForRecovery(chunkId, 0, total)) {
+            try (ChunkStore.ReadRegionResult recovery = store.readRegionForRecovery(TEST_NS, chunkId, 0, total)) {
                 assertEquals(total, recovery.length(), "recovery read must include the undurable tail");
                 assertTrue(recovery.channel() == null, "recovery tail must be materialized, not zero-copy");
                 assertArrayEquals(all, recovery.bytes(), "recovery read must return the full verified bytes");
@@ -1473,69 +1560,76 @@ class ChunkStoreTest {
         Path invalidName = dir.resolve("not-a-valid-chunk-name.chunk");
         Files.write(invalidName, new byte[] {1});
 
-        ChunkId truncated = new ChunkId(FileId.random(), 0);
-        String base = ChunkFormats.baseName(truncated);
-        Files.write(dir.resolve(base + ".chunk"), new byte[] {1, 2, 3});
-        Files.write(dir.resolve(base + ".meta"),
+        ChunkId truncated = new ChunkId(FileId.of(11), 0);
+        String trel = relMkdirs(truncated);
+        Files.write(dir.resolve(trel + ".chunk"), new byte[] {1, 2, 3});
+        Files.write(dir.resolve(trel + ".meta"),
                 new ChunkFormats.Sidecar(1, -1, 0, ChunkState.OPEN).encode());
 
         try (ChunkStore recovered = newStore()) {
-            assertEquals(0, recovered.inventory().size());
+            assertEquals(0, recovered.describeChunks().size());
+            // the invalid-name flat file is quarantined in dir
             assertTrue(Files.notExists(invalidName));
-            assertTrue(Files.notExists(dir.resolve(base + ".chunk")));
-            assertTrue(Files.notExists(dir.resolve(base + ".meta")));
-            try (Stream<Path> files = Files.list(dir)) {
-                assertEquals(3, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count());
+            try (Stream<Path> dirFiles = Files.list(dir)) {
+                assertEquals(1, dirFiles.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
+                        "invalid-name chunk must be quarantined in the store root");
+            }
+            // the truncated chunk's files are quarantined in their shard dir
+            assertTrue(Files.notExists(dir.resolve(trel + ".chunk")));
+            assertTrue(Files.notExists(dir.resolve(trel + ".meta")));
+            Path shardDir = dir.resolve(trel + ".chunk").getParent();
+            try (Stream<Path> shardFiles = Files.list(shardDir)) {
+                assertEquals(2, shardFiles.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
+                        "truncated chunk's chunk+meta must be quarantined in their shard dir");
             }
         }
     }
 
     @Test
     void recoveryTruncatesLedgerEntryBeyondDataSize() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
-        String base = ChunkFormats.baseName(chunkId);
+        ChunkId chunkId = new ChunkId(FileId.of(12), 0);
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
-            store.append(chunkId, 1, 0, 0, bytes("abcd"));
+            store.append(TEST_NS, chunkId, 1, 0, 0, bytes("abcd"));
         }
-        Files.write(dir.resolve(base + ".j"),
+        Files.write(dir.resolve(rel(chunkId) + ".j"),
                 new ChunkFormats.LedgerEntry(5, Crc.of("abcde".getBytes()), 1).encode());
 
         try (ChunkStore recovered = newStore()) {
-            assertTrue(recovered.contains(chunkId));
-            assertEquals(0, recovered.stat(chunkId).localEndOffset());
+            assertTrue(recovered.contains(TEST_NS, chunkId));
+            assertEquals(0, recovered.stat(TEST_NS, chunkId).localEndOffset());
         }
     }
 
     @Test
     void recoveryTruncatesImpossibleLedgerEndOffset() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(13), 0);
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
         }
 
-        Files.write(dir.resolve(ChunkFormats.baseName(chunkId) + ".j"),
+        Files.write(dir.resolve(rel(chunkId) + ".j"),
                 new ChunkFormats.LedgerEntry(Long.MAX_VALUE, 0, 1).encode());
 
         try (ChunkStore recovered = newStore()) {
-            assertTrue(recovered.contains(chunkId));
-            assertEquals(0, recovered.stat(chunkId).localEndOffset());
-            assertEquals(0, recovered.readLedger(chunkId, 0).size());
-            assertEquals(1, recovered.append(chunkId, 1, 0, 0, bytes("x")).endOffset());
+            assertTrue(recovered.contains(TEST_NS, chunkId));
+            assertEquals(0, recovered.stat(TEST_NS, chunkId).localEndOffset());
+            assertEquals(0, recovered.readLedger(TEST_NS, chunkId, 0).size());
+            assertEquals(1, recovered.append(TEST_NS, chunkId, 1, 0, 0, bytes("x")).endOffset());
         }
     }
 
     @Test
     void recoveryRemovesChunkCreatedBeforeSidecarWasPersisted() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
-        String base = ChunkFormats.baseName(chunkId);
-        Path dataPath = dir.resolve(base + ".chunk");
-        Path ledgerPath = dir.resolve(base + ".j");
+        ChunkId chunkId = new ChunkId(FileId.of(14), 0);
+        String r = relMkdirs(chunkId);
+        Path dataPath = dir.resolve(r + ".chunk");
+        Path ledgerPath = dir.resolve(r + ".j");
         Files.write(dataPath, new byte[] {1, 2, 3});
         Files.write(ledgerPath, new byte[] {4, 5, 6});
 
         try (ChunkStore recovered = newStore()) {
-            assertEquals(false, recovered.contains(chunkId));
+            assertEquals(false, recovered.contains(TEST_NS, chunkId));
             assertTrue(Files.notExists(dataPath));
             assertTrue(Files.notExists(ledgerPath));
         }
@@ -1543,61 +1637,61 @@ class ChunkStoreTest {
 
     @Test
     void recoveryDiscardsOpenDataWhenLedgerIsMissing() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(15), 0);
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
-            store.append(chunkId, 1, 0, 0, bytes("payload"));
+            store.append(TEST_NS, chunkId, 1, 0, 0, bytes("payload"));
         }
 
-        Files.delete(dir.resolve(ChunkFormats.baseName(chunkId) + ".j"));
+        Files.delete(dir.resolve(rel(chunkId) + ".j"));
 
         try (ChunkStore recovered = newStore()) {
-            assertTrue(recovered.contains(chunkId));
-            assertEquals(0, recovered.stat(chunkId).localEndOffset());
-            assertEquals(1, recovered.append(chunkId, 1, 0, 0, bytes("x")).endOffset());
+            assertTrue(recovered.contains(TEST_NS, chunkId));
+            assertEquals(0, recovered.stat(TEST_NS, chunkId).localEndOffset());
+            assertEquals(1, recovered.append(TEST_NS, chunkId, 1, 0, 0, bytes("x")).endOffset());
         }
     }
 
     @Test
     void recoveryKeepsEmptyOpenChunkWhenLedgerIsMissing() throws Exception {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(16), 0);
         try (ChunkStore store = newStore()) {
             open(store, chunkId, 1);
         }
 
-        Files.delete(dir.resolve(ChunkFormats.baseName(chunkId) + ".j"));
+        Files.delete(dir.resolve(rel(chunkId) + ".j"));
 
         try (ChunkStore recovered = newStore()) {
-            assertTrue(recovered.contains(chunkId));
-            assertEquals(0, recovered.stat(chunkId).localEndOffset());
-            assertEquals(1, recovered.append(chunkId, 1, 0, 0, bytes("x")).endOffset());
+            assertTrue(recovered.contains(TEST_NS, chunkId));
+            assertEquals(0, recovered.stat(TEST_NS, chunkId).localEndOffset());
+            assertEquals(1, recovered.append(TEST_NS, chunkId, 1, 0, 0, bytes("x")).endOffset());
         }
     }
 
     @Test
     void recoveryTruncatesZeroLengthAndCorruptLedgerTails() throws Exception {
-        ChunkId zeroExtent = new ChunkId(FileId.random(), 0);
+        ChunkId zeroExtent = new ChunkId(FileId.of(17), 0);
         try (ChunkStore store = newStore()) {
             open(store, zeroExtent, 1);
-            store.append(zeroExtent, 1, 0, 0, bytes("abcd"));
+            store.append(TEST_NS, zeroExtent, 1, 0, 0, bytes("abcd"));
         }
-        Files.write(dir.resolve(ChunkFormats.baseName(zeroExtent) + ".j"),
+        Files.write(dir.resolve(rel(zeroExtent) + ".j"),
                 new ChunkFormats.LedgerEntry(0, 0, 1).encode());
 
         try (ChunkStore recovered = newStore()) {
-            assertEquals(0, recovered.stat(zeroExtent).localEndOffset());
+            assertEquals(0, recovered.stat(TEST_NS, zeroExtent).localEndOffset());
         }
 
-        ChunkId badCrc = new ChunkId(FileId.random(), 0);
+        ChunkId badCrc = new ChunkId(FileId.of(18), 0);
         try (ChunkStore store = newStore()) {
             open(store, badCrc, 1);
-            store.append(badCrc, 1, 0, 0, bytes("abcd"));
+            store.append(TEST_NS, badCrc, 1, 0, 0, bytes("abcd"));
         }
-        Files.write(dir.resolve(ChunkFormats.baseName(badCrc) + ".j"),
+        Files.write(dir.resolve(rel(badCrc) + ".j"),
                 new ChunkFormats.LedgerEntry(4, 0x12345678, 1).encode());
 
         try (ChunkStore recovered = newStore()) {
-            assertEquals(0, recovered.stat(badCrc).localEndOffset());
+            assertEquals(0, recovered.stat(TEST_NS, badCrc).localEndOffset());
         }
     }
 
@@ -1605,12 +1699,12 @@ class ChunkStoreTest {
     void deleteRemovesEverything() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("x"));
-            assertEquals(ErrorCode.OK, store.delete(id));
-            assertEquals(ErrorCode.CHUNK_NOT_FOUND, store.delete(id));
+            store.append(TEST_NS, id, 1, 0, 0, bytes("x"));
+            assertEquals(ErrorCode.OK, store.delete(TEST_NS, id));
+            assertEquals(ErrorCode.CHUNK_NOT_FOUND, store.delete(TEST_NS, id));
             assertEquals(ErrorCode.CHUNK_NOT_FOUND,
-                    assertThrows(ScpException.class, () -> store.read(id, 0, 1)).code());
-            assertEquals(0, store.inventory().size());
+                    assertThrows(ScpException.class, () -> store.read(TEST_NS, id, 0, 1)).code());
+            assertEquals(0, store.describeChunks().size());
         }
     }
 
@@ -1679,7 +1773,7 @@ class ChunkStoreTest {
     @Test
     void failedImportCleanupContinuesWhenCleanupOperationsFail() throws Exception {
         try (ChunkStore store = newStore()) {
-            ChunkId failed = new ChunkId(FileId.random(), 0);
+            ChunkId failed = new ChunkId(FileId.of(19), 0);
             Object failedHandle = newHandle(store, failed);
             setObject(failedHandle, "data", new ZeroProgressFileChannel(true, false, false));
 
@@ -1688,6 +1782,7 @@ class ChunkStoreTest {
             Files.write(tmp.resolve("blocker"), new byte[] {1});
 
             Path dataPath = (Path) getObject(failedHandle, "dataPath");
+            Files.createDirectories(dataPath.getParent());
             Files.createDirectory(dataPath);
             Files.write(dataPath.resolve("blocker"), new byte[] {1});
 
@@ -1710,30 +1805,30 @@ class ChunkStoreTest {
             assertEquals(0, store.readBytes());
 
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("hello world")); // 11 bytes, chunk still OPEN
-            store.append(id, 1, 11, 11, ByteBuffer.allocate(0)); // durable-offset beacon
+            store.append(TEST_NS, id, 1, 0, 0, bytes("hello world")); // 11 bytes, chunk still OPEN
+            store.append(TEST_NS, id, 1, 11, 11, ByteBuffer.allocate(0)); // durable-offset beacon
 
             // OPEN-chunk read: bytes materialized under the lock, counted by served length
-            var r1 = store.readRegion(id, 0, 1024);
+            var r1 = store.readRegion(TEST_NS, id, 0, 1024);
             assertEquals(11, r1.length());
             assertEquals(1, store.readOps());
             assertEquals(11, store.readBytes());
 
             // partial read accrues
-            var r2 = store.readRegion(id, 6, 1024); // "world" -> 5 bytes
+            var r2 = store.readRegion(TEST_NS, id, 6, 1024); // "world" -> 5 bytes
             assertEquals(5, r2.length());
             assertEquals(2, store.readOps());
             assertEquals(16, store.readBytes());
 
             // read at/after end serves nothing and must NOT count
-            var r3 = store.readRegion(id, 11, 1024);
+            var r3 = store.readRegion(TEST_NS, id, 11, 1024);
             assertEquals(0, r3.length());
             assertEquals(2, store.readOps());
             assertEquals(16, store.readBytes());
 
             // SEALED read path also counts after CRC verification
-            store.seal(id, 1, 11, null);
-            var r4 = store.readRegion(id, 0, 1024);
+            store.seal(TEST_NS, id, 1, 11, null);
+            var r4 = store.readRegion(TEST_NS, id, 0, 1024);
             assertEquals(11, r4.length());
             assertEquals(3, store.readOps());
             assertEquals(27, store.readBytes());
@@ -1744,16 +1839,16 @@ class ChunkStoreTest {
     void readCountersIgnoreNonClientReadPaths() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("abc")); // 3 bytes
+            store.append(TEST_NS, id, 1, 0, 0, bytes("abc")); // 3 bytes
 
             // legacy synchronous read() is NOT the client data-path and must not count
-            store.read(id, 0, 1024);
+            store.read(TEST_NS, id, 0, 1024);
             assertEquals(0, store.readOps());
             assertEquals(0, store.readBytes());
 
             // FETCH_CHUNK (replication) goes through fetch(), also out of scope
-            store.seal(id, 1, 3, null);
-            store.fetch(id, 0, Integer.MAX_VALUE);
+            store.seal(TEST_NS, id, 1, 3, null);
+            store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE);
             assertEquals(0, store.readOps());
             assertEquals(0, store.readBytes());
         }
@@ -1799,7 +1894,7 @@ class ChunkStoreTest {
     void failedDeleteKeepsChunkVisibleForRetry() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("x"));
+            store.append(TEST_NS, id, 1, 0, 0, bytes("x"));
 
             Set<PosixFilePermission> originalPermissions;
             try {
@@ -1814,17 +1909,51 @@ class ChunkStoreTest {
                 Files.setPosixFilePermissions(dir, Set.of(
                         PosixFilePermission.OWNER_READ,
                         PosixFilePermission.OWNER_EXECUTE));
-                result = store.delete(id);
+                result = store.delete(TEST_NS, id);
             } finally {
                 Files.setPosixFilePermissions(dir, originalPermissions);
             }
 
             assumeTrue(result != ErrorCode.OK, "delete failure not reproducible on this filesystem");
             assertEquals(ErrorCode.INTERNAL, result);
-            assertTrue(store.contains(id));
-            assertEquals(1, store.inventory().size());
-            assertEquals(ErrorCode.OK, store.delete(id));
-            assertEquals(ErrorCode.CHUNK_NOT_FOUND, store.delete(id));
+            assertTrue(store.contains(TEST_NS, id));
+            assertEquals(1, store.describeChunks().size());
+            assertEquals(ErrorCode.OK, store.delete(TEST_NS, id));
+            assertEquals(ErrorCode.CHUNK_NOT_FOUND, store.delete(TEST_NS, id));
+        }
+    }
+
+    /** Part E (Task 7 TDD): two namespaces, same ChunkId(0,0) — must coexist, be independently
+     *  addressable, and survive a store close+reopen. */
+    @Test
+    void twoNamespaceCoexistenceAndRecovery() throws Exception {
+        StrataNamespace ns0 = StrataNamespace.of("perf-0");
+        StrataNamespace ns1 = StrataNamespace.of("perf-1");
+        ChunkId same = new ChunkId(FileId.of(0), 0);
+        byte[] data0 = "hello-ns0".getBytes(StandardCharsets.UTF_8);
+        byte[] data1 = "hello-ns1".getBytes(StandardCharsets.UTF_8);
+
+        try (ChunkStore store = new ChunkStore(dir)) {
+            // open + append + seal in ns0
+            store.open(ns0, same, false, 1, 1718000000000L);
+            store.append(ns0, same, 1, 0, 0, ByteBuffer.wrap(data0));
+            store.seal(ns0, same, 1, data0.length, null);
+
+            // open + append + seal in ns1 — same ChunkId, different namespace
+            store.open(ns1, same, false, 1, 1718000000000L);
+            store.append(ns1, same, 1, 0, 0, ByteBuffer.wrap(data1));
+            store.seal(ns1, same, 1, data1.length, null);
+
+            // both coexist
+            assertArrayEquals(data0, store.read(ns0, same, 0, Integer.MAX_VALUE).bytes());
+            assertArrayEquals(data1, store.read(ns1, same, 0, Integer.MAX_VALUE).bytes());
+        }
+
+        // Reopen: both must recover independently
+        try (ChunkStore store = new ChunkStore(dir)) {
+            assertArrayEquals(data0, store.read(ns0, same, 0, Integer.MAX_VALUE).bytes());
+            assertArrayEquals(data1, store.read(ns1, same, 0, Integer.MAX_VALUE).bytes());
+            assertEquals(2, store.describeChunks().size());
         }
     }
 
@@ -1845,7 +1974,7 @@ class ChunkStoreTest {
             sealedBytes(store, id, "cache-me-please");
             store.reclaimSealedLedgersOnce(); // become evictable (h.data nulled in Task 8; harmless here)
             assertArrayEquals("cache".getBytes(),
-                    store.read(id, 0, 5).bytes());
+                    store.read(TEST_NS, id, 0, 5).bytes());
             assertTrue(store.channelCacheMisses() + store.channelCacheHits() >= 1,
                     "a sealed read must consult the channel cache");
             assertTrue(store.cachedChannels() >= 1, "the sealed channel is cached after a read");
@@ -1857,7 +1986,7 @@ class ChunkStoreTest {
         try (ChunkStore store = newStore()) {
             byte[] full = sealedBytes(store, id, "fetch-via-cache");
             long missesBefore = store.channelCacheMisses() + store.channelCacheHits();
-            byte[] got = store.fetch(id, 0, Integer.MAX_VALUE).bytes();
+            byte[] got = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE).bytes();
             assertArrayEquals(full, got);
             assertTrue(store.channelCacheMisses() + store.channelCacheHits() > missesBefore,
                     "fetch of a sealed chunk must consult the channel cache");
@@ -1877,8 +2006,8 @@ class ChunkStoreTest {
     void sealedConcurrentReadRegionsUseExclusiveFds() throws Exception {
         try (ChunkStore store = newStore()) {
             sealedBytes(store, id, "shared-zero-copy");
-            ChunkStore.ReadRegionResult r1 = store.readRegion(id, 0, 6);
-            ChunkStore.ReadRegionResult r2 = store.readRegion(id, 6, 4);
+            ChunkStore.ReadRegionResult r1 = store.readRegion(TEST_NS, id, 0, 6);
+            ChunkStore.ReadRegionResult r2 = store.readRegion(TEST_NS, id, 6, 4);
             try {
                 assertTrue(r1.channel() != null && r2.channel() != null, "sealed reads are zero-copy");
                 assertNotSame(r1.channel(), r2.channel(),
@@ -1898,7 +2027,7 @@ class ChunkStoreTest {
     void sealedReadRegionLeaseKeepsFdOpenUntilReleased() throws Exception {
         try (ChunkStore store = newStore()) {
             sealedBytes(store, id, "lease-lifetime");
-            ChunkStore.ReadRegionResult r = store.readRegion(id, 0, 5);
+            ChunkStore.ReadRegionResult r = store.readRegion(TEST_NS, id, 0, 5);
             FileChannel ch = r.channel();
             assertTrue(ch.isOpen());
             r.close(); // releases the lease; channel stays cached/open
@@ -1908,8 +2037,8 @@ class ChunkStoreTest {
 
     @Test
     void recoveryOpensNoPersistentFdPerSealedChunk() throws Exception {
-        ChunkId a = new ChunkId(FileId.random(), 0);
-        ChunkId b = new ChunkId(FileId.random(), 0);
+        ChunkId a = new ChunkId(FileId.of(101), 0);
+        ChunkId b = new ChunkId(FileId.of(102), 0);
         try (ChunkStore store = new ChunkStore(dir, true)) { // seal-fsync on: sealed + durable immediately
             sealedBytes(store, a, "alpha");
             sealedBytes(store, b, "bravo");
@@ -1921,7 +2050,7 @@ class ChunkStoreTest {
             assertEquals(0, recovered.cachedChannels(),
                     "recovery must not open a persistent data FD per sealed chunk");
             // a read lazily opens (and caches) exactly one channel
-            assertArrayEquals("alpha".getBytes(), recovered.read(a, 0, 5).bytes());
+            assertArrayEquals("alpha".getBytes(), recovered.read(TEST_NS, a, 0, 5).bytes());
             assertEquals(1, recovered.cachedChannels());
         }
     }
@@ -1930,10 +2059,10 @@ class ChunkStoreTest {
     void sealClosesPersistentDataFdWhenSealFsyncOn() throws Exception {
         try (ChunkStore store = new ChunkStore(dir, true)) {
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("durable-seal"));
-            store.seal(id, 1, "durable-seal".length(), null);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("durable-seal"));
+            store.seal(TEST_NS, id, 1, "durable-seal".length(), null);
             assertNull(handleData(store, id), "seal-fsync=on must drop the writable FD at seal");
-            assertArrayEquals("durable-seal".getBytes(), store.read(id, 0, 12).bytes());
+            assertArrayEquals("durable-seal".getBytes(), store.read(TEST_NS, id, 0, 12).bytes());
         }
     }
 
@@ -1941,12 +2070,12 @@ class ChunkStoreTest {
     void reclaimClosesPersistentDataFdWhenSealFsyncOff() throws Exception {
         try (ChunkStore store = newStore()) { // seal-fsync off
             open(store, id, 1);
-            store.append(id, 1, 0, 0, bytes("reclaim-me"));
-            store.seal(id, 1, "reclaim-me".length(), null);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("reclaim-me"));
+            store.seal(TEST_NS, id, 1, "reclaim-me".length(), null);
             assertNotNull(handleData(store, id), "seal-fsync=off keeps the FD until reclaim");
             store.reclaimSealedLedgersOnce();
             assertNull(handleData(store, id), "reclaim drops the writable FD once durable");
-            assertArrayEquals("reclaim-me".getBytes(), store.read(id, 0, 10).bytes());
+            assertArrayEquals("reclaim-me".getBytes(), store.read(TEST_NS, id, 0, 10).bytes());
         }
     }
 
@@ -1954,9 +2083,9 @@ class ChunkStoreTest {
     void deleteInvalidatesCachedChannel() throws Exception {
         try (ChunkStore store = newStore()) {
             sealedBytes(store, id, "delete-me");
-            store.read(id, 0, 4); // caches the channel
+            store.read(TEST_NS, id, 0, 4); // caches the channel
             assertEquals(1, store.cachedChannels());
-            assertEquals(ErrorCode.OK, store.delete(id));
+            assertEquals(ErrorCode.OK, store.delete(TEST_NS, id));
             assertEquals(0, store.cachedChannels(), "delete must invalidate the cached channel");
         }
     }
@@ -1965,9 +2094,9 @@ class ChunkStoreTest {
     void readRegionLeaseSurvivesConcurrentDelete() throws Exception {
         try (ChunkStore store = newStore()) {
             sealedBytes(store, id, "inode-alive");
-            ChunkStore.ReadRegionResult region = store.readRegion(id, 0, 5);
+            ChunkStore.ReadRegionResult region = store.readRegion(TEST_NS, id, 0, 5);
             try {
-                assertEquals(ErrorCode.OK, store.delete(id)); // unlinks file; leased FD keeps inode alive
+                assertEquals(ErrorCode.OK, store.delete(TEST_NS, id)); // unlinks file; leased FD keeps inode alive
                 assertArrayEquals("inode".getBytes(), consumeRegion(region),
                         "an in-flight leased transfer still reads correct bytes after delete");
             } finally {
@@ -1978,7 +2107,7 @@ class ChunkStoreTest {
 
     /** Reflectively reads the private Handle.data field for the given chunk (test-only). */
     private static FileChannel handleData(ChunkStore store, ChunkId chunkId) throws Exception {
-        Object handle = handle(store, chunkId);
+        Object handle = handle(store, TEST_NS, chunkId);
         if (handle == null) return null;
         Field dataField = handle.getClass().getDeclaredField("data");
         dataField.setAccessible(true);
@@ -1996,13 +2125,13 @@ class ChunkStoreTest {
         try (ChunkStore store = new ChunkStore(dir, true, tinyCapacity)) {
             List<ChunkId> ids = new ArrayList<>();
             for (int i = 0; i < n; i++) {
-                ChunkId c = new ChunkId(FileId.random(), 0);
+                ChunkId c = new ChunkId(FileId.of(200 + i), 0);
                 ids.add(c);
                 sealedBytes(store, c, "payload-" + i);
             }
             // read every chunk once: misses open channels, eviction keeps the open set bounded
             for (ChunkId c : ids) {
-                store.read(c, 0, 3);
+                store.read(TEST_NS, c, 0, 3);
             }
             assertTrue(store.cachedChannels() <= store.channelCacheCapacity(),
                     "open cached channels must not exceed capacity when no leases are held");

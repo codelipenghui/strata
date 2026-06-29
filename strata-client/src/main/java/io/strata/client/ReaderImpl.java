@@ -23,25 +23,28 @@ import static io.strata.common.Checks.addChunkLength;
  * replica-known durable offset, so a reader never sees un-quorum-acked bytes (invariant §14.3).
  */
 final class ReaderImpl implements StrataFile.Reader {
-    private final MetaClient meta;
+    private final ControllerClient controller;
     private final NodePool pool;
     private final ClientConfig config;
     private final io.strata.common.FileId fileId;
+    private final io.strata.common.StrataNamespace namespace;
     private final Map<String, ManagedScpConnection> pinnedConnections = new ConcurrentHashMap<>();
 
     private volatile Messages.LookupFileResp file;
 
-    ReaderImpl(MetaClient meta, NodePool pool, ClientConfig config, io.strata.common.FileId fileId) {
-        this.meta = meta;
+    ReaderImpl(ControllerClient controller, NodePool pool, ClientConfig config, io.strata.common.FileId fileId,
+               io.strata.common.StrataNamespace namespace) {
+        this.controller = controller;
         this.pool = pool;
         this.config = config;
         this.fileId = fileId;
+        this.namespace = namespace;
         refresh();
     }
 
     @Override
     public void refresh() {
-        this.file = meta.lookupFile(fileId);
+        this.file = controller.lookupFile(namespace, fileId);
     }
 
     @Override
@@ -90,7 +93,7 @@ final class ReaderImpl implements StrataFile.Reader {
             throw new ScpException(ErrorCode.INTERNAL, "no readable replica");
         }
         int start = ThreadLocalRandom.current().nextInt(replicas.size());
-        byte[] readHeader = new Messages.Read(chunk.chunkId(), offset, maxBytes).encode();
+        byte[] readHeader = new Messages.Read(chunk.chunkId(), offset, maxBytes, namespace).encode();
         ScpException last = null;
         for (int i = 0; i < replicas.size(); i++) {
             Messages.Replica r = replicas.get((start + i) % replicas.size());

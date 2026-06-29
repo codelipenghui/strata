@@ -6,6 +6,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.FileId;
 import io.strata.common.FileState;
+import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -25,6 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Shared black-box consistency checks for integration and fault tests. */
 final class ConsistencyVerifier {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
     private static final int CALL_TIMEOUT_MS = 5_000;
     private static final int FETCH_CHUNK_BYTES = 4 * 1024 * 1024;
 
@@ -35,15 +37,20 @@ final class ConsistencyVerifier {
         return lookupFile(cluster.metaEndpoints(), fileId);
     }
 
-    static Messages.LookupFileResp lookupFile(List<String> metadataEndpoints, FileId fileId) throws Exception {
-        AssertionError failure = new AssertionError("no metadata endpoint could serve lookup for " + fileId);
-        for (String endpoint : metadataEndpoints) {
+    static Messages.LookupFileResp lookupFile(List<String> controllerEndpoints, FileId fileId) throws Exception {
+        return lookupFile(controllerEndpoints, TEST_NS, fileId);
+    }
+
+    static Messages.LookupFileResp lookupFile(List<String> controllerEndpoints,
+                                               StrataNamespace namespace, FileId fileId) throws Exception {
+        AssertionError failure = new AssertionError("no controller endpoint could serve lookup for " + fileId);
+        for (String endpoint : controllerEndpoints) {
             try {
                 String[] hp = endpoint.split(":");
                 try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                         ScpClient.KIND_TOOL, "consistency-lookup")) {
                     ByteBuffer h = direct.call(Opcode.LOOKUP_FILE,
-                            new Messages.LookupFile(fileId).encode(), null, CALL_TIMEOUT_MS);
+                            new Messages.LookupFile(namespace, fileId).encode(), null, CALL_TIMEOUT_MS);
                     return Messages.LookupFileResp.decode(h);
                 }
             } catch (Exception e) {
@@ -58,6 +65,12 @@ final class ConsistencyVerifier {
         return assertSealedFileConsistent(cluster.metaEndpoints(), client, fileId, sealedLength);
     }
 
+    static Messages.LookupFileResp assertSealedFileConsistent(MiniCluster cluster, StrataClient client,
+                                                              StrataNamespace namespace,
+                                                              FileId fileId, long sealedLength) throws Exception {
+        return assertSealedFileConsistent(cluster.metaEndpoints(), client, namespace, fileId, sealedLength);
+    }
+
     static Messages.LookupFileResp waitForFullSealedFileConsistent(MiniCluster cluster,
                                                                     StrataClient client,
                                                                     FileId fileId,
@@ -65,7 +78,7 @@ final class ConsistencyVerifier {
         return waitForFullSealedFileConsistent(cluster.metaEndpoints(), client, fileId, sealedLength);
     }
 
-    static Messages.LookupFileResp waitForFullSealedFileConsistent(List<String> metadataEndpoints,
+    static Messages.LookupFileResp waitForFullSealedFileConsistent(List<String> controllerEndpoints,
                                                                     StrataClient client,
                                                                     FileId fileId,
                                                                     long sealedLength) throws Exception {
@@ -73,7 +86,7 @@ final class ConsistencyVerifier {
         Throwable lastFailure = null;
         while (System.currentTimeMillis() < deadline) {
             try {
-                Messages.LookupFileResp lookup = assertSealedFileConsistent(metadataEndpoints, client,
+                Messages.LookupFileResp lookup = assertSealedFileConsistent(controllerEndpoints, client,
                         fileId, sealedLength);
                 assertEverySealedChunkAtFullReadableRf(lookup);
                 return lookup;
@@ -93,12 +106,24 @@ final class ConsistencyVerifier {
         throw failure;
     }
 
-    static Messages.LookupFileResp assertSealedFileConsistent(List<String> metadataEndpoints,
+    static Messages.LookupFileResp assertSealedFileConsistent(List<String> controllerEndpoints,
                                                               StrataClient client,
                                                               FileId fileId,
                                                               long sealedLength) throws Exception {
-        Messages.LookupFileResp lookup = assertSealedDescriptorConsistent(metadataEndpoints, fileId, sealedLength);
-        assertClientReadsExactlySealedLength(client, fileId, sealedLength);
+        Messages.LookupFileResp lookup = assertSealedDescriptorConsistent(controllerEndpoints, fileId, sealedLength);
+        assertClientReadsExactlySealedLength(client, StrataNamespace.of("test"), fileId, sealedLength);
+        assertSealedReplicasAreByteIdentical(lookup);
+        return lookup;
+    }
+
+    static Messages.LookupFileResp assertSealedFileConsistent(List<String> controllerEndpoints,
+                                                              StrataClient client,
+                                                              StrataNamespace namespace,
+                                                              FileId fileId,
+                                                              long sealedLength) throws Exception {
+        Messages.LookupFileResp lookup = assertSealedDescriptorConsistent(
+                controllerEndpoints, namespace, fileId, sealedLength);
+        assertClientReadsExactlySealedLength(client, namespace, fileId, sealedLength);
         assertSealedReplicasAreByteIdentical(lookup);
         return lookup;
     }
@@ -109,10 +134,17 @@ final class ConsistencyVerifier {
         return assertSealedDescriptorConsistent(cluster.metaEndpoints(), fileId, sealedLength);
     }
 
-    static Messages.LookupFileResp assertSealedDescriptorConsistent(List<String> metadataEndpoints,
+    static Messages.LookupFileResp assertSealedDescriptorConsistent(List<String> controllerEndpoints,
                                                                     FileId fileId,
                                                                     long sealedLength) throws Exception {
-        Messages.LookupFileResp lookup = lookupFile(metadataEndpoints, fileId);
+        return assertSealedDescriptorConsistent(controllerEndpoints, TEST_NS, fileId, sealedLength);
+    }
+
+    static Messages.LookupFileResp assertSealedDescriptorConsistent(List<String> controllerEndpoints,
+                                                                    StrataNamespace namespace,
+                                                                    FileId fileId,
+                                                                    long sealedLength) throws Exception {
+        Messages.LookupFileResp lookup = lookupFile(controllerEndpoints, namespace, fileId);
         assertLiveDescriptorInvariants(fileId, lookup);
         assertEquals(FileState.SEALED.value, lookup.fileState(),
                 "file metadata must be sealed for " + fileId);
@@ -159,9 +191,9 @@ final class ConsistencyVerifier {
         return assertLiveFileDescriptorConsistent(cluster.metaEndpoints(), fileId);
     }
 
-    static Messages.LookupFileResp assertLiveFileDescriptorConsistent(List<String> metadataEndpoints,
+    static Messages.LookupFileResp assertLiveFileDescriptorConsistent(List<String> controllerEndpoints,
                                                                       FileId fileId) throws Exception {
-        Messages.LookupFileResp lookup = lookupFile(metadataEndpoints, fileId);
+        Messages.LookupFileResp lookup = lookupFile(controllerEndpoints, fileId);
         assertLiveDescriptorInvariants(fileId, lookup);
 
         for (Messages.ChunkInfo chunk : lookup.chunks()) {
@@ -268,17 +300,18 @@ final class ConsistencyVerifier {
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                 ScpClient.KIND_TOOL, "fault-seal")) {
             ByteBuffer h = direct.call(Opcode.SEAL_CHUNK,
-                    new Messages.SealChunk(chunk.chunkId(), chunk.writeEpoch(), dataLength).encode(),
+                    new Messages.SealChunk(chunk.chunkId(), chunk.writeEpoch(), dataLength, TEST_NS).encode(),
                     null, CALL_TIMEOUT_MS);
             return Messages.SealResp.decode(h);
         }
     }
 
     private static void assertClientReadsExactlySealedLength(StrataClient client,
+                                                             StrataNamespace namespace,
                                                              FileId fileId,
                                                              long sealedLength) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
+        try (StrataFile.Reader reader = client.openById(namespace, fileId).openForRead()) {
             long offset = 0;
             for (int idle = 0; idle < 3; ) {
                 try (StrataFile.ReadResult result = reader.read(offset, 1 << 20)) {
@@ -370,7 +403,7 @@ final class ConsistencyVerifier {
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                 ScpClient.KIND_TOOL, "consistency-stat")) {
             ByteBuffer h = direct.call(Opcode.STAT_CHUNK,
-                    new Messages.StatChunk(chunk.chunkId()).encode(), null, CALL_TIMEOUT_MS);
+                    new Messages.StatChunk(chunk.chunkId(), TEST_NS).encode(), null, CALL_TIMEOUT_MS);
             return Messages.StatResp.decode(h);
         }
     }
@@ -434,7 +467,7 @@ final class ConsistencyVerifier {
             long offset = 0;
             while (expectedFileLength < 0 || offset < expectedFileLength) {
                 var frame = direct.callFrame(Opcode.FETCH_CHUNK,
-                        new Messages.FetchChunk(chunk.chunkId(), offset, FETCH_CHUNK_BYTES).encode(), null,
+                        new Messages.FetchChunk(chunk.chunkId(), offset, FETCH_CHUNK_BYTES, TEST_NS).encode(), null,
                         CALL_TIMEOUT_MS);
                 ByteBuffer h = frame.headerSlice();
                 Resp.check(h);

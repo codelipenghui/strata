@@ -4,6 +4,7 @@ import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -53,8 +54,8 @@ class StressFaultTest {
                         + " seed=" + Long.toUnsignedString(seed, 16)
                         + " batches=" + batches
                         + " writePolicy=" + faultCase.writePolicy()
-                        + " storageConnectionsPerEndpoint="
-                        + faultCase.storageConnectionsPerEndpoint()
+                        + " dataNodeConnectionsPerEndpoint="
+                        + faultCase.dataNodeConnectionsPerEndpoint()
                         + " nodeCount=" + faultCase.nodeCount(), t);
             }
         }
@@ -152,20 +153,20 @@ class StressFaultTest {
                 "writePolicy=rf" + faultCase.writePolicy().replicationFactor()
                         + "-aq" + faultCase.writePolicy().ackQuorum()
                         + "-fsync" + faultCase.writePolicy().fsyncOnAck(),
-                "storageConnectionsPerEndpoint=" + faultCase.storageConnectionsPerEndpoint(),
+                "dataNodeConnectionsPerEndpoint=" + faultCase.dataNodeConnectionsPerEndpoint(),
                 "nodeCount=" + faultCase.nodeCount());
         try {
             try (MiniCluster cluster = new MiniCluster(faultCase.nodeCount(), null, 2)) {
                 artifact.add("initialMetadataEndpoints=" + cluster.metaEndpoints(),
-                        "initialStorage=" + storageSummary(cluster));
+                        "initialDataNode=" + dataNodeSummary(cluster));
                 ClientConfig config = new ClientConfig(cluster.metaEndpoints(), 768, 10_000)
-                        .withStorageConnectionsPerEndpoint(faultCase.storageConnectionsPerEndpoint());
+                        .withDataNodeConnectionsPerEndpoint(faultCase.dataNodeConnectionsPerEndpoint());
                 try (StrataClient client = StrataClient.connect(config)) {
                     FileId fileId = client.create(new StrataClient.FileSpec("test",
                             "/mixed-chaos-" + faultCase.name(), faultCase.writePolicy())).id();
                     artifact.add("fileId=" + fileId);
                     BinaryWorkload workload = new BinaryWorkload();
-                    StrataFile.Appender appender = client.openById(fileId).openForAppend();
+                    StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
                     boolean appenderClosed = false;
 
                     try {
@@ -185,7 +186,7 @@ class StressFaultTest {
                                 int victimReplica = random.nextInt(openChunk.replicas().size());
                                 killedNodeId = openChunk.replicas().get(victimReplica).nodeId();
                                 killedNodeIndex = nodeIndex(cluster, killedNodeId);
-                                artifact.add("fault=kill-storage-node batch=" + batch
+                                artifact.add("fault=kill-data-node batch=" + batch
                                         + " nodeIndex=" + killedNodeIndex
                                         + " nodeId=" + killedNodeId
                                         + " endpoint=" + cluster.nodes.get(killedNodeIndex).endpoint()
@@ -196,7 +197,7 @@ class StressFaultTest {
 
                             if (batch == 9) {
                                 int leaderIndex = leaderIndex(cluster);
-                                assertTrue(leaderIndex >= 0, context + " had no metadata leader to kill");
+                                assertTrue(leaderIndex >= 0, context + " had no controller leader to kill");
                                 artifact.add("fault=kill-metadata-leader batch=" + batch
                                         + " leaderIndex=" + leaderIndex
                                         + " endpoint=" + cluster.metas.get(leaderIndex).endpoint());
@@ -211,15 +212,15 @@ class StressFaultTest {
                                     Thread.sleep(50);
                                 }
                                 assertEquals(killedNodeId, restarted.nodeId(),
-                                        context + " storage node identity changed after restart");
-                                artifact.add("fault=restarted-storage-node batch=" + batch
+                                        context + " data node identity changed after restart");
+                                artifact.add("fault=restarted-data-node batch=" + batch
                                         + " nodeIndex=" + killedNodeIndex
                                         + " nodeId=" + restarted.nodeId()
                                         + " endpoint=" + restarted.endpoint());
                             }
 
                             if (batch % 3 == 2) {
-                                workload.verifyOpenReadIsAckedPrefix(client, fileId,
+                                workload.verifyOpenReadIsAckedPrefix(client, StrataNamespace.of("test"), fileId,
                                         context + " batch " + batch);
                                 ConsistencyVerifier.assertLiveFileDescriptorConsistent(cluster, fileId);
                                 artifact.add("openReadVerifiedBatch=" + batch);
@@ -236,7 +237,7 @@ class StressFaultTest {
                         assertEquals(workload.ackedBytes(), sealed.sealedLength(),
                                 context + " appender sealed at a non-acked length");
 
-                        workload.verifySealedAckedPrefix(client, fileId, context);
+                        workload.verifySealedAckedPrefix(client, StrataNamespace.of("test"), fileId, context);
                         Messages.LookupFileResp finalDescriptor =
                                 ConsistencyVerifier.waitForFullSealedFileConsistent(cluster, client,
                                         fileId, sealed.sealedLength());
@@ -264,7 +265,7 @@ class StressFaultTest {
     }
 
     private record FaultCase(String name, StrataClient.WritePolicy writePolicy,
-                             int storageConnectionsPerEndpoint, int nodeCount) {
+                             int dataNodeConnectionsPerEndpoint, int nodeCount) {
     }
 
     private record FaultRun(FaultCase faultCase, long seed) {
@@ -302,10 +303,10 @@ class StressFaultTest {
                 "seed",
                 "batches",
                 "writePolicy",
-                "storageConnectionsPerEndpoint",
+                "dataNodeConnectionsPerEndpoint",
                 "nodeCount",
                 "initialMetadataEndpoints",
-                "initialStorage",
+                "initialDataNode",
                 "fileId",
                 "leaderAvailableBeforeSeal",
                 "liveDescriptorVerifiedBeforeSeal",
@@ -325,7 +326,7 @@ class StressFaultTest {
         artifact.requireAnyLineContaining(" ackedBytes=", " ackedSha256=");
     }
 
-    private static String storageSummary(MiniCluster cluster) {
+    private static String dataNodeSummary(MiniCluster cluster) {
         return cluster.nodes.stream()
                 .map(node -> node.config().host() + "#" + node.nodeId() + "@" + node.endpoint())
                 .toList()

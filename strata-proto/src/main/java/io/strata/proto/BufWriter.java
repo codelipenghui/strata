@@ -84,7 +84,7 @@ public final class BufWriter {
     }
 
     public BufWriter fileId(FileId f) {
-        return u64(f.msb()).u64(f.lsb());
+        return u64(f.id());
     }
 
     public BufWriter chunkId(ChunkId c) {

@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class ScpClient implements AutoCloseable {
     public static final byte KIND_BROKER = 1;
-    public static final byte KIND_STORAGE_NODE = 2;
+    public static final byte KIND_DATA_NODE = 2;
     public static final byte KIND_METADATA = 3;
     public static final byte KIND_TOOL = 4;
     private static final int MAX_PENDING_REQUESTS =

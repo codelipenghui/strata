@@ -26,7 +26,7 @@ final class ExternalCluster implements AutoCloseable {
     private final Path root;
     private final String logDirectory;
     private final List<ExternalMetadata> metadata = new ArrayList<>();
-    private final List<ExternalStorage> storage = new ArrayList<>();
+    private final List<ExternalDataNode> dataNodes = new ArrayList<>();
 
     ExternalCluster(String name) throws Exception {
         this.zk = new TestingServer(true);
@@ -46,11 +46,11 @@ final class ExternalCluster implements AutoCloseable {
         return List.copyOf(metadata);
     }
 
-    List<ExternalStorage> storageProcesses() {
-        return List.copyOf(storage);
+    List<ExternalDataNode> dataNodeProcesses() {
+        return List.copyOf(dataNodes);
     }
 
-    List<String> metadataEndpoints() {
+    List<String> controllerEndpoints() {
         return metadata.stream().map(ExternalMetadata::endpoint).toList();
     }
 
@@ -66,7 +66,7 @@ final class ExternalCluster implements AutoCloseable {
                 javaCommand(),
                 "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
                 "-cp", System.getProperty("java.class.path"),
-                MetadataServiceProcessMain.class.getName(),
+                ControllerProcessMain.class.getName(),
                 zk.getConnectString(),
                 Integer.toString(port),
                 readyFile.toString());
@@ -88,26 +88,26 @@ final class ExternalCluster implements AutoCloseable {
         return ready;
     }
 
-    ExternalStorage startStorage(String host) throws Exception {
-        return startStorage(root.resolve(host), host, 0, null);
+    ExternalDataNode startDataNode(String host) throws Exception {
+        return startDataNode(root.resolve(host), host, 0, null);
     }
 
-    ExternalStorage startStorage(String host, int listenPort, String advertisedEndpoint)
+    ExternalDataNode startDataNode(String host, int listenPort, String advertisedEndpoint)
             throws Exception {
-        return startStorage(root.resolve(host), host, listenPort, advertisedEndpoint);
+        return startDataNode(root.resolve(host), host, listenPort, advertisedEndpoint);
     }
 
-    ExternalStorage startStorage(Path dataDir, String host) throws Exception {
-        return startStorage(dataDir, host, 0, null);
+    ExternalDataNode startDataNode(Path dataDir, String host) throws Exception {
+        return startDataNode(dataDir, host, 0, null);
     }
 
-    ExternalStorage startStorage(Path dataDir, String host, int listenPort,
+    ExternalDataNode startDataNode(Path dataDir, String host, int listenPort,
                                  String advertisedEndpoint) throws Exception {
-        return startStorage(dataDir, host, listenPort, advertisedEndpoint, metadataEndpoints());
+        return startDataNode(dataDir, host, listenPort, advertisedEndpoint, controllerEndpoints());
     }
 
-    ExternalStorage startStorage(Path dataDir, String host, int listenPort,
-                                 String advertisedEndpoint, List<String> metadataEndpoints)
+    ExternalDataNode startDataNode(Path dataDir, String host, int listenPort,
+                                 String advertisedEndpoint, List<String> controllerEndpoints)
             throws Exception {
         String processName = host + "-" + System.nanoTime();
         Path logRoot = processLogRoot(logDirectory);
@@ -120,10 +120,13 @@ final class ExternalCluster implements AutoCloseable {
         command.add("-Dorg.slf4j.simpleLogger.defaultLogLevel=warn");
         command.add("-cp");
         command.add(System.getProperty("java.class.path"));
-        command.add(StorageNodeProcessMain.class.getName());
+        command.add(DataNodeProcessMain.class.getName());
         command.add(dataDir.toString());
-        command.add(String.join(",", metadataEndpoints));
+        command.add(String.join(",", controllerEndpoints));
         command.add(host);
+        // Externally-supplied node id: derive a stable positive id from the host so restartDataNode
+        // (which reuses old.host()/old.dataDir()) gets the same id bound to the volume identity.
+        command.add(Integer.toString(DataNodeProcessMain.nodeIdForHost(host)));
         command.add(readyFile.toString());
         if (advertisedEndpoint != null) {
             command.add(Integer.toString(listenPort));
@@ -134,11 +137,11 @@ final class ExternalCluster implements AutoCloseable {
         builder.redirectErrorStream(true);
         builder.redirectOutput(logFile.toFile());
         Process process = builder.start();
-        ExternalStorage ready;
+        ExternalDataNode ready;
         try {
-            ready = waitStorageReady(new ExternalStorage(dataDir, host, readyFile,
+            ready = waitDataNodeReady(new ExternalDataNode(dataDir, host, readyFile,
                     logFile, process, -1, "", listenPort, advertisedEndpoint,
-                    List.copyOf(metadataEndpoints)));
+                    List.copyOf(controllerEndpoints)));
         } catch (Exception e) {
             cleanupStartedProcess(process, e);
             throw e;
@@ -146,16 +149,16 @@ final class ExternalCluster implements AutoCloseable {
             cleanupStartedProcess(process, e);
             throw e;
         }
-        storage.add(ready);
+        dataNodes.add(ready);
         return ready;
     }
 
-    ExternalStorage restartStorage(ExternalStorage old) throws Exception {
+    ExternalDataNode restartDataNode(ExternalDataNode old) throws Exception {
         kill(old);
-        ExternalStorage restarted = startStorage(old.dataDir(), old.host(), old.listenPort(),
-                old.advertisedEndpoint(), old.metadataEndpoints());
-        storage.remove(restarted);
-        replaceStorage(old, restarted);
+        ExternalDataNode restarted = startDataNode(old.dataDir(), old.host(), old.listenPort(),
+                old.advertisedEndpoint(), old.controllerEndpoints());
+        dataNodes.remove(restarted);
+        replaceDataNode(old, restarted);
         return restarted;
     }
 
@@ -169,13 +172,13 @@ final class ExternalCluster implements AutoCloseable {
         }
     }
 
-    void kill(ExternalStorage node) throws Exception {
+    void kill(ExternalDataNode node) throws Exception {
         if (node == null || !node.process().isAlive()) {
             return;
         }
         node.process().destroyForcibly();
         if (!node.process().waitFor(10, TimeUnit.SECONDS)) {
-            throw new AssertionError("storage process did not exit after destroyForcibly");
+            throw new AssertionError("data-node process did not exit after destroyForcibly");
         }
     }
 
@@ -193,14 +196,14 @@ final class ExternalCluster implements AutoCloseable {
     }
 
     String awaitLeader() throws Exception {
-        return awaitLeader(metadataEndpoints());
+        return awaitLeader(controllerEndpoints());
     }
 
-    static String awaitLeader(List<String> metadataEndpoints) throws Exception {
+    static String awaitLeader(List<String> controllerEndpoints) throws Exception {
         long deadline = System.currentTimeMillis() + 20_000;
         AssertionError failure = new AssertionError("no metadata process became leader");
         while (System.currentTimeMillis() < deadline) {
-            for (String endpoint : metadataEndpoints) {
+            for (String endpoint : controllerEndpoints) {
                 String[] hp = endpoint.split(":");
                 try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                         ScpClient.KIND_TOOL, "external-cluster-leader-probe")) {
@@ -223,39 +226,39 @@ final class ExternalCluster implements AutoCloseable {
         return metadata.stream()
                 .filter(meta -> meta.endpoint().equals(endpoint))
                 .findFirst()
-                .orElseThrow(() -> new AssertionError("metadata endpoint not found: " + endpoint));
+                .orElseThrow(() -> new AssertionError("controller endpoint not found: " + endpoint));
     }
 
-    ExternalStorage storageByNodeId(int nodeId) {
-        return storage.stream()
+    ExternalDataNode dataNodeByNodeId(int nodeId) {
+        return dataNodes.stream()
                 .filter(node -> node.nodeId() == nodeId)
                 .findFirst()
-                .orElseThrow(() -> new AssertionError("storage node not found: " + nodeId));
+                .orElseThrow(() -> new AssertionError("data node not found: " + nodeId));
     }
 
-    Map<Integer, ExternalStorage> storageMapByNodeId() {
-        Map<Integer, ExternalStorage> byId = new HashMap<>();
-        for (ExternalStorage node : storage) {
+    Map<Integer, ExternalDataNode> dataNodeMapByNodeId() {
+        Map<Integer, ExternalDataNode> byId = new HashMap<>();
+        for (ExternalDataNode node : dataNodes) {
             byId.put(node.nodeId(), node);
         }
         return byId;
     }
 
     void waitForAllReplicaEndpoints(FileId fileId) throws Exception {
-        waitForAllReplicaEndpoints(metadataEndpoints(), fileId, storageMapByNodeId());
+        waitForAllReplicaEndpoints(controllerEndpoints(), fileId, dataNodeMapByNodeId());
     }
 
-    static void waitForAllReplicaEndpoints(List<String> metadataEndpoints, FileId fileId,
-                                           Map<Integer, ExternalStorage> expected)
+    static void waitForAllReplicaEndpoints(List<String> controllerEndpoints, FileId fileId,
+                                           Map<Integer, ExternalDataNode> expected)
             throws Exception {
         long deadline = System.currentTimeMillis() + 20_000;
         while (System.currentTimeMillis() < deadline) {
-            Messages.LookupFileResp lookup = ConsistencyVerifier.lookupFile(metadataEndpoints, fileId);
+            Messages.LookupFileResp lookup = ConsistencyVerifier.lookupFile(controllerEndpoints, fileId);
             boolean allRefreshed = true;
             int replicasSeen = 0;
             for (Messages.ChunkInfo chunk : lookup.chunks()) {
                 for (Messages.Replica replica : chunk.replicas()) {
-                    ExternalStorage node = expected.get(replica.nodeId());
+                    ExternalDataNode node = expected.get(replica.nodeId());
                     if (node == null || !node.endpoint().equals(replica.endpoint())) {
                         allRefreshed = false;
                         break;
@@ -274,9 +277,9 @@ final class ExternalCluster implements AutoCloseable {
         throw new AssertionError("replica endpoints did not refresh");
     }
 
-    String storageSummary() {
-        List<String> parts = new ArrayList<>(storage.size());
-        for (ExternalStorage node : storage) {
+    String dataNodeSummary() {
+        List<String> parts = new ArrayList<>(dataNodes.size());
+        for (ExternalDataNode node : dataNodes) {
             parts.add(node.host() + "#" + node.nodeId() + "@" + node.endpoint()
                     + " dir=" + node.dataDir());
         }
@@ -305,7 +308,7 @@ final class ExternalCluster implements AutoCloseable {
     @Override
     public void close() throws Exception {
         AssertionError failure = null;
-        for (ExternalStorage node : storage) {
+        for (ExternalDataNode node : dataNodes) {
             try {
                 kill(node);
             } catch (Exception e) {
@@ -329,14 +332,14 @@ final class ExternalCluster implements AutoCloseable {
         }
     }
 
-    private void replaceStorage(ExternalStorage old, ExternalStorage restarted) {
-        for (int i = 0; i < storage.size(); i++) {
-            if (storage.get(i).nodeId() == old.nodeId()) {
-                storage.set(i, restarted);
+    private void replaceDataNode(ExternalDataNode old, ExternalDataNode restarted) {
+        for (int i = 0; i < dataNodes.size(); i++) {
+            if (dataNodes.get(i).nodeId() == old.nodeId()) {
+                dataNodes.set(i, restarted);
                 return;
             }
         }
-        storage.add(restarted);
+        dataNodes.add(restarted);
     }
 
     private static ExternalMetadata waitMetadataReady(ExternalMetadata meta) throws Exception {
@@ -358,31 +361,31 @@ final class ExternalCluster implements AutoCloseable {
         throw new AssertionError("metadata process did not become ready\n" + childLog(meta));
     }
 
-    private static ExternalStorage waitStorageReady(ExternalStorage node) throws Exception {
+    private static ExternalDataNode waitDataNodeReady(ExternalDataNode node) throws Exception {
         long deadline = System.currentTimeMillis() + 20_000;
         while (System.currentTimeMillis() < deadline) {
             if (Files.exists(node.readyFile())) {
                 String[] parts = Files.readString(node.readyFile()).trim().split("\\s+");
                 if (parts.length == 2) {
-                    return new ExternalStorage(node.dataDir(), node.host(), node.readyFile(),
+                    return new ExternalDataNode(node.dataDir(), node.host(), node.readyFile(),
                             node.logFile(), node.process(), Integer.parseInt(parts[0]), parts[1],
-                            node.listenPort(), node.advertisedEndpoint(), node.metadataEndpoints());
+                            node.listenPort(), node.advertisedEndpoint(), node.controllerEndpoints());
                 }
             }
             if (!node.process().isAlive()) {
-                throw new AssertionError("storage process exited early with code "
+                throw new AssertionError("data-node process exited early with code "
                         + node.process().exitValue() + "\n" + childLog(node));
             }
             Thread.sleep(50);
         }
-        throw new AssertionError("storage process did not become ready\n" + childLog(node));
+        throw new AssertionError("data-node process did not become ready\n" + childLog(node));
     }
 
     private static String childLog(ExternalMetadata meta) throws Exception {
         return Files.exists(meta.logFile()) ? Files.readString(meta.logFile()) : "";
     }
 
-    private static String childLog(ExternalStorage node) throws Exception {
+    private static String childLog(ExternalDataNode node) throws Exception {
         return Files.exists(node.logFile()) ? Files.readString(node.logFile()) : "";
     }
 
@@ -421,8 +424,8 @@ final class ExternalCluster implements AutoCloseable {
     record ExternalMetadata(String endpoint, Path readyFile, Path logFile, Process process) {
     }
 
-    record ExternalStorage(Path dataDir, String host, Path readyFile, Path logFile,
+    record ExternalDataNode(Path dataDir, String host, Path readyFile, Path logFile,
                            Process process, int nodeId, String endpoint, int listenPort,
-                           String advertisedEndpoint, List<String> metadataEndpoints) {
+                           String advertisedEndpoint, List<String> controllerEndpoints) {
     }
 }

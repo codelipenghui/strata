@@ -10,9 +10,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -51,9 +54,17 @@ final class NodeRegistry {
     }
 
     private final MetadataStore store;
-    private final MetaConfig config;
+    private final ControllerConfig config;
     private final Map<Integer, LiveNode> live = new ConcurrentHashMap<>();
     private final AtomicLong sessionCounter = new AtomicLong(System.currentTimeMillis());
+    // Shared cluster-liveness snapshot (design §11): the controller publishes it; any namespace owner
+    // reads it to fill placement candidates it cannot see live in memory. The placement path caches the
+    // read for one publish cadence (repairScanIntervalMs): publishClusterLiveNodes (RepairCoordinator
+    // tick) is the only writer, so reading faster just re-fetches identical bytes. The publisher
+    // refreshes this cache on each publish, so it never re-reads from the store at all; a non-publisher
+    // owner re-reads at most once per publish interval.
+    private volatile Records.ClusterLiveNodes cachedSnapshot;
+    private volatile long cachedSnapshotAtMs;
 
     @FunctionalInterface
     interface CompletionSink {
@@ -61,7 +72,7 @@ final class NodeRegistry {
                                        Messages.CompletedCommand completion);
     }
 
-    NodeRegistry(MetadataStore store, MetaConfig config) throws Exception {
+    NodeRegistry(MetadataStore store, ControllerConfig config) throws Exception {
         this.store = store;
         this.config = config;
         // Warm persisted registrations as SUSPECT rather than DEAD. A metadata failover resets
@@ -107,6 +118,16 @@ final class NodeRegistry {
     private final java.util.concurrent.locks.ReentrantLock registerLock =
             new java.util.concurrent.locks.ReentrantLock();
 
+    /**
+     * True while a REGISTERED node is still within its dead-grace window (lease not yet expired past
+     * {@code deadGraceMs}) — the same window expiry and placement use. A node id may only be taken over
+     * by a different incarnation once its prior holder is no longer within grace.
+     */
+    private boolean withinDeadGrace(LiveNode n, long now) {
+        return n.record.state() == Records.NodeState.REGISTERED
+                && n.leaseUntil + config.deadGraceMs() >= now;
+    }
+
     Messages.RegisterResp register(Messages.RegisterNode msg) throws Exception {
         registerLock.lock();
         try {
@@ -118,34 +139,35 @@ final class NodeRegistry {
 
     private Messages.RegisterResp registerLocked(Messages.RegisterNode msg) throws Exception {
         validateRegistration(msg);
-        // identity = incarnation persisted on the node's volumes; same incarnation -> same nodeId
-        Integer nodeIdFound = null;
-        int existingVersion = -1;
-        for (LiveNode n : live.values()) {
-            if (n.record.incMsb() == msg.incMsb() && n.record.incLsb() == msg.incLsb()) {
-                nodeIdFound = n.record.nodeId();
-                existingVersion = n.recordVersion;
-                break;
+        int nodeId = msg.nodeId();
+        // The node supplies its own stable, volume-bound id (validated node-side against identity.properties).
+        // The leader no longer allocates ids — it rejects a collision (a different LIVE incarnation already
+        // holding this id, i.e. a STRATA_NODE_ID misconfiguration) and CAS-updates the id's registry record.
+        LiveNode existing = live.get(nodeId);
+        int existingVersion;
+        if (existing != null) {
+            boolean sameIncarnation = existing.record.incMsb() == msg.incMsb()
+                    && existing.record.incLsb() == msg.incLsb();
+            // A different incarnation may take this id over only once the prior holder is fully past its
+            // dead-grace window (mirroring placement/expiry). Gating on the lease alone would open a
+            // post-failover hole: a freshly elected leader warms persisted records with an already-expired
+            // lease, so a still-alive node that has not yet re-registered would look free to be stolen.
+            if (!sameIncarnation && withinDeadGrace(existing, System.currentTimeMillis())) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "nodeId " + nodeId + " is already held by a live node — check STRATA_NODE_ID uniqueness");
             }
+            // same incarnation re-registering (restart/failover), or the prior holder is fully dead-graced
+            // (a replacement node taking the id over): both proceed and open a fresh session.
+            existingVersion = existing.recordVersion;
+        } else {
+            // not in this leader's memory (e.g. just after a metadata failover): recover the persisted
+            // record's version for the CAS. The in-memory live check above is the collision authority.
+            existingVersion = store.getNode(nodeId).map(MetadataStore.Versioned::version).orElse(-1);
         }
-        if (nodeIdFound == null) {
-            // not in this leader's memory — a node that registered with a PREVIOUS leader after
-            // this instance booted. The persistent store is the identity source of truth:
-            // re-registration across metadata failover must keep the nodeId stable.
-            for (MetadataStore.Versioned<Records.NodeRecord> v : store.listNodes()) {
-                if (v.value().incMsb() == msg.incMsb() && v.value().incLsb() == msg.incLsb()) {
-                    nodeIdFound = v.value().nodeId();
-                    existingVersion = v.version();
-                    break;
-                }
-            }
-        }
-        int nodeId = nodeIdFound != null ? nodeIdFound : store.nextNodeId();
         long capacity = msg.capacities().isEmpty() ? 0 : msg.capacities().get(0).capacityBytes();
         Records.NodeRecord record = new Records.NodeRecord(nodeId, msg.incMsb(), msg.incLsb(),
                 msg.endpoints(), msg.zone(), msg.rack(), msg.host(), capacity, Records.NodeState.REGISTERED);
 
-        LiveNode existing = live.get(nodeId);
         Lock sessionWrite = existing == null ? null : existing.sessionGate.writeLock();
         if (sessionWrite != null) {
             sessionWrite.lock();
@@ -198,6 +220,10 @@ final class NodeRegistry {
     }
 
     private static void validateRegistration(Messages.RegisterNode msg) {
+        if (msg.nodeId() < 1) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                    "node registration requires a positive nodeId — set STRATA_NODE_ID");
+        }
         if (msg.endpoints().isEmpty() || msg.endpoints().stream().anyMatch(e -> e == null || e.isBlank())) {
             throw new ScpException(ErrorCode.PRECONDITION_FAILED, "node registration requires an endpoint");
         }
@@ -403,19 +429,91 @@ final class NodeRegistry {
      * Nodes eligible to hold a replica for {@code namespace}. The per-namespace placement hook: today
      * every REGISTERED node still inside dead-grace is eligible (namespace-agnostic), but this is
      * where a future per-tenant affinity/isolation policy would filter candidates. Placement includes
-     * suspect nodes because metadata heartbeat stalls and leader failover should not make storage
+     * suspect nodes because metadata heartbeat stalls and leader failover should not make data
      * nodes disappear before the dead-grace window; the subsequent node RPC is the real liveness
      * probe for creating the replica.
      */
     List<LiveNode> candidatesFor(StrataNamespace namespace) {
-        long now = System.currentTimeMillis();
+        return candidatesFor(namespace, System.currentTimeMillis());
+    }
+
+    // Package-private overload taking an explicit clock so the snapshot-cache TTL is deterministically
+    // testable; production always uses the wall clock via the one-arg form above.
+    List<LiveNode> candidatesFor(StrataNamespace namespace, long now) {
         List<LiveNode> out = new ArrayList<>();
+        Set<Integer> included = new HashSet<>();
         for (LiveNode n : live.values()) {
             if (placementEligible(n, now)) {
                 out.add(n);
+                included.add(n.record.nodeId());
+            }
+        }
+        // Shared liveness (design §11): a non-controller owner has no heartbeat channel, so fall back
+        // to the controller's published live-node snapshot for nodes it cannot see live in memory.
+        // In-memory wins (added first); the snapshot only fills gaps.
+        Records.ClusterLiveNodes snapshot = currentSnapshot(now);
+        if (snapshot != null && now - snapshot.publishedAtMs() < snapshotValidityMs()) {
+            for (Records.ClusterLiveNodes.LiveEntry e : snapshot.entries()) {
+                if (included.add(e.record().nodeId())) {
+                    out.add(snapshotLiveNode(e, now));
+                }
             }
         }
         return out;
+    }
+
+    /**
+     * Controller-only (all call sites are leader-gated): publishes the current live-node set to the
+     * root store so non-controller namespace owners can place and repair replicas (design §11).
+     */
+    void publishClusterLiveNodes() {
+        long now = System.currentTimeMillis();
+        List<Records.ClusterLiveNodes.LiveEntry> entries = new ArrayList<>();
+        for (LiveNode n : live.values()) {
+            if (n.alive(now)) {
+                entries.add(new Records.ClusterLiveNodes.LiveEntry(n.record, n.freeBytes));
+            }
+        }
+        Records.ClusterLiveNodes published = new Records.ClusterLiveNodes(now, entries);
+        try {
+            store.putClusterLiveNodes(published.encode());
+            // Refresh the local cache from what we just wrote so candidatesFor() on a non-controller
+            // owner sees this publish immediately, not the up-to-SNAPSHOT_RELOAD_MS-stale prior snapshot.
+            cachedSnapshot = published;
+            cachedSnapshotAtMs = now;
+        } catch (Exception e) {
+            log.warn("publishing cluster live-nodes snapshot failed", e);
+        }
+    }
+
+    /** A published snapshot is trusted for one lease plus two dead-grace windows after publication. */
+    private long snapshotValidityMs() {
+        return (long) config.leaseMs() + 2L * config.deadGraceMs();
+    }
+
+    private Records.ClusterLiveNodes currentSnapshot(long now) {
+        Records.ClusterLiveNodes snap = cachedSnapshot;
+        if (snap == null || now - cachedSnapshotAtMs > config.repairScanIntervalMs()) {
+            try {
+                Optional<byte[]> bytes = store.getClusterLiveNodes();
+                snap = bytes.map(Records.ClusterLiveNodes::decode).orElse(null);
+                cachedSnapshot = snap;
+                cachedSnapshotAtMs = now;
+            } catch (Exception e) {
+                log.debug("reading cluster live-nodes snapshot failed; using cached view", e);
+            }
+        }
+        return snap;
+    }
+
+    private static LiveNode snapshotLiveNode(Records.ClusterLiveNodes.LiveEntry e, long now) {
+        LiveNode n = new LiveNode();
+        n.record = e.record();        // REGISTERED, carries endpoints/host/zone/rack/capacity
+        n.recordVersion = -1;         // not this node's record to CAS — placement only reads it
+        n.sessionEpoch = -1;
+        n.leaseUntil = now;           // the controller vouched for it at publish; a placement candidate
+        n.freeBytes = e.freeBytes();
+        return n;
     }
 
     private boolean placementEligible(LiveNode n, long now) {

@@ -1,6 +1,6 @@
 package io.strata.format;
 
-import io.strata.common.ChunkId;
+import io.strata.common.NsChunkId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,7 +45,7 @@ final class ChannelCache implements AutoCloseable {
     private final int capacity;
     private final ReentrantLock lock = new ReentrantLock();
     /** Idle (not-leased) channels per chunk; access-order so iteration yields least-recently-used chunks first. */
-    private final LinkedHashMap<ChunkId, Deque<FileChannel>> idle = new LinkedHashMap<>(16, 0.75f, true);
+    private final LinkedHashMap<NsChunkId, Deque<FileChannel>> idle = new LinkedHashMap<>(16, 0.75f, true);
     private int idleCount;
     private boolean closed;
 
@@ -58,7 +58,7 @@ final class ChannelCache implements AutoCloseable {
     }
 
     /** Borrow an exclusive READ channel for {@code id}, reusing a pooled idle one or opening a new one. */
-    Lease acquire(ChunkId id, Path dataPath) throws IOException {
+    Lease acquire(NsChunkId id, Path dataPath) throws IOException {
         lock.lock();
         try {
             if (!closed) {
@@ -92,7 +92,7 @@ final class ChannelCache implements AutoCloseable {
      * unaffected — a read in flight keeps the unlinked inode alive and completes; when released the
      * channel pools again under a fresh entry and is reclaimed later by capacity eviction or close().
      */
-    void invalidate(ChunkId id) {
+    void invalidate(NsChunkId id) {
         List<FileChannel> toClose;
         lock.lock();
         try {
@@ -146,9 +146,9 @@ final class ChannelCache implements AutoCloseable {
             return null;
         }
         List<FileChannel> evicted = new ArrayList<>();
-        Iterator<Map.Entry<ChunkId, Deque<FileChannel>>> it = idle.entrySet().iterator();
+        Iterator<Map.Entry<NsChunkId, Deque<FileChannel>>> it = idle.entrySet().iterator();
         while (idleCount > capacity && it.hasNext()) {
-            Map.Entry<ChunkId, Deque<FileChannel>> e = it.next();
+            Map.Entry<NsChunkId, Deque<FileChannel>> e = it.next();
             Deque<FileChannel> dq = e.getValue();
             while (idleCount > capacity && !dq.isEmpty()) {
                 evicted.add(dq.pollFirst());
@@ -163,10 +163,10 @@ final class ChannelCache implements AutoCloseable {
     }
 
     private final class LeaseImpl implements Lease {
-        private final ChunkId id;
+        private final NsChunkId id;
         private final FileChannel channel;
         private boolean released;
-        LeaseImpl(ChunkId id, FileChannel channel) {
+        LeaseImpl(NsChunkId id, FileChannel channel) {
             this.id = id;
             this.channel = channel;
         }

@@ -37,20 +37,24 @@ final class Recovery {
     private static final Logger log = LoggerFactory.getLogger(Recovery.class);
     private static final int COPY_CHUNK_BYTES = 4 * 1024 * 1024;
 
-    private final MetaClient meta;
+    private final ControllerClient controller;
     private final NodePool appendPool;
     private final NodePool readPool;
     private final ClientConfig config;
+    private final io.strata.common.StrataNamespace namespace;
 
-    Recovery(MetaClient meta, NodePool pool, ClientConfig config) {
-        this(meta, pool, pool, config);
+    Recovery(ControllerClient controller, NodePool pool, ClientConfig config,
+             io.strata.common.StrataNamespace namespace) {
+        this(controller, pool, pool, config, namespace);
     }
 
-    Recovery(MetaClient meta, NodePool appendPool, NodePool readPool, ClientConfig config) {
-        this.meta = meta;
+    Recovery(ControllerClient controller, NodePool appendPool, NodePool readPool, ClientConfig config,
+             io.strata.common.StrataNamespace namespace) {
+        this.controller = controller;
         this.appendPool = appendPool;
         this.readPool = readPool;
         this.config = config;
+        this.namespace = namespace;
     }
 
     /** Mutable per-replica recovery state; `end` tracks our view of its local end offset. */
@@ -69,18 +73,18 @@ final class Recovery {
     }
 
     StrataFile.SealInfo recoverAndSeal(io.strata.common.FileId fileId) {
-        Messages.LookupFileResp file = meta.lookupFile(fileId);
+        Messages.LookupFileResp file = controller.lookupFile(namespace, fileId);
         boolean needsRecovery = file.chunks().stream().anyMatch(c -> c.state() != ChunkState.SEALED);
         int writerEpoch = 0;
         if (needsRecovery) {
-            writerEpoch = meta.allocateWriterEpochForRecovery(fileId);
-            file = meta.lookupFile(fileId);
+            writerEpoch = controller.allocateWriterEpochForRecovery(namespace, fileId);
+            file = controller.lookupFile(namespace, fileId);
         }
         return recoverAndSeal(fileId, file, writerEpoch);
     }
 
     StrataFile.SealInfo recoverAndSeal(io.strata.common.FileId fileId, int writerEpoch) {
-        Messages.LookupFileResp file = meta.lookupFile(fileId);
+        Messages.LookupFileResp file = controller.lookupFile(namespace, fileId);
         return recoverAndSeal(fileId, file, writerEpoch);
     }
 
@@ -108,7 +112,7 @@ final class Recovery {
                         maySealAbandonedEmptyTail));
             }
         }
-        meta.sealFile(fileId, total);
+        controller.sealFile(namespace, fileId, total);
         return new StrataFile.SealInfo(total);
     }
 
@@ -122,7 +126,7 @@ final class Recovery {
             if (r.endpoint().isEmpty()) continue;
             try {
                 ByteBuffer h = appendPool.get(r.endpoint()).call(Opcode.FENCE,
-                        new Messages.Fence(chunkId, writerEpoch).encode(), null, config.callTimeoutMs());
+                        new Messages.Fence(chunkId, writerEpoch, namespace).encode(), null, config.callTimeoutMs());
                 Messages.FenceResp fence = Messages.FenceResp.decode(h);
                 validateFenceResp(chunkId, r, fence);
                 reachable.add(new ReplicaState(r, fence));
@@ -180,7 +184,7 @@ final class Recovery {
         for (ReplicaState rs : reachable) {
             try {
                 ByteBuffer h = readPool.get(rs.replica.endpoint()).call(Opcode.READ_LEDGER,
-                        new Messages.ReadLedger(chunkId, p).encode(), null, config.callTimeoutMs());
+                        new Messages.ReadLedger(chunkId, p, namespace).encode(), null, config.callTimeoutMs());
                 long previousEnd = p;
                 for (Messages.LedgerEntry e : Messages.ReadLedgerResp.decode(h).entries()) {
                     boundaries.computeIfAbsent(e.endOffset(), ignored -> new ArrayList<>())
@@ -371,7 +375,7 @@ final class Recovery {
             // READ_RECOVERY (not client READ): recovery must see the never-acked tail above the
             // donor's durable high watermark — that is exactly the range it is re-proving for seal.
             Frame frame = readPool.get(source.replica.endpoint()).callFrame(Opcode.READ_RECOVERY,
-                    new Messages.Read(chunkId, from, (int) len).encode(), null,
+                    new Messages.Read(chunkId, from, (int) len, namespace).encode(), null,
                     config.callTimeoutMs());
             ByteBuffer h = frame.headerSlice();
             Resp.check(h);
@@ -405,7 +409,7 @@ final class Recovery {
     private void appendAndVerify(ChunkId chunkId, int epoch, ReplicaState target, long durableOffset,
                                  ByteBuffer payload, long expectedEnd) {
         ByteBuffer h = appendPool.get(target.replica.endpoint()).call(Opcode.APPEND,
-                new Messages.Append(chunkId, epoch, target.end, durableOffset).encode(),
+                new Messages.Append(chunkId, epoch, target.end, durableOffset, namespace).encode(),
                 payload, config.callTimeoutMs());
         long actualEnd;
         try {
@@ -441,7 +445,7 @@ final class Recovery {
             Messages.SealResp resp;
             try {
                 ByteBuffer h = appendPool.get(rs.replica.endpoint()).call(Opcode.SEAL_CHUNK,
-                        new Messages.SealChunk(chunkId, epoch, dataLength).encode(), null,
+                        new Messages.SealChunk(chunkId, epoch, dataLength, namespace).encode(), null,
                         config.callTimeoutMs());
                 resp = Messages.SealResp.decode(h);
             } catch (ScpException e) {
@@ -479,7 +483,7 @@ final class Recovery {
             log.warn("recovery seal divergence on {} — committing agreeing quorum {} of {} successful seals",
                     chunkId, quorum.getValue().size(), ok);
         }
-        meta.sealChunkMeta(chunkId, epoch, quorum.getKey().finalLength(), quorum.getKey().crc(),
+        controller.sealChunkMeta(namespace, chunkId, epoch, quorum.getKey().finalLength(), quorum.getKey().crc(),
                 List.copyOf(quorum.getValue()));
         return quorum.getKey().finalLength();
     }

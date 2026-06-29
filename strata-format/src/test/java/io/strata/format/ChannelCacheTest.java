@@ -2,6 +2,8 @@ package io.strata.format;
 
 import io.strata.common.ChunkId;
 import io.strata.common.FileId;
+import io.strata.common.NsChunkId;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -27,8 +29,8 @@ class ChannelCacheTest {
     @TempDir
     Path dir;
 
-    private ChunkId id(int i) {
-        return new ChunkId(new FileId(0L, i), 0);
+    private NsChunkId id(int i) {
+        return new NsChunkId(StrataNamespace.of("tenant-a"), new ChunkId(new FileId(i), 0));
     }
 
     private Path file(int i, String content) throws Exception {

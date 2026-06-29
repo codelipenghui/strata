@@ -14,19 +14,19 @@ class IdsAndCrcTest {
 
     @Test
     void fileAndChunkIdRoundtrip() {
-        FileId f = FileId.random();
+        FileId f = FileId.of(1);
         ChunkId c = new ChunkId(f, 7);
         ByteBuffer buf = ByteBuffer.allocate(ChunkId.WIRE_SIZE);
         c.writeTo(buf);
         assertEquals(ChunkId.WIRE_SIZE, buf.position());
         buf.flip();
         assertEquals(c, ChunkId.readFrom(buf));
-        assertEquals(f, FileId.fromString(f.toString()));
+        assertEquals(f, FileId.fromHex(f.toString()));
     }
 
     @Test
     void chunkIdRejectsInvalidValues() {
-        FileId f = FileId.random();
+        FileId f = FileId.of(2);
         assertThrows(IllegalArgumentException.class, () -> new ChunkId(null, 0));
         assertThrows(IllegalArgumentException.class, () -> new ChunkId(f, -1));
 
@@ -38,13 +38,13 @@ class IdsAndCrcTest {
 
     @Test
     void fileAndChunkIdsCompareByParentThenIndex() {
-        FileId first = new FileId(0, 1);
-        FileId second = new FileId(0, 2);
-        FileId laterParent = new FileId(1, 0);
+        FileId first = FileId.of(1);
+        FileId second = FileId.of(2);
+        FileId laterParent = FileId.of(3);
 
         assertTrue(first.compareTo(second) < 0);
         assertTrue(laterParent.compareTo(second) > 0);
-        assertEquals(0, first.compareTo(new FileId(0, 1)));
+        assertEquals(0, first.compareTo(FileId.of(1)));
 
         ChunkId firstChunk = new ChunkId(first, 1);
         ChunkId secondChunk = new ChunkId(first, 2);

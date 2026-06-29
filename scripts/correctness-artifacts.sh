@@ -524,7 +524,7 @@ require_full_fault_gate_artifacts() {
 
 require_chaos_gate_artifacts() {
   local failed=false
-  if ! require_correctness_artifact_matching "external storage and metadata nemesis" \
+  if ! require_correctness_artifact_matching "external data-node and metadata nemesis" \
     "scenario=external-nemesis"; then
     failed=true
   fi
@@ -532,7 +532,7 @@ require_chaos_gate_artifacts() {
     "scenario=external-concurrent-nemesis"; then
     failed=true
   fi
-  if ! require_correctness_artifact_matching "external storage-control nemesis" \
+  if ! require_correctness_artifact_matching "external data-node-control nemesis" \
     "scenario=external-control-nemesis"; then
     failed=true
   fi
@@ -555,8 +555,8 @@ audit_scenario_artifact() {
   case "$scenario" in
     stress-fault)
       require_artifact_keys "$file" \
-        case seed batches writePolicy storageConnectionsPerEndpoint nodeCount \
-        initialMetadataEndpoints initialStorage fileId leaderAvailableBeforeSeal \
+        case seed batches writePolicy dataNodeConnectionsPerEndpoint nodeCount \
+        initialMetadataEndpoints initialDataNode fileId leaderAvailableBeforeSeal \
         liveDescriptorVerifiedBeforeSeal sealedLength finalAckedBytes finalAckedSha256 \
         fullReplicaConsistencyAfterRepair finalDescriptor.fileState finalDescriptor.policy \
         finalDescriptor.chunkCount
@@ -579,8 +579,8 @@ audit_scenario_artifact() {
       ;;
     process-stress-fault)
       require_artifact_keys "$file" \
-        seed batches writePolicy storageConnectionsPerEndpoint initialMetadataEndpoints \
-        initialStorage fileId leaderAvailableBeforeSeal liveDescriptorVerifiedBeforeSeal \
+        seed batches writePolicy dataNodeConnectionsPerEndpoint initialMetadataEndpoints \
+        initialDataNode fileId leaderAvailableBeforeSeal liveDescriptorVerifiedBeforeSeal \
         sealedLength finalAckedBytes finalAckedSha256 fullReplicaConsistencyAfterRepair \
         finalDescriptor.fileState finalDescriptor.policy finalDescriptor.chunkCount
       require_replay_command_contains "$file" \
@@ -601,8 +601,8 @@ audit_scenario_artifact() {
     process-crash-recovery)
       require_artifact_keys "$file" \
         case recordCount metadataServiceCount metadataFailoverDuringRecovery \
-        writePolicy storageConnectionsPerEndpoint nodeCount initialMetadataEndpoints \
-        initialStorage fileId ackedBeforeCrashBytes ackedBeforeCrashSha256 \
+        writePolicy dataNodeConnectionsPerEndpoint nodeCount initialMetadataEndpoints \
+        initialDataNode fileId ackedBeforeCrashBytes ackedBeforeCrashSha256 \
         allOpenChunkReplicasKilled liveDescriptorVerifiedBeforeCrash \
         liveDescriptorVerifiedAfterRestart openChunkBeforeCrash restartedReplicaNodeIds \
         sealedLength finalAckedBytes finalAckedSha256 fullReplicaConsistencyAfterRepair \
@@ -612,10 +612,10 @@ audit_scenario_artifact() {
       require_replay_command_contains "$file" "./scripts/verify.sh --skip-default --fault"
       if [[ "$(artifact_value "$file" "metadataFailoverDuringRecovery")" == "true" ]]; then
         require_replay_command_contains "$file" \
-          "-Dtest=ProcessCrashRecoveryTest#storageProcessCrashThenMetadataFailoverBeforeRecoveryPreservesAckedOpenChunk"
+          "-Dtest=ProcessCrashRecoveryTest#dataNodeProcessCrashThenMetadataFailoverBeforeRecoveryPreservesAckedOpenChunk"
       else
         require_replay_command_contains "$file" \
-          "-Dtest=ProcessCrashRecoveryTest#forciblyKilledStorageProcessesRecoverAckedOpenChunkAcrossPolicies" \
+          "-Dtest=ProcessCrashRecoveryTest#forciblyKilledDataNodeProcessesRecoverAckedOpenChunkAcrossPolicies" \
           "-Dstrata.processCrash.case=$(artifact_value "$file" "case")"
       fi
       require_artifact_equal_keys "$file" "writePolicy" "beforeCrashDescriptor.policy"
@@ -644,8 +644,8 @@ audit_scenario_artifact() {
       ;;
     full-process-cluster-restart)
       require_artifact_keys "$file" \
-        seed writePolicy initialMetadataEndpoints initialStorage fileId ackedBytes ackedSha256 \
-        allProcessesKilled restartedMetadataEndpoints restartedLeader restartedStorage \
+        seed writePolicy initialMetadataEndpoints initialDataNode fileId ackedBytes ackedSha256 \
+        allProcessesKilled restartedMetadataEndpoints restartedLeader restartedDataNode \
         liveDescriptorVerifiedBeforeCrash liveDescriptorVerifiedAfterFullRestart sealedLength \
         finalAckedBytes finalAckedSha256 beforeRestartDescriptor.fileState \
         beforeRestartDescriptor.policy beforeRestartDescriptor.chunkCount \
@@ -671,18 +671,18 @@ audit_scenario_artifact() {
       ;;
     external-nemesis)
       require_artifact_keys "$file" \
-        seed schedule initialLeader clientMetadataEndpoints proxiedStorageEndpoint \
-        writePolicy storageConnectionsPerEndpoint initialStorage fileId \
-        openReadVerifiedAfterStoragePartition liveDescriptorVerifiedAfterStoragePartition \
+        seed schedule initialLeader clientMetadataEndpoints proxiedDataNodeEndpoint \
+        writePolicy dataNodeConnectionsPerEndpoint initialDataNode fileId \
+        openReadVerifiedAfterDataNodePartition liveDescriptorVerifiedAfterDataNodePartition \
         sealedLength finalAckedBytes finalAckedSha256 fullReplicaConsistencyAfterRepair \
         finalDescriptor.fileState finalDescriptor.policy finalDescriptor.chunkCount
       require_replay_command_contains "$file" \
         "./scripts/verify.sh --skip-default --chaos" \
         "-Dstrata.external.seed=$(artifact_value "$file" "seed")" \
-        "-Dtest=ExternalNemesisTest#childProcessStoragePartitionAndMetadataLeaderLossPreserveAckedBytes"
+        "-Dtest=ExternalNemesisTest#childProcessDataNodePartitionAndMetadataLeaderLossPreserveAckedBytes"
       require_artifact_equal_keys "$file" "writePolicy" "finalDescriptor.policy"
-      require_artifact_value "$file" "openReadVerifiedAfterStoragePartition" "true"
-      require_artifact_value "$file" "liveDescriptorVerifiedAfterStoragePartition" "true"
+      require_artifact_value "$file" "openReadVerifiedAfterDataNodePartition" "true"
+      require_artifact_value "$file" "liveDescriptorVerifiedAfterDataNodePartition" "true"
       require_artifact_value "$file" "fullReplicaConsistencyAfterRepair" "true"
       require_artifact_equal_keys "$file" "sealedLength" "finalAckedBytes"
       require_ack_evidence "$file" "finalAckedBytes" "finalAckedSha256"
@@ -694,11 +694,11 @@ audit_scenario_artifact() {
       ;;
     external-concurrent-nemesis)
       require_artifact_keys "$file" \
-        seed schedule initialLeader clientMetadataEndpoints proxiedStorageEndpoint \
-        writePolicy storageConnectionsPerEndpoint concurrentFiles initialStorage \
+        seed schedule initialLeader clientMetadataEndpoints proxiedDataNodeEndpoint \
+        writePolicy dataNodeConnectionsPerEndpoint concurrentFiles initialDataNode \
         primaryFileId secondaryFileId crossClientOpenReadVerifiedBeforePartition \
-        longLivedReaderVerifiedBeforePartition crossClientOpenReadVerifiedAfterStoragePartition \
-        longLivedReaderVerifiedAfterStoragePartition liveDescriptorVerifiedAfterStoragePartition \
+        longLivedReaderVerifiedBeforePartition crossClientOpenReadVerifiedAfterDataNodePartition \
+        longLivedReaderVerifiedAfterDataNodePartition liveDescriptorVerifiedAfterDataNodePartition \
         primarySealedLength primaryFinalAckedBytes primaryFinalAckedSha256 \
         primaryFullReplicaConsistencyAfterRepair secondarySealedLength \
         secondaryFinalAckedBytes secondaryFinalAckedSha256 \
@@ -709,15 +709,15 @@ audit_scenario_artifact() {
       require_replay_command_contains "$file" \
         "./scripts/verify.sh --skip-default --chaos" \
         "-Dstrata.external.seed=$(artifact_value "$file" "seed")" \
-        "-Dtest=ExternalNemesisTest#concurrentClientFilesSurviveSharedStorageAndMetadataFaults"
+        "-Dtest=ExternalNemesisTest#concurrentClientFilesSurviveSharedDataNodeAndMetadataFaults"
       require_artifact_equal_keys "$file" "writePolicy" "primaryFinalDescriptor.policy"
       require_artifact_equal_keys "$file" "writePolicy" "secondaryFinalDescriptor.policy"
       require_artifact_value "$file" "concurrentFiles" "2"
       require_artifact_value "$file" "crossClientOpenReadVerifiedBeforePartition" "true"
       require_artifact_value "$file" "longLivedReaderVerifiedBeforePartition" "true"
-      require_artifact_value "$file" "crossClientOpenReadVerifiedAfterStoragePartition" "true"
-      require_artifact_value "$file" "longLivedReaderVerifiedAfterStoragePartition" "true"
-      require_artifact_value "$file" "liveDescriptorVerifiedAfterStoragePartition" "true"
+      require_artifact_value "$file" "crossClientOpenReadVerifiedAfterDataNodePartition" "true"
+      require_artifact_value "$file" "longLivedReaderVerifiedAfterDataNodePartition" "true"
+      require_artifact_value "$file" "liveDescriptorVerifiedAfterDataNodePartition" "true"
       require_artifact_value "$file" "primaryFullReplicaConsistencyAfterRepair" "true"
       require_artifact_value "$file" "secondaryFullReplicaConsistencyAfterRepair" "true"
       require_artifact_equal_keys "$file" "primarySealedLength" "primaryFinalAckedBytes"
@@ -737,7 +737,7 @@ audit_scenario_artifact() {
     external-control-nemesis)
       require_artifact_keys "$file" \
         seed schedule metadataLeader proxiedMetadataEndpoint writePolicy \
-        storageConnectionsPerEndpoint initialStorage fileId spareNodeId spareDataEndpoint \
+        dataNodeConnectionsPerEndpoint initialDataNode fileId spareNodeId spareDataEndpoint \
         sealedLength finalAckedBytes finalAckedSha256 initialDescriptor.fileState \
         initialDescriptor.policy initialDescriptor.chunkCount duringControlPartitionUnderReplicated \
         duringControlPartition.fileState duringControlPartition.policy \
@@ -746,7 +746,7 @@ audit_scenario_artifact() {
       require_replay_command_contains "$file" \
         "./scripts/verify.sh --skip-default --chaos" \
         "-Dstrata.external.seed=$(artifact_value "$file" "seed")" \
-        "-Dtest=ExternalNemesisTest#storageControlPartitionDelaysRepairUntilHeartbeatPathHeals"
+        "-Dtest=ExternalNemesisTest#dataNodeControlPartitionDelaysRepairUntilHeartbeatPathHeals"
       require_artifact_equal_keys "$file" "writePolicy" "initialDescriptor.policy"
       require_artifact_equal_keys "$file" "writePolicy" "duringControlPartition.policy"
       require_artifact_equal_keys "$file" "writePolicy" "finalDescriptor.policy"
@@ -928,10 +928,10 @@ write_stress_fault_fixture_artifact() {
     printf 'batches=30\n'
     printf 'replayCommand=./scripts/verify.sh --skip-default --fault -Dstrata.stress.case=%s -Dstrata.stress.seed=abc123 -Dstrata.stress.batches=30\n' "$fault_case"
     printf 'writePolicy=%s\n' "$policy"
-    printf 'storageConnectionsPerEndpoint=1\n'
+    printf 'dataNodeConnectionsPerEndpoint=1\n'
     printf 'nodeCount=5\n'
     printf 'initialMetadataEndpoints=[127.0.0.1:1]\n'
-    printf 'initialStorage=[host-0#1@127.0.0.1:2]\n'
+    printf 'initialDataNode=[host-0#1@127.0.0.1:2]\n'
     printf 'fileId=file-1\n'
     printf 'leaderAvailableBeforeSeal=true\n'
     printf 'liveDescriptorVerifiedBeforeSeal=true\n'
@@ -963,9 +963,9 @@ write_process_stress_fixture_artifact() {
     printf 'batches=24\n'
     printf 'replayCommand=./scripts/verify.sh --skip-default --fault -Dtest=MetadataProcessFailoverTest#deterministicProcessFaultSchedulePreservesAckedBytes\n'
     printf 'writePolicy=rf3-aq2-fsynctrue\n'
-    printf 'storageConnectionsPerEndpoint=2\n'
+    printf 'dataNodeConnectionsPerEndpoint=2\n'
     printf 'initialMetadataEndpoints=[127.0.0.1:1]\n'
-    printf 'initialStorage=[host-0#1@127.0.0.1:2]\n'
+    printf 'initialDataNode=[host-0#1@127.0.0.1:2]\n'
     printf 'fileId=file-2\n'
     printf 'leaderAvailableBeforeSeal=true\n'
     printf 'liveDescriptorVerifiedBeforeSeal=true\n'
@@ -1013,15 +1013,15 @@ write_process_crash_fixture_artifact() {
     printf 'metadataServiceCount=%s\n' "$metadata_service_count"
     printf 'metadataFailoverDuringRecovery=%s\n' "$metadata_failover"
     if [[ "$metadata_failover" == "true" ]]; then
-      printf 'replayCommand=./scripts/verify.sh --skip-default --fault -Dtest=ProcessCrashRecoveryTest#storageProcessCrashThenMetadataFailoverBeforeRecoveryPreservesAckedOpenChunk\n'
+      printf 'replayCommand=./scripts/verify.sh --skip-default --fault -Dtest=ProcessCrashRecoveryTest#dataNodeProcessCrashThenMetadataFailoverBeforeRecoveryPreservesAckedOpenChunk\n'
     else
-      printf 'replayCommand=./scripts/verify.sh --skip-default --fault -Dtest=ProcessCrashRecoveryTest#forciblyKilledStorageProcessesRecoverAckedOpenChunkAcrossPolicies -Dstrata.processCrash.case=%s\n' "$crash_case"
+      printf 'replayCommand=./scripts/verify.sh --skip-default --fault -Dtest=ProcessCrashRecoveryTest#forciblyKilledDataNodeProcessesRecoverAckedOpenChunkAcrossPolicies -Dstrata.processCrash.case=%s\n' "$crash_case"
     fi
     printf 'writePolicy=%s\n' "$policy"
-    printf 'storageConnectionsPerEndpoint=1\n'
+    printf 'dataNodeConnectionsPerEndpoint=1\n'
     printf 'nodeCount=%s\n' "$replication_factor"
     printf 'initialMetadataEndpoints=[127.0.0.1:1]\n'
-    printf 'initialStorage=[host-0#1@127.0.0.1:2]\n'
+    printf 'initialDataNode=[host-0#1@127.0.0.1:2]\n'
     printf 'fileId=file-4\n'
     printf 'ackedBeforeCrashBytes=13\n'
     printf 'ackedBeforeCrashSha256=%s\n' "$sha"
@@ -1066,14 +1066,14 @@ write_full_restart_fixture_artifact() {
     printf 'replayCommand=./scripts/verify.sh --skip-default --fault -Dtest=MetadataProcessFailoverTest#fullProcessClusterRestartRecoversAckedOpenChunkFromSameDisks\n'
     printf 'writePolicy=rf3-aq2-fsynctrue\n'
     printf 'initialMetadataEndpoints=[127.0.0.1:1]\n'
-    printf 'initialStorage=[host-0#1@127.0.0.1:2]\n'
+    printf 'initialDataNode=[host-0#1@127.0.0.1:2]\n'
     printf 'fileId=file-3\n'
     printf 'ackedBytes=12\n'
     printf 'ackedSha256=%s\n' "$sha"
     printf 'allProcessesKilled=true\n'
     printf 'restartedMetadataEndpoints=[127.0.0.1:3]\n'
     printf 'restartedLeader=127.0.0.1:3\n'
-    printf 'restartedStorage=[host-0#1@127.0.0.1:4]\n'
+    printf 'restartedDataNode=[host-0#1@127.0.0.1:4]\n'
     printf 'liveDescriptorVerifiedBeforeCrash=true\n'
     printf 'liveDescriptorVerifiedAfterFullRestart=true\n'
     printf 'sealedLength=12\n'
@@ -1123,17 +1123,17 @@ write_external_nemesis_fixture_artifact() {
   write_artifact_header "$file" "external-nemesis" "ext-a"
   {
     printf 'seed=exta\n'
-    printf 'replayCommand=./scripts/verify.sh --skip-default --chaos -Dstrata.external.seed=exta -Dtest=ExternalNemesisTest#childProcessStoragePartitionAndMetadataLeaderLossPreserveAckedBytes\n'
-    printf 'schedule=partition-storage,metadata-blackhole,kill-leader\n'
+    printf 'replayCommand=./scripts/verify.sh --skip-default --chaos -Dstrata.external.seed=exta -Dtest=ExternalNemesisTest#childProcessDataNodePartitionAndMetadataLeaderLossPreserveAckedBytes\n'
+    printf 'schedule=partition-data-node,metadata-blackhole,kill-leader\n'
     printf 'initialLeader=127.0.0.1:1\n'
     printf 'clientMetadataEndpoints=[127.0.0.1:1, 127.0.0.1:2]\n'
-    printf 'proxiedStorageEndpoint=127.0.0.1:3\n'
+    printf 'proxiedDataNodeEndpoint=127.0.0.1:3\n'
     printf 'writePolicy=rf4-aq3-fsynctrue\n'
-    printf 'storageConnectionsPerEndpoint=2\n'
-    printf 'initialStorage=[host-0#1@127.0.0.1:4]\n'
+    printf 'dataNodeConnectionsPerEndpoint=2\n'
+    printf 'initialDataNode=[host-0#1@127.0.0.1:4]\n'
     printf 'fileId=file-ext-a\n'
-    printf 'openReadVerifiedAfterStoragePartition=true\n'
-    printf 'liveDescriptorVerifiedAfterStoragePartition=true\n'
+    printf 'openReadVerifiedAfterDataNodePartition=true\n'
+    printf 'liveDescriptorVerifiedAfterDataNodePartition=true\n'
     printf 'sealedLength=14\n'
     printf 'finalAckedBytes=14\n'
     printf 'finalAckedSha256=%s\n' "$sha"
@@ -1142,7 +1142,7 @@ write_external_nemesis_fixture_artifact() {
     printf 'finalDescriptor.policy=rf4-aq3-fsynctrue\n'
     printf 'finalDescriptor.chunkCount=1\n'
     printf 'batch=0 appendedRecords=1 ackedBytes=14 ackedSha256=%s\n' "$sha"
-    printf 'fault=partition-storage endpoint=127.0.0.1:3\n'
+    printf 'fault=partition-data-node endpoint=127.0.0.1:3\n'
     printf 'finalDescriptor.chunk=file.0 state=SEALED length=14 crc=1 writeEpoch=1 replicas=%s\n' "$replicas"
     printf 'status=passed\n'
   } >> "$file"
@@ -1158,22 +1158,22 @@ write_external_concurrent_fixture_artifact() {
   write_artifact_header "$file" "external-concurrent-nemesis" "ext-b"
   {
     printf 'seed=extb\n'
-    printf 'replayCommand=./scripts/verify.sh --skip-default --chaos -Dstrata.external.seed=extb -Dtest=ExternalNemesisTest#concurrentClientFilesSurviveSharedStorageAndMetadataFaults\n'
-    printf 'schedule=two-client-files,partition-storage,metadata-blackhole,kill-leader\n'
+    printf 'replayCommand=./scripts/verify.sh --skip-default --chaos -Dstrata.external.seed=extb -Dtest=ExternalNemesisTest#concurrentClientFilesSurviveSharedDataNodeAndMetadataFaults\n'
+    printf 'schedule=two-client-files,partition-data-node,metadata-blackhole,kill-leader\n'
     printf 'initialLeader=127.0.0.1:1\n'
     printf 'clientMetadataEndpoints=[127.0.0.1:1, 127.0.0.1:2]\n'
-    printf 'proxiedStorageEndpoint=127.0.0.1:3\n'
+    printf 'proxiedDataNodeEndpoint=127.0.0.1:3\n'
     printf 'writePolicy=rf4-aq3-fsynctrue\n'
-    printf 'storageConnectionsPerEndpoint=2\n'
+    printf 'dataNodeConnectionsPerEndpoint=2\n'
     printf 'concurrentFiles=2\n'
-    printf 'initialStorage=[host-0#1@127.0.0.1:4]\n'
+    printf 'initialDataNode=[host-0#1@127.0.0.1:4]\n'
     printf 'primaryFileId=file-ext-b-primary\n'
     printf 'secondaryFileId=file-ext-b-secondary\n'
     printf 'crossClientOpenReadVerifiedBeforePartition=true\n'
     printf 'longLivedReaderVerifiedBeforePartition=true\n'
-    printf 'crossClientOpenReadVerifiedAfterStoragePartition=true\n'
-    printf 'longLivedReaderVerifiedAfterStoragePartition=true\n'
-    printf 'liveDescriptorVerifiedAfterStoragePartition=true\n'
+    printf 'crossClientOpenReadVerifiedAfterDataNodePartition=true\n'
+    printf 'longLivedReaderVerifiedAfterDataNodePartition=true\n'
+    printf 'liveDescriptorVerifiedAfterDataNodePartition=true\n'
     printf 'primarySealedLength=15\n'
     printf 'primaryFinalAckedBytes=15\n'
     printf 'primaryFinalAckedSha256=%s\n' "$primary_sha"
@@ -1189,7 +1189,7 @@ write_external_concurrent_fixture_artifact() {
     printf 'secondaryFinalDescriptor.policy=rf4-aq3-fsynctrue\n'
     printf 'secondaryFinalDescriptor.chunkCount=1\n'
     printf 'batch=0 file=primary appendedRecords=1 ackedBytes=15 ackedSha256=%s secondaryAckedBytes=16 secondaryAckedSha256=%s\n' "$primary_sha" "$secondary_sha"
-    printf 'fault=partition-storage endpoint=127.0.0.1:3\n'
+    printf 'fault=partition-data-node endpoint=127.0.0.1:3\n'
     printf 'primaryFinalDescriptor.chunk=file.0 state=SEALED length=15 crc=1 writeEpoch=1 replicas=%s\n' "$replicas"
     printf 'secondaryFinalDescriptor.chunk=file.0 state=SEALED length=16 crc=1 writeEpoch=1 replicas=%s\n' "$replicas"
     printf 'status=passed\n'
@@ -1205,13 +1205,13 @@ write_external_control_fixture_artifact() {
   write_artifact_header "$file" "external-control-nemesis" "ext-c"
   {
     printf 'seed=extc\n'
-    printf 'replayCommand=./scripts/verify.sh --skip-default --chaos -Dstrata.external.seed=extc -Dtest=ExternalNemesisTest#storageControlPartitionDelaysRepairUntilHeartbeatPathHeals\n'
+    printf 'replayCommand=./scripts/verify.sh --skip-default --chaos -Dstrata.external.seed=extc -Dtest=ExternalNemesisTest#dataNodeControlPartitionDelaysRepairUntilHeartbeatPathHeals\n'
     printf 'schedule=seal-rf3,start-spare-through-control-proxy,partition-spare-control,kill-replica\n'
     printf 'metadataLeader=127.0.0.1:1\n'
     printf 'proxiedMetadataEndpoint=127.0.0.1:2\n'
     printf 'writePolicy=rf3-aq2-fsynctrue\n'
-    printf 'storageConnectionsPerEndpoint=2\n'
-    printf 'initialStorage=[host-0#1@127.0.0.1:4]\n'
+    printf 'dataNodeConnectionsPerEndpoint=2\n'
+    printf 'initialDataNode=[host-0#1@127.0.0.1:4]\n'
     printf 'fileId=file-ext-c\n'
     printf 'spareNodeId=4\n'
     printf 'spareDataEndpoint=127.0.0.1:5\n'
@@ -1230,7 +1230,7 @@ write_external_control_fixture_artifact() {
     printf 'finalDescriptor.policy=rf3-aq2-fsynctrue\n'
     printf 'finalDescriptor.chunkCount=1\n'
     printf 'batch=0 appendedRecords=1 ackedBytes=17 ackedSha256=%s\n' "$sha"
-    printf 'fault=partition-storage-control nodeId=4\n'
+    printf 'fault=partition-data-node-control nodeId=4\n'
     printf 'initialDescriptor.chunk=file.0 state=SEALED length=17 crc=1 writeEpoch=1 replicas=%s\n' "$full_replicas"
     printf 'duringControlPartition.chunk=file.0 state=SEALED length=17 crc=1 writeEpoch=1 replicas=[1@127.0.0.1:4]\n'
     printf 'finalDescriptor.chunk=file.0 state=SEALED length=17 crc=1 writeEpoch=1 replicas=%s\n' "$full_replicas"
@@ -1357,7 +1357,7 @@ run_correctness_artifact_self_test() {
   audit_correctness_artifacts >/dev/null
   require_chaos_gate_artifacts
 
-  sed -i.bak 's/ -Dtest=ExternalNemesisTest#storageControlPartitionDelaysRepairUntilHeartbeatPathHeals//' \
+  sed -i.bak 's/ -Dtest=ExternalNemesisTest#dataNodeControlPartitionDelaysRepairUntilHeartbeatPathHeals//' \
     "$root/external-control-nemesis-ext-c.txt"
   rm -f "$root/external-control-nemesis-ext-c.txt.bak"
   expect_artifact_audit_failure "missing external nemesis replay test selector" audit_correctness_artifacts

@@ -1,10 +1,16 @@
 package io.strata.meta;
 
+import io.strata.common.ErrorCode;
 import io.strata.common.FileState;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
+import io.strata.common.StrataNamespace;
 import io.strata.common.FileId;
+import io.strata.common.ScpException;
 import io.strata.proto.Messages;
+import io.strata.proto.Opcode;
+import io.strata.proto.ScpClient;
+import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Constructor;
@@ -15,7 +21,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -23,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RepairCoordinatorTest {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
     private static final byte MEDIA = 1;
 
     @Test
@@ -82,57 +91,6 @@ class RepairCoordinatorTest {
 
         Records.ChunkRecord chunk = store.files.get(fileId).value().chunks().get(0);
         assertEquals(List.of(source.nodeId(), target.nodeId()), chunk.replicas());
-    }
-
-    @Test
-    void inventoryDoesNotDeleteRepairTargetCopyWhileCommandIsInFlight() throws Exception {
-        FakeStore store = new FakeStore();
-        NodeRegistry registry = new NodeRegistry(store, config());
-        Registered source = register(registry, 301, "source");
-        Registered target = register(registry, 401, "target");
-        FileId fileId = fileId(301);
-        ChunkId chunkId = new ChunkId(fileId, 0);
-        store.createFile(file(fileId, FileState.SEALED,
-                List.of(sealed(0, 512, 3001, List.of(source.nodeId())))));
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
-
-        coordinator.scanOnce();
-        Messages.ReplicateCmd replicate = assertInstanceOf(Messages.ReplicateCmd.class,
-                onlyCommand(heartbeat(registry, coordinator, target, List.of())));
-        coordinator.onInventory(inventory(target, List.of(
-                new Messages.InventoryEntry(chunkId, ChunkState.SEALED, 512, 3001))));
-        assertTrue(heartbeat(registry, coordinator, target, List.of()).commands().isEmpty());
-        registry.enqueue(target.nodeId(), new Messages.DeleteCmd(123, List.of(chunkId)));
-
-        Messages.HeartbeatResp afterCompletion = heartbeat(registry, coordinator, target,
-                List.of(new Messages.CompletedCommand(replicate.commandId(), (short) 0)));
-
-        assertTrue(afterCompletion.commands().isEmpty());
-        assertEquals(List.of(source.nodeId(), target.nodeId()),
-                store.files.get(fileId).value().chunks().get(0).replicas());
-    }
-
-    @Test
-    void staleMissingInventoryAfterRepairSwapDoesNotDropNewReplica() throws Exception {
-        FakeStore store = new FakeStore();
-        NodeRegistry registry = new NodeRegistry(store, config());
-        Registered source = register(registry, 302, "source");
-        Registered target = register(registry, 402, "target");
-        FileId fileId = fileId(302);
-        store.createFile(file(fileId, FileState.SEALED,
-                List.of(sealed(0, 512, 3002, List.of(source.nodeId())))));
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
-
-        coordinator.scanOnce();
-        Messages.ReplicateCmd replicate = assertInstanceOf(Messages.ReplicateCmd.class,
-                onlyCommand(heartbeat(registry, coordinator, target, List.of())));
-        coordinator.onCommandCompleted(target.nodeId(),
-                new Messages.CompletedCommand(replicate.commandId(), (short) 0));
-        coordinator.onInventory(inventory(target, List.of()));
-
-        assertEquals(List.of(source.nodeId(), target.nodeId()),
-                store.files.get(fileId).value().chunks().get(0).replicas());
-        assertTrue(heartbeat(registry, coordinator, target, List.of()).commands().isEmpty());
     }
 
     @Test
@@ -316,7 +274,7 @@ class RepairCoordinatorTest {
     @Test
     void expiredReplicateCommandIsRetried() throws Exception {
         FakeStore store = new FakeStore();
-        MetaConfig config = config(-1);
+        ControllerConfig config = config(-1);
         NodeRegistry registry = new NodeRegistry(store, config);
         Registered source = register(registry, 120, "source");
         Registered target = register(registry, 130, "target");
@@ -410,7 +368,7 @@ class RepairCoordinatorTest {
     @Test
     void expiredDeleteCommandIsRetriedByNextScan() throws Exception {
         FakeStore store = new FakeStore();
-        MetaConfig config = config(-1);
+        ControllerConfig config = config(-1);
         NodeRegistry registry = new NodeRegistry(store, config);
         Registered node = register(registry, 1411, "delete-target");
         FileId fileId = fileId(821);
@@ -497,131 +455,6 @@ class RepairCoordinatorTest {
     }
 
     @Test
-    void inventoryDropsMissingCorruptOpenAndDeletingReplicasAndDeletesOrphans() throws Exception {
-        FakeStore store = new FakeStore();
-        NodeRegistry registry = new NodeRegistry(store, config());
-        Registered node = register(registry, 150, "node");
-        FileId fileId = fileId(10);
-        ChunkId missing = new ChunkId(fileId, 0);
-        ChunkId corrupt = new ChunkId(fileId, 1);
-        ChunkId open = new ChunkId(fileId, 2);
-        ChunkId deleting = new ChunkId(fileId, 3);
-        ChunkId orphan = new ChunkId(fileId(11), 0);
-        store.createFile(file(fileId, FileState.SEALED, List.of(
-                sealed(0, 100, 100, List.of(node.nodeId())),
-                sealed(1, 200, 200, List.of(node.nodeId())),
-                sealed(2, 300, 300, List.of(node.nodeId())),
-                sealed(3, 400, 400, List.of(node.nodeId())))));
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
-
-        coordinator.onInventory(inventory(node, List.of(
-                new Messages.InventoryEntry(corrupt, ChunkState.SEALED, 201, 200),
-                new Messages.InventoryEntry(open, ChunkState.OPEN, 300, 300),
-                new Messages.InventoryEntry(deleting, ChunkState.DELETING, 400, 400),
-                new Messages.InventoryEntry(orphan, ChunkState.SEALED, 1, 1))));
-
-        Records.FileRecord file = store.files.get(fileId).value();
-        assertEquals(List.of(List.of(), List.of(), List.of(), List.of()),
-                file.chunks().stream().map(Records.ChunkRecord::replicas).toList());
-        Messages.HeartbeatResp heartbeat = heartbeat(registry, coordinator, node, List.of());
-        assertEquals(4, heartbeat.commands().size());
-        assertEquals(List.of(orphan),
-                assertInstanceOf(Messages.DeleteCmd.class, heartbeat.commands().get(0)).chunkIds());
-        assertEquals(List.of(corrupt),
-                assertInstanceOf(Messages.DeleteCmd.class, heartbeat.commands().get(1)).chunkIds());
-        assertEquals(List.of(open),
-                assertInstanceOf(Messages.DeleteCmd.class, heartbeat.commands().get(2)).chunkIds());
-        assertEquals(List.of(deleting),
-                assertInstanceOf(Messages.DeleteCmd.class, heartbeat.commands().get(3)).chunkIds());
-        assertEquals(missing, file.chunkId(0));
-    }
-
-    @Test
-    void inventoryGracesStaleOpenReportForJustSealedReplica() throws Exception {
-        FakeStore store = new FakeStore();
-        MetaConfig graceConfig = config().withReplicaMissingGraceMs(60_000);
-        NodeRegistry registry = new NodeRegistry(store, graceConfig);
-        Registered node = register(registry, 151, "node");
-        FileId fileId = fileId(12);
-        ChunkId chunkId = new ChunkId(fileId, 0);
-        store.createFile(file(fileId, FileState.SEALED,
-                List.of(sealed(0, 100, 100, List.of(node.nodeId())))));
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, graceConfig, () -> true);
-
-        coordinator.onInventory(inventory(node, List.of(
-                new Messages.InventoryEntry(chunkId, ChunkState.OPEN, 100, 100))));
-
-        assertEquals(List.of(node.nodeId()), store.files.get(fileId).value().chunks().get(0).replicas());
-        assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
-
-        coordinator.onInventory(inventory(node, List.of(
-                new Messages.InventoryEntry(chunkId, ChunkState.SEALED, 100, 100))));
-
-        assertEquals(List.of(node.nodeId()), store.files.get(fileId).value().chunks().get(0).replicas());
-        assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
-    }
-
-    @Test
-    void inventoryIgnoresNonLiveNodesAndContinuesAfterStoreFailure() throws Exception {
-        FakeStore store = new FakeStore();
-        NodeRegistry registry = new NodeRegistry(store, config());
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
-
-        coordinator.onInventory(new Messages.InventoryReport(999, 1, 2, 3, 0, 1,
-                List.of(new Messages.InventoryEntry(new ChunkId(fileId(85), 0), ChunkState.SEALED, 1, 1))));
-
-        Registered node = register(registry, 146, "node");
-        store.throwOnListFiles = true;
-        coordinator.onInventory(inventory(node, List.of()));
-        store.throwOnListFiles = false;
-
-        assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
-    }
-
-    @Test
-    void inventoryIgnoresStaleSessionForLiveNode() throws Exception {
-        FakeStore store = new FakeStore();
-        NodeRegistry registry = new NodeRegistry(store, config());
-        Registered node = register(registry, 1461, "node");
-        FileId fileId = fileId(851);
-        store.createFile(file(fileId, FileState.SEALED,
-                List.of(sealed(0, 10, 100, List.of(node.nodeId())))));
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
-
-        coordinator.onInventory(new Messages.InventoryReport(node.nodeId(), node.incMsb(), node.incLsb(),
-                node.sessionEpoch() - 1, 0, 1, List.of()));
-
-        assertEquals(List.of(node.nodeId()), store.files.get(fileId).value().chunks().get(0).replicas());
-        assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
-    }
-
-    @Test
-    void inventoryLeavesKnownHealthyDeletingAndOpenEntriesAlone() throws Exception {
-        FakeStore store = new FakeStore();
-        NodeRegistry registry = new NodeRegistry(store, config());
-        Registered node = register(registry, 147, "node");
-        FileId healthyFile = fileId(86);
-        ChunkId healthy = new ChunkId(healthyFile, 0);
-        FileId deletingFile = fileId(87);
-        FileId openFile = fileId(88);
-        store.createFile(file(healthyFile, FileState.SEALED,
-                List.of(sealed(0, 10, 100, List.of(node.nodeId())))));
-        store.createFile(file(deletingFile, FileState.DELETING,
-                List.of(sealed(0, 20, 200, List.of(node.nodeId())))));
-        store.createFile(new Records.FileRecord(openFile, "test", "/open-file", 3, 2, true, FileState.OPEN, 1234,
-                List.of(new Records.ChunkRecord(0, ChunkState.OPEN, 0, 0, 1, List.of(node.nodeId())))));
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
-
-        coordinator.onInventory(inventory(node, List.of(
-                new Messages.InventoryEntry(healthy, ChunkState.SEALED, 10, 100))));
-
-        assertEquals(List.of(node.nodeId()), store.files.get(healthyFile).value().chunks().get(0).replicas());
-        assertEquals(List.of(node.nodeId()), store.files.get(deletingFile).value().chunks().get(0).replicas());
-        assertEquals(List.of(node.nodeId()), store.files.get(openFile).value().chunks().get(0).replicas());
-        assertTrue(heartbeat(registry, coordinator, node, List.of()).commands().isEmpty());
-    }
-
-    @Test
     void closeInterruptsStartedScannerAndRestoresInterrupt() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config(60_000));
@@ -640,7 +473,7 @@ class RepairCoordinatorTest {
     @Test
     void scanLoopContinuesAfterStoreFailure() throws Exception {
         FakeStore store = new FakeStore();
-        MetaConfig fast = new MetaConfig("unused", 0, 1, 10_000, 0, 1, 1);
+        ControllerConfig fast = new ControllerConfig("unused", 0, 1, 10_000, 0, 1, 1);
         NodeRegistry registry = new NodeRegistry(store, fast);
         Registered source = register(registry, 149, "source");
         Registered target = register(registry, 159, "target");
@@ -672,20 +505,447 @@ class RepairCoordinatorTest {
         }
     }
 
-    private static MetaConfig config() {
+    @Test
+    void nonControllerOwnerHealsUnderReplicatedChunkViaExecReplicate() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        List<Messages.ReplicateCmd> received = new CopyOnWriteArrayList<>();
+        UUID inc = UUID.randomUUID();
+        try (ScpServer targetServer = new ScpServer(0, 999, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.EXEC_REPLICATE.code) {
+                        received.add((Messages.ReplicateCmd) Messages.Command.read(req.headerSlice()));
+                        return ScpServer.ok(req, Messages.okHeader(), null);
+                    }
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
+                })) {
+            Registered dead = register(registry, 500, "dead-host");
+            Registered live1 = register(registry, 510, "live1-host");
+            Registered live2 = register(registry, 520, "live2-host");
+            Registered target = registerAt(registry, 530, "target-host", "127.0.0.1:" + targetServer.port());
+
+            // the controller's authoritative view: the dead node is DEAD in the root store
+            Optional<MetadataStore.Versioned<Records.NodeRecord>> deadRecord = store.getNode(dead.nodeId());
+            store.putNode(deadRecord.orElseThrow().value().withState(Records.NodeState.DEAD),
+                    deadRecord.get().version());
+
+            // an under-replicated sealed chunk (RF 3, one dead replica) in an owned namespace
+            FileId fileId = fileId(42);
+            Records.ChunkRecord chunk = sealed(0, 4096, 0xCAFE,
+                    List.of(dead.nodeId(), live1.nodeId(), live2.nodeId()));
+            store.createFile(file(fileId, FileState.SEALED, List.of(chunk)));
+
+            // a sharded non-controller owner of the namespace heals the chunk directly
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                    () -> false, () -> false, ns -> true);
+            owner.ownerRepairPass();
+
+            assertEquals(1, received.size(), "owner sent exactly one EXEC_REPLICATE");
+            assertEquals(new ChunkId(fileId, 0), received.get(0).chunkId());
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertTrue(replicas.contains(target.nodeId()), "the repair target became a replica");
+            assertFalse(replicas.contains(dead.nodeId()), "the dead replica was swapped out");
+            assertEquals(3, replicas.size(), "chunk restored to its replication factor");
+        }
+    }
+
+    @Test
+    void nonLeaderOwnerVerifiesNodeAbsentFromItsFrozenRegistry() throws Exception {
+        // A non-leader namespace owner does not receive heartbeats (they are leader-gated), so its in-memory
+        // registry is frozen at boot: a data node that (re-)registered AFTER it booted is absent from
+        // registry.live and reads as isDead. The verify lane must judge liveness from the persisted snapshot,
+        // not registry.isDead — otherwise it silently skips VERIFY_CHUNKS for that node's replicas (a
+        // missing/corrupt-copy detection blind spot, since verify is the only physical-integrity check).
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        List<Messages.VerifyChunks> verifies = new CopyOnWriteArrayList<>();
+        UUID inc = UUID.randomUUID();
+        try (ScpServer node = new ScpServer(0, 777, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                        Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                        verifies.add(vc);
+                        List<Messages.VerifyChunkResult> results = new ArrayList<>();
+                        for (ChunkId id : vc.chunkIds()) {
+                            results.add(new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096, 0xCAFE));
+                        }
+                        return ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
+                    }
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
+                })) {
+            // Persist the node in the store (with the stub endpoint), then drop it from the registry's live
+            // map to simulate a non-leader owner that never warmed/heard this (post-boot) node.
+            Registered late = registerAt(registry, 880, "late-host", "127.0.0.1:" + node.port());
+            liveNodes(registry).remove(late.nodeId());
+            assertTrue(registry.isDead(late.nodeId()),
+                    "premise: the node is absent from the frozen registry (the old liveness source reads it dead)");
+
+            FileId fileId = fileId(0x5151);
+            Records.ChunkRecord chunk = sealed(0, 4096, 0xCAFE, List.of(late.nodeId()));
+            store.createFile(file(fileId, FileState.SEALED, List.of(chunk)));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                    () -> false, () -> false, ns -> true);
+            owner.verifyPass();
+
+            assertEquals(1, verifies.size(),
+                    "owner issued VERIFY_CHUNKS for a node present only in the persisted snapshot");
+            assertEquals(List.of(new ChunkId(fileId, 0)), verifies.get(0).chunkIds());
+        }
+    }
+
+    @Test
+    void nonLeaderOwnerKeepsLastLiveReplicaWhenPeerIsDeadInPersistedState() throws Exception {
+        // The last-live-replica guard must judge survivors from the persisted snapshot. A peer the leader
+        // declared DEAD (persisted) but still stale-REGISTERED in a non-leader owner's frozen registry must
+        // NOT count as a live survivor — else an unhealthy verdict on the only actually-live replica would
+        // drop it, leaving 0 live copies (data loss).
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        UUID inc = UUID.randomUUID();
+        try (ScpServer node = new ScpServer(0, 778, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                        Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                        List<Messages.VerifyChunkResult> results = new ArrayList<>();
+                        for (ChunkId id : vc.chunkIds()) {
+                            // corrupt: present + SEALED but a crc that mismatches the descriptor (0xCAFE)
+                            results.add(new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096, 0xBAD));
+                        }
+                        return ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
+                    }
+                    // a destructive delete must never reach the last live replica; reject so any attempt is loud
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode " + req.opcode());
+                })) {
+            Registered verified = registerAt(registry, 980, "verified-host", "127.0.0.1:" + node.port());
+            Registered peer = register(registry, 990, "peer-host");
+            // leader's authoritative view: the peer is DEAD in the persisted store, but the non-leader owner's
+            // frozen registry still lists it as live (we do NOT mark it dead in the registry).
+            Optional<MetadataStore.Versioned<Records.NodeRecord>> peerRec = store.getNode(peer.nodeId());
+            store.putNode(peerRec.orElseThrow().value().withState(Records.NodeState.DEAD), peerRec.get().version());
+            assertFalse(registry.isDead(peer.nodeId()),
+                    "premise: the dead peer is stale-live in the frozen registry");
+
+            FileId fileId = fileId(0x6262);
+            Records.ChunkRecord chunk = sealed(0, 4096, 0xCAFE, List.of(verified.nodeId(), peer.nodeId()));
+            store.createFile(file(fileId, FileState.SEALED, List.of(chunk)));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                    () -> false, () -> false, ns -> true);
+            owner.verifyPass();
+
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertTrue(replicas.contains(verified.nodeId()),
+                    "the last actually-live replica was kept (guard counted survivors from the persisted view)");
+            assertEquals(2, replicas.size(), "the corrupt verdict did not drop the last live replica");
+        }
+    }
+
+    @Test
+    void lastLiveGuardCountsDrainingPeerAsSurvivor() throws Exception {
+        // A DRAINING node still holds its bytes, so it counts as a live survivor: a corrupt verdict on
+        // another replica IS dropped (the draining copy + reconcile re-replicate). This pins DRAINING != DEAD
+        // so the persisted-liveness predicate can't be silently narrowed to state == REGISTERED.
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        UUID inc = UUID.randomUUID();
+        try (ScpServer node = new ScpServer(0, 779, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                        Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                        List<Messages.VerifyChunkResult> results = new ArrayList<>();
+                        for (ChunkId id : vc.chunkIds()) {
+                            results.add(new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096, 0xBAD));
+                        }
+                        return ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
+                    }
+                    // the corrupt replica's delete is expected (a draining survivor exists); ack via failure is
+                    // fine — applyDeleteConfirmed has already mutated the descriptor, which is what we assert.
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode " + req.opcode());
+                })) {
+            Registered verified = registerAt(registry, 981, "verified2-host", "127.0.0.1:" + node.port());
+            Registered draining = register(registry, 991, "draining-host");
+            Optional<MetadataStore.Versioned<Records.NodeRecord>> rec = store.getNode(draining.nodeId());
+            store.putNode(rec.orElseThrow().value().withState(Records.NodeState.DRAINING), rec.get().version());
+
+            FileId fileId = fileId(0x7373);
+            Records.ChunkRecord chunk = sealed(0, 4096, 0xCAFE, List.of(verified.nodeId(), draining.nodeId()));
+            store.createFile(file(fileId, FileState.SEALED, List.of(chunk)));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                    () -> false, () -> false, ns -> true);
+            owner.verifyPass();
+
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertFalse(replicas.contains(verified.nodeId()),
+                    "the corrupt replica was dropped because a DRAINING peer counts as a live survivor");
+            assertEquals(List.of(draining.nodeId()), replicas, "only the draining survivor remains");
+        }
+    }
+
+    @Test
+    void ownerRepairThatLosesEveryCasDoesNotReportFalseSuccess() throws Exception {
+        FakeStore store = new FakeStore();
+        store.failUpdateFileAttempts = 10; // > CAS_RETRIES: every descriptor-swap CAS loses
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        List<Messages.ReplicateCmd> received = new CopyOnWriteArrayList<>();
+        UUID inc = UUID.randomUUID();
+        try (ScpServer targetServer = new ScpServer(0, 999, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.EXEC_REPLICATE.code) {
+                        received.add((Messages.ReplicateCmd) Messages.Command.read(req.headerSlice()));
+                        return ScpServer.ok(req, Messages.okHeader(), null);
+                    }
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
+                })) {
+            Registered dead = register(registry, 600, "dead-host");
+            Registered live1 = register(registry, 610, "live1-host");
+            Registered live2 = register(registry, 620, "live2-host");
+            Registered target = registerAt(registry, 630, "target-host", "127.0.0.1:" + targetServer.port());
+
+            Optional<MetadataStore.Versioned<Records.NodeRecord>> deadRecord = store.getNode(dead.nodeId());
+            store.putNode(deadRecord.orElseThrow().value().withState(Records.NodeState.DEAD),
+                    deadRecord.get().version());
+
+            FileId fileId = fileId(43);
+            Records.ChunkRecord chunk = sealed(0, 4096, 0xCAFE,
+                    List.of(dead.nodeId(), live1.nodeId(), live2.nodeId()));
+            store.createFile(file(fileId, FileState.SEALED, List.of(chunk)));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                    () -> false, () -> false, ns -> true);
+            long beforeEvent = owner.eventRepairs();
+            long beforeReconcile = owner.reconcileRepairs();
+
+            owner.ownerRepairPass();
+
+            // the physical pull was still attempted...
+            assertEquals(1, received.size(), "owner still sent EXEC_REPLICATE");
+            // ...but with every CAS lost, the descriptor must NOT be falsely updated...
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertTrue(replicas.contains(dead.nodeId()), "dead replica still present — no swap landed");
+            assertFalse(replicas.contains(target.nodeId()), "target not added — no swap landed");
+            // ...and the repair must NOT be counted as a success (the false-success bug this guards).
+            assertEquals(beforeEvent, owner.eventRepairs(), "no event repair counted when the CAS never landed");
+            assertEquals(beforeReconcile, owner.reconcileRepairs(),
+                    "no reconcile repair counted when the CAS never landed");
+        }
+    }
+
+    @Test
+    void nonControllerOwnerReclaimsDeletedFileViaExecDelete() throws Exception {
+        // The reclamation-gap regression: a DELETING file in a namespace owned by a non-leader controller
+        // was skipped by ownerRepairPass and never reached the leader's heartbeat command channel, so its
+        // physical chunks leaked forever. The owner must now reclaim them directly via DELETE_CHUNKS.
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        List<Messages.DeleteChunks> received = new CopyOnWriteArrayList<>();
+        UUID inc = UUID.randomUUID();
+        try (ScpServer targetServer = new ScpServer(0, 999, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.DELETE_CHUNKS.code) {
+                        Messages.DeleteChunks m = Messages.DeleteChunks.decode(req.headerSlice());
+                        received.add(m);
+                        List<Short> codes = new ArrayList<>();
+                        for (var id : m.chunkIds()) codes.add(ErrorCode.OK.code);
+                        return ScpServer.ok(req, new Messages.DeleteChunksResp(m.chunkIds(), codes).encode(), null);
+                    }
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
+                })) {
+            Registered target = registerAt(registry, 700, "target-host", "127.0.0.1:" + targetServer.port());
+
+            FileId fileId = fileId(44);
+            store.createFile(file(fileId, FileState.DELETING,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(target.nodeId())))));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                    () -> false, () -> false, ns -> true);
+            owner.ownerRepairPass();
+
+            assertEquals(1, received.size(), "owner sent exactly one DELETE_CHUNKS");
+            assertEquals(List.of(new ChunkId(fileId, 0)), received.get(0).chunkIds());
+            assertFalse(store.files.containsKey(fileId),
+                    "the deleted file's record was reclaimed once its only replica confirmed");
+        }
+    }
+
+    @Test
+    void nonControllerOwnerReclaimsDeletedFileWhoseReplicaIsDeadWithoutRpc() throws Exception {
+        // A DELETING file whose only replica sits on a DEAD node: the data is already unreachable, so the
+        // owner must converge the descriptor (and reclaim the record) without attempting a DELETE_CHUNKS RPC.
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Registered dead = register(registry, 710, "dead-host");
+        Optional<MetadataStore.Versioned<Records.NodeRecord>> deadRecord = store.getNode(dead.nodeId());
+        store.putNode(deadRecord.orElseThrow().value().withState(Records.NodeState.DEAD),
+                deadRecord.get().version());
+
+        FileId fileId = fileId(45);
+        store.createFile(file(fileId, FileState.DELETING,
+                List.of(sealed(0, 4096, 0xBEEF, List.of(dead.nodeId())))));
+
+        RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                () -> false, () -> false, ns -> true);
+        owner.ownerRepairPass();
+
+        assertFalse(store.files.containsKey(fileId),
+                "a deleted file whose only replica is dead is reclaimed without an RPC");
+    }
+
+    /**
+     * Regression test for the per-file liveness bug in ownerRepairPass: a poison file (getFile throws)
+     * must not abort the whole pass — the DELETING file that follows it must still be processed.
+     * Pre-fix: the exception propagates out of the loop and the DELETING file is never reached.
+     * Post-fix: the poison file is logged-and-skipped, the DELETING file is driven to DELETED.
+     */
+    @Test
+    void ownerRepairPassContinuesAfterPoisonFileThrows() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        // poison file — listed by the store but getFile throws; placed first in iteration order
+        FileId poisonFile = fileId(9001);
+        store.createFile(file(poisonFile, FileState.SEALED,
+                List.of(sealed(0, 128, 1111, List.of(777)))));
+
+        // DELETING file that must still be processed after the poison file
+        FileId deletingFile = fileId(9002);
+        store.createFile(file(deletingFile, FileState.DELETING, List.of()));
+
+        // mark the node as DEAD in the store (required by ownerRepairPass's nodesById path)
+        // (no live nodes needed: the DELETING file has no chunks so it converges immediately)
+
+        // arm the poison: getFile for poisonFile now throws
+        store.throwOnGetFileId = poisonFile;
+
+        // non-controller owner of the namespace
+        RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                () -> false, () -> false, ns -> true);
+        owner.ownerRepairPass();
+
+        // the DELETING file must have been reclaimed (no chunks → deleteFile was called)
+        assertFalse(store.files.containsKey(deletingFile),
+                "DELETING file must be reclaimed even when a preceding file's getFile throws");
+    }
+
+    /**
+     * Regression test for the cross-namespace DeleteAction in-flight dedup collision.
+     *
+     * Pre-fix: the alreadyInflight predicate in driveDeletion matched on (chunkId, nodeId) only, with no
+     * namespace check. FileId values are per-namespace and ChunkId = (FileId, index) carries no namespace,
+     * so two DELETING files in different namespaces with the same numeric FileId and chunk index produce the
+     * same ChunkId. The second namespace's DeleteAction was suppressed by the first's in-flight entry, so
+     * its physical chunk delete was never enqueued and the file stayed DELETING forever.
+     *
+     * Post-fix: && d.namespace().equals(ns) is added to the predicate, so the dedup is per-namespace.
+     *
+     * Setup: one coordinator, one store. scanOnce drives nsA/fileId(2001)/chunk(0) into inflight.
+     * Then driveDeletion is called reflectively for nsB/fileId(2001)/chunk(0) — same ChunkId, different
+     * namespace. The nsB DeleteCmd must be enqueued. Pre-fix: suppressed → assertion fails.
+     */
+    @Test
+    void driveDeletionEnqueuesDeleteForBothNamespacesWhenChunkIdsCollide() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Registered node = register(registry, 9200, "collision-node");
+
+        StrataNamespace nsA = StrataNamespace.of("ns-a");
+        StrataNamespace nsB = StrataNamespace.of("ns-b");
+        FileId sharedFileId = fileId(2001); // same numeric id in both namespaces → same ChunkId
+
+        // nsA file in the store so scanOnce picks it up and populates inflight.
+        store.createFile(new Records.FileRecord(sharedFileId, nsA,
+                io.strata.common.StrataPath.of("/da"), 3, 2, false,
+                FileState.DELETING, 1,
+                List.of(sealed(0, 64, 0xAA, List.of(node.nodeId())))));
+
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
+
+        // scanOnce drives nsA's deletion: enqueues DeleteCmd(nsA/sharedFileId/chunk0, node) into inflight.
+        coordinator.scanOnce();
+
+        // Drain nsA's DeleteCmd from the registry queue (heartbeat without completions — action stays inflight).
+        Messages.HeartbeatResp afterNsA = heartbeat(registry, coordinator, node, List.of());
+        assertEquals(1, afterNsA.commands().size(), "nsA DeleteCmd must be enqueued");
+        assertInstanceOf(Messages.DeleteCmd.class, afterNsA.commands().get(0));
+
+        // Drive driveDeletion for nsB with the SAME fileId and chunk index (identical ChunkId, different ns).
+        // driveDeletion is private; call it reflectively, same pattern as issueReplicate above.
+        Records.FileRecord fileBRecord = new Records.FileRecord(sharedFileId, nsB,
+                io.strata.common.StrataPath.of("/db"), 3, 2, false,
+                FileState.DELETING, 1,
+                List.of(sealed(0, 64, 0xBB, List.of(node.nodeId()))));
+        invokeDriveDeletion(coordinator, fileBRecord, 0 /* store version */);
+
+        // Post-fix: nsB's DeleteCmd must be enqueued (namespace-aware dedup does not suppress it).
+        // Pre-fix: nsB's DeleteCmd is suppressed because (chunkId, nodeId) matches nsA's inflight entry
+        //          → assertEquals fails with 0 commands.
+        Messages.HeartbeatResp afterNsB = heartbeat(registry, coordinator, node, List.of());
+        assertEquals(1, afterNsB.commands().size(),
+                "nsB DeleteCmd must be enqueued; namespace-blind dedup suppressed it (pre-fix bug)");
+        assertInstanceOf(Messages.DeleteCmd.class, afterNsB.commands().get(0));
+    }
+
+    /**
+     * Regression test for the per-file liveness bug in scanOnce (leader path): a poison file
+     * must not abort the whole pass — the DELETING file that follows it must still be processed.
+     * Pre-fix: the exception propagates out of the loop and the DELETING file is never reached.
+     * Post-fix: the poison file is logged-and-skipped, the DELETING file is driven to DELETED.
+     */
+    @Test
+    void scanOnceContinuesAfterPoisonFileThrows() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        // poison file — listed by the store but getFile throws; placed first in iteration order
+        FileId poisonFile = fileId(9003);
+        store.createFile(file(poisonFile, FileState.SEALED,
+                List.of(sealed(0, 128, 2222, List.of(888)))));
+
+        // DELETING file (no chunks) that must be driven to DELETED by the same pass
+        FileId deletingFile = fileId(9004);
+        store.createFile(file(deletingFile, FileState.DELETING, List.of()));
+
+        // arm the poison: getFile for poisonFile now throws
+        store.throwOnGetFileId = poisonFile;
+
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
+        coordinator.scanOnce();
+
+        // the DELETING file must have been reclaimed (no chunks → deleteFile was called)
+        assertFalse(store.files.containsKey(deletingFile),
+                "DELETING file must be reclaimed even when a preceding file's getFile throws");
+    }
+
+    private static Registered registerAt(NodeRegistry registry, long incMsb, String host, String endpoint)
+            throws Exception {
+        long incLsb = incMsb + 1;
+        Messages.RegisterResp resp = registry.register(new Messages.RegisterNode(
+                (int) incMsb, incMsb, incLsb, List.of(endpoint), "zone", "rack", host,
+                List.of(new Messages.StorageCapacity(1_000_000)), 1, 0));
+        return new Registered(resp.nodeId(), incMsb, incLsb, resp.sessionEpoch());
+    }
+
+    private static ControllerConfig config() {
         return config(1);
     }
 
-    private static MetaConfig config(int repairCommandTimeoutMs) {
+    private static ControllerConfig config(int repairCommandTimeoutMs) {
         // grace 0: these tests assert prompt missing-replica drops
-        return new MetaConfig("unused", 0, 1, 60_000, 0, 1,
+        return new ControllerConfig("unused", 0, 1, 60_000, 0, 1,
                 repairCommandTimeoutMs).withReplicaMissingGraceMs(0);
     }
 
     private static Registered register(NodeRegistry registry, long incMsb, String host) throws Exception {
         long incLsb = incMsb + 1;
         Messages.RegisterResp resp = registry.register(new Messages.RegisterNode(
-                incMsb, incLsb, List.of(host + ":9000"), "zone", "rack", host,
+                (int) incMsb, incMsb, incLsb, List.of(host + ":9000"), "zone", "rack", host,
                 List.of(new Messages.StorageCapacity(1_000_000)), 1, 0));
         return new Registered(resp.nodeId(), incMsb, incLsb, resp.sessionEpoch());
     }
@@ -702,11 +962,6 @@ class RepairCoordinatorTest {
                 });
     }
 
-    private static Messages.InventoryReport inventory(Registered node, List<Messages.InventoryEntry> entries) {
-        return new Messages.InventoryReport(node.nodeId(), node.incMsb(), node.incLsb(),
-                node.sessionEpoch(), 0, 1, entries);
-    }
-
     private static Messages.Command onlyCommand(Messages.HeartbeatResp heartbeat) {
         assertEquals(1, heartbeat.commands().size());
         return heartbeat.commands().get(0);
@@ -715,18 +970,19 @@ class RepairCoordinatorTest {
     private static void issueReplicate(RepairCoordinator coordinator, FileId fileId,
                                        Records.FileRecord file, Records.ChunkRecord chunk) throws Exception {
         Method method = RepairCoordinator.class.getDeclaredMethod(
-                "issueReplicate", FileId.class, Records.FileRecord.class, Records.ChunkRecord.class);
+                "issueReplicate", StrataNamespace.class, FileId.class, Records.FileRecord.class,
+                Records.ChunkRecord.class, RepairCoordinator.RepairTrigger.class);
         method.setAccessible(true);
-        method.invoke(coordinator, fileId, file, chunk);
+        method.invoke(coordinator, file.namespace(), fileId, file, chunk, RepairCoordinator.RepairTrigger.RECONCILE);
     }
 
     private static Object replicateAction(FileId fileId, ChunkId chunkId, int deadNode, int targetNode)
             throws Exception {
         Class<?> type = Class.forName("io.strata.meta.RepairCoordinator$ReplicateAction");
-        Constructor<?> ctor = type.getDeclaredConstructor(FileId.class, ChunkId.class, int.class, int.class,
-                long.class);
+        Constructor<?> ctor = type.getDeclaredConstructor(StrataNamespace.class, FileId.class, ChunkId.class,
+                int.class, int.class, long.class);
         ctor.setAccessible(true);
-        return ctor.newInstance(fileId, chunkId, deadNode, targetNode, System.currentTimeMillis());
+        return ctor.newInstance(TEST_NS, fileId, chunkId, deadNode, targetNode, System.currentTimeMillis());
     }
 
     private static void applyReplicaSwap(RepairCoordinator coordinator, Object action) throws Exception {
@@ -738,9 +994,18 @@ class RepairCoordinatorTest {
     private static void applyDeleteConfirmed(RepairCoordinator coordinator, FileId fileId, ChunkId chunkId, int nodeId)
             throws Exception {
         Method method = RepairCoordinator.class.getDeclaredMethod(
-                "applyDeleteConfirmed", FileId.class, ChunkId.class, int.class);
+                "applyDeleteConfirmed", StrataNamespace.class, FileId.class, ChunkId.class, int.class);
         method.setAccessible(true);
-        method.invoke(coordinator, fileId, chunkId, nodeId);
+        method.invoke(coordinator, TEST_NS, fileId, chunkId, nodeId);
+    }
+
+    /** Calls the private driveDeletion(FileRecord, int) on the coordinator via reflection. */
+    private static void invokeDriveDeletion(RepairCoordinator coordinator,
+                                            Records.FileRecord file, int version) throws Exception {
+        Method method = RepairCoordinator.class.getDeclaredMethod(
+                "driveDeletion", Records.FileRecord.class, int.class);
+        method.setAccessible(true);
+        method.invoke(coordinator, file, version);
     }
 
     private static Records.FileRecord file(FileId fileId, FileState state,
@@ -753,7 +1018,7 @@ class RepairCoordinatorTest {
     }
 
     private static FileId fileId(long lsb) {
-        return new FileId(0, lsb);
+        return FileId.of(lsb);
     }
 
     private static void markDead(NodeRegistry registry, int nodeId) throws Exception {
@@ -779,11 +1044,12 @@ class RepairCoordinatorTest {
         // sentinel namespace, so per-namespace enumeration still exercises repair's skip-on-missing path
         private static final io.strata.common.StrataNamespace ORPHAN_NS =
                 io.strata.common.StrataNamespace.of("orphan-listed");
-        private int nextNodeId = 1;
         private int failUpdateFileAttempts;
         private int failDeleteFileAttempts;
         private boolean throwOnGetFile;
         private boolean throwOnListFiles;
+        /** If non-null, getFile throws for this specific fileId (poison-file injection). */
+        private FileId throwOnGetFileId;
 
         @Override
         public void createFile(Records.FileRecord record) {
@@ -803,9 +1069,12 @@ class RepairCoordinatorTest {
         }
 
         @Override
-        public Optional<Versioned<Records.FileRecord>> getFile(FileId id) {
+        public Optional<Versioned<Records.FileRecord>> getFile(io.strata.common.StrataNamespace namespace, FileId id) {
             if (throwOnGetFile) {
                 throw new IllegalStateException("getFile failure");
+            }
+            if (throwOnGetFileId != null && throwOnGetFileId.equals(id)) {
+                throw new IllegalStateException("poison file getFile failure for " + id);
             }
             return Optional.ofNullable(files.get(id));
         }
@@ -847,7 +1116,7 @@ class RepairCoordinatorTest {
         }
 
         @Override
-        public boolean deleteFile(FileId id, int expectedVersion) {
+        public boolean deleteFile(io.strata.common.StrataNamespace namespace, FileId id, int expectedVersion) {
             Versioned<Records.FileRecord> current = files.get(id);
             if (current == null) {
                 return true;
@@ -895,11 +1164,6 @@ class RepairCoordinatorTest {
                 namespaces.add(ORPHAN_NS);  // surface orphan/recordless ids through enumeration
             }
             return new ArrayList<>(namespaces);
-        }
-
-        @Override
-        public int nextNodeId() {
-            return nextNodeId++;
         }
 
         @Override

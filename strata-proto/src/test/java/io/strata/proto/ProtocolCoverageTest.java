@@ -198,7 +198,7 @@ class ProtocolCoverageTest {
 
     @Test
     void listBackedMessagesDefensivelyCopyAndValidateCounts() {
-        ChunkId chunkId = new ChunkId(FileId.random(), 0);
+        ChunkId chunkId = new ChunkId(FileId.of(1), 0);
         List<Messages.Replica> replicas = new ArrayList<>(List.of(new Messages.Replica(1, "node:9000")));
         Messages.CreateChunkResp createChunk = new Messages.CreateChunkResp(chunkId, 7, replicas);
         replicas.clear();
@@ -214,7 +214,7 @@ class ProtocolCoverageTest {
         assertThrows(IllegalArgumentException.class,
                 () -> new Messages.DeleteChunksResp(List.of(chunkId), List.of()));
         assertThrows(IllegalArgumentException.class,
-                () -> new Messages.DeleteFilesResp(List.of(FileId.random()), List.of()));
+                () -> new Messages.DeleteFilesResp(List.of(FileId.of(2)), List.of()));
     }
 
     @Test

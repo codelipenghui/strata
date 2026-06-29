@@ -8,17 +8,18 @@ import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.api.transaction.CuratorOp;
 import org.apache.curator.retry.ExponentialBackoffRetry;
-import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.data.Stat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
@@ -30,19 +31,29 @@ import java.util.concurrent.atomic.LongAdder;
  * /strata/namespaces/<namespace>/paths/<path segments>/__file (FileId binding or empty tombstone),
  * /strata/namespaces/<namespace>/files/<fileId> (per-namespace file index for namespace-scoped
  * enumeration without a global /strata/files scan),
- * /strata/nodes/<nodeId>, /strata/ids/seq- (sequential, node-id allocation).
+ * /strata/nodes/<nodeId> (node identity record; ids are externally supplied via STRATA_NODE_ID).
  */
 public final class ZkMetadataStore implements MetadataStore {
     private static final Logger log = LoggerFactory.getLogger(ZkMetadataStore.class);
     private static final String FILES = "/strata/files";
     private static final String NAMESPACES = "/strata/namespaces";
     private static final String NODES = "/strata/nodes";
-    private static final String IDS = "/strata/ids";
     private static final String FILE_MARKER = "__file";
     private static final byte[] DELETED_FILE_MARKER = new byte[0];
-
+    // Namespace-sharding consensus root (design §5, §6.1): a single global metadata-epoch counter
+    // and one assignment record per namespace. Distinct from /strata/namespaces (user path/file
+    // bindings) so the two never collide.
+    private static final String META = "/strata/meta";
+    private static final String META_NAMESPACES = META + "/namespaces";
+    private static final String META_EPOCH = META + "/epoch";
+    private static final String META_LIVE_NODES = META + "/live-nodes";
+    // Low-volume CAS counter for the system namespace's file ids (a handful of meta-log segments).
+    private static final String META_SYS_FILE_ID = META + "/sys-file-id";
+    // Global monotonic file-id counter for the ZK backend. File ids are globally unique in ZK
+    // because all file records live under a shared /strata/files/<id> flat space.
+    private static final String META_GLOBAL_FILE_ID = META + "/global-file-id";
     /** The next-level znodes under {@code /strata}, used to tag per-subtree ZK request metrics. */
-    public static final List<String> SUBTREES = List.of("files", "namespaces", "nodes", "ids");
+    public static final List<String> SUBTREES = List.of("files", "namespaces", "nodes");
 
     private final CuratorFramework curator;
     private final boolean ownsCurator;
@@ -101,13 +112,13 @@ public final class ZkMetadataStore implements MetadataStore {
 
     private void init() {
         try {
-            for (String path : new String[]{FILES, NAMESPACES, NODES, IDS}) {
+            for (String path : new String[]{FILES, NAMESPACES, NODES, META, META_NAMESPACES}) {
                 try {
                     if (curator.checkExists().forPath(path) == null) {
                         curator.create().creatingParentsIfNeeded().forPath(path);
                     }
                 } catch (KeeperException.NodeExistsException ignored) {
-                    // Another metadata service won the create race for this root; continue
+                    // Another controller won the create race for this root; continue
                     // initializing the rest of the namespace.
                 }
             }
@@ -159,7 +170,9 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     @Override
-    public Optional<Versioned<Records.FileRecord>> getFile(FileId id) throws Exception {
+    public Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) throws Exception {
+        // ZK backend: file ids are globally unique (all records live under /strata/files/<id>);
+        // the namespace arg satisfies the interface contract but does not change the lookup.
         try {
             Stat stat = new Stat();
             byte[] data = curator.getData().storingStatIn(stat).forPath(FILES + "/" + id);
@@ -216,10 +229,12 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     @Override
-    public boolean deleteFile(FileId id, int expectedVersion) throws Exception {
+    public boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) throws Exception {
+        // ZK backend: file ids are globally unique; the namespace arg satisfies the interface
+        // contract but does not change the lookup — the record's own namespace() is used below.
         String filePath = FILES + "/" + id;
         try {
-            Optional<Versioned<Records.FileRecord>> current = getFile(id);
+            Optional<Versioned<Records.FileRecord>> current = getFile(namespace, id);
             if (current.isEmpty()) {
                 return true;
             }
@@ -244,14 +259,16 @@ public final class ZkMetadataStore implements MetadataStore {
                 curator.setData().withVersion(expectedVersion).forPath(filePath, tombstone);
                 record(FILES, true, tombstone.length);
             }
-            // The file is logically gone; drop its per-namespace index entry so namespace listings
-            // don't have to filter it. The tombstone under /strata/files stays until the sweeper reaps it.
-            dropNamespaceFileIndex(record.namespace(), id);
+            // Keep the per-namespace index entry until the sweeper reaps the tombstone (sweepDeletedFiles
+            // drops it): listFilesIncludingTombstones — the controller's opId-reuse scan — reads that index,
+            // so an entry dropped here would let a stale CREATE replay miss the unswept tombstone and
+            // resurrect the deleted file under a fresh id. listFiles filters the tombstone via getFile, so the
+            // retained entry never leaks into a normal namespace listing.
             return true;
         } catch (KeeperException.BadVersionException e) {
             return false;
         } catch (KeeperException.NoNodeException ignored) {
-            return getFile(id).isEmpty();
+            return getFile(namespace, id).isEmpty();
         }
     }
 
@@ -266,12 +283,46 @@ public final class ZkMetadataStore implements MetadataStore {
         }
         record(NAMESPACES, false, 0);
         for (String child : children) {
-            FileId id = FileId.fromString(child);
-            if (getFile(id).isPresent()) {  // skip DELETED tombstones (index entry not yet swept)
+            FileId id = FileId.fromHex(child);
+            if (getFile(namespace, id).isPresent()) {  // skip DELETED tombstones (index entry not yet swept)
                 out.add(id);
             }
         }
         return out;
+    }
+
+    /**
+     * All file ids for the namespace, including DELETED tombstone records that have not yet been swept.
+     * Used by the controller to detect opId reuse after deletion (prevents stale-replay resurrection).
+     */
+    List<FileId> listFilesIncludingTombstones(StrataNamespace namespace) throws Exception {
+        List<String> children;
+        try {
+            children = curator.getChildren().forPath(namespaceFilesDir(namespace));
+        } catch (KeeperException.NoNodeException e) {
+            return List.of();
+        }
+        record(NAMESPACES, false, 0);
+        List<FileId> out = new ArrayList<>(children.size());
+        for (String child : children) {
+            out.add(FileId.fromHex(child));
+        }
+        return out;
+    }
+
+    /**
+     * Fetches a file record including DELETED tombstone records. Used by the controller's opId-reuse
+     * scan to detect tombstoned files carrying a previously-used opId.
+     */
+    Optional<Records.FileRecord> getFileIncludingTombstone(FileId id) throws Exception {
+        try {
+            byte[] data = curator.getData().forPath(FILES + "/" + id);
+            record(FILES, false, data.length);
+            return Optional.of(Records.FileRecord.decode(data));
+        } catch (KeeperException.NoNodeException e) {
+            record(FILES, false, 0);
+            return Optional.empty();
+        }
     }
 
     @Override
@@ -298,7 +349,7 @@ public final class ZkMetadataStore implements MetadataStore {
     public int sweepDeletedFiles(long olderThanMs) throws Exception {
         // Ages tombstones by the znode mtime (set when deleteFile wrote DELETED). Relies on a DELETED
         // znode never being mutated again (every writer goes through getFile, which hides it), so
-        // mtime == delete time. The meta clock (now) is compared to the ZK-server mtime, so olderThanMs
+        // mtime == delete time. The controller clock (now) is compared to the ZK-server mtime, so olderThanMs
         // must absorb that skew — see DELETED_TOMBSTONE_TTL_MS.
         long now = System.currentTimeMillis();
         int reaped = 0;
@@ -324,7 +375,7 @@ public final class ZkMetadataStore implements MetadataStore {
                 record(FILES, true, 0);
                 // also drop any lingering per-namespace index entry (e.g. if deleteFile's best-effort
                 // cleanup didn't run); harmless if already gone
-                dropNamespaceFileIndex(decoded.namespace(), FileId.fromString(child));
+                dropNamespaceFileIndex(decoded.namespace(), FileId.fromHex(child));
                 reaped++;
             } catch (KeeperException.BadVersionException | KeeperException.NoNodeException ignored) {
                 // raced with another mutation/sweeper; leave it for the next pass
@@ -384,7 +435,7 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     private static byte[] fileIdBytes(FileId id) {
-        ByteBuffer buf = ByteBuffer.allocate(16);
+        ByteBuffer buf = ByteBuffer.allocate(8);
         id.writeTo(buf);
         return buf.array();
     }
@@ -393,7 +444,7 @@ public final class ZkMetadataStore implements MetadataStore {
         if (bytes.length == 0) {
             return Optional.empty();
         }
-        if (bytes.length != 16) {
+        if (bytes.length != 8) {
             throw new IllegalArgumentException("bad namespace file id length " + bytes.length);
         }
         return Optional.of(FileId.readFrom(ByteBuffer.wrap(bytes)));
@@ -420,14 +471,6 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     private record PathMarker(Optional<FileId> fileId, int version) {
-    }
-
-    @Override
-    public int nextNodeId() throws Exception {
-        String path = curator.create().withMode(CreateMode.PERSISTENT_SEQUENTIAL).forPath(IDS + "/seq-");
-        record(IDS, true, 0);
-        String seq = path.substring(path.lastIndexOf('-') + 1);
-        return Integer.parseInt(seq) + 1; // node ids start at 1
     }
 
     @Override
@@ -472,6 +515,148 @@ public final class ZkMetadataStore implements MetadataStore {
         return out;
     }
 
+    /**
+     * Atomically increments the long counter stored at {@code zkPath}, creating the znode at 1 if
+     * it does not yet exist. Uses a CAS-with-retry loop: on BadVersion the read-modify-write is
+     * retried; on NoNode the znode is created at 1 (and if another writer wins the create race,
+     * the loop retries the CAS).
+     */
+    private long casIncrementZkCounter(String zkPath) throws Exception {
+        while (true) {
+            try {
+                Stat stat = new Stat();
+                byte[] data = curator.getData().storingStatIn(stat).forPath(zkPath);
+                long current = data.length == 8 ? ByteBuffer.wrap(data).getLong() : 0L;
+                long next = current + 1;
+                try {
+                    curator.setData().withVersion(stat.getVersion())
+                            .forPath(zkPath, ByteBuffer.allocate(8).putLong(next).array());
+                    return next;
+                } catch (KeeperException.BadVersionException retry) {
+                    // lost the CAS race; re-read and try again
+                }
+            } catch (KeeperException.NoNodeException e) {
+                try {
+                    curator.create().creatingParentsIfNeeded()
+                            .forPath(zkPath, ByteBuffer.allocate(8).putLong(1L).array());
+                    return 1L;
+                } catch (KeeperException.NodeExistsException created) {
+                    // another writer created it first; loop to CAS-increment off its value
+                }
+            }
+        }
+    }
+
+    @Override
+    public long allocateMetadataEpoch() throws Exception {
+        return casIncrementZkCounter(META_EPOCH);
+    }
+
+    @Override
+    public long nextSystemFileId() throws Exception {
+        return casIncrementZkCounter(META_SYS_FILE_ID);
+    }
+
+    @Override
+    public Optional<Versioned<Records.NamespaceAssignment>> getNamespaceAssignment(StrataNamespace namespace)
+            throws Exception {
+        try {
+            Stat stat = new Stat();
+            byte[] data = curator.getData().storingStatIn(stat).forPath(assignmentPath(namespace));
+            return Optional.of(new Versioned<>(Records.NamespaceAssignment.decode(data), stat.getVersion()));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    @Override
+    public boolean putNamespaceAssignment(Records.NamespaceAssignment assignment, int expectedVersion)
+            throws Exception {
+        return casCreateOrSet(assignmentPath(assignment.namespace()), assignment.encode(), expectedVersion)
+                .isPresent();
+    }
+
+    /**
+     * Creates the znode ({@code expectedVersion < 0}) or CAS-sets it at the expected version; returns the
+     * new znode data-version on success, or empty on a create/version conflict (node already exists, stale
+     * version, or vanished). Returning the version lets the caller chain the next CAS without a read-back.
+     */
+    private OptionalInt casCreateOrSet(String path, byte[] enc, int expectedVersion) throws Exception {
+        try {
+            if (expectedVersion < 0) {
+                curator.create().creatingParentsIfNeeded().forPath(path, enc);
+                return OptionalInt.of(0); // a freshly created znode has data version 0
+            }
+            Stat stat = curator.setData().withVersion(expectedVersion).forPath(path, enc);
+            return OptionalInt.of(stat.getVersion());
+        } catch (KeeperException.NodeExistsException | KeeperException.BadVersionException
+                 | KeeperException.NoNodeException e) {
+            return OptionalInt.empty();
+        }
+    }
+
+    @Override
+    public List<StrataNamespace> listAssignedNamespaces() throws Exception {
+        try {
+            List<String> children = curator.getChildren().forPath(META_NAMESPACES);
+            List<StrataNamespace> out = new ArrayList<>(children.size());
+            for (String child : children) {
+                out.add(StrataNamespace.of(child));
+            }
+            return out;
+        } catch (KeeperException.NoNodeException e) {
+            return List.of();
+        }
+    }
+
+    private static String assignmentPath(StrataNamespace namespace) {
+        return META_NAMESPACES + "/" + namespace + "/assignment";
+    }
+
+    @Override
+    public Optional<Versioned<Records.NamespaceManifest>> getNamespaceManifest(StrataNamespace namespace)
+            throws Exception {
+        try {
+            Stat stat = new Stat();
+            byte[] data = curator.getData().storingStatIn(stat).forPath(manifestPath(namespace));
+            return Optional.of(new Versioned<>(Records.NamespaceManifest.decode(data), stat.getVersion()));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    @Override
+    public OptionalInt putNamespaceManifest(Records.NamespaceManifest manifest, int expectedVersion)
+            throws Exception {
+        return casCreateOrSet(manifestPath(manifest.namespace()), manifest.encode(), expectedVersion);
+    }
+
+    private static String manifestPath(StrataNamespace namespace) {
+        return META_NAMESPACES + "/" + namespace + "/manifest";
+    }
+
+    @Override
+    public void putClusterLiveNodes(byte[] snapshot) throws Exception {
+        try {
+            curator.setData().forPath(META_LIVE_NODES, snapshot);
+        } catch (KeeperException.NoNodeException e) {
+            try {
+                curator.create().creatingParentsIfNeeded().forPath(META_LIVE_NODES, snapshot);
+            } catch (KeeperException.NodeExistsException created) {
+                curator.setData().forPath(META_LIVE_NODES, snapshot);
+            }
+        }
+    }
+
+    @Override
+    public Optional<byte[]> getClusterLiveNodes() throws Exception {
+        try {
+            return Optional.of(curator.getData().forPath(META_LIVE_NODES));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
     /** Read-only: ZooKeeper requests issued against a {@code /strata} subtree, by op kind. */
     public long zkOps(String subtree, boolean write) {
         Counters c = zkStats.get(subtree);
@@ -513,9 +698,6 @@ public final class ZkMetadataStore implements MetadataStore {
         if (path.startsWith(NODES)) {
             return "nodes";
         }
-        if (path.startsWith(IDS)) {
-            return "ids";
-        }
         return "other";
     }
 
@@ -533,6 +715,24 @@ public final class ZkMetadataStore implements MetadataStore {
         final LongAdder readBytes = new LongAdder();
         final LongAdder writeOps = new LongAdder();
         final LongAdder writeBytes = new LongAdder();
+    }
+
+    /**
+     * Assigns a globally-unique file id for the ZK backend. The ZK file record space is flat
+     * ({@code /strata/files/<id>}), so ids must be globally unique across all namespaces.
+     * Uses a single global CAS counter rather than per-namespace counters.
+     */
+    @Override
+    public FileId assignFileId(StrataNamespace namespace) throws Exception {
+        return FileId.of(nextGlobalFileId());
+    }
+
+    /**
+     * Global monotonic file-id counter. The ZK backend stores all file records under the shared
+     * {@code /strata/files/<id>} flat space, so ids must be globally unique regardless of namespace.
+     */
+    private long nextGlobalFileId() throws Exception {
+        return casIncrementZkCounter(META_GLOBAL_FILE_ID);
     }
 
     @Override

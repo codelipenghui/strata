@@ -7,8 +7,9 @@ import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
-import io.strata.node.StorageNode;
+import io.strata.node.DataNode;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -34,6 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * away, and file deletion physically converges on the nodes.
  */
 class RepairAndRetentionTest {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     private MiniCluster cluster;
     private StrataClient client;
@@ -43,7 +45,7 @@ class RepairAndRetentionTest {
         cluster = new MiniCluster(4);
         client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint())
                 .withChunkRollBytes(4096)
-                .withStorageConnectionsPerEndpoint(3));
+                .withDataNodeConnectionsPerEndpoint(3));
     }
 
     @AfterEach
@@ -57,7 +59,7 @@ class RepairAndRetentionTest {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/repair-me")).id();
         Workload workload = new Workload();
         StrataFile.SealInfo sealed;
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 1200); // several chunks across 4 nodes
             sealed = appender.seal();
         }
@@ -91,29 +93,29 @@ class RepairAndRetentionTest {
         assertTrue(repaired, "repair did not restore RF=3 without the dead node in time");
 
         // all data still reads back intact
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
     }
 
     @Test
     void orphanChunkIsReconciledAway() throws Exception {
         // plant an orphan: a sealed chunk on a node that metadata knows nothing about
-        StorageNode node = cluster.nodes.get(0);
-        ChunkId orphan = new ChunkId(FileId.random(), 0);
+        DataNode node = cluster.nodes.get(0);
+        ChunkId orphan = new ChunkId(FileId.of(1), 0);
         try (ScpClient direct = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_TOOL, "planter")) {
-            direct.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(orphan, 1, false, 1 << 20, System.currentTimeMillis()).encode(), null, 5000);
-            direct.call(Opcode.APPEND, new Messages.Append(orphan, 1, 0, 0).encode(),
+            direct.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(orphan, 1, false, 1 << 20, System.currentTimeMillis(), TEST_NS).encode(), null, 5000);
+            direct.call(Opcode.APPEND, new Messages.Append(orphan, 1, 0, 0, TEST_NS).encode(),
                     ByteBuffer.wrap("orphan-bytes".getBytes()), 5000);
-            direct.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(orphan, 1, 12).encode(), null, 5000);
+            direct.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(orphan, 1, 12, TEST_NS).encode(), null, 5000);
         }
-        assertTrue(node.store().contains(orphan));
+        assertTrue(node.store().contains(TEST_NS, orphan));
 
-        // inventory report (5s interval) -> coordinator spots the orphan -> DELETE command
+        // node-local orphan GC (grace -> owner-confirm via LOOKUP_FILE -> delete) reaps the unreferenced chunk
         long deadline = System.currentTimeMillis() + 30_000;
-        while (System.currentTimeMillis() < deadline && node.store().contains(orphan)) {
+        while (System.currentTimeMillis() < deadline && node.store().contains(TEST_NS, orphan)) {
             Thread.sleep(250);
         }
-        assertFalse(node.store().contains(orphan), "orphan chunk was not reconciled away");
+        assertFalse(node.store().contains(TEST_NS, orphan), "orphan chunk was not reconciled away");
     }
 
     @Test
@@ -121,7 +123,7 @@ class RepairAndRetentionTest {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/missing-live-replica")).id();
         Workload workload = new Workload();
         StrataFile.SealInfo sealed;
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 300);
             sealed = appender.seal();
         }
@@ -130,12 +132,12 @@ class RepairAndRetentionTest {
         var lookup = lookupFile(fileId);
         Messages.ChunkInfo chunk = lookup.chunks().get(0);
         ChunkId chunkId = chunk.chunkId();
-        StorageNode victim = nodeById(chunk.replicas().get(0).nodeId());
-        assertEquals(ErrorCode.OK, victim.store().delete(chunkId));
-        assertFalse(victim.store().contains(chunkId));
+        DataNode victim = nodeById(chunk.replicas().get(0).nodeId());
+        assertEquals(ErrorCode.OK, victim.store().delete(TEST_NS, chunkId));
+        assertFalse(victim.store().contains(TEST_NS, chunkId));
 
         // allow for the inventory-loss grace (a sealed replica is only dropped once it has stayed
-        // missing from inventory past MetaConfig.replicaMissingGraceMs()) plus the re-repair
+        // missing from inventory past ControllerConfig.replicaMissingGraceMs()) plus the re-repair
         long deadline = System.currentTimeMillis() + 140_000;
         boolean repaired = false;
         while (System.currentTimeMillis() < deadline && !repaired) {
@@ -147,13 +149,13 @@ class RepairAndRetentionTest {
                 }
                 repaired = currentChunk.replicas().size() == 3
                         && currentChunk.replicas().stream()
-                        .allMatch(replica -> nodeById(replica.nodeId()).store().contains(chunkId));
+                        .allMatch(replica -> nodeById(replica.nodeId()).store().contains(TEST_NS, chunkId));
                 break;
             }
         }
         assertTrue(repaired, "missing sealed replica was not dropped and repaired in time");
 
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
     }
 
@@ -162,7 +164,7 @@ class RepairAndRetentionTest {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/corrupt-live-replica")).id();
         Workload workload = new Workload();
         StrataFile.SealInfo sealed;
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 300);
             sealed = appender.seal();
         }
@@ -171,11 +173,11 @@ class RepairAndRetentionTest {
         Messages.ChunkInfo chunk = lookupFile(fileId).chunks().get(0);
         assertTrue(chunk.length() > 0, "test setup requires a non-empty sealed chunk");
         ChunkId chunkId = chunk.chunkId();
-        StorageNode victim = nodeById(chunk.replicas().get(0).nodeId());
+        DataNode victim = nodeById(chunk.replicas().get(0).nodeId());
         corruptDataByte(victim, chunkId, Math.min(3, chunk.length() - 1));
 
         assertEquals(ErrorCode.CRC_MISMATCH,
-                assertThrows(ScpException.class, () -> victim.store().read(chunkId, 0, 1)).code(),
+                assertThrows(ScpException.class, () -> victim.store().read(TEST_NS, chunkId, 0, 1)).code(),
                 "corrupt sealed replica must not serve bytes before scrub reports it");
         assertEquals(1, victim.store().scrubOnce(), "scrub must expose the CRC mismatch through inventory");
 
@@ -204,7 +206,7 @@ class RepairAndRetentionTest {
         }
         assertTrue(repaired, "corrupt sealed replica was not dropped and repaired in time");
 
-        workload.verifyAckedPrefix(client, fileId);
+        workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
     }
 
@@ -213,7 +215,7 @@ class RepairAndRetentionTest {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/delete-me")).id();
         Workload workload = new Workload();
         StrataFile.SealInfo sealed;
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 600);
             sealed = appender.seal();
         }
@@ -222,7 +224,7 @@ class RepairAndRetentionTest {
         List<ChunkId> chunkIds = lookup.chunks().stream().map(Messages.ChunkInfo::chunkId).toList();
         assertTrue(chunkIds.size() >= 2);
 
-        client.deleteById(List.of(fileId));
+        client.deleteById(StrataNamespace.of("test"), fileId);
 
         // metadata record disappears once all replicas confirm physical deletion
         waitForFileDeleted(fileId);
@@ -235,7 +237,7 @@ class RepairAndRetentionTest {
     void fileDeletionConvergesWhenReplicaWasAlreadyMissingLocally() throws Exception {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/delete-missing-local")).id();
         Workload workload = new Workload();
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             workload.appendAcked(appender, 0, 300);
             appender.seal();
         }
@@ -243,11 +245,11 @@ class RepairAndRetentionTest {
         var lookup = lookupFile(fileId);
         List<ChunkId> chunkIds = lookup.chunks().stream().map(Messages.ChunkInfo::chunkId).toList();
         Messages.ChunkInfo chunk = lookup.chunks().get(0);
-        StorageNode victim = nodeById(chunk.replicas().get(0).nodeId());
-        assertEquals(ErrorCode.OK, victim.store().delete(chunk.chunkId()));
-        assertFalse(victim.store().contains(chunk.chunkId()));
+        DataNode victim = nodeById(chunk.replicas().get(0).nodeId());
+        assertEquals(ErrorCode.OK, victim.store().delete(TEST_NS, chunk.chunkId()));
+        assertFalse(victim.store().contains(TEST_NS, chunk.chunkId()));
 
-        client.deleteById(List.of(fileId));
+        client.deleteById(StrataNamespace.of("test"), fileId);
 
         waitForFileDeleted(fileId);
         assertNoNodeContains(chunkIds);
@@ -257,7 +259,7 @@ class RepairAndRetentionTest {
     void deletingOpenFileCannotBeResurrectedByStaleAppender() throws Exception {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/delete-open-writer")).id();
         Workload workload = new Workload();
-        StrataFile.Appender stale = client.openById(fileId).openForAppend();
+        StrataFile.Appender stale = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         try {
             workload.appendAcked(stale, 0, 80);
             List<ChunkId> chunkIds = lookupFile(fileId).chunks().stream()
@@ -265,7 +267,7 @@ class RepairAndRetentionTest {
                     .toList();
             assertTrue(!chunkIds.isEmpty(), "test setup requires an open metadata chunk");
 
-            client.deleteById(List.of(fileId));
+            client.deleteById(StrataNamespace.of("test"), fileId);
 
             ScpException sealFailure = assertThrows(ScpException.class, stale::seal,
                     "stale appender must not seal or resurrect a DELETING file");
@@ -281,47 +283,17 @@ class RepairAndRetentionTest {
         }
     }
 
-    @Test
-    void staleInventoryForLiveNodeDoesNotDropHealthyReplica() throws Exception {
-        FileId fileId = client.create(StrataClient.FileSpec.log("test", "/stale-inventory")).id();
-        Workload workload = new Workload();
-        StrataFile.SealInfo sealed;
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
-            workload.appendAcked(appender, 0, 200);
-            sealed = appender.seal();
-        }
-
-        var lookup = lookupFile(fileId);
-        var replica = lookup.chunks().get(0).replicas().get(0);
-        StorageNode node = nodeById(replica.nodeId());
-        sendInventory(new Messages.InventoryReport(replica.nodeId(),
-                node.incarnation().getMostSignificantBits(), node.incarnation().getLeastSignificantBits(),
-                -1, 0, 1, List.of()));
-
-        var after = lookupFile(fileId);
-        assertTrue(after.chunks().get(0).replicas().stream().anyMatch(r -> r.nodeId() == replica.nodeId()),
-                "stale inventory must not drop a healthy live replica");
-        workload.verifyAckedPrefix(client, fileId);
-        ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
-    }
-
     private Messages.LookupFileResp lookupFile(FileId fileId) throws Exception {
         String[] hp = cluster.metaEndpoint().split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
-            ByteBuffer h = direct.call(Opcode.LOOKUP_FILE, new Messages.LookupFile(fileId).encode(), null, 5000);
+            ByteBuffer h = direct.call(Opcode.LOOKUP_FILE, new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, 5000);
             return Messages.LookupFileResp.decode(h);
         }
     }
 
-    private void sendInventory(Messages.InventoryReport report) throws Exception {
-        String[] hp = cluster.metaEndpoint().split(":");
-        try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
-            direct.call(Opcode.INVENTORY_REPORT, report.encode(), null, 5000);
-        }
-    }
 
-    private StorageNode nodeById(int nodeId) {
-        for (StorageNode node : cluster.nodes) {
+    private DataNode nodeById(int nodeId) {
+        for (DataNode node : cluster.nodes) {
             if (node.nodeId() == nodeId) {
                 return node;
             }
@@ -329,9 +301,9 @@ class RepairAndRetentionTest {
         throw new AssertionError("node " + nodeId + " not found");
     }
 
-    private static void corruptDataByte(StorageNode node, ChunkId chunkId, long dataOffset) throws Exception {
+    private static void corruptDataByte(DataNode node, ChunkId chunkId, long dataOffset) throws Exception {
         var chunkPath = node.config().dataDir().resolve("chunks")
-                .resolve(ChunkFormats.baseName(chunkId) + ".chunk");
+                .resolve(ChunkFormats.chunkRelativePath(TEST_NS, chunkId) + ".chunk");
         long position = ChunkFormats.DATA_START + dataOffset;
         try (FileChannel channel = FileChannel.open(chunkPath, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
             ByteBuffer one = ByteBuffer.allocate(1);
@@ -361,9 +333,9 @@ class RepairAndRetentionTest {
     }
 
     private void assertNoNodeContains(List<ChunkId> chunkIds) {
-        for (StorageNode node : cluster.nodes) {
+        for (DataNode node : cluster.nodes) {
             for (ChunkId id : chunkIds) {
-                assertFalse(node.store().contains(id),
+                assertFalse(node.store().contains(TEST_NS, id),
                         "node " + node.nodeId() + " still holds deleted chunk " + id);
             }
         }

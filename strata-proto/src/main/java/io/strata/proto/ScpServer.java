@@ -65,7 +65,7 @@ public final class ScpServer implements AutoCloseable {
         }
 
         /**
-         * Composes two handlers onto one listener: opcodes &gt;= 0x0100 (control plane — storage-node
+         * Composes two handlers onto one listener: opcodes &gt;= 0x0100 (control plane — data-node
          * registration + client metadata RPCs) route to {@code controlPlane}; everything else (data
          * plane; PING too) to {@code dataPlane}. HELLO never reaches a handler (the server answers it).
          * Lets a combined node serve data + metadata on a single SCP port.
@@ -92,7 +92,7 @@ public final class ScpServer implements AutoCloseable {
     private final Channel serverChannel;
     private final ChannelGroup connections = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
     private final Handler handler;
-    private volatile int nodeId; // updatable: a fresh storage node learns its id at registration
+    private final int nodeId; // fixed at construction from the volume-bound identity (STRATA_NODE_ID)
     private final long incMsb;
     private final long incLsb;
     private final int maxInflightRequests;
@@ -150,11 +150,6 @@ public final class ScpServer implements AutoCloseable {
 
     public int port() {
         return ((InetSocketAddress) serverChannel.localAddress()).getPort();
-    }
-
-    /** Updates the node id announced in HELLO responses (assigned at first registration). */
-    public void setNodeId(int nodeId) {
-        this.nodeId = nodeId;
     }
 
     private final class ConnectionHandler extends SimpleChannelInboundHandler<Frame> {

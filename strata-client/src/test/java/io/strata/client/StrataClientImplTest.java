@@ -11,7 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertNotSame;
 class StrataClientImplTest {
 
     @Test
-    void usesSeparateStoragePoolsForAppendAndReadTraffic() throws Exception {
+    void usesSeparateDataNodePoolsForAppendAndReadTraffic() throws Exception {
         ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500);
 
         try (StrataClientImpl client = new StrataClientImpl(config)) {

@@ -10,16 +10,16 @@ import io.strata.proto.Messages;
 import java.util.List;
 import java.util.Objects;
 
-/** SCP-backed StrataClient implementation over the v0 metadata service. */
+/** SCP-backed StrataClient implementation over the v0 controller. */
 final class StrataClientImpl implements StrataClient {
     private final ClientConfig config;
-    private final MetaClient meta;
+    private final ControllerClient controller;
     private final NodePool appendPool;
     private final NodePool readPool;
 
     StrataClientImpl(ClientConfig config) {
         this.config = config;
-        this.meta = new MetaClient(config);
+        this.controller = new ControllerClient(config);
         this.appendPool = new NodePool(config, "strata-client-append");
         this.readPool = new NodePool(config, "strata-client-read");
     }
@@ -27,41 +27,42 @@ final class StrataClientImpl implements StrataClient {
     @Override
     public StrataFile create(FileSpec spec) {
         Objects.requireNonNull(spec, "spec");
-        return new StrataFileImpl(meta, appendPool, readPool, config,
-                meta.createFile(spec), spec.namespace(), spec.path());
+        return new StrataFileImpl(controller, appendPool, readPool, config,
+                controller.createFile(spec), spec.namespace(), spec.path());
     }
 
     @Override
     public StrataFile open(StrataNamespace namespace, StrataPath path) {
         Objects.requireNonNull(namespace, "namespace");
         Objects.requireNonNull(path, "path");
-        FileId fileId = meta.lookupPath(namespace, path);
-        return new StrataFileImpl(meta, appendPool, readPool, config, fileId, namespace, path);
+        FileId fileId = controller.lookupPath(namespace, path);
+        return new StrataFileImpl(controller, appendPool, readPool, config, fileId, namespace, path);
     }
 
     @Override
-    public StrataFile openById(FileId fileId) {
+    public StrataFile openById(StrataNamespace namespace, FileId fileId) {
+        Objects.requireNonNull(namespace, "namespace");
         Objects.requireNonNull(fileId, "fileId");
-        Messages.LookupFileResp file = meta.lookupFile(fileId);
-        return new StrataFileImpl(meta, appendPool, readPool, config, fileId, file.namespace(), file.path());
+        Messages.LookupFileResp file = controller.lookupFile(namespace, fileId);
+        return new StrataFileImpl(controller, appendPool, readPool, config, fileId, namespace, file.path());
     }
 
     @Override
     public void delete(List<FilePath> paths) {
         Objects.requireNonNull(paths, "paths");
-        deleteById(paths.stream()
-                .map(path -> {
-                    Objects.requireNonNull(path, "path");
-                    return meta.lookupPath(path.namespace(), path.path());
-                })
-                .toList());
+        for (FilePath p : paths) {
+            Objects.requireNonNull(p, "path");
+            FileId id = controller.lookupPath(p.namespace(), p.path());
+            deleteById(p.namespace(), List.of(id));
+        }
     }
 
     @Override
-    public void deleteById(List<FileId> fileIds) {
+    public void deleteById(StrataNamespace namespace, List<FileId> fileIds) {
+        Objects.requireNonNull(namespace, "namespace");
         Objects.requireNonNull(fileIds, "fileIds");
         fileIds = fileIds.stream().map(id -> Objects.requireNonNull(id, "fileId")).toList();
-        Messages.DeleteFilesResp resp = meta.deleteFiles(fileIds);
+        Messages.DeleteFilesResp resp = controller.deleteFiles(namespace, fileIds);
         if (!resp.fileIds().equals(fileIds) || resp.codes().size() != fileIds.size()) {
             throw new ScpException(ErrorCode.INTERNAL, "metadata delete response did not match request");
         }
@@ -78,6 +79,6 @@ final class StrataClientImpl implements StrataClient {
     public void close() {
         appendPool.close();
         readPool.close();
-        meta.close();
+        controller.close();
     }
 }

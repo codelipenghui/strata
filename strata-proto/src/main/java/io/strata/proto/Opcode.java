@@ -17,10 +17,10 @@ public enum Opcode {
     // recovery-scoped ranged read: serves locally-present bytes up to localEndOffset, including the
     // never-acked tail above the durable high watermark that the client READ path clamps away.
     READ_RECOVERY(0x001A),
-    // control plane (storage node -> metadata)
+    // control plane (data node -> metadata)
     REGISTER_NODE(0x0101),
     NODE_HEARTBEAT(0x0102),
-    INVENTORY_REPORT(0x0103),
+    // (0x0103 INVENTORY_REPORT removed: durability reconciliation is owner-pull VERIFY_CHUNKS, §20.3)
     // v0 client -> metadata (v1 moves broker-facing APIs to Kafka RPC)
     CREATE_FILE(0x0201),
     CREATE_CHUNK(0x0202),
@@ -30,7 +30,17 @@ public enum Opcode {
     SEAL_FILE(0x0206),
     ABORT_CHUNK_META(0x0207),
     LOOKUP_PATH(0x0208),
-    ALLOCATE_WRITER_EPOCH(0x0209);
+    ALLOCATE_WRITER_EPOCH(0x0209),
+    // direct metadata-owner -> data-node repair: a non-controller namespace owner, which has no heartbeat
+    // command channel, tells a target node to pull a chunk from a live source (reuses the proven
+    // ControlLoop.replicate path). Data-plane opcode (< 0x0100) so the combined-node router sends it to
+    // DataNodeHandlers, not the Controller. Append-only — kept last in the data-plane block (design §11).
+    EXEC_REPLICATE(0x001B),
+    // owner-pull durability verification (design §20.3): a namespace owner asks a data node, in bounded
+    // batches, for the local state of the chunks it expects that node to hold (present/missing/corrupt).
+    // Replaces the central inventory push. Owner -> node, so a data-plane opcode (< 0x0100) routed to
+    // DataNodeHandlers. Append-only — kept last in the data-plane block.
+    VERIFY_CHUNKS(0x001C);
 
     public final short code;
 

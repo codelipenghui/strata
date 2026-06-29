@@ -5,6 +5,7 @@ import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.Resp;
@@ -27,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * After recovery, EVERY descriptor replica must serve the full sealed chunk, byte-identical.
  */
 class RecoveryCatchUpTest {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     @Test
     void laggingReplicaIsCaughtUpBeforeSeal() throws Exception {
@@ -41,7 +43,7 @@ class RecoveryCatchUpTest {
                         new Messages.CreateFile("test", "/lag").encode(), null, 5000))
                         .fileId();
                 chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
-                        new Messages.CreateChunk(fileId, 1).encode(), null, 5000));
+                        new Messages.CreateChunk(StrataNamespace.of("test"), fileId, 1).encode(), null, 5000));
             }
 
             byte[] a = "AAAA".getBytes(), b = "BBBB".getBytes(), c = "CCCC".getBytes();
@@ -52,20 +54,19 @@ class RecoveryCatchUpTest {
                 String[] nhp = replica.endpoint().split(":");
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "w")) {
-                    node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1,
-                            false, 1 << 20, 1L).encode(), null, 5000);
-                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0).encode(),
+                    node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1, false, 1 << 20, 1L, TEST_NS).encode(), null, 5000);
+                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0, TEST_NS).encode(),
                             ByteBuffer.wrap(a), 5000);
                     if (i < 2) {
-                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 4, 4).encode(),
+                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 4, 4, TEST_NS).encode(),
                                 ByteBuffer.wrap(b), 5000);
-                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 8, 8).encode(),
+                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 8, 8, TEST_NS).encode(),
                                 ByteBuffer.wrap(c), 5000);
                     }
                 }
             }
 
-            var sealed = client.openById(fileId).recoverAndSeal();
+            var sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
             assertEquals(12, sealed.sealedLength(), "all quorum-durable bytes must be preserved");
 
             // EVERY replica in the descriptor must now serve the full sealed chunk byte-identically
@@ -75,13 +76,13 @@ class RecoveryCatchUpTest {
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "v")) {
                     var stat = Messages.StatResp.decode(node.call(Opcode.STAT_CHUNK,
-                            new Messages.StatChunk(chunk.chunkId()).encode(), null, 5000));
+                            new Messages.StatChunk(chunk.chunkId(), TEST_NS).encode(), null, 5000));
                     assertEquals(ChunkState.SEALED, stat.state(),
                             "replica " + replica.nodeId() + " must be sealed after recovery");
                     assertEquals(12, stat.sealedLength());
 
                     var frame = node.callFrame(Opcode.FETCH_CHUNK,
-                            new Messages.FetchChunk(chunk.chunkId(), 0, Integer.MAX_VALUE).encode(),
+                            new Messages.FetchChunk(chunk.chunkId(), 0, Integer.MAX_VALUE, TEST_NS).encode(),
                             null, 5000);
                     ByteBuffer h = frame.headerSlice();
                     Resp.check(h);
@@ -109,7 +110,7 @@ class RecoveryCatchUpTest {
                                         .encode(), null, 5000))
                         .fileId();
                 chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
-                        new Messages.CreateChunk(fileId, 1).encode(), null, 5000));
+                        new Messages.CreateChunk(StrataNamespace.of("test"), fileId, 1).encode(), null, 5000));
             }
 
             byte[] a = "AAAA".getBytes(StandardCharsets.UTF_8);
@@ -120,36 +121,35 @@ class RecoveryCatchUpTest {
                 String[] nhp = replica.endpoint().split(":");
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "w")) {
-                    node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1,
-                            false, 1 << 20, 1L).encode(), null, 5000);
-                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0).encode(),
+                    node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1, false, 1 << 20, 1L, TEST_NS).encode(), null, 5000);
+                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0, TEST_NS).encode(),
                             ByteBuffer.wrap(a), 5000);
                     if (i == 0) {
-                        node.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(chunk.chunkId(), 1, 4).encode(),
+                        node.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(chunk.chunkId(), 1, 4, TEST_NS).encode(),
                                 null, 5000);
                     } else {
-                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 4, 4).encode(),
+                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 4, 4, TEST_NS).encode(),
                                 ByteBuffer.wrap(b), 5000);
-                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 8, 8).encode(),
+                        node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 8, 8, TEST_NS).encode(),
                                 ByteBuffer.allocate(0), 5000);
                     }
                 }
             }
 
-            var sealed = client.openById(fileId).recoverAndSeal();
+            var sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
             assertEquals(8, sealed.sealedLength(),
                     "a short sealed replica must not truncate quorum-durable bytes");
 
             Messages.LookupFileResp lookup;
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
                 lookup = Messages.LookupFileResp.decode(meta.call(Opcode.LOOKUP_FILE,
-                        new Messages.LookupFile(fileId).encode(), null, 5000));
+                        new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, 5000));
             }
             assertEquals(2, lookup.chunks().get(0).replicas().size(),
                     "the short sealed copy must be excluded from the descriptor");
             assertTrue(lookup.chunks().get(0).replicas().stream().noneMatch(r -> r.nodeId() == shortReplica));
 
-            try (var reader = client.openById(fileId).openForRead()) {
+            try (var reader = client.openById(StrataNamespace.of("test"), fileId).openForRead()) {
                 try (StrataFile.ReadResult rr = reader.read(0, 16)) {
                     byte[] got = new byte[rr.length()];
                     rr.buffer().get(got);
@@ -172,7 +172,7 @@ class RecoveryCatchUpTest {
                         new Messages.CreateFile("test", "/partial").encode(), null, 5000))
                         .fileId();
                 chunk = Messages.CreateChunkResp.decode(meta.call(Opcode.CREATE_CHUNK,
-                        new Messages.CreateChunk(fileId, 1).encode(), null, 5000));
+                        new Messages.CreateChunk(StrataNamespace.of("test"), fileId, 1).encode(), null, 5000));
             }
 
             byte[] a = "AAAA".getBytes(StandardCharsets.UTF_8);
@@ -185,18 +185,17 @@ class RecoveryCatchUpTest {
                 String[] nhp = replica.endpoint().split(":");
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "w")) {
-                    node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1,
-                            false, 1 << 20, 1L).encode(), null, 5000);
-                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0).encode(),
+                    node.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk.chunkId(), 1, false, 1 << 20, 1L, TEST_NS).encode(), null, 5000);
+                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 0, 0, TEST_NS).encode(),
                             ByteBuffer.wrap(a), 5000);
-                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 4, 4).encode(),
+                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 4, 4, TEST_NS).encode(),
                             ByteBuffer.wrap(b), 5000);
-                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 8, 8).encode(),
+                    node.call(Opcode.APPEND, new Messages.Append(chunk.chunkId(), 1, 8, 8, TEST_NS).encode(),
                             ByteBuffer.wrap(i < 2 ? full : partial), 5000);
                 }
             }
 
-            var sealed = client.openById(fileId).recoverAndSeal();
+            var sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
             assertEquals(12, sealed.sealedLength(),
                     "recovery must preserve the full valid batch, not stop at a shorter partial boundary");
 
@@ -205,7 +204,7 @@ class RecoveryCatchUpTest {
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "v")) {
                     var frame = node.callFrame(Opcode.READ,
-                            new Messages.Read(chunk.chunkId(), 0, 64).encode(), null, 5000);
+                            new Messages.Read(chunk.chunkId(), 0, 64, TEST_NS).encode(), null, 5000);
                     ByteBuffer h = frame.headerSlice();
                     Resp.check(h);
                     byte[] bytes = new byte[frame.payloadLength()];

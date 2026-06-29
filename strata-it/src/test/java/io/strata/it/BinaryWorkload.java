@@ -3,6 +3,7 @@ package io.strata.it;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
@@ -41,8 +42,8 @@ final class BinaryWorkload {
         }
     }
 
-    void verifyOpenReadIsAckedPrefix(StrataClient client, FileId fileId, String context) {
-        try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
+    void verifyOpenReadIsAckedPrefix(StrataClient client, StrataNamespace namespace, FileId fileId, String context) {
+        try (StrataFile.Reader reader = client.openById(namespace, fileId).openForRead()) {
             verifyReaderReadIsAckedPrefix(reader, context + " open");
         }
     }
@@ -67,9 +68,9 @@ final class BinaryWorkload {
         }
     }
 
-    void verifySealedAckedPrefix(StrataClient client, FileId fileId, String context) {
+    void verifySealedAckedPrefix(StrataClient client, StrataNamespace namespace, FileId fileId, String context) {
         byte[] expectedBytes = expected.toByteArray();
-        byte[] actual = Workload.readAll(client, fileId, expectedBytes.length);
+        byte[] actual = Workload.readAll(client, namespace, fileId, expectedBytes.length);
         assertTrue(actual.length >= expectedBytes.length,
                 context + " read " + actual.length + " < acked " + expectedBytes.length);
         assertArrayEquals(expectedBytes, Arrays.copyOf(actual, expectedBytes.length),

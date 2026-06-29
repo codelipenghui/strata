@@ -7,4 +7,4 @@
 #   ./scripts/perf.sh --read-sealed --duration 300
 set -euo pipefail
 cd "$(dirname "$0")/.."
-exec docker compose run --rm --no-deps loadgen perf --meta node1:9100 "$@"
+exec docker compose run --rm --no-deps loadgen perf --controller node1:9100 "$@"

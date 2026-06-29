@@ -16,8 +16,8 @@ This file is the durable source of truth for the development loop — update the
   - `NODE_HEARTBEAT` request gains tagged field `completedCommands` (commandId → status) so the repair coordinator learns copy completion.
   - `SEAL_CHUNK` (0x0015): footer sections from caller are optional; the node always computes CRC_RANGES + STATS itself so recovery-sealed chunks are byte-identical across replicas.
   - Error codes added: 15 NOT_LEADER (tagged leader hint), 16 NO_CAPACITY (placement cannot find 3 nodes).
-- **v0 epoch source:** metadata allocates a monotonic writer epoch per file. v1 can map this to Kafka controller leader epochs; storage layer is agnostic.
-- **v0 metadata service:** single active instance in tests (Curator leader election implemented); leases in leader memory, registrations + file/chunk records in ZK (CAS via znode versions, leader-only writes).
+- **Epoch source:** metadata allocates a monotonic writer epoch per file; the storage layer is agnostic to how the controller sources it.
+- **v0 controller:** single active instance in tests (Curator leader election implemented); leases in leader memory, registrations + file/chunk records in ZK (CAS via znode versions, leader-only writes).
 - **File naming:** every file has a first-class `StrataNamespace` plus `StrataPath`. `FileId` is globally unique; `(namespace, path)` is unique only while a file is live. The v0 ZK backend stores path bindings under `/strata/namespaces/<namespace>/paths/<path>/__file`, leaving that namespace node as the future ACL/quota root.
 
 ## Module layout
@@ -26,8 +26,8 @@ This file is the durable source of truth for the development loop — update the
 strata-common   ids (FileId/ChunkId/NodeId), Varint, Crc32C, ErrorCode, exceptions
 strata-proto    SCP frame codec, tagged fields, opcodes, message structs, Netty-backed ScpClient/ScpServer
 strata-format   chunk file header/footer/trailer, sidecar .meta, integrity ledger .j, ChunkStore engine + crash recovery
-strata-node     storage node: SCP handlers → ChunkStore; register/heartbeat/inventory loop; REPLICATE executor (pull)
-strata-meta     MetadataStore SPI, ZkMetadataStore, MetadataService (SCP listener, placement, leases, repair, retention)
+strata-node     data node: SCP handlers → ChunkStore; register/heartbeat/inventory loop; REPLICATE executor (pull)
+strata-meta     MetadataStore SPI, ZkMetadataStore, Controller (SCP listener, placement, leases, repair, retention)
 strata-client   StrataClient/StrataFile/Appender/Reader per design §12 (quorum ack, DO, roll, create-ahead, recoverAndSeal)
 strata-it       integration tests: in-process cluster + embedded ZK (primary correctness layer); chaos via testcontainers
 tla/            ChunkReplication.tla + TLC config
@@ -41,7 +41,7 @@ scripts/        verify.sh (full pyramid), run helpers
 - [x] 3. SCP framing + messages + roundtrip/golden tests
 - [x] 4. Chunk store engine + crash recovery + torn-write tests
 - [x] 5. Storage node server + single-node integration test
-- [x] 6. Metadata service on ZK (embedded-ZK tests)
+- [x] 6. Controller on ZK (embedded-ZK tests)
 - [x] 7. Client library + 3-node end-to-end happy path
 - [x] 8. Failure paths: fencing, seal-and-roll, seal recovery (§7.3) + fault-injection tests
 - [x] 9. Repair + reconciliation + retention + tests
@@ -95,7 +95,7 @@ scripts/        verify.sh (full pyramid), run helpers
     to agree on length+crc (the appender's check) — never commits metadata over divergent bytes
     (`RecoveryDivergenceTest` constructs same-length-different-bytes replicas).
   - P1 stuck repair: in-flight commands are swept when the executing node is DEAD or the command
-    aged past `repairCommandTimeoutMs` (new MetaConfig field) — the chunksBeingRepaired marker is
+    aged past `repairCommandTimeoutMs` (new ControllerConfig field) — the chunksBeingRepaired marker is
     released and the next scan re-issues (`RepairReliabilityTest`).
   - P2 SEAL_FILE validation: refuses unless every chunk is SEALED and lengths sum to the
     requested total (new error code 19 PRECONDITION_FAILED); also closes the no-epoch zombie
@@ -167,10 +167,10 @@ re-registration on a live connection (stateless RPC), one reviewer self-retracti
   open tail (appenders seal before rolling, recovery seals before new appenders open); racing
   same-epoch appenders could otherwise both claim file offset 0 in different chunks. Fence check
   keeps precedence. Same-epoch dual writers after a seal remain a caller-contract violation that
-  v1 controller-issued unique epochs eliminate. (`MetadataServiceTest`.)
+  v1 controller-issued unique epochs eliminate. (`ControllerTest`.)
 - **P1 DELETING files are immutable to writers** — seal-chunk and SEAL_FILE now reject DELETING
   (SEAL_FILE previously RESURRECTED a half-deleted file to SEALED, stopping deletion with chunks
-  missing). (`MetadataServiceTest`.)
+  missing). (`ControllerTest`.)
 - **P2 read/fetch clamped server-side** at 8 MB per request (allocation was data-bounded, not
   attacker-controlled, but a >64 MB response would die at the frame layer anyway; callers loop).
 - **P2 varint length validation before allocation** — a small frame advertising a huge/negative
@@ -221,7 +221,7 @@ unrelated matrix artifacts.
 CI uploads surefire reports and storage child-process logs from `strata-it/target/process-crash-logs`
 so process-crash failures include the node-side evidence needed for replay and diagnosis.
 The embedded fault gate also covers full service cold restart: clients, metadata, and storage
-services are stopped, storage nodes restart from the same data directories against the same ZK
+services are stopped, data nodes restart from the same data directories against the same ZK
 state, and tests verify sealed-file readability plus recovery of an abandoned open chunk.
 It also restarts the embedded ZooKeeper server itself before bringing metadata/storage back,
 proving the v0 ZK metadata records survive a metadata-store process restart.

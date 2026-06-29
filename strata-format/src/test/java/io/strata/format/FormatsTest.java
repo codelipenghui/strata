@@ -4,6 +4,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
@@ -14,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class FormatsTest {
 
-    private final ChunkId id = new ChunkId(FileId.fromString("11111111-2222-3333-4444-555555555555"), 9);
+    private final ChunkId id = new ChunkId(FileId.fromHex("1111111122223333"), 9);
 
     private static void refreshHeaderCrc(byte[] bytes) {
         ByteBuffer.wrap(bytes).putInt(ChunkFormats.HEADER_SIZE - 4,
@@ -123,5 +124,19 @@ class FormatsTest {
     @Test
     void baseNameRoundtrip() {
         assertEquals(id, ChunkFormats.parseBaseName(ChunkFormats.baseName(id)));
+    }
+
+    @Test
+    void chunkRelativePathSharding() {
+        StrataNamespace ns = StrataNamespace.of("perf-0");
+        // FileId 0, index 0: L1=0x00, L2=0x00
+        assertEquals("perf-0/00/00/0000000000000000.0",
+                ChunkFormats.chunkRelativePath(ns, new ChunkId(FileId.of(0), 0)));
+        // FileId 255 (0xFF), index 0: L1=0xff, L2=0x00
+        assertEquals("perf-0/ff/00/00000000000000ff.0",
+                ChunkFormats.chunkRelativePath(ns, new ChunkId(FileId.of(255), 0)));
+        // FileId 256 (0x100), index 2: L1=0x00, L2=0x01
+        assertEquals("perf-0/00/01/0000000000000100.2",
+                ChunkFormats.chunkRelativePath(ns, new ChunkId(FileId.of(256), 2)));
     }
 }

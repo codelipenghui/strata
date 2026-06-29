@@ -2,6 +2,7 @@ package io.strata.meta;
 
 import io.strata.common.FileState;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.retry.ExponentialBackoffRetry;
@@ -26,7 +27,7 @@ class ZkMetadataStoreCasTest {
     @Test
     void staleNodeWriteLosesCas() throws Exception {
         try (TestingServer zk = new TestingServer(true)) {
-            // two store handles = two metadata service instances
+            // two store handles = two controller instances
             try (ZkMetadataStore leaderA = new ZkMetadataStore(zk.getConnectString());
                  ZkMetadataStore leaderB = new ZkMetadataStore(zk.getConnectString())) {
 
@@ -55,20 +56,21 @@ class ZkMetadataStoreCasTest {
         try (TestingServer zk = new TestingServer(true)) {
             try (ZkMetadataStore leaderA = new ZkMetadataStore(zk.getConnectString());
                  ZkMetadataStore leaderB = new ZkMetadataStore(zk.getConnectString())) {
-                FileId fileId = FileId.random();
+                FileId fileId = FileId.of(1);
+                StrataNamespace ns = StrataNamespace.of("test");
                 Records.FileRecord file = new Records.FileRecord(fileId, "test", "/test-file", 3, 2, false, FileState.OPEN, System.currentTimeMillis(), List.of());
                 leaderA.createFile(file);
-                int v0 = leaderA.getFile(fileId).orElseThrow().version();
+                int v0 = leaderA.getFile(ns, fileId).orElseThrow().version();
 
                 assertTrue(leaderB.updateFile(file.withState(FileState.SEALED), v0));
 
-                assertFalse(leaderA.deleteFile(fileId, v0), "stale-version delete must be rejected");
+                assertFalse(leaderA.deleteFile(ns, fileId, v0), "stale-version delete must be rejected");
                 assertEquals(FileState.SEALED,
-                        leaderA.getFile(fileId).orElseThrow().value().state(),
+                        leaderA.getFile(ns, fileId).orElseThrow().value().state(),
                         "the newer file version must survive");
 
-                int currentVersion = leaderA.getFile(fileId).orElseThrow().version();
-                assertTrue(leaderA.deleteFile(fileId, currentVersion));
+                int currentVersion = leaderA.getFile(ns, fileId).orElseThrow().version();
+                assertTrue(leaderA.deleteFile(ns, fileId, currentVersion));
             }
         }
     }
@@ -81,13 +83,11 @@ class ZkMetadataStoreCasTest {
             curator.start();
             try {
                 try (ZkMetadataStore store = new ZkMetadataStore(curator)) {
-                    assertEquals(1, store.nextNodeId());
                 }
 
                 assertTrue(curator.getZookeeperClient().isConnected(), "store.close must not close external curator");
                 try (ZkMetadataStore second = new ZkMetadataStore(curator)) {
                     assertEquals(List.of(), second.listNamespaces());
-                    assertEquals(2, second.nextNodeId());
                 }
             } finally {
                 curator.close();
@@ -99,12 +99,12 @@ class ZkMetadataStoreCasTest {
     void pathMarkersMustContainAFullFileIdAndMatchDeleteExpectation() throws Exception {
         try (TestingServer zk = new TestingServer(true)) {
             try (ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
-                FileId fileId = FileId.random();
+                FileId fileId = FileId.of(2);
                 Records.FileRecord file = new Records.FileRecord(fileId, "test", "/marker-owner", 3, 2, false, FileState.OPEN,
                         System.currentTimeMillis(), List.of());
                 store.createFile(file);
 
-                FileId other = FileId.random();
+                FileId other = FileId.of(3);
                 store.curator().setData().forPath(markerPath("test", "/marker-owner"), fileIdBytes(other));
                 assertEquals(other, store.resolvePath(file.namespace(), file.path()).orElseThrow());
                 assertFalse(store.deletePath(file.namespace(), file.path(), fileId));
@@ -120,6 +120,6 @@ class ZkMetadataStoreCasTest {
     }
 
     private static byte[] fileIdBytes(FileId id) {
-        return ByteBuffer.allocate(16).putLong(id.msb()).putLong(id.lsb()).array();
+        return ByteBuffer.allocate(8).putLong(id.id()).array();
     }
 }

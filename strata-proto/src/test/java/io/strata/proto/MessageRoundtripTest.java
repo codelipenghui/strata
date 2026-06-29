@@ -3,6 +3,7 @@ package io.strata.proto;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
@@ -14,8 +15,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class MessageRoundtripTest {
 
-    private final FileId f = FileId.fromString("11111111-2222-3333-4444-555555555555");
+    private final FileId f = FileId.fromHex("1111111122223333");
     private final ChunkId c = new ChunkId(f, 3);
+    private final StrataNamespace ns = StrataNamespace.of("test");
 
     private static ByteBuffer buf(byte[] b) {
         return ByteBuffer.wrap(b);
@@ -23,31 +25,31 @@ class MessageRoundtripTest {
 
     @Test
     void dataPlaneRoundtrips() {
-        var open = new Messages.OpenChunk(c, 5, true, 1 << 30, 1718000000000L);
+        var open = new Messages.OpenChunk(c, 5, true, 1 << 30, 1718000000000L, ns);
         assertEquals(open, Messages.OpenChunk.decode(buf(open.encode())));
 
-        var append = new Messages.Append(c, 5, 1024, 512);
+        var append = new Messages.Append(c, 5, 1024, 512, ns);
         assertEquals(append, Messages.Append.decode(buf(append.encode())));
 
-        var read = new Messages.Read(c, 99, 65536);
+        var read = new Messages.Read(c, 99, 65536, ns);
         assertEquals(read, Messages.Read.decode(buf(read.encode())));
 
-        var fence = new Messages.Fence(c, 6);
+        var fence = new Messages.Fence(c, 6, ns);
         assertEquals(fence, Messages.Fence.decode(buf(fence.encode())));
 
-        var stat = new Messages.StatChunk(c);
+        var stat = new Messages.StatChunk(c, ns);
         assertEquals(stat, Messages.StatChunk.decode(buf(stat.encode())));
 
-        var seal = new Messages.SealChunk(c, 5, 4096);
+        var seal = new Messages.SealChunk(c, 5, 4096, ns);
         assertEquals(seal, Messages.SealChunk.decode(buf(seal.encode())));
 
-        var del = new Messages.DeleteChunks(List.of(c, new ChunkId(f, 4)));
+        var del = new Messages.DeleteChunks(List.of(c, new ChunkId(f, 4)), ns);
         assertEquals(del, Messages.DeleteChunks.decode(buf(del.encode())));
 
-        var fetch = new Messages.FetchChunk(c, 0, Integer.MAX_VALUE);
+        var fetch = new Messages.FetchChunk(c, 0, Integer.MAX_VALUE, ns);
         assertEquals(fetch, Messages.FetchChunk.decode(buf(fetch.encode())));
 
-        var rl = new Messages.ReadLedger(c, 2048);
+        var rl = new Messages.ReadLedger(c, 2048, ns);
         assertEquals(rl, Messages.ReadLedger.decode(buf(rl.encode())));
     }
 
@@ -81,7 +83,7 @@ class MessageRoundtripTest {
 
     @Test
     void controlPlaneRoundtrips() {
-        var reg = new Messages.RegisterNode(1L, 2L, List.of("h1:9000", "h2:9000"), "z1", "r1", "host1",
+        var reg = new Messages.RegisterNode(7, 1L, 2L, List.of("h1:9000", "h2:9000"), "z1", "r1", "host1",
                 List.of(new Messages.StorageCapacity(1L << 40)), 1, 0);
         assertEquals(reg, Messages.RegisterNode.decode(buf(reg.encode())));
 
@@ -97,14 +99,10 @@ class MessageRoundtripTest {
         assertEquals(hbEmpty, Messages.NodeHeartbeat.decode(buf(hbEmpty.encode())));
 
         var hbResp = new Messages.HeartbeatResp(123456, List.of(
-                new Messages.ReplicateCmd(1, c, List.of(new Messages.Replica(7, "h7:9000")), (byte) 1, 0xAA, 4096),
-                new Messages.DeleteCmd(2, List.of(c)),
+                new Messages.ReplicateCmd(1, c, List.of(new Messages.Replica(7, "h7:9000")), (byte) 1, 0xAA, 4096, ns),
+                new Messages.DeleteCmd(2, List.of(c), ns),
                 new Messages.DrainCmd(3)));
         assertEquals(hbResp, decodeResp(hbResp.encode(), Messages.HeartbeatResp::decode));
-
-        var inv = new Messages.InventoryReport(42, 1, 2, 9, 0, 1,
-                List.of(new Messages.InventoryEntry(c, ChunkState.SEALED, 4096, 0xAB)));
-        assertEquals(inv, Messages.InventoryReport.decode(buf(inv.encode())));
     }
 
     @Test
@@ -129,35 +127,35 @@ class MessageRoundtripTest {
         var cfr = new Messages.CreateFileResp(f);
         assertEquals(cfr, decodeResp(cfr.encode(), Messages.CreateFileResp::decode));
 
-        var cc = new Messages.CreateChunk(f, 5);
+        var cc = new Messages.CreateChunk(ns, f, 5);
         assertEquals(cc, Messages.CreateChunk.decode(buf(cc.encode())));
 
-        var ccExcluded = new Messages.CreateChunk(f, 5, 11, 12, List.of(2, 4));
+        var ccExcluded = new Messages.CreateChunk(ns, f, 5, 11, 12, List.of(2, 4));
         assertEquals(ccExcluded, Messages.CreateChunk.decode(buf(ccExcluded.encode())));
 
         var ccr = new Messages.CreateChunkResp(c, 5,
                 List.of(new Messages.Replica(1, "a:1"), new Messages.Replica(2, "b:2"), new Messages.Replica(3, "c:3")));
         assertEquals(ccr, decodeResp(ccr.encode(), Messages.CreateChunkResp::decode));
 
-        var appendEpoch = Messages.AllocateWriterEpoch.forAppend(f);
+        var appendEpoch = Messages.AllocateWriterEpoch.forAppend(ns, f);
         assertEquals(appendEpoch, Messages.AllocateWriterEpoch.decode(buf(appendEpoch.encode())));
 
-        var recoveryEpoch = Messages.AllocateWriterEpoch.forRecovery(f);
+        var recoveryEpoch = Messages.AllocateWriterEpoch.forRecovery(ns, f);
         assertEquals(recoveryEpoch, Messages.AllocateWriterEpoch.decode(buf(recoveryEpoch.encode())));
 
         assertThrows(IllegalArgumentException.class,
-                () -> new Messages.AllocateWriterEpoch(f, (byte) 99));
+                () -> new Messages.AllocateWriterEpoch(ns, f, (byte) 99));
 
         var epochResp = new Messages.AllocateWriterEpochResp(7);
         assertEquals(epochResp, decodeResp(epochResp.encode(), Messages.AllocateWriterEpochResp::decode));
 
-        var scm = new Messages.SealChunkMeta(c, 5, 4096, 0xDD, List.of(1, 2));
+        var scm = new Messages.SealChunkMeta(ns, c, 5, 4096, 0xDD, List.of(1, 2));
         assertEquals(scm, Messages.SealChunkMeta.decode(buf(scm.encode())));
 
-        var abort = new Messages.AbortChunkMeta(c, 5, 1, 2);
+        var abort = new Messages.AbortChunkMeta(ns, c, 5, 1, 2);
         assertEquals(abort, Messages.AbortChunkMeta.decode(buf(abort.encode())));
 
-        var lf = new Messages.LookupFile(f);
+        var lf = new Messages.LookupFile(ns, f);
         assertEquals(lf, Messages.LookupFile.decode(buf(lf.encode())));
 
         var lp = new Messages.LookupPath("test", "/kafka/topicA/0/00000000000000000000");
@@ -172,13 +170,13 @@ class MessageRoundtripTest {
                                 List.of(new Messages.Replica(1, "a:1")))));
         assertEquals(lfr, decodeResp(lfr.encode(), Messages.LookupFileResp::decode));
 
-        var df = new Messages.DeleteFiles(List.of(f));
+        var df = new Messages.DeleteFiles(ns, List.of(f));
         assertEquals(df, Messages.DeleteFiles.decode(buf(df.encode())));
 
         var dfr = new Messages.DeleteFilesResp(List.of(f), List.of((short) 0));
         assertEquals(dfr, decodeResp(dfr.encode(), Messages.DeleteFilesResp::decode));
 
-        var sf = new Messages.SealFile(f, 1 << 20);
+        var sf = new Messages.SealFile(ns, f, 1 << 20);
         assertEquals(sf, Messages.SealFile.decode(buf(sf.encode())));
     }
 

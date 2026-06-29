@@ -20,7 +20,7 @@ class ManagedScpConnectionHintTest {
     void malformedLeaderHintFallsBackToConfiguredEndpoint() {
         try (ManagedScpConnection conn = new ManagedScpConnection(
                 List.of("127.0.0.1:1"), ConnectionPolicy.DEFAULT, ScpClient.KIND_BROKER,
-                "test", "metadata endpoint", true, false)) {
+                "test", "controller endpoint", true, false)) {
             byte[] header = new BufWriter().noTags().toBytes();
             conn.preferEndpoint("bad-host:notaport");  // unparseable hint from a misconfigured peer
 

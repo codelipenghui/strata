@@ -30,9 +30,10 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Storage-node control plane (tech design §10.4): register, heartbeat (commands ride the
- * responses), inventory reports, and the REPLICATE executor (pull via FETCH_CHUNK).
- * Storage nodes never read cluster metadata — everything here is self-reporting and obedience.
+ * Data-node control plane (tech design §10.4): register, heartbeat (commands ride the
+ * responses), the periodic scrub (durability reconciles via owner-pull VERIFY_CHUNKS, not a
+ * node inventory push), and the REPLICATE executor (pull via FETCH_CHUNK).
+ * Data nodes never read cluster metadata — everything here is self-reporting and obedience.
  */
 final class ControlLoop implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ControlLoop.class);
@@ -40,14 +41,14 @@ final class ControlLoop implements AutoCloseable {
     private static final int FETCH_CHUNK_BYTES = 4 * 1024 * 1024;
     private static final long MAX_REPAIR_FOOTER_BYTES = 64L * 1024 * 1024;
 
-    private final StorageNode node;
-    private final NodeConfig config;
+    private final DataNode node;
+    private final DataNodeConfig config;
     private final ChunkStore store;
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final LinkedBlockingQueue<Messages.Command> commandQueue = new LinkedBlockingQueue<>();
     private final ConcurrentLinkedQueue<Messages.CompletedCommand> completed = new ConcurrentLinkedQueue<>();
 
-    private volatile ManagedScpConnection meta;
+    private volatile ManagedScpConnection controller;
     private volatile long sessionEpoch = -1;
     private volatile int heartbeatIntervalMs = 1_000;
     // confined to the control (run) thread today; volatile guards the lock-discipline asymmetry —
@@ -55,7 +56,7 @@ final class ControlLoop implements AutoCloseable {
     private volatile int endpointIndex = 0;
     private final Backoff backoff;
 
-    ControlLoop(StorageNode node, NodeConfig config, ChunkStore store) {
+    ControlLoop(DataNode node, DataNodeConfig config, ChunkStore store) {
         this.node = node;
         this.config = config;
         this.store = store;
@@ -73,7 +74,7 @@ final class ControlLoop implements AutoCloseable {
     void start() {
         threads.add(Thread.ofVirtual().name("node-control-" + node.incarnation()).start(this::run));
         threads.add(Thread.ofVirtual().name("node-cmd-exec-" + node.incarnation()).start(this::executeCommands));
-        threads.add(Thread.ofVirtual().name("node-inventory-" + node.incarnation()).start(this::inventoryLoop));
+        threads.add(Thread.ofVirtual().name("node-scrub-" + node.incarnation()).start(this::scrubLoop));
     }
 
     private void run() {
@@ -81,7 +82,7 @@ final class ControlLoop implements AutoCloseable {
             try {
                 ensureRegistered();
                 if (closed.get()) {
-                    continue; // raced with close(): skip heartbeat (meta may be absent) and exit
+                    continue; // raced with close(): skip heartbeat (controller may be absent) and exit
                 }
                 heartbeatOnce();
                 backoff.reset();
@@ -127,27 +128,31 @@ final class ControlLoop implements AutoCloseable {
             // shutting down: do not create a fresh connection that close() might race past
             return;
         }
-        if (meta == null) {
+        if (controller == null) {
             disconnect();
-            String ep = config.metadataEndpoints().get(endpointIndex % config.metadataEndpoints().size());
+            String ep = config.controllerEndpoints().get(endpointIndex % config.controllerEndpoints().size());
             Endpoint.parse(ep, "endpoint", ErrorCode.INTERNAL);
-            meta = new ManagedScpConnection(List.of(ep), config.connectionPolicy(),
-                    ScpClient.KIND_STORAGE_NODE, "node-" + node.incarnation(),
-                    "metadata endpoint", false, false);
+            controller = new ManagedScpConnection(List.of(ep), config.connectionPolicy(),
+                    ScpClient.KIND_DATA_NODE, "node-" + node.incarnation(),
+                    "controller endpoint", false, false);
             sessionEpoch = -1;
         }
         if (sessionEpoch < 0) {
             var reg = new Messages.RegisterNode(
+                    node.nodeId(),
                     node.incarnation().getMostSignificantBits(), node.incarnation().getLeastSignificantBits(),
                     List.of(node.endpoint()), config.zone(), config.rack(), config.host(),
                     List.of(new Messages.StorageCapacity(config.capacityBytes())),
                     1, 0);
-            ByteBuffer resp = meta.call(Opcode.REGISTER_NODE, reg.encode(), null, CALL_TIMEOUT_MS);
+            ByteBuffer resp = controller.call(Opcode.REGISTER_NODE, reg.encode(), null, CALL_TIMEOUT_MS);
             var r = Messages.RegisterResp.decode(resp);
-            node.nodeIdAssigned(r.nodeId());
+            if (r.nodeId() != node.nodeId()) {
+                // the node owns its id (volume-bound, STRATA_NODE_ID); the leader only echoes it back
+                log.warn("controller echoed nodeId {} but this node is {}", r.nodeId(), node.nodeId());
+            }
             sessionEpoch = r.sessionEpoch();
             heartbeatIntervalMs = Math.max(100, r.heartbeatIntervalMs());
-            log.info("registered: nodeId={} session={} hb={}ms", r.nodeId(), r.sessionEpoch(), r.heartbeatIntervalMs());
+            log.info("registered: nodeId={} session={} hb={}ms", node.nodeId(), r.sessionEpoch(), r.heartbeatIntervalMs());
         }
     }
 
@@ -163,7 +168,7 @@ final class ControlLoop implements AutoCloseable {
                 List.of(new Messages.StorageUsage(used, Math.max(0, config.capacityBytes() - used))),
                 commandQueue.size(), done);
         try {
-            ByteBuffer resp = meta.call(Opcode.NODE_HEARTBEAT, hb.encode(), null, CALL_TIMEOUT_MS);
+            ByteBuffer resp = controller.call(Opcode.NODE_HEARTBEAT, hb.encode(), null, CALL_TIMEOUT_MS);
             var r = Messages.HeartbeatResp.decode(resp);
             commandQueue.addAll(r.commands());
         } catch (RuntimeException e) {
@@ -187,7 +192,7 @@ final class ControlLoop implements AutoCloseable {
                     case Messages.ReplicateCmd r -> replicate(r);
                     case Messages.DeleteCmd d -> {
                         for (var id : d.chunkIds()) {
-                            ErrorCode result = store.delete(id);
+                            ErrorCode result = store.delete(d.namespace(), id);
                             if (result != ErrorCode.OK && result != ErrorCode.CHUNK_NOT_FOUND) {
                                 throw new ScpException(result, "delete " + id + " failed");
                             }
@@ -206,11 +211,11 @@ final class ControlLoop implements AutoCloseable {
         }
     }
 
-    private void replicate(Messages.ReplicateCmd cmd) throws IOException {
-        if (store.contains(cmd.chunkId())) {
+    void replicate(Messages.ReplicateCmd cmd) throws IOException {
+        if (store.contains(cmd.namespace(), cmd.chunkId())) {
             // command replay — but only a VALID copy counts: a local chunk whose seal state or
             // crc/length mismatch the descriptor is corrupt and must be replaced, not trusted
-            var stat = store.stat(cmd.chunkId());
+            var stat = store.stat(cmd.namespace(), cmd.chunkId());
             if (stat.state() == io.strata.common.ChunkState.SEALED
                     && stat.sealedLength() == cmd.expectedLength()
                     && stat.dataCrc() == cmd.expectedCrc()) {
@@ -218,7 +223,7 @@ final class ControlLoop implements AutoCloseable {
             }
             log.warn("local copy of {} mismatches descriptor (state={} len={} crc={}) — re-pulling",
                     cmd.chunkId(), stat.state(), stat.sealedLength(), stat.dataCrc());
-            ErrorCode deleteResult = store.delete(cmd.chunkId());
+            ErrorCode deleteResult = store.delete(cmd.namespace(), cmd.chunkId());
             if (deleteResult != ErrorCode.OK && deleteResult != ErrorCode.CHUNK_NOT_FOUND) {
                 throw new ScpException(deleteResult, "delete stale local copy of " + cmd.chunkId() + " failed");
             }
@@ -228,12 +233,12 @@ final class ControlLoop implements AutoCloseable {
             if (source.nodeId() == node.nodeId()) continue;
             try {
                 Endpoint hp = Endpoint.parse(source.endpoint(), "endpoint", ErrorCode.INTERNAL);
-                try (ScpClient src = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_STORAGE_NODE,
+                try (ScpClient src = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_DATA_NODE,
                         "repair-" + node.nodeId())) {
                     Path tmp = store.createImportTemp(cmd.chunkId());
                     try {
                         long fileLength = fetchWholeFile(src, cmd, tmp);
-                        store.importSealed(cmd.chunkId(), tmp, cmd.expectedLength(), cmd.expectedCrc());
+                        store.importSealed(cmd.namespace(), cmd.chunkId(), tmp, cmd.expectedLength(), cmd.expectedCrc());
                         tmp = null; // importSealed consumes the temp file by moving it into place.
                         log.info("replicated {} from node {} ({} bytes)", cmd.chunkId(), source.nodeId(), fileLength);
                     } finally {
@@ -261,7 +266,7 @@ final class ControlLoop implements AutoCloseable {
         try (FileChannel out = FileChannel.open(output,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
             while (fileLength < 0 || offset < fileLength) {
-                var fetch = new Messages.FetchChunk(cmd.chunkId(), offset, FETCH_CHUNK_BYTES);
+                var fetch = new Messages.FetchChunk(cmd.chunkId(), offset, FETCH_CHUNK_BYTES, cmd.namespace());
                 var frame = src.callFrame(Opcode.FETCH_CHUNK, fetch.encode(), null, CALL_TIMEOUT_MS);
                 Messages.FetchResp resp;
                 try {
@@ -329,29 +334,19 @@ final class ControlLoop implements AutoCloseable {
         return max;
     }
 
-    private void inventoryLoop() {
-        int cycle = 0;
+    /**
+     * Periodic local data scrub (design §20.3). With durability reconciliation now owner-driven (the
+     * owner pulls VERIFY_CHUNKS), there is no inventory push; the node only re-CRCs its sealed chunks so
+     * data rot surfaces in the next VERIFY_CHUNKS answer and the owner drops + re-repairs the replica.
+     */
+    private void scrubLoop() {
         while (!closed.get()) {
-            sleepQuiet(config.inventoryIntervalMs());
+            sleepQuiet(config.scrubIntervalMs());
             if (closed.get()) return;
             try {
-                // periodic scrub (every 10th cycle): recompute sealed data CRCs so rot shows up
-                // in the NEXT report's crc and the coordinator drops + re-repairs the replica
-                if (++cycle % 10 == 0) {
-                    store.scrubOnce();
-                }
-                ManagedScpConnection m = meta;
-                if (m == null || sessionEpoch < 0) continue;
-                List<Messages.InventoryEntry> entries = new ArrayList<>();
-                for (var item : store.inventory()) {
-                    entries.add(new Messages.InventoryEntry(item.chunkId(), item.state(), item.length(), item.crc()));
-                }
-                var report = new Messages.InventoryReport(node.nodeId(),
-                        node.incarnation().getMostSignificantBits(), node.incarnation().getLeastSignificantBits(),
-                        sessionEpoch, 0, 1, entries);
-                m.call(Opcode.INVENTORY_REPORT, report.encode(), null, CALL_TIMEOUT_MS);
+                store.scrubOnce();
             } catch (Exception e) {
-                log.debug("inventory report failed: {}", e.toString());
+                log.debug("scrub failed: {}", e.toString());
             }
         }
     }
@@ -362,8 +357,8 @@ final class ControlLoop implements AutoCloseable {
     }
 
     private void disconnect() {
-        ManagedScpConnection m = meta;
-        meta = null;
+        ManagedScpConnection m = controller;
+        controller = null;
         sessionEpoch = -1;
         if (m != null) m.close();
     }

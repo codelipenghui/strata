@@ -1,36 +1,18 @@
 package io.strata.common;
 
 import java.nio.ByteBuffer;
-import java.util.UUID;
 
-/** Identifier of a storage-layer file (tech design §3). */
-public record FileId(long msb, long lsb) implements Comparable<FileId> {
-    public static FileId random() {
-        UUID u = UUID.randomUUID();
-        return new FileId(u.getMostSignificantBits(), u.getLeastSignificantBits());
-    }
+/** Identifier of a storage-layer file, unique WITHIN a namespace (owner-assigned long). */
+public record FileId(long id) implements Comparable<FileId> {
+    public static FileId of(long id) { return new FileId(id); }
 
-    public static FileId fromString(String s) {
-        UUID u = UUID.fromString(s);
-        return new FileId(u.getMostSignificantBits(), u.getLeastSignificantBits());
-    }
+    public static FileId fromHex(String s) { return new FileId(Long.parseUnsignedLong(s, 16)); }
 
-    public void writeTo(ByteBuffer buf) {
-        buf.putLong(msb).putLong(lsb);
-    }
+    public void writeTo(ByteBuffer buf) { buf.putLong(id); }
 
-    public static FileId readFrom(ByteBuffer buf) {
-        return new FileId(buf.getLong(), buf.getLong());
-    }
+    public static FileId readFrom(ByteBuffer buf) { return new FileId(buf.getLong()); }
 
-    @Override
-    public String toString() {
-        return new UUID(msb, lsb).toString();
-    }
+    @Override public String toString() { return String.format("%016x", id); }
 
-    @Override
-    public int compareTo(FileId o) {
-        int c = Long.compareUnsigned(msb, o.msb);
-        return c != 0 ? c : Long.compareUnsigned(lsb, o.lsb);
-    }
+    @Override public int compareTo(FileId o) { return Long.compareUnsigned(id, o.id); }
 }

@@ -75,7 +75,8 @@ class ClientServerTest {
                 // server-side ScpException becomes a typed client-side exception
                 ScpException e = assertThrows(ScpException.class,
                         () -> client.call(Opcode.READ, new Messages.Read(
-                                new io.strata.common.ChunkId(io.strata.common.FileId.random(), 0), 0, 1).encode(), null, 2000));
+                                new io.strata.common.ChunkId(io.strata.common.FileId.of(1), 0), 0, 1,
+                                io.strata.common.StrataNamespace.of("test")).encode(), null, 2000));
                 assertEquals(ErrorCode.UNKNOWN_OPCODE, e.code());
             }
         }

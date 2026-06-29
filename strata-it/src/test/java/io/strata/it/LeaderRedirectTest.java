@@ -3,7 +3,7 @@ package io.strata.it;
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.common.FileId;
-import io.strata.meta.MetadataService;
+import io.strata.meta.Controller;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -25,7 +25,7 @@ class LeaderRedirectTest {
         try (MiniCluster cluster = new MiniCluster(0, null, 3)) {
             cluster.awaitAnyLeader();
 
-            MetadataService standby = cluster.metas.stream()
+            Controller standby = cluster.metas.stream()
                     .filter(m -> !m.isLeader())
                     .findFirst()
                     .orElseThrow(() -> new AssertionError("expected a standby among 3 metas"));

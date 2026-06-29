@@ -29,10 +29,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * round-trips, so mixed-version clients/nodes cannot silently drift on encodings.
  */
 class MessageGoldenCorpusTest {
-    private static final FileId FILE_ID = FileId.fromString("11111111-2222-3333-4444-555555555555");
+    private static final FileId FILE_ID = FileId.fromHex("1111111122223333");
     private static final ChunkId CHUNK_ID = new ChunkId(FILE_ID, 3);
     private static final long OP_ID_MSB = 0x0123456789abcdefL;
     private static final long OP_ID_LSB = 0xfedcba9876543210L;
+    private static final StrataNamespace NS = StrataNamespace.of("test");
 
     @Test
     void opcodeTableIsAppendOnlyGoldenCorpus() {
@@ -51,7 +52,6 @@ class MessageGoldenCorpusTest {
                 "READ_RECOVERY=0x001a",
                 "REGISTER_NODE=0x0101",
                 "NODE_HEARTBEAT=0x0102",
-                "INVENTORY_REPORT=0x0103",
                 "CREATE_FILE=0x0201",
                 "CREATE_CHUNK=0x0202",
                 "SEAL_CHUNK_META=0x0203",
@@ -60,7 +60,9 @@ class MessageGoldenCorpusTest {
                 "SEAL_FILE=0x0206",
                 "ABORT_CHUNK_META=0x0207",
                 "LOOKUP_PATH=0x0208",
-                "ALLOCATE_WRITER_EPOCH=0x0209"),
+                "ALLOCATE_WRITER_EPOCH=0x0209",
+                "EXEC_REPLICATE=0x001b",
+                "VERIFY_CHUNKS=0x001c"),
                 Arrays.stream(Opcode.values())
                         .map(op -> op.name() + "=0x" + String.format("%04x", op.code & 0xFFFF))
                         .toList());
@@ -115,14 +117,14 @@ class MessageGoldenCorpusTest {
 
     @Test
     void completeFrameMatchesGoldenCorpus() throws Exception {
-        Frame frame = Frame.request(Opcode.READ, new Messages.Read(CHUNK_ID, 99, 65_536).encode(),
+        Frame frame = Frame.request(Opcode.READ, new Messages.Read(CHUNK_ID, 99, 65_536, NS).encode(),
                 null, 0x0102030405060708L);
 
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         FrameIO.write(new DataOutputStream(bytes), frame);
 
-        String expected = "0000003b5c01001200010000010203040506070800000000000000000021"
-                + "111111112222333344445555555555550000000300000000000000630001000000";
+        String expected = "000000385c0100120001000001020304050607080000000000000000001e"
+                + "111111112222333300000003000000000000006300010000" + "0474657374" + "00";
         assertEquals(expected, hex(bytes.toByteArray()));
 
         Frame decoded = FrameIO.read(new DataInputStream(new ByteArrayInputStream(hexBytes(expected))));
@@ -130,7 +132,7 @@ class MessageGoldenCorpusTest {
         assertEquals(1, decoded.apiVersion());
         assertFalse(decoded.isResponse());
         assertEquals(0x0102030405060708L, decoded.correlationId());
-        assertEquals(new Messages.Read(CHUNK_ID, 99, 65_536),
+        assertEquals(new Messages.Read(CHUNK_ID, 99, 65_536, NS),
                 Messages.Read.decode(decoded.headerSlice()));
         assertEquals(0, decoded.payloadLength());
     }
@@ -150,53 +152,57 @@ class MessageGoldenCorpusTest {
                         () -> new Messages.HelloResp(0x0102030405060708L, 42, 0x1111222233334444L,
                                 0x5555666677778888L, FrameIO.MAX_FRAME_BYTES, 1L << 30).encode(),
                         Messages.HelloResp::decode,
+                        // EXEC_REPLICATE moved from 0x020a (control-plane range) to 0x001b (data-plane)
+                        // to fix combined-node routing: opcodes >= 0x0100 route to Controller, but
+                        // EXEC_REPLICATE is handled by DataNodeHandlers (Bug B fix). VERIFY_CHUNKS (0x001c)
+                        // appended (§20.3); INVENTORY_REPORT (0x0103) removed (§20.3) — count back to 0x19.
                         "0000000101020304050607080000002a11112222333344445555666677778888"
-                                + "04000000000000004000000018000100010010000100110001001200010013"
-                                + "0001001400010015000100160001001700010018000100190001001a0001"
-                                + "010100010102000101030001020100010202000102030001020400010205"
-                                + "00010206000102070001020800010209000100"),
+                                + "040000000000000040000000190001000100100001001100010012000100130001"
+                                + "001400010015000100160001001700010018000100190001001a000101010001"
+                                + "0102000102010001020200010203000102040001020500010206000102070001"
+                                + "0208000102090001001b0001001c000100"),
                 request("openChunk",
-                        new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L),
-                        () -> new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L).encode(),
+                        new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L, NS),
+                        () -> new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L, NS).encode(),
                         Messages.OpenChunk::decode,
-                        "111111112222333344445555555555550000000300000005010000000040000000"
-                                + "0000019000c79c0000"),
+                        "11111111222233330000000300000005010000000040000000"
+                                + "0000019000c79c000474657374" + "00"),
                 request("append",
-                        new Messages.Append(CHUNK_ID, 5, 1024, 512),
-                        () -> new Messages.Append(CHUNK_ID, 5, 1024, 512).encode(),
+                        new Messages.Append(CHUNK_ID, 5, 1024, 512, NS),
+                        () -> new Messages.Append(CHUNK_ID, 5, 1024, 512, NS).encode(),
                         Messages.Append::decode,
-                        "1111111122223333444455555555555500000003000000050000000000000400"
-                                + "000000000000020000"),
+                        "111111112222333300000003000000050000000000000400"
+                                + "0000000000000200" + "0474657374" + "00"),
                 response("appendResp",
                         new Messages.AppendResp(2048),
                         () -> new Messages.AppendResp(2048).encode(),
                         Messages.AppendResp::decode,
                         "0000000000000000080000"),
                 request("read",
-                        new Messages.Read(CHUNK_ID, 99, 65_536),
-                        () -> new Messages.Read(CHUNK_ID, 99, 65_536).encode(),
+                        new Messages.Read(CHUNK_ID, 99, 65_536, NS),
+                        () -> new Messages.Read(CHUNK_ID, 99, 65_536, NS).encode(),
                         Messages.Read::decode,
-                        "111111112222333344445555555555550000000300000000000000630001000000"),
+                        "111111112222333300000003000000000000006300010000" + "0474657374" + "00"),
                 response("readResp",
                         new Messages.ReadResp(4096, 2048),
                         () -> new Messages.ReadResp(4096, 2048).encode(),
                         Messages.ReadResp::decode,
                         "00000000000000001000000000000000080000"),
                 request("fence",
-                        new Messages.Fence(CHUNK_ID, 6),
-                        () -> new Messages.Fence(CHUNK_ID, 6).encode(),
+                        new Messages.Fence(CHUNK_ID, 6, NS),
+                        () -> new Messages.Fence(CHUNK_ID, 6, NS).encode(),
                         Messages.Fence::decode,
-                        "11111111222233334444555555555555000000030000000600"),
+                        "11111111222233330000000300000006" + "0474657374" + "00"),
                 response("fenceResp",
                         new Messages.FenceResp(7, 100, 80, ChunkState.OPEN),
                         () -> new Messages.FenceResp(7, 100, 80, ChunkState.OPEN).encode(),
                         Messages.FenceResp::decode,
                         "000000000007000000000000006400000000000000500000"),
                 request("statChunk",
-                        new Messages.StatChunk(CHUNK_ID),
-                        () -> new Messages.StatChunk(CHUNK_ID).encode(),
+                        new Messages.StatChunk(CHUNK_ID, NS),
+                        () -> new Messages.StatChunk(CHUNK_ID, NS).encode(),
                         Messages.StatChunk::decode,
-                        "111111112222333344445555555555550000000300"),
+                        "111111112222333300000003" + "0474657374" + "00"),
                 response("statResp",
                         new Messages.StatResp(ChunkState.SEALED, 100, 100, 5, 7, 100, 0xCAFE),
                         () -> new Messages.StatResp(ChunkState.SEALED, 100, 100, 5, 7, 100,
@@ -205,41 +211,40 @@ class MessageGoldenCorpusTest {
                         "000001000000000000006400000000000000640000000500000007000000000000"
                                 + "00640000cafe00"),
                 request("sealChunk",
-                        new Messages.SealChunk(CHUNK_ID, 5, 4096),
-                        () -> new Messages.SealChunk(CHUNK_ID, 5, 4096).encode(),
+                        new Messages.SealChunk(CHUNK_ID, 5, 4096, NS),
+                        () -> new Messages.SealChunk(CHUNK_ID, 5, 4096, NS).encode(),
                         Messages.SealChunk::decode,
-                        "111111112222333344445555555555550000000300000005000000000000100000"),
+                        "1111111122223333000000030000000500000000000010000474657374" + "00"),
                 response("sealResp",
                         new Messages.SealResp(4096, 0xBEEF),
                         () -> new Messages.SealResp(4096, 0xBEEF).encode(),
                         Messages.SealResp::decode,
                         "000000000000000010000000beef00"),
                 request("deleteChunks",
-                        new Messages.DeleteChunks(List.of(CHUNK_ID, new ChunkId(FILE_ID, 4))),
-                        () -> new Messages.DeleteChunks(List.of(CHUNK_ID, new ChunkId(FILE_ID, 4))).encode(),
+                        new Messages.DeleteChunks(List.of(CHUNK_ID, new ChunkId(FILE_ID, 4)), NS),
+                        () -> new Messages.DeleteChunks(List.of(CHUNK_ID, new ChunkId(FILE_ID, 4)), NS).encode(),
                         Messages.DeleteChunks::decode,
-                        "021111111122223333444455555555555500000003111111112222333344445555"
-                                + "555555550000000400"),
+                        "02111111112222333300000003111111112222333300000004" + "0474657374" + "00"),
                 response("deleteChunksResp",
                         new Messages.DeleteChunksResp(List.of(CHUNK_ID), List.of((short) 0)),
                         () -> new Messages.DeleteChunksResp(List.of(CHUNK_ID), List.of((short) 0)).encode(),
                         Messages.DeleteChunksResp::decode,
-                        "0000011111111122223333444455555555555500000003000000"),
+                        "000001111111112222333300000003000000"),
                 request("fetchChunk",
-                        new Messages.FetchChunk(CHUNK_ID, 0, Integer.MAX_VALUE),
-                        () -> new Messages.FetchChunk(CHUNK_ID, 0, Integer.MAX_VALUE).encode(),
+                        new Messages.FetchChunk(CHUNK_ID, 0, Integer.MAX_VALUE, NS),
+                        () -> new Messages.FetchChunk(CHUNK_ID, 0, Integer.MAX_VALUE, NS).encode(),
                         Messages.FetchChunk::decode,
-                        "111111112222333344445555555555550000000300000000000000007fffffff00"),
+                        "11111111222233330000000300000000000000007fffffff" + "0474657374" + "00"),
                 response("fetchResp",
                         new Messages.FetchResp(8192, ChunkState.SEALED),
                         () -> new Messages.FetchResp(8192, ChunkState.SEALED).encode(),
                         Messages.FetchResp::decode,
                         "000000000000000020000100"),
                 request("readLedger",
-                        new Messages.ReadLedger(CHUNK_ID, 2048),
-                        () -> new Messages.ReadLedger(CHUNK_ID, 2048).encode(),
+                        new Messages.ReadLedger(CHUNK_ID, 2048, NS),
+                        () -> new Messages.ReadLedger(CHUNK_ID, 2048, NS).encode(),
                         Messages.ReadLedger::decode,
-                        "1111111122223333444455555555555500000003000000000000080000"),
+                        "11111111222233330000000300000000000008000474657374" + "00"),
                 response("readLedgerResp",
                         new Messages.ReadLedgerResp(List.of(
                                 new Messages.LedgerEntry(100, 1, 5),
@@ -250,15 +255,15 @@ class MessageGoldenCorpusTest {
                         Messages.ReadLedgerResp::decode,
                         "0000020000000000000064000000010000000500000000000000c800000002"
                                 + "0000000500"),
-                request("registerNode",
-                        new Messages.RegisterNode(1, 2, List.of("h1:9000", "h2:9000"), "z1",
+                request("registerDataNode",
+                        new Messages.RegisterNode(7, 1, 2, List.of("h1:9000", "h2:9000"), "z1",
                                 "r1", "host1", List.of(new Messages.StorageCapacity(1L << 40)),
                                 1, 0),
-                        () -> new Messages.RegisterNode(1, 2, List.of("h1:9000", "h2:9000"),
+                        () -> new Messages.RegisterNode(7, 1, 2, List.of("h1:9000", "h2:9000"),
                                 "z1", "r1", "host1",
                                 List.of(new Messages.StorageCapacity(1L << 40)), 1, 0).encode(),
                         Messages.RegisterNode::decode,
-                        "00000000000000010000000000000002020768313a393030300768323a39303030"
+                        "0000000700000000000000010000000000000002020768313a393030300768323a39303030"
                                 + "027a3102723105686f73743101000001000000000000000001000000000000000000"),
                 response("registerResp",
                         new Messages.RegisterResp(42, 9, 1000, 10_000),
@@ -284,59 +289,47 @@ class MessageGoldenCorpusTest {
                         new Messages.HeartbeatResp(123_456, List.of(
                                 new Messages.ReplicateCmd(1, CHUNK_ID,
                                         List.of(new Messages.Replica(7, "h7:9000")),
-                                        (byte) 1, 0xAA, 4096),
-                                new Messages.DeleteCmd(2, List.of(CHUNK_ID)),
+                                        (byte) 1, 0xAA, 4096, NS),
+                                new Messages.DeleteCmd(2, List.of(CHUNK_ID), NS),
                                 new Messages.DrainCmd(3))),
                         () -> new Messages.HeartbeatResp(123_456, List.of(
                                 new Messages.ReplicateCmd(1, CHUNK_ID,
                                         List.of(new Messages.Replica(7, "h7:9000")),
-                                        (byte) 1, 0xAA, 4096),
-                                new Messages.DeleteCmd(2, List.of(CHUNK_ID)),
+                                        (byte) 1, 0xAA, 4096, NS),
+                                new Messages.DeleteCmd(2, List.of(CHUNK_ID), NS),
                                 new Messages.DrainCmd(3))).encode(),
                         Messages.HeartbeatResp::decode,
-                        "0000000000000001e2400300000000000000010111111111222233334444555555"
-                                + "5555550000000301000000070768373a3930303001000000aa000000000000"
-                                + "1000000000000000000202011111111122223333444455555555555500000003"
-                                + "00000000000000030300"),
-                request("inventoryReport",
-                        new Messages.InventoryReport(42, 1, 2, 9, 0, 1,
-                                List.of(new Messages.InventoryEntry(CHUNK_ID, ChunkState.SEALED,
-                                        4096, 0xAB))),
-                        () -> new Messages.InventoryReport(42, 1, 2, 9, 0, 1,
-                                List.of(new Messages.InventoryEntry(CHUNK_ID, ChunkState.SEALED,
-                                        4096, 0xAB))).encode(),
-                        Messages.InventoryReport::decode,
-                        "0000002a000000000000000100000000000000020000000000000009000000000000"
-                                + "0001011111111122223333444455555555555500000003010000000000001000"
-                                + "000000ab00"),
+                        "0000000000000001e240030000000000000001011111111122223333000000030100000007"
+                                + "0768373a3930303001000000aa00000000000010000474657374"
+                                + "000000000000000202011111111122223333000000030474657374" + "0000000000000003" + "03" + "00"),
                 request("createFile",
                         new Messages.CreateFile("test", "/kafka/topicA/0/00000000000000000000",
-                                FILE_ID, OP_ID_MSB, OP_ID_LSB),
+                                OP_ID_MSB, OP_ID_LSB),
                         () -> new Messages.CreateFile("test", "/kafka/topicA/0/00000000000000000000",
-                                FILE_ID, OP_ID_MSB, OP_ID_LSB).encode(),
+                                OP_ID_MSB, OP_ID_LSB).encode(),
                         Messages.CreateFile::decode,
-                        "0474657374242f6b61666b612f746f706963412f302f3030303030303030303030303030303030303030000000030000000200111111112222333344445555555555550123456789abcdeffedcba987654321000"),
+                        "0474657374242f6b61666b612f746f706963412f302f3030303030303030303030303030303030303030000000030000000200"
+                                + "0123456789abcdeffedcba987654321000"),
                 request("createFileCustomPolicy",
                         new Messages.CreateFile(StrataNamespace.of("tenant-a"),
                                 StrataPath.of("/cluster/topic/partition-0"),
-                                new Messages.WritePolicy(5, 3, true), FILE_ID, OP_ID_MSB, OP_ID_LSB),
+                                new Messages.WritePolicy(5, 3, true), OP_ID_MSB, OP_ID_LSB),
                         () -> new Messages.CreateFile(StrataNamespace.of("tenant-a"),
                                 StrataPath.of("/cluster/topic/partition-0"),
-                                new Messages.WritePolicy(5, 3, true), FILE_ID, OP_ID_MSB, OP_ID_LSB).encode(),
+                                new Messages.WritePolicy(5, 3, true), OP_ID_MSB, OP_ID_LSB).encode(),
                         Messages.CreateFile::decode,
                         "0874656e616e742d611a2f636c75737465722f746f7069632f706172746974696f"
-                                + "6e2d300000000500000003011111111122223333444455555555555501234567"
-                                + "89abcdeffedcba987654321000"),
+                                + "6e2d300000000500000003010123456789abcdeffedcba987654321000"),
                 response("createFileResp",
                         new Messages.CreateFileResp(FILE_ID),
                         () -> new Messages.CreateFileResp(FILE_ID).encode(),
                         Messages.CreateFileResp::decode,
-                        "00001111111122223333444455555555555500"),
+                        "0000111111112222333300"),
                 request("createChunk",
-                        new Messages.CreateChunk(FILE_ID, 5, OP_ID_MSB, OP_ID_LSB),
-                        () -> new Messages.CreateChunk(FILE_ID, 5, OP_ID_MSB, OP_ID_LSB).encode(),
+                        new Messages.CreateChunk(NS, FILE_ID, 5, OP_ID_MSB, OP_ID_LSB),
+                        () -> new Messages.CreateChunk(NS, FILE_ID, 5, OP_ID_MSB, OP_ID_LSB).encode(),
                         Messages.CreateChunk::decode,
-                        "11111111222233334444555555555555000000050123456789abcdeffedcba987654321000"),
+                        "04746573741111111122223333000000050123456789abcdeffedcba987654321000"),
                 response("createChunkResp",
                         new Messages.CreateChunkResp(CHUNK_ID, 5,
                                 List.of(new Messages.Replica(1, "a:1"),
@@ -347,41 +340,41 @@ class MessageGoldenCorpusTest {
                                         new Messages.Replica(2, "b:2"),
                                         new Messages.Replica(3, "c:3"))).encode(),
                         Messages.CreateChunkResp::decode,
-                        "000011111111222233334444555555555555000000030000000503000000010361"
+                        "00001111111122223333000000030000000503000000010361"
                                 + "3a310000000203623a320000000303633a3300"),
                 request("allocateWriterEpochAppend",
-                        Messages.AllocateWriterEpoch.forAppend(FILE_ID),
-                        () -> Messages.AllocateWriterEpoch.forAppend(FILE_ID).encode(),
+                        Messages.AllocateWriterEpoch.forAppend(NS, FILE_ID),
+                        () -> Messages.AllocateWriterEpoch.forAppend(NS, FILE_ID).encode(),
                         Messages.AllocateWriterEpoch::decode,
-                        "111111112222333344445555555555550100"),
+                        "0474657374111111112222333301" + "00"),
                 request("allocateWriterEpochRecovery",
-                        Messages.AllocateWriterEpoch.forRecovery(FILE_ID),
-                        () -> Messages.AllocateWriterEpoch.forRecovery(FILE_ID).encode(),
+                        Messages.AllocateWriterEpoch.forRecovery(NS, FILE_ID),
+                        () -> Messages.AllocateWriterEpoch.forRecovery(NS, FILE_ID).encode(),
                         Messages.AllocateWriterEpoch::decode,
-                        "111111112222333344445555555555550200"),
+                        "0474657374111111112222333302" + "00"),
                 response("allocateWriterEpochResp",
                         new Messages.AllocateWriterEpochResp(7),
                         () -> new Messages.AllocateWriterEpochResp(7).encode(),
                         Messages.AllocateWriterEpochResp::decode,
                         "00000000000700"),
                 request("sealChunkMeta",
-                        new Messages.SealChunkMeta(CHUNK_ID, 5, 4096, 0xDD, List.of(1, 2)),
-                        () -> new Messages.SealChunkMeta(CHUNK_ID, 5, 4096, 0xDD,
+                        new Messages.SealChunkMeta(NS, CHUNK_ID, 5, 4096, 0xDD, List.of(1, 2)),
+                        () -> new Messages.SealChunkMeta(NS, CHUNK_ID, 5, 4096, 0xDD,
                                 List.of(1, 2)).encode(),
                         Messages.SealChunkMeta::decode,
-                        "1111111122223333444455555555555500000003000000050000000000001000"
+                        "0474657374111111112222333300000003000000050000000000001000"
                                 + "000000dd02000000010000000200"),
                 request("abortChunkMeta",
-                        new Messages.AbortChunkMeta(CHUNK_ID, 5, 1, 2),
-                        () -> new Messages.AbortChunkMeta(CHUNK_ID, 5, 1, 2).encode(),
+                        new Messages.AbortChunkMeta(NS, CHUNK_ID, 5, 1, 2),
+                        () -> new Messages.AbortChunkMeta(NS, CHUNK_ID, 5, 1, 2).encode(),
                         Messages.AbortChunkMeta::decode,
-                        "1111111122223333444455555555555500000003000000050000000000000001"
+                        "0474657374111111112222333300000003000000050000000000000001"
                                 + "000000000000000200"),
                 request("lookupFile",
-                        new Messages.LookupFile(FILE_ID),
-                        () -> new Messages.LookupFile(FILE_ID).encode(),
+                        new Messages.LookupFile(NS, FILE_ID),
+                        () -> new Messages.LookupFile(NS, FILE_ID).encode(),
                         Messages.LookupFile::decode,
-                        "1111111122223333444455555555555500"),
+                        "04746573741111111122223333" + "00"),
                 request("lookupPath",
                         new Messages.LookupPath("test", "/kafka/topicA/0/00000000000000000000"),
                         () -> new Messages.LookupPath("test",
@@ -392,7 +385,7 @@ class MessageGoldenCorpusTest {
                         new Messages.LookupPathResp(FILE_ID),
                         () -> new Messages.LookupPathResp(FILE_ID).encode(),
                         Messages.LookupPathResp::decode,
-                        "00001111111122223333444455555555555500"),
+                        "0000111111112222333300"),
                 response("lookupFileResp",
                         new Messages.LookupFileResp("test", "/kafka/topicA/0/00000000000000000000",
                                 Messages.WritePolicy.DEFAULT, (byte) 0,
@@ -404,22 +397,22 @@ class MessageGoldenCorpusTest {
                                 List.of(new Messages.ChunkInfo(CHUNK_ID, ChunkState.OPEN, 0, 0,
                                         5, List.of(new Messages.Replica(1, "a:1"))))).encode(),
                         Messages.LookupFileResp::decode,
-                        "00000474657374242f6b61666b612f746f706963412f302f3030303030303030303030303030303030303030000000030000000200000111111111222233334444555555555555000000030000000000000000000000000000000005010000000103613a3100"),
+                        "00000474657374242f6b61666b612f746f706963412f302f303030303030303030303030303030303030303000000003000000020000011111111122223333000000030000000000000000000000000000000005010000000103613a3100"),
                 request("deleteFiles",
-                        new Messages.DeleteFiles(List.of(FILE_ID)),
-                        () -> new Messages.DeleteFiles(List.of(FILE_ID)).encode(),
+                        new Messages.DeleteFiles(NS, List.of(FILE_ID)),
+                        () -> new Messages.DeleteFiles(NS, List.of(FILE_ID)).encode(),
                         Messages.DeleteFiles::decode,
-                        "011111111122223333444455555555555500"),
+                        "047465737401" + "1111111122223333" + "00"),
                 response("deleteFilesResp",
                         new Messages.DeleteFilesResp(List.of(FILE_ID), List.of((short) 0)),
                         () -> new Messages.DeleteFilesResp(List.of(FILE_ID), List.of((short) 0)).encode(),
                         Messages.DeleteFilesResp::decode,
-                        "00000111111111222233334444555555555555000000"),
+                        "0000011111111122223333000000"),
                 request("sealFile",
-                        new Messages.SealFile(FILE_ID, 1L << 20),
-                        () -> new Messages.SealFile(FILE_ID, 1L << 20).encode(),
+                        new Messages.SealFile(NS, FILE_ID, 1L << 20),
+                        () -> new Messages.SealFile(NS, FILE_ID, 1L << 20).encode(),
                         Messages.SealFile::decode,
-                        "11111111222233334444555555555555000000000010000000"));
+                        "0474657374" + "1111111122223333" + "000000000010000000"));
     }
 
     private static <T> GoldenCase<T> request(String name, T expected, Supplier<byte[]> encoder,

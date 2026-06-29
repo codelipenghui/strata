@@ -30,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class NodeRegistryTest {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     @AfterEach
     void clearInjector() {
@@ -62,7 +63,7 @@ class NodeRegistryTest {
         store.nodes.put(1, new MetadataStore.Versioned<>(node(1, Records.NodeState.REGISTERED), 1));
         store.nodes.put(2, new MetadataStore.Versioned<>(node(2, Records.NodeState.REGISTERED), 1));
         store.nodes.put(3, new MetadataStore.Versioned<>(node(3, Records.NodeState.REGISTERED), 1));
-        MetaConfig config = new MetaConfig("unused", 0, 1, 1_000, 60_000, 1, 1);
+        ControllerConfig config = new ControllerConfig("unused", 0, 1, 1_000, 60_000, 1, 1);
 
         NodeRegistry registry = new NodeRegistry(store, config);
 
@@ -79,10 +80,10 @@ class NodeRegistryTest {
     @Test
     void placementCandidatesExcludeNodesPastDeadGrace() throws Exception {
         FakeStore store = new FakeStore();
-        MetaConfig config = new MetaConfig("unused", 0, 1, 1_000, 50, 1, 1);
+        ControllerConfig config = new ControllerConfig("unused", 0, 1, 1_000, 50, 1, 1);
         NodeRegistry registry = new NodeRegistry(store, config);
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
-                101, 102, List.of("node:9000"), "z", "r", "h",
+                1, 101, 102, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
         NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
 
@@ -96,39 +97,39 @@ class NodeRegistryTest {
         NodeRegistry registry = new NodeRegistry(new FakeStore(), config());
 
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
-                1, 2, List.of(), "z", "r", "h",
+                1, 1, 2, List.of(), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
-                1, 2, List.of("node:9000"), "z", "r", "h", List.of(), 1, 0)));
+                1, 1, 2, List.of("node:9000"), "z", "r", "h", List.of(), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
-                1, 2, List.of("node:9000"), "z", "r", "h",
+                1, 1, 2, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(0)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
-                1, 2, List.of("node"), "z", "r", "h",
+                1, 1, 2, List.of("node"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
-                1, 2, List.of("node :9000"), "z", "r", "h",
+                1, 1, 2, List.of("node :9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
-                1, 2, List.of("[::1:9000"), "z", "r", "h",
+                1, 1, 2, List.of("[::1:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
-                1, 2, List.of("node:not-a-port"), "z", "r", "h",
+                1, 1, 2, List.of("node:not-a-port"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
-                1, 2, List.of("node:0"), "z", "r", "h",
+                1, 1, 2, List.of("node:0"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
-                1, 2, List.of("node:9000"), "", "r", "h",
+                1, 1, 2, List.of("node:9000"), "", "r", "h",
                 List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
-                1, 2, List.of(""), "z", "r", "h",
+                1, 1, 2, List.of(""), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
-                1, 2, List.of("node:65536"), "z", "r", "h",
+                1, 1, 2, List.of("node:65536"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertEquals(1, registry.register(new Messages.RegisterNode(
-                1, 2, List.of("[::1]:9000"), "z", "r", "h",
+                1, 1, 2, List.of("[::1]:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(1)), 1, 0)).nodeId());
     }
 
@@ -139,9 +140,82 @@ class NodeRegistryTest {
         NodeRegistry registry = new NodeRegistry(store, config());
 
         ScpException e = assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
-                1, 2, List.of("node:9000"), "z", "r", "h",
+                1, 1, 2, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(1)), 1, 0)));
         assertEquals(ErrorCode.NOT_LEADER, e.code());
+    }
+
+    @Test
+    void registrationRejectsNonPositiveNodeId() throws Exception {
+        NodeRegistry registry = new NodeRegistry(new FakeStore(), config());
+
+        ScpException e = assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
+                0, 1, 2, List.of("node:9000"), "z", "r", "h",
+                List.of(new Messages.StorageCapacity(1)), 1, 0)));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, e.code());
+        assertTrue(e.getMessage().contains("positive nodeId"));
+    }
+
+    @Test
+    void duplicateLiveNodeIdIsRejected() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        // Incarnation A claims nodeId 5 and is live.
+        Messages.RegisterResp a = registry.register(new Messages.RegisterNode(
+                5, 100, 101, List.of("node-a:9000"), "z", "r", "host-a",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        assertEquals(5, a.nodeId());
+        assertTrue(registry.isAlive(5));
+
+        // A DIFFERENT incarnation (B) trying to claim the same live id is rejected: a STRATA_NODE_ID
+        // collision must not let two distinct nodes share an id.
+        ScpException collision = assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
+                5, 200, 201, List.of("node-b:9000"), "z", "r", "host-b",
+                List.of(new Messages.StorageCapacity(10)), 1, 0)));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, collision.code());
+        assertTrue(collision.getMessage().contains("already held by a live node"),
+                "collision message should explain the id is held by a live node");
+        // A is still the holder, untouched.
+        assertEquals("node-a:9000", registry.endpointOf(5));
+
+        // Once A's lease expires, a replacement incarnation may take the id over.
+        liveNodes(registry).get(5).leaseUntil = System.currentTimeMillis() - 1;
+        Messages.RegisterResp b = registry.register(new Messages.RegisterNode(
+                5, 200, 201, List.of("node-b:9000"), "z", "r", "host-b",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        assertEquals(5, b.nodeId());
+        assertEquals("node-b:9000", registry.endpointOf(5));
+        assertTrue(registry.isAlive(5));
+    }
+
+    @Test
+    void collisionGuardCoversTheDeadGraceWindowNotJustTheLease() throws Exception {
+        FakeStore store = new FakeStore();
+        // deadGraceMs = 60s: a prior holder stays protected from takeover for lease+grace, covering the
+        // post-failover window where a warmed record's lease is already expired but its node may be alive.
+        ControllerConfig graceConfig = new ControllerConfig("unused", 0, 1, 1_000, 60_000, 1, 1);
+        NodeRegistry registry = new NodeRegistry(store, graceConfig);
+
+        registry.register(new Messages.RegisterNode(
+                5, 100, 101, List.of("node-a:9000"), "z", "r", "host-a",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+
+        // A's lease has expired but it is still within dead-grace: a different incarnation must NOT steal id 5.
+        liveNodes(registry).get(5).leaseUntil = System.currentTimeMillis() - 1;
+        ScpException collision = assertThrows(ScpException.class, () -> registry.register(new Messages.RegisterNode(
+                5, 200, 201, List.of("node-b:9000"), "z", "r", "host-b",
+                List.of(new Messages.StorageCapacity(10)), 1, 0)));
+        assertEquals(ErrorCode.PRECONDITION_FAILED, collision.code());
+        assertEquals("node-a:9000", registry.endpointOf(5));
+
+        // Once fully past dead-grace, the replacement incarnation may take the id over.
+        liveNodes(registry).get(5).leaseUntil = System.currentTimeMillis() - graceConfig.deadGraceMs() - 1;
+        Messages.RegisterResp b = registry.register(new Messages.RegisterNode(
+                5, 200, 201, List.of("node-b:9000"), "z", "r", "host-b",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        assertEquals(5, b.nodeId());
+        assertEquals("node-b:9000", registry.endpointOf(5));
     }
 
     @Test
@@ -153,14 +227,14 @@ class NodeRegistryTest {
         NodeRegistry registry = new NodeRegistry(store, config());
 
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
-                11, 12, List.of("new:9000"), "z", "r", "new-host",
+                9, 11, 12, List.of("new:9000"), "z", "r", "new-host",
                 List.of(new Messages.StorageCapacity(99)), 1, 0));
         assertEquals(9, registered.nodeId());
         assertEquals("new:9000", registry.endpointOf(9));
         assertEquals("new-host", registry.hostOf(9));
 
         for (int i = 0; i < 18; i++) {
-            registry.enqueue(9, new Messages.DeleteCmd(i, List.of(new ChunkId(new FileId(i, i + 1), 0))));
+            registry.enqueue(9, new Messages.DeleteCmd(i, List.of(new ChunkId(FileId.of(i), 0)), TEST_NS));
         }
         Messages.HeartbeatResp first = registry.heartbeat(new Messages.NodeHeartbeat(
                 9, 11, 12, registered.sessionEpoch(),
@@ -198,7 +272,7 @@ class NodeRegistryTest {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
-                31, 32, List.of("node:9000"), "z", "r", "h",
+                1, 31, 32, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
         List<Integer> completedBy = new ArrayList<>();
 
@@ -223,7 +297,7 @@ class NodeRegistryTest {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
-                33, 34, List.of("node:9000"), "z", "r", "h",
+                1, 33, 34, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
         NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
         AtomicReference<Boolean> callbackHeldNodeLock = new AtomicReference<>();
@@ -245,7 +319,7 @@ class NodeRegistryTest {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
-                37, 38, List.of("node:9000"), "z", "r", "h",
+                1, 37, 38, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
         AtomicReference<Messages.CompletedCommand> dispatched = new AtomicReference<>();
         CompletableFuture<Void> neverApplies = new CompletableFuture<>();
@@ -272,10 +346,10 @@ class NodeRegistryTest {
     @Test
     void heartbeatLeaseIsComputedAfterWaitingForNodeLock() throws Exception {
         FakeStore store = new FakeStore();
-        MetaConfig config = config();
+        ControllerConfig config = config();
         NodeRegistry registry = new NodeRegistry(store, config);
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
-                35, 36, List.of("node:9000"), "z", "r", "h",
+                1, 35, 36, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
         NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
         AtomicReference<Messages.HeartbeatResp> heartbeat = new AtomicReference<>();
@@ -317,7 +391,7 @@ class NodeRegistryTest {
         long incMsb = 37;
         long incLsb = 38;
         Messages.RegisterResp first = registry.register(new Messages.RegisterNode(
-                incMsb, incLsb, List.of("node:9000"), "z", "r", "h",
+                1, incMsb, incLsb, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
         NodeRegistry.LiveNode live = liveNodes(registry).get(first.nodeId());
         CountDownLatch heartbeatBeforeCompletions = new CountDownLatch(1);
@@ -354,7 +428,7 @@ class NodeRegistryTest {
             try {
                 registerStarted.set(true);
                 registry.register(new Messages.RegisterNode(
-                        incMsb, incLsb, List.of("node-new:9000"), "z", "r", "h",
+                        1, incMsb, incLsb, List.of("node-new:9000"), "z", "r", "h",
                         List.of(new Messages.StorageCapacity(10)), 1, 0));
                 registerFinished.set(true);
             } catch (Throwable t) {
@@ -383,10 +457,10 @@ class NodeRegistryTest {
     @Test
     void heartbeatCompletionProcessingPreventsExpireScanFromDeclaringNodeDead() throws Exception {
         FakeStore store = new FakeStore();
-        MetaConfig config = new MetaConfig("unused", 0, 1, 50, 0, 1, 1);
+        ControllerConfig config = new ControllerConfig("unused", 0, 1, 50, 0, 1, 1);
         NodeRegistry registry = new NodeRegistry(store, config);
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
-                39, 40, List.of("node:9000"), "z", "r", "h",
+                1, 39, 40, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
         CountDownLatch heartbeatBeforeCompletions = new CountDownLatch(1);
         CountDownLatch releaseHeartbeat = new CountDownLatch(1);
@@ -441,7 +515,7 @@ class NodeRegistryTest {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
-                41, 42, List.of("node:9000"), "z", "r", "h",
+                1, 41, 42, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
         NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
         Records.NodeRecord dead = live.record.withState(Records.NodeState.DEAD);
@@ -461,7 +535,7 @@ class NodeRegistryTest {
         NodeRegistry registry = new NodeRegistry(store, config());
 
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
-                21, 22, List.of("node:9000"), "z", "r", "h",
+                1, 21, 22, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
         NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
         Records.NodeRecord dead = live.record.withState(Records.NodeState.DEAD);
@@ -483,7 +557,7 @@ class NodeRegistryTest {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
-                51, 52, List.of("node:9000"), "z", "r", "h",
+                1, 51, 52, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
         NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
         live.leaseUntil = 0;
@@ -498,7 +572,7 @@ class NodeRegistryTest {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
-                61, 62, List.of("node:9000"), "z", "r", "h",
+                1, 61, 62, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
 
         assertEquals(ErrorCode.NOT_REGISTERED, assertThrows(ScpException.class, () -> registry.heartbeat(
@@ -516,12 +590,12 @@ class NodeRegistryTest {
         long incMsb = 71;
         long incLsb = 72;
         Messages.RegisterResp first = registry.register(new Messages.RegisterNode(
-                incMsb, incLsb, List.of("node:9000"), "z", "r", "h",
+                1, incMsb, incLsb, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
-        registry.enqueue(first.nodeId(), new Messages.DeleteCmd(99, List.of(new ChunkId(FileId.random(), 0))));
+        registry.enqueue(first.nodeId(), new Messages.DeleteCmd(99, List.of(new ChunkId(FileId.of(1), 0)), TEST_NS));
 
         Messages.RegisterResp second = registry.register(new Messages.RegisterNode(
-                incMsb, incLsb, List.of("node-new:9000"), "z", "r", "h",
+                1, incMsb, incLsb, List.of("node-new:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
         assertTrue(second.sessionEpoch() != first.sessionEpoch(), "re-register must create a new session");
         ScpException stale = assertThrows(ScpException.class, () -> registry.heartbeat(new Messages.NodeHeartbeat(
@@ -540,7 +614,7 @@ class NodeRegistryTest {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
         Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
-                81, 82, List.of("node:9000"), "z", "r", "h",
+                1, 81, 82, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
         NodeRegistry.LiveNode live = liveNodes(registry).get(registered.nodeId());
 
@@ -570,7 +644,7 @@ class NodeRegistryTest {
         long incMsb = 91;
         long incLsb = 92;
         Messages.RegisterResp first = registry.register(new Messages.RegisterNode(
-                incMsb, incLsb, List.of("node:9000"), "z", "r", "h",
+                1, incMsb, incLsb, List.of("node:9000"), "z", "r", "h",
                 List.of(new Messages.StorageCapacity(10)), 1, 0));
         CountDownLatch registerPersisted = new CountDownLatch(1);
         CountDownLatch publishSession = new CountDownLatch(1);
@@ -585,7 +659,7 @@ class NodeRegistryTest {
         Thread registerThread = new Thread(() -> {
             try {
                 registry.register(new Messages.RegisterNode(
-                        incMsb, incLsb, List.of("node-new:9000"), "z", "r", "h",
+                        1, incMsb, incLsb, List.of("node-new:9000"), "z", "r", "h",
                         List.of(new Messages.StorageCapacity(10)), 1, 0));
             } catch (Throwable t) {
                 registerFailure.set(t);
@@ -612,8 +686,34 @@ class NodeRegistryTest {
         assertEquals(Boolean.FALSE, currentSession.get());
     }
 
-    private static MetaConfig config() {
-        return new MetaConfig("unused", 0, 1, 1_000, 0, 1, 1);
+    @Test
+    void placementSnapshotReadIsCachedForTheRepairScanInterval() throws Exception {
+        FakeStore store = new FakeStore();
+        long t0 = 1_000_000L;
+        // A non-empty published snapshot so the cache populates (a null snapshot never caches).
+        store.liveNodesSnapshot = new Records.ClusterLiveNodes(t0,
+                List.of(new Records.ClusterLiveNodes.LiveEntry(node(5, Records.NodeState.REGISTERED), 1_000L)))
+                .encode();
+        // repairScanIntervalMs = 5000 (the publishClusterLiveNodes cadence); the snapshot-read TTL tracks it.
+        ControllerConfig config = new ControllerConfig("unused", 0, 1, 1_000, 60_000, 5_000, 1);
+        NodeRegistry registry = new NodeRegistry(store, config);
+
+        registry.candidatesFor(StrataNamespace.of("ns"), t0);
+        assertEquals(1, store.liveNodeReads, "first placement reads the snapshot once");
+
+        // Well past the old hard-coded 100ms TTL but within the 5s publish cadence: must stay cached.
+        registry.candidatesFor(StrataNamespace.of("ns"), t0 + 101);
+        registry.candidatesFor(StrataNamespace.of("ns"), t0 + 4_999);
+        assertEquals(1, store.liveNodeReads,
+                "within the repair-scan/publish interval the snapshot read is served from cache (was re-read every 100ms)");
+
+        // Past the publish cadence: a non-publisher re-reads once to pick up a fresh snapshot.
+        registry.candidatesFor(StrataNamespace.of("ns"), t0 + 5_001);
+        assertEquals(2, store.liveNodeReads, "after the publish interval the snapshot is re-read once");
+    }
+
+    private static ControllerConfig config() {
+        return new ControllerConfig("unused", 0, 1, 1_000, 0, 1, 1);
     }
 
     private static Records.NodeRecord node(int id, Records.NodeState state) {
@@ -651,10 +751,12 @@ class NodeRegistryTest {
 
     private static final class FakeStore implements MetadataStore {
         private final Map<Integer, MetadataStore.Versioned<Records.NodeRecord>> nodes = new LinkedHashMap<>();
-        private int nextNodeId = 1;
         private boolean failNextPutNode;
         private int failPutNodeAttempts;
         private boolean throwOnPutNode;
+        // Counts snapshot reads on the placement path; serves a published snapshot if set.
+        private int liveNodeReads;
+        private byte[] liveNodesSnapshot;
 
         @Override
         public void createFile(Records.FileRecord record) {
@@ -662,7 +764,7 @@ class NodeRegistryTest {
         }
 
         @Override
-        public Optional<Versioned<Records.FileRecord>> getFile(FileId id) {
+        public Optional<Versioned<Records.FileRecord>> getFile(io.strata.common.StrataNamespace namespace, FileId id) {
             throw new UnsupportedOperationException();
         }
 
@@ -689,7 +791,7 @@ class NodeRegistryTest {
         }
 
         @Override
-        public boolean deleteFile(FileId id, int expectedVersion) {
+        public boolean deleteFile(io.strata.common.StrataNamespace namespace, FileId id, int expectedVersion) {
             throw new UnsupportedOperationException();
         }
 
@@ -704,8 +806,14 @@ class NodeRegistryTest {
         }
 
         @Override
-        public int nextNodeId() {
-            return nextNodeId++;
+        public Optional<byte[]> getClusterLiveNodes() {
+            liveNodeReads++;
+            return Optional.ofNullable(liveNodesSnapshot);
+        }
+
+        @Override
+        public void putClusterLiveNodes(byte[] snapshot) {
+            liveNodesSnapshot = snapshot;
         }
 
         @Override

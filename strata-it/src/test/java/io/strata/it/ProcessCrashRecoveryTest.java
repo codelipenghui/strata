@@ -7,7 +7,8 @@ import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
-import io.strata.meta.MetaConfig;
+import io.strata.common.StrataNamespace;
+import io.strata.meta.ControllerConfig;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -29,11 +30,12 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * OS-process crash coverage for the storage data plane. Unlike the in-process MiniCluster node
+ * OS-process crash coverage for the data-node data plane. Unlike the in-process MiniCluster node
  * restarts, these tests kill child JVMs so ChunkStore recovery sees a real abrupt process stop.
  */
 @Tag("chaos")
 class ProcessCrashRecoveryTest {
+    private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
     private static final String PROCESS_CRASH_CASE_PROPERTY = "strata.processCrash.case";
     private static final List<CrashCase> CRASH_CASES = List.of(
             new CrashCase("rf3-aq2", StrataClient.WritePolicy.replicated(3, 2), 1, 3),
@@ -43,14 +45,14 @@ class ProcessCrashRecoveryTest {
     private MiniCluster cluster;
 
     @Test
-    void forciblyKilledStorageProcessesRecoverAckedOpenChunkAcrossPolicies() throws Exception {
+    void forciblyKilledDataNodeProcessesRecoverAckedOpenChunkAcrossPolicies() throws Exception {
         for (CrashCase crashCase : selectedCrashCases()) {
             runAllOpenChunkReplicasCrashAndRecover(crashCase, 180, 1);
         }
     }
 
     @Test
-    void singleStorageProcessCrashDuringAppendRollsAndSealsAckedData() throws Exception {
+    void singleDataNodeProcessCrashDuringAppendRollsAndSealsAckedData() throws Exception {
         List<ExternalNode> processes = new ArrayList<>();
         try (MiniCluster c = new MiniCluster(0, null, 1)) {
             cluster = c;
@@ -61,13 +63,13 @@ class ProcessCrashRecoveryTest {
 
                 ClientConfig config = ClientConfig.of(cluster.metaEndpoint())
                         .withChunkRollBytes(384)
-                        .withStorageConnectionsPerEndpoint(2);
+                        .withDataNodeConnectionsPerEndpoint(2);
                 try (StrataClient client = StrataClient.connect(config)) {
                     FileId fileId = client.create(new StrataClient.FileSpec("test",
                             "/process-single-crash-roll",
                             StrataClient.WritePolicy.replicated(3, 2))).id();
                     Workload workload = new Workload();
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 80);
 
                         Messages.ChunkInfo openChunk = latestChunk(fileId);
@@ -82,7 +84,7 @@ class ProcessCrashRecoveryTest {
                                 "single process crash sealed at non-acked length");
                     }
 
-                    workload.verifyAckedPrefix(client, fileId);
+                    workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                     ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                             workload.ackedBytes());
                 }
@@ -97,7 +99,7 @@ class ProcessCrashRecoveryTest {
     }
 
     @Test
-    void storageProcessCrashThenMetadataFailoverBeforeRecoveryPreservesAckedOpenChunk() throws Exception {
+    void dataNodeProcessCrashThenMetadataFailoverBeforeRecoveryPreservesAckedOpenChunk() throws Exception {
         runAllOpenChunkReplicasCrashAndRecover(new CrashCase("meta-failover-rf3-aq2-fsync",
                 StrataClient.WritePolicy.fsync(3, 2), 2, 3), 140, 2);
     }
@@ -114,13 +116,13 @@ class ProcessCrashRecoveryTest {
 
                 ClientConfig config = ClientConfig.of(cluster.metaEndpoint())
                         .withChunkRollBytes(1 << 16)
-                        .withStorageConnectionsPerEndpoint(2);
+                        .withDataNodeConnectionsPerEndpoint(2);
                 try (StrataClient client = StrataClient.connect(config)) {
                     FileId fileId = client.create(StrataClient.FileSpec.log("test",
                             "/process-repair-copy-crash")).id();
                     Workload workload = new Workload();
                     StrataFile.SealInfo sealed;
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 180);
                         sealed = appender.seal();
                     }
@@ -137,7 +139,7 @@ class ProcessCrashRecoveryTest {
                     kill(target);
                     waitForChunkRepairedExcluding(processes, chunkId, target.nodeId(), 3);
 
-                    workload.verifyAckedPrefix(client, fileId);
+                    workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                     ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                             sealed.sealedLength());
                 }
@@ -162,13 +164,13 @@ class ProcessCrashRecoveryTest {
                 }
 
                 ClientConfig config = new ClientConfig(cluster.metaEndpoints(), 1 << 16, 10_000)
-                        .withStorageConnectionsPerEndpoint(2);
+                        .withDataNodeConnectionsPerEndpoint(2);
                 try (StrataClient client = StrataClient.connect(config)) {
                     FileId fileId = client.create(StrataClient.FileSpec.log("test",
                             "/process-repair-failover")).id();
                     Workload workload = new Workload();
                     StrataFile.SealInfo sealed;
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 180);
                         sealed = appender.seal();
                     }
@@ -186,7 +188,7 @@ class ProcessCrashRecoveryTest {
                     cluster.awaitAnyLeader();
 
                     waitForChunkRepaired(processes, chunkId, 3);
-                    workload.verifyAckedPrefix(client, fileId);
+                    workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                     ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                             sealed.sealedLength());
                 }
@@ -212,13 +214,13 @@ class ProcessCrashRecoveryTest {
 
                 ClientConfig config = ClientConfig.of(cluster.metaEndpoint())
                         .withChunkRollBytes(1 << 16)
-                        .withStorageConnectionsPerEndpoint(2);
+                        .withDataNodeConnectionsPerEndpoint(2);
                 try (StrataClient client = StrataClient.connect(config)) {
                     FileId fileId = client.create(StrataClient.FileSpec.log("test",
                             "/process-delete-local-crash")).id();
                     Workload workload = new Workload();
                     StrataFile.SealInfo sealed;
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 160);
                         sealed = appender.seal();
                     }
@@ -226,7 +228,7 @@ class ProcessCrashRecoveryTest {
                             sealed.sealedLength());
 
                     ChunkId chunkId = lookupFile(fileId).chunks().get(0).chunkId();
-                    client.deleteById(List.of(fileId));
+                    client.deleteById(StrataNamespace.of("test"), fileId);
 
                     ExternalNode victim = waitForAnyProcessMissingLocalCopy(processes, chunkId);
                     kill(victim);
@@ -259,13 +261,13 @@ class ProcessCrashRecoveryTest {
                 }
 
                 ClientConfig config = new ClientConfig(cluster.metaEndpoints(), 1 << 16, 10_000)
-                        .withStorageConnectionsPerEndpoint(2);
+                        .withDataNodeConnectionsPerEndpoint(2);
                 try (StrataClient client = StrataClient.connect(config)) {
                     FileId fileId = client.create(StrataClient.FileSpec.log("test",
                             "/process-delete-failover")).id();
                     Workload workload = new Workload();
                     StrataFile.SealInfo sealed;
-                    try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+                    try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
                         workload.appendAcked(appender, 0, 160);
                         sealed = appender.seal();
                     }
@@ -273,7 +275,7 @@ class ProcessCrashRecoveryTest {
                             sealed.sealedLength());
 
                     ChunkId chunkId = lookupFile(fileId).chunks().get(0).chunkId();
-                    client.deleteById(List.of(fileId));
+                    client.deleteById(StrataNamespace.of("test"), fileId);
 
                     waitForAnyProcessMissingLocalCopy(processes, chunkId);
                     killLeader("delete failover after local delete");
@@ -307,7 +309,7 @@ class ProcessCrashRecoveryTest {
                 "writePolicy=rf" + crashCase.writePolicy().replicationFactor()
                         + "-aq" + crashCase.writePolicy().ackQuorum()
                         + "-fsync" + crashCase.writePolicy().fsyncOnAck(),
-                "storageConnectionsPerEndpoint=" + crashCase.storageConnectionsPerEndpoint(),
+                "dataNodeConnectionsPerEndpoint=" + crashCase.dataNodeConnectionsPerEndpoint(),
                 "nodeCount=" + crashCase.nodeCount());
         List<ExternalNode> processes = new ArrayList<>();
         try {
@@ -318,16 +320,16 @@ class ProcessCrashRecoveryTest {
                     for (int i = 0; i < crashCase.nodeCount(); i++) {
                         processes.add(startNode(crashCase.name() + "-host-" + i));
                     }
-                    artifact.add("initialStorage=" + storageSummary(processes));
+                    artifact.add("initialDataNode=" + dataNodeSummary(processes));
 
                     ClientConfig config = new ClientConfig(cluster.metaEndpoints(), 1 << 16, 10_000)
-                            .withStorageConnectionsPerEndpoint(crashCase.storageConnectionsPerEndpoint());
+                            .withDataNodeConnectionsPerEndpoint(crashCase.dataNodeConnectionsPerEndpoint());
                     try (StrataClient client = StrataClient.connect(config)) {
                         FileId fileId = client.create(new StrataClient.FileSpec("test",
                                 "/process-crash-" + crashCase.name(), crashCase.writePolicy())).id();
                         artifact.add("fileId=" + fileId);
                         Workload workload = new Workload();
-                        StrataFile.Appender abandoned = client.openById(fileId).openForAppend();
+                        StrataFile.Appender abandoned = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
                         try {
                             workload.appendAcked(abandoned, 0, recordCount);
                             artifact.add("ackedBeforeCrashBytes=" + workload.ackedBytes(),
@@ -378,10 +380,10 @@ class ProcessCrashRecoveryTest {
                             artifact.add("liveDescriptorVerifiedAfterRestart=true",
                                     "restartedReplicaNodeIds=" + restartedById.keySet());
 
-                            StrataFile.SealInfo sealed = client.openById(fileId).recoverAndSeal();
+                            StrataFile.SealInfo sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
                             assertEquals(workload.ackedBytes(), sealed.sealedLength(),
                                     "recovery sealed at a non-acked length");
-                            workload.verifyAckedPrefix(client, fileId);
+                            workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
                             Messages.LookupFileResp finalDescriptor =
                                     ConsistencyVerifier.waitForFullSealedFileConsistent(cluster, client,
                                             fileId, sealed.sealedLength());
@@ -418,7 +420,7 @@ class ProcessCrashRecoveryTest {
                 break;
             }
         }
-        assertTrue(leaderIndex >= 0, context + " had no metadata leader to kill");
+        assertTrue(leaderIndex >= 0, context + " had no controller leader to kill");
         cluster.killMeta(leaderIndex);
     }
 
@@ -428,11 +430,11 @@ class ProcessCrashRecoveryTest {
                 return meta.endpoint();
             }
         }
-        throw new AssertionError("no metadata leader is available");
+        throw new AssertionError("no controller leader is available");
     }
 
     private record CrashCase(String name, StrataClient.WritePolicy writePolicy,
-                             int storageConnectionsPerEndpoint, int nodeCount) {
+                             int dataNodeConnectionsPerEndpoint, int nodeCount) {
     }
 
     private static List<CrashCase> selectedCrashCases() {
@@ -453,11 +455,11 @@ class ProcessCrashRecoveryTest {
         if (metadataServiceCount > 1) {
             return "./scripts/verify.sh --skip-default --fault"
                     + " -Dtest=ProcessCrashRecoveryTest#"
-                    + "storageProcessCrashThenMetadataFailoverBeforeRecoveryPreservesAckedOpenChunk";
+                    + "dataNodeProcessCrashThenMetadataFailoverBeforeRecoveryPreservesAckedOpenChunk";
         }
         return "./scripts/verify.sh --skip-default --fault"
                 + " -Dtest=ProcessCrashRecoveryTest#"
-                + "forciblyKilledStorageProcessesRecoverAckedOpenChunkAcrossPolicies"
+                + "forciblyKilledDataNodeProcessesRecoverAckedOpenChunkAcrossPolicies"
                 + " -D" + PROCESS_CRASH_CASE_PROPERTY + "=" + crashCase.name();
     }
 
@@ -468,10 +470,10 @@ class ProcessCrashRecoveryTest {
                 "metadataServiceCount",
                 "metadataFailoverDuringRecovery",
                 "writePolicy",
-                "storageConnectionsPerEndpoint",
+                "dataNodeConnectionsPerEndpoint",
                 "nodeCount",
                 "initialMetadataEndpoints",
-                "initialStorage",
+                "initialDataNode",
                 "fileId",
                 "ackedBeforeCrashBytes",
                 "ackedBeforeCrashSha256",
@@ -502,7 +504,7 @@ class ProcessCrashRecoveryTest {
         // metadata drops that replica within seconds (the 90s production default would outlast the
         // missing-replica deadline). The in-process metadata can't see a static-field override.
         return new MiniCluster(0, null, metadataServiceCount,
-                zkConnect -> new MetaConfig(zkConnect, 0, 5_000, 9_000, 1_000, 250, 9_000)
+                (zkConnect, idx) -> new ControllerConfig(zkConnect, 0, 5_000, 9_000, 1_000, 250, 9_000)
                         .withReplicaMissingGraceMs(2_000));
     }
 
@@ -522,10 +524,13 @@ class ProcessCrashRecoveryTest {
                 java,
                 "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
                 "-cp", classpath,
-                StorageNodeProcessMain.class.getName(),
+                DataNodeProcessMain.class.getName(),
                 dataDir.toString(),
                 String.join(",", cluster.metaEndpoints()),
                 host,
+                // Externally-supplied node id, stable per host: a crash-recovery restart passes the
+                // same host/dataDir and so reuses the same id (bound to the volume identity).
+                Integer.toString(DataNodeProcessMain.nodeIdForHost(host)),
                 readyFile.toString());
         builder.redirectErrorStream(true);
         builder.redirectOutput(logFile.toFile());
@@ -550,12 +555,12 @@ class ProcessCrashRecoveryTest {
                 }
             }
             if (!node.process().isAlive()) {
-                throw new AssertionError("storage node process exited early with code "
+                throw new AssertionError("data node process exited early with code "
                         + node.process().exitValue() + "\n" + childLog(node));
             }
             Thread.sleep(50);
         }
-        throw new AssertionError("storage node process did not become ready\n" + childLog(node));
+        throw new AssertionError("data node process did not become ready\n" + childLog(node));
     }
 
     private static String childLog(ExternalNode node) throws Exception {
@@ -578,7 +583,7 @@ class ProcessCrashRecoveryTest {
         }
         node.process().destroyForcibly();
         if (!node.process().waitFor(10, TimeUnit.SECONDS)) {
-            throw new AssertionError("storage node process did not exit after destroyForcibly");
+            throw new AssertionError("data node process did not exit after destroyForcibly");
         }
     }
 
@@ -691,12 +696,12 @@ class ProcessCrashRecoveryTest {
     }
 
     private boolean isFileDeleted(FileId fileId) throws Exception {
-        AssertionError failure = new AssertionError("no metadata endpoint could confirm deletion for " + fileId);
+        AssertionError failure = new AssertionError("no controller endpoint could confirm deletion for " + fileId);
         for (String endpoint : cluster.metaEndpoints()) {
             String[] hp = endpoint.split(":");
             try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                     ScpClient.KIND_TOOL, "process-delete-lookup")) {
-                direct.call(Opcode.LOOKUP_FILE, new Messages.LookupFile(fileId).encode(), null, 5_000);
+                direct.call(Opcode.LOOKUP_FILE, new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, 5_000);
                 return false;
             } catch (ScpException e) {
                 if (e.code() == ErrorCode.FILE_NOT_FOUND) {
@@ -721,7 +726,7 @@ class ProcessCrashRecoveryTest {
         return ids;
     }
 
-    private static String storageSummary(List<ExternalNode> nodes) {
+    private static String dataNodeSummary(List<ExternalNode> nodes) {
         return nodes.stream()
                 .map(node -> node.host() + "#" + node.nodeId() + "@" + node.endpoint())
                 .toList()
@@ -733,7 +738,7 @@ class ProcessCrashRecoveryTest {
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                 ScpClient.KIND_TOOL, "process-direct-delete")) {
             var resp = Messages.DeleteChunksResp.decode(direct.call(Opcode.DELETE_CHUNKS,
-                    new Messages.DeleteChunks(List.of(chunkId)).encode(), null, 5_000));
+                    new Messages.DeleteChunks(List.of(chunkId), TEST_NS).encode(), null, 5_000));
             assertEquals(ErrorCode.OK.code, resp.codes().get(0).shortValue(),
                     "direct delete failed for " + chunkId + " on node " + node.nodeId());
         }
@@ -746,7 +751,7 @@ class ProcessCrashRecoveryTest {
         String[] hp = node.endpoint().split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                 ScpClient.KIND_TOOL, "process-stat")) {
-            direct.call(Opcode.STAT_CHUNK, new Messages.StatChunk(chunkId).encode(), null, 5_000);
+            direct.call(Opcode.STAT_CHUNK, new Messages.StatChunk(chunkId, TEST_NS).encode(), null, 5_000);
             return true;
         } catch (ScpException e) {
             if (e.code() == ErrorCode.CHUNK_NOT_FOUND) {

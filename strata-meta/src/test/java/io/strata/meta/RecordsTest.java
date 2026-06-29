@@ -52,7 +52,7 @@ class RecordsTest {
 
     @Test
     void fileRecordRoundtripAndRejectsUnknownVersions() {
-        FileId fileId = new FileId(1, 2);
+        FileId fileId = FileId.of(1);
         Records.ChunkRecord chunk = new Records.ChunkRecord(3, ChunkState.SEALED, 4096, 0xAA, 5,
                 List.of(7, 8), 33, 44);
         Records.FileRecord record = new Records.FileRecord(fileId, "test", "/test-file",
@@ -107,7 +107,7 @@ class RecordsTest {
         assertThrows(UnsupportedOperationException.class, () -> chunk.replicas().add(4));
 
         List<Records.ChunkRecord> chunks = new ArrayList<>(List.of(chunk));
-        Records.FileRecord file = new Records.FileRecord(new FileId(1, 2), "test", "/copy-test",
+        Records.FileRecord file = new Records.FileRecord(FileId.of(1), "test", "/copy-test",
                 3, 2, false, FileState.OPEN, 1, chunks);
         chunks.clear();
         assertEquals(List.of(chunk), file.chunks());
@@ -164,7 +164,7 @@ class RecordsTest {
     private static byte[] fileRecordWithChunkCount(int count) {
         BufWriter w = new BufWriter();
         w.u8(7);
-        w.fileId(new FileId(1, 2));
+        w.fileId(FileId.of(1));
         w.string("test").string("/test-file");
         w.u32(3).u32(2).u8(0).i32(0).u8(FileState.OPEN.value).u64(1);
         w.u64(0).u64(0);
@@ -175,7 +175,7 @@ class RecordsTest {
     private static byte[] fileRecordWithReplicaCount(int count) {
         BufWriter w = new BufWriter();
         w.u8(7);
-        w.fileId(new FileId(1, 2));
+        w.fileId(FileId.of(1));
         w.string("test").string("/test-file");
         w.u32(3).u32(2).u8(0).i32(1).u8(FileState.OPEN.value).u64(1);
         w.u64(0).u64(0);

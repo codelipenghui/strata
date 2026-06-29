@@ -4,6 +4,7 @@ import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
@@ -214,7 +215,7 @@ class PerfSmokeTest {
         byte[] payload = new byte[recordSize];
         ThreadLocalRandom.current().nextBytes(payload);
         FileId id = client.create(new StrataClient.FileSpec("test", path, policy)).id();
-        try (StrataFile.Appender ap = client.openById(id).openForAppend()) {
+        try (StrataFile.Appender ap = client.openById(StrataNamespace.of("test"), id).openForAppend()) {
             await(appendWindowed(ap, payload, warm, null, 1));
             long[] lat = new long[samples];
             await(appendWindowed(ap, payload, samples, lat, 1));
@@ -228,7 +229,7 @@ class PerfSmokeTest {
         byte[] payload = new byte[recordSize];
         ThreadLocalRandom.current().nextBytes(payload);
         FileId id = client.create(new StrataClient.FileSpec("test", path)).id();
-        try (StrataFile.Appender ap = client.openById(id).openForAppend()) {
+        try (StrataFile.Appender ap = client.openById(StrataNamespace.of("test"), id).openForAppend()) {
             await(appendWindowed(ap, payload, records, null, 16));
             ap.seal();
         }
@@ -239,7 +240,7 @@ class PerfSmokeTest {
     private long[] readLatency(StrataClient client, FileId fileId, int readSize, long fileBytes) {
         int warm = Math.min(LAT_SAMPLES / 5, 200);
         long span = Math.max(1, fileBytes - readSize);
-        try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
+        try (StrataFile.Reader reader = client.openById(StrataNamespace.of("test"), fileId).openForRead()) {
             for (int i = 0; i < warm; i++) {
                 reader.read((long) i * readSize % span, readSize);
             }
@@ -259,7 +260,7 @@ class PerfSmokeTest {
         byte[] payload = new byte[readSize];
         ThreadLocalRandom.current().nextBytes(payload);
         FileId id = client.create(new StrataClient.FileSpec("test", path)).id();
-        StrataFile.Appender ap = client.openById(id).openForAppend();
+        StrataFile.Appender ap = client.openById(StrataNamespace.of("test"), id).openForAppend();
         try {
             await(appendWindowed(ap, payload, 256, null, 32)); // fill a durable tail, do NOT seal
             long durable = ap.durableOffset();
@@ -290,7 +291,7 @@ class PerfSmokeTest {
         for (int f = 0; f < files; f++) {
             FileId id = client.create(new StrataClient.FileSpec("test", pathPrefix + f, policy)).id();
             ids.add(id);
-            appenders.add(client.openById(id).openForAppend());
+            appenders.add(client.openById(StrataNamespace.of("test"), id).openForAppend());
         }
         try {
             int warm = Math.min(WARMUP, recordsPerFile);
@@ -331,7 +332,7 @@ class PerfSmokeTest {
                                        int passes, long perFileBytes) throws Exception {
         List<StrataFile.Reader> rds = new ArrayList<>();
         for (int r = 0; r < readers; r++) {
-            rds.add(client.openById(files.get(r % files.size())).openForRead());
+            rds.add(client.openById(StrataNamespace.of("test"), files.get(r % files.size())).openForRead());
         }
         try {
             long[][] perReader = new long[readers][];
@@ -410,7 +411,7 @@ class PerfSmokeTest {
         byte[] payload = new byte[RECORD_SIZE];
         java.util.concurrent.ThreadLocalRandom.current().nextBytes(payload);
 
-        try (StrataFile.Appender appender = client.openById(fileId).openForAppend()) {
+        try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
             // warmup (not measured)
             await(appendWindowed(appender, payload, Math.min(WARMUP, records), null, window));
 
@@ -479,7 +480,7 @@ class PerfSmokeTest {
     }
 
     private ReadResult runRead(StrataClient client, FileId fileId) {
-        try (StrataFile.Reader reader = client.openById(fileId).openForRead()) {
+        try (StrataFile.Reader reader = client.openById(StrataNamespace.of("test"), fileId).openForRead()) {
             long[] latencies = new long[4096];
             long start = System.nanoTime();
             ReadPass pass = readToEnd(reader, latencies, 0);

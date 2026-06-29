@@ -5,11 +5,14 @@ import io.strata.common.ChunkState;
 import io.strata.common.Closeables;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
+import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -22,8 +25,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
@@ -32,6 +37,7 @@ import java.util.zip.CRC32C;
 import static io.strata.common.Checks.checkedAdd;
 import static io.strata.format.ChunkFormats.DATA_START;
 import static io.strata.format.ChunkFormats.HEADER_SIZE;
+import static io.strata.common.Fsync.forceDirectory;
 import static io.strata.format.ChunkFormats.TRAILER_SIZE;
 import static io.strata.format.ChunkFormats.readFully;
 import static io.strata.format.ChunkFormats.writeFully;
@@ -53,9 +59,9 @@ public final class ChunkStore implements AutoCloseable {
     private static final int RECOVERY_FENCE_REQUIRED = Integer.MAX_VALUE;
 
     private final Path dir;
-    private final Map<ChunkId, Handle> chunks = new ConcurrentHashMap<>();
+    private final Map<NsChunkId, Handle> chunks = new ConcurrentHashMap<>();
     private final ChannelCache channelCache;
-    private final Set<ChunkId> creating = ConcurrentHashMap.newKeySet();
+    private final Set<NsChunkId> creating = ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.atomic.AtomicLong forceCount =
             new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong appendOps =
@@ -305,7 +311,7 @@ public final class ChunkStore implements AutoCloseable {
                 data.force(false); // footer/trailer durable before the sidecar may claim SEALED on disk
             } catch (IOException | RuntimeException e) {
                 synchronized (h) {
-                    if (chunks.get(h.id) != h || h.data != data || !h.sealedLedgerPending) {
+                    if (chunks.get(h.nsKey) != h || h.data != data || !h.sealedLedgerPending) {
                         continue; // delete()/close() won the race after we snapshotted — not ours to log
                     }
                 }
@@ -315,7 +321,7 @@ public final class ChunkStore implements AutoCloseable {
             boolean reclaimed = false;
             try {
                 synchronized (h) {
-                    if (chunks.get(h.id) != h || h.data != data
+                    if (chunks.get(h.nsKey) != h || h.data != data
                             || h.state != ChunkState.SEALED || !h.sealedLedgerPending) {
                         continue; // superseded after the force — leave it to the winner
                     }
@@ -325,7 +331,7 @@ public final class ChunkStore implements AutoCloseable {
                     closeAndNullData(h);                // release the writable FD; reads use the cache
                     reclaimed = true;
                 }
-                forceDirectory(); // make the unlink durable (recovery's SEALED branch re-deletes otherwise)
+                forceDirectory(h.shardDir); // make the unlink durable (recovery's SEALED branch re-deletes otherwise)
             } catch (IOException | RuntimeException e) {
                 log.warn("sealed-ledger reclaim of {} failed (will retry)", h.id, e);
                 continue;
@@ -363,7 +369,7 @@ public final class ChunkStore implements AutoCloseable {
                 data.force(false); // flushes all currently-dirty pages (>= flushTo)
             } catch (IOException | RuntimeException e) {
                 synchronized (h) {
-                    if (chunks.get(h.id) != h || h.state != ChunkState.OPEN || h.data != data) {
+                    if (chunks.get(h.nsKey) != h || h.state != ChunkState.OPEN || h.data != data) {
                         // delete()/close()/seal() won the race after we snapshotted the channel.
                         // The handle is no longer eligible for background writeback, so do not log
                         // and do not retry this stale closed channel every period.
@@ -375,7 +381,7 @@ public final class ChunkStore implements AutoCloseable {
             }
             boolean credited = false;
             synchronized (h) {
-                if (chunks.get(h.id) == h && h.state == ChunkState.OPEN
+                if (chunks.get(h.nsKey) == h && h.state == ChunkState.OPEN
                         && h.data == data && h.bgFlushedOffset < flushTo) {
                     h.bgFlushedOffset = flushTo;
                     credited = true;
@@ -391,7 +397,10 @@ public final class ChunkStore implements AutoCloseable {
 
     private final class Handle {
         final ChunkId id;
+        final StrataNamespace ns;
+        final NsChunkId nsKey;  // pre-computed map key — avoids per-iteration allocation in background loops
         final ChunkFormats.Header header;
+        final Path shardDir;   // dir/<ns>/<l1>/<l2> — durability target for chunk-file mutations
         final Path dataPath;
         final Path metaPath;
         final Path ledgerPath;
@@ -410,6 +419,10 @@ public final class ChunkStore implements AutoCloseable {
         long sealedLength = -1;
         int dataCrc;
         List<Integer> sealedRangeCrcs = List.of();
+        // Last time an owner attested this replica via VERIFY_CHUNKS (design §20.3); seeded to when this
+        // node first learned of the chunk so a freshly-created/recovered chunk gets the full orphan grace
+        // (§20.4) before it can be considered a suspect. In-memory only: a restart re-earns verification.
+        volatile long lastVerifiedAtMs = System.currentTimeMillis();
 
         // Running CRC state for an OPEN chunk: the whole-chunk CRC and the per-CRC_RANGE_SIZE range
         // CRCs are folded as bytes are appended (and rebuilt from the verified prefix on recovery),
@@ -456,13 +469,34 @@ public final class ChunkStore implements AutoCloseable {
             return new CrcScan((int) runningWhole.getValue(), ranges);
         }
 
-        Handle(ChunkId id, ChunkFormats.Header header) {
+        Handle(ChunkId id, ChunkFormats.Header header, StrataNamespace ns) {
             this.id = id;
+            this.ns = ns;
+            this.nsKey = new NsChunkId(ns, id);
             this.header = header;
-            String base = ChunkFormats.baseName(id);
-            this.dataPath = dir.resolve(base + ".chunk");
-            this.metaPath = dir.resolve(base + ".meta");
-            this.ledgerPath = dir.resolve(base + ".j");
+            String rel = ChunkFormats.chunkRelativePath(ns, id);
+            Path chunkFile = dir.resolve(rel + ".chunk");
+            this.shardDir = chunkFile.getParent();
+            this.dataPath = chunkFile;
+            this.metaPath = dir.resolve(rel + ".meta");
+            this.ledgerPath = dir.resolve(rel + ".j");
+        }
+
+        /**
+         * Path-based constructor for recovery: Task 7 supplies the exact chunk file path discovered
+         * during the namespace-aware directory walk; the paths are derived directly from the given
+         * dataPath rather than recomputed from a namespace, avoiding a second path-encoding step.
+         */
+        Handle(ChunkId id, ChunkFormats.Header header, Path dataPath, StrataNamespace ns) {
+            this.id = id;
+            this.ns = ns;
+            this.nsKey = new NsChunkId(ns, id);
+            this.header = header;
+            this.dataPath = dataPath;
+            this.shardDir = dataPath.getParent();
+            String baseName = ChunkFormats.baseName(id);
+            this.metaPath = shardDir.resolve(baseName + ".meta");
+            this.ledgerPath = shardDir.resolve(baseName + ".j");
         }
 
         void persistSidecar() throws IOException {
@@ -479,7 +513,7 @@ public final class ChunkStore implements AutoCloseable {
                 }
             }
             if (sync && !existed) {
-                forceDirectory();
+                forceDirectory(shardDir);
             }
         }
 
@@ -510,22 +544,23 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    private Handle lookup(ChunkId id) {
-        Handle h = chunks.get(id);
+    private Handle lookup(StrataNamespace ns, ChunkId id) {
+        Handle h = chunks.get(new NsChunkId(ns, id));
         if (h == null) throw new ScpException(ErrorCode.CHUNK_NOT_FOUND, id.toString());
         return h;
     }
 
-    private void reserveNewChunk(ChunkId id) {
-        if (!creating.add(id)) throw chunkAlreadyExists(id);
-        if (chunks.containsKey(id)) {
-            creating.remove(id);
+    private void reserveNewChunk(StrataNamespace ns, ChunkId id) {
+        NsChunkId key = new NsChunkId(ns, id);
+        if (!creating.add(key)) throw chunkAlreadyExists(id);
+        if (chunks.containsKey(key)) {
+            creating.remove(key);
             throw chunkAlreadyExists(id);
         }
     }
 
-    private void releaseReservation(ChunkId id) {
-        creating.remove(id);
+    private void releaseReservation(StrataNamespace ns, ChunkId id) {
+        creating.remove(new NsChunkId(ns, id));
     }
 
     private static ScpException chunkAlreadyExists(ChunkId id) {
@@ -555,7 +590,8 @@ public final class ChunkStore implements AutoCloseable {
 
     /* ---------------- operations ---------------- */
 
-    public void open(ChunkId id, boolean fsyncOnAck, int writeEpoch, long createdAtMs) throws IOException {
+    public void open(StrataNamespace ns, ChunkId id, boolean fsyncOnAck, int writeEpoch, long createdAtMs)
+            throws IOException {
         long t0 = System.nanoTime();
         long tChannelOpen = t0;
         long tHeaderWrite = t0;
@@ -565,7 +601,7 @@ public final class ChunkStore implements AutoCloseable {
         long tLedgerDirForce = t0;
         long tSidecar = t0;
         long tInstall = t0;
-        reserveNewChunk(id);
+        reserveNewChunk(ns, id);
         Handle h = null;
         boolean dataCreated = false;
         boolean ledgerOwned = false;
@@ -573,7 +609,11 @@ public final class ChunkStore implements AutoCloseable {
         boolean installed = false;
         try {
             ChunkFormats.Header header = new ChunkFormats.Header(id, fsyncOnAck, writeEpoch, createdAtMs, 0, 0, 0);
-            h = new Handle(id, header);
+            h = new Handle(id, header, ns);
+            Files.createDirectories(h.shardDir);
+            if (sealFsync) {
+                forceDirectory(h.shardDir);
+            }
             if (Files.exists(h.dataPath)) throw chunkAlreadyExists(id);
             boolean ledgerPreexisted = Files.exists(h.ledgerPath);
             boolean metaPreexisted = Files.exists(h.metaPath);
@@ -588,14 +628,14 @@ public final class ChunkStore implements AutoCloseable {
             }
             tDataForce = System.nanoTime();
             if (sealFsync) {
-                forceDirectory();
+                forceDirectory(h.shardDir);
             }
             tDataDirForce = System.nanoTime();
             ledgerOwned = !ledgerPreexisted;
             h.ledger = IntegrityLedger.create(h.ledgerPath);
             tLedgerCreate = System.nanoTime();
             if (sealFsync) {
-                forceDirectory();
+                forceDirectory(h.shardDir);
             }
             tLedgerDirForce = System.nanoTime();
             h.state = ChunkState.OPEN;
@@ -607,12 +647,12 @@ public final class ChunkStore implements AutoCloseable {
             h.persistSidecar(sealFsync);
             tSidecar = System.nanoTime();
             h.startCommitterIfFsync(forceCount);
-            chunks.put(id, h);
+            chunks.put(new NsChunkId(ns, id), h);
             tInstall = System.nanoTime();
             if (tInstall - t0 > SLOW_MUTATION_LOG_NANOS) {
-                log.info("slow open {} fsyncOnAck={} phases(ms): dataOpen={} headerWrite={} dataFsync={} "
+                log.info("slow open {} ns={} fsyncOnAck={} phases(ms): dataOpen={} headerWrite={} dataFsync={} "
                                 + "dataDirFsync={} ledgerCreate={} ledgerDirFsync={} sidecarPersist={} total={}",
-                        id, fsyncOnAck, msBetween(t0, tChannelOpen), msBetween(tChannelOpen, tHeaderWrite),
+                        id, ns, fsyncOnAck, msBetween(t0, tChannelOpen), msBetween(tChannelOpen, tHeaderWrite),
                         sealFsync ? msBetween(tHeaderWrite, tDataForce) : "-1.0",
                         sealFsync ? msBetween(tDataForce, tDataDirForce) : "-1.0",
                         msBetween(tDataDirForce, tLedgerCreate),
@@ -624,7 +664,7 @@ public final class ChunkStore implements AutoCloseable {
             if (!installed && h != null) {
                 cleanupFailedOpen(h, dataCreated, ledgerOwned, metaOwned);
             }
-            releaseReservation(id);
+            releaseReservation(ns, id);
         }
     }
 
@@ -646,26 +686,20 @@ public final class ChunkStore implements AutoCloseable {
                 log.warn("failed to close incomplete chunk {}", h.dataPath, e);
             }
         }
-        deleteOwnedPath(dataCreated, h.dataPath, "incomplete chunk data");
-        deleteOwnedPath(ledgerOwned, h.ledgerPath, "incomplete chunk ledger");
-        deleteOwnedPath(metaOwned, h.metaPath, "incomplete chunk sidecar");
+        deleteOwnedPath(dataCreated, h.dataPath, h.shardDir, "incomplete chunk data");
+        deleteOwnedPath(ledgerOwned, h.ledgerPath, h.shardDir, "incomplete chunk ledger");
+        deleteOwnedPath(metaOwned, h.metaPath, h.shardDir, "incomplete chunk sidecar");
     }
 
-    private void deleteOwnedPath(boolean owned, Path path, String description) {
+    private void deleteOwnedPath(boolean owned, Path path, Path containingDir, String description) {
         if (!owned) return;
         try {
             Files.deleteIfExists(path);
             if (sealFsync) {
-                forceDirectory();
+                forceDirectory(containingDir);
             }
         } catch (IOException e) {
             log.warn("failed to delete {} {}", description, path, e);
-        }
-    }
-
-    private void forceDirectory() throws IOException {
-        try (FileChannel ch = FileChannel.open(dir, StandardOpenOption.READ)) {
-            ch.force(true);
         }
     }
 
@@ -718,8 +752,8 @@ public final class ChunkStore implements AutoCloseable {
      * immediately for ack-on-replicate, after a covering group-commit force for ack-on-fsync.
      */
     public java.util.concurrent.CompletableFuture<AppendResult> appendAsync(
-            ChunkId id, int epoch, long baseOffset, long durableOffset, ByteBuffer payload) throws IOException {
-        Handle h = lookup(id);
+            StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset, ByteBuffer payload) throws IOException {
+        Handle h = lookup(ns, id);
         // CRC the payload before taking the chunk monitor: the pass is state-independent and
         // would otherwise serialize behind every other append to this chunk
         // Crc.of(ByteBuffer) duplicates the buffer internally, so it leaves payload's position
@@ -784,10 +818,10 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     /** Synchronous convenience (tests, simple callers); production append path uses appendAsync. */
-    public AppendResult append(ChunkId id, int epoch, long baseOffset, long durableOffset,
+    public AppendResult append(StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset,
                                ByteBuffer payload) throws IOException {
         try {
-            return appendAsync(id, epoch, baseOffset, durableOffset, payload).join();
+            return appendAsync(ns, id, epoch, baseOffset, durableOffset, payload).join();
         } catch (java.util.concurrent.CompletionException e) {
             if (e.getCause() instanceof ScpException se) throw se;
             throw new ScpException(ErrorCode.INTERNAL, String.valueOf(e.getCause()));
@@ -816,10 +850,10 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    public ReadResult read(ChunkId id, long offset, int maxBytes) throws IOException {
+    public ReadResult read(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
         requireNonNegative(offset, "read offset");
         requireNonNegative(maxBytes, "read maxBytes");
-        Handle h = lookup(id);
+        Handle h = lookup(ns, id);
         long sealedLength;
         List<Integer> rangeCrcs;
         long lastKnownDO;
@@ -841,14 +875,14 @@ public final class ChunkStore implements AutoCloseable {
         if (offset >= sealedLength) return new ReadResult(new byte[0], sealedLength, lastKnownDO);
         int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), sealedLength - offset);
         byte[] out = new byte[n];
-        try (ChannelCache.Lease lease = channelCache.acquire(id, dataPath)) {
+        try (ChannelCache.Lease lease = channelCache.acquire(h.nsKey, dataPath)) {
             readSealedVerified(lease.channel(), sealedLength, rangeCrcs, id, offset, out);
         }
         return new ReadResult(out, sealedLength, lastKnownDO);
     }
 
-    public ReadRegionResult readRegion(ChunkId id, long offset, int maxBytes) throws IOException {
-        return readRegion(id, offset, maxBytes, false);
+    public ReadRegionResult readRegion(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
+        return readRegion(ns, id, offset, maxBytes, false);
     }
 
     /**
@@ -859,15 +893,15 @@ public final class ChunkStore implements AutoCloseable {
      * still integrity-ledger verified, and the recovery path does not count toward client read
      * throughput metrics.
      */
-    public ReadRegionResult readRegionForRecovery(ChunkId id, long offset, int maxBytes) throws IOException {
-        return readRegion(id, offset, maxBytes, true);
+    public ReadRegionResult readRegionForRecovery(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
+        return readRegion(ns, id, offset, maxBytes, true);
     }
 
-    private ReadRegionResult readRegion(ChunkId id, long offset, int maxBytes,
+    private ReadRegionResult readRegion(StrataNamespace ns, ChunkId id, long offset, int maxBytes,
                                         boolean includeUndurableTail) throws IOException {
         requireNonNegative(offset, "read offset");
         requireNonNegative(maxBytes, "read maxBytes");
-        Handle h = lookup(id);
+        Handle h = lookup(ns, id);
         synchronized (h) {
             long localEnd = h.currentEnd();
             long readableEnd = (h.state == ChunkState.SEALED || includeUndurableTail)
@@ -920,7 +954,7 @@ public final class ChunkStore implements AutoCloseable {
             // SEALED: zero-copy region over an exclusive leased cache channel (never shared across readers —
             // FileChannel is interruptible, so a shared FD would close for all on any reader's interrupt). The
             // lease is released (returning the channel to the idle pool) when the response Frame closes.
-            ChannelCache.Lease lease = channelCache.acquire(id, h.dataPath);
+            ChannelCache.Lease lease = channelCache.acquire(h.nsKey, h.dataPath);
             try {
                 return new ReadRegionResult(lease.channel(), filePos, n, null, localEnd, h.lastKnownDO,
                         lease::release);
@@ -933,8 +967,8 @@ public final class ChunkStore implements AutoCloseable {
 
     public record FenceResult(int persistedFenceEpoch, long localEndOffset, long lastKnownDO, ChunkState state) {}
 
-    public FenceResult fence(ChunkId id, int fenceEpoch) throws IOException {
-        Handle h = lookup(id);
+    public FenceResult fence(StrataNamespace ns, ChunkId id, int fenceEpoch) throws IOException {
+        Handle h = lookup(ns, id);
         synchronized (h) {
             if (h.fenceEpoch == RECOVERY_FENCE_REQUIRED) {
                 if (fenceEpoch <= h.writeEpoch) {
@@ -954,8 +988,8 @@ public final class ChunkStore implements AutoCloseable {
     public record StatResult(ChunkState state, long localEndOffset, long lastKnownDO, int writeEpoch,
                              int fenceEpoch, long sealedLength, int dataCrc) {}
 
-    public StatResult stat(ChunkId id) {
-        Handle h = lookup(id);
+    public StatResult stat(StrataNamespace ns, ChunkId id) {
+        Handle h = lookup(ns, id);
         synchronized (h) {
             return new StatResult(h.state, h.currentEnd(), h.lastKnownDO, h.writeEpoch, h.fenceEpoch,
                     h.sealedLength, h.dataCrc);
@@ -968,11 +1002,11 @@ public final class ChunkStore implements AutoCloseable {
      * Seals at dataLength (must be <= current end; shorter means truncate the never-acked tail).
      * callerSections, if non-empty, is a pre-encoded section list: u32 count + section bytes.
      */
-    public SealResult seal(ChunkId id, int epoch, long dataLength, ByteBuffer callerSections) throws IOException {
+    public SealResult seal(StrataNamespace ns, ChunkId id, int epoch, long dataLength, ByteBuffer callerSections) throws IOException {
         // a negative length would pass the > end check and truncate(DATA_START + negative)
         // destroys the chunk HEADER before anything throws — reject at the boundary
         requireNonNegative(dataLength, "seal dataLength");
-        Handle h = lookup(id);
+        Handle h = lookup(ns, id);
         synchronized (h) {
             checkEpoch(h, epoch);
             if (h.state == ChunkState.SEALED) {
@@ -1176,9 +1210,9 @@ public final class ChunkStore implements AutoCloseable {
         return new CrcScan((int) whole.getValue(), ranges);
     }
 
-    public List<ChunkFormats.LedgerEntry> readLedger(ChunkId id, long fromOffset) {
+    public List<ChunkFormats.LedgerEntry> readLedger(StrataNamespace ns, ChunkId id, long fromOffset) {
         requireNonNegative(fromOffset, "ledger offset");
-        Handle h = lookup(id);
+        Handle h = lookup(ns, id);
         synchronized (h) {
             if (h.ledger == null) return List.of();
             return h.ledger.entriesAfter(fromOffset);
@@ -1188,10 +1222,10 @@ public final class ChunkStore implements AutoCloseable {
     public record FetchResult(long fileLength, ChunkState state, byte[] bytes) {}
 
     /** Raw file bytes (header + data + footer) — repair/relocation transfer. Sealed chunks only. */
-    public FetchResult fetch(ChunkId id, long offset, int maxBytes) throws IOException {
+    public FetchResult fetch(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
         requireNonNegative(offset, "fetch offset");
         requireNonNegative(maxBytes, "fetch maxBytes");
-        Handle h = lookup(id);
+        Handle h = lookup(ns, id);
         ChunkState state;
         Path dataPath;
         synchronized (h) {
@@ -1201,7 +1235,7 @@ public final class ChunkStore implements AutoCloseable {
             state = h.state;
             dataPath = h.dataPath;
         }
-        try (ChannelCache.Lease lease = channelCache.acquire(id, dataPath)) {
+        try (ChannelCache.Lease lease = channelCache.acquire(h.nsKey, dataPath)) {
             FileChannel data = lease.channel();
             long fileLen = data.size();
             if (offset >= fileLen) return new FetchResult(fileLen, state, new byte[0]);
@@ -1212,18 +1246,19 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    /** Creates a temp file in the chunk directory for a streaming sealed-chunk import. */
+    /** Creates a temp file in the chunk store root for a streaming sealed-chunk import. */
     public Path createImportTemp(ChunkId id) throws IOException {
         Files.createDirectories(dir);
         return Files.createTempFile(dir, ChunkFormats.baseName(id) + ".", ".import");
     }
 
     /** Imports a sealed chunk from raw file bytes (tests/simple callers). Validates everything. */
-    public void importSealed(ChunkId id, byte[] fileBytes, long expectedLength, int expectedCrc) throws IOException {
+    public void importSealed(StrataNamespace ns, ChunkId id, byte[] fileBytes,
+                             long expectedLength, int expectedCrc) throws IOException {
         Path tmp = createImportTemp(id);
         try {
             Files.write(tmp, fileBytes);
-            importSealed(id, tmp, expectedLength, expectedCrc);
+            importSealed(ns, id, tmp, expectedLength, expectedCrc);
         } finally {
             Files.deleteIfExists(tmp);
         }
@@ -1234,8 +1269,9 @@ public final class ChunkStore implements AutoCloseable {
      * The source file is consumed: on success it is atomically moved into place; on failure the
      * caller should delete it.
      */
-    public void importSealed(ChunkId id, Path sourceFile, long expectedLength, int expectedCrc) throws IOException {
-        reserveNewChunk(id);
+    public void importSealed(StrataNamespace ns, ChunkId id, Path sourceFile,
+                             long expectedLength, int expectedCrc) throws IOException {
+        reserveNewChunk(ns, id);
         try {
             long fileLen = Files.size(sourceFile);
             if (fileLen < HEADER_SIZE + TRAILER_SIZE) {
@@ -1272,7 +1308,8 @@ public final class ChunkStore implements AutoCloseable {
                 rangeCrcs = decodeCrcRanges(footerBytes, trailer.dataLength(), trailer.sectionCount());
             }
 
-            Handle h = new Handle(id, header);
+            Handle h = new Handle(id, header, ns);
+            Files.createDirectories(h.shardDir);
             if (Files.exists(h.dataPath)) throw chunkAlreadyExists(id);
             boolean movedData = false;
             boolean sidecarStarted = false;
@@ -1282,7 +1319,7 @@ public final class ChunkStore implements AutoCloseable {
                     ch.force(true);
                 }
                 Files.move(sourceFile, h.dataPath, StandardCopyOption.ATOMIC_MOVE);
-                forceDirectory();
+                forceDirectory(h.shardDir);
                 movedData = true;
                 h.data = null; // sealed + durable on import: reads go through the channel cache
                 h.state = ChunkState.SEALED;
@@ -1296,8 +1333,8 @@ public final class ChunkStore implements AutoCloseable {
                 sidecarStarted = true;
                 h.persistSidecar();
                 Files.deleteIfExists(h.ledgerPath);
-                forceDirectory();
-                chunks.put(id, h);
+                forceDirectory(h.shardDir);
+                chunks.put(new NsChunkId(ns, id), h);
                 installed = true;
             } finally {
                 if (!installed) {
@@ -1305,7 +1342,7 @@ public final class ChunkStore implements AutoCloseable {
                 }
             }
         } finally {
-            releaseReservation(id);
+            releaseReservation(ns, id);
         }
     }
 
@@ -1338,14 +1375,14 @@ public final class ChunkStore implements AutoCloseable {
         }
         try {
             Files.deleteIfExists(tmp);
-            forceDirectory();
+            forceDirectory(dir); // temp file lives in store root
         } catch (IOException e) {
             log.warn("failed to delete incomplete import temp file {}", tmp, e);
         }
         if (movedData) {
             try {
                 Files.deleteIfExists(h.dataPath);
-                forceDirectory();
+                forceDirectory(h.shardDir);
             } catch (IOException e) {
                 log.warn("failed to delete incomplete import data file {}", h.dataPath, e);
             }
@@ -1353,17 +1390,18 @@ public final class ChunkStore implements AutoCloseable {
         if (sidecarStarted) {
             try {
                 Files.deleteIfExists(h.metaPath);
-                forceDirectory();
+                forceDirectory(h.shardDir);
             } catch (IOException e) {
                 log.warn("failed to delete incomplete import sidecar {}", h.metaPath, e);
             }
         }
     }
 
-    public ErrorCode delete(ChunkId id) {
+    public ErrorCode delete(StrataNamespace ns, ChunkId id) {
         long t0 = System.nanoTime();
-        Handle h = chunks.get(id);
-        if (h == null && creating.contains(id)) return ErrorCode.INTERNAL;
+        NsChunkId key = new NsChunkId(ns, id);
+        Handle h = chunks.get(key);
+        if (h == null && creating.contains(key)) return ErrorCode.INTERNAL;
         if (h == null) return ErrorCode.CHUNK_NOT_FOUND;
         long tBeforeLock = System.nanoTime();
         long tLock = tBeforeLock;
@@ -1388,17 +1426,17 @@ public final class ChunkStore implements AutoCloseable {
                 Files.deleteIfExists(h.ledgerPath);
                 tFileDelete = System.nanoTime();
                 if (sealFsync) {
-                    forceDirectory();
+                    forceDirectory(h.shardDir);
                 }
                 tDirForce = System.nanoTime();
-                chunks.remove(id, h);
+                chunks.remove(key, h);
                 tRemove = System.nanoTime();
             } catch (IOException e) {
                 log.warn("delete {} failed", id, e);
                 return ErrorCode.INTERNAL;
             }
         }
-        channelCache.invalidate(id);
+        channelCache.invalidate(key);
         if (tRemove - t0 > SLOW_MUTATION_LOG_NANOS) {
             log.info("slow delete {} phases(ms): preLookup={} lockWait={} stopCommitter={} dataClose={} "
                             + "ledgerClose={} fileDelete={} dirFsync={} lockHeld={} total={}",
@@ -1411,13 +1449,63 @@ public final class ChunkStore implements AutoCloseable {
         return ErrorCode.OK;
     }
 
-    public record InventoryItem(ChunkId chunkId, ChunkState state, long length, int crc) {}
+    /** A point-in-time view of one stored chunk — for tests/diagnostics that inspect the store's contents. */
+    public record ChunkSummary(StrataNamespace namespace, ChunkId chunkId, ChunkState state, long length, int crc) {}
 
-    public List<InventoryItem> inventory() {
-        List<InventoryItem> out = new ArrayList<>();
+    /** Snapshots every chunk this store holds. No longer pushed anywhere (Phase 2 replaced the inventory
+     *  push with owner-pull VERIFY_CHUNKS); retained as a store-inspection accessor. */
+    public List<ChunkSummary> describeChunks() {
+        List<ChunkSummary> out = new ArrayList<>();
         for (Handle h : chunks.values()) {
             synchronized (h) {
-                out.add(new InventoryItem(h.id, h.state, h.currentEnd(), h.dataCrc));
+                out.add(new ChunkSummary(h.ns, h.id, h.state, h.currentEnd(), h.dataCrc));
+            }
+        }
+        return out;
+    }
+
+    /** One chunk's local verification fact for {@link #verify}; {@code present == false} means absent. */
+    public record VerifyResult(ChunkId chunkId, boolean present, ChunkState state, long length, int crc) {}
+
+    /**
+     * Owner-pull verification (design §20.3): report the local state of each requested chunk and stamp
+     * the present ones as freshly verified — which both refreshes the orphan-GC grace (§20.4) and lets
+     * the owner compare state/length/crc against its descriptor to find missing/corrupt replicas. An
+     * absent chunk reports {@code present == false} (a missing replica). Read-only on the data itself.
+     */
+    public List<VerifyResult> verify(StrataNamespace ns, List<ChunkId> chunkIds) {
+        long now = System.currentTimeMillis();
+        List<VerifyResult> out = new ArrayList<>(chunkIds.size());
+        for (ChunkId id : chunkIds) {
+            Handle h = chunks.get(new NsChunkId(ns, id));
+            if (h == null) {
+                out.add(new VerifyResult(id, false, ChunkState.OPEN, 0, 0));
+                continue;
+            }
+            synchronized (h) {
+                h.lastVerifiedAtMs = now;
+                out.add(new VerifyResult(id, true, h.state, h.currentEnd(), h.dataCrc));
+            }
+        }
+        return out;
+    }
+
+    /** A locally-held sealed chunk no owner has verified within the grace window (orphan-GC candidate). */
+    public record SuspectChunk(StrataNamespace namespace, ChunkId chunkId) {}
+
+    /**
+     * Node-local orphan-GC candidates (design §20.4): sealed chunks no owner has attested within
+     * {@code olderThanMs} (via {@link #verify}). Open chunks (in-flight writes) and freshly-known chunks
+     * (still inside grace) are excluded. Returns a snapshot; the caller confirms each with the owner
+     * before deleting — a suspect is not yet a confirmed orphan.
+     */
+    public List<SuspectChunk> orphanSuspects(long olderThanMs, long now) {
+        List<SuspectChunk> out = new ArrayList<>();
+        for (Handle h : chunks.values()) {
+            synchronized (h) {
+                if (h.state == ChunkState.SEALED && now - h.lastVerifiedAtMs >= olderThanMs) {
+                    out.add(new SuspectChunk(h.ns, h.id));
+                }
             }
         }
         return out;
@@ -1443,16 +1531,16 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    public boolean contains(ChunkId id) {
-        return chunks.containsKey(id);
+    public boolean contains(StrataNamespace ns, ChunkId id) {
+        return chunks.containsKey(new NsChunkId(ns, id));
     }
 
     /**
      * Re-verifies sealed chunks' data regions against their trailer CRC (tech design §16
      * crash-safety / the read-path's deferred verification). On rot, the handle's dataCrc is
-     * updated to the RECOMPUTED value so the next inventory report mismatches the descriptor —
-     * the coordinator's existing corrupt-replica path then drops and re-repairs this copy.
-     * Returns the number of corrupt chunks found.
+     * updated to the RECOMPUTED value so the next owner-pull VERIFY_CHUNKS reports a crc that
+     * mismatches the descriptor — the coordinator's corrupt-replica path then drops and
+     * re-repairs this copy. Returns the number of corrupt chunks found.
      */
     public int scrubOnce() throws IOException {
         int corrupt = 0;
@@ -1467,14 +1555,14 @@ public final class ChunkStore implements AutoCloseable {
                 dataPath = h.dataPath;
             }
             int actual;
-            try (ChannelCache.Lease lease = channelCache.acquire(h.id, dataPath)) {
+            try (ChannelCache.Lease lease = channelCache.acquire(h.nsKey, dataPath)) {
                 actual = scanDataCrcs(lease.channel(), sealedLength).dataCrc();
             }
             if (actual != storedCrc) {
                 synchronized (h) {
                     if (h.state == ChunkState.SEALED && h.dataCrc == storedCrc) {
                         log.error("scrub: sealed chunk {} data rot — stored crc {} actual {}; "
-                                + "exposing via inventory for re-repair", h.id, storedCrc, actual);
+                                + "updating reported crc so the next owner verify re-repairs", h.id, storedCrc, actual);
                         h.dataCrc = actual;
                         corrupt++;
                     }
@@ -1486,27 +1574,95 @@ public final class ChunkStore implements AutoCloseable {
 
     /* ---------------- startup recovery (tech design §11.3) ---------------- */
 
+    /**
+     * Startup recovery: walks the namespace-sharded directory tree in parallel, recovering every
+     * {@code .chunk} file found under {@code dir/<ns>/<shard>/}. Each top-level namespace directory
+     * is recovered concurrently via virtual threads. Any unexpected flat {@code .chunk} files sitting
+     * directly in the store root (outside a namespace directory) are quarantined and logged as errors.
+     */
     private void recoverAll() throws IOException {
-        try (Stream<Path> files = Files.list(dir)) {
-            files.filter(p -> p.getFileName().toString().endsWith(".chunk"))
-                    .forEach(p -> {
-                        String base = p.getFileName().toString();
-                        base = base.substring(0, base.length() - ".chunk".length());
-                        try {
-                            recoverOne(ChunkFormats.parseBaseName(base));
-                        } catch (Exception e) {
-                            log.error("failed to recover chunk {} — quarantined", base, e);
-                            quarantineRecoveredFiles(base);
-                        }
-                    });
+        if (!Files.isDirectory(dir)) return;
+
+        // Single pass: partition store-root entries into namespace dirs and stray .chunk files.
+        List<Path> nsDirs = new ArrayList<>();
+        List<Path> rootChunks = new ArrayList<>();
+        try (Stream<Path> stream = Files.list(dir)) {
+            stream.forEach(p -> {
+                if (Files.isDirectory(p)) {
+                    nsDirs.add(p);
+                } else if (p.getFileName().toString().endsWith(".chunk")) {
+                    rootChunks.add(p);
+                }
+            });
+        }
+        // Quarantine any unexpected flat .chunk files placed directly in the store root
+        // (they cannot belong to any namespace directory and indicate corruption or misplaced files).
+        for (Path p : rootChunks) {
+            log.error("unexpected flat .chunk file in store root — quarantined: {}", p);
+            quarantineRecoveredFiles(p);
+        }
+
+        if (nsDirs.isEmpty()) return;
+
+        // Recover each namespace in parallel via virtual threads
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            List<Future<?>> futures = new ArrayList<>();
+            for (Path nsDir : nsDirs) {
+                String nsName = nsDir.getFileName().toString();
+                StrataNamespace ns = StrataNamespace.of(nsName);
+                futures.add(executor.submit(() -> {
+                    try {
+                        recoverNamespace(ns, nsDir);
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                }));
+            }
+            for (Future<?> f : futures) {
+                try {
+                    f.get();
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    if (cause instanceof UncheckedIOException uioe) throw uioe.getCause();
+                    if (cause instanceof IOException ioe) throw ioe;
+                    throw new IOException("recovery failed", cause);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("recovery interrupted", e);
+                }
+            }
+        } finally {
+            executor.shutdownNow();
         }
     }
 
-    private void quarantineRecoveredFiles(String base) {
+    private void recoverNamespace(StrataNamespace ns, Path nsDir) throws IOException {
+        // Collect all .chunk files first (crash-safety: avoid delete-during-walk)
+        List<Path> chunkFiles;
+        try (Stream<Path> files = Files.walk(nsDir)) {
+            chunkFiles = files.filter(p -> p.getFileName().toString().endsWith(".chunk")).toList();
+        }
+        for (Path p : chunkFiles) {
+            String name = p.getFileName().toString();
+            String base = name.substring(0, name.length() - ".chunk".length());
+            try {
+                recoverOne(ns, ChunkFormats.parseBaseName(base), p);
+            } catch (Exception e) {
+                log.error("failed to recover chunk {} — quarantined", base, e);
+                quarantineRecoveredFiles(p);
+            }
+        }
+    }
+
+    private void quarantineRecoveredFiles(Path dataPath) {
         boolean moved = false;
         String suffix = ".quarantine-" + System.currentTimeMillis();
+        String base = dataPath.getFileName().toString();
+        base = base.substring(0, base.length() - ".chunk".length());
+        Path shardDir = dataPath.getParent();
         for (String ext : List.of(".chunk", ".meta", ".j")) {
-            Path source = dir.resolve(base + ext);
+            Path source = shardDir.resolve(base + ext);
             if (!Files.exists(source)) {
                 continue;
             }
@@ -1519,9 +1675,9 @@ public final class ChunkStore implements AutoCloseable {
         }
         if (moved) {
             try {
-                forceDirectory();
+                forceDirectory(shardDir);
             } catch (IOException e) {
-                log.warn("failed to fsync quarantine directory {}", dir, e);
+                log.warn("failed to fsync quarantine directory {}", shardDir, e);
             }
         }
     }
@@ -1536,8 +1692,12 @@ public final class ChunkStore implements AutoCloseable {
         return target;
     }
 
-    private void recoverOne(ChunkId id) throws IOException {
-        Handle probe = new Handle(id, null);
+    /**
+     * Recovers a single chunk given its namespace and data file path. The namespace-aware Handle
+     * constructor stores the namespace so the chunk is keyed correctly in the NsChunkId map.
+     */
+    void recoverOne(StrataNamespace ns, ChunkId id, Path dataPath) throws IOException {
+        Handle probe = new Handle(id, null, dataPath, ns);
         boolean hasSidecar = Files.exists(probe.metaPath);
         byte[] headerBytes = new byte[HEADER_SIZE];
         ChunkFormats.Header header;
@@ -1567,7 +1727,7 @@ public final class ChunkStore implements AutoCloseable {
             }
             reconstructedSidecar = true;
         }
-        Handle h = new Handle(id, header);
+        Handle h = new Handle(id, header, dataPath, ns);
         boolean installed = false;
         try {
             if (sidecar.state() == ChunkState.SEALED) {
@@ -1602,7 +1762,7 @@ public final class ChunkStore implements AutoCloseable {
                     h.persistSidecar();
                 }
                 Files.deleteIfExists(h.ledgerPath); // seal crashed before ledger delete
-                forceDirectory();
+                forceDirectory(h.shardDir);
             } else {
                 // OPEN: keep a persistent writable channel + ledger (pinned, as before).
                 h.data = FileChannel.open(h.dataPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
@@ -1649,9 +1809,9 @@ public final class ChunkStore implements AutoCloseable {
                 }
                 h.startCommitterIfFsync(forceCount);
             }
-            chunks.put(id, h);
+            chunks.put(new NsChunkId(ns, id), h);
             installed = true;
-            log.info("recovered chunk {} state={} end={}", id, h.state, h.end);
+            log.info("recovered chunk {} ns={} state={} end={}", id, ns, h.state, h.end);
         } finally {
             if (!installed) {
                 closeRecoveringHandle(h);
@@ -1709,7 +1869,7 @@ public final class ChunkStore implements AutoCloseable {
         log.warn("chunk {} has no sidecar — removing {} remnants", id, reason);
         Files.deleteIfExists(probe.dataPath);
         Files.deleteIfExists(probe.ledgerPath);
-        forceDirectory();
+        forceDirectory(probe.shardDir);
     }
 
     private boolean looksLikeValidSealedChunk(Path dataPath) {

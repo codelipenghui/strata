@@ -15,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Per-subtree ZK request/byte counters: the store attributes every ZooKeeper op to the top-level
  * {@code /strata/<subtree>} it touches, split read vs write, so the metrics layer can chart request
- * rate and throughput per subtree (files / namespaces / nodes / ids).
+ * rate and throughput per subtree (files / namespaces / nodes).
  */
 class ZkMetadataStoreMetricsTest {
 
@@ -23,10 +23,6 @@ class ZkMetadataStoreMetricsTest {
     void countsZkOpsAndBytesPerSubtree() throws Exception {
         try (TestingServer zk = new TestingServer(true);
              ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
-
-            // ids subtree: sequential id allocation is a write
-            store.nextNodeId();
-            assertTrue(store.zkOps("ids", true) >= 1, "nextNodeId must count an ids write");
 
             // nodes subtree: putNode writes, getNode reads
             Records.NodeRecord node = new Records.NodeRecord(
@@ -38,7 +34,7 @@ class ZkMetadataStoreMetricsTest {
             assertTrue(store.zkOps("nodes", false) >= 1, "getNode must count a nodes read");
 
             // files + namespaces subtrees: createFile writes the file record and the namespace marker
-            FileId fileId = FileId.random();
+            FileId fileId = FileId.of(1);
             Records.FileRecord file = new Records.FileRecord(
                     fileId, "test", "/test-file", 3, 2, false, FileState.OPEN, System.currentTimeMillis(), List.of());
             store.createFile(file);
@@ -47,7 +43,7 @@ class ZkMetadataStoreMetricsTest {
             assertTrue(store.zkOps("namespaces", true) >= 1, "createFile must count a namespaces write (marker)");
 
             // files read: getFile reads the record
-            store.getFile(fileId);
+            store.getFile(StrataNamespace.of("test"), fileId);
             assertTrue(store.zkOps("files", false) >= 1, "getFile must count a files read");
             assertTrue(store.zkBytes("files", false) > 0, "getFile must count files read bytes");
 

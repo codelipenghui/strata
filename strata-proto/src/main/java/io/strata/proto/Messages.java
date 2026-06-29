@@ -107,33 +107,47 @@ public final class Messages {
     /* ---------- data plane ---------- */
 
     public record OpenChunk(ChunkId chunkId, int writeEpoch, boolean fsyncOnAck,
-                            long expectedMaxBytes, long createdAtMs) {
+                            long expectedMaxBytes, long createdAtMs, StrataNamespace namespace) {
+        public OpenChunk {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.chunkId(chunkId).i32(writeEpoch).u8(fsyncOnAck ? 1 : 0)
-                    .u64(expectedMaxBytes).u64(createdAtMs).noTags();
+                    .u64(expectedMaxBytes).u64(createdAtMs).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static OpenChunk decode(ByteBuffer b) {
-            OpenChunk m = new OpenChunk(ChunkId.readFrom(b), b.getInt(), Varint.readBoolean(b),
-                    b.getLong(), b.getLong());
+            ChunkId chunkId = ChunkId.readFrom(b);
+            int writeEpoch = b.getInt();
+            boolean fsyncOnAck = Varint.readBoolean(b);
+            long expectedMaxBytes = b.getLong();
+            long createdAtMs = b.getLong();
+            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             TaggedFields.readFrom(b);
-            return m;
+            return new OpenChunk(chunkId, writeEpoch, fsyncOnAck, expectedMaxBytes, createdAtMs, namespace);
         }
     }
 
-    public record Append(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset) {
+    public record Append(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset,
+                         StrataNamespace namespace) {
+        public Append {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
-            // fixed 41 bytes: chunkId 20 + i32 4 + u64 8 + u64 8 + noTags 1 — size exactly so the
-            // per-append writer never over-allocates (this runs once per record, for all 3 replicas)
-            BufWriter w = new BufWriter(41);
-            w.chunkId(chunkId).i32(writeEpoch).u64(baseOffset).u64(durableOffset).noTags();
+            int len = namespace.value().length(); // ASCII namespace: UTF-8 length == char length
+            BufWriter w = new BufWriter(33 + (len < 128 ? 1 : 2) + len);
+            w.chunkId(chunkId).i32(writeEpoch).u64(baseOffset).u64(durableOffset)
+                    .string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static Append decode(ByteBuffer b) {
-            Append m = new Append(ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong());
+            Append m = new Append(ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong(),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -154,15 +168,20 @@ public final class Messages {
         }
     }
 
-    public record Read(ChunkId chunkId, long offset, int maxBytes) {
+    public record Read(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace) {
+        public Read {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(offset).u32(maxBytes).noTags();
+            w.chunkId(chunkId).u64(offset).u32(maxBytes).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static Read decode(ByteBuffer b) {
-            Read m = new Read(ChunkId.readFrom(b), b.getLong(), b.getInt());
+            Read m = new Read(ChunkId.readFrom(b), b.getLong(), b.getInt(),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -183,15 +202,20 @@ public final class Messages {
         }
     }
 
-    public record Fence(ChunkId chunkId, int fenceEpoch) {
+    public record Fence(ChunkId chunkId, int fenceEpoch, StrataNamespace namespace) {
+        public Fence {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(fenceEpoch).noTags();
+            w.chunkId(chunkId).i32(fenceEpoch).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static Fence decode(ByteBuffer b) {
-            Fence m = new Fence(ChunkId.readFrom(b), b.getInt());
+            Fence m = new Fence(ChunkId.readFrom(b), b.getInt(),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -212,15 +236,20 @@ public final class Messages {
         }
     }
 
-    public record StatChunk(ChunkId chunkId) {
+    public record StatChunk(ChunkId chunkId, StrataNamespace namespace) {
+        public StatChunk {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).noTags();
+            w.chunkId(chunkId).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static StatChunk decode(ByteBuffer b) {
-            StatChunk m = new StatChunk(ChunkId.readFrom(b));
+            StatChunk m = new StatChunk(ChunkId.readFrom(b),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -244,15 +273,20 @@ public final class Messages {
         }
     }
 
-    public record SealChunk(ChunkId chunkId, int writeEpoch, long dataLength) {
+    public record SealChunk(ChunkId chunkId, int writeEpoch, long dataLength, StrataNamespace namespace) {
+        public SealChunk {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(writeEpoch).u64(dataLength).noTags();
+            w.chunkId(chunkId).i32(writeEpoch).u64(dataLength).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static SealChunk decode(ByteBuffer b) {
-            SealChunk m = new SealChunk(ChunkId.readFrom(b), b.getInt(), b.getLong());
+            SealChunk m = new SealChunk(ChunkId.readFrom(b), b.getInt(), b.getLong(),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -273,16 +307,17 @@ public final class Messages {
         }
     }
 
-    public record DeleteChunks(List<ChunkId> chunkIds) {
+    public record DeleteChunks(List<ChunkId> chunkIds, StrataNamespace namespace) {
         public DeleteChunks {
             chunkIds = List.copyOf(chunkIds);
+            namespace = Objects.requireNonNull(namespace, "namespace");
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.varint(chunkIds.size());
             for (ChunkId c : chunkIds) w.chunkId(c);
-            w.noTags();
+            w.string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
@@ -290,8 +325,9 @@ public final class Messages {
             int n = count(b);
             List<ChunkId> ids = new ArrayList<>(n);
             for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
+            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             TaggedFields.readFrom(b);
-            return new DeleteChunks(ids);
+            return new DeleteChunks(ids, namespace);
         }
     }
 
@@ -328,15 +364,20 @@ public final class Messages {
         }
     }
 
-    public record FetchChunk(ChunkId chunkId, long offset, int maxBytes) {
+    public record FetchChunk(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace) {
+        public FetchChunk {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(offset).u32(maxBytes).noTags();
+            w.chunkId(chunkId).u64(offset).u32(maxBytes).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static FetchChunk decode(ByteBuffer b) {
-            FetchChunk m = new FetchChunk(ChunkId.readFrom(b), b.getLong(), b.getInt());
+            FetchChunk m = new FetchChunk(ChunkId.readFrom(b), b.getLong(), b.getInt(),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -357,15 +398,20 @@ public final class Messages {
         }
     }
 
-    public record ReadLedger(ChunkId chunkId, long fromOffset) {
+    public record ReadLedger(ChunkId chunkId, long fromOffset, StrataNamespace namespace) {
+        public ReadLedger {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(fromOffset).noTags();
+            w.chunkId(chunkId).u64(fromOffset).string(namespace.toString()).noTags();
             return w.toBytes();
         }
 
         public static ReadLedger decode(ByteBuffer b) {
-            ReadLedger m = new ReadLedger(ChunkId.readFrom(b), b.getLong());
+            ReadLedger m = new ReadLedger(ChunkId.readFrom(b), b.getLong(),
+                    StrataNamespace.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -397,11 +443,11 @@ public final class Messages {
         }
     }
 
-    /* ---------- control plane: storage node <-> metadata ---------- */
+    /* ---------- control plane: data node <-> metadata ---------- */
 
     public record StorageCapacity(long capacityBytes) {}
 
-    public record RegisterNode(long incMsb, long incLsb, List<String> endpoints,
+    public record RegisterNode(int nodeId, long incMsb, long incLsb, List<String> endpoints,
                                String zone, String rack, String host,
                                List<StorageCapacity> capacities, int onDiskFormatMax, long featureBits) {
         public RegisterNode {
@@ -411,7 +457,7 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.u64(incMsb).u64(incLsb);
+            w.u32(nodeId).u64(incMsb).u64(incLsb);
             w.varint(endpoints.size());
             for (String e : endpoints) w.string(e);
             w.string(zone).string(rack).string(host);
@@ -422,6 +468,7 @@ public final class Messages {
         }
 
         public static RegisterNode decode(ByteBuffer b) {
+            int nodeId = b.getInt();
             long msb = b.getLong(), lsb = b.getLong();
             int ne = count(b);
             List<String> eps = new ArrayList<>(ne);
@@ -433,7 +480,7 @@ public final class Messages {
             int fmt = b.getInt();
             long features = b.getLong();
             TaggedFields.readFrom(b);
-            return new RegisterNode(msb, lsb, eps, zone, rack, host, caps, fmt, features);
+            return new RegisterNode(nodeId, msb, lsb, eps, zone, rack, host, caps, fmt, features);
         }
     }
 
@@ -515,11 +562,13 @@ public final class Messages {
                 case ReplicateCmd r -> {
                     w.u8(1).chunkId(r.chunkId());
                     writeReplicas(w, r.sources());
-                    w.u8(r.priority()).u32(r.expectedCrc()).u64(r.expectedLength());
+                    w.u8(r.priority()).u32(r.expectedCrc()).u64(r.expectedLength())
+                     .string(r.namespace().toString());
                 }
                 case DeleteCmd d -> {
                     w.u8(2).varint(d.chunkIds().size());
                     for (ChunkId id : d.chunkIds()) w.chunkId(id);
+                    w.string(d.namespace().toString());
                 }
                 case DrainCmd dr -> w.u8(3);
             }
@@ -529,12 +578,21 @@ public final class Messages {
             long id = b.getLong();
             byte type = b.get();
             return switch (type) {
-                case 1 -> new ReplicateCmd(id, ChunkId.readFrom(b), readReplicas(b), b.get(), b.getInt(), b.getLong());
+                case 1 -> {
+                    ChunkId chunkId = ChunkId.readFrom(b);
+                    List<Replica> sources = readReplicas(b);
+                    byte priority = b.get();
+                    int expectedCrc = b.getInt();
+                    long expectedLength = b.getLong();
+                    StrataNamespace ns = StrataNamespace.of(Varint.readString(b));
+                    yield new ReplicateCmd(id, chunkId, sources, priority, expectedCrc, expectedLength, ns);
+                }
                 case 2 -> {
                     int n = count(b);
                     List<ChunkId> ids = new ArrayList<>(n);
                     for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
-                    yield new DeleteCmd(id, ids);
+                    StrataNamespace delNs = StrataNamespace.of(Varint.readString(b));
+                    yield new DeleteCmd(id, ids, delNs);
                 }
                 case 3 -> new DrainCmd(id);
                 default -> throw new IllegalArgumentException("unknown command type " + type);
@@ -543,15 +601,18 @@ public final class Messages {
     }
 
     public record ReplicateCmd(long commandId, ChunkId chunkId, List<Replica> sources,
-                               byte priority, int expectedCrc, long expectedLength) implements Command {
+                               byte priority, int expectedCrc, long expectedLength,
+                               StrataNamespace namespace) implements Command {
         public ReplicateCmd {
             sources = List.copyOf(sources);
+            namespace = Objects.requireNonNull(namespace, "namespace");
         }
     }
 
-    public record DeleteCmd(long commandId, List<ChunkId> chunkIds) implements Command {
+    public record DeleteCmd(long commandId, List<ChunkId> chunkIds, StrataNamespace namespace) implements Command {
         public DeleteCmd {
             chunkIds = List.copyOf(chunkIds);
+            namespace = Objects.requireNonNull(namespace, "namespace");
         }
     }
 
@@ -582,36 +643,79 @@ public final class Messages {
         }
     }
 
-    public record InventoryEntry(ChunkId chunkId, ChunkState state, long length, int crc) {}
+    /* ---------- owner-pull chunk verification (design §20.3) ---------- */
 
-    public record InventoryReport(int nodeId, long incMsb, long incLsb, long sessionEpoch,
-                                  int shardIndex, int shardCount, List<InventoryEntry> entries) {
-        public InventoryReport {
-            entries = List.copyOf(entries);
+    /**
+     * Owner -> node: verify the listed chunks of one namespace. The node answers with the actual local
+     * state of each (see {@link VerifyChunkResult}); the owner compares against its descriptor to decide
+     * present-ok / missing / corrupt. {@code verifierEndpoint} is the asking owner's advertised endpoint,
+     * so the node can record "last verified by which owner, when" for node-local orphan GC (design §20.4).
+     */
+    public record VerifyChunks(StrataNamespace namespace, String verifierEndpoint, List<ChunkId> chunkIds) {
+        public VerifyChunks {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+            verifierEndpoint = Objects.requireNonNull(verifierEndpoint, "verifierEndpoint");
+            chunkIds = List.copyOf(chunkIds);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.u32(nodeId).u64(incMsb).u64(incLsb).u64(sessionEpoch).u32(shardIndex).u32(shardCount);
-            w.varint(entries.size());
-            for (InventoryEntry e : entries) {
-                w.chunkId(e.chunkId()).u8(e.state().value).u64(e.length()).u32(e.crc());
+            w.string(namespace.toString()).string(verifierEndpoint).varint(chunkIds.size());
+            for (ChunkId c : chunkIds) w.chunkId(c);
+            w.noTags();
+            return w.toBytes();
+        }
+
+        public static VerifyChunks decode(ByteBuffer b) {
+            StrataNamespace ns = StrataNamespace.of(Varint.readString(b));
+            String verifier = Varint.readString(b);
+            int n = count(b);
+            List<ChunkId> ids = new ArrayList<>(n);
+            for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
+            TaggedFields.readFrom(b);
+            return new VerifyChunks(ns, verifier, ids);
+        }
+    }
+
+    /**
+     * One chunk's local verification fact. {@code present == false} means the node holds no such chunk
+     * (a missing replica); otherwise {@code state/length/crc} are the node's actual values for the owner
+     * to compare against the descriptor (a length/crc mismatch on a SEALED chunk is corruption).
+     */
+    public record VerifyChunkResult(ChunkId chunkId, boolean present, ChunkState state, long length, int crc) {
+    }
+
+    /** Node -> owner reply to {@link VerifyChunks}, one result per requested chunk (order-independent). */
+    public record VerifyChunksResp(List<VerifyChunkResult> results) {
+        public VerifyChunksResp {
+            results = List.copyOf(results);
+        }
+
+        public byte[] encode() {
+            BufWriter w = new BufWriter();
+            Resp.writeOk(w);
+            w.varint(results.size());
+            for (VerifyChunkResult r : results) {
+                w.chunkId(r.chunkId()).u8(r.present() ? 1 : 0).u8(r.state().value)
+                        .u64(r.length()).u32(r.crc());
             }
             w.noTags();
             return w.toBytes();
         }
 
-        public static InventoryReport decode(ByteBuffer b) {
-            int nodeId = b.getInt();
-            long incMsb = b.getLong(), incLsb = b.getLong(), sessionEpoch = b.getLong();
-            int shard = b.getInt(), shardCount = b.getInt();
+        public static VerifyChunksResp decode(ByteBuffer b) {
             int n = count(b);
-            List<InventoryEntry> es = new ArrayList<>(n);
+            List<VerifyChunkResult> rs = new ArrayList<>(n);
             for (int i = 0; i < n; i++) {
-                es.add(new InventoryEntry(ChunkId.readFrom(b), ChunkState.fromValue(b.get()), b.getLong(), b.getInt()));
+                ChunkId chunkId = ChunkId.readFrom(b);
+                boolean present = Varint.readBoolean(b);
+                ChunkState state = ChunkState.fromValue(b.get());
+                long length = b.getLong();
+                int crc = b.getInt();
+                rs.add(new VerifyChunkResult(chunkId, present, state, length, crc));
             }
             TaggedFields.readFrom(b);
-            return new InventoryReport(nodeId, incMsb, incLsb, sessionEpoch, shard, shardCount, es);
+            return new VerifyChunksResp(rs);
         }
     }
 
@@ -643,16 +747,15 @@ public final class Messages {
     }
 
     public record CreateFile(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy,
-                             FileId fileId, long opIdMsb, long opIdLsb) {
+                             long opIdMsb, long opIdLsb) {
         public CreateFile {
             namespace = Objects.requireNonNull(namespace, "namespace");
             path = Objects.requireNonNull(path, "path");
             writePolicy = Objects.requireNonNull(writePolicy, "writePolicy");
-            fileId = Objects.requireNonNull(fileId, "fileId");
         }
 
         public CreateFile(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy) {
-            this(namespace, path, writePolicy, FileId.random(), UUID.randomUUID());
+            this(namespace, path, writePolicy, UUID.randomUUID());
         }
 
         public CreateFile(String namespace, String path) {
@@ -664,28 +767,28 @@ public final class Messages {
         }
 
         private CreateFile(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy,
-                           FileId fileId, UUID opId) {
-            this(namespace, path, writePolicy, fileId,
+                           UUID opId) {
+            this(namespace, path, writePolicy,
                     opId.getMostSignificantBits(), opId.getLeastSignificantBits());
         }
 
-        public CreateFile(String namespace, String path, FileId fileId, long opIdMsb, long opIdLsb) {
+        public CreateFile(String namespace, String path, long opIdMsb, long opIdLsb) {
             this(StrataNamespace.of(namespace), StrataPath.of(path), WritePolicy.DEFAULT,
-                    fileId, opIdMsb, opIdLsb);
+                    opIdMsb, opIdLsb);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.string(namespace.toString()).string(path.toString());
             writePolicy.writeTo(w);
-            w.fileId(fileId).u64(opIdMsb).u64(opIdLsb).noTags();
+            w.u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
         public static CreateFile decode(ByteBuffer b) {
             CreateFile m = new CreateFile(StrataNamespace.of(Varint.readString(b)),
                     StrataPath.of(Varint.readString(b)), WritePolicy.readFrom(b),
-                    FileId.readFrom(b), b.getLong(), b.getLong());
+                    b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }
@@ -706,29 +809,30 @@ public final class Messages {
         }
     }
 
-    public record CreateChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb,
+    public record CreateChunk(StrataNamespace namespace, FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb,
                               List<Integer> excludedNodeIds) {
         public static final int TAG_EXCLUDED_NODE_IDS = 0;
 
         public CreateChunk {
+            namespace = Objects.requireNonNull(namespace, "namespace");
             excludedNodeIds = List.copyOf(excludedNodeIds);
         }
 
-        public CreateChunk(FileId fileId, int writeEpoch) {
-            this(fileId, writeEpoch, UUID.randomUUID());
+        public CreateChunk(StrataNamespace namespace, FileId fileId, int writeEpoch) {
+            this(namespace, fileId, writeEpoch, UUID.randomUUID());
         }
 
-        public CreateChunk(FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb) {
-            this(fileId, writeEpoch, opIdMsb, opIdLsb, List.of());
+        public CreateChunk(StrataNamespace namespace, FileId fileId, int writeEpoch, long opIdMsb, long opIdLsb) {
+            this(namespace, fileId, writeEpoch, opIdMsb, opIdLsb, List.of());
         }
 
-        private CreateChunk(FileId fileId, int writeEpoch, UUID opId) {
-            this(fileId, writeEpoch, opId.getMostSignificantBits(), opId.getLeastSignificantBits(), List.of());
+        private CreateChunk(StrataNamespace namespace, FileId fileId, int writeEpoch, UUID opId) {
+            this(namespace, fileId, writeEpoch, opId.getMostSignificantBits(), opId.getLeastSignificantBits(), List.of());
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.fileId(fileId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb);
+            w.string(namespace.toString()).fileId(fileId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb);
             if (excludedNodeIds.isEmpty()) {
                 w.noTags();
             } else {
@@ -741,6 +845,7 @@ public final class Messages {
         }
 
         public static CreateChunk decode(ByteBuffer b) {
+            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             FileId fileId = FileId.readFrom(b);
             int writeEpoch = b.getInt();
             long opIdMsb = b.getLong();
@@ -759,7 +864,7 @@ public final class Messages {
                 }
                 excluded = ids;
             }
-            return new CreateChunk(fileId, writeEpoch, opIdMsb, opIdLsb, excluded);
+            return new CreateChunk(namespace, fileId, writeEpoch, opIdMsb, opIdLsb, excluded);
         }
     }
 
@@ -784,33 +889,35 @@ public final class Messages {
         }
     }
 
-    public record AllocateWriterEpoch(FileId fileId, byte purpose) {
+    public record AllocateWriterEpoch(StrataNamespace namespace, FileId fileId, byte purpose) {
         public static final byte FOR_APPEND = 1;
         public static final byte FOR_RECOVERY = 2;
 
         public AllocateWriterEpoch {
+            namespace = Objects.requireNonNull(namespace, "namespace");
             fileId = Objects.requireNonNull(fileId, "fileId");
             if (purpose != FOR_APPEND && purpose != FOR_RECOVERY) {
                 throw new IllegalArgumentException("unknown writer epoch purpose " + (purpose & 0xFF));
             }
         }
 
-        public static AllocateWriterEpoch forAppend(FileId fileId) {
-            return new AllocateWriterEpoch(fileId, FOR_APPEND);
+        public static AllocateWriterEpoch forAppend(StrataNamespace namespace, FileId fileId) {
+            return new AllocateWriterEpoch(namespace, fileId, FOR_APPEND);
         }
 
-        public static AllocateWriterEpoch forRecovery(FileId fileId) {
-            return new AllocateWriterEpoch(fileId, FOR_RECOVERY);
+        public static AllocateWriterEpoch forRecovery(StrataNamespace namespace, FileId fileId) {
+            return new AllocateWriterEpoch(namespace, fileId, FOR_RECOVERY);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.fileId(fileId).u8(purpose).noTags();
+            w.string(namespace.toString()).fileId(fileId).u8(purpose).noTags();
             return w.toBytes();
         }
 
         public static AllocateWriterEpoch decode(ByteBuffer b) {
-            AllocateWriterEpoch m = new AllocateWriterEpoch(FileId.readFrom(b), b.get());
+            AllocateWriterEpoch m = new AllocateWriterEpoch(
+                    StrataNamespace.of(Varint.readString(b)), FileId.readFrom(b), b.get());
             TaggedFields.readFrom(b);
             return m;
         }
@@ -836,15 +943,16 @@ public final class Messages {
      * replica skipped during seal would otherwise stay listed and serve short/stale reads).
      * Empty = keep all (compat). v0 fixed-field addition (pre-release; single apiVersion).
      */
-    public record SealChunkMeta(ChunkId chunkId, int writeEpoch, long length, int crc,
+    public record SealChunkMeta(StrataNamespace namespace, ChunkId chunkId, int writeEpoch, long length, int crc,
                                 List<Integer> sealedReplicas) {
         public SealChunkMeta {
+            namespace = Objects.requireNonNull(namespace, "namespace");
             sealedReplicas = List.copyOf(sealedReplicas);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(writeEpoch).u64(length).u32(crc);
+            w.string(namespace.toString()).chunkId(chunkId).i32(writeEpoch).u64(length).u32(crc);
             w.varint(sealedReplicas.size());
             for (int id : sealedReplicas) w.u32(id);
             w.noTags();
@@ -852,6 +960,7 @@ public final class Messages {
         }
 
         public static SealChunkMeta decode(ByteBuffer b) {
+            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             ChunkId id = ChunkId.readFrom(b);
             int epoch = b.getInt();
             long length = b.getLong();
@@ -860,33 +969,42 @@ public final class Messages {
             List<Integer> sealed = new ArrayList<>(n);
             for (int i = 0; i < n; i++) sealed.add(b.getInt());
             TaggedFields.readFrom(b);
-            return new SealChunkMeta(id, epoch, length, crc, sealed);
+            return new SealChunkMeta(namespace, id, epoch, length, crc, sealed);
         }
     }
 
-    public record AbortChunkMeta(ChunkId chunkId, int writeEpoch, long opIdMsb, long opIdLsb) {
+    public record AbortChunkMeta(StrataNamespace namespace, ChunkId chunkId, int writeEpoch, long opIdMsb, long opIdLsb) {
+        public AbortChunkMeta {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb).noTags();
+            w.string(namespace.toString()).chunkId(chunkId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
         public static AbortChunkMeta decode(ByteBuffer b) {
-            AbortChunkMeta m = new AbortChunkMeta(ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong());
+            AbortChunkMeta m = new AbortChunkMeta(
+                    StrataNamespace.of(Varint.readString(b)), ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }
     }
 
-    public record LookupFile(FileId fileId) {
+    public record LookupFile(StrataNamespace namespace, FileId fileId) {
+        public LookupFile {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.fileId(fileId).noTags();
+            w.string(namespace.toString()).fileId(fileId).noTags();
             return w.toBytes();
         }
 
         public static LookupFile decode(ByteBuffer b) {
-            LookupFile m = new LookupFile(FileId.readFrom(b));
+            LookupFile m = new LookupFile(StrataNamespace.of(Varint.readString(b)), FileId.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -987,13 +1105,15 @@ public final class Messages {
         }
     }
 
-    public record DeleteFiles(List<FileId> fileIds) {
+    public record DeleteFiles(StrataNamespace namespace, List<FileId> fileIds) {
         public DeleteFiles {
+            namespace = Objects.requireNonNull(namespace, "namespace");
             fileIds = List.copyOf(fileIds);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
+            w.string(namespace.toString());
             w.varint(fileIds.size());
             for (FileId f : fileIds) w.fileId(f);
             w.noTags();
@@ -1001,11 +1121,12 @@ public final class Messages {
         }
 
         public static DeleteFiles decode(ByteBuffer b) {
+            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             int n = count(b);
             List<FileId> ids = new ArrayList<>(n);
             for (int i = 0; i < n; i++) ids.add(FileId.readFrom(b));
             TaggedFields.readFrom(b);
-            return new DeleteFiles(ids);
+            return new DeleteFiles(namespace, ids);
         }
     }
 
@@ -1042,15 +1163,19 @@ public final class Messages {
         }
     }
 
-    public record SealFile(FileId fileId, long totalLength) {
+    public record SealFile(StrataNamespace namespace, FileId fileId, long totalLength) {
+        public SealFile {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.fileId(fileId).u64(totalLength).noTags();
+            w.string(namespace.toString()).fileId(fileId).u64(totalLength).noTags();
             return w.toBytes();
         }
 
         public static SealFile decode(ByteBuffer b) {
-            SealFile m = new SealFile(FileId.readFrom(b), b.getLong());
+            SealFile m = new SealFile(StrataNamespace.of(Varint.readString(b)), FileId.readFrom(b), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }
