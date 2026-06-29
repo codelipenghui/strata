@@ -205,23 +205,22 @@ final class NamespaceMetadataLogRepository {
 
     /** Immutable freeze of the state to compact, captured under the mutation lock (the short locked phase). */
     private record Frozen(long cut, int expectedVersion, long newGeneration,
-                          NamespaceMetadataState.Snapshot snapshot,
-                          FileId oldLogFileId, FileId oldSnapshotFileId) {
+                          NamespaceMetadataState.Snapshot snapshot) {
     }
 
     /** Captures the cut, the manifest version to CAS against, and an immutable snapshot of the state. */
     private Frozen freeze() {
         long cut = appliedOffset;
-        return new Frozen(cut, manifestVersion, generation + 1, state.exportSnapshot(cut),
-                logFileId, snapshotFileId);
+        return new Frozen(cut, manifestVersion, generation + 1, state.exportSnapshot(cut));
     }
 
     /**
      * The short locked publish phase: carry the post-freeze tail into the (already-rolled) new open log,
      * CAS-publish the manifest, then swap the in-memory pointers. Mirrors the crash-window invariants of
-     * {@link #publishCompacted}: the new files are written before the CAS, old files are deleted only after
-     * a winning CAS, and a lost CAS cleans up the new files and throws (fence). It never reads or seals the
-     * old open log, so a publish failure leaves that log writable for the next op / re-acquire.
+     * {@link #publishCompacted}: the new files are written before the CAS, a lost CAS cleans up the new files
+     * and throws (fence), and the just-superseded generation is NOT deleted inline (issue #8) — it is retained
+     * and reclaimed by the retention-gated sweep. It never reads or seals the old open log, so a publish
+     * failure leaves that log writable for the next op / re-acquire.
      */
     private void publishFrozen(Frozen frozen, FileId newSnapshot, FileId newLog) throws Exception {
         // Carry the freeze→CAS-window appends [cut, appliedOffset) — buffered by append() into
@@ -250,8 +249,9 @@ final class NamespaceMetadataLogRepository {
         // durable end is unchanged. (Do NOT reset to cut — that would drop the carried tail.)
         this.generation = frozen.newGeneration();
         this.manifestVersion = newVersion.getAsInt();
-        deleteQuietly(frozen.oldSnapshotFileId());
-        deleteQuietly(frozen.oldLogFileId());
+        // The just-superseded generation (old snapshot/log) is NOT deleted inline (issue #8, design §10 step
+        // 6): it is retained as a rollback margin and reclaimed by the retention-gated sweep
+        // (NamespaceLogBackend.gcOrphanedSystemFiles) once STRATA_CONTROLLER_LOG_RETENTION_MS has elapsed.
     }
 
     private void recoverAndRepublish() throws Exception {
@@ -285,8 +285,6 @@ final class NamespaceMetadataLogRepository {
             throw new IllegalStateException("manifest CAS lost for namespace " + namespace
                     + " — fenced; recover again under a new epoch");
         }
-        FileId oldSnapshot = this.snapshotFileId;
-        FileId oldLog = this.logFileId;
         this.snapshotFileId = newSnapshot;
         this.logFileId = newLog;
         this.logStartOffset = cut;
@@ -295,8 +293,11 @@ final class NamespaceMetadataLogRepository {
         // The CAS returns the new znode version directly — no read-back round-trip, and no window where a
         // transient read failure leaves manifestVersion stale (which would fence the namespace on next CAS).
         this.manifestVersion = newVersion.getAsInt();
-        deleteQuietly(oldSnapshot);
-        deleteQuietly(oldLog);
+        // The just-superseded generation (old snapshot/log) is NOT deleted inline (issue #8, design §10 step
+        // 6): it is retained as a rollback margin and reclaimed by the retention-gated sweep
+        // (NamespaceLogBackend.gcOrphanedSystemFiles) once STRATA_CONTROLLER_LOG_RETENTION_MS has elapsed
+        // since this publish. Deferring to that sweep keeps reclamation on ONE durable, failover-safe path
+        // rather than an inline best-effort delete that no retention window could honor.
     }
 
     private void deleteQuietly(FileId id) {

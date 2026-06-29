@@ -106,12 +106,12 @@ class ClientServerTest {
             });
 
             CompletableFuture<Frame> future = client.send(Opcode.PING, header, ByteBuffer.wrap(payload));
-            assertTrue(encoderPaused.await(5, TimeUnit.SECONDS), "encoder did not reach request write seam");
+            assertTrue(encoderPaused.await(30, TimeUnit.SECONDS), "encoder did not reach request write seam");
             java.util.Arrays.fill(header, (byte) 8);
             java.util.Arrays.fill(payload, (byte) 9);
             releaseEncoder.countDown();
 
-            Frame response = future.get(5, TimeUnit.SECONDS);
+            Frame response = future.get(30, TimeUnit.SECONDS);
             Resp.check(response.headerSlice());
             byte[] echoed = new byte[response.payloadLength()];
             response.payloadSlice().get(echoed);
@@ -210,7 +210,7 @@ class ClientServerTest {
              });
              ManagedScpConnection conn = managed(endpoint(server), 30, 100, 80)) {
             CompletableFuture<Frame> future = conn.sendWithTimeout(Opcode.READ, emptyHeader(), null, 1_000);
-            assertTrue(requestStarted.await(1, TimeUnit.SECONDS));
+            assertTrue(requestStarted.await(30, TimeUnit.SECONDS));
             long generation = conn.generation();
 
             TimeUnit.MILLISECONDS.sleep(180);
@@ -218,7 +218,7 @@ class ClientServerTest {
             assertEquals(generation, conn.generation());
 
             releaseRequest.countDown();
-            Resp.check(future.get(1, TimeUnit.SECONDS).headerSlice());
+            Resp.check(future.get(30, TimeUnit.SECONDS).headerSlice());
         } finally {
             releaseRequest.countDown();
         }
@@ -305,7 +305,7 @@ class ClientServerTest {
             try {
                 CompletableFuture<Frame> future = client.sendWithTimeout(Opcode.PING, emptyHeader(), null, 200);
                 var e = assertThrows(java.util.concurrent.ExecutionException.class,
-                        () -> future.get(1, java.util.concurrent.TimeUnit.SECONDS));
+                        () -> future.get(30, java.util.concurrent.TimeUnit.SECONDS));
                 assertEquals(java.util.concurrent.TimeoutException.class, e.getCause().getClass());
                 assertEquals(0, client.pendingCount(),
                         "timed-out pipelined request left its correlation entry behind");
@@ -335,7 +335,7 @@ class ClientServerTest {
         try (ScpServer server = new ScpServer(0, 1, 0, 0, blocked);
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
             CompletableFuture<Frame> pending = client.send(Opcode.PING, emptyHeader(), null);
-            assertTrue(started.await(3, TimeUnit.SECONDS), "server request did not start");
+            assertTrue(started.await(30, TimeUnit.SECONDS), "server request did not start");
 
             client.close();
             Thread.sleep(200);
@@ -343,7 +343,7 @@ class ClientServerTest {
 
             release.countDown();
             assertThrows(java.util.concurrent.ExecutionException.class,
-                    () -> pending.get(3, TimeUnit.SECONDS));
+                    () -> pending.get(30, TimeUnit.SECONDS));
         } finally {
             release.countDown();
         }
@@ -403,10 +403,14 @@ class ClientServerTest {
         try (ScpServer server = new ScpServer(0, 1, 0, 0, blocked, 1, 1 << 20);
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "admission")) {
             CompletableFuture<Frame> first = client.send(Opcode.PING, emptyHeader(), null);
-            assertTrue(firstStarted.await(5, TimeUnit.SECONDS));
+            // Readiness wait — block until the async handler runs for the first request. This is NOT a
+            // latency deadline (the admission deadline under test is asserted below via THROTTLED), so give
+            // it a generous budget: on a slow/loaded CI runner the first connect + round-trip + async
+            // dispatch can exceed a few seconds and a tight budget times out spuriously.
+            assertTrue(firstStarted.await(30, TimeUnit.SECONDS));
 
             CompletableFuture<Frame> rejected = client.send(Opcode.PING, emptyHeader(), null);
-            Frame rejectedFrame = rejected.get(1, TimeUnit.SECONDS);
+            Frame rejectedFrame = rejected.get(30, TimeUnit.SECONDS);
             ScpException e = assertThrows(ScpException.class, () -> Resp.check(rejectedFrame.headerSlice()));
             assertEquals(ErrorCode.THROTTLED, e.code());
 
@@ -502,13 +506,13 @@ class ClientServerTest {
         try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
             CompletableFuture<Frame> pending = client.send(Opcode.PING, emptyHeader(), null);
-            Frame request = seenRequest.get(3, TimeUnit.SECONDS);
+            Frame request = seenRequest.get(30, TimeUnit.SECONDS);
             assertTrue(request.ownsBuffer());
             assertEquals(1, request.ownerRefCnt());
 
             server.close();
             var e = assertThrows(java.util.concurrent.ExecutionException.class,
-                    () -> pending.get(3, TimeUnit.SECONDS));
+                    () -> pending.get(30, TimeUnit.SECONDS));
             assertEquals(IOException.class, e.getCause().getClass());
             waitFor(() -> request.ownerRefCnt() == 0);
 
@@ -1014,7 +1018,9 @@ class ClientServerTest {
     }
 
     private static void waitFor(BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        // Readiness poll, not a latency deadline — give a generous budget so a loaded CI runner can't time
+        // out spuriously while waiting for an expected condition (refcount drained, generation advanced, …).
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
         while (System.nanoTime() < deadline) {
             if (condition.getAsBoolean()) {
                 return;

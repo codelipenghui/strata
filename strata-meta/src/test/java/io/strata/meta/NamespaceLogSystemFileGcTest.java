@@ -99,6 +99,81 @@ class NamespaceLogSystemFileGcTest {
     }
 
     @Test
+    void retainsTheJustSupersededGenerationUntilTheSafetyDelayElapsesThenReclaimsIt() throws Exception {
+        // Issue #8: a superseded snapshot/log generation must survive a configurable safety delay (a rollback
+        // margin), not be deleted the instant the new manifest is durable. The window is timed off the
+        // SUCCESSOR generation's createdAtMs — the durable instant the prior generation was superseded — so it
+        // is honored across failover with no in-memory queue. Here gen 7 (live) was created at t=1000, which is
+        // when gen 6 was superseded; with a 500ms window gen 6 survives at t=1400 and is reclaimed at t=1600.
+        String owner = "tenant-retention";
+        FileId liveSnapshot = FileId.of(0x71); // gen 7, referenced -> live, createdAtMs=1000 (supersedes gen 6)
+        FileId liveLog = FileId.of(0x72);      // gen 7, referenced -> live
+        FileId supersededGen6 = FileId.of(0x60); // gen 6, unreferenced, just superseded -> retained then reaped
+
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            putSystemFile(root, liveSnapshot, owner, 7, "snapshot", FileState.SEALED);
+            putSystemFile(root, liveLog, owner, 7, "log", FileState.OPEN);
+            putSystemFile(root, supersededGen6, owner, 6, "snapshot", FileState.SEALED);
+            root.putNamespaceManifest(new Records.NamespaceManifest(StrataNamespace.of(owner), 1L, 7L, 0L, 0L,
+                    Optional.of(liveSnapshot), Optional.of(liveLog)), -1);
+
+            RecordingFileStore fs = new RecordingFileStore();
+            NamespaceLogBackend backend = new NamespaceLogBackend(root, fs, false);
+
+            // Within the 500ms window (age = 1400 - 1000 = 400): the superseded generation is RETAINED.
+            assertEquals(0, backend.gcOrphanedSystemFiles(1400L, 500L),
+                    "a just-superseded generation is retained while inside the safety delay");
+            assertFalse(fs.deleted.contains(supersededGen6), "retained generation is not reclaimed yet");
+
+            // Past the window (age = 1600 - 1000 = 600 >= 500): it is reclaimed.
+            assertEquals(1, backend.gcOrphanedSystemFiles(1600L, 500L),
+                    "a superseded generation is reclaimed once the safety delay has elapsed");
+            assertTrue(fs.deleted.contains(supersededGen6), "the superseded generation is reaped past the window");
+            assertFalse(fs.deleted.contains(liveSnapshot), "the live generation is never reaped");
+            assertFalse(fs.deleted.contains(liveLog), "the live generation is never reaped");
+            backend.close();
+        }
+    }
+
+    @Test
+    void retentionWindowIsHonoredAcrossFailoverWithNoInMemoryQueue() throws Exception {
+        // The retention window must be durable: a new owner (a fresh backend with NO shared in-memory state)
+        // over the same consensus root must still honor it — proving the window is timed off the successor
+        // generation's durable FileRecord.createdAtMs, not an in-memory queue a leadership change would lose
+        // (issue #8 failover correction). gen 5 (live) was created at t=1000, superseding gen 4.
+        String owner = "tenant-failover";
+        FileId liveSnapshot = FileId.of(0x51);   // gen 5, referenced -> live, createdAtMs=1000
+        FileId supersededGen4 = FileId.of(0x40); // gen 4, unreferenced, just superseded
+
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            putSystemFile(root, liveSnapshot, owner, 5, "snapshot", FileState.SEALED);
+            putSystemFile(root, supersededGen4, owner, 4, "snapshot", FileState.SEALED);
+            root.putNamespaceManifest(new Records.NamespaceManifest(StrataNamespace.of(owner), 1L, 5L, 0L, 0L,
+                    Optional.of(liveSnapshot), Optional.empty()), -1);
+
+            RecordingFileStore fs1 = new RecordingFileStore();
+            NamespaceLogBackend owner1 = new NamespaceLogBackend(root, fs1, false);
+            assertEquals(0, owner1.gcOrphanedSystemFiles(1400L, 500L),
+                    "the original owner retains the superseded generation inside the window");
+            owner1.close();
+
+            // Failover: a brand-new backend, still inside the window, must ALSO retain — no in-memory queue.
+            RecordingFileStore fs2 = new RecordingFileStore();
+            NamespaceLogBackend owner2 = new NamespaceLogBackend(root, fs2, false);
+            assertEquals(0, owner2.gcOrphanedSystemFiles(1499L, 500L),
+                    "a new owner after failover still honors the window (recomputed from durable state)");
+            assertTrue(fs2.deleted.isEmpty(), "nothing reclaimed by the new owner while inside the window");
+
+            assertEquals(1, owner2.gcOrphanedSystemFiles(1600L, 500L),
+                    "past the window the new owner reclaims the superseded generation");
+            assertTrue(fs2.deleted.contains(supersededGen4));
+            owner2.close();
+        }
+    }
+
+    @Test
     void keepsEverythingForANamespaceWithNoPublishedManifestYet() throws Exception {
         // A namespace mid its FIRST publish: gen-1 files exist but no manifest is published. The GC cannot
         // prove these are dead, so it must keep them (a crashed first publish leaks until the namespace

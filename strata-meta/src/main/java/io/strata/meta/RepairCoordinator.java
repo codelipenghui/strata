@@ -247,10 +247,12 @@ class RepairCoordinator implements AutoCloseable {
                 reconcile();
                 // Tombstone GC is the one genuinely periodic chore and does not gate convergence (a file
                 // reads as deleted the moment it reaches DELETED, well before its tombstone is swept), so
-                // it stays on the slow reconcileIntervalMs cadence instead of running every tick.
+                // it stays on the slow reconcileIntervalMs cadence instead of running every tick. Run on
+                // every controller, not just the leader: a namespace owner reaps its own namespaces'
+                // tombstones (sweepTombstones() routes leader vs owner).
                 long now = System.currentTimeMillis();
-                if (isLeader.getAsBoolean() && now - lastTombstoneSweep >= config.reconcileIntervalMs()) {
-                    store.sweepDeletedFiles(DELETED_TOMBSTONE_TTL_MS);
+                if (now - lastTombstoneSweep >= config.reconcileIntervalMs()) {
+                    sweepTombstones();
                     lastTombstoneSweep = now;
                 }
             } catch (InterruptedException e) {
@@ -387,6 +389,22 @@ class RepairCoordinator implements AutoCloseable {
             return;
         }
         scanOnce();
+    }
+
+    /**
+     * Reaps DELETED-file tombstones at the slow reconcile cadence (design §6: the namespace owner owns
+     * its namespace's metadata lifecycle, tombstone GC included). The leader sweeps the shared system-root
+     * tombstones globally — and its own loaded repos — via {@link MetadataStore#sweepDeletedFiles}; a
+     * non-leader owner reaps only the namespaces it owns ({@link MetadataStore#sweepOwnedNamespaceTombstones}),
+     * because their per-namespace metadata-log tombstones live in repos the leader does not hold. Gating the
+     * whole sweep on the single global latch leaks tombstones in every non-leader-owned namespace forever.
+     */
+    void sweepTombstones() throws Exception {
+        if (isLeader.getAsBoolean()) {
+            store.sweepDeletedFiles(DELETED_TOMBSTONE_TTL_MS);
+        } else {
+            store.sweepOwnedNamespaceTombstones(DELETED_TOMBSTONE_TTL_MS);
+        }
     }
 
     /**

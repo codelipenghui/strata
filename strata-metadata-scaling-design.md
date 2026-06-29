@@ -390,6 +390,18 @@ Every mutating client request carries an operation id. The namespace leader
 records operation ids in the log or snapshot state so retries are idempotent
 across leader failover.
 
+> **Current status (impl):** Only *file create* is opId-idempotent today —
+> `FileCreated.createOp*` is recorded in the metadata log and indexed by
+> `NamespaceMetadataState.opIdIndex` (`opId -> fileId`), consulted by
+> `createFileOwnerAssigned`, and swept on the tombstone horizon via
+> `TombstoneSwept`. Chunk-bind/seal/delete are **not** backed by an
+> `opId -> result` record; they rely on state-check + per-file CAS-version +
+> write-epoch fencing for retry safety. (Seal additionally pins the chunk
+> incarnation via the create-op so a stale same-epoch seal cannot be applied to
+> an aborted-and-recreated chunk; delete acks idempotently once the file is a
+> tombstone.) The **general idempotency table and its snapshot watermark
+> (§9/§10/§13 below) are design-only — not yet implemented** (issue #9).
+
 The authoritative metadata log must not contain derived indexes or operational
 delivery events. The following are explicitly excluded from the metadata log:
 
@@ -504,9 +516,10 @@ independent from the physical metadata-file implementation: tests can use an
 in-memory store, while the service runtime uses `StrataSystemMetadataFileStore`
 to write metadata-log bytes as replicated Strata chunks and publish only the
 system-file descriptors in the root store. Retention-cutoff garbage collection of
-older superseded system files (only the single just-superseded snapshot/log pair
-is reclaimed inline today) and multi-chunk metadata system files remain separate
-hardening work.
+superseded system files is implemented (the inline delete is removed; superseded
+generations are reclaimed by the retention-gated sweep after
+`STRATA_CONTROLLER_LOG_RETENTION_MS`); multi-chunk metadata system files remain a
+separate hardening item.
 
 `NamespaceLogMetadataStore` is the current bridge from the existing
 `MetadataStore` SPI to the namespace-log backend. It delegates node registry,
@@ -566,6 +579,14 @@ snapshot generation N:
     placement usage index
     deletion/tombstone queues
 ```
+
+> **Current status (impl):** the `idempotency table watermark` listed above is
+> **design-only**. The implemented snapshot (`NamespaceMetadataState.Snapshot` /
+> `NamespaceMetadataSnapshotCodec`) persists only `nextFileId`,
+> `nextLogStartOffset`, the file table, and retained tombstones — no idempotency
+> table or watermark. The create `opId -> fileId` index is rebuilt on restore
+> from each retained `FileRecord.createOp*`, not snapshotted independently
+> (issue #9).
 
 The materialized indexes are checkpoint accelerators. A namespace leader can
 discard and rebuild any derived index from the authoritative current-state
@@ -635,15 +656,21 @@ at the snapshot cut — recovery reads the whole log file assuming
 `byte 0 == logStartOffset == snapshot cut`. The durable end (`appliedOffset`) is
 preserved across the swap, not reset to the cut. A per-repo guard skips an
 overlapping compaction so a second sweep cannot race the first into a self-fencing
-CAS. In both forms, a lost CAS cleans up the just-written snapshot/log and leaves
-the old manifest and its files intact; a winning CAS deletes the superseded
-snapshot/log only after the new manifest is durably published, so exactly one
-prior generation is reclaimed inline.
+CAS.
 
-A rotation-vs-compaction policy chooser, retention-cutoff deletion of older
-superseded generations, and multi-chunk metadata system files are still future
-work; the service path is already wired to a Strata-backed metadata file store for
-metadata-log bytes.
+In both forms a lost CAS cleans up the just-written snapshot/log and leaves the old
+manifest and its files intact. On a winning CAS the superseded snapshot/log pair is
+**NOT** deleted inline (step 6): it is retained as a rollback margin and reclaimed
+by the retention-gated sweep. That sweep (`gcOrphanedSystemFiles`) runs each tick on
+the same compaction thread and reclaims superseded/orphaned system generations whose
+retention window has elapsed; the window (`STRATA_CONTROLLER_LOG_RETENTION_MS`, step
+6's "safety delay") is timed off the successor generation's durable `createdAtMs`, so
+it is honored across failover with no in-memory queue, and with the default `0` a
+superseded generation is reclaimed on the next sweep.
+
+A rotation-vs-compaction policy chooser and multi-chunk metadata system files are
+still future work; the service path is already wired to a Strata-backed metadata file
+store for metadata-log bytes.
 
 The compacted snapshot contains the latest state, not the full mutation history:
 
@@ -802,6 +829,11 @@ The recovery barrier is:
 10. verify the leadership epoch is still current
 11. publish/enter ACTIVE and begin serving metadata requests
 ```
+
+> **Current status (impl):** step 9 restores only the create index today — the
+> sole retained idempotency state is the `FileCreated`-derived `opId -> fileId`
+> map, rebuilt by replay/restore. Retried chunk-bind/seal/delete ops carry no
+> restored `opId -> result` record (issue #9).
 
 The invariant is:
 
