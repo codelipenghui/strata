@@ -490,22 +490,23 @@ referencing uncommitted tail bytes. Rolling the open segment on recovery is a
 metadata-epoch fencing rule: a stale leader that still holds the old open system
 file must not be able to append bytes that a successor can later publish without
 replaying. `NamespaceMetadataLogRepository` now pairs
-recovery, publish, rotation, and synchronous snapshot compaction with
+recovery, publish, rotation, and snapshot compaction with
 `MetadataStore.putNamespaceManifest` CAS so a recovered leader publishes the new
 open tail before accepting metadata writes, and later appends remain recoverable
 from the compact manifest even before the next explicit publish. A background
 sweep (`NamespaceLogBackend.startBackgroundCompaction`) bounds steady-state
-open-log growth: on a fixed interval it runs the synchronous `compactAndPublish`
-cycle for any owned namespace whose open log has passed a configured byte
-threshold, so a stable long-lived leader's log is bounded by snapshot cadence
-rather than only compacting at open/failover. The repository is deliberately
+open-log growth: on a fixed interval it runs the non-blocking (copy-on-write)
+`compact` cycle (see §10) for any owned namespace whose open log has passed a
+configured byte threshold, so a stable long-lived leader's log is bounded by
+snapshot cadence rather than only compacting at open/failover — and without
+stalling that namespace's writes while it snapshots. The repository is deliberately
 independent from the physical metadata-file implementation: tests can use an
 in-memory store, while the service runtime uses `StrataSystemMetadataFileStore`
 to write metadata-log bytes as replicated Strata chunks and publish only the
-system-file descriptors in the root store. Non-blocking (copy-on-write)
-compaction, retention-cutoff garbage collection of older superseded system files
-(only the single just-superseded snapshot/log pair is reclaimed inline today),
-and multi-chunk metadata system files remain separate hardening work.
+system-file descriptors in the root store. Retention-cutoff garbage collection of
+older superseded system files (only the single just-superseded snapshot/log pair
+is reclaimed inline today) and multi-chunk metadata system files remain separate
+hardening work.
 
 `NamespaceLogMetadataStore` is the current bridge from the existing
 `MetadataStore` SPI to the namespace-log backend. It delegates node registry,
@@ -611,23 +612,38 @@ The compaction cycle is:
 6. delete old metadata-log segments below logStartOffset after a safety delay
 ```
 
-The current implementation foundation supports the synchronous form of this
-cycle for one namespace: `compactAndPublish` writes a new snapshot file at the
-current applied offset, opens a new empty metadata-log segment at that same
-offset, and CAS-publishes a manifest whose `logStartOffset` equals the snapshot
-offset. If that CAS loses, the caller must discard the loaded log and recover
-again; on a lost CAS the just-written snapshot/log are cleaned up and the old
-manifest and its files are left intact, and on a winning CAS the superseded
-snapshot/log pair is deleted only after the new manifest is durably published, so
-exactly one prior generation is ever reclaimed inline. A background sweep
-(`NamespaceLogBackend.startBackgroundCompaction` → `compactOversizedRepos`) drives
-this cycle in steady state: on the `STRATA_CONTROLLER_LOG_COMPACT_INTERVAL_MS`
-cadence it compacts any owned namespace whose open log exceeds
-`STRATA_CONTROLLER_LOG_COMPACT_BYTES`, bounding open-log size for a stable leader.
+The current implementation realizes this cycle in two forms. On open/failover,
+`recoverAndRepublish` runs the **synchronous** form (`publishCompacted`): with no
+concurrent appends it writes a new snapshot at the recovered durable end, opens a
+new *empty* metadata-log segment at that same offset, and CAS-publishes a manifest
+whose `logStartOffset` equals the snapshot offset — the empty roll fences a stale
+predecessor (it can no longer append bytes a successor would publish).
+
+In steady state, the background sweep
+(`NamespaceLogBackend.startBackgroundCompaction` → `compactOversizedRepos` →
+`NamespaceMetadataLogRepository.compact`) runs the **non-blocking (copy-on-write)**
+form so a namespace keeps accepting writes for the duration of its own compaction.
+It splits the cycle into a short locked freeze (capture the cut, the manifest
+version to CAS against, and an *immutable* snapshot of the state), a long
+**unlocked** phase (encode the snapshot and write the snapshot file — the
+expensive, replicated work), and a short locked publish (CAS the manifest and swap
+the pointers). Because appends that land in the freeze→CAS window go to the *old,
+still-published* open log (so they survive a fencing failover, whose recovery
+replays the whole old open log), the publish phase **carries that tail
+`[cut, appliedOffset)` into the new segment** so the new open log physically starts
+at the snapshot cut — recovery reads the whole log file assuming
+`byte 0 == logStartOffset == snapshot cut`. The durable end (`appliedOffset`) is
+preserved across the swap, not reset to the cut. A per-repo guard skips an
+overlapping compaction so a second sweep cannot race the first into a self-fencing
+CAS. In both forms, a lost CAS cleans up the just-written snapshot/log and leaves
+the old manifest and its files intact; a winning CAS deletes the superseded
+snapshot/log only after the new manifest is durably published, so exactly one
+prior generation is reclaimed inline.
+
 A rotation-vs-compaction policy chooser, retention-cutoff deletion of older
-superseded generations, non-blocking (copy-on-write) compaction, and multi-chunk
-metadata system files are still future work; the service path is
-already wired to a Strata-backed metadata file store for metadata-log bytes.
+superseded generations, and multi-chunk metadata system files are still future
+work; the service path is already wired to a Strata-backed metadata file store for
+metadata-log bytes.
 
 The compacted snapshot contains the latest state, not the full mutation history:
 
