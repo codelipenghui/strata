@@ -797,6 +797,18 @@ public final class Controller implements AutoCloseable {
                         throw new ScpException(ErrorCode.FENCED_EPOCH, "chunk epoch " + c.writeEpoch(),
                                 c.writeEpoch());
                     }
+                    // incarnation pin: a seal that names its create-op must target the same chunk
+                    // incarnation it created. At equal write epochs the fence cannot separate an
+                    // abort + same-epoch recreate, so a stale seal from the old incarnation would
+                    // otherwise apply its length/crc to the new one. opId (0,0) opts out — seal
+                    // recovery seals at a strictly higher epoch and relies on the fence alone.
+                    if ((m.opIdMsb() != 0 || m.opIdLsb() != 0)
+                            && m.writeEpoch() == c.writeEpoch()
+                            && !c.createdBy(m.opIdMsb(), m.opIdLsb())) {
+                        throw new ScpException(ErrorCode.FENCED_EPOCH,
+                                "seal opId does not match chunk incarnation at epoch " + c.writeEpoch(),
+                                c.writeEpoch());
+                    }
                     if (c.state() == ChunkState.SEALED) {
                         if (c.length() == m.length() && c.crc() == m.crc()) return; // idempotent retry
                         // same length but different crc is byte divergence — never swallow it
@@ -922,7 +934,12 @@ public final class Controller implements AutoCloseable {
     private void markDeleting(StrataNamespace namespace, FileId id) throws Exception {
         for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
             var opt = getFile(namespace, id);
-            if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, id.toString());
+            // idempotent after deletion: a DELETED tombstone (and a later swept record) read as
+            // empty here, as does a never-created id. A delete retry whose first response was lost
+            // — or one that lands after a controller failover/tombstone reap — must ack OK rather
+            // than FILE_NOT_FOUND, so the caller observes a single logical deletion. (abortChunk
+            // returns idempotently on the same empty condition.)
+            if (opt.isEmpty()) return;
             Records.FileRecord current = opt.get().value();
             Records.FileRecord deleting = current.withState(FileState.DELETING);
             if (store.updateFile(deleting, opt.get().version())) {

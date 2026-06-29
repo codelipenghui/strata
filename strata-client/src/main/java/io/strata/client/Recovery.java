@@ -483,8 +483,11 @@ final class Recovery {
             log.warn("recovery seal divergence on {} — committing agreeing quorum {} of {} successful seals",
                     chunkId, quorum.getValue().size(), ok);
         }
+        // recovery seals at a strictly higher (recovery-allocated) epoch than the chunk's create
+        // epoch, so the write-epoch fence alone separates it from any stale same-epoch seal — it
+        // does not (and cannot) pin the original create-op, hence the (0,0) no-pin sentinel.
         controller.sealChunkMeta(namespace, chunkId, epoch, quorum.getKey().finalLength(), quorum.getKey().crc(),
-                List.copyOf(quorum.getValue()));
+                List.copyOf(quorum.getValue()), 0L, 0L);
         return quorum.getKey().finalLength();
     }
 }

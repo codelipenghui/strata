@@ -150,9 +150,10 @@ final class ControllerClient implements AutoCloseable {
     }
 
     void sealChunkMeta(StrataNamespace namespace, io.strata.common.ChunkId chunkId, int writeEpoch, long length,
-                       int crc, java.util.List<Integer> sealedReplicas) {
+                       int crc, java.util.List<Integer> sealedReplicas, long opIdMsb, long opIdLsb) {
         call(Opcode.SEAL_CHUNK_META,
-                new Messages.SealChunkMeta(namespace, chunkId, writeEpoch, length, crc, sealedReplicas).encode(),
+                new Messages.SealChunkMeta(namespace, chunkId, writeEpoch, length, crc, sealedReplicas,
+                        opIdMsb, opIdLsb).encode(),
                 namespace);
     }
 
