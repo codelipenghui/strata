@@ -200,9 +200,15 @@ public final class Controller implements AutoCloseable {
         // namespace's currently-published generation (an in-flight publish is always at a higher generation).
         boolean orphanGc = boolSetting("STRATA_CONTROLLER_LOG_ORPHAN_GC",
                 "strata.controller.log.orphan.gc", true);
+        // Safety delay (design §10 step 6 / issue #8): retain a superseded metadata-log generation this many
+        // ms after it is superseded before the sweep reclaims it — a rollback margin against a bad newest
+        // generation. 0 (default) disables the window: superseded generations are reclaimed on the next sweep.
+        int retentionMs = intSetting("STRATA_CONTROLLER_LOG_RETENTION_MS",
+                "strata.controller.log.retention.ms", 0);
         return (root, endpoint) -> {
             NamespaceLogBackend logBackend = new NamespaceLogBackend(root,
                     new StrataSystemMetadataFileStore(() -> endpoint, replicationFactor, ackQuorum, logFsync), true);
+            logBackend.setLogRetentionMs(retentionMs);
             logBackend.startBackgroundCompaction(compactBytes, compactIntervalMs, orphanGc);
             return new NamespaceLogMetadataStore(logBackend);
         };

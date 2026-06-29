@@ -159,8 +159,6 @@ final class NamespaceMetadataLogRepository {
             throw new IllegalStateException("manifest CAS lost for namespace " + namespace
                     + " — fenced; recover again under a new epoch");
         }
-        FileId oldSnapshot = this.snapshotFileId;
-        FileId oldLog = this.logFileId;
         this.snapshotFileId = newSnapshot;
         this.logFileId = newLog;
         this.logStartOffset = cut;
@@ -169,8 +167,11 @@ final class NamespaceMetadataLogRepository {
         // The CAS returns the new znode version directly — no read-back round-trip, and no window where a
         // transient read failure leaves manifestVersion stale (which would fence the namespace on next CAS).
         this.manifestVersion = newVersion.getAsInt();
-        deleteQuietly(oldSnapshot);
-        deleteQuietly(oldLog);
+        // The just-superseded generation (old snapshot/log) is NOT deleted inline (issue #8, design §10 step
+        // 6): it is retained as a rollback margin and reclaimed by the retention-gated sweep
+        // (NamespaceLogBackend.gcOrphanedSystemFiles) once STRATA_CONTROLLER_LOG_RETENTION_MS has elapsed
+        // since this publish. Deferring to that sweep keeps reclamation on ONE durable, failover-safe path
+        // rather than an inline best-effort delete that no retention window could honor.
     }
 
     private void deleteQuietly(FileId id) {
