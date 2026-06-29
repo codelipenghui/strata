@@ -259,9 +259,11 @@ public final class ZkMetadataStore implements MetadataStore {
                 curator.setData().withVersion(expectedVersion).forPath(filePath, tombstone);
                 record(FILES, true, tombstone.length);
             }
-            // The file is logically gone; drop its per-namespace index entry so namespace listings
-            // don't have to filter it. The tombstone under /strata/files stays until the sweeper reaps it.
-            dropNamespaceFileIndex(record.namespace(), id);
+            // Keep the per-namespace index entry until the sweeper reaps the tombstone (sweepDeletedFiles
+            // drops it): listFilesIncludingTombstones — the controller's opId-reuse scan — reads that index,
+            // so an entry dropped here would let a stale CREATE replay miss the unswept tombstone and
+            // resurrect the deleted file under a fresh id. listFiles filters the tombstone via getFile, so the
+            // retained entry never leaks into a normal namespace listing.
             return true;
         } catch (KeeperException.BadVersionException e) {
             return false;

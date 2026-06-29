@@ -1,6 +1,7 @@
 package io.strata.meta;
 
 import io.strata.common.FileId;
+import io.strata.common.FileState;
 import io.strata.common.StrataNamespace;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
@@ -111,6 +112,29 @@ class ZkMetadataRootTest {
             assertEquals(v1, a.getNamespaceManifest(ns).orElseThrow().value());
 
             assertTrue(a.getNamespaceManifest(StrataNamespace.of("tenant-none")).isEmpty());
+        }
+    }
+
+    @Test
+    void deletedTombstoneStaysIndexedForOpIdReuseScanUntilSwept() throws Exception {
+        // C2: deleteFile must NOT drop the per-namespace index entry — listFilesIncludingTombstones (the
+        // controller's opId-reuse scan) reads that index, so dropping it lets a stale CREATE replay miss the
+        // unswept DELETED tombstone and resurrect the deleted file under a fresh id. The sweeper drops it.
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
+            StrataNamespace ns = StrataNamespace.of("tenant-a");
+            FileId id = FileId.of(0x42);
+            store.createFile(new Records.FileRecord(id, "tenant-a", "/f", 3, 2, false,
+                    FileState.SEALED, 1234, List.of(), 7L, 7L));
+            assertTrue(store.listFilesIncludingTombstones(ns).contains(id));
+
+            int version = store.getFile(ns, id).orElseThrow().version();
+            assertTrue(store.deleteFile(ns, id, version));
+
+            assertTrue(store.listFilesIncludingTombstones(ns).contains(id),
+                    "the DELETED tombstone stays indexed for the opId-reuse scan until the sweeper reaps it");
+            assertFalse(store.listFiles(ns).contains(id), "but a normal listing filters the tombstone");
+            assertTrue(store.getFile(ns, id).isEmpty(), "and the file reads as logically gone");
         }
     }
 }
