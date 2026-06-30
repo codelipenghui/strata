@@ -592,6 +592,43 @@ class RecoveryTest {
     }
 
     @Test
+    void conflictingSingleHolderContinuationsAboveFloorTruncateToFloor() throws Exception {
+        // PR #34 review: with one replica unreachable, two reachable replicas can each hold a CRC-valid
+        // but DIFFERENT continuation from the floor — R1 has A[0,4), R2 has B[0,8) with a different
+        // prefix. Neither has a reachable quorum. The reachability gate alone would let the farther
+        // B[0,8) through and graft B[4,8) onto R1's A prefix, then fail the seal with divergence.
+        // Recovery must treat conflicting continuations from the same floor as a divergent split and
+        // truncate at the floor instead.
+        FileId fileId = FileId.of(39);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean r1Grafted = new AtomicBoolean();
+        byte[] a = new byte[] {1, 1, 1, 1};
+        byte[] b = new byte[] {2, 2, 2, 2, 2, 2, 2, 2};
+
+        try (ScpServer r1 = ledgerOrderingReplica(1, a.length,
+                     List.of(new Messages.LedgerEntry(a.length, Crc.of(a), 1)), a, r1Grafted);
+             ScpServer r2 = ledgerOrderingReplica(2, b.length,
+                     List.of(new Messages.LedgerEntry(b.length, Crc.of(b), 1)), b, null);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(r1)),
+                             new Messages.Replica(2, endpoint(r2)),
+                             new Messages.Replica(3, "127.0.0.1:1")))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2);
+
+                assertEquals(0, sealedInfo.sealedLength(),
+                        "conflicting single-holder continuations must truncate at the floor");
+                assertEquals(0L, sealedFileLength.get());
+                assertFalse(r1Grafted.get(),
+                        "a conflicting longer continuation must not be grafted onto R1's prefix");
+            }
+        }
+    }
+
+    @Test
     void divergentContinuationAboveFloorIsTruncatedNotCommitted() throws Exception {
         // Safety counterpart to issue #29: a single CRC-valid copy above the floor is re-replicated,
         // but a genuine divergent split (replicas hold DIFFERENT CRC-valid bytes for the same range,

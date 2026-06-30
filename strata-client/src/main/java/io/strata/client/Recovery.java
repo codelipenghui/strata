@@ -268,8 +268,12 @@ final class Recovery {
     private Candidate bestContinuation(ChunkId chunkId, List<ReplicaState> reachable,
                                        TreeMap<Long, List<LedgerCandidate>> boundaries, long p,
                                        int ackQuorum, int unreachableReplicas) {
-        Candidate best = null;
-        for (var entry : boundaries.tailMap(p, false).entrySet()) {
+        // Farthest boundary first: a longer continuation that is still provable — a reachable quorum,
+        // or (issue #29) a single CRC-valid copy that could still have been acked — should win over a
+        // shorter one. A sub-quorum single is committed only if no reachable replica holds conflicting
+        // bytes over the overlap; otherwise it is a divergent split with no quorum to resolve it, so we
+        // fall back to a nearer boundary and ultimately truncate at the floor.
+        for (var entry : boundaries.tailMap(p, false).descendingMap().entrySet()) {
             long end = entry.getKey();
             // The CRC(s) a batch [p, end) is allowed to have, per any reachable replica's ledger.
             Set<Integer> validCrcs = new HashSet<>();
@@ -279,34 +283,55 @@ final class Recovery {
                 }
             }
             if (validCrcs.isEmpty()) continue;
-            Candidate candidate = agreedContinuation(chunkId, reachable, p, end, validCrcs, ackQuorum,
+            Agreed agreed = agreedContinuation(chunkId, reachable, p, end, validCrcs, ackQuorum,
                     unreachableReplicas);
-            if (candidate != null) {
-                best = candidate; // prefer the farthest agreed boundary
+            if (agreed == null) continue;
+            Candidate candidate = new Candidate(end, agreed.bytes());
+            if (agreed.quorum()) {
+                return candidate; // a reachable quorum wins; the seal quorum drops any outlier (§14.6)
+            }
+            if (!conflictsAboveFloor(chunkId, reachable, p, candidate)) {
+                return candidate;
             }
         }
-        return best;
+        return null;
+    }
+
+    /**
+     * True if any reachable replica holds bytes above the floor {@code p} that disagree with
+     * {@code candidate} on their overlap. This gates the sub-quorum (single-holder) acceptance from
+     * issue #29: with no agreeing quorum to drop an outlier at seal time, re-replicating a continuation
+     * that conflicts with a replica's existing prefix would graft mismatched bytes and fail the seal
+     * instead of truncating cleanly at the floor.
+     */
+    private boolean conflictsAboveFloor(ChunkId chunkId, List<ReplicaState> reachable, long p,
+                                        Candidate candidate) {
+        for (ReplicaState rs : reachable) {
+            long overlapEnd = Math.min(rs.end, candidate.end());
+            if (overlapEnd <= p) continue; // holds nothing above the floor within the candidate range
+            byte[] held = readRange(chunkId, rs, p, overlapEnd);
+            if (held == null) continue; // an unreadable replica is not positive evidence of divergence
+            int len = (int) (overlapEnd - p);
+            if (!java.util.Arrays.equals(held, 0, len, candidate.bytes(), 0, len)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
      * Decides the batch {@code [from, to)} above the durable floor. A reachable replica contributes
-     * its bytes only if they match one of the batch's CRC-valid ledger entries, so torn/corrupt
-     * tails are ignored. Then:
-     * <ul>
-     *   <li>a byte-value held by {@code >= ackQuorum} reachable replicas wins outright, dropping any
-     *       divergent outlier (§14.6);</li>
-     *   <li>otherwise a SINGLE CRC-valid value (no competitor) is re-replicated to quorum ONLY if it
-     *       could still have been producer-acked — i.e. its holders plus the replicas we could not
-     *       fence reach {@code ackQuorum}. Under fence-before-recover + single-writer that surviving
-     *       copy is the one writer's authoritative content, so this preserves an acked batch whose
-     *       other holder is simply unreachable (issue #29) while still discarding a batch that, with
-     *       every replica reachable, provably never reached quorum (a never-acked dirty tail);</li>
-     *   <li>a genuine split — multiple distinct CRC-valid values, none reaching quorum — is rejected
-     *       so the seal stops at the floor rather than committing an arbitrary side.</li>
-     * </ul>
+     * its bytes only if they match one of the batch's CRC-valid ledger entries, so torn/corrupt tails
+     * are ignored. A byte-value held by {@code >= ackQuorum} reachable replicas is returned as a
+     * {@code quorum} result (it wins outright, dropping divergent outliers, §14.6). Otherwise a single
+     * CRC-valid value (no competitor) is returned as a non-quorum result only if it could still have
+     * been producer-acked — its holders plus the replicas we could not fence reach {@code ackQuorum}
+     * (issue #29); the caller then verifies that single copy against the other reachable replicas
+     * before committing it. Multiple distinct CRC-valid values (a split with no quorum) yield
+     * {@code null}, so the seal stops at the floor.
      */
-    private Candidate agreedContinuation(ChunkId chunkId, List<ReplicaState> reachable, long from, long to,
-                                         Set<Integer> validCrcs, int ackQuorum, int unreachableReplicas) {
+    private Agreed agreedContinuation(ChunkId chunkId, List<ReplicaState> reachable, long from, long to,
+                                      Set<Integer> validCrcs, int ackQuorum, int unreachableReplicas) {
         List<CandidateCount> counts = new ArrayList<>();
         for (ReplicaState rs : reachable) {
             if (rs.end < to) continue;
@@ -317,9 +342,8 @@ final class Recovery {
             boolean merged = false;
             for (CandidateCount candidate : counts) {
                 if (java.util.Arrays.equals(candidate.bytes, data)) {
-                    // an agreeing quorum wins outright, dropping any divergent outlier (§14.6)
                     if (++candidate.count >= ackQuorum) {
-                        return new Candidate(to, candidate.bytes);
+                        return new Agreed(candidate.bytes, true);
                     }
                     merged = true;
                     break;
@@ -329,13 +353,13 @@ final class Recovery {
                 counts.add(new CandidateCount(data));
             }
         }
-        // Below quorum: a single CRC-valid value (no competitor) is re-replicated only if it could
-        // still have been acked once the replicas we could not fence are counted as possible holders.
         if (counts.size() == 1 && counts.get(0).count + unreachableReplicas >= ackQuorum) {
-            return new Candidate(to, counts.get(0).bytes);
+            return new Agreed(counts.get(0).bytes, false);
         }
         return null;
     }
+
+    private record Agreed(byte[] bytes, boolean quorum) {}
 
     /**
      * Brings every reachable replica's end up to {@code target} by copying from a replica that
