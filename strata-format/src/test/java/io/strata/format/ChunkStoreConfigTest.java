@@ -23,6 +23,24 @@ class ChunkStoreConfigTest {
     }
 
     @Test
+    void rejectsZeroMinAccumulationNanos() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new ChunkStoreConfig(8 << 20, 10_000L, 0L, 50_000_000L));
+    }
+
+    @Test
+    void rejectsNegativeMaxRequestBytes() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new ChunkStoreConfig(-1, 10_000L, 1_000_000L, 50_000_000L));
+    }
+
+    @Test
+    void withGroupCommitAccumulationNanosRejectsMinGreaterThanMax() {
+        assertThrows(IllegalArgumentException.class,
+                () -> ChunkStoreConfig.DEFAULT.withGroupCommitAccumulationNanos(50_000_000L, 1_000_000L));
+    }
+
+    @Test
     void withSettersOverride() {
         ChunkStoreConfig c = ChunkStoreConfig.DEFAULT.withMaxRequestBytes(4 << 20)
                 .withGroupCommitDrainTimeoutMs(20_000L)
