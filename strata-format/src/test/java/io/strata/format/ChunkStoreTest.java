@@ -4,6 +4,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
+import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
 import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
@@ -33,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -913,6 +915,38 @@ class ChunkStoreTest {
             assertEquals(4, e.detail());
 
             assertEquals(4, store.seal(TEST_NS, id, 1, 4, null).finalLength());
+        }
+    }
+
+    @Test
+    void readRegionRevalidatesHandleAfterOffLockOpen() throws Exception {
+        // readRegion snapshots the handle's metadata under the lock, then opens the file OFF the lock. If
+        // the id is deleted + re-imported in that window, the new physical file at the same path must NOT
+        // be bound to the stale snapshot (length/state). The post-open revalidation fails the read instead
+        // (CHUNK_NOT_FOUND; the client retries). A seam injects the delete+re-create at the exact window.
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(new byte[4096]));
+            store.seal(TEST_NS, id, 1, 4096, null); // SEALED → readRegion takes the off-lock zero-copy branch
+
+            AtomicBoolean swapped = new AtomicBoolean(false);
+            FailureInjector.arm("format.readRegion.beforeOpen", p -> {
+                if (swapped.compareAndSet(false, true)) {
+                    try {
+                        store.delete(TEST_NS, id);
+                        store.open(TEST_NS, id, false, 2, 1718000000000L); // fresh empty handle, same id + path
+                    } catch (IOException ioe) {
+                        throw new RuntimeException(ioe);
+                    }
+                }
+            });
+            try {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> store.readRegion(TEST_NS, id, 0, 4096));
+                assertEquals(ErrorCode.CHUNK_NOT_FOUND, e.code());
+            } finally {
+                FailureInjector.reset();
+            }
         }
     }
 

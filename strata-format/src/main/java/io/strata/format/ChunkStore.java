@@ -5,6 +5,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.Closeables;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
+import io.strata.common.FailureInjector;
 import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
@@ -1029,6 +1030,9 @@ public final class ChunkStore implements AutoCloseable {
         } finally {
             h.lock.unlock();
         }
+        // Test seam: lets a test delete + re-import this id in the window between the lock release and the
+        // off-lock open/acquire below, to exercise the post-open handle revalidation.
+        FailureInjector.point("format.readRegion.beforeOpen");
         if (!sealed) {
             // OPEN client fast path: independent transient READ FD, opened OFF the chunk lock. We do NOT
             // re-run readOpenVerified here (it would materialize + CRC the range, removing the zero-copy
@@ -1038,6 +1042,7 @@ public final class ChunkStore implements AutoCloseable {
             // by closing it; the transport streams the region via sendfile.
             FileChannel readChannel = FileChannel.open(dataPath, StandardOpenOption.READ);
             try {
+                requireCurrentHandle(h, nsKey, id);
                 return new ReadRegionResult(readChannel, filePos, n, null, localEnd, lastKnownDO,
                         () -> closeQuietly(readChannel));
             } catch (RuntimeException e) {
@@ -1055,11 +1060,27 @@ public final class ChunkStore implements AutoCloseable {
         // safe. The lease is released (returning the channel to the idle pool) when the response Frame closes.
         ChannelCache.Lease lease = channelCache.acquire(nsKey, dataPath);
         try {
+            requireCurrentHandle(h, nsKey, id);
             return new ReadRegionResult(lease.channel(), filePos, n, null, localEnd, lastKnownDO,
                     lease::release);
         } catch (RuntimeException e) {
             lease.release();
             throw e;
+        }
+    }
+
+    /**
+     * Revalidates, after an off-lock open/acquire in {@link #readRegion}, that this handle is still the
+     * mapped one for its id. A delete + re-import for the same {@link NsChunkId} (same data path) in the
+     * window between the metadata snapshot and the open would otherwise bind the stale snapshot
+     * (length/state) to the freshly-replaced physical file. A {@code Handle} is in the map iff it has not
+     * been deleted, so an identity mismatch means the snapshot is stale: fail with CHUNK_NOT_FOUND and let
+     * the client retry — the same contract as opening an already-unlinked file. The verified read() path
+     * needs no equivalent: it CRC-checks the bytes against the snapshot, so a replaced file fails the check.
+     */
+    private void requireCurrentHandle(Handle h, NsChunkId nsKey, ChunkId id) {
+        if (chunks.get(nsKey) != h) {
+            throw new ScpException(ErrorCode.CHUNK_NOT_FOUND, id.toString());
         }
     }
 
