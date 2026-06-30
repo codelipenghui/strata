@@ -105,8 +105,6 @@ services:
       # Back-pressure window: maximum bytes of in-flight SCP requests accepted server-side (default 1 GiB).
       # Reduce on memory-constrained nodes; raise if client throughput saturates the window under heavy load.
       # STRATA_SCP_MAX_INFLIGHT_BYTES: "1073741824"
-      # Client retry deadline across owner redirects and failover (client, default 15 s).
-      # STRATA_CLIENT_CONTROLLER_RETRY_DEADLINE_MS: "15000"
       # Per-namespace metrics refresh period (server, default 10 s).
       # STRATA_METRICS_NS_REFRESH_INTERVAL_MS: "10000"
     volumes:

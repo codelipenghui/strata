@@ -28,8 +28,9 @@ internals.
   `STRATA_<UPPER_SNAKE>` env override in `StrataServer` via `intEnv/longEnv/boolEnv/env`.
 - Env naming follows the **nearest existing sibling**: repair/verify cadences stay bare
   (`STRATA_VERIFY_*`, like `STRATA_REPAIR_*`); controller log/ZK/lifecycle knobs use
-  `STRATA_CONTROLLER_*`; client knobs use `STRATA_CLIENT_*`; metrics use `STRATA_METRICS_*`;
-  transport/codec use `STRATA_SCP_*`. Env defaults reproduce today's behavior exactly.
+  `STRATA_CONTROLLER_*`; metrics use `STRATA_METRICS_*`; transport/codec use `STRATA_SCP_*`.
+  Client knobs (`ClientConfig`) have no env entrypoint — they are library config fields set by the
+  caller, not by `StrataServer`. Env defaults reproduce today's behavior exactly.
 - Clean break: delete the old `Integer.getInteger`/`Long.getLong` `-D` lookups and bare literals;
   no env→`-D`→default fallback chain.
 
@@ -69,11 +70,15 @@ values through. `ControlLoop` already holds `DataNodeConfig` (`ControlLoop.java:
 
 **`ClientConfig` (3)**
 
-| Site | Literal | Field | Env | Default | Notes |
-|---|---|---|---|---|---|
-| `ControllerClient.java:65` | `15_000` | `controllerRetryDeadlineMs` | `STRATA_CLIENT_CONTROLLER_RETRY_DEADLINE_MS` | 15000 | retry-deadline floor across owner redirects/failover; the floor still wins over a smaller `callTimeoutMs` |
-| `ControllerClient.java:102` | `200` | `controllerRetryBackoffMs` | `STRATA_CLIENT_CONTROLLER_RETRY_BACKOFF_MS` | 200 | flat backoff between metadata retries; `>0` |
-| `Recovery.java:38` | `4*1024*1024` | `recoveryCopyChunkBytes` | `STRATA_CLIENT_RECOVERY_COPY_CHUNK_BYTES` | 4 MiB | seal-recovery copy batch; `>0` |
+The client has no `StrataServer` env entrypoint — these knobs are library config fields set by the
+caller (e.g. the broker) via `ClientConfig` fields / `with*` setters. There are no `STRATA_CLIENT_*`
+env variables; do not add them to docker-compose or other server-side config.
+
+| Site | Literal | Field | Default | Notes |
+|---|---|---|---|---|
+| `ControllerClient.java:65` | `15_000` | `controllerRetryDeadlineMs` | 15000 | retry-deadline floor across owner redirects/failover; the floor still wins over a smaller `callTimeoutMs`; `>0` |
+| `ControllerClient.java:102` | `200` | `controllerRetryBackoffMs` | 200 | flat backoff between metadata retries; `>0` |
+| `Recovery.java:38` | `4*1024*1024` | `recoveryCopyChunkBytes` | 4 MiB | seal-recovery copy batch; `>0` |
 
 `ControllerClient` / `Recovery` receive these from the `ClientConfig` already held by the client.
 
