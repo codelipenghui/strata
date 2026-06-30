@@ -191,12 +191,13 @@ final class ServerMetrics {
      */
     static RequestObserver requestObserver(MeterRegistry reg) {
         Map<String, Timer> timers = new ConcurrentHashMap<>();
-        return (opcode, durationNanos, success) -> {
+        return (opcode, namespace, durationNanos, success) -> {
             String status = success ? "ok" : "error";
-            timers.computeIfAbsent(opcode + ':' + status, k -> Timer.builder("strata_scp_request_duration")
-                            .description("request handler latency by opcode (incl. async durability wait)")
+            timers.computeIfAbsent(opcode + ':' + status + ':' + namespace, k -> Timer.builder("strata_scp_request_duration")
+                            .description("request handler latency by opcode + namespace (incl. async durability wait)")
                             .tag("opcode", opcode)
                             .tag("status", status)
+                            .tag("namespace", namespace)
                             .serviceLevelObjectives(
                                     Duration.ofMillis(1), Duration.ofMillis(2), Duration.ofMillis(5),
                                     Duration.ofMillis(10), Duration.ofMillis(25), Duration.ofMillis(50),

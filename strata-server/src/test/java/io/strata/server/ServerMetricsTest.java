@@ -45,4 +45,14 @@ class ServerMetricsTest {
                     "strata_data_node_read_bytes FunctionCounter must be registered");
         }
     }
+
+    @Test
+    void requestObserverTagsNamespace() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        io.strata.proto.RequestObserver obs = ServerMetrics.requestObserver(registry);
+        obs.observe("READ", "orders", 1_000_000L, true);
+        assertNotNull(registry.find("strata_scp_request_duration")
+                        .tag("namespace", "orders").tag("opcode", "READ").tag("status", "ok").timer(),
+                "request timer must carry a namespace tag");
+    }
 }

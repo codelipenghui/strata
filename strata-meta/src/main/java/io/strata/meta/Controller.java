@@ -442,6 +442,8 @@ public final class Controller implements AutoCloseable {
      * back to the global leader latch, so single-leader behavior is unchanged.
      */
     private void requireNamespaceOwner(StrataNamespace namespace) {
+        // Tag this request's metrics with its namespace (read back by ScpServer's request observer).
+        io.strata.proto.RequestContext.setNamespace(namespace.value());
         if (NamespaceLogBackend.isSystem(namespace)) {
             // Metadata-log system files live in the shared ZK root (CAS-guarded), so any node may serve
             // them — a non-controller owner writes its own namespace's metadata-log files here.
