@@ -40,12 +40,20 @@ final class ControlLoop implements AutoCloseable {
     private static final int CALL_TIMEOUT_MS = 10_000;
     private static final int FETCH_CHUNK_BYTES = 4 * 1024 * 1024;
     private static final long MAX_REPAIR_FOOTER_BYTES = 64L * 1024 * 1024;
+    // Bounded command execution (Phase 4): COMMAND_PARALLELISM consumer vthreads drain a bounded queue so
+    // a slow REPLICATE (whole-chunk network pull) cannot head-of-line-block fast DELETE/DRAIN commands, and
+    // the backlog cannot grow without bound. Overflow is NACK'd (THROTTLED) so the controller re-drives it
+    // on its next reconcile scan. Both tunable via system property.
+    static final int COMMAND_PARALLELISM =
+            Math.max(1, Integer.getInteger("strata.node.commandParallelism", 8));
+    private static final int MAX_QUEUED_COMMANDS =
+            Math.max(COMMAND_PARALLELISM, Integer.getInteger("strata.node.maxQueuedCommands", 1024));
 
     private final DataNode node;
     private final DataNodeConfig config;
     private final ChunkStore store;
     private final AtomicBoolean closed = new AtomicBoolean(false);
-    private final LinkedBlockingQueue<Messages.Command> commandQueue = new LinkedBlockingQueue<>();
+    private final LinkedBlockingQueue<Messages.Command> commandQueue = new LinkedBlockingQueue<>(MAX_QUEUED_COMMANDS);
     private final ConcurrentLinkedQueue<Messages.CompletedCommand> completed = new ConcurrentLinkedQueue<>();
 
     private volatile ManagedScpConnection controller;
@@ -73,7 +81,10 @@ final class ControlLoop implements AutoCloseable {
 
     void start() {
         threads.add(Thread.ofVirtual().name("node-control-" + node.incarnation()).start(this::run));
-        threads.add(Thread.ofVirtual().name("node-cmd-exec-" + node.incarnation()).start(this::executeCommands));
+        for (int i = 0; i < COMMAND_PARALLELISM; i++) {
+            threads.add(Thread.ofVirtual().name("node-cmd-exec-" + node.incarnation() + "-" + i)
+                    .start(this::executeCommands));
+        }
         threads.add(Thread.ofVirtual().name("node-scrub-" + node.incarnation()).start(this::scrubLoop));
     }
 
@@ -170,11 +181,24 @@ final class ControlLoop implements AutoCloseable {
         try {
             ByteBuffer resp = controller.call(Opcode.NODE_HEARTBEAT, hb.encode(), null, CALL_TIMEOUT_MS);
             var r = Messages.HeartbeatResp.decode(resp);
-            commandQueue.addAll(r.commands());
+            acceptCommands(r.commands());
         } catch (RuntimeException e) {
             // re-queue completions so they are reported on the next successful heartbeat
             completed.addAll(done);
             throw e;
+        }
+    }
+
+    /**
+     * Admits commands from a heartbeat response into the bounded execution queue. Commands that do not fit
+     * are NACK'd (reported THROTTLED) so the controller drops them from inflight and re-drives them on its
+     * next reconcile scan — bounding the node-side backlog instead of growing it without limit.
+     */
+    void acceptCommands(List<Messages.Command> commands) {
+        for (Messages.Command cmd : commands) {
+            if (!commandQueue.offer(cmd)) {
+                completed.add(new Messages.CompletedCommand(cmd.commandId(), ErrorCode.THROTTLED.code));
+            }
         }
     }
 
