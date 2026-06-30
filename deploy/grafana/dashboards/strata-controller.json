@@ -402,7 +402,7 @@
     {
       "id": 11,
       "type": "timeseries",
-      "title": "Files per namespace",
+      "title": "Files owned (this controller)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -415,20 +415,17 @@
       },
       "targets": [
         {
-          "expr": "strata_controller_namespace_files{instance=~\"$instance\"}",
+          "expr": "sum(strata_controller_namespace_files{instance=~\"$instance\"})",
           "refId": "A",
-          "legendFormat": "{{namespace}}"
+          "legendFormat": "files"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "custom": {
-            "fillOpacity": 20,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "normal"
-            }
+            "fillOpacity": 10,
+            "showPoints": "never"
           }
         }
       },
@@ -447,12 +444,12 @@
           "sort": "desc"
         }
       },
-      "description": "live files per namespace this controller owns"
+      "description": "live files this controller owns (sharding load); per-namespace: Strata \u2014 Namespace dashboard"
     },
     {
       "id": 12,
       "type": "timeseries",
-      "title": "Metadata-log bytes per namespace",
+      "title": "Metadata-log bytes (this controller)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -465,20 +462,17 @@
       },
       "targets": [
         {
-          "expr": "strata_controller_namespace_log_bytes{instance=~\"$instance\"}",
+          "expr": "sum(strata_controller_namespace_log_bytes{instance=~\"$instance\"})",
           "refId": "A",
-          "legendFormat": "{{namespace}}"
+          "legendFormat": "bytes"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "bytes",
           "custom": {
-            "fillOpacity": 20,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "normal"
-            }
+            "fillOpacity": 10,
+            "showPoints": "never"
           }
         }
       },
@@ -497,7 +491,7 @@
           "sort": "desc"
         }
       },
-      "description": "open metadata-log size per owned namespace"
+      "description": "open metadata-log bytes this controller owns; per-namespace: Strata \u2014 Namespace dashboard"
     },
     {
       "id": 20,
