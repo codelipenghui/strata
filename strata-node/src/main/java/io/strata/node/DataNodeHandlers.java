@@ -32,6 +32,15 @@ final class DataNodeHandlers implements ScpServer.Handler {
     @Override
     public java.util.concurrent.CompletableFuture<Frame> handleAsync(Frame req) throws Exception {
         if (req.opcode() == Opcode.APPEND.code) {
+            // The per-record digest is writer-origin: a non-empty append MUST carry the client's payload
+            // CRC (FLAG_PAYLOAD_CRC), which the node stores verbatim as the ledger digest. Reject a
+            // non-empty append that lacks it rather than silently store a 0 digest that would defeat
+            // torn-tail recovery. (The wire encoder always sets the flag for a non-empty payload, so this
+            // only fires for a malformed/non-conforming client.)
+            if (req.payloadLength() > 0 && (req.flags() & Frame.FLAG_PAYLOAD_CRC) == 0) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "non-empty APPEND must carry FLAG_PAYLOAD_CRC (writer-origin per-record digest)");
+            }
             // validation + write run synchronously here (per-chunk ordering preserved); the ack
             // defers until durability per the chunk's policy — for ack-on-fsync that means a
             // covering group-commit force, while this connection keeps processing frames
