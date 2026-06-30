@@ -218,7 +218,7 @@ final class NamespaceLogBackend implements AutoCloseable {
         // so we must observe creation times for live (referenced) files too — hence we scan every file here.
         Map<StrataNamespace, Map<Long, Long>> genCreatedAt = new HashMap<>();
         List<ReapCandidate> candidates = new ArrayList<>();
-        for (FileId id : root.listFiles(SYSTEM_NAMESPACE)) {
+        for (FileId id : root.listFileIds(SYSTEM_NAMESPACE)) {
             Optional<MetadataStore.Versioned<Records.FileRecord>> rec = root.getFile(SYSTEM_NAMESPACE, id);
             if (rec.isEmpty()) {
                 continue; // already gone
@@ -603,6 +603,19 @@ final class NamespaceLogBackend implements AutoCloseable {
     List<FileId> listFiles(StrataNamespace namespace) throws Exception {
         if (isSystem(namespace)) {
             return root.listFiles(namespace);
+        }
+        return runLocked(repo(namespace), repo -> repo.state().liveFiles());
+    }
+
+    /**
+     * Children-only enumeration for the reconcile/verify sweep (see {@link MetadataStore#listFileIds}). For
+     * the system namespace the metadata-log segment descriptors live in the consensus root, so this routes
+     * to the root's children-only listing — the sweep no longer reads every segment record just to enumerate
+     * ids. User namespaces already serve their listing from the in-memory repo (no consensus-root read).
+     */
+    List<FileId> listFileIds(StrataNamespace namespace) throws Exception {
+        if (isSystem(namespace)) {
+            return root.listFileIds(namespace);
         }
         return runLocked(repo(namespace), repo -> repo.state().liveFiles());
     }

@@ -941,6 +941,45 @@ class RepairCoordinatorTest {
         return new Registered(resp.nodeId(), incMsb, incLsb, resp.sessionEpoch());
     }
 
+    @Test
+    void verifyPassThrottlesSystemNamespaceToSlowCadence() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        FileId sysFile = fileId(700);
+        // OPEN file in the system metadata-log namespace, no sealed chunks -> verifyFile is a no-op after
+        // its single getFile, so getFile count == number of times the system namespace was verified.
+        store.createFile(new Records.FileRecord(sysFile, "strata-meta", "/metadata-log/seg-700",
+                3, 2, false, FileState.OPEN, 1234, List.of()));
+        RepairCoordinator coordinator =
+                new RepairCoordinator(store, registry, config(), () -> false, () -> false, ns -> true);
+        coordinator.systemVerifyIntervalMsForTest(60_000);
+
+        coordinator.verifyPass();
+        coordinator.verifyPass();
+        coordinator.verifyPass();
+
+        assertEquals(1, store.getFileCalls(sysFile),
+                "system namespace is owner-verified once per slow window, not every brisk verify pass");
+    }
+
+    @Test
+    void verifyPassRunsSystemNamespaceEveryPassWhenIntervalElapsed() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        FileId sysFile = fileId(701);
+        store.createFile(new Records.FileRecord(sysFile, "strata-meta", "/metadata-log/seg-701",
+                3, 2, false, FileState.OPEN, 1234, List.of()));
+        RepairCoordinator coordinator =
+                new RepairCoordinator(store, registry, config(), () -> false, () -> false, ns -> true);
+        coordinator.systemVerifyIntervalMsForTest(0);  // window always elapsed
+
+        coordinator.verifyPass();
+        coordinator.verifyPass();
+
+        assertEquals(2, store.getFileCalls(sysFile),
+                "with the throttle window elapsed the system namespace is verified every pass");
+    }
+
     private static ControllerConfig config() {
         return config(1);
     }
@@ -1049,6 +1088,8 @@ class RepairCoordinatorTest {
         private final Map<Name, FileId> paths = new LinkedHashMap<>();
         private final Map<Integer, Versioned<Records.NodeRecord>> nodes = new LinkedHashMap<>();
         private final List<FileId> extraListedFiles = new ArrayList<>();
+        /** Per-file getFile call counter — test observability for the system-namespace verify throttle. */
+        private final Map<FileId, Integer> getFileCalls = new LinkedHashMap<>();
         // a fileId that enumeration surfaces but getFile cannot resolve (orphan/race) lives under this
         // sentinel namespace, so per-namespace enumeration still exercises repair's skip-on-missing path
         private static final io.strata.common.StrataNamespace ORPHAN_NS =
@@ -1079,6 +1120,7 @@ class RepairCoordinatorTest {
 
         @Override
         public Optional<Versioned<Records.FileRecord>> getFile(io.strata.common.StrataNamespace namespace, FileId id) {
+            getFileCalls.merge(id, 1, Integer::sum);
             if (throwOnGetFile) {
                 throw new IllegalStateException("getFile failure");
             }
@@ -1086,6 +1128,10 @@ class RepairCoordinatorTest {
                 throw new IllegalStateException("poison file getFile failure for " + id);
             }
             return Optional.ofNullable(files.get(id));
+        }
+
+        int getFileCalls(FileId id) {
+            return getFileCalls.getOrDefault(id, 0);
         }
 
         @Override

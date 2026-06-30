@@ -56,4 +56,51 @@ class ZkMetadataStoreMetricsTest {
             assertEquals(0, store.zkBytes("bogus", false));
         }
     }
+
+    /**
+     * {@link ZkMetadataStore#listFileIds} is a children-only enumeration for the repair/verify sweep: it
+     * must NOT read any file record (the caller re-reads each via getFile). This is the fix for the
+     * per-tick read amplification where listFiles read every record just to filter tombstones and the
+     * repair loop then read each survivor a second time.
+     */
+    @Test
+    void listFileIdsDoesNotReadFileRecords() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
+            StrataNamespace ns = StrataNamespace.of("n");
+            for (int i = 1; i <= 4; i++) {
+                store.createFile(new Records.FileRecord(FileId.of(i), "n", "/f" + i, 3, 2, false,
+                        FileState.OPEN, System.currentTimeMillis(), List.of()));
+            }
+
+            long filesReadBefore = store.zkOps("files", false);
+            List<FileId> ids = store.listFileIds(ns);
+
+            assertEquals(4, ids.size(), "must enumerate every index entry");
+            assertEquals(filesReadBefore, store.zkOps("files", false),
+                    "listFileIds must not read any file record (children-only enumeration)");
+        }
+    }
+
+    /**
+     * {@link ZkMetadataStore#listNamespaces} only needs to know whether a namespace has ANY live file, so
+     * it must short-circuit on the first live record instead of reading every record (it ran on every node
+     * every repair/verify tick, reading all system metadata-log segment records just to test non-emptiness).
+     */
+    @Test
+    void listNamespacesShortCircuitsEmptinessProbe() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
+            for (int i = 1; i <= 5; i++) {
+                store.createFile(new Records.FileRecord(FileId.of(i), "n", "/f" + i, 3, 2, false,
+                        FileState.OPEN, System.currentTimeMillis(), List.of()));
+            }
+
+            long filesReadBefore = store.zkOps("files", false);
+            assertEquals(List.of(StrataNamespace.of("n")), store.listNamespaces());
+
+            assertEquals(1, store.zkOps("files", false) - filesReadBefore,
+                    "listNamespaces must read at most one record per namespace to confirm it is non-empty");
+        }
+    }
 }

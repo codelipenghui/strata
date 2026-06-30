@@ -215,6 +215,16 @@ class RepairCoordinator implements AutoCloseable {
     // so it stays brisk enough that detection + repair lands well inside the integration deadlines.
     private static final long VERIFY_INTERVAL_MS = 2_000;
     private static final int VERIFY_BATCH_SIZE = 256;
+    // The system (metadata-log) namespace's segment descriptors change only on log roll/compaction, so the
+    // brisk user-data owner-pull cadence (VERIFY_INTERVAL_MS) is wasted re-reading them every pass. Verify
+    // the system namespace on this slower cadence instead. reconcile() (every repairScanIntervalMs) and the
+    // node-death event path remain the durability backstops, so this only relaxes the proactive
+    // corruption/silent-loss detection latency for metadata-log segments, not their re-replication on loss.
+    private static final long SYSTEM_VERIFY_INTERVAL_MS = 30_000;
+    private volatile long systemVerifyIntervalMs = SYSTEM_VERIFY_INTERVAL_MS;
+    // Last wall-clock ms the system namespace was owner-verified (0 = never). The verify loop is single
+    // threaded, but tests drive verifyPass() directly, so this stays a field.
+    private long lastSystemVerifyMs;
 
     // leaderSince is written by the scan thread (tick/reconcile) and read by the verify thread's settle
     // gate, so it must publish safely across threads.
@@ -296,6 +306,11 @@ class RepairCoordinator implements AutoCloseable {
         sweepStuckCommands();
     }
 
+    /** Test seam: shrink/grow the system-namespace owner-verify cadence to exercise the throttle. */
+    void systemVerifyIntervalMsForTest(long ms) {
+        this.systemVerifyIntervalMs = ms;
+    }
+
     /** Test seam: stamps {@code leaderSince} far enough in the past that the settle gate is open. */
     void becomeLeaderForTest() {
         leaderSince = System.currentTimeMillis() - (config.leaseMs() + config.deadGraceMs()) - 1;
@@ -332,7 +347,7 @@ class RepairCoordinator implements AutoCloseable {
             if (!ownsAll.getAsBoolean() && !ownsNamespace.test(ns) && !NamespaceLogBackend.isSystem(ns)) {
                 continue;
             }
-            for (FileId fileId : store.listFiles(ns)) {
+            for (FileId fileId : store.listFileIds(ns)) {
                 Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
                 if (opt.isEmpty()) {
                     continue;
@@ -416,7 +431,7 @@ class RepairCoordinator implements AutoCloseable {
     private List<NsFileKey> allFilesByNamespace() throws Exception {
         List<NsFileKey> out = new ArrayList<>();
         for (var ns : store.listNamespaces()) {
-            for (FileId id : store.listFiles(ns)) {
+            for (FileId id : store.listFileIds(ns)) {
                 out.add(new NsFileKey(ns, id));
             }
         }
@@ -604,7 +619,7 @@ class RepairCoordinator implements AutoCloseable {
                 if (!ownsNamespace.test(ns)) {
                     continue;
                 }
-                for (FileId fileId : store.listFiles(ns)) {
+                for (FileId fileId : store.listFileIds(ns)) {
                     perFileIsolated(ns, fileId, "ownerRepairPass", () -> {
                         Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
                         if (opt.isEmpty()) {
@@ -671,7 +686,15 @@ class RepairCoordinator implements AutoCloseable {
             if (!ownsNamespace.test(ns)) {
                 continue;
             }
-            for (FileId fileId : store.listFiles(ns)) {
+            if (NamespaceLogBackend.isSystem(ns)) {
+                // metadata-log segments rarely change; verify them on the slower SYSTEM_VERIFY_INTERVAL_MS
+                // cadence instead of every brisk pass. reconcile() + the node-death path still backstop loss.
+                if (lastSystemVerifyMs != 0 && now - lastSystemVerifyMs < systemVerifyIntervalMs) {
+                    continue;
+                }
+                lastSystemVerifyMs = now;
+            }
+            for (FileId fileId : store.listFileIds(ns)) {
                 perFileIsolated(ns, fileId, "verifyPass", () -> verifyFile(ns, fileId, nodes, now));
             }
         }

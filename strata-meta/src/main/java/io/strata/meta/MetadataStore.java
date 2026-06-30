@@ -55,6 +55,21 @@ public interface MetadataStore extends AutoCloseable {
     List<FileId> listFiles(StrataNamespace namespace) throws Exception;
 
     /**
+     * Candidate file ids for a per-namespace reconcile/verify sweep — like {@link #listFiles} but it does
+     * NOT read each record to filter DELETED tombstones, so it may include a tombstone whose index entry
+     * is not yet swept. Callers re-read each id via {@link #getFile} (which hides tombstones) and skip the
+     * empties, so the enumeration is a cheap directory listing and the per-file read is the single source
+     * of truth. This avoids the read amplification of {@code listFiles} (one record read to filter) followed
+     * by a second {@code getFile} of the survivors in the repair loops. The default composes
+     * {@link #listFiles} — backends whose listing already costs a record read per file (or that hold the
+     * records in memory) gain nothing and need no override; the consensus-root backend overrides it with a
+     * children-only listing.
+     */
+    default List<FileId> listFileIds(StrataNamespace namespace) throws Exception {
+        return listFiles(namespace);
+    }
+
+    /**
      * Namespaces that currently have at least one live file — the roots files are organized under.
      * A cluster-wide file sweep is {@code listNamespaces()} composed with {@link #listFiles(StrataNamespace)};
      * there is intentionally no global flat file listing.
