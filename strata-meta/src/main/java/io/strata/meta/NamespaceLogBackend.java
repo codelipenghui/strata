@@ -308,19 +308,34 @@ final class NamespaceLogBackend implements AutoCloseable {
         }
         repoCreateLock.lock();
         try {
-            r = repos.get(namespace);
-            if (r == null) {
-                long epoch = root.allocateMetadataEpoch();
-                r = NamespaceMetadataLogRepository.open(namespace, fileStore, root, epoch, metrics);
-                repos.put(namespace, r);   // publish only after recovery
-                // Cold acquisition = this node started owning a namespace it had no repository for: an
-                // ownership handoff to this node. The fence-driven reacquire() path is NOT counted here.
-                metrics.recordOwnerAcquired(namespace);
-            }
-            return r;
+            // Cold acquisition = this node started owning a namespace it had no repository for: an
+            // ownership handoff to this node, counted as an owner-change.
+            return openLocked(namespace, true);
         } finally {
             repoCreateLock.unlock();
         }
+    }
+
+    /**
+     * Opens (and recovers) this node's repository for {@code namespace} if not already cached; caller holds
+     * {@code repoCreateLock}. {@code countAsAcquisition} distinguishes a genuine cold ownership handoff
+     * (counted in {@code ownerChanges}) from the fence-driven in-place {@link #reacquire} — an epoch bump on
+     * a namespace this node already owns, which must NOT register as an owner change. If another thread won
+     * the open race the existing repo is returned and nothing is counted.
+     */
+    private NamespaceMetadataLogRepository openLocked(StrataNamespace namespace, boolean countAsAcquisition)
+            throws Exception {
+        NamespaceMetadataLogRepository r = repos.get(namespace);
+        if (r != null) {
+            return r;
+        }
+        long epoch = root.allocateMetadataEpoch();
+        r = NamespaceMetadataLogRepository.open(namespace, fileStore, root, epoch, metrics);
+        repos.put(namespace, r);   // publish only after recovery
+        if (countAsAcquisition) {
+            metrics.recordOwnerAcquired(namespace);
+        }
+        return r;
     }
 
     @FunctionalInterface
@@ -376,7 +391,9 @@ final class NamespaceLogBackend implements AutoCloseable {
         repoCreateLock.lock();
         try {
             repos.remove(namespace, stale); // no-op if another thread already re-acquired
-            return repo(namespace);          // re-opens at a fresh epoch (recovers latest state) if we evicted
+            // In-place epoch bump on a namespace this node already owns — NOT an ownership handoff, so it
+            // must not increment ownerChanges (recordReacquire already counts this churn separately).
+            return openLocked(namespace, false);
         } finally {
             repoCreateLock.unlock();
         }
