@@ -93,9 +93,8 @@ class EndToEndTest {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/empty-append")).id();
 
         try (StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend()) {
-            var ack = appender.append(ByteBuffer.allocate(0)).get(1, TimeUnit.SECONDS);
-            assertEquals(0, ack.endOffset());
-            assertEquals(0, ack.durableOffset());
+            long ack = appender.append(ByteBuffer.allocate(0)).get(1, TimeUnit.SECONDS);
+            assertEquals(0, ack);
             assertEquals(0, appender.durableOffset());
             assertEquals(0, appender.seal().sealedLength());
         }

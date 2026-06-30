@@ -179,9 +179,9 @@ class FailureRecoveryTest {
 
         StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         try {
-            var ack = appender.append(ByteBuffer.wrap(acked)).join();
-            assertEquals(acked.length, ack.endOffset());
-            assertEquals(acked.length, ack.durableOffset());
+            long ack = appender.append(ByteBuffer.wrap(acked)).join();
+            assertEquals(acked.length, ack);
+            assertEquals(acked.length, appender.durableOffset());
 
             Messages.ChunkInfo openChunk = latestChunk(fileId);
             assertEquals(ChunkState.OPEN, openChunk.state());
@@ -219,9 +219,9 @@ class FailureRecoveryTest {
 
         StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         try {
-            var ack = appender.append(ByteBuffer.wrap(acked)).join();
-            assertEquals(acked.length, ack.endOffset());
-            assertEquals(acked.length, ack.durableOffset());
+            long ack = appender.append(ByteBuffer.wrap(acked)).join();
+            assertEquals(acked.length, ack);
+            assertEquals(acked.length, appender.durableOffset());
 
             Messages.ChunkInfo openChunk = latestChunk(fileId);
             assertEquals(ChunkState.OPEN, openChunk.state());
