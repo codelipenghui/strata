@@ -52,8 +52,6 @@ import static io.strata.format.ChunkFormats.writeFully;
 public final class ChunkStore implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ChunkStore.class);
 
-    /** Per-request read/fetch cap: callers loop; the frame layer tops out at 64 MB anyway. */
-    public static final int MAX_REQUEST_BYTES = 8 * 1024 * 1024;
     private static final long MAX_IMPORT_FOOTER_BYTES = 64L * 1024 * 1024;
 
     private static final int RECOVERY_FENCE_REQUIRED = Integer.MAX_VALUE;
@@ -114,6 +112,7 @@ public final class ChunkStore implements AutoCloseable {
     /** Whether seal/open/delete force their metadata + data to disk synchronously. Defaults from
      *  STRATA_SEAL_FSYNC; overridable per instance so tests can exercise both durability paths. */
     private final boolean sealFsync;
+    private final ChunkStoreConfig csConfig;
     private final ScheduledExecutorService flusher;
     private final ExecutorService cleanupExecutor;
 
@@ -178,9 +177,13 @@ public final class ChunkStore implements AutoCloseable {
         this(dir, SEAL_FSYNC_DEFAULT);
     }
 
+    public ChunkStore(Path dir, ChunkStoreConfig csConfig) throws IOException {
+        this(dir, SEAL_FSYNC_DEFAULT, (int) CHANNEL_CACHE_MAX_SIZE, csConfig);
+    }
+
     /** Package-private: lets tests exercise both the seal-fsync-on and -off durability paths. */
     ChunkStore(Path dir, boolean sealFsync) throws IOException {
-        this(dir, sealFsync, (int) CHANNEL_CACHE_MAX_SIZE);
+        this(dir, sealFsync, (int) CHANNEL_CACHE_MAX_SIZE, ChunkStoreConfig.DEFAULT);
     }
 
     /**
@@ -188,8 +191,13 @@ public final class ChunkStore implements AutoCloseable {
      * without creating thousands of files (avoids static-final class-load timing coupling).
      */
     ChunkStore(Path dir, boolean sealFsync, int channelCacheCapacity) throws IOException {
+        this(dir, sealFsync, channelCacheCapacity, ChunkStoreConfig.DEFAULT);
+    }
+
+    ChunkStore(Path dir, boolean sealFsync, int channelCacheCapacity, ChunkStoreConfig csConfig) throws IOException {
         this.dir = dir;
         this.sealFsync = sealFsync;
+        this.csConfig = csConfig;
         this.channelCache = new ChannelCache(channelCacheCapacity);
         Files.createDirectories(dir);
         recoverAll();
@@ -554,7 +562,10 @@ public final class ChunkStore implements AutoCloseable {
                     // both must be durable before acking; either alone is safe for recovery
                     data.force(false);
                     ledger.force();
-                }, counter);
+                }, counter,
+                csConfig.groupCommitDrainTimeoutMs(),
+                csConfig.groupCommitMinAccumulationNanos(),
+                csConfig.groupCommitMaxAccumulationNanos());
             }
         }
 
@@ -896,7 +907,7 @@ public final class ChunkStore implements AutoCloseable {
             if (h.state != ChunkState.SEALED) {
                 long end = h.currentEnd();
                 if (offset >= end) return new ReadResult(new byte[0], end, h.lastKnownDO);
-                int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), end - offset);
+                int n = (int) Math.min(Math.min(maxBytes, csConfig.maxRequestBytes()), end - offset);
                 byte[] out = new byte[n];
                 readOpenVerified(h, offset, out);
                 return new ReadResult(out, end, h.lastKnownDO);
@@ -907,7 +918,7 @@ public final class ChunkStore implements AutoCloseable {
             dataPath = h.dataPath;
         }
         if (offset >= sealedLength) return new ReadResult(new byte[0], sealedLength, lastKnownDO);
-        int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), sealedLength - offset);
+        int n = (int) Math.min(Math.min(maxBytes, csConfig.maxRequestBytes()), sealedLength - offset);
         byte[] out = new byte[n];
         try (ChannelCache.Lease lease = channelCache.acquire(h.nsKey, dataPath)) {
             readSealedVerified(lease.channel(), sealedLength, rangeCrcs, id, offset, out);
@@ -943,7 +954,7 @@ public final class ChunkStore implements AutoCloseable {
             if (offset >= readableEnd) {
                 return new ReadRegionResult(null, 0, 0, null, localEnd, h.lastKnownDO, null);
             }
-            int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), readableEnd - offset);
+            int n = (int) Math.min(Math.min(maxBytes, csConfig.maxRequestBytes()), readableEnd - offset);
             if (n == 0) {
                 return new ReadRegionResult(null, 0, 0, null, localEnd, h.lastKnownDO, null);
             }
@@ -1276,7 +1287,7 @@ public final class ChunkStore implements AutoCloseable {
             FileChannel data = lease.channel();
             long fileLen = data.size();
             if (offset >= fileLen) return new FetchResult(fileLen, state, new byte[0]);
-            int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), fileLen - offset);
+            int n = (int) Math.min(Math.min(maxBytes, csConfig.maxRequestBytes()), fileLen - offset);
             byte[] out = new byte[n];
             readFully(data, ByteBuffer.wrap(out), offset);
             return new FetchResult(fileLen, state, out);
