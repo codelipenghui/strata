@@ -168,6 +168,19 @@ class RecordsTest {
         assertTrue(e.getMessage().contains("crc"));
     }
 
+    @Test
+    void preEnvelopeRecordBytesAreRejected() {
+        // Clean break (no back-compat / no migration shim — project policy): a record written by pre-PR
+        // code carries no CRC envelope, so its trailing 4 bytes are real record fields, not a checksum.
+        // Decode must fail closed rather than parse it as a plausible record. (ZK is redeployed fresh, so
+        // there is no legacy data to migrate; this documents and pins the intentional break.)
+        Records.FileRecord record = new Records.FileRecord(FileId.of(1), "test", "/pre-envelope",
+                3, 2, false, FileState.OPEN, 1234, List.of());
+        byte[] enveloped = record.encode();
+        byte[] preEnvelope = java.util.Arrays.copyOf(enveloped, enveloped.length - 4); // strip CRC = old format
+        assertThrows(IllegalArgumentException.class, () -> Records.FileRecord.decode(preEnvelope));
+    }
+
     private static byte[] legacyFileRecordBytes(FileId fileId) {
         BufWriter w = new BufWriter();
         w.u8(1);
