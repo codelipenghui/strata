@@ -89,6 +89,11 @@ public final class NamespaceLogMetadataStore implements MetadataStore {
     }
 
     @Override
+    public List<FileId> listFileIds(StrataNamespace namespace) throws Exception {
+        return backend.listFileIds(namespace);
+    }
+
+    @Override
     public List<StrataNamespace> listNamespaces() throws Exception {
         return backend.listNamespaces();
     }

@@ -311,6 +311,39 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     /**
+     * Children-only enumeration for the per-namespace reconcile/verify sweep: returns every index entry
+     * (including not-yet-swept DELETED tombstones) WITHOUT reading a single file record. The repair loops
+     * re-read each id via {@link #getFile} (which hides tombstones) and skip the empties, so this avoids
+     * the read amplification of {@link #listFiles} (one record read per file to filter tombstones) followed
+     * by the loop's second read of each survivor — the dominant idle {@code /strata/files} read load.
+     */
+    @Override
+    public List<FileId> listFileIds(StrataNamespace namespace) throws Exception {
+        return listFilesIncludingTombstones(namespace);
+    }
+
+    /**
+     * True if {@code namespace} has at least one live (non-tombstone) file. Short-circuits on the first
+     * live record so {@link #listNamespaces}'s non-emptiness probe reads at most one record per namespace
+     * instead of every record — it runs on every controller on every repair/verify tick.
+     */
+    private boolean hasLiveFile(StrataNamespace namespace) throws Exception {
+        List<String> children;
+        try {
+            children = curator.getChildren().forPath(namespaceFilesDir(namespace));
+        } catch (KeeperException.NoNodeException e) {
+            return false;
+        }
+        record(NAMESPACES, false, 0);
+        for (String child : children) {
+            if (getFile(namespace, FileId.fromHex(child)).isPresent()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Fetches a file record including DELETED tombstone records. Used by the controller's opId-reuse
      * scan to detect tombstoned files carrying a previously-used opId.
      */
@@ -338,7 +371,7 @@ public final class ZkMetadataStore implements MetadataStore {
         for (String child : children) {
             StrataNamespace ns = StrataNamespace.of(child);
             // a namespace znode persists after its files are gone; only report namespaces with live files
-            if (!listFiles(ns).isEmpty()) {
+            if (hasLiveFile(ns)) {
                 out.add(ns);
             }
         }
