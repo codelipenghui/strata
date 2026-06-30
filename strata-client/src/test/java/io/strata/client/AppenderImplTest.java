@@ -47,9 +47,9 @@ class AppenderImplTest {
 
         onReplicaResponse(appender, staleSession, ok, null);
 
-        var ack = appender.append(ByteBuffer.allocate(0)).join();
-        assertEquals(0, ack.endOffset());
-        assertEquals(0, ack.durableOffset());
+        long ack = appender.append(ByteBuffer.allocate(0)).join();
+        assertEquals(0, ack);
+        assertEquals(0, appender.durableOffset());
     }
 
     @Test
@@ -60,9 +60,9 @@ class AppenderImplTest {
         onReplicaResponse(appender, staleSession, null,
                 new ScpException(ErrorCode.INTERNAL, "old chunk timed out"));
 
-        var ack = appender.append(ByteBuffer.allocate(0)).join();
-        assertEquals(0, ack.endOffset());
-        assertEquals(0, ack.durableOffset());
+        long ack = appender.append(ByteBuffer.allocate(0)).join();
+        assertEquals(0, ack);
+        assertEquals(0, appender.durableOffset());
     }
 
     @Test
@@ -134,9 +134,9 @@ class AppenderImplTest {
         onReplicaResponse(appender, staleSession,
                 errorResp(ErrorCode.INTERNAL, "old error", 77), null);
 
-        var ack = appender.append(ByteBuffer.allocate(0)).join();
-        assertEquals(0, ack.endOffset());
-        assertEquals(0, ack.durableOffset());
+        long ack = appender.append(ByteBuffer.allocate(0)).join();
+        assertEquals(0, ack);
+        assertEquals(0, appender.durableOffset());
     }
 
     @Test
@@ -148,9 +148,9 @@ class AppenderImplTest {
 
         onReplicaResponse(appender, staleSession, malformed, null);
 
-        var ack = appender.append(ByteBuffer.allocate(0)).join();
-        assertEquals(0, ack.endOffset());
-        assertEquals(0, ack.durableOffset());
+        long ack = appender.append(ByteBuffer.allocate(0)).join();
+        assertEquals(0, ack);
+        assertEquals(0, appender.durableOffset());
     }
 
     @Test
@@ -161,16 +161,16 @@ class AppenderImplTest {
         setLong(session, "end", 7);
         setLong(session, "durable", 3);
 
-        CompletableFuture<StrataFile.AppendAck> ack = appender.append(ByteBuffer.allocate(0));
+        CompletableFuture<Long> ack = appender.append(ByteBuffer.allocate(0));
         assertFalse(ack.isDone());
 
         onReplicaResponse(appender, session, 0, appendResp(7), null);
         assertFalse(ack.isDone());
         onReplicaResponse(appender, session, 1, appendResp(7), null);
 
-        StrataFile.AppendAck result = ack.get(1, TimeUnit.SECONDS);
-        assertEquals(7, result.endOffset());
-        assertEquals(7, result.durableOffset());
+        long result = ack.get(1, TimeUnit.SECONDS);
+        assertEquals(7, result);
+        assertEquals(7, appender.durableOffset());
     }
 
     @Test
@@ -181,10 +181,10 @@ class AppenderImplTest {
         setLong(session, "end", 7);
         setLong(session, "durable", 7);
 
-        StrataFile.AppendAck ack = appender.append(ByteBuffer.allocate(0)).get(1, TimeUnit.SECONDS);
+        long ack = appender.append(ByteBuffer.allocate(0)).get(1, TimeUnit.SECONDS);
 
-        assertEquals(7, ack.endOffset());
-        assertEquals(7, ack.durableOffset());
+        assertEquals(7, ack);
+        assertEquals(7, appender.durableOffset());
     }
 
     @Test
@@ -194,9 +194,9 @@ class AppenderImplTest {
 
         onReplicaResponse(appender, staleSession, null, null);
 
-        var ack = appender.append(ByteBuffer.allocate(0)).join();
-        assertEquals(0, ack.endOffset());
-        assertEquals(0, ack.durableOffset());
+        long ack = appender.append(ByteBuffer.allocate(0)).join();
+        assertEquals(0, ack);
+        assertEquals(0, appender.durableOffset());
     }
 
     @Test
@@ -206,7 +206,7 @@ class AppenderImplTest {
         setSession(appender, session);
         setLong(session, "end", 11);
 
-        CompletableFuture<StrataFile.AppendAck> ack = appender.append(ByteBuffer.allocate(0));
+        CompletableFuture<Long> ack = appender.append(ByteBuffer.allocate(0));
 
         onReplicaResponse(appender, session, 0, null,
                 new ScpException(ErrorCode.INTERNAL, "first replica failed"));
@@ -227,7 +227,7 @@ class AppenderImplTest {
         setSession(appender, session);
         setLong(session, "end", 5);
 
-        CompletableFuture<StrataFile.AppendAck> ack = appender.append(ByteBuffer.allocate(0));
+        CompletableFuture<Long> ack = appender.append(ByteBuffer.allocate(0));
 
         onReplicaResponse(appender, session, 0, 5, appendResp(6), null);
         assertFalse(ack.isDone());
@@ -235,9 +235,9 @@ class AppenderImplTest {
         assertFalse(ack.isDone());
         onReplicaResponse(appender, session, 2, appendResp(5), null);
 
-        StrataFile.AppendAck result = ack.get(1, TimeUnit.SECONDS);
-        assertEquals(5, result.endOffset());
-        assertEquals(5, result.durableOffset());
+        long result = ack.get(1, TimeUnit.SECONDS);
+        assertEquals(5, result);
+        assertEquals(5, appender.durableOffset());
     }
 
     @Test
@@ -247,7 +247,7 @@ class AppenderImplTest {
         setSession(appender, session);
         setLong(session, "end", 5);
 
-        CompletableFuture<StrataFile.AppendAck> ack = appender.append(ByteBuffer.allocate(0));
+        CompletableFuture<Long> ack = appender.append(ByteBuffer.allocate(0));
         Frame malformed = Frame.response(Frame.request(Opcode.APPEND, new byte[0], null, 7),
                 new byte[] {0, 0}, null);
 
@@ -269,7 +269,7 @@ class AppenderImplTest {
         setSession(appender, session);
         setLong(session, "end", 5);
 
-        CompletableFuture<StrataFile.AppendAck> ack = appender.append(ByteBuffer.allocate(0));
+        CompletableFuture<Long> ack = appender.append(ByteBuffer.allocate(0));
 
         onReplicaResponse(appender, session, 0, 5, null, null);
         assertFalse(ack.isDone());
@@ -277,9 +277,9 @@ class AppenderImplTest {
         assertFalse(ack.isDone());
         onReplicaResponse(appender, session, 2, appendResp(5), null);
 
-        StrataFile.AppendAck result = ack.get(1, TimeUnit.SECONDS);
-        assertEquals(5, result.endOffset());
-        assertEquals(5, result.durableOffset());
+        long result = ack.get(1, TimeUnit.SECONDS);
+        assertEquals(5, result);
+        assertEquals(5, appender.durableOffset());
     }
 
     @Test
@@ -289,7 +289,7 @@ class AppenderImplTest {
         setSession(appender, session);
         setLong(session, "end", 5);
 
-        CompletableFuture<StrataFile.AppendAck> ack = appender.append(ByteBuffer.allocate(0));
+        CompletableFuture<Long> ack = appender.append(ByteBuffer.allocate(0));
 
         onReplicaResponse(appender, session, 0, null,
                 new ScpException(ErrorCode.FENCED_EPOCH, "fenced", 9));
@@ -308,7 +308,7 @@ class AppenderImplTest {
         setSession(appender, session);
         setLong(session, "end", 5);
 
-        CompletableFuture<StrataFile.AppendAck> ack = appender.append(ByteBuffer.allocate(0));
+        CompletableFuture<Long> ack = appender.append(ByteBuffer.allocate(0));
 
         onReplicaResponse(appender, session, 0, null,
                 new java.util.concurrent.CompletionException(
@@ -328,7 +328,7 @@ class AppenderImplTest {
         setSession(appender, session);
         setLong(session, "end", 5);
 
-        CompletableFuture<StrataFile.AppendAck> ack = appender.append(ByteBuffer.allocate(0));
+        CompletableFuture<Long> ack = appender.append(ByteBuffer.allocate(0));
 
         onReplicaResponse(appender, session, 0, null, new RuntimeException("transport closed"));
         assertFalse(ack.isDone());
@@ -336,9 +336,9 @@ class AppenderImplTest {
         assertFalse(ack.isDone());
         onReplicaResponse(appender, session, 2, appendResp(5), null);
 
-        StrataFile.AppendAck result = ack.get(1, TimeUnit.SECONDS);
-        assertEquals(5, result.endOffset());
-        assertEquals(5, result.durableOffset());
+        long result = ack.get(1, TimeUnit.SECONDS);
+        assertEquals(5, result);
+        assertEquals(5, appender.durableOffset());
     }
 
     @Test
@@ -348,7 +348,7 @@ class AppenderImplTest {
         setSession(appender, session);
         setLong(session, "end", 5);
 
-        CompletableFuture<StrataFile.AppendAck> ack = appender.append(ByteBuffer.allocate(0));
+        CompletableFuture<Long> ack = appender.append(ByteBuffer.allocate(0));
 
         onReplicaResponse(appender, session, 0, null,
                 new java.util.concurrent.CompletionException("closed", null));
@@ -357,9 +357,9 @@ class AppenderImplTest {
         assertFalse(ack.isDone());
         onReplicaResponse(appender, session, 2, appendResp(5), null);
 
-        StrataFile.AppendAck result = ack.get(1, TimeUnit.SECONDS);
-        assertEquals(5, result.endOffset());
-        assertEquals(5, result.durableOffset());
+        long result = ack.get(1, TimeUnit.SECONDS);
+        assertEquals(5, result);
+        assertEquals(5, appender.durableOffset());
     }
 
     @Test
@@ -387,7 +387,7 @@ class AppenderImplTest {
                     new Messages.Replica(3, endpoint(shouldNotReceive)));
             setSession(appender, session);
 
-            CompletableFuture<StrataFile.AppendAck> ack = appender.append(ByteBuffer.wrap(new byte[] {1}));
+            CompletableFuture<Long> ack = appender.append(ByteBuffer.wrap(new byte[] {1}));
 
             assertTrue(ack.isCompletedExceptionally());
             assertFalse(unexpectedAppend.await(100, TimeUnit.MILLISECONDS),
@@ -402,7 +402,7 @@ class AppenderImplTest {
         setSession(appender, session);
         setLong(session, "end", 5);
 
-        CompletableFuture<StrataFile.AppendAck> ack = appender.append(ByteBuffer.allocate(0));
+        CompletableFuture<Long> ack = appender.append(ByteBuffer.allocate(0));
 
         onReplicaResponse(appender, session, 0, null,
                 new ScpException(ErrorCode.INTERNAL, "first failure"));
@@ -413,9 +413,9 @@ class AppenderImplTest {
         assertFalse(ack.isDone());
         onReplicaResponse(appender, session, 2, appendResp(5), null);
 
-        StrataFile.AppendAck result = ack.get(1, TimeUnit.SECONDS);
-        assertEquals(5, result.endOffset());
-        assertEquals(5, result.durableOffset());
+        long result = ack.get(1, TimeUnit.SECONDS);
+        assertEquals(5, result);
+        assertEquals(5, appender.durableOffset());
     }
 
     @Test
@@ -491,7 +491,7 @@ class AppenderImplTest {
         setSession(appender, session);
         setLong(session, "end", 2);
 
-        CompletableFuture<StrataFile.AppendAck> ack = appender.append(ByteBuffer.allocate(0));
+        CompletableFuture<Long> ack = appender.append(ByteBuffer.allocate(0));
         onReplicaResponse(appender, session, 0, appendResp(2), null);
         onReplicaResponse(appender, session, 1, appendResp(2), null);
 
@@ -511,7 +511,7 @@ class AppenderImplTest {
         setLong(session, "end", 1);
         setLong(session, "durable", 0);
         setBoolean(session, "needRoll", true);
-        CompletableFuture<StrataFile.AppendAck> pending = new CompletableFuture<>();
+        CompletableFuture<Long> pending = new CompletableFuture<>();
         pending(session).add(pending(1, pending));
 
         ScpException e = assertThrows(ScpException.class,
@@ -532,7 +532,7 @@ class AppenderImplTest {
         setLong(session, "end", 1);
         setLong(session, "durable", 0);
         setBoolean(session, "needRoll", true);
-        CompletableFuture<StrataFile.AppendAck> pending = new CompletableFuture<>();
+        CompletableFuture<Long> pending = new CompletableFuture<>();
         pending(session).add(pending(1, pending));
 
         Thread.currentThread().interrupt();
@@ -1188,9 +1188,9 @@ class AppenderImplTest {
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
-                StrataFile.AppendAck ack = appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
-                assertEquals(1, ack.endOffset());
-                assertEquals(1, ack.durableOffset());
+                long ack = appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS);
+                assertEquals(1, ack);
+                assertEquals(1, appender.durableOffset());
 
                 StrataFile.SealInfo seal = appender.seal();
                 assertEquals(1, seal.sealedLength());
@@ -1222,14 +1222,14 @@ class AppenderImplTest {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
                         StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
-                assertEquals(1, appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS).endOffset());
+                assertEquals(1, (long) appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS));
                 // Quiesce before disconnect so the disconnect cannot lose s1's in-flight first-append
                 // response and trigger a roll that re-opens s1 (see the multi-connection variant below).
                 waitFor(() -> s1Appends.get() == 1 && s2Appends.get() == 1 && s3Appends.get() == 1
                         && appendsQuiesced(appender));
                 pool.get(endpoint(s1)).disconnect();
 
-                assertEquals(2, appender.append(ByteBuffer.wrap(new byte[] {2})).get(1, TimeUnit.SECONDS).endOffset());
+                assertEquals(2, (long) appender.append(ByteBuffer.wrap(new byte[] {2})).get(1, TimeUnit.SECONDS));
                 assertEquals(1, s1Appends.get(), "replaced replica connection must not receive replayed append");
                 assertEquals(2, s2Appends.get());
                 assertEquals(2, s3Appends.get());
@@ -1265,7 +1265,7 @@ class AppenderImplTest {
                 AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
                         StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
 
-                assertEquals(1, appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS).endOffset());
+                assertEquals(1, (long) appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS));
                 // append(...).get() returns on the s2+s3 ack quorum, so s1's first append can still be in
                 // flight client-side (its response not yet processed). Wait until the pipeline is fully
                 // quiesced before disconnecting s1's pinned connection: otherwise the disconnect can lose
@@ -1279,7 +1279,7 @@ class AppenderImplTest {
                 assertNotSame(pinnedFirstReplica, pool.get(endpoint(s1)));
 
                 pinnedFirstReplica.disconnect();
-                assertEquals(2, appender.append(ByteBuffer.wrap(new byte[] {2})).get(1, TimeUnit.SECONDS).endOffset());
+                assertEquals(2, (long) appender.append(ByteBuffer.wrap(new byte[] {2})).get(1, TimeUnit.SECONDS));
 
                 assertEquals(1, s1Appends.get(), "replaced pinned connection must fail without replaying append");
                 assertEquals(2, s2Appends.get());
@@ -1753,7 +1753,7 @@ class AppenderImplTest {
         return (ArrayDeque<Object>) field.get(session);
     }
 
-    private static Object pending(long chunkEnd, CompletableFuture<StrataFile.AppendAck> future) throws Exception {
+    private static Object pending(long chunkEnd, CompletableFuture<Long> future) throws Exception {
         Class<?> type = Class.forName("io.strata.client.AppenderImpl$Pending");
         Constructor<?> ctor = type.getDeclaredConstructor(long.class, CompletableFuture.class);
         ctor.setAccessible(true);

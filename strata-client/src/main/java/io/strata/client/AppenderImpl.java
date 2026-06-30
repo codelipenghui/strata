@@ -114,7 +114,7 @@ final class AppenderImpl implements StrataFile.Appender {
         }
     }
 
-    private record Pending(long chunkEnd, CompletableFuture<StrataFile.AppendAck> future) {}
+    private record Pending(long chunkEnd, CompletableFuture<Long> future) {}
 
     AppenderImpl(ControllerClient controller, NodePool pool, ClientConfig config, io.strata.common.FileId fileId,
                  io.strata.common.StrataNamespace namespace, int epoch, Messages.WritePolicy writePolicy,
@@ -132,7 +132,7 @@ final class AppenderImpl implements StrataFile.Appender {
     }
 
     @Override
-    public CompletableFuture<StrataFile.AppendAck> append(ByteBuffer data) {
+    public CompletableFuture<Long> append(ByteBuffer data) {
         lock.lock();
         try {
             awaitNotRolling();
@@ -140,13 +140,12 @@ final class AppenderImpl implements StrataFile.Appender {
             int len = data.remaining();
             if (len == 0) {
                 if (session == null) {
-                    return CompletableFuture.completedFuture(new StrataFile.AppendAck(fileBase, fileBase));
+                    return CompletableFuture.completedFuture(fileBase);
                 }
                 if (session.end <= session.durable) {
-                    return CompletableFuture.completedFuture(
-                            new StrataFile.AppendAck(fileOffset(session.end), fileOffset(session.durable)));
+                    return CompletableFuture.completedFuture(fileOffset(session.end));
                 }
-                CompletableFuture<StrataFile.AppendAck> callerFuture = new CompletableFuture<>();
+                CompletableFuture<Long> callerFuture = new CompletableFuture<>();
                 session.pending.addLast(new Pending(session.end, callerFuture));
                 return callerFuture;
             }
@@ -160,7 +159,7 @@ final class AppenderImpl implements StrataFile.Appender {
             long base = s.end;
             long newEnd = checkedAdd(base, len, "chunk offset");
             s.end = newEnd;
-            CompletableFuture<StrataFile.AppendAck> callerFuture = new CompletableFuture<>();
+            CompletableFuture<Long> callerFuture = new CompletableFuture<>();
             s.pending.addLast(new Pending(newEnd, callerFuture));
 
             byte[] header = new Messages.Append(s.chunkId, epoch, base, s.durable, namespace).encode();
@@ -356,15 +355,15 @@ final class AppenderImpl implements StrataFile.Appender {
             s.durable = quorumEnd;
             while (!s.pending.isEmpty() && s.pending.peekFirst().chunkEnd() <= s.durable) {
                 Pending p = s.pending.peekFirst();
-                StrataFile.AppendAck ack;
+                long endOffset;
                 try {
-                    ack = new StrataFile.AppendAck(fileOffset(p.chunkEnd()), fileOffset(s.durable));
+                    endOffset = fileOffset(p.chunkEnd());
                 } catch (ScpException e) {
                     dieLocked(e);
                     return;
                 }
                 s.pending.pollFirst();
-                p.future().complete(ack);
+                p.future().complete(endOffset);
             }
             progress.signalAll();
         }

@@ -28,7 +28,7 @@ final class Workload {
     /** Appends n records, waiting for each ack (call from a virtual thread for pipelining tests). */
     long appendAcked(StrataFile.Appender appender, int from, int n) {
         long lastEnd = -1;
-        List<CompletableFuture<StrataFile.AppendAck>> futures = new ArrayList<>(n);
+        List<CompletableFuture<Long>> futures = new ArrayList<>(n);
         List<byte[]> payloads = new ArrayList<>(n);
         for (int i = from; i < from + n; i++) {
             byte[] p = payload(i);
@@ -36,9 +36,9 @@ final class Workload {
             futures.add(appender.append(ByteBuffer.wrap(p)));
         }
         for (int i = 0; i < n; i++) {
-            StrataFile.AppendAck ack = futures.get(i).join();
+            long ack = futures.get(i).join();
             recordAcked(payloads.get(i));
-            lastEnd = ack.endOffset();
+            lastEnd = ack;
         }
         return lastEnd;
     }

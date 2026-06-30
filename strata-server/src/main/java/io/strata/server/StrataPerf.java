@@ -319,7 +319,9 @@ final class StrataPerf {
             pace(config.writeLimiter(), bytes);
             permits.acquire();
             appendTracked(appender, payload, bytes, permits, writeStats,
-                    ack -> file.publishDurable(ack.durableOffset()),
+                    // a completed append's endOffset is quorum-acked (<= durable), so publishing it is a
+                    // durable-safe, lock-free readable watermark; line 327 reconciles to the exact HWM on drain
+                    endOffset -> file.publishDurable(endOffset),
                     err -> appendFailed.set(true));
             written += bytes;
         }
@@ -332,11 +334,11 @@ final class StrataPerf {
 
     private static void appendTracked(StrataFile.Appender appender, byte[] payload, int bytes,
                                       Semaphore permits, Stats stats,
-                                      Consumer<StrataFile.AppendAck> onSuccess,
+                                      Consumer<Long> onSuccess,
                                       Consumer<Throwable> onFailure) {
         long t0 = System.nanoTime();
         stats.inflight.incrementAndGet();
-        CompletableFuture<StrataFile.AppendAck> future;
+        CompletableFuture<Long> future;
         try {
             future = appender.append(ByteBuffer.wrap(payload, 0, bytes));
         } catch (RuntimeException e) {
@@ -348,8 +350,8 @@ final class StrataPerf {
     }
 
     private static void finishAppend(Stats stats, int bytes, Semaphore permits, long startNanos,
-                                     StrataFile.AppendAck ack, Throwable err,
-                                     Consumer<StrataFile.AppendAck> onSuccess,
+                                     Long ack, Throwable err,
+                                     Consumer<Long> onSuccess,
                                      Consumer<Throwable> onFailure) {
         try {
             stats.record(System.nanoTime() - startNanos);

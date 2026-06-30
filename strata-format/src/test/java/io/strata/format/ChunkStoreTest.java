@@ -4,6 +4,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
+import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
 import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
@@ -33,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -913,6 +915,38 @@ class ChunkStoreTest {
             assertEquals(4, e.detail());
 
             assertEquals(4, store.seal(TEST_NS, id, 1, 4, null).finalLength());
+        }
+    }
+
+    @Test
+    void readRegionRevalidatesHandleAfterOffLockOpen() throws Exception {
+        // readRegion snapshots the handle's metadata under the lock, then opens the file OFF the lock. If
+        // the id is deleted + re-imported in that window, the new physical file at the same path must NOT
+        // be bound to the stale snapshot (length/state). The post-open revalidation fails the read instead
+        // (CHUNK_NOT_FOUND; the client retries). A seam injects the delete+re-create at the exact window.
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(new byte[4096]));
+            store.seal(TEST_NS, id, 1, 4096, null); // SEALED → readRegion takes the off-lock zero-copy branch
+
+            AtomicBoolean swapped = new AtomicBoolean(false);
+            FailureInjector.arm("format.readRegion.beforeOpen", p -> {
+                if (swapped.compareAndSet(false, true)) {
+                    try {
+                        store.delete(TEST_NS, id);
+                        store.open(TEST_NS, id, false, 2, 1718000000000L); // fresh empty handle, same id + path
+                    } catch (IOException ioe) {
+                        throw new RuntimeException(ioe);
+                    }
+                }
+            });
+            try {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> store.readRegion(TEST_NS, id, 0, 4096));
+                assertEquals(ErrorCode.CHUNK_NOT_FOUND, e.code());
+            } finally {
+                FailureInjector.reset();
+            }
         }
     }
 
@@ -1855,14 +1889,22 @@ class ChunkStoreTest {
     }
 
     @Test
-    void chunkStateMetricsUseSynchronizedSnapshotOrVolatileState() throws Exception {
+    void chunkStateMetricsReadHandleStateUnderChunkLockOrVolatile() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
             Object handle = handle(store, id);
             Field state = handle.getClass().getDeclaredField("state");
             if (Modifier.isVolatile(state.getModifiers())) {
-                return;
+                return; // a volatile state field is also a safe publication — nothing to prove via the lock
             }
+
+            // Otherwise openChunks() must read each Handle.state under that handle's lock, which gives the
+            // same happens-before the old synchronized(h) did. Hold the lock and prove the metric read
+            // cannot complete until we release it.
+            Field lockField = handle.getClass().getDeclaredField("lock");
+            lockField.setAccessible(true);
+            java.util.concurrent.locks.ReentrantLock lock =
+                    (java.util.concurrent.locks.ReentrantLock) lockField.get(handle);
 
             AtomicReference<Integer> openCount = new AtomicReference<>();
             AtomicReference<Throwable> failure = new AtomicReference<>();
@@ -1874,13 +1916,17 @@ class ChunkStoreTest {
                 }
             }, "chunk-state-metric-reader");
 
-            synchronized (handle) {
+            lock.lock();
+            try {
                 reader.start();
-                waitFor(() -> reader.getState() == Thread.State.BLOCKED || !reader.isAlive(),
-                        "metric reader did not reach the handle state read");
-                assertTrue(reader.isAlive() && reader.getState() == Thread.State.BLOCKED,
-                        "openChunks() must synchronize on each handle or make Handle.state volatile");
+                // ReentrantLock parks the contending acquirer (AQS), so it reports WAITING (not BLOCKED).
+                waitFor(() -> reader.getState() == Thread.State.WAITING || !reader.isAlive(),
+                        "metric reader did not park on the chunk lock");
+                assertTrue(reader.isAlive() && reader.getState() == Thread.State.WAITING,
+                        "openChunks() must read Handle.state under the chunk lock or make Handle.state volatile");
                 assertEquals(null, openCount.get());
+            } finally {
+                lock.unlock();
             }
 
             reader.join(TimeUnit.SECONDS.toMillis(3));
