@@ -527,7 +527,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(strata_controller_log_append_records_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum(rate(strata_controller_namespace_log_append_records_total{instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "records/s"
         }
@@ -574,7 +574,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(strata_controller_log_append_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum(rate(strata_controller_namespace_log_append_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "bytes/s"
         }
@@ -620,12 +620,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(strata_controller_log_compactions_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum(rate(strata_controller_namespace_log_compactions_total{instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "compactions/s"
         },
         {
-          "expr": "sum(rate(strata_controller_log_recoveries_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum(rate(strata_controller_namespace_log_recoveries_total{instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "B",
           "legendFormat": "recoveries/s"
         }

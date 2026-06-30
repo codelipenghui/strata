@@ -596,7 +596,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(strata_controller_log_append_records_total[$__rate_interval]))",
+          "expr": "sum(rate(strata_controller_namespace_log_append_records_total[$__rate_interval]))",
           "refId": "A",
           "instant": true
         }
