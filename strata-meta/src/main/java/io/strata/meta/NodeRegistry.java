@@ -31,7 +31,6 @@ import java.util.function.Predicate;
  */
 final class NodeRegistry {
     private static final Logger log = LoggerFactory.getLogger(NodeRegistry.class);
-    private static final int MAX_COMMANDS_PER_HEARTBEAT = 16;
 
     static final class LiveNode {
         volatile Records.NodeRecord record;
@@ -293,13 +292,14 @@ final class NodeRegistry {
                 onCompleted.accept(msg.nodeId(), msg.incMsb(), msg.incLsb(), msg.sessionEpoch(), c);
             }
 
+            int maxCommands = config.maxCommandsPerHeartbeat();
             long newLeaseUntil;
             n.lock.lock();
             try {
                 validateCurrentSessionLocked(n, msg);
                 newLeaseUntil = System.currentTimeMillis() + config.leaseMs();
                 n.leaseUntil = newLeaseUntil;
-                for (int i = 0; i < MAX_COMMANDS_PER_HEARTBEAT; i++) {
+                for (int i = 0; i < maxCommands; i++) {
                     Messages.Command c = n.pending.poll();
                     if (c == null) break;
                     out.add(c);
