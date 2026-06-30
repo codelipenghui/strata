@@ -388,6 +388,112 @@
       "description": "configured controller membership"
     },
     {
+      "id": 8,
+      "type": "row",
+      "title": "Controller requests (SCP)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "collapsed": false
+    },
+    {
+      "id": 81,
+      "type": "timeseries",
+      "title": "Controller request rate by opcode",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "targets": [
+        {
+          "expr": "sum by (opcode)(rate(strata_scp_request_duration_seconds_count{instance=~\"$instance\",opcode=~\"CREATE_FILE|CREATE_CHUNK|ALLOCATE_WRITER_EPOCH|SEAL_CHUNK_META|ABORT_CHUNK_META|SEAL_FILE|LOOKUP_FILE|LOOKUP_PATH|DELETE_FILES|REGISTER_NODE|NODE_HEARTBEAT\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{opcode}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "controller SCP request rate by opcode for this controller (excludes data-plane ops + PING)"
+    },
+    {
+      "id": 82,
+      "type": "timeseries",
+      "title": "Controller request p99 latency by opcode",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le,opcode)(rate(strata_scp_request_duration_seconds_bucket{instance=~\"$instance\",opcode=~\"CREATE_FILE|CREATE_CHUNK|ALLOCATE_WRITER_EPOCH|SEAL_CHUNK_META|ABORT_CHUNK_META|SEAL_FILE|LOOKUP_FILE|LOOKUP_PATH|DELETE_FILES|REGISTER_NODE|NODE_HEARTBEAT\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "{{opcode}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "p99 controller request latency by opcode (incl. async waits)"
+    },
+    {
       "id": 10,
       "type": "row",
       "title": "Namespaces owned by this controller",
@@ -395,7 +501,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 5
+        "y": 14
       },
       "collapsed": false
     },
@@ -411,7 +517,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 6
+        "y": 15
       },
       "targets": [
         {
@@ -458,7 +564,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 6
+        "y": 15
       },
       "targets": [
         {
@@ -501,7 +607,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 14
+        "y": 23
       },
       "collapsed": false
     },
@@ -517,7 +623,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 15
+        "y": 24
       },
       "targets": [
         {
@@ -564,7 +670,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 15
+        "y": 24
       },
       "targets": [
         {
@@ -610,7 +716,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 23
+        "y": 32
       },
       "targets": [
         {
@@ -662,7 +768,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 23
+        "y": 32
       },
       "targets": [
         {
@@ -711,7 +817,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 31
+        "y": 40
       },
       "collapsed": false
     },
@@ -727,7 +833,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 41
       },
       "targets": [
         {
@@ -774,7 +880,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 41
       },
       "targets": [
         {
@@ -816,7 +922,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 40
+        "y": 49
       },
       "collapsed": false
     },
@@ -832,7 +938,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 41
+        "y": 50
       },
       "targets": [
         {
@@ -878,7 +984,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 41
+        "y": 50
       },
       "targets": [
         {
