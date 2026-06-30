@@ -29,7 +29,7 @@ final class ServerMetrics {
     }
 
     /** Control-plane: durability census, repair progress, cluster liveness, leadership, ZK. */
-    static void registerController(MeterRegistry reg, Controller s) {
+    static void registerController(MeterRegistry reg, Controller s, long refreshIntervalMs) {
         Gauge.builder("strata_controller_is_leader", s, m -> m.isLeader() ? 1 : 0)
                 .description("1 if this instance is the active controller leader (cluster sum should be 1)").register(reg);
         Gauge.builder("strata_controller_zk_connected", s, m -> m.zkConnected() ? 1 : 0)
@@ -95,7 +95,7 @@ final class ServerMetrics {
         // registered lazily in registerPerNamespace below as strata_controller_namespace_log_*{namespace}.
         // The global controller view is sum without(namespace)(...). (design §3.4)
 
-        registerPerNamespace(reg, s);
+        registerPerNamespace(reg, s, refreshIntervalMs);
     }
 
     // Per-namespace controller counter names, index-aligned with NamespaceLogMetrics.stats(): 0 appendRecords,
@@ -114,7 +114,7 @@ final class ServerMetrics {
      * supplier-bound). Cardinality grows with the namespace count — namespace stays control-plane, so
      * these live only on the controller (data nodes never see namespaces).
      */
-    private static void registerPerNamespace(MeterRegistry reg, Controller s) {
+    private static void registerPerNamespace(MeterRegistry reg, Controller s, long refreshIntervalMs) {
         MultiGauge files = MultiGauge.builder("strata_controller_namespace_files")
                 .description("live files per namespace owned by this controller").register(reg);
         MultiGauge logBytes = MultiGauge.builder("strata_controller_namespace_log_bytes")
@@ -142,7 +142,7 @@ final class ServerMetrics {
                     .map(ns -> MultiGauge.Row.of(Tags.of("namespace", ns, "owner", self), 1))
                     .collect(java.util.stream.Collectors.toList()), true);
             registerNewControllerNamespaceCounters(reg, s);
-        }, 0, 10, TimeUnit.SECONDS);
+        }, 0, refreshIntervalMs, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -157,7 +157,7 @@ final class ServerMetrics {
     }
 
     /** Data plane: capacity, chunk state, write throughput, fsync force rate, registration. */
-    static void registerDataNode(MeterRegistry reg, DataNode n) {
+    static void registerDataNode(MeterRegistry reg, DataNode n, long refreshIntervalMs) {
         Gauge.builder("strata_data_node_registered", n, x -> x.registered() ? 1 : 0)
                 .description("1 if the node holds a metadata registration").register(reg);
 
@@ -203,7 +203,7 @@ final class ServerMetrics {
             t.setDaemon(true);
             return t;
         });
-        refresh.scheduleAtFixedRate(() -> registerNewDataNodeNamespaces(reg, n), 0, 10, TimeUnit.SECONDS);
+        refresh.scheduleAtFixedRate(() -> registerNewDataNodeNamespaces(reg, n), 0, refreshIntervalMs, TimeUnit.MILLISECONDS);
     }
 
     private static final String[] DATA_NODE_NS_COUNTERS = {
@@ -255,22 +255,23 @@ final class ServerMetrics {
      * Timers are cached per opcode+status, so the per-request cost is a map lookup + a histogram
      * record. For an async APPEND in fsync mode this latency includes the group-commit/fsync wait.
      */
-    static RequestObserver requestObserver(MeterRegistry reg) {
+    static RequestObserver requestObserver(MeterRegistry reg, long[] bucketsMs) {
+        Duration[] slos = new Duration[bucketsMs.length];
+        for (int i = 0; i < bucketsMs.length; i++) {
+            slos[i] = Duration.ofMillis(bucketsMs[i]);
+        }
         Map<String, Timer> timers = new ConcurrentHashMap<>();
         return (opcode, namespace, durationNanos, success) -> {
             String status = success ? "ok" : "error";
-            timers.computeIfAbsent(opcode + ':' + status + ':' + namespace, k -> Timer.builder("strata_scp_request_duration")
-                            .description("request handler latency by opcode + namespace (incl. async durability wait)")
-                            .tag("opcode", opcode)
-                            .tag("status", status)
-                            .tag("namespace", namespace)
-                            .serviceLevelObjectives(
-                                    Duration.ofMillis(1), Duration.ofMillis(2), Duration.ofMillis(5),
-                                    Duration.ofMillis(10), Duration.ofMillis(25), Duration.ofMillis(50),
-                                    Duration.ofMillis(100), Duration.ofMillis(250), Duration.ofMillis(500),
-                                    Duration.ofSeconds(1), Duration.ofMillis(2500), Duration.ofSeconds(5))
-                            .register(reg))
-                    .record(durationNanos, TimeUnit.NANOSECONDS);
+            timers.computeIfAbsent(opcode + ':' + status + ':' + namespace, k -> {
+                Timer.Builder b = Timer.builder("strata_scp_request_duration")
+                        .description("request handler latency by opcode + namespace (incl. async durability wait)")
+                        .tag("opcode", opcode)
+                        .tag("status", status)
+                        .tag("namespace", namespace);
+                b.serviceLevelObjectives(slos);
+                return b.register(reg);
+            }).record(durationNanos, TimeUnit.NANOSECONDS);
         };
     }
 }

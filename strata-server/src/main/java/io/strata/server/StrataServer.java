@@ -85,11 +85,14 @@ public final class StrataServer {
         Controller service = new Controller(config);
         log.info("controller started: endpoint={} zk={} leader={}",
                 service.endpoint(), config.zkConnect(), service.isLeader());
+        long nsRefreshMs = intEnv("STRATA_METRICS_NS_REFRESH_INTERVAL_MS", 10_000);
+        long[] buckets = parseBucketsMs(env("STRATA_METRICS_REQUEST_DURATION_BUCKETS_MS", null),
+                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
         AutoCloseable metrics = null;
         try {
             metrics = startMetrics("controller", reg -> {
-                ServerMetrics.registerController(reg, service);
-                service.setRequestObserver(ServerMetrics.requestObserver(reg));
+                ServerMetrics.registerController(reg, service, nsRefreshMs);
+                service.setRequestObserver(ServerMetrics.requestObserver(reg, buckets));
             }, () -> service.isLeader() && service.zkConnected());
             awaitShutdown("controller", metrics, service);
         } catch (Exception e) {
@@ -127,11 +130,14 @@ public final class StrataServer {
         DataNode node = new DataNode(config);
         log.info("data node started: endpoint={} dataDir={} controller={}",
                 node.endpoint(), config.dataDir(), config.controllerEndpoints());
+        long nsRefreshMs = intEnv("STRATA_METRICS_NS_REFRESH_INTERVAL_MS", 10_000);
+        long[] buckets = parseBucketsMs(env("STRATA_METRICS_REQUEST_DURATION_BUCKETS_MS", null),
+                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
         AutoCloseable metrics = null;
         try {
             metrics = startMetrics("data-node", reg -> {
-                ServerMetrics.registerDataNode(reg, node);
-                node.setRequestObserver(ServerMetrics.requestObserver(reg));
+                ServerMetrics.registerDataNode(reg, node, nsRefreshMs);
+                node.setRequestObserver(ServerMetrics.requestObserver(reg, buckets));
             }, node::registered);
             awaitShutdown("data node", metrics, node);
         } catch (Exception e) {
@@ -230,12 +236,15 @@ public final class StrataServer {
             node = new DataNode(nodeConfig, controller.handler());
             Controller startedController = controller;
             DataNode startedNode = node;
+            long nsRefreshMs = intEnv("STRATA_METRICS_NS_REFRESH_INTERVAL_MS", 10_000);
+            long[] buckets = parseBucketsMs(env("STRATA_METRICS_REQUEST_DURATION_BUCKETS_MS", null),
+                    new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
             AutoCloseable metrics = startMetrics("combined", reg -> {
-                ServerMetrics.registerController(reg, startedController);
-                ServerMetrics.registerDataNode(reg, startedNode);
+                ServerMetrics.registerController(reg, startedController, nsRefreshMs);
+                ServerMetrics.registerDataNode(reg, startedNode, nsRefreshMs);
                 // The single (node) listener serves both planes, so observe there; the embedded controller
                 // has no server of its own.
-                startedNode.setRequestObserver(ServerMetrics.requestObserver(reg));
+                startedNode.setRequestObserver(ServerMetrics.requestObserver(reg, buckets));
             }, () -> startedController.isLeader() && startedController.zkConnected() && startedNode.registered());
             return new Combined(controller, node, metrics);
         } catch (Exception e) {
@@ -368,6 +377,32 @@ public final class StrataServer {
     private static boolean boolEnv(String key, boolean def) {
         String v = env(key, null);
         return v == null ? def : Boolean.parseBoolean(v);
+    }
+
+    /**
+     * Parses a comma-separated list of positive, strictly-ascending millisecond bucket boundaries
+     * for SLO histogram configuration. Returns {@code def} when {@code csv} is null or blank.
+     * Throws {@link IllegalArgumentException} for non-positive values or non-ascending order.
+     */
+    static long[] parseBucketsMs(String csv, long[] def) {
+        if (csv == null || csv.isBlank()) {
+            return def;
+        }
+        String[] parts = csv.split(",");
+        long[] out = new long[parts.length];
+        long prev = 0;
+        for (int i = 0; i < parts.length; i++) {
+            long v = Long.parseLong(parts[i].trim());
+            if (v <= 0) {
+                throw new IllegalArgumentException("bucket must be positive ms: " + v);
+            }
+            if (v <= prev) {
+                throw new IllegalArgumentException("buckets must be strictly ascending: " + csv);
+            }
+            out[i] = v;
+            prev = v;
+        }
+        return out;
     }
 
     private StrataServer() {
