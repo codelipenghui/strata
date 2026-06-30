@@ -61,7 +61,7 @@ class OrphanGcTest {
             seal(store, listed);
             String endpoint = "127.0.0.1:" + owner.port();
             // grace 0 + startup 0 → every sealed chunk is an immediate suspect; gcOnce confirms each.
-            OrphanGc gc = new OrphanGc(store, NODE_ID, List.of(endpoint), 0, 60_000, 0);
+            OrphanGc gc = new OrphanGc(store, NODE_ID, List.of(endpoint), 0, 60_000, 0, 5_000);
             gc.gcOnce();
 
             assertFalse(store.contains(NS, orphan), "an unreferenced chunk (FILE_NOT_FOUND) must be GC'd");
@@ -75,7 +75,7 @@ class OrphanGcTest {
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"))) {
             seal(store, chunk);
             // a controller endpoint with nothing listening — the confirm cannot complete.
-            OrphanGc gc = new OrphanGc(store, NODE_ID, List.of("127.0.0.1:1"), 0, 60_000, 0);
+            OrphanGc gc = new OrphanGc(store, NODE_ID, List.of("127.0.0.1:1"), 0, 60_000, 0, 5_000);
             gc.gcOnce();
             assertTrue(store.contains(NS, chunk),
                     "an unreachable owner must never trigger a delete (fail-safe data-loss guard, §20.5)");
@@ -91,7 +91,7 @@ class OrphanGcTest {
             seal(store, orphan);
             // the non-owner is listed FIRST: confirm must redirect past its NOT_LEADER to the real owner.
             OrphanGc gc = new OrphanGc(store, NODE_ID,
-                    List.of("127.0.0.1:" + notOwner.port(), "127.0.0.1:" + owner.port()), 0, 60_000, 0);
+                    List.of("127.0.0.1:" + notOwner.port(), "127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000);
             gc.gcOnce();
 
             assertFalse(store.contains(NS, orphan),
@@ -107,7 +107,7 @@ class OrphanGcTest {
              ScpServer b = notLeaderServer()) {
             seal(store, chunk);
             OrphanGc gc = new OrphanGc(store, NODE_ID,
-                    List.of("127.0.0.1:" + a.port(), "127.0.0.1:" + b.port()), 0, 60_000, 0);
+                    List.of("127.0.0.1:" + a.port(), "127.0.0.1:" + b.port()), 0, 60_000, 0, 5_000);
             gc.gcOnce();
 
             assertTrue(store.contains(NS, chunk),
@@ -124,7 +124,7 @@ class OrphanGcTest {
             String endpoint = "127.0.0.1:" + owner.port();
             // grace 0 makes the chunk an immediate suspect and the owner would confirm it an orphan, but a
             // 600ms node-startup grace must suppress the GC loop (scanning every 30ms) until warm-up elapses.
-            try (OrphanGc gc = new OrphanGc(store, NODE_ID, List.of(endpoint), 0, 30, 600)) {
+            try (OrphanGc gc = new OrphanGc(store, NODE_ID, List.of(endpoint), 0, 30, 600, 5_000)) {
                 gc.start();
                 Thread.sleep(200); // several scan intervals in, still inside the 600ms startup grace
                 assertTrue(store.contains(NS, orphan),
@@ -138,6 +138,12 @@ class OrphanGcTest {
                         "once the startup grace elapses the confirmed orphan is GC'd by the loop");
             }
         }
+    }
+
+    @Test
+    void sevenArgConstructorIsAvailable() throws Exception {
+        OrphanGc.class.getDeclaredConstructor(ChunkStore.class, int.class, java.util.List.class,
+                long.class, long.class, long.class, int.class);
     }
 
     private static ScpServer notLeaderServer() throws Exception {

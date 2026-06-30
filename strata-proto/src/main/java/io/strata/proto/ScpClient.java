@@ -10,6 +10,7 @@ import io.netty.channel.ChannelOption;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.strata.common.EnvConfig;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
 
@@ -37,7 +38,7 @@ public final class ScpClient implements AutoCloseable {
     public static final byte KIND_METADATA = 3;
     public static final byte KIND_TOOL = 4;
     private static final int MAX_PENDING_REQUESTS =
-            Integer.getInteger("strata.scp.maxPendingRequests", 1024);
+            EnvConfig.intEnv("STRATA_SCP_MAX_PENDING_REQUESTS", 1024);
 
     private final Channel channel;
     private final AtomicLong correlation = new AtomicLong(1);
@@ -50,7 +51,7 @@ public final class ScpClient implements AutoCloseable {
     private final Messages.HelloResp serverHello;
 
     public ScpClient(String host, int port, byte clientKind, String clientId) throws IOException {
-        this(host, port, clientKind, clientId, 5_000);
+        this(host, port, clientKind, clientId, io.strata.common.ConnectionPolicy.DEFAULT.connectTimeoutMs());
     }
 
     public ScpClient(String host, int port, byte clientKind, String clientId, int connectTimeoutMs) throws IOException {

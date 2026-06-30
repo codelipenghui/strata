@@ -45,9 +45,14 @@ final class GroupCommitter implements AutoCloseable {
 
     private record Waiter(long endOffset, CompletableFuture<Void> future) {}
 
-    GroupCommitter(String name, Syncer syncer, AtomicLong forceCounter) {
+    GroupCommitter(String name, Syncer syncer, AtomicLong forceCounter,
+                   long drainTimeoutMs, long minAccumulationNanos, long maxAccumulationNanos) {
         this.syncer = syncer;
         this.forceCounter = forceCounter;
+        this.drainTimeoutMs = drainTimeoutMs;
+        this.minAccumulationNanos = minAccumulationNanos;
+        this.maxAccumulationNanos = maxAccumulationNanos;
+        this.accumulationNanos = minAccumulationNanos;
         this.flusher = Thread.ofVirtual().name("group-commit-" + name).start(this::run);
     }
 
@@ -82,21 +87,20 @@ final class GroupCommitter implements AutoCloseable {
      * Accumulation gap before each force: in-flight fsyncs interfere with concurrent data/ledger
      * writes at the OS level, so a clean gap lets queued writes land and each force covers a real
      * batch. The gap is ADAPTIVE — it tracks the observed force duration (clamped to
-     * [MIN, MAX]). Rationale: a force amortizes a large fixed cost (syscall + device flush, and
-     * under N concurrent open chunks N flushers contend so each force is slow); accumulating for
-     * ~one force-time keeps the duty cycle near 50% and makes the batch grow in proportion to the
-     * force cost. When forces are cheap (light load / few chunks) the gap shrinks toward MIN for
-     * low ack latency; when many chunks contend it grows toward MAX so a single big force replaces
-     * many small ones — measured ~3.75x fsync throughput AND lower latency vs a fixed 5ms gap on a
-     * shared SSD with 24 open chunks. Convergent (capped at MAX), correctness-neutral (a force
-     * still covers every in-flight append; the durability invariant is unchanged).
+     * [minAccumulationNanos, maxAccumulationNanos]). Rationale: a force amortizes a large fixed
+     * cost (syscall + device flush, and under N concurrent open chunks N flushers contend so each
+     * force is slow); accumulating for ~one force-time keeps the duty cycle near 50% and makes
+     * the batch grow in proportion to the force cost. When forces are cheap (light load / few
+     * chunks) the gap shrinks toward MIN for low ack latency; when many chunks contend it grows
+     * toward MAX so a single big force replaces many small ones — measured ~3.75x fsync throughput
+     * AND lower latency vs a fixed 5ms gap on a shared SSD with 24 open chunks. Convergent
+     * (capped at MAX), correctness-neutral (a force still covers every in-flight append; the
+     * durability invariant is unchanged).
      */
-    private static final long MIN_ACCUMULATION_NANOS =
-            Long.getLong("strata.groupcommit.minAccumulationNanos", 1_000_000);   // 1ms latency floor
-    private static final long MAX_ACCUMULATION_NANOS =
-            Long.getLong("strata.groupcommit.maxAccumulationNanos", 50_000_000);  // 50ms batch cap
-
-    private long accumulationNanos = MIN_ACCUMULATION_NANOS; // flusher-thread-only; adapts per force
+    private final long drainTimeoutMs;
+    private final long minAccumulationNanos;
+    private final long maxAccumulationNanos;
+    private long accumulationNanos; // flusher-thread-only; adapts per force; init to minAccumulationNanos
 
     private void run() {
         while (true) {
@@ -143,8 +147,8 @@ final class GroupCommitter implements AutoCloseable {
             // self-tune the next accumulation gap to this force's cost (see field doc): bigger
             // forces (more chunks contending) -> longer gap -> bigger amortizing batch.
             if (failure == null) {
-                accumulationNanos = Math.min(MAX_ACCUMULATION_NANOS,
-                        Math.max(MIN_ACCUMULATION_NANOS, System.nanoTime() - forceStart));
+                accumulationNanos = Math.min(maxAccumulationNanos,
+                        Math.max(minAccumulationNanos, System.nanoTime() - forceStart));
             }
 
             List<Waiter> done = new ArrayList<>();
@@ -212,7 +216,7 @@ final class GroupCommitter implements AutoCloseable {
             lock.unlock();
         }
         try {
-            flusher.join(10_000);
+            flusher.join(drainTimeoutMs);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }

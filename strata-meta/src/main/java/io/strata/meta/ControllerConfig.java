@@ -20,7 +20,14 @@ public record ControllerConfig(
         List<String> controllerEndpoints, // eligible controller endpoints for namespace ownership (rendezvous,
                                         // design §6.1). empty/size<=1 => this node owns every namespace
                                         // (no sharding — preserves single-leader behavior)
-        int controllerReplicaCount   // metadata replica-set size per namespace (design §6.1)
+        int controllerReplicaCount,  // metadata replica-set size per namespace (design §6.1)
+        int verifyIntervalMs,        // owner-pull VERIFY_CHUNKS cadence (RepairCoordinator)
+        int verifyBatchSize,         // chunk-ids per VERIFY_CHUNKS RPC
+        int systemVerifyIntervalMs,  // slower verify cadence for the system (metadata-log) namespace
+        long deletedTombstoneTtlMs,  // DELETED tombstone retention before reap
+        int maxCommandsPerHeartbeat, // commands drained per node heartbeat
+        int zkRetryBaseMs,           // Curator ExponentialBackoffRetry base sleep
+        int zkRetryMaxRetries        // Curator ExponentialBackoffRetry max retries
 ) {
     public ControllerConfig {
         if (zkConnect == null || zkConnect.isBlank()) {
@@ -46,12 +53,39 @@ public record ControllerConfig(
         if (controllerReplicaCount <= 0) {
             controllerReplicaCount = 3;
         }
+        if (verifyIntervalMs <= 0) {
+            throw new IllegalArgumentException("verifyIntervalMs must be positive: " + verifyIntervalMs);
+        }
+        if (verifyBatchSize <= 0) {
+            throw new IllegalArgumentException("verifyBatchSize must be positive: " + verifyBatchSize);
+        }
+        if (systemVerifyIntervalMs <= 0) {
+            throw new IllegalArgumentException("systemVerifyIntervalMs must be positive: " + systemVerifyIntervalMs);
+        }
+        if (deletedTombstoneTtlMs <= 0) {
+            throw new IllegalArgumentException("deletedTombstoneTtlMs must be positive: " + deletedTombstoneTtlMs);
+        }
+        if (maxCommandsPerHeartbeat <= 0) {
+            throw new IllegalArgumentException("maxCommandsPerHeartbeat must be positive: " + maxCommandsPerHeartbeat);
+        }
+        if (zkRetryBaseMs <= 0) {
+            throw new IllegalArgumentException("zkRetryBaseMs must be positive: " + zkRetryBaseMs);
+        }
+        if (zkRetryMaxRetries < 0) {
+            throw new IllegalArgumentException("zkRetryMaxRetries must be >= 0: " + zkRetryMaxRetries);
+        }
+        // A DELETED tombstone fences a delayed CREATE replay; it must outlive the reconcile sweep cadence.
+        if (deletedTombstoneTtlMs <= repairScanIntervalMs) {
+            throw new IllegalArgumentException("deletedTombstoneTtlMs (" + deletedTombstoneTtlMs
+                    + ") must exceed repairScanIntervalMs (" + repairScanIntervalMs + ")");
+        }
     }
 
     public ControllerConfig(String zkConnect, int listenPort, int heartbeatIntervalMs, int leaseMs,
                       int deadGraceMs, int repairScanIntervalMs, int repairCommandTimeoutMs) {
         this(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs, repairScanIntervalMs,
-                repairCommandTimeoutMs, 60_000, 60_000, 15_000, "127.0.0.1", 90_000, List.of(), 3);
+                repairCommandTimeoutMs, 60_000, 60_000, 15_000, "127.0.0.1", 90_000, List.of(), 3,
+                2_000, 256, 30_000, 600_000L, 16, 100, 5);
     }
 
     /** Full v0 tuning tuple without namespace sharding (kept so existing callers compile unchanged). */
@@ -61,20 +95,24 @@ public record ControllerConfig(
                       long replicaMissingGraceMs) {
         this(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs, repairScanIntervalMs,
                 repairCommandTimeoutMs, 60_000, zkSessionTimeoutMs, zkConnectionTimeoutMs, advertisedHost,
-                replicaMissingGraceMs, List.of(), 3);
+                replicaMissingGraceMs, List.of(), 3, 2_000, 256, 30_000, 600_000L, 16, 100, 5);
     }
 
     public ControllerConfig withAdvertisedHost(String host) {
         return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
                 repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
-                zkConnectionTimeoutMs, host, replicaMissingGraceMs, controllerEndpoints, controllerReplicaCount);
+                zkConnectionTimeoutMs, host, replicaMissingGraceMs, controllerEndpoints, controllerReplicaCount,
+                verifyIntervalMs, verifyBatchSize, systemVerifyIntervalMs, deletedTombstoneTtlMs,
+                maxCommandsPerHeartbeat, zkRetryBaseMs, zkRetryMaxRetries);
     }
 
     /** A copy with the missing-replica grace overridden — lets tests drop a deleted replica promptly. */
     public ControllerConfig withReplicaMissingGraceMs(long graceMs) {
         return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
                 repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
-                zkConnectionTimeoutMs, advertisedHost, graceMs, controllerEndpoints, controllerReplicaCount);
+                zkConnectionTimeoutMs, advertisedHost, graceMs, controllerEndpoints, controllerReplicaCount,
+                verifyIntervalMs, verifyBatchSize, systemVerifyIntervalMs, deletedTombstoneTtlMs,
+                maxCommandsPerHeartbeat, zkRetryBaseMs, zkRetryMaxRetries);
     }
 
     /** A copy with the slow-reconcile cadence overridden. */
@@ -82,7 +120,8 @@ public record ControllerConfig(
         return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
                 repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
                 zkConnectionTimeoutMs, advertisedHost, replicaMissingGraceMs, controllerEndpoints,
-                controllerReplicaCount);
+                controllerReplicaCount, verifyIntervalMs, verifyBatchSize, systemVerifyIntervalMs,
+                deletedTombstoneTtlMs, maxCommandsPerHeartbeat, zkRetryBaseMs, zkRetryMaxRetries);
     }
 
     /**
@@ -93,11 +132,69 @@ public record ControllerConfig(
     public ControllerConfig withControllerEndpoints(List<String> endpoints, int replicaCount) {
         return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
                 repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
-                zkConnectionTimeoutMs, advertisedHost, replicaMissingGraceMs, endpoints, replicaCount);
+                zkConnectionTimeoutMs, advertisedHost, replicaMissingGraceMs, endpoints, replicaCount,
+                verifyIntervalMs, verifyBatchSize, systemVerifyIntervalMs, deletedTombstoneTtlMs,
+                maxCommandsPerHeartbeat, zkRetryBaseMs, zkRetryMaxRetries);
+    }
+
+    public ControllerConfig withVerifyIntervalMs(int v) {
+        return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
+                repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
+                zkConnectionTimeoutMs, advertisedHost, replicaMissingGraceMs, controllerEndpoints,
+                controllerReplicaCount, v, verifyBatchSize, systemVerifyIntervalMs, deletedTombstoneTtlMs,
+                maxCommandsPerHeartbeat, zkRetryBaseMs, zkRetryMaxRetries);
+    }
+
+    public ControllerConfig withVerifyBatchSize(int v) {
+        return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
+                repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
+                zkConnectionTimeoutMs, advertisedHost, replicaMissingGraceMs, controllerEndpoints,
+                controllerReplicaCount, verifyIntervalMs, v, systemVerifyIntervalMs, deletedTombstoneTtlMs,
+                maxCommandsPerHeartbeat, zkRetryBaseMs, zkRetryMaxRetries);
+    }
+
+    public ControllerConfig withSystemVerifyIntervalMs(int v) {
+        return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
+                repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
+                zkConnectionTimeoutMs, advertisedHost, replicaMissingGraceMs, controllerEndpoints,
+                controllerReplicaCount, verifyIntervalMs, verifyBatchSize, v, deletedTombstoneTtlMs,
+                maxCommandsPerHeartbeat, zkRetryBaseMs, zkRetryMaxRetries);
+    }
+
+    public ControllerConfig withDeletedTombstoneTtlMs(long v) {
+        return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
+                repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
+                zkConnectionTimeoutMs, advertisedHost, replicaMissingGraceMs, controllerEndpoints,
+                controllerReplicaCount, verifyIntervalMs, verifyBatchSize, systemVerifyIntervalMs, v,
+                maxCommandsPerHeartbeat, zkRetryBaseMs, zkRetryMaxRetries);
+    }
+
+    public ControllerConfig withMaxCommandsPerHeartbeat(int v) {
+        return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
+                repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
+                zkConnectionTimeoutMs, advertisedHost, replicaMissingGraceMs, controllerEndpoints,
+                controllerReplicaCount, verifyIntervalMs, verifyBatchSize, systemVerifyIntervalMs,
+                deletedTombstoneTtlMs, v, zkRetryBaseMs, zkRetryMaxRetries);
+    }
+
+    public ControllerConfig withZkRetryBaseMs(int v) {
+        return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
+                repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
+                zkConnectionTimeoutMs, advertisedHost, replicaMissingGraceMs, controllerEndpoints,
+                controllerReplicaCount, verifyIntervalMs, verifyBatchSize, systemVerifyIntervalMs,
+                deletedTombstoneTtlMs, maxCommandsPerHeartbeat, v, zkRetryMaxRetries);
+    }
+
+    public ControllerConfig withZkRetryMaxRetries(int v) {
+        return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
+                repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, zkSessionTimeoutMs,
+                zkConnectionTimeoutMs, advertisedHost, replicaMissingGraceMs, controllerEndpoints,
+                controllerReplicaCount, verifyIntervalMs, verifyBatchSize, systemVerifyIntervalMs,
+                deletedTombstoneTtlMs, maxCommandsPerHeartbeat, zkRetryBaseMs, v);
     }
 
     public static ControllerConfig forTests(String zkConnect) {
         return new ControllerConfig(zkConnect, 0, 200, 1_000, 1_500, 300, 3_000, 5_000, 5_000, 20_000, "127.0.0.1",
-                90_000, List.of(), 3);
+                90_000, List.of(), 3, 2_000, 256, 30_000, 600_000L, 16, 100, 5);
     }
 }

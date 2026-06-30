@@ -647,7 +647,7 @@ class ChunkStoreTest {
                     () -> {
                         throw new IOException("forced fsync failure");
                     },
-                    new AtomicLong());
+                    new AtomicLong(), 10_000L, 1_000_000L, 50_000_000L);
             setHandleObject(store, id, "committer", failingCommitter);
             try {
                 ScpException appendFailure = assertThrows(ScpException.class,
@@ -688,7 +688,7 @@ class ChunkStoreTest {
                     () -> {
                         throw new IOException("forced fsync failure");
                     },
-                    new AtomicLong());
+                    new AtomicLong(), 10_000L, 1_000_000L, 50_000_000L);
             setHandleObject(store, id, "committer", failingCommitter);
 
             ScpException e = assertThrows(ScpException.class,
@@ -741,7 +741,7 @@ class ChunkStoreTest {
                 () -> {
                     throw new IOException("forced fsync failure");
                 },
-                new AtomicLong());
+                new AtomicLong(), 10_000L, 1_000_000L, 50_000_000L);
         setHandleObject(store, id, "committer", failingCommitter);
 
         ScpException appendFailure = assertThrows(ScpException.class,
@@ -1392,9 +1392,9 @@ class ChunkStoreTest {
             // a request asking for "everything" must be clamped, not answered with one
             // chunk-sized allocation (callers loop; the frame layer caps at 64 MB anyway)
             var r = store.read(TEST_NS, id, 0, Integer.MAX_VALUE);
-            assertEquals(ChunkStore.MAX_REQUEST_BYTES, r.bytes().length);
+            assertEquals(ChunkStoreConfig.DEFAULT.maxRequestBytes(), r.bytes().length);
             var f = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE);
-            assertEquals(ChunkStore.MAX_REQUEST_BYTES, f.bytes().length);
+            assertEquals(ChunkStoreConfig.DEFAULT.maxRequestBytes(), f.bytes().length);
         }
     }
 

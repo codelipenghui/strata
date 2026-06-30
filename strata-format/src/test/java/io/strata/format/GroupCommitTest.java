@@ -133,7 +133,7 @@ class GroupCommitTest {
         AtomicLong forces = new AtomicLong();
         GroupCommitter committer = new GroupCommitter("fail", () -> {
             throw new IOException("disk unavailable");
-        }, forces);
+        }, forces, 10_000L, 1_000_000L, 50_000_000L);
 
         CompletionException first = assertThrows(CompletionException.class,
                 () -> committer.awaitFlush(1).join());
@@ -153,7 +153,7 @@ class GroupCommitTest {
     @Test
     void awaitAfterCloseFailsUnlessAlreadyFlushed() {
         AtomicLong forces = new AtomicLong();
-        GroupCommitter committer = new GroupCommitter("closed", forces::incrementAndGet, forces);
+        GroupCommitter committer = new GroupCommitter("closed", forces::incrementAndGet, forces, 10_000L, 1_000_000L, 50_000_000L);
         assertTrue(committer.closeAndConfirm());
 
         assertEquals(null, committer.awaitFlush(0).join());
@@ -179,7 +179,7 @@ class GroupCommitTest {
                 Thread.currentThread().interrupt();
                 throw new IOException("interrupted", e);
             }
-        }, forces);
+        }, forces, 10_000L, 1_000_000L, 50_000_000L);
 
         CompletableFuture<Void> waiter = committer.awaitFlush(1);
         assertTrue(forceStarted.await(1, TimeUnit.SECONDS));
@@ -205,7 +205,7 @@ class GroupCommitTest {
     @Test
     void flusherInterruptPoisonsFutureWaiters() throws Exception {
         AtomicLong forces = new AtomicLong();
-        GroupCommitter committer = new GroupCommitter("interrupt", forces::incrementAndGet, forces);
+        GroupCommitter committer = new GroupCommitter("interrupt", forces::incrementAndGet, forces, 10_000L, 1_000_000L, 50_000_000L);
         Thread flusher = flusherThread(committer);
 
         flusher.interrupt();
@@ -223,7 +223,7 @@ class GroupCommitTest {
     @Test
     void closeAndConfirmPreservesCallerInterrupt() throws Exception {
         AtomicLong forces = new AtomicLong();
-        GroupCommitter committer = new GroupCommitter("caller-interrupted", forces::incrementAndGet, forces);
+        GroupCommitter committer = new GroupCommitter("caller-interrupted", forces::incrementAndGet, forces, 10_000L, 1_000_000L, 50_000_000L);
 
         Thread.currentThread().interrupt();
         try {

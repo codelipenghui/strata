@@ -20,6 +20,11 @@ class ConnectionPolicyTest {
     }
 
     @Test
+    void defaultConnectTimeoutIsFiveSeconds() {
+        assertEquals(5_000, ConnectionPolicy.DEFAULT.connectTimeoutMs());
+    }
+
+    @Test
     void validatesPositiveDurationsAndBackoffOrdering() {
         assertThrows(IllegalArgumentException.class, () -> new ConnectionPolicy(0, 1, 1, 1, 1, 1));
         assertThrows(IllegalArgumentException.class, () -> new ConnectionPolicy(1, 0, 1, 1, 1, 1));

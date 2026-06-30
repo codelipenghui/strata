@@ -8,14 +8,16 @@ import java.util.Objects;
 
 /** Client configuration. chunkRollBytes is ~2 GB nominal in production; tests use small values. */
 public record ClientConfig(List<String> controllerEndpoints, long chunkRollBytes, long callTimeoutMs,
-                           ConnectionPolicy connectionPolicy, int dataNodeConnectionsPerEndpoint) {
+                           ConnectionPolicy connectionPolicy, int dataNodeConnectionsPerEndpoint,
+                           long controllerRetryDeadlineMs, int controllerRetryBackoffMs,
+                           int recoveryCopyChunkBytes) {
     public ClientConfig(List<String> controllerEndpoints, long chunkRollBytes, long callTimeoutMs) {
-        this(controllerEndpoints, chunkRollBytes, callTimeoutMs, ConnectionPolicy.DEFAULT, 1);
+        this(controllerEndpoints, chunkRollBytes, callTimeoutMs, ConnectionPolicy.DEFAULT, 1, 15_000L, 200, 4 * 1024 * 1024);
     }
 
     public ClientConfig(List<String> controllerEndpoints, long chunkRollBytes, long callTimeoutMs,
                         ConnectionPolicy connectionPolicy) {
-        this(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy, 1);
+        this(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy, 1, 15_000L, 200, 4 * 1024 * 1024);
     }
 
     public ClientConfig {
@@ -36,24 +38,52 @@ public record ClientConfig(List<String> controllerEndpoints, long chunkRollBytes
         if (dataNodeConnectionsPerEndpoint <= 0) {
             throw new IllegalArgumentException("dataNodeConnectionsPerEndpoint must be positive");
         }
+        if (controllerRetryDeadlineMs <= 0) {
+            throw new IllegalArgumentException("controllerRetryDeadlineMs must be positive: " + controllerRetryDeadlineMs);
+        }
+        if (controllerRetryBackoffMs <= 0) {
+            throw new IllegalArgumentException("controllerRetryBackoffMs must be positive: " + controllerRetryBackoffMs);
+        }
+        if (recoveryCopyChunkBytes <= 0) {
+            throw new IllegalArgumentException("recoveryCopyChunkBytes must be positive: " + recoveryCopyChunkBytes);
+        }
     }
 
     public static ClientConfig of(String metadataEndpoint) {
-        return new ClientConfig(List.of(metadataEndpoint), 2L << 30, 10_000); // 2 GiB nominal chunk roll
+        return new ClientConfig(List.of(metadataEndpoint), 2L << 30, 10_000, ConnectionPolicy.DEFAULT, 1, 15_000L, 200, 4 * 1024 * 1024);
     }
 
     public ClientConfig withChunkRollBytes(long bytes) {
         return new ClientConfig(controllerEndpoints, bytes, callTimeoutMs, connectionPolicy,
-                dataNodeConnectionsPerEndpoint);
+                dataNodeConnectionsPerEndpoint, controllerRetryDeadlineMs, controllerRetryBackoffMs,
+                recoveryCopyChunkBytes);
     }
 
     public ClientConfig withConnectionPolicy(ConnectionPolicy policy) {
         return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, policy,
-                dataNodeConnectionsPerEndpoint);
+                dataNodeConnectionsPerEndpoint, controllerRetryDeadlineMs, controllerRetryBackoffMs,
+                recoveryCopyChunkBytes);
     }
 
     public ClientConfig withDataNodeConnectionsPerEndpoint(int connections) {
-        return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy, connections);
+        return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy,
+                connections, controllerRetryDeadlineMs, controllerRetryBackoffMs, recoveryCopyChunkBytes);
+    }
+
+    public ClientConfig withControllerRetryDeadlineMs(long deadlineMs) {
+        return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy,
+                dataNodeConnectionsPerEndpoint, deadlineMs, controllerRetryBackoffMs, recoveryCopyChunkBytes);
+    }
+
+    public ClientConfig withControllerRetryBackoffMs(int backoffMs) {
+        return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy,
+                dataNodeConnectionsPerEndpoint, controllerRetryDeadlineMs, backoffMs, recoveryCopyChunkBytes);
+    }
+
+    public ClientConfig withRecoveryCopyChunkBytes(int copyChunkBytes) {
+        return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy,
+                dataNodeConnectionsPerEndpoint, controllerRetryDeadlineMs, controllerRetryBackoffMs,
+                copyChunkBytes);
     }
 
     private static void validateEndpoint(String endpoint) {

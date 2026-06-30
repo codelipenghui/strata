@@ -77,7 +77,8 @@ public final class Controller implements AutoCloseable {
         ScpServer openedServer = null;
         try {
             openedStore = new ZkMetadataStore(config.zkConnect(),
-                    config.zkSessionTimeoutMs(), config.zkConnectionTimeoutMs());
+                    config.zkSessionTimeoutMs(), config.zkConnectionTimeoutMs(),
+                    config.zkRetryBaseMs(), config.zkRetryMaxRetries());
             UUID serviceId = UUID.randomUUID();
 
             if (embedded) {
@@ -205,9 +206,12 @@ public final class Controller implements AutoCloseable {
         // generation. 0 (default) disables the window: superseded generations are reclaimed on the next sweep.
         int retentionMs = intSetting("STRATA_CONTROLLER_LOG_RETENTION_MS",
                 "strata.controller.log.retention.ms", 0);
+        int readChunkBytes = intSetting("STRATA_CONTROLLER_LOG_READ_CHUNK_BYTES",
+                "strata.controller.log.read.chunk.bytes", 4 * 1024 * 1024);
         return (root, endpoint) -> {
             NamespaceLogBackend logBackend = new NamespaceLogBackend(root,
-                    new StrataSystemMetadataFileStore(() -> endpoint, replicationFactor, ackQuorum, logFsync), true);
+                    new StrataSystemMetadataFileStore(() -> endpoint, replicationFactor, ackQuorum, logFsync,
+                            readChunkBytes), true);
             logBackend.setLogRetentionMs(retentionMs);
             logBackend.startBackgroundCompaction(compactBytes, compactIntervalMs, orphanGc);
             return new NamespaceLogMetadataStore(logBackend);

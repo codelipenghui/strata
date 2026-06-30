@@ -29,17 +29,21 @@ import java.util.function.Supplier;
  * is no infinite recursion and no engine-lock re-entry.
  */
 final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore {
-    private static final int READ_CHUNK = 4 * 1024 * 1024;
 
     private final Supplier<String> metaEndpoint;
     private final StrataClient.WritePolicy policy;
+    private final int readChunkBytes;
     private final Object initLock = new Object();
     private volatile StrataClient client;
     private final Map<FileId, StrataFile.Appender> openLogAppenders = new ConcurrentHashMap<>();
 
     StrataSystemMetadataFileStore(Supplier<String> metaEndpoint, int replicationFactor, int ackQuorum,
-                                  boolean fsyncOnAck) {
+                                  boolean fsyncOnAck, int readChunkBytes) {
         this.metaEndpoint = metaEndpoint;
+        if (readChunkBytes <= 0) {
+            throw new IllegalArgumentException("readChunkBytes must be positive: " + readChunkBytes);
+        }
+        this.readChunkBytes = readChunkBytes;
         // Durability is by REPLICATION, not single-node fsync: the metadata log is a Strata file with RF
         // replicas, acked once the ack quorum holds the record. fsyncOnAck=false (default) keeps it
         // page-cache durable on the quorum — fully safe against process/JVM/container crashes (the page
@@ -118,7 +122,7 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
         try (StrataFile.Reader reader = file.openForRead()) {
             long offset = 0;
             while (true) {
-                try (StrataFile.ReadResult result = reader.read(offset, READ_CHUNK)) {
+                try (StrataFile.ReadResult result = reader.read(offset, readChunkBytes)) {
                     int n = result.length();
                     if (n > 0) {
                         byte[] bytes = new byte[n];

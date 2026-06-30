@@ -37,8 +37,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 final class ControlLoop implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ControlLoop.class);
-    private static final int CALL_TIMEOUT_MS = 10_000;
-    private static final int FETCH_CHUNK_BYTES = 4 * 1024 * 1024;
     private static final long MAX_REPAIR_FOOTER_BYTES = 64L * 1024 * 1024;
     // Bounded command execution (Phase 4): COMMAND_PARALLELISM consumer vthreads drain a bounded queue so
     // a slow REPLICATE (whole-chunk network pull) cannot head-of-line-block fast DELETE/DRAIN commands, and
@@ -155,7 +153,7 @@ final class ControlLoop implements AutoCloseable {
                     List.of(node.endpoint()), config.zone(), config.rack(), config.host(),
                     List.of(new Messages.StorageCapacity(config.capacityBytes())),
                     1, 0);
-            ByteBuffer resp = controller.call(Opcode.REGISTER_NODE, reg.encode(), null, CALL_TIMEOUT_MS);
+            ByteBuffer resp = controller.call(Opcode.REGISTER_NODE, reg.encode(), null, config.controlCallTimeoutMs());
             var r = Messages.RegisterResp.decode(resp);
             if (r.nodeId() != node.nodeId()) {
                 // the node owns its id (volume-bound, STRATA_NODE_ID); the leader only echoes it back
@@ -179,7 +177,7 @@ final class ControlLoop implements AutoCloseable {
                 List.of(new Messages.StorageUsage(used, Math.max(0, config.capacityBytes() - used))),
                 commandQueue.size(), done);
         try {
-            ByteBuffer resp = controller.call(Opcode.NODE_HEARTBEAT, hb.encode(), null, CALL_TIMEOUT_MS);
+            ByteBuffer resp = controller.call(Opcode.NODE_HEARTBEAT, hb.encode(), null, config.controlCallTimeoutMs());
             var r = Messages.HeartbeatResp.decode(resp);
             acceptCommands(r.commands());
         } catch (RuntimeException e) {
@@ -284,14 +282,16 @@ final class ControlLoop implements AutoCloseable {
     }
 
     long fetchWholeFile(ScpClient src, Messages.ReplicateCmd cmd, Path output) throws IOException {
+        int fetchBytes = config.repairFetchBytes();
+        int callTimeoutMs = config.controlCallTimeoutMs();
         long offset = 0;
         long fileLength = -1;
         long maxFileLength = maxRepairFileLength(cmd.expectedLength());
         try (FileChannel out = FileChannel.open(output,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
             while (fileLength < 0 || offset < fileLength) {
-                var fetch = new Messages.FetchChunk(cmd.chunkId(), offset, FETCH_CHUNK_BYTES, cmd.namespace());
-                var frame = src.callFrame(Opcode.FETCH_CHUNK, fetch.encode(), null, CALL_TIMEOUT_MS);
+                var fetch = new Messages.FetchChunk(cmd.chunkId(), offset, fetchBytes, cmd.namespace());
+                var frame = src.callFrame(Opcode.FETCH_CHUNK, fetch.encode(), null, callTimeoutMs);
                 Messages.FetchResp resp;
                 try {
                     ByteBuffer hb = frame.headerSlice();
@@ -319,9 +319,9 @@ final class ControlLoop implements AutoCloseable {
                             "source file length changed: " + fileLength + " -> " + reportedLength);
                 }
                 int n = frame.payloadLength();
-                if (n > FETCH_CHUNK_BYTES) {
+                if (n > fetchBytes) {
                     throw new ScpException(ErrorCode.CORRUPT_CHUNK,
-                            "source sent " + n + " bytes for fetch limit " + FETCH_CHUNK_BYTES);
+                            "source sent " + n + " bytes for fetch limit " + fetchBytes);
                 }
                 if (n > fileLength - offset) {
                     throw new ScpException(ErrorCode.CORRUPT_CHUNK, "source sent bytes past EOF");

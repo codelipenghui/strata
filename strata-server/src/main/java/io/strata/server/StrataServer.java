@@ -65,7 +65,14 @@ public final class StrataServer {
                 // hostname() default is the container/pod id — set STRATA_ADVERTISED_HOST to a name
                 // clients can resolve (the service/DNS name) whenever more than one replica runs.
                 .withAdvertisedHost(env("STRATA_ADVERTISED_HOST", hostname()))
-                .withReconcileIntervalMs(intEnv("STRATA_REPAIR_RECONCILE_INTERVAL_MS", 15_000));
+                .withReconcileIntervalMs(intEnv("STRATA_REPAIR_RECONCILE_INTERVAL_MS", 15_000))
+                .withVerifyIntervalMs(intEnv("STRATA_VERIFY_INTERVAL_MS", 2_000))
+                .withVerifyBatchSize(intEnv("STRATA_VERIFY_BATCH_SIZE", 256))
+                .withSystemVerifyIntervalMs(intEnv("STRATA_SYSTEM_VERIFY_INTERVAL_MS", 30_000))
+                .withDeletedTombstoneTtlMs(longEnv("STRATA_CONTROLLER_DELETED_TOMBSTONE_TTL_MS", 600_000))
+                .withMaxCommandsPerHeartbeat(intEnv("STRATA_CONTROLLER_MAX_COMMANDS_PER_HEARTBEAT", 16))
+                .withZkRetryBaseMs(intEnv("STRATA_CONTROLLER_ZK_RETRY_BASE_MS", 100))
+                .withZkRetryMaxRetries(intEnv("STRATA_CONTROLLER_ZK_RETRY_MAX", 5));
         // Namespace sharding is OPT-IN (default off = single global leader). When enabled, namespaces are
         // rendezvous-assigned across STRATA_CONTROLLER_ENDPOINTS so each controller node owns a shard. The
         // client (ControllerClient) is sharding-aware: it keeps one connection per owner and routes each op
@@ -78,11 +85,14 @@ public final class StrataServer {
         Controller service = new Controller(config);
         log.info("controller started: endpoint={} zk={} leader={}",
                 service.endpoint(), config.zkConnect(), service.isLeader());
+        long nsRefreshMs = intEnv("STRATA_METRICS_NS_REFRESH_INTERVAL_MS", 10_000);
+        long[] buckets = parseBucketsMs(env("STRATA_METRICS_REQUEST_DURATION_BUCKETS_MS", null),
+                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
         AutoCloseable metrics = null;
         try {
             metrics = startMetrics("controller", reg -> {
-                ServerMetrics.registerController(reg, service);
-                service.setRequestObserver(ServerMetrics.requestObserver(reg));
+                ServerMetrics.registerController(reg, service, nsRefreshMs);
+                service.setRequestObserver(ServerMetrics.requestObserver(reg, buckets));
             }, () -> service.isLeader() && service.zkConnected());
             awaitShutdown("controller", metrics, service);
         } catch (Exception e) {
@@ -105,15 +115,29 @@ public final class StrataServer {
                 env("STRATA_HOST", hostname),
                 longEnv("STRATA_CAPACITY_BYTES", 1L << 40),  // 1 TiB
                 intEnv("STRATA_SCRUB_INTERVAL_MS", 300_000)) // full re-CRC every 5 min (was 30s push x10)
-                .withNodeId(requiredIntEnv("STRATA_NODE_ID"));
+                .withNodeId(requiredIntEnv("STRATA_NODE_ID"))
+                .withOrphanGraceMs(longEnv("STRATA_ORPHAN_GRACE_MS", 6_000))
+                .withOrphanScanIntervalMs(longEnv("STRATA_ORPHAN_SCAN_INTERVAL_MS", 3_000))
+                .withOrphanStartupGraceMs(longEnv("STRATA_ORPHAN_STARTUP_GRACE_MS", 6_000))
+                .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
+                .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
+                .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
+                .withChunkStoreConfig(new io.strata.format.ChunkStoreConfig(
+                        intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
+                        longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
+                        longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
+                        longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000)));
         DataNode node = new DataNode(config);
         log.info("data node started: endpoint={} dataDir={} controller={}",
                 node.endpoint(), config.dataDir(), config.controllerEndpoints());
+        long nsRefreshMs = intEnv("STRATA_METRICS_NS_REFRESH_INTERVAL_MS", 10_000);
+        long[] buckets = parseBucketsMs(env("STRATA_METRICS_REQUEST_DURATION_BUCKETS_MS", null),
+                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
         AutoCloseable metrics = null;
         try {
             metrics = startMetrics("data-node", reg -> {
-                ServerMetrics.registerDataNode(reg, node);
-                node.setRequestObserver(ServerMetrics.requestObserver(reg));
+                ServerMetrics.registerDataNode(reg, node, nsRefreshMs);
+                node.setRequestObserver(ServerMetrics.requestObserver(reg, buckets));
             }, node::registered);
             awaitShutdown("data node", metrics, node);
         } catch (Exception e) {
@@ -144,7 +168,14 @@ public final class StrataServer {
                 intEnv("STRATA_REPAIR_SCAN_INTERVAL_MS", 5_000),
                 intEnv("STRATA_REPAIR_COMMAND_TIMEOUT_MS", 30_000))
                 .withAdvertisedHost(advertisedHost)
-                .withReconcileIntervalMs(intEnv("STRATA_REPAIR_RECONCILE_INTERVAL_MS", 15_000));
+                .withReconcileIntervalMs(intEnv("STRATA_REPAIR_RECONCILE_INTERVAL_MS", 15_000))
+                .withVerifyIntervalMs(intEnv("STRATA_VERIFY_INTERVAL_MS", 2_000))
+                .withVerifyBatchSize(intEnv("STRATA_VERIFY_BATCH_SIZE", 256))
+                .withSystemVerifyIntervalMs(intEnv("STRATA_SYSTEM_VERIFY_INTERVAL_MS", 30_000))
+                .withDeletedTombstoneTtlMs(longEnv("STRATA_CONTROLLER_DELETED_TOMBSTONE_TTL_MS", 600_000))
+                .withMaxCommandsPerHeartbeat(intEnv("STRATA_CONTROLLER_MAX_COMMANDS_PER_HEARTBEAT", 16))
+                .withZkRetryBaseMs(intEnv("STRATA_CONTROLLER_ZK_RETRY_BASE_MS", 100))
+                .withZkRetryMaxRetries(intEnv("STRATA_CONTROLLER_ZK_RETRY_MAX", 5));
         // Namespace sharding is OPT-IN (default off = single global leader). The sharding-aware client
         // (ControllerClient) keeps one connection per owner and routes each op to its namespace's owner,
         // so it does not thrash a single connection. Off by default to gate rollout. See runController /
@@ -164,7 +195,18 @@ public final class StrataServer {
                 env("STRATA_HOST", hostname),
                 longEnv("STRATA_CAPACITY_BYTES", 1L << 40),  // 1 TiB
                 intEnv("STRATA_SCRUB_INTERVAL_MS", 300_000)) // full re-CRC every 5 min (was 30s push x10)
-                .withNodeId(requiredIntEnv("STRATA_NODE_ID"));
+                .withNodeId(requiredIntEnv("STRATA_NODE_ID"))
+                .withOrphanGraceMs(longEnv("STRATA_ORPHAN_GRACE_MS", 6_000))
+                .withOrphanScanIntervalMs(longEnv("STRATA_ORPHAN_SCAN_INTERVAL_MS", 3_000))
+                .withOrphanStartupGraceMs(longEnv("STRATA_ORPHAN_STARTUP_GRACE_MS", 6_000))
+                .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
+                .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
+                .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
+                .withChunkStoreConfig(new io.strata.format.ChunkStoreConfig(
+                        intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
+                        longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
+                        longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
+                        longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000)));
         Combined combined = startCombined(controllerConfig, nodeConfig);
         log.info("combined node started: scp={} zk={}", combined.node().endpoint(), controllerConfig.zkConnect());
         awaitShutdown("combined node", combined);
@@ -194,12 +236,15 @@ public final class StrataServer {
             node = new DataNode(nodeConfig, controller.handler());
             Controller startedController = controller;
             DataNode startedNode = node;
+            long nsRefreshMs = intEnv("STRATA_METRICS_NS_REFRESH_INTERVAL_MS", 10_000);
+            long[] buckets = parseBucketsMs(env("STRATA_METRICS_REQUEST_DURATION_BUCKETS_MS", null),
+                    new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
             AutoCloseable metrics = startMetrics("combined", reg -> {
-                ServerMetrics.registerController(reg, startedController);
-                ServerMetrics.registerDataNode(reg, startedNode);
+                ServerMetrics.registerController(reg, startedController, nsRefreshMs);
+                ServerMetrics.registerDataNode(reg, startedNode, nsRefreshMs);
                 // The single (node) listener serves both planes, so observe there; the embedded controller
                 // has no server of its own.
-                startedNode.setRequestObserver(ServerMetrics.requestObserver(reg));
+                startedNode.setRequestObserver(ServerMetrics.requestObserver(reg, buckets));
             }, () -> startedController.isLeader() && startedController.zkConnected() && startedNode.registered());
             return new Combined(controller, node, metrics);
         } catch (Exception e) {
@@ -332,6 +377,32 @@ public final class StrataServer {
     private static boolean boolEnv(String key, boolean def) {
         String v = env(key, null);
         return v == null ? def : Boolean.parseBoolean(v);
+    }
+
+    /**
+     * Parses a comma-separated list of positive, strictly-ascending millisecond bucket boundaries
+     * for SLO histogram configuration. Returns {@code def} when {@code csv} is null or blank.
+     * Throws {@link IllegalArgumentException} for non-positive values or non-ascending order.
+     */
+    static long[] parseBucketsMs(String csv, long[] def) {
+        if (csv == null || csv.isBlank()) {
+            return def;
+        }
+        String[] parts = csv.split(",");
+        long[] out = new long[parts.length];
+        long prev = 0;
+        for (int i = 0; i < parts.length; i++) {
+            long v = Long.parseLong(parts[i].trim());
+            if (v <= 0) {
+                throw new IllegalArgumentException("bucket must be positive ms: " + v);
+            }
+            if (v <= prev) {
+                throw new IllegalArgumentException("buckets must be strictly ascending: " + csv);
+            }
+            out[i] = v;
+            prev = v;
+        }
+        return out;
     }
 
     private StrataServer() {

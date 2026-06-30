@@ -31,7 +31,7 @@ class ServerMetricsTest {
     void registerNodeExposesChannelCacheAndFdMeters() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             SimpleMeterRegistry registry = new SimpleMeterRegistry();
-            ServerMetrics.registerDataNode(registry, node);
+            ServerMetrics.registerDataNode(registry, node, 10_000);
 
             assertNotNull(registry.find("strata_data_node_filechannel_cache").tag("event", "hit").functionCounter());
             assertNotNull(registry.find("strata_data_node_filechannel_cache").tag("event", "miss").functionCounter());
@@ -47,7 +47,7 @@ class ServerMetricsTest {
         // No I/O yet → no namespace → the per-namespace counters are absent (registered lazily on first I/O).
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             SimpleMeterRegistry registry = new SimpleMeterRegistry();
-            ServerMetrics.registerDataNode(registry, node);
+            ServerMetrics.registerDataNode(registry, node, 10_000);
             ServerMetrics.registerNewDataNodeNamespaces(registry, node); // idempotent; no-op with no namespaces
             assertNull(registry.find("strata_data_node_append_bytes").functionCounter(),
                     "no per-namespace counter until a namespace sees I/O");
@@ -70,7 +70,7 @@ class ServerMetricsTest {
             }
 
             SimpleMeterRegistry registry = new SimpleMeterRegistry();
-            ServerMetrics.registerDataNode(registry, node);
+            ServerMetrics.registerDataNode(registry, node, 10_000);
             ServerMetrics.registerNewDataNodeNamespaces(registry, node); // force the lazy registration now
 
             var appendBytes = registry.find("strata_data_node_append_bytes")
@@ -84,7 +84,8 @@ class ServerMetricsTest {
     @Test
     void requestObserverTagsNamespace() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
-        io.strata.proto.RequestObserver obs = ServerMetrics.requestObserver(registry);
+        io.strata.proto.RequestObserver obs = ServerMetrics.requestObserver(registry,
+                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
         obs.observe("READ", "orders", 1_000_000L, true);
         assertNotNull(registry.find("strata_scp_request_duration")
                         .tag("namespace", "orders").tag("opcode", "READ").tag("status", "ok").timer(),

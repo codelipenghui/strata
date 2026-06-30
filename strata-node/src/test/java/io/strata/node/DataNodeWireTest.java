@@ -394,7 +394,7 @@ class DataNodeWireTest {
         });
              ScpClient src = new ScpClient("127.0.0.1", source.port(),
                      ScpClient.KIND_DATA_NODE, "repair-test")) {
-            ControlLoop loop = new ControlLoop(null, null, null);
+            ControlLoop loop = new ControlLoop(null, DataNodeConfig.standalone(dir), null);
             var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS);
             Path output = dir.resolve("oversized-repair-fetch.chunk");
 
@@ -413,7 +413,7 @@ class DataNodeWireTest {
                 ByteBuffer.wrap(fileBytes)));
              ScpClient src = new ScpClient("127.0.0.1", source.port(),
                      ScpClient.KIND_DATA_NODE, "repair-test")) {
-            ControlLoop loop = new ControlLoop(null, null, null);
+            ControlLoop loop = new ControlLoop(null, DataNodeConfig.standalone(dir), null);
             var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS);
             Path output = dir.resolve("valid-repair-fetch.chunk");
 
@@ -425,7 +425,7 @@ class DataNodeWireTest {
     @Test
     void repairFetchRejectsMalformedSourceProgress() throws Exception {
         ChunkId repairChunk = new ChunkId(FileId.of(6), 0);
-        ControlLoop loop = new ControlLoop(null, null, null);
+        ControlLoop loop = new ControlLoop(null, DataNodeConfig.standalone(dir), null);
         var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS);
 
         try (ScpServer openSource = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
@@ -495,7 +495,7 @@ class DataNodeWireTest {
 
     @Test
     void repairFetchRejectsInvalidExpectedLengthsBeforeNetworkUse() {
-        ControlLoop loop = new ControlLoop(null, null, null);
+        ControlLoop loop = new ControlLoop(null, DataNodeConfig.standalone(dir), null);
         ChunkId repairChunk = new ChunkId(FileId.of(7), 0);
         Path output = dir.resolve("invalid-expected-length-fetch.chunk");
 

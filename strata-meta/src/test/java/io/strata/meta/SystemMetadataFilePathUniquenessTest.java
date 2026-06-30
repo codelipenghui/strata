@@ -61,7 +61,7 @@ class SystemMetadataFilePathUniquenessTest {
     void systemFileSpecPathIsUniquePerCallForSameNsGenerationKind() throws Exception {
         StrataSystemMetadataFileStore store = new StrataSystemMetadataFileStore(
                 () -> "127.0.0.1:0", // endpoint unused — systemFileSpec doesn't connect
-                3, 2, false);
+                3, 2, false, 4 * 1024 * 1024);
 
         Method systemFileSpec = StrataSystemMetadataFileStore.class.getDeclaredMethod(
                 "systemFileSpec", StrataNamespace.class, long.class, String.class);

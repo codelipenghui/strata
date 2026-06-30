@@ -1,0 +1,41 @@
+name: TLA
+
+# TLA+ model checking is expensive and the specs change rarely, so this only
+# runs when a TLA spec (or the model-check tooling/config) actually changes.
+"on":
+  pull_request:
+    paths:
+      - "tla/**"
+      - "**/*.tla"
+      - "scripts/tlc.sh"
+      - ".github/workflows/tla.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "tla/**"
+      - "**/*.tla"
+      - "scripts/tlc.sh"
+      - ".github/workflows/tla.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tla-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  model-check:
+    name: TLA+ model checking
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Run TLA+ model checker
+        run: ./scripts/verify.sh --skip-default --tlc

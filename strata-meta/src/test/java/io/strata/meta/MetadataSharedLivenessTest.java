@@ -62,7 +62,7 @@ class MetadataSharedLivenessTest {
 
     private ControllerConfig shardedConfig(int port) {
         return new ControllerConfig(zk.getConnectString(), port, 200, 1_000, 1_500, 300, 3_000,
-                60_000, 5_000, 20_000, "127.0.0.1", 90_000, endpoints, 2);
+                60_000, 5_000, 20_000, "127.0.0.1", 90_000, endpoints, 2, 2_000, 256, 30_000, 600_000L, 16, 100, 5);
     }
 
     @Test

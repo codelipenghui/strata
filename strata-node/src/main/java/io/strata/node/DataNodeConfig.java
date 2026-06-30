@@ -2,6 +2,7 @@ package io.strata.node;
 
 import io.strata.common.ConnectionPolicy;
 import io.strata.common.Endpoint;
+import io.strata.format.ChunkStoreConfig;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -27,13 +28,21 @@ public record DataNodeConfig(
         long capacityBytes,
         int scrubIntervalMs,             // cadence of the node-local sealed-chunk re-CRC scrub (design §20.3)
         ConnectionPolicy connectionPolicy,
-        int nodeId                       // -1 = standalone/unregistered; otherwise >= 1
+        int nodeId,                      // -1 = standalone/unregistered; otherwise >= 1
+        long orphanGraceMs,
+        long orphanScanIntervalMs,
+        long orphanStartupGraceMs,
+        int orphanConfirmTimeoutMs,
+        int controlCallTimeoutMs,
+        int repairFetchBytes,
+        ChunkStoreConfig chunkStoreConfig
 ) {
     public DataNodeConfig(Path dataDir, int listenPort, String advertisedHost, String advertisedEndpointOverride,
                       List<String> controllerEndpoints, String zone, String rack, String host,
                       long capacityBytes, int scrubIntervalMs) {
         this(dataDir, listenPort, advertisedHost, advertisedEndpointOverride, controllerEndpoints,
-                zone, rack, host, capacityBytes, scrubIntervalMs, ConnectionPolicy.DEFAULT, -1);
+                zone, rack, host, capacityBytes, scrubIntervalMs, ConnectionPolicy.DEFAULT, -1,
+                6_000L, 3_000L, 6_000L, 5_000, 10_000, 4 * 1024 * 1024, ChunkStoreConfig.DEFAULT);
     }
 
     public DataNodeConfig {
@@ -67,6 +76,25 @@ public record DataNodeConfig(
             throw new IllegalArgumentException("nodeId must be -1 (standalone) or >= 1: " + nodeId);
         }
         connectionPolicy = Objects.requireNonNull(connectionPolicy, "connectionPolicy");
+        if (orphanGraceMs <= 0) {
+            throw new IllegalArgumentException("orphanGraceMs must be positive: " + orphanGraceMs);
+        }
+        if (orphanScanIntervalMs <= 0) {
+            throw new IllegalArgumentException("orphanScanIntervalMs must be positive: " + orphanScanIntervalMs);
+        }
+        if (orphanStartupGraceMs <= 0) {
+            throw new IllegalArgumentException("orphanStartupGraceMs must be positive: " + orphanStartupGraceMs);
+        }
+        if (orphanConfirmTimeoutMs <= 0) {
+            throw new IllegalArgumentException("orphanConfirmTimeoutMs must be positive: " + orphanConfirmTimeoutMs);
+        }
+        if (controlCallTimeoutMs <= 0) {
+            throw new IllegalArgumentException("controlCallTimeoutMs must be positive: " + controlCallTimeoutMs);
+        }
+        if (repairFetchBytes <= 0) {
+            throw new IllegalArgumentException("repairFetchBytes must be positive: " + repairFetchBytes);
+        }
+        chunkStoreConfig = java.util.Objects.requireNonNull(chunkStoreConfig, "chunkStoreConfig");
     }
 
     private static void requireText(String value, String field) {
@@ -91,21 +119,78 @@ public record DataNodeConfig(
 
     public DataNodeConfig withListenPort(int port) {
         return new DataNodeConfig(dataDir, port, advertisedHost, advertisedEndpointOverride,
-                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId);
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
     }
 
     public DataNodeConfig withAdvertisedEndpoint(String endpoint) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, endpoint,
-                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId);
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
     }
 
     public DataNodeConfig withConnectionPolicy(ConnectionPolicy policy) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
-                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, policy, nodeId);
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, policy, nodeId,
+                orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
     }
 
     public DataNodeConfig withNodeId(int id) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
-                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, id);
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, id,
+                orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
+    }
+
+    public DataNodeConfig withOrphanGraceMs(long v) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                v, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
+    }
+
+    public DataNodeConfig withOrphanScanIntervalMs(long v) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                orphanGraceMs, v, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
+    }
+
+    public DataNodeConfig withOrphanStartupGraceMs(long v) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                orphanGraceMs, orphanScanIntervalMs, v, orphanConfirmTimeoutMs,
+                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
+    }
+
+    public DataNodeConfig withOrphanConfirmTimeoutMs(int v) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, v,
+                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
+    }
+
+    public DataNodeConfig withControlCallTimeoutMs(int v) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                v, repairFetchBytes, chunkStoreConfig);
+    }
+
+    public DataNodeConfig withRepairFetchBytes(int v) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                controlCallTimeoutMs, v, chunkStoreConfig);
+    }
+
+    public DataNodeConfig withChunkStoreConfig(ChunkStoreConfig v) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                controlCallTimeoutMs, repairFetchBytes, v);
     }
 }

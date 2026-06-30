@@ -67,11 +67,16 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     public ZkMetadataStore(String zkConnect, int sessionTimeoutMs, int connectionTimeoutMs) {
+        this(zkConnect, sessionTimeoutMs, connectionTimeoutMs, 100, 5);
+    }
+
+    public ZkMetadataStore(String zkConnect, int sessionTimeoutMs, int connectionTimeoutMs,
+                           int retryBaseMs, int retryMaxRetries) {
         this(CuratorFrameworkFactory.builder()
                 .connectString(zkConnect)
                 .sessionTimeoutMs(sessionTimeoutMs)
                 .connectionTimeoutMs(connectionTimeoutMs)
-                .retryPolicy(new ExponentialBackoffRetry(100, 5))
+                .retryPolicy(new ExponentialBackoffRetry(retryBaseMs, retryMaxRetries))
                 .build(), true, connectionTimeoutMs);
     }
 
@@ -383,7 +388,7 @@ public final class ZkMetadataStore implements MetadataStore {
         // Ages tombstones by the znode mtime (set when deleteFile wrote DELETED). Relies on a DELETED
         // znode never being mutated again (every writer goes through getFile, which hides it), so
         // mtime == delete time. The controller clock (now) is compared to the ZK-server mtime, so olderThanMs
-        // must absorb that skew — see DELETED_TOMBSTONE_TTL_MS.
+        // must absorb that skew — see ControllerConfig.deletedTombstoneTtlMs.
         long now = System.currentTimeMillis();
         int reaped = 0;
         List<String> children = curator.getChildren().forPath(FILES);

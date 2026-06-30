@@ -687,6 +687,36 @@ class NodeRegistryTest {
     }
 
     @Test
+    void heartbeatDrainsAtMostConfiguredCommands() throws Exception {
+        ControllerConfig cfg = ControllerConfig.forTests("zk:1").withMaxCommandsPerHeartbeat(2);
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, cfg);
+        Messages.RegisterResp registered = registry.register(new Messages.RegisterNode(
+                1, 201, 202, List.of("node:9000"), "z", "r", "h",
+                List.of(new Messages.StorageCapacity(10)), 1, 0));
+        for (int i = 0; i < 5; i++) {
+            registry.enqueue(registered.nodeId(),
+                    new Messages.DeleteCmd(i, List.of(new ChunkId(FileId.of(i), 0)), TEST_NS));
+        }
+
+        Messages.HeartbeatResp first = registry.heartbeat(new Messages.NodeHeartbeat(
+                registered.nodeId(), 201, 202, registered.sessionEpoch(),
+                List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), ignoreCompletions());
+        Messages.HeartbeatResp second = registry.heartbeat(new Messages.NodeHeartbeat(
+                registered.nodeId(), 201, 202, registered.sessionEpoch(),
+                List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), ignoreCompletions());
+
+        assertEquals(2, first.commands().size(),
+                "heartbeat must drain at most maxCommandsPerHeartbeat (2) commands");
+        assertEquals(2, second.commands().size(),
+                "second heartbeat also drains up to the configured cap");
+        Messages.HeartbeatResp third = registry.heartbeat(new Messages.NodeHeartbeat(
+                registered.nodeId(), 201, 202, registered.sessionEpoch(),
+                List.of(new Messages.StorageUsage(1, 9)), 0, List.of()), ignoreCompletions());
+        assertEquals(1, third.commands().size(), "third heartbeat drains the remaining 1 command");
+    }
+
+    @Test
     void placementSnapshotReadIsCachedForTheRepairScanInterval() throws Exception {
         FakeStore store = new FakeStore();
         long t0 = 1_000_000L;
