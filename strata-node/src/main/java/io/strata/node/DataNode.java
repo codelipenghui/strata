@@ -80,7 +80,9 @@ public final class DataNode implements AutoCloseable {
                 // Node-local orphan GC (design §20.4): reclaim sealed chunks no owner references, after
                 // confirming with the namespace owner. Only a registered node runs it (it needs a nodeId
                 // to recognise itself in a descriptor and controller endpoints to ask).
-                startedGc = new OrphanGc(openedStore, nodeId, config.controllerEndpoints());
+                startedGc = new OrphanGc(openedStore, nodeId, config.controllerEndpoints(),
+                        config.orphanGraceMs(), config.orphanScanIntervalMs(), config.orphanStartupGraceMs(),
+                        config.orphanConfirmTimeoutMs());
                 this.orphanGc = startedGc;
                 startedGc.start();
             } else {

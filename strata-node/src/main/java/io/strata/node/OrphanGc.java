@@ -50,7 +50,7 @@ final class OrphanGc implements AutoCloseable {
     static final long DEFAULT_GRACE_MS = 6_000;
     static final long DEFAULT_SCAN_INTERVAL_MS = 3_000;
     static final long DEFAULT_STARTUP_GRACE_MS = 6_000;
-    private static final int CONFIRM_TIMEOUT_MS = 5_000;
+    private static final int DEFAULT_CONFIRM_TIMEOUT_MS = 5_000;
 
     private final ChunkStore store;
     private final int nodeId;
@@ -58,23 +58,26 @@ final class OrphanGc implements AutoCloseable {
     private final long graceMs;
     private final long scanIntervalMs;
     private final long startupGraceMs;
+    private final int confirmTimeoutMs;
     private final long startedAtMs = System.currentTimeMillis();
     private final AtomicBoolean closed = new AtomicBoolean();
     private volatile Thread thread;
 
     OrphanGc(ChunkStore store, int nodeId, List<String> controllerEndpoints) {
         this(store, nodeId, controllerEndpoints,
-                DEFAULT_GRACE_MS, DEFAULT_SCAN_INTERVAL_MS, DEFAULT_STARTUP_GRACE_MS);
+                DEFAULT_GRACE_MS, DEFAULT_SCAN_INTERVAL_MS, DEFAULT_STARTUP_GRACE_MS,
+                DEFAULT_CONFIRM_TIMEOUT_MS);
     }
 
     OrphanGc(ChunkStore store, int nodeId, List<String> controllerEndpoints,
-             long graceMs, long scanIntervalMs, long startupGraceMs) {
+             long graceMs, long scanIntervalMs, long startupGraceMs, int confirmTimeoutMs) {
         this.store = store;
         this.nodeId = nodeId;
         this.controllerEndpoints = List.copyOf(controllerEndpoints);
         this.graceMs = graceMs;
         this.scanIntervalMs = scanIntervalMs;
         this.startupGraceMs = startupGraceMs;
+        this.confirmTimeoutMs = confirmTimeoutMs;
     }
 
     void start() {
@@ -141,7 +144,7 @@ final class OrphanGc implements AutoCloseable {
             }
             try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(),
                     ScpClient.KIND_TOOL, "orphan-confirm")) {
-                ByteBuffer resp = client.call(Opcode.LOOKUP_FILE, req, null, CONFIRM_TIMEOUT_MS);
+                ByteBuffer resp = client.call(Opcode.LOOKUP_FILE, req, null, confirmTimeoutMs);
                 Messages.LookupFileResp r = Messages.LookupFileResp.decode(resp);
                 for (Messages.ChunkInfo ci : r.chunks()) {
                     if (ci.chunkId().equals(chunkId)) {
