@@ -37,4 +37,24 @@ class FramePayloadCrcTest {
 
         assertEquals(0, decoded.payloadCrc());
     }
+
+    @Test
+    void unflaggedPayloadCrcFieldIsIgnored() throws Exception {
+        // a frame with no FLAG_PAYLOAD_CRC but stale/garbage in the payload-CRC field (a malformed
+        // or adversarial peer) must still report 0 — the accessor's documented contract.
+        Frame sent = Frame.request(Opcode.PING, new byte[] {1}, ByteBuffer.allocate(0), 1L);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        FrameIO.write(new DataOutputStream(bytes), sent);
+        byte[] raw = bytes.toByteArray();
+        // payload-CRC field sits at output offset 24:
+        // 4 len + 1 magic + 1 ver + 2 opcode + 2 apiVersion + 2 flags + 8 correlationId + 4 payloadLen
+        raw[24] = (byte) 0xDE;
+        raw[25] = (byte) 0xAD;
+        raw[26] = (byte) 0xBE;
+        raw[27] = (byte) 0xEF;
+
+        Frame decoded = FrameIO.read(new DataInputStream(new ByteArrayInputStream(raw)));
+
+        assertEquals(0, decoded.payloadCrc());
+    }
 }
