@@ -980,6 +980,33 @@ class RepairCoordinatorTest {
                 "with the throttle window elapsed the system namespace is verified every pass");
     }
 
+    @Test
+    void systemVerifyCadenceComesFromConfig() throws Exception {
+        // Verify the cadence is read from config.systemVerifyIntervalMs(), not from the old static constant.
+        // Strategy: configure a 50 ms window. Sleep 100 ms between passes. Before the fix, the field was
+        // initialized from SYSTEM_VERIFY_INTERVAL_MS (30 000 ms), so 100 ms would NOT re-trigger — only
+        // 1 getFile call for 2 passes. After the fix, 100 ms > 50 ms → the second pass re-verifies → 2 calls.
+        ControllerConfig cfg = config().withSystemVerifyIntervalMs(50);
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, cfg);
+        FileId sysFile = fileId(702);
+        // OPEN file in the system metadata-log namespace, no sealed chunks -> verifyFile is a no-op after
+        // its single getFile, so getFile count == number of times the system namespace was verified.
+        store.createFile(new Records.FileRecord(sysFile, "strata-meta", "/metadata-log/seg-702",
+                3, 2, false, FileState.OPEN, 1234, List.of()));
+        // non-leader owner that owns all namespaces (ownsAll=false so non-leader, ownsNamespace=true always)
+        RepairCoordinator coordinator =
+                new RepairCoordinator(store, registry, cfg, () -> false, () -> false, ns -> true);
+
+        coordinator.verifyPass();                // stamps lastSystemVerifyMs
+        Thread.sleep(100);                       // 100 ms > configured 50 ms window → should re-verify
+        coordinator.verifyPass();                // must re-verify after the window elapses
+
+        assertEquals(2, store.getFileCalls(sysFile),
+                "system verify cadence must come from config.systemVerifyIntervalMs() (50 ms), "
+                        + "not the deleted 30 000 ms constant");
+    }
+
     private static ControllerConfig config() {
         return config(1);
     }

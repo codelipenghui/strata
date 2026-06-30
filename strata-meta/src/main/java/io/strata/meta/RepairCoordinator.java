@@ -112,13 +112,7 @@ class RepairCoordinator implements AutoCloseable {
     private final java.util.concurrent.atomic.AtomicLong reconcileSkippedFiles = new java.util.concurrent.atomic.AtomicLong();
     private volatile Thread scanThread;
 
-    // A deleted file's record is kept as a DELETED tombstone (fencing a delayed CREATE replay from
-    // resurrecting it) and reaped only after this window. INVARIANT: it must exceed the longest
-    // possible create-replay delay — the client create-retry deadline (max(15s, callTimeoutMs), see
-    // ControllerClient) plus the controller<->ZK clock-skew the mtime-based sweep tolerates — and it must exceed
-    // repairScanIntervalMs (the sweep cadence). 10 min vs the 15s default is a ~40x margin; raise it
-    // if callTimeoutMs is ever configured near it.
-    private static final long DELETED_TOMBSTONE_TTL_MS = 600_000;
+    // Deleted-tombstone TTL is now sourced from config.deletedTombstoneTtlMs() (default 600 000 ms).
 
     // Durability gauges, refreshed by each scanOnce so the metrics endpoint reads them in O(1)
     // (no extra ZK scan per scrape). volatile: written by the scan thread, read by the HTTP thread.
@@ -194,6 +188,7 @@ class RepairCoordinator implements AutoCloseable {
         this.isLeader = isLeader;
         this.ownsAll = ownsAllNamespaces;
         this.ownsNamespace = ownsNamespace;
+        this.systemVerifyIntervalMs = config.systemVerifyIntervalMs();
     }
 
     void start() {
@@ -210,18 +205,10 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     private volatile Thread verifyThread;
-    // Owner-pull verification cadence (design §20.3). A constant for now — the project does not ship to
-    // prod, and this is the only missing/corrupt-replica detection path once the inventory push is gone,
-    // so it stays brisk enough that detection + repair lands well inside the integration deadlines.
-    private static final long VERIFY_INTERVAL_MS = 2_000;
-    private static final int VERIFY_BATCH_SIZE = 256;
-    // The system (metadata-log) namespace's segment descriptors change only on log roll/compaction, so the
-    // brisk user-data owner-pull cadence (VERIFY_INTERVAL_MS) is wasted re-reading them every pass. Verify
-    // the system namespace on this slower cadence instead. reconcile() (every repairScanIntervalMs) and the
-    // node-death event path remain the durability backstops, so this only relaxes the proactive
-    // corruption/silent-loss detection latency for metadata-log segments, not their re-replication on loss.
-    private static final long SYSTEM_VERIFY_INTERVAL_MS = 30_000;
-    private volatile long systemVerifyIntervalMs = SYSTEM_VERIFY_INTERVAL_MS;
+    // Verify cadence/batch/system-interval are now sourced from config (verifyIntervalMs,
+    // verifyBatchSize, systemVerifyIntervalMs). systemVerifyIntervalMs is set in the canonical
+    // constructor body so the config value is always applied at construction.
+    private volatile long systemVerifyIntervalMs;
     // Last wall-clock ms the system namespace was owner-verified (0 = never). The verify loop is single
     // threaded, but tests drive verifyPass() directly, so this stays a field.
     private long lastSystemVerifyMs;
@@ -416,9 +403,9 @@ class RepairCoordinator implements AutoCloseable {
      */
     void sweepTombstones() throws Exception {
         if (isLeader.getAsBoolean()) {
-            store.sweepDeletedFiles(DELETED_TOMBSTONE_TTL_MS);
+            store.sweepDeletedFiles(config.deletedTombstoneTtlMs());
         } else {
-            store.sweepOwnedNamespaceTombstones(DELETED_TOMBSTONE_TTL_MS);
+            store.sweepOwnedNamespaceTombstones(config.deletedTombstoneTtlMs());
         }
     }
 
@@ -650,7 +637,7 @@ class RepairCoordinator implements AutoCloseable {
     private void verifyLoop() {
         while (!closed.get()) {
             try {
-                Thread.sleep(VERIFY_INTERVAL_MS);
+                Thread.sleep(config.verifyIntervalMs());
                 verifyPass();
             } catch (InterruptedException e) {
                 return;
@@ -733,8 +720,9 @@ class RepairCoordinator implements AutoCloseable {
                 continue;
             }
             List<ChunkId> ids = e.getValue();
-            for (int i = 0; i < ids.size(); i += VERIFY_BATCH_SIZE) {
-                List<ChunkId> batch = ids.subList(i, Math.min(i + VERIFY_BATCH_SIZE, ids.size()));
+            int batchSize = config.verifyBatchSize();
+            for (int i = 0; i < ids.size(); i += batchSize) {
+                List<ChunkId> batch = ids.subList(i, Math.min(i + batchSize, ids.size()));
                 List<Messages.VerifyChunkResult> results = execVerify(node, ns, batch);
                 // Empty == the RPC could not reach the node: no verdict, so we never drop a replica on an
                 // unreachable owner-verify (fail-safe). A truly dead node is handled by the reconcile scan.
