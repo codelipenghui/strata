@@ -108,6 +108,36 @@ class DataNodeConfigTest {
         assertThrows(IllegalArgumentException.class, () -> new DataNodeConfig(Path.of("data"), 0, "127.0.0.1",
                 null, List.of(), "zone", "rack", "host", 1, 0));
         assertThrows(NullPointerException.class, () -> new DataNodeConfig(Path.of("data"), 0, "127.0.0.1",
-                null, List.of(), "zone", "rack", "host", 1, 1, null, -1));
+                null, List.of(), "zone", "rack", "host", 1, 1, null, -1,
+                0L, 0L, 0L, 0, 0, 0, null));
+    }
+
+    @Test
+    void newNodeTuningFieldsDefault() {
+        DataNodeConfig c = new DataNodeConfig(Path.of("data"), 0, "10.0.0.1", null,
+                List.of("meta:9000"), "zone", "rack", "host", 1234, 55);
+        assertEquals(6_000, c.orphanGraceMs());
+        assertEquals(3_000, c.orphanScanIntervalMs());
+        assertEquals(6_000, c.orphanStartupGraceMs());
+        assertEquals(5_000, c.orphanConfirmTimeoutMs());
+        assertEquals(10_000, c.controlCallTimeoutMs());
+        assertEquals(4 * 1024 * 1024, c.repairFetchBytes());
+        assertEquals(io.strata.format.ChunkStoreConfig.DEFAULT, c.chunkStoreConfig());
+    }
+
+    @Test
+    void withSettersOverrideNodeTuning() {
+        DataNodeConfig c = new DataNodeConfig(Path.of("data"), 0, "10.0.0.1", null,
+                List.of("meta:9000"), "zone", "rack", "host", 1234, 55)
+                .withOrphanGraceMs(1000).withOrphanScanIntervalMs(500).withOrphanStartupGraceMs(1500)
+                .withOrphanConfirmTimeoutMs(2500).withControlCallTimeoutMs(8000).withRepairFetchBytes(1 << 20)
+                .withChunkStoreConfig(io.strata.format.ChunkStoreConfig.DEFAULT.withMaxRequestBytes(4096));
+        assertEquals(1000, c.orphanGraceMs());
+        assertEquals(500, c.orphanScanIntervalMs());
+        assertEquals(1500, c.orphanStartupGraceMs());
+        assertEquals(2500, c.orphanConfirmTimeoutMs());
+        assertEquals(8000, c.controlCallTimeoutMs());
+        assertEquals(1 << 20, c.repairFetchBytes());
+        assertEquals(4096, c.chunkStoreConfig().maxRequestBytes());
     }
 }

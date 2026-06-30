@@ -811,7 +811,8 @@ class ControlLoopTest {
     private static DataNodeConfig config(List<String> controllerEndpoints, int inventoryIntervalMs) {
         ConnectionPolicy testPolicy = new ConnectionPolicy(1_000, 1_000, 100, 1_000, 1, 1);
         return new DataNodeConfig(Path.of("."), 0, "127.0.0.1", null, controllerEndpoints,
-                "z", "r", "h", 1L << 20, inventoryIntervalMs, testPolicy, -1);
+                "z", "r", "h", 1L << 20, inventoryIntervalMs, testPolicy, -1,
+                0L, 0L, 0L, 0, 0, 0, null);
     }
 
     private static DataNodeConfig configWithoutMetadata() {

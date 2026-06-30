@@ -112,7 +112,18 @@ public final class StrataServer {
                 env("STRATA_HOST", hostname),
                 longEnv("STRATA_CAPACITY_BYTES", 1L << 40),  // 1 TiB
                 intEnv("STRATA_SCRUB_INTERVAL_MS", 300_000)) // full re-CRC every 5 min (was 30s push x10)
-                .withNodeId(requiredIntEnv("STRATA_NODE_ID"));
+                .withNodeId(requiredIntEnv("STRATA_NODE_ID"))
+                .withOrphanGraceMs(longEnv("STRATA_ORPHAN_GRACE_MS", 6_000))
+                .withOrphanScanIntervalMs(longEnv("STRATA_ORPHAN_SCAN_INTERVAL_MS", 3_000))
+                .withOrphanStartupGraceMs(longEnv("STRATA_ORPHAN_STARTUP_GRACE_MS", 6_000))
+                .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
+                .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
+                .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
+                .withChunkStoreConfig(new io.strata.format.ChunkStoreConfig(
+                        intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
+                        longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
+                        longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
+                        longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000)));
         DataNode node = new DataNode(config);
         log.info("data node started: endpoint={} dataDir={} controller={}",
                 node.endpoint(), config.dataDir(), config.controllerEndpoints());
@@ -178,7 +189,18 @@ public final class StrataServer {
                 env("STRATA_HOST", hostname),
                 longEnv("STRATA_CAPACITY_BYTES", 1L << 40),  // 1 TiB
                 intEnv("STRATA_SCRUB_INTERVAL_MS", 300_000)) // full re-CRC every 5 min (was 30s push x10)
-                .withNodeId(requiredIntEnv("STRATA_NODE_ID"));
+                .withNodeId(requiredIntEnv("STRATA_NODE_ID"))
+                .withOrphanGraceMs(longEnv("STRATA_ORPHAN_GRACE_MS", 6_000))
+                .withOrphanScanIntervalMs(longEnv("STRATA_ORPHAN_SCAN_INTERVAL_MS", 3_000))
+                .withOrphanStartupGraceMs(longEnv("STRATA_ORPHAN_STARTUP_GRACE_MS", 6_000))
+                .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
+                .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
+                .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
+                .withChunkStoreConfig(new io.strata.format.ChunkStoreConfig(
+                        intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
+                        longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
+                        longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
+                        longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000)));
         Combined combined = startCombined(controllerConfig, nodeConfig);
         log.info("combined node started: scp={} zk={}", combined.node().endpoint(), controllerConfig.zkConnect());
         awaitShutdown("combined node", combined);
