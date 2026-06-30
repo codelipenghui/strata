@@ -15,4 +15,10 @@ class ScpTransportConfigTest {
         // MAX_PENDING_REQUESTS default must remain 1024 when STRATA_SCP_MAX_PENDING_REQUESTS is unset.
         assertEquals(1024, ScpClient.maxPendingRequests());
     }
+
+    @Test
+    void maxFrameBytesDefaultUnchanged() {
+        // MAX_FRAME_BYTES default must remain 64 MiB when STRATA_MAX_FRAME_BYTES is unset.
+        assertEquals(64 * 1024 * 1024, FrameIO.MAX_FRAME_BYTES);
+    }
 }
