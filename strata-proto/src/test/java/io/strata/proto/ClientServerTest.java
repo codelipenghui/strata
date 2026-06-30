@@ -522,6 +522,53 @@ class ClientServerTest {
     }
 
     @Test
+    void serverCloseDuringAsyncDispatchReleasesOrphanedRequestBuffer() throws Exception {
+        // Deterministic regression for the close-vs-register race: handleAsync returns a deferred future,
+        // then the connection closes BEFORE handleRequest adds the request to inFlightAsyncRequests, so
+        // channelInactive drains the still-empty set. The request buffer must still be released, not
+        // orphaned until the (possibly-never-completed) future fires. A seam forces that ordering.
+        java.util.concurrent.CountDownLatch reachedSeam = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch proceed = new java.util.concurrent.CountDownLatch(1);
+        CompletableFuture<Frame> delayed = new CompletableFuture<>(); // intentionally never completed
+        AtomicReference<Frame> serverReq = new AtomicReference<>();
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("handleAsync should be used");
+            }
+
+            @Override
+            public CompletableFuture<Frame> handleAsync(Frame request) {
+                serverReq.set(request);
+                return delayed;
+            }
+        };
+        FailureInjector.arm("scp.handleRequest.beforeInflightAdd", p -> {
+            reachedSeam.countDown();
+            proceed.await();
+        });
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
+            CompletableFuture<Frame> pending = client.send(Opcode.PING, emptyHeader(), null);
+            assertTrue(reachedSeam.await(30, TimeUnit.SECONDS), "request thread never reached the seam");
+            Frame req = serverReq.get();
+            assertEquals(1, req.ownerRefCnt());
+
+            // Close while the request thread is paused BEFORE the inflight-add: channelInactive drains the
+            // still-empty inFlightAsyncRequests set, then we let the add proceed (registering after the drain).
+            server.close();
+            proceed.countDown();
+
+            // The orphaned request buffer must still be released (claimed by the post-add re-check).
+            waitFor(() -> req.ownerRefCnt() == 0);
+            assertThrows(java.util.concurrent.ExecutionException.class,
+                    () -> pending.get(30, TimeUnit.SECONDS));
+        } finally {
+            FailureInjector.reset();
+        }
+    }
+
+    @Test
     void clientReaderClosesLocalSocketWhenPeerCloses() throws Exception {
         try (ScpServer server = new ScpServer(0, 1, 0, 0,
                 req -> ScpServer.ok(req, Messages.okHeader(), null));
