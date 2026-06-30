@@ -761,7 +761,6 @@ public final class ChunkStore implements AutoCloseable {
         // payloadCrc is the writer's CRC32C over this payload, already verified by the frame decoder;
         // the node stores it as the per-record digest and never originates its own.
         long t0 = System.nanoTime();
-        long tPayloadCrc = t0;
         long newEnd;
         GroupCommitter committer;
         int len;
@@ -805,9 +804,9 @@ public final class ChunkStore implements AutoCloseable {
         }
         tUnlock = System.nanoTime();
         if (tUnlock - t0 > SLOW_APPEND_LOG_NANOS) {
-            log.info("slow append {} len={} base={} phases(ms): payloadCrc={} lockWait={} dataWrite={} "
+            log.info("slow append {} len={} base={} phases(ms): lockWait={} dataWrite={} "
                             + "ledgerAppend={} runningCrc={} lockHeld={} total={}",
-                    id, len, baseOffset, msBetween(t0, tPayloadCrc), msBetween(tBeforeLock, tLock),
+                    id, len, baseOffset, msBetween(tBeforeLock, tLock),
                     msBetween(tLock, tWrite), msBetween(tWrite, tLedger), msBetween(tLedger, tRunningCrc),
                     msBetween(tLock, tRunningCrc), msBetween(t0, tUnlock));
         }
@@ -1098,7 +1097,7 @@ public final class ChunkStore implements AutoCloseable {
             // we no longer write a SEALED .meta. The OPEN sidecar created at open() stays as the
             // pre-reclaim recovery net (a crash before the trailer is durable rebuilds OPEN from the
             // retained ledger) and is unlinked once the chunk is durably sealed (below / in reclaim).
-            long tSidecar = System.nanoTime();
+            long tStateUpdated = System.nanoTime();
             h.ledger.close();
             long tLedgerClose = System.nanoTime();
             Path ledgerPath = h.ledgerPath;
@@ -1121,14 +1120,13 @@ public final class ChunkStore implements AutoCloseable {
             long tLedgerDeleteEnqueue = System.nanoTime();
             if (tLedgerDeleteEnqueue - t0 > SLOW_MUTATION_LOG_NANOS) {
                 log.info("slow seal {} len={}MiB phases(ms): crc={} ledgerCount={} stopCommitter={} "
-                                + "truncate={} footerBuild={} footerWrite={} dataFsync={} sidecarPersist={} "
+                                + "truncate={} footerBuild={} footerWrite={} dataFsync={} "
                                 + "ledgerClose={} ledgerDeleteEnqueue={} total={}",
                         id, dataLength >> 20, msBetween(t0, tCrc), msBetween(tCrc, tLedgerCount),
                         msBetween(tLedgerCount, tCommitter), msBetween(tCommitter, tTruncate),
                         msBetween(tTruncate, tFooterBuild), msBetween(tFooterBuild, tWrite),
                         sealFsync ? msBetween(tWrite, tForce) : "-1.0",
-                        sealFsync ? msBetween(tForce, tSidecar) : "-1.0",
-                        msBetween(tSidecar, tLedgerClose), msBetween(tLedgerClose, tLedgerDeleteEnqueue),
+                        msBetween(tStateUpdated, tLedgerClose), msBetween(tLedgerClose, tLedgerDeleteEnqueue),
                         msBetween(t0, tLedgerDeleteEnqueue));
             }
             return new SealResult(dataLength, scan.dataCrc);
@@ -1735,7 +1733,8 @@ public final class ChunkStore implements AutoCloseable {
         // retained straggler ledger by coverage so a footer-shaped OPEN payload is not misread as sealed.
         boolean reconstructedSidecar = false;
         ChunkFormats.Sidecar sidecar;
-        if (isSealedByTrailer(probe.dataPath, probe.ledgerPath)) {
+        SealedProbe sealedProbe = trySealedProbe(probe.dataPath, id);
+        if (isSealedByTrailer(sealedProbe, probe.ledgerPath)) {
             sidecar = new ChunkFormats.Sidecar(header.createWriteEpoch(), -1, 0, ChunkState.SEALED);
             if (hasSidecar) {
                 Files.deleteIfExists(probe.metaPath); // a stale OPEN sidecar must not outlive the trailer
@@ -1754,33 +1753,22 @@ public final class ChunkStore implements AutoCloseable {
         boolean installed = false;
         try {
             if (sidecar.state() == ChunkState.SEALED) {
-                // Sealed chunks are durable + immutable: validate the trailer/footer with a transient
-                // channel and DO NOT keep a persistent data FD — reads open via the channel cache.
-                // verify the footer sections against the trailer's CRC (cheap — KBs): a sealed chunk
-                // with rotted footer metadata must be quarantined, not served as healthy (full
-                // data-region verification is deferred to scrub; readers have CRC_RANGES + batch CRCs)
-                try (FileChannel data = FileChannel.open(h.dataPath, StandardOpenOption.READ)) {
-                    long fileLen = data.size();
-                    byte[] trailerBytes = new byte[TRAILER_SIZE];
-                    readFully(data, ByteBuffer.wrap(trailerBytes), fileLen - TRAILER_SIZE);
-                    ChunkFormats.Trailer trailer = ChunkFormats.Trailer.decode(trailerBytes);
-                    int footerLen = checkedFooterLength(trailer, fileLen);
-                    byte[] footerBytes = new byte[(int) footerLen];
-                    readFully(data, ByteBuffer.wrap(footerBytes), trailer.footerStart());
-                    if (Crc.of(footerBytes) != trailer.footerCrc()) {
-                        throw new CorruptChunkException("footer crc mismatch for sealed chunk " + id);
-                    }
-                    h.writeEpoch = sidecar.writeEpoch();
-                    h.fenceEpoch = sidecar.fenceEpoch();
-                    h.lastKnownDO = sidecar.lastKnownDO();
-                    h.data = null;
-                    h.state = ChunkState.SEALED;
-                    h.end = trailer.dataLength();
-                    h.sealedLength = trailer.dataLength();
-                    h.dataCrc = trailer.dataCrc();
-                    h.sealedRangeCrcs = decodeCrcRanges(footerBytes, trailer.dataLength(), trailer.sectionCount());
-                    h.lastKnownDO = Math.max(h.lastKnownDO, trailer.dataLength());
-                }
+                // Sealed chunks are durable + immutable: reuse the trailer/footer the recovery probe
+                // already read, and DO NOT keep a persistent data FD — reads open via the channel cache.
+                // If the SEALED verdict came from a sidecar instead of the trailer (a rotted footer the
+                // probe rejected, so sealedProbe is null), re-read to re-prove the footer, quarantining
+                // (CorruptChunkException) a sealed chunk with bad footer metadata.
+                SealedProbe sealed = sealedProbe != null ? sealedProbe : readSealedFooterFromPath(h.dataPath, id);
+                ChunkFormats.Trailer trailer = sealed.trailer();
+                h.writeEpoch = sidecar.writeEpoch();
+                h.fenceEpoch = sidecar.fenceEpoch();
+                h.data = null;
+                h.state = ChunkState.SEALED;
+                h.end = trailer.dataLength();
+                h.sealedLength = trailer.dataLength();
+                h.dataCrc = trailer.dataCrc();
+                h.sealedRangeCrcs = sealed.rangeCrcs();
+                h.lastKnownDO = Math.max(sidecar.lastKnownDO(), trailer.dataLength());
                 if (reconstructedSidecar) {
                     h.persistSidecar();
                 }
@@ -1894,26 +1882,45 @@ public final class ChunkStore implements AutoCloseable {
         forceDirectory(probe.shardDir);
     }
 
-    /** trailer.dataLength if {@code dataPath} carries a valid sealed trailer/footer, else -1. */
-    private long sealedDataLength(Path dataPath) {
+    /** A sealed chunk's trailer + decoded CRC ranges, read and CRC-validated from the file in one pass. */
+    private record SealedProbe(ChunkFormats.Trailer trailer, List<Integer> rangeCrcs) {}
+
+    /**
+     * Reads and CRC-validates the sealed trailer + footer from an open chunk channel. Throws
+     * {@link CorruptChunkException} on a footer-CRC mismatch — the quarantine signal for a sealed chunk
+     * whose footer metadata has rotted. Shared by the recovery probe (which swallows the throw into
+     * "not validly sealed") and the SEALED install path (which lets it quarantine). Full data-region
+     * verification is deferred to scrub; readers have CRC_RANGES + batch CRCs.
+     */
+    private static SealedProbe readSealedFooter(FileChannel data, long fileLen, ChunkId id) throws IOException {
+        byte[] trailerBytes = new byte[TRAILER_SIZE];
+        readFully(data, ByteBuffer.wrap(trailerBytes), fileLen - TRAILER_SIZE);
+        ChunkFormats.Trailer trailer = ChunkFormats.Trailer.decode(trailerBytes);
+        int footerLen = checkedFooterLength(trailer, fileLen);
+        byte[] footerBytes = new byte[footerLen];
+        readFully(data, ByteBuffer.wrap(footerBytes), trailer.footerStart());
+        if (Crc.of(footerBytes) != trailer.footerCrc()) {
+            throw new CorruptChunkException("footer crc mismatch for sealed chunk " + id);
+        }
+        return new SealedProbe(trailer, decodeCrcRanges(footerBytes, trailer.dataLength(), trailer.sectionCount()));
+    }
+
+    /** The validated sealed trailer/footer of {@code dataPath}, or null if it is not a valid sealed chunk. */
+    private SealedProbe trySealedProbe(Path dataPath, ChunkId id) {
         try (FileChannel ch = FileChannel.open(dataPath, StandardOpenOption.READ)) {
             long fileLen = ch.size();
             if (fileLen < DATA_START + TRAILER_SIZE) {
-                return -1;
+                return null;
             }
-            byte[] trailerBytes = new byte[TRAILER_SIZE];
-            readFully(ch, ByteBuffer.wrap(trailerBytes), fileLen - TRAILER_SIZE);
-            ChunkFormats.Trailer trailer = ChunkFormats.Trailer.decode(trailerBytes);
-            int footerLen = checkedFooterLength(trailer, fileLen);
-            byte[] footerBytes = new byte[footerLen];
-            readFully(ch, ByteBuffer.wrap(footerBytes), trailer.footerStart());
-            if (Crc.of(footerBytes) != trailer.footerCrc()) {
-                return -1;
-            }
-            decodeCrcRanges(footerBytes, trailer.dataLength(), trailer.sectionCount());
-            return trailer.dataLength();
+            return readSealedFooter(ch, fileLen, id);
         } catch (IOException | RuntimeException e) {
-            return -1;
+            return null;
+        }
+    }
+
+    private static SealedProbe readSealedFooterFromPath(Path dataPath, ChunkId id) throws IOException {
+        try (FileChannel data = FileChannel.open(dataPath, StandardOpenOption.READ)) {
+            return readSealedFooter(data, data.size(), id);
         }
     }
 
@@ -1924,15 +1931,14 @@ public final class ChunkStore implements AutoCloseable {
      * payload (strictly past dataLength). The footer/trailer of a real sealed chunk physically occupy
      * [dataLength, EOF), so dataLength can never equal a footer-shaped chunk's full ledger coverage.
      */
-    private boolean isSealedByTrailer(Path dataPath, Path ledgerPath) {
-        long sealedLen = sealedDataLength(dataPath);
-        if (sealedLen < 0) {
+    private boolean isSealedByTrailer(SealedProbe probe, Path ledgerPath) {
+        if (probe == null) {
             return false;
         }
         if (!Files.exists(ledgerPath)) {
             return true;
         }
-        return ledgerLastEndOffset(ledgerPath) == sealedLen;
+        return ledgerLastEndOffset(ledgerPath) == probe.trailer().dataLength();
     }
 
     /** Highest endOffset among intact ledger entries, or -1 if none/unreadable (torn tail scanned back). */

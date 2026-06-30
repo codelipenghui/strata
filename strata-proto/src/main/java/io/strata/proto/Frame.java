@@ -58,13 +58,26 @@ public final class Frame implements AutoCloseable {
                                  int payloadCrc) {
         ByteBuffer header = owner.nioBuffer(headerIndex, headerLen).asReadOnlyBuffer();
         ByteBuffer payload = owner.nioBuffer(payloadIndex, payloadLen).asReadOnlyBuffer();
-        return new Frame(opcode, apiVersion, flags, correlationId, header, payload, null, owner, payloadCrc);
+        return new Frame(opcode, apiVersion, flags, correlationId, header, payload, null, owner,
+                retainedPayloadCrc(flags, payloadLen, payloadCrc));
     }
 
     static Frame decoded(short opcode, short apiVersion, short flags, long correlationId,
                          ByteBuffer header, ByteBuffer payload, int payloadCrc) {
+        ByteBuffer payloadSlice = readOnlySlice(payload);
         return new Frame(opcode, apiVersion, flags, correlationId,
-                readOnlySlice(header), readOnlySlice(payload), null, null, payloadCrc);
+                readOnlySlice(header), payloadSlice, null, null,
+                retainedPayloadCrc(flags, payloadSlice.remaining(), payloadCrc));
+    }
+
+    /**
+     * The payload CRC to retain on a decoded frame: the sender's value only when a non-empty payload
+     * actually carried {@link #FLAG_PAYLOAD_CRC}, else 0. Centralizing the rule here — rather than at
+     * each decode site — keeps the {@link #payloadCrc()} contract (0 on an unflagged or empty frame)
+     * enforced at construction for every decode path, including any added later.
+     */
+    private static int retainedPayloadCrc(short flags, int payloadLen, int payloadCrc) {
+        return (flags & FLAG_PAYLOAD_CRC) != 0 && payloadLen > 0 ? payloadCrc : 0;
     }
 
     public record FilePayload(FileChannel channel, long position, int length, Runnable releaser)
