@@ -296,6 +296,38 @@ class CrashRecoveryTest {
     }
 
     @Test
+    void openChunkWithFooterShapedPayloadAndTornLedgerTailRecoversAsOpen() throws Exception {
+        // Reviewer repro (PR #37): an OPEN chunk whose payload suffix is footer-shaped AND whose last
+        // ledger entry is torn. A backward scan over the torn tail lands on the PREVIOUS intact entry,
+        // which here ends exactly at the fake trailer's dataLength — so the trailer disambiguator would
+        // wrongly install SEALED and delete the sidecar/ledger. Recovery MUST keep the chunk OPEN.
+        byte[] live = "live".getBytes();
+        byte[] payload = footerShapedPayload(live);   // live + footer + trailer; fake trailer.dataLength == live.length
+        byte[] tail = java.util.Arrays.copyOfRange(payload, live.length, payload.length);
+
+        ChunkStore store = new ChunkStore(dir);
+        store.open(TEST_NS, id, true, 1, 1718000000000L);
+        // two appends split exactly at the fake dataLength, so ledger entry #1 ends at live.length (== dataLength)
+        store.appendAsync(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(live)).get(5, TimeUnit.SECONDS);
+        store.appendAsync(TEST_NS, id, 1, live.length, 0, ByteBuffer.wrap(tail)).get(5, TimeUnit.SECONDS);
+        store.close();
+
+        Files.delete(metaPath());
+        // tear the second (last) ledger entry so the backward scan falls back to entry #1 (ends at dataLength)
+        try (FileChannel j = FileChannel.open(ledgerPath(), StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            ByteBuffer one = ByteBuffer.allocate(1);
+            j.read(one, ChunkFormats.LEDGER_ENTRY_SIZE);   // first byte of entry #2
+            j.write(ByteBuffer.wrap(new byte[]{(byte) (one.get(0) ^ 0xFF)}), ChunkFormats.LEDGER_ENTRY_SIZE);
+        }
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            assertEquals(ChunkState.OPEN, recovered.stat(TEST_NS, id).state(),
+                    "footer-shaped payload + torn ledger tail must not be misread as SEALED");
+            assertTrue(Files.exists(ledgerPath()), "the OPEN chunk's ledger must not be deleted by a false sealed recovery");
+        }
+    }
+
+    @Test
     void missingSidecarFsyncOpenChunkRequiresFreshFenceBeforeAppend() throws Exception {
         byte[] payload = "acked-fsync".getBytes();
         ChunkStore store = new ChunkStore(dir);

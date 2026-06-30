@@ -2140,10 +2140,12 @@ public final class ChunkStore implements AutoCloseable {
 
     /**
      * A valid sealed trailer is the authoritative SEALED signal at recovery, but a retained straggler
-     * ledger must be reconciled: a real sealed chunk's ledger ends exactly at trailer.dataLength, while
-     * an OPEN chunk whose payload merely looks like a footer has a ledger covering the whole appended
-     * payload (strictly past dataLength). The footer/trailer of a real sealed chunk physically occupy
-     * [dataLength, EOF), so dataLength can never equal a footer-shaped chunk's full ledger coverage.
+     * ledger must be reconciled. A cleanly-sealed chunk's ledger was truncated to whole entries ending
+     * exactly at trailer.dataLength, with an INTACT last entry and no torn tail. An OPEN chunk whose
+     * payload merely looks like a footer has a longer ledger — and, crucially, the disambiguator must
+     * require the ledger to END CLEANLY at dataLength, not merely to CONTAIN an intact entry there: a
+     * torn last entry on a footer-shaped open chunk could leave the previous intact entry sitting exactly
+     * at the fake trailer's dataLength, which a backward scan would mistake for a clean seal (PR #37).
      */
     private boolean isSealedByTrailer(SealedProbe probe, Path ledgerPath) {
         if (probe == null) {
@@ -2152,29 +2154,30 @@ public final class ChunkStore implements AutoCloseable {
         if (!Files.exists(ledgerPath)) {
             return true;
         }
-        return ledgerLastEndOffset(ledgerPath) == probe.trailer().dataLength();
+        return ledgerEndsCleanlyAt(ledgerPath, probe.trailer().dataLength());
     }
 
-    /** Highest endOffset among intact ledger entries, or -1 if none/unreadable (torn tail scanned back). */
-    private static long ledgerLastEndOffset(Path ledgerPath) {
+    /**
+     * True iff {@code ledgerPath} is a cleanly-terminated ledger whose LAST entry is intact and ends
+     * exactly at {@code dataLength}. A torn tail — a partial trailing entry (size not a whole multiple of
+     * the entry size) or a corrupt last entry — means the chunk was not cleanly sealed, so it must not
+     * read as sealed even if an EARLIER intact entry happens to hit dataLength. Unlike a backward scan,
+     * this does not skip a torn tail.
+     */
+    private static boolean ledgerEndsCleanlyAt(Path ledgerPath, long dataLength) {
         try {
-            long entries = Files.size(ledgerPath) / ChunkFormats.LEDGER_ENTRY_SIZE;
-            if (entries == 0) {
-                return -1;
+            long size = Files.size(ledgerPath);
+            if (size == 0 || size % ChunkFormats.LEDGER_ENTRY_SIZE != 0) {
+                return false;
             }
             byte[] buf = new byte[ChunkFormats.LEDGER_ENTRY_SIZE];
             try (FileChannel ch = FileChannel.open(ledgerPath, StandardOpenOption.READ)) {
-                for (long i = entries; i >= 1; i--) {
-                    readFully(ch, ByteBuffer.wrap(buf), (i - 1) * ChunkFormats.LEDGER_ENTRY_SIZE);
-                    ChunkFormats.LedgerEntry e = ChunkFormats.LedgerEntry.decodeOrNull(buf, 0);
-                    if (e != null) {
-                        return e.endOffset();
-                    }
-                }
+                readFully(ch, ByteBuffer.wrap(buf), size - ChunkFormats.LEDGER_ENTRY_SIZE);
             }
-            return -1;
+            ChunkFormats.LedgerEntry last = ChunkFormats.LedgerEntry.decodeOrNull(buf, 0);
+            return last != null && last.endOffset() == dataLength;
         } catch (IOException | RuntimeException e) {
-            return -1;
+            return false;
         }
     }
 
