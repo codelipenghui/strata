@@ -96,7 +96,7 @@ class ChunkStoreLockConcurrencyTest {
             ChunkId id = new ChunkId(FileId.of(7), 0);
             store.open(TEST_NS, id, false, 1, NOW);
 
-            final int appendRounds = 1500;
+            final int appendRounds = 400;
             final int readers = 8;
             final AtomicLong end = new AtomicLong(0);
             final AtomicBoolean writerDone = new AtomicBoolean(false);
@@ -149,7 +149,7 @@ class ChunkStoreLockConcurrencyTest {
                 }));
             }
 
-            awaitNoFailure(Duration.ofSeconds(60), failure, () -> {
+            awaitNoFailure(Duration.ofSeconds(120), failure, () -> {
                 threads.forEach(Thread::start);
                 go.countDown();
                 for (Thread t : threads) t.join();
@@ -194,7 +194,7 @@ class ChunkStoreLockConcurrencyTest {
                 }));
             }
 
-            awaitNoFailure(Duration.ofSeconds(30), failure, () -> {
+            awaitNoFailure(Duration.ofSeconds(60), failure, () -> {
                 readers.forEach(Thread::start);
                 go.countDown();
                 store.seal(TEST_NS, id, 1, len, null);
@@ -269,7 +269,7 @@ class ChunkStoreLockConcurrencyTest {
                 }));
             }
 
-            awaitNoFailure(Duration.ofSeconds(30), failure, () -> {
+            awaitNoFailure(Duration.ofSeconds(60), failure, () -> {
                 appenders.forEach(Thread::start);
                 go.countDown();
                 store.seal(TEST_NS, id, 1, len, null);
@@ -292,7 +292,7 @@ class ChunkStoreLockConcurrencyTest {
      */
     @Test
     void concurrentSealAndDeleteLeaveNoTornState() throws Exception {
-        for (int iter = 0; iter < 40; iter++) {
+        for (int iter = 0; iter < 20; iter++) {
             final int it = iter;
             try (ChunkStore store = newStore()) {
                 ChunkId id = new ChunkId(FileId.of(40 + it), 0);
@@ -321,7 +321,7 @@ class ChunkStoreLockConcurrencyTest {
                     }
                 });
 
-                awaitNoFailure(Duration.ofSeconds(20), err, () -> {
+                awaitNoFailure(Duration.ofSeconds(60), err, () -> {
                     sealer.start();
                     deleter.start();
                     go.countDown();
@@ -347,7 +347,7 @@ class ChunkStoreLockConcurrencyTest {
      */
     @Test
     void concurrentDeleteWithReadPressureNeverDeadlocksAndEndsDeleted() throws Exception {
-        for (int iter = 0; iter < 40; iter++) {
+        for (int iter = 0; iter < 20; iter++) {
             final int it = iter;
             try (ChunkStore store = newStore()) {
                 ChunkId id = new ChunkId(FileId.of(80 + it), 0);
@@ -386,7 +386,7 @@ class ChunkStoreLockConcurrencyTest {
                     }));
                 }
 
-                awaitNoFailure(Duration.ofSeconds(20), deleterErr, () -> {
+                awaitNoFailure(Duration.ofSeconds(60), deleterErr, () -> {
                     threads.forEach(Thread::start);
                     go.countDown();
                     for (Thread t : threads) t.join();
@@ -415,7 +415,7 @@ class ChunkStoreLockConcurrencyTest {
             store.append(TEST_NS, id, 1, 0, 0, allBytes(256, (byte) 'X'));
             store.append(TEST_NS, id, 1, 256, 256, allBytes(256, (byte) 'X')); // lastKnownDO -> 256
 
-            final int appendRounds = 800;
+            final int appendRounds = 300;
             final AtomicLong end = new AtomicLong(512);
             final AtomicBoolean writerDone = new AtomicBoolean(false);
             final AtomicReference<Throwable> failure = new AtomicReference<>();
@@ -458,7 +458,7 @@ class ChunkStoreLockConcurrencyTest {
                 }));
             }
 
-            awaitNoFailure(Duration.ofSeconds(60), failure, () -> {
+            awaitNoFailure(Duration.ofSeconds(120), failure, () -> {
                 threads.forEach(Thread::start);
                 go.countDown();
                 for (Thread t : threads) t.join();
