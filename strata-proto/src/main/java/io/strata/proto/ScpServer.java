@@ -15,6 +15,7 @@ import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.util.concurrent.GlobalEventExecutor;
+import io.strata.common.EnvConfig;
 import io.strata.common.ErrorCode;
 import io.strata.common.FailureInjector;
 import io.strata.common.ScpException;
@@ -41,9 +42,9 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class ScpServer implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ScpServer.class);
     private static final int DEFAULT_MAX_INFLIGHT_REQUESTS =
-            Integer.getInteger("strata.scp.server.maxInflightRequests", 1024);
+            EnvConfig.intEnv("STRATA_SCP_MAX_INFLIGHT_REQUESTS", 1024);
     private static final long DEFAULT_MAX_INFLIGHT_BYTES =
-            Long.getLong("strata.scp.server.maxInflightBytes", 1L << 30);
+            EnvConfig.longEnv("STRATA_SCP_MAX_INFLIGHT_BYTES", 1L << 30);
 
     /**
      * Handles one request frame; returns the response frame. Throw ScpException for protocol errors.
