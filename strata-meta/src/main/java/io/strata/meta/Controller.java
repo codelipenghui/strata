@@ -77,7 +77,8 @@ public final class Controller implements AutoCloseable {
         ScpServer openedServer = null;
         try {
             openedStore = new ZkMetadataStore(config.zkConnect(),
-                    config.zkSessionTimeoutMs(), config.zkConnectionTimeoutMs());
+                    config.zkSessionTimeoutMs(), config.zkConnectionTimeoutMs(),
+                    config.zkRetryBaseMs(), config.zkRetryMaxRetries());
             UUID serviceId = UUID.randomUUID();
 
             if (embedded) {

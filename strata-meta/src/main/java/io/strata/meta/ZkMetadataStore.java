@@ -67,11 +67,16 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     public ZkMetadataStore(String zkConnect, int sessionTimeoutMs, int connectionTimeoutMs) {
+        this(zkConnect, sessionTimeoutMs, connectionTimeoutMs, 100, 5);
+    }
+
+    public ZkMetadataStore(String zkConnect, int sessionTimeoutMs, int connectionTimeoutMs,
+                           int retryBaseMs, int retryMaxRetries) {
         this(CuratorFrameworkFactory.builder()
                 .connectString(zkConnect)
                 .sessionTimeoutMs(sessionTimeoutMs)
                 .connectionTimeoutMs(connectionTimeoutMs)
-                .retryPolicy(new ExponentialBackoffRetry(100, 5))
+                .retryPolicy(new ExponentialBackoffRetry(retryBaseMs, retryMaxRetries))
                 .build(), true, connectionTimeoutMs);
     }
 
