@@ -15,9 +15,11 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 
 import static io.strata.common.Checks.addChunkLength;
@@ -30,8 +32,12 @@ import static io.strata.common.Checks.addChunkLength;
  * seal point is EVICTED from the recovery set — sealing it would either fail or leave a short copy
  * in the descriptor.
  *
- * Tolerance: requires the file's configured ack quorum at the seal point. Bytes beyond the seal
- * point were never producer-acked; discarding them is correct.
+ * Tolerance: a batch above the durable floor is re-replicated to quorum when it could still have
+ * been producer-acked — i.e. it is held by an ackQuorum once the replicas we could not fence are
+ * counted as possible holders (§7.3 step 3 / issue #29). This preserves an acked batch whose other
+ * holder is merely unreachable, even when RF &gt; ackQuorum. A batch that — with every replica
+ * reachable — never reached ackQuorum (a never-acked dirty tail), and a divergent split, are
+ * truncated at the floor.
  */
 final class Recovery {
     private static final Logger log = LoggerFactory.getLogger(Recovery.class);
@@ -121,9 +127,11 @@ final class Recovery {
         ChunkId chunkId = chunk.chunkId();
 
         // 1. fence all reachable replicas; collect their state
+        int placedReplicas = 0;
         List<ReplicaState> reachable = new ArrayList<>();
         for (Messages.Replica r : chunk.replicas()) {
             if (r.endpoint().isEmpty()) continue;
+            placedReplicas++;
             try {
                 ByteBuffer h = appendPool.get(r.endpoint()).call(Opcode.FENCE,
                         new Messages.Fence(chunkId, writerEpoch, namespace).encode(), null, config.callTimeoutMs());
@@ -145,6 +153,12 @@ final class Recovery {
                     chunkId, reachable.size(), ackQuorum);
         }
         requireQuorum(chunkId, reachable, ackQuorum);
+
+        // Replicas we could not fence may still hold bytes we cannot see. A batch above the floor
+        // could therefore have reached ackQuorum (i.e. been producer-acked) even if fewer than
+        // ackQuorum reachable replicas hold it (issue #29). Captured before any later eviction so
+        // it counts only genuinely-unreachable replicas, not stale ones we inspected and dropped.
+        final int unreachableReplicas = placedReplicas - reachable.size();
 
         // The highest piggybacked DO is the recovery floor: bytes below it were quorum-durable.
         // A sealed replica shorter than this floor is not an authoritative mid-seal remnant; it
@@ -203,9 +217,10 @@ final class Recovery {
         // At each point, prefer the farthest valid continuation; a shorter valid boundary from
         // one replica must not block a larger intact append held by a quorum of replicas.
         while (true) {
-            Candidate candidate = bestContinuation(chunkId, reachable, boundaries, p, ackQuorum);
+            Candidate candidate = bestContinuation(chunkId, reachable, boundaries, p, ackQuorum,
+                    unreachableReplicas);
             if (candidate == null) {
-                break; // gap: nothing reachable holds these bytes — they were never quorum-acked
+                break; // no agreed continuation: a true gap, a torn/CRC-invalid tail, or a divergent split
             }
             long end = candidate.end();
             byte[] batch = candidate.bytes();
@@ -252,48 +267,72 @@ final class Recovery {
 
     private Candidate bestContinuation(ChunkId chunkId, List<ReplicaState> reachable,
                                        TreeMap<Long, List<LedgerCandidate>> boundaries, long p,
-                                       int ackQuorum) {
+                                       int ackQuorum, int unreachableReplicas) {
         Candidate best = null;
         for (var entry : boundaries.tailMap(p, false).entrySet()) {
             long end = entry.getKey();
+            // The CRC(s) a batch [p, end) is allowed to have, per any reachable replica's ledger.
+            Set<Integer> validCrcs = new HashSet<>();
             for (LedgerCandidate ledger : entry.getValue()) {
-                if (ledger.previousEnd() != p) continue;
-                Candidate candidate = quorumCandidate(chunkId, reachable, p, end,
-                        ledger.entry().payloadCrc(), ackQuorum);
-                if (candidate != null) {
-                    best = candidate;
-                    break;
+                if (ledger.previousEnd() == p) {
+                    validCrcs.add(ledger.entry().payloadCrc());
                 }
+            }
+            if (validCrcs.isEmpty()) continue;
+            Candidate candidate = agreedContinuation(chunkId, reachable, p, end, validCrcs, ackQuorum,
+                    unreachableReplicas);
+            if (candidate != null) {
+                best = candidate; // prefer the farthest agreed boundary
             }
         }
         return best;
     }
 
-    private Candidate quorumCandidate(ChunkId chunkId, List<ReplicaState> reachable, long from, long to,
-                                      int payloadCrc, int ackQuorum) {
+    /**
+     * Decides the batch {@code [from, to)} above the durable floor. A reachable replica contributes
+     * its bytes only if they match one of the batch's CRC-valid ledger entries, so torn/corrupt
+     * tails are ignored. Then:
+     * <ul>
+     *   <li>a byte-value held by {@code >= ackQuorum} reachable replicas wins outright, dropping any
+     *       divergent outlier (§14.6);</li>
+     *   <li>otherwise a SINGLE CRC-valid value (no competitor) is re-replicated to quorum ONLY if it
+     *       could still have been producer-acked — i.e. its holders plus the replicas we could not
+     *       fence reach {@code ackQuorum}. Under fence-before-recover + single-writer that surviving
+     *       copy is the one writer's authoritative content, so this preserves an acked batch whose
+     *       other holder is simply unreachable (issue #29) while still discarding a batch that, with
+     *       every replica reachable, provably never reached quorum (a never-acked dirty tail);</li>
+     *   <li>a genuine split — multiple distinct CRC-valid values, none reaching quorum — is rejected
+     *       so the seal stops at the floor rather than committing an arbitrary side.</li>
+     * </ul>
+     */
+    private Candidate agreedContinuation(ChunkId chunkId, List<ReplicaState> reachable, long from, long to,
+                                         Set<Integer> validCrcs, int ackQuorum, int unreachableReplicas) {
         List<CandidateCount> counts = new ArrayList<>();
         for (ReplicaState rs : reachable) {
             if (rs.end < to) continue;
             byte[] data = readRange(chunkId, rs, from, to);
-            if (data == null || Crc.of(data) != payloadCrc) {
+            if (data == null || !validCrcs.contains(Crc.of(data))) {
                 continue;
             }
+            boolean merged = false;
             for (CandidateCount candidate : counts) {
                 if (java.util.Arrays.equals(candidate.bytes, data)) {
-                    candidate.count++;
-                    if (candidate.count >= ackQuorum) {
+                    // an agreeing quorum wins outright, dropping any divergent outlier (§14.6)
+                    if (++candidate.count >= ackQuorum) {
                         return new Candidate(to, candidate.bytes);
                     }
-                    data = null;
+                    merged = true;
                     break;
                 }
             }
-            if (data != null) {
-                if (ackQuorum <= 1) {
-                    return new Candidate(to, data);
-                }
+            if (!merged) {
                 counts.add(new CandidateCount(data));
             }
+        }
+        // Below quorum: a single CRC-valid value (no competitor) is re-replicated only if it could
+        // still have been acked once the replicas we could not fence are counted as possible holders.
+        if (counts.size() == 1 && counts.get(0).count + unreachableReplicas >= ackQuorum) {
+            return new Candidate(to, counts.get(0).bytes);
         }
         return null;
     }
