@@ -309,30 +309,33 @@ public final class Controller implements AutoCloseable {
         return out;
     }
 
-    /** Metadata-log records appended ({@code rate()} = metadata-mutation ops/s); 0 under ZK. */
-    public long metadataLogAppendRecords() {
-        return store instanceof NamespaceLogMetadataStore log ? log.metrics().appendRecords() : 0L;
+    /**
+     * Per-namespace namespace-log counters for the namespaces this controller owns; empty under the ZK
+     * backend. Value is the fixed index order documented on {@code NamespaceLogMetrics.stats()}:
+     * [appendRecords, appendBytes, readRecords, readBytes, compactions, recoveries, reacquisitions,
+     * ownerChanges]. Drives the per-namespace write-log / read-log / compaction / owner-change panels;
+     * the global controller view is {@code sum without(namespace)}.
+     */
+    public java.util.Map<String, long[]> namespaceLogStats() {
+        return store instanceof NamespaceLogMetadataStore log ? log.metrics().stats() : java.util.Map.of();
     }
 
-    /** Metadata-log bytes appended ({@code rate()} = metadata write throughput); 0 under ZK. */
-    public long metadataLogAppendBytes() {
-        return store instanceof NamespaceLogMetadataStore log ? log.metrics().appendBytes() : 0L;
+    /** Namespaces this controller has namespace-log activity for — drives lazy per-namespace meter
+     *  registration without a snapshot allocation; empty under the ZK backend. */
+    public java.util.Set<String> namespaceLogNamespaces() {
+        return store instanceof NamespaceLogMetadataStore log ? log.metrics().namespaces() : java.util.Set.of();
     }
 
-    /** Metadata-log snapshot+roll compactions; cadence of open-log truncation; 0 under ZK. */
-    public long metadataLogCompactions() {
-        return store instanceof NamespaceLogMetadataStore log ? log.metrics().compactions() : 0L;
+    /** One per-namespace namespace-log counter by index (see {@link #namespaceLogStats}); 0 under ZK or if
+     *  absent. O(1) — bound per Micrometer FunctionCounter so each scrape avoids rebuilding the stats map. */
+    public long namespaceLogValue(String namespace, int index) {
+        return store instanceof NamespaceLogMetadataStore log ? log.metrics().value(namespace, index) : 0L;
     }
 
-    /** Namespace repositories (re)opened from a manifest; a spike = failover/restart churn; 0 under ZK. */
-    public long metadataLogRecoveries() {
-        return store instanceof NamespaceLogMetadataStore log ? log.metrics().recoveries() : 0L;
-    }
-
-    /** Stale-epoch meta-log re-acquisitions (a fenced append re-opened the namespace); a spike = ownership
-     *  contention / membership churn; 0 under ZK. */
-    public long metadataLogReacquisitions() {
-        return store instanceof NamespaceLogMetadataStore log ? log.metrics().reacquisitions() : 0L;
+    /** This controller's rendezvous endpoint identity — the {@code owner} label for the namespace-owner
+     *  gauge ({@code strata_controller_namespace_owner}); same value the latch advertises. */
+    public String localControllerEndpoint() {
+        return ownership.localEndpoint();
     }
 
     /** Consensus-root requests this service has issued against a {@code /strata} subtree, by op kind. */
@@ -442,6 +445,8 @@ public final class Controller implements AutoCloseable {
      * back to the global leader latch, so single-leader behavior is unchanged.
      */
     private void requireNamespaceOwner(StrataNamespace namespace) {
+        // Tag this request's metrics with its namespace (read back by ScpServer's request observer).
+        io.strata.proto.RequestContext.setNamespace(namespace.value());
         if (NamespaceLogBackend.isSystem(namespace)) {
             // Metadata-log system files live in the shared ZK root (CAS-guarded), so any node may serve
             // them — a non-controller owner writes its own namespace's metadata-log files here.

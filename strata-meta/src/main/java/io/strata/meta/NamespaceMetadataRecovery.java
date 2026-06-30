@@ -13,13 +13,13 @@ import java.util.Optional;
 final class NamespaceMetadataRecovery {
     private NamespaceMetadataRecovery() {}
 
-    record Recovered(NamespaceMetadataState state, long durableEndOffset) {}
+    record Recovered(NamespaceMetadataState state, long durableEndOffset, long recordsReplayed, long bytesRead) {}
 
     static Recovered recover(StrataNamespace namespace, NamespaceMetadataFileStore fileStore,
                              Optional<Records.NamespaceManifest> manifest) throws Exception {
         NamespaceMetadataState state = new NamespaceMetadataState(namespace);
         if (manifest.isEmpty()) {
-            return new Recovered(state, 0L); // never published — a fresh namespace
+            return new Recovered(state, 0L, 0L, 0L); // never published — a fresh namespace
         }
         Records.NamespaceManifest m = manifest.get();
         if (m.snapshotFileId().isPresent()) {
@@ -28,6 +28,8 @@ final class NamespaceMetadataRecovery {
             state.restore(snapshot);
         }
         long durableEnd = m.logStartOffset();
+        long recordsReplayed = 0;
+        long bytesRead = 0;
         if (m.logFileId().isPresent()) {
             // Replay the WHOLE open log file, not just up to publishedLogOffset: a fenced successor may
             // apply additional CRC-valid records already durable in the open tail (design §9).
@@ -37,7 +39,9 @@ final class NamespaceMetadataRecovery {
                 state.apply(r);
             }
             durableEnd = m.logStartOffset() + prefix.validBytes();
+            recordsReplayed = prefix.records().size();
+            bytesRead = prefix.validBytes();
         }
-        return new Recovered(state, durableEnd);
+        return new Recovered(state, durableEnd, recordsReplayed, bytesRead);
     }
 }

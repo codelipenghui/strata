@@ -295,14 +295,18 @@ public final class ScpServer implements AutoCloseable {
                         Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(e), 0), null));
                 handlerFailed = true;
             }
+            // The handler set the request's namespace (if any) into RequestContext during its synchronous
+            // decode, on this same connection-handler thread — read it now, before any async completion,
+            // and carry it into both the sync and async observe paths.
+            String ns = RequestContext.takeNamespace();
             if (respF.isDone() && !respF.isCompletedExceptionally()) {
-                observeRequest(req, startNanos, !handlerFailed);
+                observeRequest(req, startNanos, !handlerFailed, ns);
                 writeResponse(ctx, requireResponse(req, respF.join()), false, req); // fast path, no extra hop
             } else {
                 inFlightAsyncRequests.add(req);
                 respF.whenComplete((resp, err) -> {
                     inFlightAsyncRequests.remove(req);
-                    observeRequest(req, startNanos, err == null);
+                    observeRequest(req, startNanos, err == null, ns);
                     Frame frame = resp;
                     if (err != null) {
                         Throwable cause = err instanceof java.util.concurrent.CompletionException
@@ -316,13 +320,13 @@ public final class ScpServer implements AutoCloseable {
             }
         }
 
-        private void observeRequest(Frame req, long startNanos, boolean success) {
+        private void observeRequest(Frame req, long startNanos, boolean success, String namespace) {
             RequestObserver obs = requestObserver;
             if (obs == null) {
                 return;
             }
             Opcode op = Opcode.fromCode(req.opcode());
-            obs.observe(op != null ? op.name() : "unknown", System.nanoTime() - startNanos, success);
+            obs.observe(op != null ? op.name() : "unknown", namespace, System.nanoTime() - startNanos, success);
         }
 
         private void writeResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
