@@ -1,7 +1,7 @@
 # Expose hardcoded operational tuning knobs as configuration
 
 Date: 2026-06-29
-Status: Approved design (pending implementation plan)
+Status: Implemented
 
 ## Problem
 

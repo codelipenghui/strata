@@ -83,6 +83,32 @@ services:
       # (default false trades that local-crash durability for throughput). Even with it false,
       # recovery never loses acknowledged data: a sealed chunk's integrity ledger is retained until
       # the SEALED state is forced durable in the background.
+      #
+      # --- tuning knobs (defaults match current behaviour; uncomment to override) ---
+      # Proactive missing/corrupt-replica detection cadence (controller, default 2 s).
+      # Lower values accelerate repair convergence; higher reduces controller CPU under heavy load.
+      # STRATA_VERIFY_INTERVAL_MS: "2000"
+      # Maximum repair commands dispatched per node per heartbeat (controller, default 16).
+      # Raise on a fast network; lower to reduce repair bandwidth competition with writes.
+      # STRATA_CONTROLLER_MAX_COMMANDS_PER_HEARTBEAT: "16"
+      # Node→controller RPC timeout for REGISTER / HEARTBEAT / FETCH_CHUNK (data-node, default 10 s).
+      # Increase on high-latency networks; decrease to fail-fast in tight clusters.
+      # STRATA_CONTROL_CALL_TIMEOUT_MS: "10000"
+      # Repair pull granularity per FETCH_CHUNK request (data-node, default 4 MiB).
+      # Larger values improve throughput on fast links; smaller reduces memory pressure under many concurrent repairs.
+      # STRATA_REPAIR_FETCH_BYTES: "4194304"
+      # Maximum SCP frame size for both encode and decode (transport, default 64 MiB).
+      # Must be identical across all nodes and clients; raising allows larger single-RPC payloads.
+      # STRATA_MAX_FRAME_BYTES: "67108864"
+      # Netty worker threads for the SCP server (transport, default 0 = 2×cores).
+      # STRATA_SCP_SERVER_IO_THREADS: "0"
+      # Back-pressure window: maximum bytes of in-flight SCP requests accepted server-side (default 1 GiB).
+      # Reduce on memory-constrained nodes; raise if client throughput saturates the window under heavy load.
+      # STRATA_SCP_MAX_INFLIGHT_BYTES: "1073741824"
+      # Client retry deadline across owner redirects and failover (client, default 15 s).
+      # STRATA_CLIENT_CONTROLLER_RETRY_DEADLINE_MS: "15000"
+      # Per-namespace metrics refresh period (server, default 10 s).
+      # STRATA_METRICS_NS_REFRESH_INTERVAL_MS: "10000"
     volumes:
       - node1-data:/data
     depends_on:
