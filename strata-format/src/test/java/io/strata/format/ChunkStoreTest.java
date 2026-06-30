@@ -1855,14 +1855,22 @@ class ChunkStoreTest {
     }
 
     @Test
-    void chunkStateMetricsUseSynchronizedSnapshotOrVolatileState() throws Exception {
+    void chunkStateMetricsReadHandleStateUnderChunkLockOrVolatile() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
             Object handle = handle(store, id);
             Field state = handle.getClass().getDeclaredField("state");
             if (Modifier.isVolatile(state.getModifiers())) {
-                return;
+                return; // a volatile state field is also a safe publication — nothing to prove via the lock
             }
+
+            // Otherwise openChunks() must read each Handle.state under that handle's lock, which gives the
+            // same happens-before the old synchronized(h) did. Hold the lock and prove the metric read
+            // cannot complete until we release it.
+            Field lockField = handle.getClass().getDeclaredField("lock");
+            lockField.setAccessible(true);
+            java.util.concurrent.locks.ReentrantLock lock =
+                    (java.util.concurrent.locks.ReentrantLock) lockField.get(handle);
 
             AtomicReference<Integer> openCount = new AtomicReference<>();
             AtomicReference<Throwable> failure = new AtomicReference<>();
@@ -1874,13 +1882,17 @@ class ChunkStoreTest {
                 }
             }, "chunk-state-metric-reader");
 
-            synchronized (handle) {
+            lock.lock();
+            try {
                 reader.start();
-                waitFor(() -> reader.getState() == Thread.State.BLOCKED || !reader.isAlive(),
-                        "metric reader did not reach the handle state read");
-                assertTrue(reader.isAlive() && reader.getState() == Thread.State.BLOCKED,
-                        "openChunks() must synchronize on each handle or make Handle.state volatile");
+                // ReentrantLock parks the contending acquirer (AQS), so it reports WAITING (not BLOCKED).
+                waitFor(() -> reader.getState() == Thread.State.WAITING || !reader.isAlive(),
+                        "metric reader did not park on the chunk lock");
+                assertTrue(reader.isAlive() && reader.getState() == Thread.State.WAITING,
+                        "openChunks() must read Handle.state under the chunk lock or make Handle.state volatile");
                 assertEquals(null, openCount.get());
+            } finally {
+                lock.unlock();
             }
 
             reader.join(TimeUnit.SECONDS.toMillis(3));
