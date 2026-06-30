@@ -90,6 +90,21 @@ class ChunkStoreTest {
     }
 
     @Test
+    void appendStoresTheSuppliedDigestVerbatim() throws Exception {
+        try (ChunkStore store = newStore()) {
+            store.open(TEST_NS, id, false, 1, 1718000000000L);
+            // a digest that is deliberately NOT Crc.of(payload): proves the node stores the
+            // caller's value rather than recomputing its own.
+            int suppliedDigest = 0x1234_5678;
+            store.appendAsync(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("payload".getBytes()), suppliedDigest).join();
+
+            var entries = store.readLedger(TEST_NS, id, 0);
+            assertEquals(1, entries.size());
+            assertEquals(suppliedDigest, entries.get(0).payloadCrc());
+        }
+    }
+
+    @Test
     void verifyReportsPresentSealedFactsAndMissingAbsent() throws Exception {
         try (ChunkStore store = newStore()) {
             ChunkId present = new ChunkId(FileId.of(1), 0);

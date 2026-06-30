@@ -137,6 +137,26 @@ class DataNodeWireTest {
     }
 
     @Test
+    void appendStoresTheClientFramePayloadCrc() throws Exception {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
+             ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
+                    1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
+
+            byte[] payload = "client-computed".getBytes();
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
+                    ByteBuffer.wrap(payload), 5000);
+
+            ByteBuffer lh = client.call(Opcode.READ_LEDGER,
+                    new Messages.ReadLedger(id, 0, TEST_NS).encode(), null, 5000);
+            var ledger = Messages.ReadLedgerResp.decode(lh);
+            assertEquals(1, ledger.entries().size());
+            assertEquals(io.strata.common.Crc.of(ByteBuffer.wrap(payload)),
+                    ledger.entries().get(0).payloadCrc());
+        }
+    }
+
+    @Test
     void fullChunkLifecycleOverTheWire() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {

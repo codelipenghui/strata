@@ -37,7 +37,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             // covering group-commit force, while this connection keeps processing frames
             var m = Messages.Append.decode(req.headerSlice());
             return store.appendAsync(m.namespace(), m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
-                            req.payloadSlice())
+                            req.payloadSlice(), req.payloadCrc())
                     .thenApply(r -> ScpServer.ok(req, new Messages.AppendResp(r.endOffset()).encode(), null));
         }
         return java.util.concurrent.CompletableFuture.completedFuture(handle(req));

@@ -755,15 +755,13 @@ public final class ChunkStore implements AutoCloseable {
      * immediately for ack-on-replicate, after a covering group-commit force for ack-on-fsync.
      */
     public java.util.concurrent.CompletableFuture<AppendResult> appendAsync(
-            StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset, ByteBuffer payload) throws IOException {
+            StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset,
+            ByteBuffer payload, int payloadCrc) throws IOException {
         Handle h = lookup(ns, id);
-        // CRC the payload before taking the chunk monitor: the pass is state-independent and
-        // would otherwise serialize behind every other append to this chunk
-        // Crc.of(ByteBuffer) duplicates the buffer internally, so it leaves payload's position
-        // and limit intact — no need to allocate an outer duplicate here.
+        // payloadCrc is the writer's CRC32C over this payload, already verified by the frame decoder;
+        // the node stores it as the per-record digest and never originates its own.
         long t0 = System.nanoTime();
-        int payloadCrc = payload.hasRemaining() ? Crc.of(payload) : 0;
-        long tPayloadCrc = System.nanoTime();
+        long tPayloadCrc = t0;
         long newEnd;
         GroupCommitter committer;
         int len;
@@ -818,6 +816,14 @@ public final class ChunkStore implements AutoCloseable {
         }
         long end = newEnd;
         return committer.awaitFlush(end).thenApply(v -> new AppendResult(end));
+    }
+
+    /** Convenience for tests/simple callers without a precomputed digest: computes it then delegates. */
+    public java.util.concurrent.CompletableFuture<AppendResult> appendAsync(
+            StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset, ByteBuffer payload)
+            throws IOException {
+        return appendAsync(ns, id, epoch, baseOffset, durableOffset, payload,
+                payload.hasRemaining() ? Crc.of(payload) : 0);
     }
 
     /** Synchronous convenience (tests, simple callers); production append path uses appendAsync. */
