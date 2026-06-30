@@ -111,7 +111,7 @@ final class NettyFrameCodec {
                     FrameIO.checkPayloadCrc(payloadCrc, Crc.of(frame.nioBuffer(payloadIndex, payloadLen)));
                 }
                 out.add(Frame.fromOwnedBuffer(opcode, apiVersion, flags, correlationId,
-                        frame, headerIndex, headerLen, payloadIndex, payloadLen));
+                        frame, headerIndex, headerLen, payloadIndex, payloadLen, payloadCrc));
                 emitted = true;
             } finally {
                 if (!emitted) {
