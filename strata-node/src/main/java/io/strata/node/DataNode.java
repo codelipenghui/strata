@@ -63,7 +63,7 @@ public final class DataNode implements AutoCloseable {
         ControlLoop startedLoop = null;
         OrphanGc startedGc = null;
         try {
-            openedStore = new ChunkStore(config.dataDir().resolve("chunks"));
+            openedStore = new ChunkStore(config.dataDir().resolve("chunks"), config.chunkStoreConfig());
             DataNodeHandlers dataHandler = new DataNodeHandlers(openedStore, this);
             ScpServer.Handler handler = controllerHandler == null
                     ? dataHandler

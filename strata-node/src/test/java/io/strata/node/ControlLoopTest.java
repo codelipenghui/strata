@@ -804,6 +804,58 @@ class ControlLoopTest {
         }
     }
 
+    @Test
+    void fetchWholeFileUsesRepairFetchBytesFromConfig() throws Exception {
+        // Verify that repairFetchBytes from DataNodeConfig flows through to fetchWholeFile's
+        // over-fetch guard. With repairFetchBytes=512 a server response of 513 bytes must be
+        // rejected with CORRUPT_CHUNK, whereas the default (4 MiB) would accept it.
+        int customFetchBytes = 512;
+        DataNodeConfig customConfig = new DataNodeConfig(Path.of("."), 0, "127.0.0.1", null, List.of(),
+                "z", "r", "h", 1L << 20, 60_000, ConnectionPolicy.DEFAULT, -1,
+                0L, 0L, 0L, 0, 0, customFetchBytes, null);
+        long minLength = ChunkFormats.HEADER_SIZE + ChunkFormats.TRAILER_SIZE;
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
+             ScpServer source = new ScpServer(0, 77, 0, 0, req -> {
+                 // respond with customFetchBytes+1 payload: more than the configured limit
+                 return ScpServer.ok(req, new Messages.FetchResp(minLength, ChunkState.SEALED).encode(),
+                         ByteBuffer.wrap(new byte[customFetchBytes + 1]));
+             });
+             ScpClient client = new ScpClient("127.0.0.1", source.port(),
+                     ScpClient.KIND_DATA_NODE, "fetch-custom-limit-test")) {
+            ControlLoop loop = new ControlLoop(node, customConfig, node.store());
+            Path output = dir.resolve("custom-fetch-limit.chunk");
+            ScpException e = assertThrows(ScpException.class,
+                    () -> loop.fetchWholeFile(client, new Messages.ReplicateCmd(30,
+                            new ChunkId(FileId.of(20), 0), List.of(), (byte) 0, 0, 1, TEST_NS), output));
+            assertEquals(ErrorCode.CORRUPT_CHUNK, e.code(),
+                    "over-fetch guard must use config.repairFetchBytes() not a hardcoded constant");
+            assertTrue(e.getMessage().contains(String.valueOf(customFetchBytes)),
+                    "error message must reflect the configured fetch limit, not the old default");
+        }
+    }
+
+    @Test
+    void dataNodeBuildsChunkStoreWithConfiguredMaxRequestBytes() throws Exception {
+        // Verify that DataNode passes config.chunkStoreConfig() to ChunkStore so that
+        // maxRequestBytes is respected. A custom cap of 4 bytes must truncate a 10-byte read.
+        int cap = 4;
+        io.strata.format.ChunkStoreConfig smallCap = io.strata.format.ChunkStoreConfig.DEFAULT.withMaxRequestBytes(cap);
+        DataNodeConfig cfg = DataNodeConfig.standalone(dir).withChunkStoreConfig(smallCap);
+        try (DataNode node = new DataNode(cfg)) {
+            ChunkStore store = node.store();
+            ChunkId id = new ChunkId(FileId.of(99), 0);
+            byte[] data = "helloworld".getBytes(); // 10 bytes
+            store.open(TEST_NS, id, false, 1, 1L);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(data));
+            store.seal(TEST_NS, id, 1, data.length, null);
+
+            // read() caps at maxRequestBytes; requesting 10 bytes must get at most 4
+            var result = store.read(TEST_NS, id, 0, data.length);
+            assertTrue(result.bytes().length <= cap,
+                    "ChunkStore maxRequestBytes cap must be " + cap + " but read returned " + result.bytes().length + " bytes");
+        }
+    }
+
     private static DataNodeConfig config(ScpServer metaServer, int inventoryIntervalMs) {
         return config(List.of(endpoint(metaServer)), inventoryIntervalMs);
     }
