@@ -153,14 +153,9 @@ final class ServerMetrics {
 
         FunctionCounter.builder("strata_data_node_groupcommit_force", n, DataNode::fsyncForceCount)
                 .description("group-commit force()/fsync calls").register(reg);
-        FunctionCounter.builder("strata_data_node_append_ops", n, DataNode::appendOps)
-                .description("appended records (rate() = write ops/sec)").register(reg);
-        FunctionCounter.builder("strata_data_node_append_bytes", n, DataNode::appendBytes)
-                .description("appended payload bytes (rate() = write throughput)").register(reg);
-        FunctionCounter.builder("strata_data_node_read_ops", n, DataNode::readOps)
-                .description("client READ operations served (rate() = read ops/sec)").register(reg);
-        FunctionCounter.builder("strata_data_node_read_bytes", n, DataNode::readBytes)
-                .description("client READ payload bytes served (rate() = read throughput)").register(reg);
+        // append/read ops+bytes are now per-namespace (strata_data_node_{append,read}_{ops,bytes}_total
+        // carry a {namespace} tag) — registered lazily below as namespaces first see I/O. The fleet rollup
+        // is sum without(namespace)(...). Namespace is the data plane's primary metrics axis (design §3.3).
         FunctionCounter.builder("strata_data_node_background_flush", n, DataNode::backgroundFlushes)
                 .description("background-writeback fsyncs of open chunks").register(reg);
 
@@ -177,6 +172,42 @@ final class ServerMetrics {
                 .tag("event", "miss").register(reg);
         FunctionCounter.builder("strata_data_node_filechannel_cache", n, DataNode::channelCacheEvictions)
                 .tag("event", "eviction").register(reg);
+
+        // Per-namespace data throughput: register a function-counter per namespace as it first appears in
+        // namespaceIoStats(). Refreshed off a daemon timer because the namespace set changes at runtime; a
+        // counter is never deregistered once a namespace goes idle (its value freezes), so cardinality is
+        // bounded by namespaces ever seen on this node and counter semantics stay monotonic.
+        var refresh = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "data-node-ns-metrics");
+            t.setDaemon(true);
+            return t;
+        });
+        refresh.scheduleAtFixedRate(() -> registerNewDataNodeNamespaces(reg, n), 0, 10, TimeUnit.SECONDS);
+    }
+
+    private static final long[] EMPTY4 = new long[4];
+    private static final String[] DATA_NODE_NS_COUNTERS = {
+            "strata_data_node_append_ops", "strata_data_node_append_bytes",
+            "strata_data_node_read_ops", "strata_data_node_read_bytes"};
+
+    /**
+     * Idempotently registers the per-namespace data-throughput function-counters for any namespace now
+     * present in the node's I/O stats but not yet registered. Called by the refresh timer; also callable
+     * directly (tests) to register without waiting for a tick.
+     */
+    static void registerNewDataNodeNamespaces(MeterRegistry reg, DataNode n) {
+        for (String ns : n.namespaceIoStats().keySet()) {
+            for (int i = 0; i < DATA_NODE_NS_COUNTERS.length; i++) {
+                String name = DATA_NODE_NS_COUNTERS[i];
+                if (reg.find(name).tag("namespace", ns).functionCounter() == null) {
+                    final int idx = i;
+                    FunctionCounter.builder(name, n, x -> x.namespaceIoStats().getOrDefault(ns, EMPTY4)[idx])
+                            .tag("namespace", ns)
+                            .description("per-namespace data throughput (rate() = ops/s or bytes/s)")
+                            .register(reg);
+                }
+            }
+        }
     }
 
     /**

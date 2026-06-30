@@ -72,6 +72,12 @@ public final class ChunkStore implements AutoCloseable {
             new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong readBytes =
             new java.util.concurrent.atomic.AtomicLong();
+    // Per-namespace [appendOps, appendBytes, readOps, readBytes] for the namespace dashboard. A map of
+    // LongAdder quads — the data-path cost is one lock-free lookup + adder increment. The global counters
+    // above stay as the cluster rollup; ServerMetrics exports the per-namespace view and derives the fleet
+    // line as sum without(namespace).
+    private final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.LongAdder[]> nsIo =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.concurrent.atomic.AtomicLong backgroundFlushes =
             new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong sealedLedgerReclaims =
@@ -237,6 +243,19 @@ public final class ChunkStore implements AutoCloseable {
     /** Total client READ payload bytes served since start (drives read throughput via rate()). Only {@link #readRegion} updates this; {@link #readRegionForRecovery}, {@code read()}, and {@code fetch()} do not. */
     public long readBytes() {
         return readBytes.get();
+    }
+
+    private java.util.concurrent.atomic.LongAdder[] nsIoFor(StrataNamespace ns) {
+        return nsIo.computeIfAbsent(ns.value(), k -> new java.util.concurrent.atomic.LongAdder[]{
+                new java.util.concurrent.atomic.LongAdder(), new java.util.concurrent.atomic.LongAdder(),
+                new java.util.concurrent.atomic.LongAdder(), new java.util.concurrent.atomic.LongAdder()});
+    }
+
+    /** Per-namespace [appendOps, appendBytes, readOps, readBytes] snapshot for the namespace dashboard. */
+    public java.util.Map<String, long[]> namespaceIoStats() {
+        java.util.Map<String, long[]> out = new java.util.HashMap<>(nsIo.size());
+        nsIo.forEach((ns, a) -> out.put(ns, new long[]{a[0].sum(), a[1].sum(), a[2].sum(), a[3].sum()}));
+        return out;
     }
 
     /** Open (being-written) chunk count — best-effort snapshot for observability. */
@@ -800,6 +819,9 @@ public final class ChunkStore implements AutoCloseable {
             h.end = newEnd;
             appendOps.incrementAndGet();
             appendBytes.addAndGet(len);
+            var nsCounters = nsIoFor(ns);
+            nsCounters[0].increment();
+            nsCounters[1].add(len);
             committer = h.committer;
         }
         tUnlock = System.nanoTime();
@@ -918,6 +940,9 @@ public final class ChunkStore implements AutoCloseable {
                 // throughput). Recovery reads are internal control-plane traffic, not client reads.
                 readOps.incrementAndGet();
                 readBytes.addAndGet(n);
+                var nsCounters = nsIoFor(ns);
+                nsCounters[2].increment();
+                nsCounters[3].add(n);
             }
             long filePos = checkedAdd(DATA_START, offset, "chunk file offset");
             if (h.state != ChunkState.SEALED) {

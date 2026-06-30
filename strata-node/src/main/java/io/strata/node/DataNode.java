@@ -189,6 +189,11 @@ public final class DataNode implements AutoCloseable {
         return store.readBytes();
     }
 
+    /** Per-namespace [appendOps, appendBytes, readOps, readBytes] for the namespace dashboard. */
+    public java.util.Map<String, long[]> namespaceIoStats() {
+        return store.namespaceIoStats();
+    }
+
     public long backgroundFlushes() {
         return store.backgroundFlushes();
     }

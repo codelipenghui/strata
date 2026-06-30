@@ -2138,4 +2138,23 @@ class ChunkStoreTest {
             assertTrue(store.channelCacheEvictions() > 0, "eviction must have fired");
         }
     }
+
+    @Test
+    void perNamespaceIoCountersAccumulate() throws Exception {
+        try (ChunkStore store = newStore()) {
+            ChunkId c = new ChunkId(FileId.of(1), 0);
+            open(store, c, 1);
+            byte[] payload = "hello".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            store.appendAsync(TEST_NS, c, 1, 0, 0, ByteBuffer.wrap(payload)).join();
+            store.seal(TEST_NS, c, 1, payload.length, null);   // sealed → fully readable region
+            store.readRegion(TEST_NS, c, 0, Integer.MAX_VALUE);
+
+            long[] stats = store.namespaceIoStats().get("test");
+            assertNotNull(stats, "namespace must appear in namespaceIoStats after I/O");
+            assertEquals(1L, stats[0], "appendOps");
+            assertEquals(payload.length, stats[1], "appendBytes");
+            assertEquals(1L, stats[2], "readOps");
+            assertEquals(payload.length, stats[3], "readBytes");
+        }
+    }
 }
