@@ -258,7 +258,8 @@ final class ControlLoop implements AutoCloseable {
     }
 
     long fetchWholeFile(ScpClient src, Messages.ReplicateCmd cmd, Path output) throws IOException {
-        int fetchBytes = config != null ? config.repairFetchBytes() : 4 * 1024 * 1024;
+        int fetchBytes = config.repairFetchBytes();
+        int callTimeoutMs = config.controlCallTimeoutMs();
         long offset = 0;
         long fileLength = -1;
         long maxFileLength = maxRepairFileLength(cmd.expectedLength());
@@ -266,8 +267,7 @@ final class ControlLoop implements AutoCloseable {
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
             while (fileLength < 0 || offset < fileLength) {
                 var fetch = new Messages.FetchChunk(cmd.chunkId(), offset, fetchBytes, cmd.namespace());
-                var frame = src.callFrame(Opcode.FETCH_CHUNK, fetch.encode(), null,
-                        config != null ? config.controlCallTimeoutMs() : 10_000);
+                var frame = src.callFrame(Opcode.FETCH_CHUNK, fetch.encode(), null, callTimeoutMs);
                 Messages.FetchResp resp;
                 try {
                     ByteBuffer hb = frame.headerSlice();
