@@ -10,7 +10,7 @@ public record ConnectionPolicy(
         int reconnectMaxBackoffMs
 ) {
     public static final ConnectionPolicy DEFAULT = new ConnectionPolicy(
-            5_000,
+            EnvConfig.intEnv("STRATA_SCP_CONNECT_TIMEOUT_MS", 5_000),
             10_000,
             2_000,
             60_000,

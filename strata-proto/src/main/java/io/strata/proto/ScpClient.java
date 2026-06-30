@@ -51,7 +51,7 @@ public final class ScpClient implements AutoCloseable {
     private final Messages.HelloResp serverHello;
 
     public ScpClient(String host, int port, byte clientKind, String clientId) throws IOException {
-        this(host, port, clientKind, clientId, 5_000);
+        this(host, port, clientKind, clientId, io.strata.common.ConnectionPolicy.DEFAULT.connectTimeoutMs());
     }
 
     public ScpClient(String host, int port, byte clientKind, String clientId, int connectTimeoutMs) throws IOException {
