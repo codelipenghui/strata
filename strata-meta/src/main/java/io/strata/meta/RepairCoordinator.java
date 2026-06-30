@@ -674,7 +674,7 @@ class RepairCoordinator implements AutoCloseable {
                 continue;
             }
             if (NamespaceLogBackend.isSystem(ns)) {
-                // metadata-log segments rarely change; verify them on the slower SYSTEM_VERIFY_INTERVAL_MS
+                // metadata-log segments rarely change; verify them on the slower systemVerifyIntervalMs
                 // cadence instead of every brisk pass. reconcile() + the node-death path still backstop loss.
                 if (lastSystemVerifyMs != 0 && now - lastSystemVerifyMs < systemVerifyIntervalMs) {
                     continue;
