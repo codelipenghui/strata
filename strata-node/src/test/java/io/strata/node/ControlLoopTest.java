@@ -80,7 +80,7 @@ class ControlLoopTest {
 
             loop.start();
             List<Thread> threads = get(loop, "threads");
-            assertEquals(3, threads.size());
+            assertEquals(2 + ControlLoop.COMMAND_PARALLELISM, threads.size()); // control + N cmd-exec + scrub
 
             loop.close();
             for (Thread thread : threads) {
@@ -505,6 +505,29 @@ class ControlLoopTest {
         worker.join(2_000);
 
         assertEquals(ErrorCode.INTERNAL.code, completed.peek().status());
+    }
+
+    @Test
+    void acceptCommandsNacksCommandsThatOverflowTheBoundedQueue() throws Exception {
+        ControlLoop loop = new ControlLoop(null, configWithoutMetadata(), null);
+        LinkedBlockingQueue<Messages.Command> q = get(loop, "commandQueue");
+        ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
+
+        int cap = q.remainingCapacity();
+        java.util.List<Messages.Command> fill = new java.util.ArrayList<>();
+        for (int i = 0; i < cap; i++) fill.add(new Messages.DrainCmd(1000 + i));
+        loop.acceptCommands(fill);
+        assertEquals(cap, q.size(), "the bounded queue should fill exactly to capacity");
+        assertTrue(completed.isEmpty(), "nothing overflows until the queue is full");
+
+        // two more commands cannot be queued → NACK'd as THROTTLED so the controller drops them from
+        // inflight and the next reconcile scan re-drives them (bounded backlog, no unbounded growth)
+        loop.acceptCommands(List.of(new Messages.DrainCmd(7777), new Messages.DrainCmd(7778)));
+        assertEquals(cap, q.size(), "queue stays bounded at capacity");
+        Map<Long, Short> byId = completed.stream().collect(Collectors.toMap(
+                Messages.CompletedCommand::commandId, Messages.CompletedCommand::status));
+        assertEquals(ErrorCode.THROTTLED.code, byId.get(7777L));
+        assertEquals(ErrorCode.THROTTLED.code, byId.get(7778L));
     }
 
     @Test

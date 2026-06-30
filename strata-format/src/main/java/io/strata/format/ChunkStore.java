@@ -5,6 +5,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.Closeables;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
+import io.strata.common.FailureInjector;
 import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
@@ -31,6 +32,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 import java.util.zip.CRC32C;
 
@@ -46,7 +48,10 @@ import static io.strata.format.ChunkFormats.writeFully;
  * Node-local chunk engine (tech design §5, §11): epoch-fenced appends, integrity-ledger crash
  * recovery, seal with node-computed CRC_RANGES/STATS, sealed-chunk import for repair.
  *
- * All mutations are synchronized per chunk handle. The data region is raw logical bytes —
+ * All mutations are serialized per chunk handle by a per-{@code Handle} {@link ReentrantLock}
+ * (NOT the intrinsic monitor: critical sections block on FileChannel I/O and the group-commit
+ * flusher join, and on Java 21 a virtual thread that blocks while holding {@code synchronized}
+ * pins its carrier — ReentrantLock unmounts cleanly). The data region is raw logical bytes —
  * this engine never parses payload content (invariant §14.10), not even during recovery.
  */
 public final class ChunkStore implements AutoCloseable {
@@ -298,8 +303,11 @@ public final class ChunkStore implements AutoCloseable {
     private int countByState(ChunkState state) {
         int n = 0;
         for (Handle h : chunks.values()) {
-            synchronized (h) {
+            h.lock.lock();
+            try {
                 if (h.state == state) n++;
+            } finally {
+                h.lock.unlock();
             }
         }
         return n;
@@ -325,33 +333,40 @@ public final class ChunkStore implements AutoCloseable {
      * the chunk by replaying the ledger. Removing the ledger before the SEALED state is durable would
      * make recovery truncate acknowledged data to zero (C1). So this re-establishes the seal-time
      * durability ordering off the seal hot path: force the data (footer/trailer), then force the
-     * SEALED sidecar, and only THEN unlink the ledger. The data force runs outside the chunk monitor
-     * (it is slow); the monitor is held only to snapshot and to finish. Package-private so tests can
+     * SEALED sidecar, and only THEN unlink the ledger. The data force runs outside the chunk lock
+     * (it is slow); the lock is held only to snapshot and to finish. Package-private so tests can
      * drive a round deterministically.
      */
     void reclaimSealedLedgersOnce() {
         for (Handle h : chunks.values()) {
             FileChannel data;
-            synchronized (h) {
+            h.lock.lock();
+            try {
                 if (h.state != ChunkState.SEALED || !h.sealedLedgerPending) {
                     continue;
                 }
                 data = h.data;
+            } finally {
+                h.lock.unlock();
             }
             try {
                 data.force(false); // footer/trailer durable before the sidecar may claim SEALED on disk
             } catch (IOException | RuntimeException e) {
-                synchronized (h) {
+                h.lock.lock();
+                try {
                     if (chunks.get(h.nsKey) != h || h.data != data || !h.sealedLedgerPending) {
                         continue; // delete()/close() won the race after we snapshotted — not ours to log
                     }
+                } finally {
+                    h.lock.unlock();
                 }
                 log.warn("sealed-ledger reclaim of {} failed to force data (will retry)", h.id, e);
                 continue;
             }
             boolean reclaimed = false;
             try {
-                synchronized (h) {
+                h.lock.lock();
+                try {
                     if (chunks.get(h.nsKey) != h || h.data != data
                             || h.state != ChunkState.SEALED || !h.sealedLedgerPending) {
                         continue; // superseded after the force — leave it to the winner
@@ -361,6 +376,8 @@ public final class ChunkStore implements AutoCloseable {
                     h.sealedLedgerPending = false;
                     closeAndNullData(h);                // release the writable FD; reads use the cache
                     reclaimed = true;
+                } finally {
+                    h.lock.unlock();
                 }
                 forceDirectory(h.shardDir); // make the unlink durable (recovery's SEALED branch re-deletes otherwise)
             } catch (IOException | RuntimeException e) {
@@ -376,15 +393,16 @@ public final class ChunkStore implements AutoCloseable {
     /**
      * Best-effort writeback: fsync each OPEN, non-ack-on-fsync chunk that has accumulated at least
      * {@link #BG_FLUSH_THRESHOLD_BYTES} since its last background flush, bounding the dirty backlog a
-     * later seal must flush. The force runs OUTSIDE the chunk monitor (it is slow and safe to run
-     * concurrently with positional appends); the monitor is held only to read state and record
+     * later seal must flush. The force runs OUTSIDE the chunk lock (it is slow and safe to run
+     * concurrently with positional appends); the lock is held only to read state and record
      * progress. Package-private so tests can drive a round deterministically.
      */
     void backgroundFlushOnce() {
         for (Handle h : chunks.values()) {
             long flushTo;
             FileChannel data;
-            synchronized (h) {
+            h.lock.lock();
+            try {
                 // ack-on-fsync chunks already force continuously via their committer; sealed chunks are
                 // immutable and were forced at seal — neither needs background writeback
                 if (h.state != ChunkState.OPEN || h.committer != null) {
@@ -395,28 +413,36 @@ public final class ChunkStore implements AutoCloseable {
                 }
                 flushTo = h.end;
                 data = h.data;
+            } finally {
+                h.lock.unlock();
             }
             try {
                 data.force(false); // flushes all currently-dirty pages (>= flushTo)
             } catch (IOException | RuntimeException e) {
-                synchronized (h) {
+                h.lock.lock();
+                try {
                     if (chunks.get(h.nsKey) != h || h.state != ChunkState.OPEN || h.data != data) {
                         // delete()/close()/seal() won the race after we snapshotted the channel.
                         // The handle is no longer eligible for background writeback, so do not log
                         // and do not retry this stale closed channel every period.
                         continue;
                     }
+                } finally {
+                    h.lock.unlock();
                 }
                 log.warn("background writeback of {} failed (will retry)", h.id, e);
                 continue;
             }
             boolean credited = false;
-            synchronized (h) {
+            h.lock.lock();
+            try {
                 if (chunks.get(h.nsKey) == h && h.state == ChunkState.OPEN
                         && h.data == data && h.bgFlushedOffset < flushTo) {
                     h.bgFlushedOffset = flushTo;
                     credited = true;
                 }
+            } finally {
+                h.lock.unlock();
             }
             if (credited) {
                 backgroundFlushes.incrementAndGet();
@@ -427,6 +453,11 @@ public final class ChunkStore implements AutoCloseable {
     /* ---------------- per-chunk state ---------------- */
 
     private final class Handle {
+        // Serializes all access to this chunk's mutable state. Deliberately a ReentrantLock, NOT the
+        // intrinsic monitor: critical sections block on FileChannel I/O (write/force/open/truncate) and
+        // on the group-commit flusher join, and on Java 21 a virtual thread that blocks while holding
+        // `synchronized` pins its carrier. ReentrantLock unmounts cleanly; no wait/notify is used.
+        final ReentrantLock lock = new ReentrantLock();
         final ChunkId id;
         final StrataNamespace ns;
         final NsChunkId nsKey;  // pre-computed map key — avoids per-iteration allocation in background loops
@@ -438,6 +469,13 @@ public final class ChunkStore implements AutoCloseable {
         FileChannel data;
         IntegrityLedger ledger; // null once sealed
         GroupCommitter committer; // non-null only for OPEN ack-on-fsync chunks
+        // Set while seal() stops the committer OFF the chunk lock (the up-to-12s flusher join). The
+        // state is still OPEN during that window, so this flag is what makes the chunk un-appendable:
+        // appendAsync rejects when it is set, so no append can advance end / write bytes that the
+        // in-flight seal would then finalize inconsistently. A reversible in-memory flag, deliberately NOT
+        // a new ChunkState: a failed or lost-race seal must restore the chunk to clean OPEN+committer-running
+        // (delete() instead blocks appends with the *terminal* DELETING state). Never persisted.
+        boolean sealing;
         // SEAL_FSYNC=false leaves a sealed chunk's footer/sidecar unforced, so its ledger is retained
         // as the recovery safety net until reclaimSealedLedgersOnce() forces the SEALED state durable.
         boolean sealedLedgerPending;
@@ -471,7 +509,7 @@ public final class ChunkStore implements AutoCloseable {
         /**
          * Folds freshly-appended logical bytes into the running whole + range CRCs, rolling a range
          * CRC every CRC_RANGE_SIZE. Must be called in append order while holding this handle's
-         * monitor; {@code payload}'s position/limit are left untouched.
+         * lock; {@code payload}'s position/limit are left untouched.
          */
         void crcAccumulate(ByteBuffer payload) {
             ByteBuffer src = payload.duplicate();
@@ -743,7 +781,7 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    /** Closes and nulls a sealed Handle's writable data channel under its monitor. Caller holds the monitor. */
+    /** Closes and nulls a sealed Handle's writable data channel under its lock. Caller holds the lock. */
     private void closeAndNullData(Handle h) {
         if (h.data != null) {
             try {
@@ -785,7 +823,7 @@ public final class ChunkStore implements AutoCloseable {
     public java.util.concurrent.CompletableFuture<AppendResult> appendAsync(
             StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset, ByteBuffer payload) throws IOException {
         Handle h = lookup(ns, id);
-        // CRC the payload before taking the chunk monitor: the pass is state-independent and
+        // CRC the payload before taking the chunk lock: the pass is state-independent and
         // would otherwise serialize behind every other append to this chunk
         // Crc.of(ByteBuffer) duplicates the buffer internally, so it leaves payload's position
         // and limit intact — no need to allocate an outer duplicate here.
@@ -801,12 +839,15 @@ public final class ChunkStore implements AutoCloseable {
         long tLedger = tBeforeLock;
         long tRunningCrc = tBeforeLock;
         long tUnlock;
-        synchronized (h) {
+        h.lock.lock();
+        try {
             tLock = System.nanoTime();
             // fence check dominates the state check: a deposed writer must learn FENCED_EPOCH
             // (permanent death), never CHUNK_SEALED (which reads as "roll and continue")
             checkEpoch(h, epoch);
-            if (h.state != ChunkState.OPEN) throw new ScpException(ErrorCode.CHUNK_SEALED, id.toString());
+            // h.sealing: a seal is finalizing this chunk with the lock released for its committer stop;
+            // reject as if already sealed so no append slips into that window (see Handle.sealing).
+            if (h.state != ChunkState.OPEN || h.sealing) throw new ScpException(ErrorCode.CHUNK_SEALED, id.toString());
             h.writeEpoch = Math.max(h.writeEpoch, epoch);
             if (baseOffset != h.end) {
                 throw new ScpException(ErrorCode.OFFSET_GAP, "expected " + h.end + " got " + baseOffset, h.end);
@@ -825,7 +866,7 @@ public final class ChunkStore implements AutoCloseable {
             // Fold into the running whole + range CRCs ONLY after the data + ledger writes commit: a
             // throwing ledger.append must leave the accumulators (and h.end) untouched, or a same-offset
             // retry on this Handle would fold the same bytes twice and corrupt the seal-time snapshot.
-            // crcAccumulate is pure CPU under the monitor — it preserves append order and cannot throw.
+            // crcAccumulate is pure CPU under the lock — it preserves append order and cannot throw.
             h.crcAccumulate(payload);
             tRunningCrc = System.nanoTime();
             h.end = newEnd;
@@ -835,6 +876,8 @@ public final class ChunkStore implements AutoCloseable {
             nsCounters[0].increment();
             nsCounters[1].add(len);
             committer = h.committer;
+        } finally {
+            h.lock.unlock();
         }
         tUnlock = System.nanoTime();
         if (tUnlock - t0 > SLOW_APPEND_LOG_NANOS) {
@@ -892,7 +935,8 @@ public final class ChunkStore implements AutoCloseable {
         List<Integer> rangeCrcs;
         long lastKnownDO;
         Path dataPath;
-        synchronized (h) {
+        h.lock.lock();
+        try {
             if (h.state != ChunkState.SEALED) {
                 long end = h.currentEnd();
                 if (offset >= end) return new ReadResult(new byte[0], end, h.lastKnownDO);
@@ -905,6 +949,8 @@ public final class ChunkStore implements AutoCloseable {
             rangeCrcs = h.sealedRangeCrcs;
             lastKnownDO = h.lastKnownDO;
             dataPath = h.dataPath;
+        } finally {
+            h.lock.unlock();
         }
         if (offset >= sealedLength) return new ReadResult(new byte[0], sealedLength, lastKnownDO);
         int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), sealedLength - offset);
@@ -936,16 +982,25 @@ public final class ChunkStore implements AutoCloseable {
         requireNonNegative(offset, "read offset");
         requireNonNegative(maxBytes, "read maxBytes");
         Handle h = lookup(ns, id);
-        synchronized (h) {
-            long localEnd = h.currentEnd();
+        boolean sealed;
+        long localEnd;
+        long lastKnownDO;
+        long filePos;
+        int n;
+        Path dataPath;
+        NsChunkId nsKey;
+        h.lock.lock();
+        try {
+            localEnd = h.currentEnd();
+            lastKnownDO = h.lastKnownDO;
             long readableEnd = (h.state == ChunkState.SEALED || includeUndurableTail)
-                    ? localEnd : Math.min(localEnd, h.lastKnownDO);
+                    ? localEnd : Math.min(localEnd, lastKnownDO);
             if (offset >= readableEnd) {
-                return new ReadRegionResult(null, 0, 0, null, localEnd, h.lastKnownDO, null);
+                return new ReadRegionResult(null, 0, 0, null, localEnd, lastKnownDO, null);
             }
-            int n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), readableEnd - offset);
+            n = (int) Math.min(Math.min(maxBytes, MAX_REQUEST_BYTES), readableEnd - offset);
             if (n == 0) {
-                return new ReadRegionResult(null, 0, 0, null, localEnd, h.lastKnownDO, null);
+                return new ReadRegionResult(null, 0, 0, null, localEnd, lastKnownDO, null);
             }
             if (!includeUndurableTail) {
                 // observability: count client READ bytes served (mirrors append counters; drives read
@@ -956,49 +1011,76 @@ public final class ChunkStore implements AutoCloseable {
                 nsCounters[2].increment();
                 nsCounters[3].add(n);
             }
-            long filePos = checkedAdd(DATA_START, offset, "chunk file offset");
-            if (h.state != ChunkState.SEALED) {
-                if (includeUndurableTail) {
-                    // Recovery reads may inspect bytes above lastKnownDO. Keep them materialized and
-                    // verified under the chunk lock because that tail can be truncated by a later seal.
-                    byte[] out = new byte[n];
-                    readOpenVerified(h, offset, out);
-                    return new ReadRegionResult(null, 0, n, out, localEnd, h.lastKnownDO, null);
-                }
-                // Intentional fast client-read path: client READs are already clamped to lastKnownDO
-                // above, so they never expose the undurable tail that a concurrent seal may truncate.
-                // We do NOT re-run readOpenVerified here. Doing so would materialize and CRC the range
-                // under the chunk lock before sendfile, removing the throughput benefit for actively
-                // written segments. This means read-time detection of local rot in the durable prefix is
-                // deferred to verified read()/READ_RECOVERY paths, crash recovery, and sealed scrub.
-                // OPEN client fast path: independent transient READ FD, released by closing it.
-                FileChannel readChannel = FileChannel.open(h.dataPath, StandardOpenOption.READ);
-                try {
-                    return new ReadRegionResult(readChannel, filePos, n, null, localEnd, h.lastKnownDO,
-                            () -> closeQuietly(readChannel));
-                } catch (RuntimeException e) {
-                    closeQuietly(readChannel);
-                    throw e;
-                }
+            filePos = checkedAdd(DATA_START, offset, "chunk file offset");
+            if (h.state != ChunkState.SEALED && includeUndurableTail) {
+                // Recovery reads may inspect bytes above lastKnownDO. Keep them materialized and verified
+                // UNDER the chunk lock because that tail can be truncated by a later seal.
+                byte[] out = new byte[n];
+                readOpenVerified(h, offset, out);
+                return new ReadRegionResult(null, 0, n, out, localEnd, lastKnownDO, null);
             }
-            // SEALED: the data region is immutable (no further append/seal/truncate), so hand back a
-            // zero-copy region the transport streams via sendfile — the fast client read path. We do
-            // NOT re-verify range CRCs per read here: that forced a full CRC-range read + a 4 MiB
-            // allocation per request and serialized readers on the chunk lock (~20x slower, measured);
-            // integrity is covered by background scrub and the verified read()/fetch()/import paths. A
-            // concurrent delete only unlinks the path while this independent FD keeps the inode alive,
-            // so the deferred transfer is safe.
-            // SEALED: zero-copy region over an exclusive leased cache channel (never shared across readers —
-            // FileChannel is interruptible, so a shared FD would close for all on any reader's interrupt). The
-            // lease is released (returning the channel to the idle pool) when the response Frame closes.
-            ChannelCache.Lease lease = channelCache.acquire(h.nsKey, h.dataPath);
+            // Snapshot what the off-lock open needs. The bytes we will expose are stable once the lock is
+            // released: an OPEN client read is clamped to lastKnownDO (which no concurrent seal can truncate
+            // below), and a SEALED chunk's data region is immutable. So the blocking open/acquire below need
+            // not hold the chunk lock — keeping it off-lock stops a blocking open from serializing every
+            // other op on this chunk.
+            sealed = h.state == ChunkState.SEALED;
+            dataPath = h.dataPath;
+            nsKey = h.nsKey;
+        } finally {
+            h.lock.unlock();
+        }
+        // Test seam: lets a test delete + re-import this id in the window between the lock release and the
+        // off-lock open/acquire below, to exercise the post-open handle revalidation.
+        FailureInjector.point("format.readRegion.beforeOpen");
+        if (!sealed) {
+            // OPEN client fast path: independent transient READ FD, opened OFF the chunk lock. We do NOT
+            // re-run readOpenVerified here (it would materialize + CRC the range, removing the zero-copy
+            // throughput benefit); read-time rot detection in the durable prefix is deferred to the verified
+            // read()/READ_RECOVERY paths, crash recovery, and sealed scrub. A concurrent delete may unlink
+            // the file first → open throws the expected delete/read race; clients retry. The FD is released
+            // by closing it; the transport streams the region via sendfile.
+            FileChannel readChannel = FileChannel.open(dataPath, StandardOpenOption.READ);
             try {
-                return new ReadRegionResult(lease.channel(), filePos, n, null, localEnd, h.lastKnownDO,
-                        lease::release);
+                requireCurrentHandle(h, nsKey, id);
+                return new ReadRegionResult(readChannel, filePos, n, null, localEnd, lastKnownDO,
+                        () -> closeQuietly(readChannel));
             } catch (RuntimeException e) {
-                lease.release();
+                closeQuietly(readChannel);
                 throw e;
             }
+        }
+        // SEALED: the data region is immutable (no further append/seal/truncate), so hand back a zero-copy
+        // region the transport streams via sendfile. We do NOT re-verify range CRCs per read here: that
+        // forced a full CRC-range read + a 4 MiB allocation per request (~20x slower, measured); integrity
+        // is covered by background scrub and the verified read()/fetch()/import paths. The exclusive leased
+        // cache channel is acquired OFF the chunk lock (never shared across readers — FileChannel is
+        // interruptible, so a shared FD would close for all on any reader's interrupt). A concurrent delete
+        // only unlinks the path while this independent FD keeps the inode alive, so the deferred transfer is
+        // safe. The lease is released (returning the channel to the idle pool) when the response Frame closes.
+        ChannelCache.Lease lease = channelCache.acquire(nsKey, dataPath);
+        try {
+            requireCurrentHandle(h, nsKey, id);
+            return new ReadRegionResult(lease.channel(), filePos, n, null, localEnd, lastKnownDO,
+                    lease::release);
+        } catch (RuntimeException e) {
+            lease.release();
+            throw e;
+        }
+    }
+
+    /**
+     * Revalidates, after an off-lock open/acquire in {@link #readRegion}, that this handle is still the
+     * mapped one for its id. A delete + re-import for the same {@link NsChunkId} (same data path) in the
+     * window between the metadata snapshot and the open would otherwise bind the stale snapshot
+     * (length/state) to the freshly-replaced physical file. A {@code Handle} is in the map iff it has not
+     * been deleted, so an identity mismatch means the snapshot is stale: fail with CHUNK_NOT_FOUND and let
+     * the client retry — the same contract as opening an already-unlinked file. The verified read() path
+     * needs no equivalent: it CRC-checks the bytes against the snapshot, so a replaced file fails the check.
+     */
+    private void requireCurrentHandle(Handle h, NsChunkId nsKey, ChunkId id) {
+        if (chunks.get(nsKey) != h) {
+            throw new ScpException(ErrorCode.CHUNK_NOT_FOUND, id.toString());
         }
     }
 
@@ -1006,7 +1088,8 @@ public final class ChunkStore implements AutoCloseable {
 
     public FenceResult fence(StrataNamespace ns, ChunkId id, int fenceEpoch) throws IOException {
         Handle h = lookup(ns, id);
-        synchronized (h) {
+        h.lock.lock();
+        try {
             if (h.fenceEpoch == RECOVERY_FENCE_REQUIRED) {
                 if (fenceEpoch <= h.writeEpoch) {
                     throw new ScpException(ErrorCode.FENCED_EPOCH,
@@ -1019,6 +1102,8 @@ public final class ChunkStore implements AutoCloseable {
                 h.persistSidecar();
             }
             return new FenceResult(h.fenceEpoch, h.currentEnd(), h.lastKnownDO, h.state);
+        } finally {
+            h.lock.unlock();
         }
     }
 
@@ -1027,9 +1112,12 @@ public final class ChunkStore implements AutoCloseable {
 
     public StatResult stat(StrataNamespace ns, ChunkId id) {
         Handle h = lookup(ns, id);
-        synchronized (h) {
+        h.lock.lock();
+        try {
             return new StatResult(h.state, h.currentEnd(), h.lastKnownDO, h.writeEpoch, h.fenceEpoch,
                     h.sealedLength, h.dataCrc);
+        } finally {
+            h.lock.unlock();
         }
     }
 
@@ -1044,7 +1132,10 @@ public final class ChunkStore implements AutoCloseable {
         // destroys the chunk HEADER before anything throws — reject at the boundary
         requireNonNegative(dataLength, "seal dataLength");
         Handle h = lookup(ns, id);
-        synchronized (h) {
+        GroupCommitter committerToStop = null;
+        SealPrep prep = null;
+        h.lock.lock();
+        try {
             checkEpoch(h, epoch);
             if (h.state == ChunkState.SEALED) {
                 if (h.sealedLength == dataLength) return new SealResult(h.sealedLength, h.dataCrc); // idempotent
@@ -1062,100 +1153,156 @@ public final class ChunkStore implements AutoCloseable {
                 throw new ScpException(ErrorCode.INTERNAL,
                         "seal below durable watermark: " + dataLength + " < " + h.lastKnownDO, h.lastKnownDO);
             }
-            CallerSections caller = readCallerSections(callerSections);
-            int callerCount = caller.count();
-            byte[] callerBytes = caller.bytes();
-
-            // Node-computed sections are deterministic, so replicas stay byte-identical. Compute
-            // them before stopping the fsync committer; caller validation or read verification
-            // failures must leave an OPEN ack-on-fsync chunk with its committer still running.
-            // Common path: seal at the live end — emit the CRCs accumulated during append, no re-read.
-            // A truncating seal (dataLength < end, e.g. after recovery) can't use the running state.
-            long t0 = System.nanoTime();
-            CrcScan scan = dataLength == h.end ? h.snapshotRunningCrcs() : scanDataCrcs(h.data, dataLength);
-            long tCrc = System.nanoTime();
-            int ledgerEntryCount = ledgerEntriesThrough(h.ledger, dataLength);
-            long tLedgerCount = System.nanoTime();
-
-            // stop the group committer BEFORE truncating: its flusher must not race the truncate,
-            // and its final force drains any remaining waiters
-            h.stopCommitter();
-            long tCommitter = System.nanoTime();
-            if (dataLength < h.end) {
-                h.data.truncate(checkedAdd(DATA_START, dataLength, "chunk file offset"));
-                h.ledger.truncateTo(dataLength);
-                h.end = dataLength;
+            if (h.state == ChunkState.DELETING) {
+                // a concurrent delete is tearing this chunk down; it is no longer sealable
+                throw new ScpException(ErrorCode.CHUNK_NOT_FOUND, id.toString());
             }
-            long tTruncate = System.nanoTime();
-
-            ByteBuffer crcRanges = ByteBuffer.allocate(4 + 4 + scan.rangeCrcs.size() * 4);
-            crcRanges.putInt(ChunkFormats.CRC_RANGE_SIZE).putInt(scan.rangeCrcs.size());
-            for (int c : scan.rangeCrcs) crcRanges.putInt(c);
-            byte[] stats = ByteBuffer.allocate(12).putLong(dataLength).putInt(ledgerEntryCount).array();
-
-            int footerLen = callerBytes.length
-                    + ChunkFormats.sectionSize(crcRanges.array())
-                    + ChunkFormats.sectionSize(stats);
-            ByteBuffer footer = ByteBuffer.allocate(footerLen);
-            footer.put(callerBytes);
-            ChunkFormats.writeSection(footer, ChunkFormats.SECTION_CRC_RANGES, crcRanges.array());
-            ChunkFormats.writeSection(footer, ChunkFormats.SECTION_STATS, stats);
-            footer.flip();
-
-            long footerStart = checkedAdd(DATA_START, dataLength, "footer start");
-            int footerCrc = Crc.of(footer.duplicate());
-            ChunkFormats.Trailer trailer = new ChunkFormats.Trailer(dataLength, footerStart,
-                    callerCount + 2, 0, footerCrc, scan.dataCrc);
-            long tFooterBuild = System.nanoTime();
-
-            writeFully(h.data, footer.duplicate(), footerStart);
-            writeFully(h.data, ByteBuffer.wrap(trailer.encode()),
-                    checkedAdd(footerStart, footerLen, "trailer offset"));
-            long tWrite = System.nanoTime();
-            if (sealFsync) {
-                h.data.force(false);
+            if (h.sealing) {
+                // another seal is finalizing this chunk in its off-lock committer-stop window; reject so
+                // two sealers never both own it. A retry will observe SEALED and get the idempotent result.
+                throw new ScpException(ErrorCode.CHUNK_SEALED, "seal already in progress for " + id);
             }
-            long tForce = System.nanoTime();
-
-            h.state = ChunkState.SEALED;
-            h.sealedLength = dataLength;
-            h.dataCrc = scan.dataCrc;
-            h.sealedRangeCrcs = List.copyOf(scan.rangeCrcs);
-            h.lastKnownDO = dataLength;
-            h.persistSidecar(sealFsync);
-            long tSidecar = System.nanoTime();
-            h.ledger.close();
-            long tLedgerClose = System.nanoTime();
-            Path ledgerPath = h.ledgerPath;
-            h.ledger = null;
-            if (sealFsync) {
-                // data + sidecar were just forced durable above, so the SEALED state is recoverable
-                // from the trailer without the ledger — drop it now.
-                deleteLedgerAsync(id, ledgerPath);
-                // sealed + durable: release the writable FD; reads now go through the channel cache.
-                closeAndNullData(h);
-            } else {
-                // SEAL_FSYNC=false left the footer/sidecar only in the page cache, so a crash can leave
-                // a stale OPEN sidecar on disk. Recovery's OPEN branch rebuilds from the ledger, so the
-                // ledger must outlive the unforced SEALED state: retain it until reclaimSealedLedgersOnce()
-                // has forced the SEALED state durable. Deleting it here loses acknowledged data (C1).
-                h.sealedLedgerPending = true;
+            // Validate the caller footer + snapshot CRCs BEFORE stopping the committer: a caller-validation
+            // or read-verification failure must leave an OPEN ack-on-fsync chunk with its committer running.
+            prep = prepareSealLocked(h, callerSections, dataLength);
+            committerToStop = h.committer;
+            if (committerToStop == null) {
+                return finalizeSealLocked(h, id, dataLength, prep); // ack-on-replicate: nothing to drain off-lock
             }
-            long tLedgerDeleteEnqueue = System.nanoTime();
-            if (tLedgerDeleteEnqueue - t0 > SLOW_MUTATION_LOG_NANOS) {
-                log.info("slow seal {} len={}MiB phases(ms): crc={} ledgerCount={} stopCommitter={} "
-                                + "truncate={} footerBuild={} footerWrite={} dataFsync={} sidecarPersist={} "
-                                + "ledgerClose={} ledgerDeleteEnqueue={} total={}",
-                        id, dataLength >> 20, msBetween(t0, tCrc), msBetween(tCrc, tLedgerCount),
-                        msBetween(tLedgerCount, tCommitter), msBetween(tCommitter, tTruncate),
-                        msBetween(tTruncate, tFooterBuild), msBetween(tFooterBuild, tWrite),
-                        sealFsync ? msBetween(tWrite, tForce) : "-1.0",
-                        sealFsync ? msBetween(tForce, tSidecar) : "-1.0",
-                        msBetween(tSidecar, tLedgerClose), msBetween(tLedgerClose, tLedgerDeleteEnqueue),
-                        msBetween(t0, tLedgerDeleteEnqueue));
-            }
-            return new SealResult(dataLength, scan.dataCrc);
+            h.sealing = true; // enter the off-lock committer-stop window
+        } finally {
+            h.lock.unlock();
         }
+        // Phase B (off the chunk lock): drain + join the committer — the up-to-12s pole — so other ops on
+        // this chunk are not blocked, and no carrier is held, while a degraded fsync drains.
+        boolean confirmed = committerToStop.closeAndConfirm();
+        boolean poisoned = confirmed && committerToStop.isPoisoned();
+        h.lock.lock();
+        try {
+            if (!confirmed) {
+                h.sealing = false;
+                throw new IOException("group-commit flusher stuck for " + id + " — refusing to seal");
+            }
+            if (poisoned) {
+                h.sealing = false;
+                throw new IOException("group-commit flusher failed for " + id + " — refusing to seal");
+            }
+            if (h.state == ChunkState.DELETING || chunks.get(h.nsKey) != h) {
+                // a concurrent delete won the released-lock window; it owns teardown. Abort the seal.
+                h.sealing = false;
+                throw new ScpException(ErrorCode.CHUNK_NOT_FOUND, id.toString());
+            }
+            h.committer = null; // confirmed stopped above; detach before mutating files
+            try {
+                return finalizeSealLocked(h, id, dataLength, prep);
+            } finally {
+                h.sealing = false;
+            }
+        } finally {
+            h.lock.unlock();
+        }
+    }
+
+    private record SealPrep(CallerSections caller, CrcScan scan, int ledgerEntryCount) {}
+
+    /**
+     * Validates the caller footer and snapshots the seal CRCs + ledger count under the chunk lock,
+     * BEFORE the committer is stopped — a caller-validation or read-verification failure here must
+     * leave an OPEN ack-on-fsync chunk with its committer still running.
+     */
+    private SealPrep prepareSealLocked(Handle h, ByteBuffer callerSections, long dataLength) throws IOException {
+        CallerSections caller = readCallerSections(callerSections);
+        CrcScan scan = dataLength == h.end ? h.snapshotRunningCrcs() : scanDataCrcs(h.data, dataLength);
+        int ledgerEntryCount = ledgerEntriesThrough(h.ledger, dataLength);
+        return new SealPrep(caller, scan, ledgerEntryCount);
+    }
+
+    /**
+     * Finalizes a seal with the chunk lock held and the committer already stopped/absent: truncate the
+     * never-acked tail, write footer+trailer, optional fsync, publish SEALED.
+     */
+    private SealResult finalizeSealLocked(Handle h, ChunkId id, long dataLength, SealPrep prep) throws IOException {
+        int callerCount = prep.caller().count();
+        byte[] callerBytes = prep.caller().bytes();
+        CrcScan scan = prep.scan();
+        int ledgerEntryCount = prep.ledgerEntryCount();
+        long t0 = System.nanoTime();
+        // The committer is already stopped by the caller (off the lock for ack-on-fsync, or it never
+        // existed for ack-on-replicate), so no flusher can race the truncate/footer writes below.
+        long tCommitter = t0;
+        if (dataLength < h.end) {
+            h.data.truncate(checkedAdd(DATA_START, dataLength, "chunk file offset"));
+            h.ledger.truncateTo(dataLength);
+            h.end = dataLength;
+        }
+        long tTruncate = System.nanoTime();
+
+        ByteBuffer crcRanges = ByteBuffer.allocate(4 + 4 + scan.rangeCrcs.size() * 4);
+        crcRanges.putInt(ChunkFormats.CRC_RANGE_SIZE).putInt(scan.rangeCrcs.size());
+        for (int c : scan.rangeCrcs) crcRanges.putInt(c);
+        byte[] stats = ByteBuffer.allocate(12).putLong(dataLength).putInt(ledgerEntryCount).array();
+
+        int footerLen = callerBytes.length
+                + ChunkFormats.sectionSize(crcRanges.array())
+                + ChunkFormats.sectionSize(stats);
+        ByteBuffer footer = ByteBuffer.allocate(footerLen);
+        footer.put(callerBytes);
+        ChunkFormats.writeSection(footer, ChunkFormats.SECTION_CRC_RANGES, crcRanges.array());
+        ChunkFormats.writeSection(footer, ChunkFormats.SECTION_STATS, stats);
+        footer.flip();
+
+        long footerStart = checkedAdd(DATA_START, dataLength, "footer start");
+        int footerCrc = Crc.of(footer.duplicate());
+        ChunkFormats.Trailer trailer = new ChunkFormats.Trailer(dataLength, footerStart,
+                callerCount + 2, 0, footerCrc, scan.dataCrc);
+        long tFooterBuild = System.nanoTime();
+
+        writeFully(h.data, footer.duplicate(), footerStart);
+        writeFully(h.data, ByteBuffer.wrap(trailer.encode()),
+                checkedAdd(footerStart, footerLen, "trailer offset"));
+        long tWrite = System.nanoTime();
+        if (sealFsync) {
+            h.data.force(false);
+        }
+        long tForce = System.nanoTime();
+
+        h.state = ChunkState.SEALED;
+        h.sealedLength = dataLength;
+        h.dataCrc = scan.dataCrc;
+        h.sealedRangeCrcs = List.copyOf(scan.rangeCrcs);
+        h.lastKnownDO = dataLength;
+        h.persistSidecar(sealFsync);
+        long tSidecar = System.nanoTime();
+        h.ledger.close();
+        long tLedgerClose = System.nanoTime();
+        Path ledgerPath = h.ledgerPath;
+        h.ledger = null;
+        if (sealFsync) {
+            // data + sidecar were just forced durable above, so the SEALED state is recoverable
+            // from the trailer without the ledger — drop it now.
+            deleteLedgerAsync(id, ledgerPath);
+            // sealed + durable: release the writable FD; reads now go through the channel cache.
+            closeAndNullData(h);
+        } else {
+            // SEAL_FSYNC=false left the footer/sidecar only in the page cache, so a crash can leave
+            // a stale OPEN sidecar on disk. Recovery's OPEN branch rebuilds from the ledger, so the
+            // ledger must outlive the unforced SEALED state: retain it until reclaimSealedLedgersOnce()
+            // has forced the SEALED state durable. Deleting it here loses acknowledged data (C1).
+            h.sealedLedgerPending = true;
+        }
+        long tLedgerDeleteEnqueue = System.nanoTime();
+        if (tLedgerDeleteEnqueue - t0 > SLOW_MUTATION_LOG_NANOS) {
+            log.info("slow seal {} len={}MiB phases(ms): stopCommitter={} "
+                            + "truncate={} footerBuild={} footerWrite={} dataFsync={} sidecarPersist={} "
+                            + "ledgerClose={} ledgerDeleteEnqueue={} total={}",
+                    id, dataLength >> 20, msBetween(t0, tCommitter), msBetween(tCommitter, tTruncate),
+                    msBetween(tTruncate, tFooterBuild), msBetween(tFooterBuild, tWrite),
+                    sealFsync ? msBetween(tWrite, tForce) : "-1.0",
+                    sealFsync ? msBetween(tForce, tSidecar) : "-1.0",
+                    msBetween(tSidecar, tLedgerClose), msBetween(tLedgerClose, tLedgerDeleteEnqueue),
+                    msBetween(t0, tLedgerDeleteEnqueue));
+        }
+        return new SealResult(dataLength, scan.dataCrc);
     }
 
     private static String msBetween(long fromNs, long toNs) {
@@ -1250,9 +1397,12 @@ public final class ChunkStore implements AutoCloseable {
     public List<ChunkFormats.LedgerEntry> readLedger(StrataNamespace ns, ChunkId id, long fromOffset) {
         requireNonNegative(fromOffset, "ledger offset");
         Handle h = lookup(ns, id);
-        synchronized (h) {
+        h.lock.lock();
+        try {
             if (h.ledger == null) return List.of();
             return h.ledger.entriesAfter(fromOffset);
+        } finally {
+            h.lock.unlock();
         }
     }
 
@@ -1265,12 +1415,15 @@ public final class ChunkStore implements AutoCloseable {
         Handle h = lookup(ns, id);
         ChunkState state;
         Path dataPath;
-        synchronized (h) {
+        h.lock.lock();
+        try {
             if (h.state != ChunkState.SEALED) {
                 throw new ScpException(ErrorCode.INTERNAL, "fetch of non-sealed chunk " + id);
             }
             state = h.state;
             dataPath = h.dataPath;
+        } finally {
+            h.lock.unlock();
         }
         try (ChannelCache.Lease lease = channelCache.acquire(h.nsKey, dataPath)) {
             FileChannel data = lease.channel();
@@ -1440,48 +1593,58 @@ public final class ChunkStore implements AutoCloseable {
         Handle h = chunks.get(key);
         if (h == null && creating.contains(key)) return ErrorCode.INTERNAL;
         if (h == null) return ErrorCode.CHUNK_NOT_FOUND;
-        long tBeforeLock = System.nanoTime();
-        long tLock = tBeforeLock;
-        long tStopCommitter = tBeforeLock;
-        long tDataClose = tBeforeLock;
-        long tLedgerClose = tBeforeLock;
-        long tFileDelete = tBeforeLock;
-        long tDirForce = tBeforeLock;
-        long tRemove = tBeforeLock;
-        synchronized (h) {
-            tLock = System.nanoTime();
-            try {
-                h.state = ChunkState.DELETING;
-                h.stopCommitter();
-                tStopCommitter = System.nanoTime();
-                if (h.data != null) h.data.close();
-                tDataClose = System.nanoTime();
-                if (h.ledger != null) h.ledger.close();
-                tLedgerClose = System.nanoTime();
-                Files.deleteIfExists(h.dataPath);
-                Files.deleteIfExists(h.metaPath);
-                Files.deleteIfExists(h.ledgerPath);
-                tFileDelete = System.nanoTime();
-                if (sealFsync) {
-                    forceDirectory(h.shardDir);
-                }
-                tDirForce = System.nanoTime();
-                chunks.remove(key, h);
-                tRemove = System.nanoTime();
-            } catch (IOException e) {
-                log.warn("delete {} failed", id, e);
-                return ErrorCode.INTERNAL;
+        GroupCommitter committerToStop;
+        h.lock.lock();
+        try {
+            h.state = ChunkState.DELETING; // blocks appends/seal for the whole teardown
+            committerToStop = h.committer;
+            if (committerToStop == null) {
+                return deleteLocked(h, key, id, t0); // nothing to drain off-lock — tear down under the lock
             }
+        } finally {
+            h.lock.unlock();
+        }
+        // Phase B (off the chunk lock): drain + join the committer — the up-to-12s pole — so other ops on
+        // this chunk are not blocked while a degraded fsync drains.
+        if (!committerToStop.closeAndConfirm() || committerToStop.isPoisoned()) {
+            // flusher stuck/failed: a force may still be in flight, so we must NOT close/delete the files.
+            // Leave the chunk DELETING and visible so a later delete retries (mirrors the file-IO-failure path).
+            log.warn("delete {} — group-commit flusher did not stop cleanly; left for retry", id);
+            return ErrorCode.INTERNAL;
+        }
+        h.lock.lock();
+        try {
+            h.committer = null; // confirmed stopped above; safe to mutate files
+            return deleteLocked(h, key, id, t0);
+        } finally {
+            h.lock.unlock();
+        }
+    }
+
+    /**
+     * Closes and unlinks a chunk's files and removes it from the map, with the chunk lock held and the
+     * committer already stopped/absent. On I/O failure the chunk is left visible (state DELETING) so a
+     * later delete retries; idempotent, so a re-entrant delete after a partial failure re-runs cleanly.
+     */
+    private ErrorCode deleteLocked(Handle h, NsChunkId key, ChunkId id, long t0) {
+        try {
+            // committer already stopped by the caller (off-lock, or it never existed) — files are safe to mutate
+            if (h.data != null) h.data.close();
+            if (h.ledger != null) h.ledger.close();
+            Files.deleteIfExists(h.dataPath);
+            Files.deleteIfExists(h.metaPath);
+            Files.deleteIfExists(h.ledgerPath);
+            if (sealFsync) {
+                forceDirectory(h.shardDir);
+            }
+            chunks.remove(key, h);
+        } catch (IOException e) {
+            log.warn("delete {} failed", id, e);
+            return ErrorCode.INTERNAL;
         }
         channelCache.invalidate(key);
-        if (tRemove - t0 > SLOW_MUTATION_LOG_NANOS) {
-            log.info("slow delete {} phases(ms): preLookup={} lockWait={} stopCommitter={} dataClose={} "
-                            + "ledgerClose={} fileDelete={} dirFsync={} lockHeld={} total={}",
-                    id, msBetween(t0, tBeforeLock), msBetween(tBeforeLock, tLock),
-                    msBetween(tLock, tStopCommitter), msBetween(tStopCommitter, tDataClose),
-                    msBetween(tDataClose, tLedgerClose), msBetween(tLedgerClose, tFileDelete),
-                    sealFsync ? msBetween(tFileDelete, tDirForce) : "-1.0",
-                    msBetween(tLock, tRemove), msBetween(t0, tRemove));
+        if (System.nanoTime() - t0 > SLOW_MUTATION_LOG_NANOS) {
+            log.info("slow delete {} took {}ms", id, msBetween(t0, System.nanoTime()));
         }
         return ErrorCode.OK;
     }
@@ -1494,8 +1657,11 @@ public final class ChunkStore implements AutoCloseable {
     public List<ChunkSummary> describeChunks() {
         List<ChunkSummary> out = new ArrayList<>();
         for (Handle h : chunks.values()) {
-            synchronized (h) {
+            h.lock.lock();
+            try {
                 out.add(new ChunkSummary(h.ns, h.id, h.state, h.currentEnd(), h.dataCrc));
+            } finally {
+                h.lock.unlock();
             }
         }
         return out;
@@ -1519,9 +1685,12 @@ public final class ChunkStore implements AutoCloseable {
                 out.add(new VerifyResult(id, false, ChunkState.OPEN, 0, 0));
                 continue;
             }
-            synchronized (h) {
+            h.lock.lock();
+            try {
                 h.lastVerifiedAtMs = now;
                 out.add(new VerifyResult(id, true, h.state, h.currentEnd(), h.dataCrc));
+            } finally {
+                h.lock.unlock();
             }
         }
         return out;
@@ -1539,10 +1708,13 @@ public final class ChunkStore implements AutoCloseable {
     public List<SuspectChunk> orphanSuspects(long olderThanMs, long now) {
         List<SuspectChunk> out = new ArrayList<>();
         for (Handle h : chunks.values()) {
-            synchronized (h) {
+            h.lock.lock();
+            try {
                 if (h.state == ChunkState.SEALED && now - h.lastVerifiedAtMs >= olderThanMs) {
                     out.add(new SuspectChunk(h.ns, h.id));
                 }
+            } finally {
+                h.lock.unlock();
             }
         }
         return out;
@@ -1551,11 +1723,9 @@ public final class ChunkStore implements AutoCloseable {
     public long usedBytes() {
         long total = 0;
         for (Handle h : chunks.values()) {
-            synchronized (h) {
-                total += sizeIfExists(h.dataPath);
-                total += sizeIfExists(h.metaPath);
-                total += sizeIfExists(h.ledgerPath);
-            }
+            total += sizeIfExists(h.dataPath);
+            total += sizeIfExists(h.metaPath);
+            total += sizeIfExists(h.ledgerPath);
         }
         return total;
     }
@@ -1585,24 +1755,30 @@ public final class ChunkStore implements AutoCloseable {
             long sealedLength;
             int storedCrc;
             Path dataPath;
-            synchronized (h) {
+            h.lock.lock();
+            try {
                 if (h.state != ChunkState.SEALED) continue;
                 sealedLength = h.sealedLength;
                 storedCrc = h.dataCrc;
                 dataPath = h.dataPath;
+            } finally {
+                h.lock.unlock();
             }
             int actual;
             try (ChannelCache.Lease lease = channelCache.acquire(h.nsKey, dataPath)) {
                 actual = scanDataCrcs(lease.channel(), sealedLength).dataCrc();
             }
             if (actual != storedCrc) {
-                synchronized (h) {
+                h.lock.lock();
+                try {
                     if (h.state == ChunkState.SEALED && h.dataCrc == storedCrc) {
                         log.error("scrub: sealed chunk {} data rot — stored crc {} actual {}; "
                                 + "updating reported crc so the next owner verify re-repairs", h.id, storedCrc, actual);
                         h.dataCrc = actual;
                         corrupt++;
                     }
+                } finally {
+                    h.lock.unlock();
                 }
             }
         }
@@ -2116,7 +2292,8 @@ public final class ChunkStore implements AutoCloseable {
         }
         Throwable failure = null;
         for (Handle h : chunks.values()) {
-            synchronized (h) {
+            h.lock.lock();
+            try {
                 boolean mayCloseFiles = true;
                 if (h.committer != null) {
                     try {
@@ -2166,6 +2343,8 @@ public final class ChunkStore implements AutoCloseable {
                         failure = Closeables.suppress(failure, e);
                     }
                 }
+            } finally {
+                h.lock.unlock();
             }
         }
         channelCache.close();

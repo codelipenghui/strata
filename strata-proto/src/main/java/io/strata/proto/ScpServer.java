@@ -303,9 +303,16 @@ public final class ScpServer implements AutoCloseable {
                 observeRequest(req, startNanos, !handlerFailed, ns);
                 writeResponse(ctx, requireResponse(req, respF.join()), false, req); // fast path, no extra hop
             } else {
+                // Test seam: lets a test pause the request thread here to drive the close-vs-register
+                // race deterministically (connection closes after handleAsync returns but before the add).
+                FailureInjector.point("scp.handleRequest.beforeInflightAdd");
                 inFlightAsyncRequests.add(req);
                 respF.whenComplete((resp, err) -> {
-                    inFlightAsyncRequests.remove(req);
+                    if (!inFlightAsyncRequests.remove(req)) {
+                        // channelInactive (connection closed) or the close-race guard below already claimed
+                        // and released req — there is no open connection to answer, so stop here.
+                        return;
+                    }
                     observeRequest(req, startNanos, err == null, ns);
                     Frame frame = resp;
                     if (err != null) {
@@ -317,6 +324,14 @@ public final class ScpServer implements AutoCloseable {
                     }
                     writeResponse(ctx, requireResponse(req, frame), false, req);
                 });
+                // The connection can close between handleAsync returning and the add above; channelInactive
+                // would then drain inFlightAsyncRequests before req was in it, orphaning the request buffer.
+                // Re-check and claim it ourselves — remove() is the single-owner handoff across this path,
+                // channelInactive, and the whenComplete callback, so req is released exactly once.
+                if (!connectionOpen.get() && inFlightAsyncRequests.remove(req)) {
+                    releaseInbound(req);
+                    req.close();
+                }
             }
         }
 
