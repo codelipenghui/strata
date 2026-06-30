@@ -295,14 +295,25 @@ public final class ScpServer implements AutoCloseable {
                         Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(e), 0), null));
                 handlerFailed = true;
             }
+            // The handler set the request's namespace (if any) into RequestContext during its synchronous
+            // decode, on this same connection-handler thread — read it now, before any async completion,
+            // and carry it into both the sync and async observe paths.
+            String ns = RequestContext.takeNamespace();
             if (respF.isDone() && !respF.isCompletedExceptionally()) {
-                observeRequest(req, startNanos, !handlerFailed);
+                observeRequest(req, startNanos, !handlerFailed, ns);
                 writeResponse(ctx, requireResponse(req, respF.join()), false, req); // fast path, no extra hop
             } else {
+                // Test seam: lets a test pause the request thread here to drive the close-vs-register
+                // race deterministically (connection closes after handleAsync returns but before the add).
+                FailureInjector.point("scp.handleRequest.beforeInflightAdd");
                 inFlightAsyncRequests.add(req);
                 respF.whenComplete((resp, err) -> {
-                    inFlightAsyncRequests.remove(req);
-                    observeRequest(req, startNanos, err == null);
+                    if (!inFlightAsyncRequests.remove(req)) {
+                        // channelInactive (connection closed) or the close-race guard below already claimed
+                        // and released req — there is no open connection to answer, so stop here.
+                        return;
+                    }
+                    observeRequest(req, startNanos, err == null, ns);
                     Frame frame = resp;
                     if (err != null) {
                         Throwable cause = err instanceof java.util.concurrent.CompletionException
@@ -313,16 +324,24 @@ public final class ScpServer implements AutoCloseable {
                     }
                     writeResponse(ctx, requireResponse(req, frame), false, req);
                 });
+                // The connection can close between handleAsync returning and the add above; channelInactive
+                // would then drain inFlightAsyncRequests before req was in it, orphaning the request buffer.
+                // Re-check and claim it ourselves — remove() is the single-owner handoff across this path,
+                // channelInactive, and the whenComplete callback, so req is released exactly once.
+                if (!connectionOpen.get() && inFlightAsyncRequests.remove(req)) {
+                    releaseInbound(req);
+                    req.close();
+                }
             }
         }
 
-        private void observeRequest(Frame req, long startNanos, boolean success) {
+        private void observeRequest(Frame req, long startNanos, boolean success, String namespace) {
             RequestObserver obs = requestObserver;
             if (obs == null) {
                 return;
             }
             Opcode op = Opcode.fromCode(req.opcode());
-            obs.observe(op != null ? op.name() : "unknown", System.nanoTime() - startNanos, success);
+            obs.observe(op != null ? op.name() : "unknown", namespace, System.nanoTime() - startNanos, success);
         }
 
         private void writeResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,

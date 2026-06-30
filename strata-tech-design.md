@@ -413,9 +413,9 @@ interface StrataFile {
 }
 
 interface Appender extends AutoCloseable {
-  CompletableFuture<AppendAck> append(ByteBuffer data);
-      // pipelined; completes on quorum ack; AppendAck{long endOffset, long durableOffset}
-  long durableOffset();
+  CompletableFuture<Long> append(ByteBuffer data);
+      // pipelined; completes on quorum ack with this append's file-logical endOffset
+  long durableOffset();   // sole durable query: current quorum-acked HWM (monotonic, weaker than recovery-durable)
   CompletableFuture<SealInfo> seal(FooterSections sections);   // caller supplies index/snapshot sections
 }
 

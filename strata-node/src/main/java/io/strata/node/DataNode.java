@@ -173,20 +173,14 @@ public final class DataNode implements AutoCloseable {
         return store.fsyncForceCount();
     }
 
-    public long appendOps() {
-        return store.appendOps();
+    /** Namespaces that have seen I/O — drives lazy per-namespace meter registration. */
+    public java.util.Set<String> ioNamespaces() {
+        return store.ioNamespaces();
     }
 
-    public long appendBytes() {
-        return store.appendBytes();
-    }
-
-    public long readOps() {
-        return store.readOps();
-    }
-
-    public long readBytes() {
-        return store.readBytes();
+    /** One per-namespace I/O counter by index (0 appendOps, 1 appendBytes, 2 readOps, 3 readBytes); O(1). */
+    public long ioValue(String namespace, int index) {
+        return store.ioValue(namespace, index);
     }
 
     public long backgroundFlushes() {

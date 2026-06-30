@@ -525,7 +525,12 @@ class RecoveryTest {
     }
 
     @Test
-    void singleReplicaLedgerContinuationPastDurableFloorIsDiscarded() throws Exception {
+    void singleReplicaLedgerContinuationPastDurableFloorIsDiscardedWhenAllReplicasReachable() throws Exception {
+        // Counterpart to issue #29: when ALL placed replicas are reachable and only one holds the
+        // continuation above the floor, that batch could not have reached ackQuorum, so it was never
+        // producer-acked — recovery must discard it (seal at the floor), not manufacture a tail. The
+        // re-replicate path only fires when the unreachable replica count leaves room for the batch to
+        // have been acked on a holder we cannot see (see ackedTailSurvivesSingleHolderLossDuringSealRecovery).
         FileId fileId = FileId.of(19);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<Long> sealedFileLength = new AtomicReference<>();
@@ -547,6 +552,112 @@ class RecoveryTest {
                 assertEquals(0, sealedInfo.sealedLength());
                 assertEquals(0L, sealedFileLength.get());
                 assertFalse(laggingAppend.get());
+            }
+        }
+    }
+
+    @Test
+    void ackedTailSurvivesSingleHolderLossDuringSealRecovery() throws Exception {
+        // Issue #29 end-to-end shape: RF=3 / ackQuorum=2. The batch ending at 4 was acked on two
+        // holders; one of them (R2) is unreachable during recovery — a single node fault. Only the
+        // surviving holder R1 still proves the batch; R3 lags at the durable floor. Recovery must
+        // re-replicate the acked tail to R3 and seal at 4, not truncate to the floor (which would
+        // be a single-fault acked-data loss).
+        FileId fileId = FileId.of(37);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean laggingAppend = new AtomicBoolean();
+        byte[] data = new byte[] {1, 2, 3, 4};
+        int crc = Crc.of(data);
+
+        try (ScpServer holder = ledgerOrderingReplica(1, data.length,
+                     List.of(new Messages.LedgerEntry(data.length, crc, 1)), data, null);
+             ScpServer lagging = ledgerOrderingReplica(3, 0, List.of(), data, laggingAppend);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(holder)),
+                             new Messages.Replica(2, "127.0.0.1:1"),
+                             new Messages.Replica(3, endpoint(lagging))))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2);
+
+                assertEquals(4, sealedInfo.sealedLength(),
+                        "a producer-acked tail must survive a single holder loss");
+                assertEquals(4L, sealedFileLength.get());
+                assertTrue(laggingAppend.get(),
+                        "the surviving CRC-valid copy must be re-replicated to the lagging replica");
+            }
+        }
+    }
+
+    @Test
+    void conflictingSingleHolderContinuationsAboveFloorTruncateToFloor() throws Exception {
+        // PR #34 review: with one replica unreachable, two reachable replicas can each hold a CRC-valid
+        // but DIFFERENT continuation from the floor — R1 has A[0,4), R2 has B[0,8) with a different
+        // prefix. Neither has a reachable quorum. The reachability gate alone would let the farther
+        // B[0,8) through and graft B[4,8) onto R1's A prefix, then fail the seal with divergence.
+        // Recovery must treat conflicting continuations from the same floor as a divergent split and
+        // truncate at the floor instead.
+        FileId fileId = FileId.of(39);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean r1Grafted = new AtomicBoolean();
+        byte[] a = new byte[] {1, 1, 1, 1};
+        byte[] b = new byte[] {2, 2, 2, 2, 2, 2, 2, 2};
+
+        try (ScpServer r1 = ledgerOrderingReplica(1, a.length,
+                     List.of(new Messages.LedgerEntry(a.length, Crc.of(a), 1)), a, r1Grafted);
+             ScpServer r2 = ledgerOrderingReplica(2, b.length,
+                     List.of(new Messages.LedgerEntry(b.length, Crc.of(b), 1)), b, null);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(r1)),
+                             new Messages.Replica(2, endpoint(r2)),
+                             new Messages.Replica(3, "127.0.0.1:1")))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2);
+
+                assertEquals(0, sealedInfo.sealedLength(),
+                        "conflicting single-holder continuations must truncate at the floor");
+                assertEquals(0L, sealedFileLength.get());
+                assertFalse(r1Grafted.get(),
+                        "a conflicting longer continuation must not be grafted onto R1's prefix");
+            }
+        }
+    }
+
+    @Test
+    void divergentContinuationAboveFloorIsTruncatedNotCommitted() throws Exception {
+        // Safety counterpart to issue #29: a single CRC-valid copy above the floor is re-replicated,
+        // but a genuine divergent split (replicas hold DIFFERENT CRC-valid bytes for the same range,
+        // §14.6) must still be truncated to the floor — recovery must never silently pick one.
+        FileId fileId = FileId.of(38);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        byte[] a = new byte[] {1, 1, 1, 1};
+        byte[] b = new byte[] {2, 2, 2, 2};
+        byte[] c = new byte[] {3, 3, 3, 3};
+
+        try (ScpServer r1 = ledgerOrderingReplica(1, a.length,
+                     List.of(new Messages.LedgerEntry(a.length, Crc.of(a), 1)), a, null);
+             ScpServer r2 = ledgerOrderingReplica(2, b.length,
+                     List.of(new Messages.LedgerEntry(b.length, Crc.of(b), 1)), b, null);
+             ScpServer r3 = ledgerOrderingReplica(3, c.length,
+                     List.of(new Messages.LedgerEntry(c.length, Crc.of(c), 1)), c, null);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(r1)),
+                             new Messages.Replica(2, endpoint(r2)),
+                             new Messages.Replica(3, endpoint(r3))))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2);
+
+                assertEquals(0, sealedInfo.sealedLength(),
+                        "a divergent split above the floor must be truncated, not committed");
+                assertEquals(0L, sealedFileLength.get());
             }
         }
     }

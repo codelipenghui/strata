@@ -388,9 +388,9 @@
       "description": "configured controller membership"
     },
     {
-      "id": 10,
+      "id": 8,
       "type": "row",
-      "title": "Namespaces owned by this controller",
+      "title": "Controller requests (SCP)",
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -400,9 +400,9 @@
       "collapsed": false
     },
     {
-      "id": 11,
+      "id": 81,
       "type": "timeseries",
-      "title": "Files per namespace",
+      "title": "Controller request rate by opcode",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -415,20 +415,17 @@
       },
       "targets": [
         {
-          "expr": "strata_controller_namespace_files{instance=~\"$instance\"}",
+          "expr": "sum by (opcode)(rate(strata_scp_request_duration_seconds_count{instance=~\"$instance\",opcode=~\"CREATE_FILE|CREATE_CHUNK|ALLOCATE_WRITER_EPOCH|SEAL_CHUNK_META|ABORT_CHUNK_META|SEAL_FILE|LOOKUP_FILE|LOOKUP_PATH|DELETE_FILES|REGISTER_NODE|NODE_HEARTBEAT\"}[$__rate_interval]))",
           "refId": "A",
-          "legendFormat": "{{namespace}}"
+          "legendFormat": "{{opcode}}"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "ops",
           "custom": {
-            "fillOpacity": 20,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "normal"
-            }
+            "fillOpacity": 10,
+            "showPoints": "never"
           }
         }
       },
@@ -447,12 +444,12 @@
           "sort": "desc"
         }
       },
-      "description": "live files per namespace this controller owns"
+      "description": "controller SCP request rate by opcode for this controller (excludes data-plane ops + PING)"
     },
     {
-      "id": 12,
+      "id": 82,
       "type": "timeseries",
-      "title": "Metadata-log bytes per namespace",
+      "title": "Controller request p99 latency by opcode",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -465,20 +462,17 @@
       },
       "targets": [
         {
-          "expr": "strata_controller_namespace_log_bytes{instance=~\"$instance\"}",
+          "expr": "histogram_quantile(0.99, sum by (le,opcode)(rate(strata_scp_request_duration_seconds_bucket{instance=~\"$instance\",opcode=~\"CREATE_FILE|CREATE_CHUNK|ALLOCATE_WRITER_EPOCH|SEAL_CHUNK_META|ABORT_CHUNK_META|SEAL_FILE|LOOKUP_FILE|LOOKUP_PATH|DELETE_FILES|REGISTER_NODE|NODE_HEARTBEAT\"}[$__rate_interval])))",
           "refId": "A",
-          "legendFormat": "{{namespace}}"
+          "legendFormat": "{{opcode}}"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "bytes",
+          "unit": "s",
           "custom": {
-            "fillOpacity": 20,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "normal"
-            }
+            "fillOpacity": 10,
+            "showPoints": "never"
           }
         }
       },
@@ -497,7 +491,113 @@
           "sort": "desc"
         }
       },
-      "description": "open metadata-log size per owned namespace"
+      "description": "p99 controller request latency by opcode (incl. async waits)"
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Namespaces owned by this controller",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      },
+      "collapsed": false
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Files owned (this controller)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 15
+      },
+      "targets": [
+        {
+          "expr": "sum(strata_controller_namespace_files{instance=~\"$instance\"})",
+          "refId": "A",
+          "legendFormat": "files"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "live files this controller owns (sharding load); per-namespace: Strata \u2014 Namespace dashboard"
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Metadata-log bytes (this controller)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 15
+      },
+      "targets": [
+        {
+          "expr": "sum(strata_controller_namespace_log_bytes{instance=~\"$instance\"})",
+          "refId": "A",
+          "legendFormat": "bytes"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "open metadata-log bytes this controller owns; per-namespace: Strata \u2014 Namespace dashboard"
     },
     {
       "id": 20,
@@ -507,7 +607,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 14
+        "y": 23
       },
       "collapsed": false
     },
@@ -523,11 +623,11 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 15
+        "y": 24
       },
       "targets": [
         {
-          "expr": "sum(rate(strata_controller_log_append_records_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum(rate(strata_controller_namespace_log_append_records_total{instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "records/s"
         }
@@ -570,11 +670,11 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 15
+        "y": 24
       },
       "targets": [
         {
-          "expr": "sum(rate(strata_controller_log_append_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum(rate(strata_controller_namespace_log_append_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "bytes/s"
         }
@@ -616,16 +716,16 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 23
+        "y": 32
       },
       "targets": [
         {
-          "expr": "sum(rate(strata_controller_log_compactions_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum(rate(strata_controller_namespace_log_compactions_total{instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "compactions/s"
         },
         {
-          "expr": "sum(rate(strata_controller_log_recoveries_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum(rate(strata_controller_namespace_log_recoveries_total{instance=~\"$instance\"}[$__rate_interval]))",
           "refId": "B",
           "legendFormat": "recoveries/s"
         }
@@ -668,7 +768,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 23
+        "y": 32
       },
       "targets": [
         {
@@ -717,7 +817,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 31
+        "y": 40
       },
       "collapsed": false
     },
@@ -733,7 +833,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 41
       },
       "targets": [
         {
@@ -780,7 +880,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 41
       },
       "targets": [
         {
@@ -822,7 +922,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 40
+        "y": 49
       },
       "collapsed": false
     },
@@ -838,7 +938,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 41
+        "y": 50
       },
       "targets": [
         {
@@ -884,7 +984,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 41
+        "y": 50
       },
       "targets": [
         {

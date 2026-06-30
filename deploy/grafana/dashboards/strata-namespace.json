@@ -1,0 +1,1077 @@
+{
+  "uid": "strata-namespace",
+  "title": "Strata \u2014 Namespace",
+  "tags": [
+    "strata"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(strata_controller_namespace_files, namespace)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 1,
+        "label": "namespace"
+      }
+    ]
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "Strata dashboards",
+      "asDropdown": true,
+      "keepTime": true,
+      "includeVars": true,
+      "tags": [
+        "strata"
+      ],
+      "icon": "external link"
+    }
+  ],
+  "panels": [
+    {
+      "id": 2,
+      "type": "row",
+      "title": "Ownership \u2014 $namespace",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Current owner per namespace",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "strata_controller_namespace_owner{namespace=~\"$namespace\"}",
+          "refId": "A",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "__name__": true,
+              "role": true,
+              "job": true,
+              "instance": true
+            }
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true
+      },
+      "description": "the controller currently owning each namespace (=1 series, owner label)"
+    },
+    {
+      "id": 4,
+      "type": "state-timeline",
+      "title": "Owner over time",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "strata_controller_namespace_owner{namespace=~\"$namespace\"}",
+          "refId": "A",
+          "legendFormat": "{{namespace}} \u2192 {{owner}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 80
+          }
+        }
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "description": "owner band per namespace; it flips when ownership moves (a brief gap/overlap is the handoff)"
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Ownership changes/s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "expr": "sum by (namespace)(rate(strata_controller_namespace_owner_changes_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "cold repository acquisitions = ownership handoffs to a controller"
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Namespaces owned per controller",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "targets": [
+        {
+          "expr": "strata_controller_namespaces_loaded",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "namespaces each controller owns a live metadata-log repository for (sharding spread)"
+    },
+    {
+      "id": 7,
+      "type": "row",
+      "title": "Throughput \u2014 $namespace",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "collapsed": false
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Write throughput by namespace",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "targets": [
+        {
+          "expr": "sum by (namespace)(rate(strata_data_node_append_bytes_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "client write bytes/s per namespace (data plane)"
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Read throughput by namespace",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "targets": [
+        {
+          "expr": "sum by (namespace)(rate(strata_data_node_read_bytes_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "client read bytes/s per namespace (data plane)"
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Write ops/s by namespace",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "targets": [
+        {
+          "expr": "sum by (namespace)(rate(strata_data_node_append_ops_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "client append ops/s per namespace"
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Read ops/s by namespace",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "targets": [
+        {
+          "expr": "sum by (namespace)(rate(strata_data_node_read_ops_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "client read ops/s per namespace"
+    },
+    {
+      "id": 12,
+      "type": "row",
+      "title": "Latency \u2014 $namespace",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "collapsed": false
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Client data p99 (APPEND/READ) by namespace",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 35
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le,namespace)(rate(strata_scp_request_duration_seconds_bucket{namespace=~\"$namespace\",opcode=~\"APPEND|READ\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "p99 client data-op latency per namespace (incl. async durability wait)"
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Controller request p99 by namespace",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 35
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le,namespace)(rate(strata_scp_request_duration_seconds_bucket{namespace=~\"$namespace\",opcode=~\"CREATE_FILE|CREATE_CHUNK|LOOKUP_FILE|LOOKUP_PATH|SEAL_FILE|SEAL_CHUNK_META|ABORT_CHUNK_META|ALLOCATE_WRITER_EPOCH|DELETE_FILES|DELETE_PATH\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "p99 controller metadata-request latency per namespace"
+    },
+    {
+      "id": 15,
+      "type": "row",
+      "title": "Controller requests \u2014 $namespace",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "collapsed": false
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Controller request rate by opcode",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 44
+      },
+      "targets": [
+        {
+          "expr": "sum by (opcode)(rate(strata_scp_request_duration_seconds_count{namespace=~\"$namespace\",opcode=~\"CREATE_FILE|CREATE_CHUNK|LOOKUP_FILE|LOOKUP_PATH|SEAL_FILE|SEAL_CHUNK_META|ABORT_CHUNK_META|ALLOCATE_WRITER_EPOCH|DELETE_FILES|DELETE_PATH\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{opcode}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "controller request rate by opcode for the selected namespace(s)"
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Controller error rate by opcode",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 44
+      },
+      "targets": [
+        {
+          "expr": "sum by (opcode)(rate(strata_scp_request_duration_seconds_count{namespace=~\"$namespace\",opcode=~\"CREATE_FILE|CREATE_CHUNK|LOOKUP_FILE|LOOKUP_PATH|SEAL_FILE|SEAL_CHUNK_META|ABORT_CHUNK_META|ALLOCATE_WRITER_EPOCH|DELETE_FILES|DELETE_PATH\",status=\"error\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{opcode}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "controller failed-request rate by opcode (status=error)"
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "Namespace log \u2014 $namespace",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      },
+      "collapsed": false
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Write-log records/s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 53
+      },
+      "targets": [
+        {
+          "expr": "sum by (namespace)(rate(strata_controller_namespace_log_append_records_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "metadata-log records appended per namespace (write-log mutation rate)"
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Write-log throughput",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 53
+      },
+      "targets": [
+        {
+          "expr": "sum by (namespace)(rate(strata_controller_namespace_log_append_bytes_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "metadata-log bytes appended per namespace (write-log throughput)"
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Read-log replay records/s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
+      "targets": [
+        {
+          "expr": "sum by (namespace)(rate(strata_controller_namespace_log_read_records_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "metadata-log records replayed during recovery per namespace (read-log)"
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Read-log replay throughput",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "targets": [
+        {
+          "expr": "sum by (namespace)(rate(strata_controller_namespace_log_read_bytes_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "metadata-log bytes replayed during recovery per namespace (read-log)"
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Compactions & recoveries/s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 69
+      },
+      "targets": [
+        {
+          "expr": "sum by (namespace)(rate(strata_controller_namespace_log_compactions_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{namespace}} compactions"
+        },
+        {
+          "expr": "sum by (namespace)(rate(strata_controller_namespace_log_recoveries_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "{{namespace}} recoveries"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "snapshot+roll compactions and repository recoveries per namespace"
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Reacquisitions & owner changes/s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 69
+      },
+      "targets": [
+        {
+          "expr": "sum by (namespace)(rate(strata_controller_namespace_log_reacquisitions_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{namespace}} reacquire"
+        },
+        {
+          "expr": "sum by (namespace)(rate(strata_controller_namespace_owner_changes_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "{{namespace}} owner-change"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "stale-epoch reacquisitions (in-place churn) vs cold acquisitions (handoffs) per namespace"
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Live files per namespace",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 77
+      },
+      "targets": [
+        {
+          "expr": "strata_controller_namespace_files{namespace=~\"$namespace\"}",
+          "refId": "A",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "live (non-deleted) files per namespace"
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Open metadata-log bytes per namespace",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 77
+      },
+      "targets": [
+        {
+          "expr": "strata_controller_namespace_log_bytes{namespace=~\"$namespace\"}",
+          "refId": "A",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "open metadata-log size per namespace"
+    }
+  ]
+}

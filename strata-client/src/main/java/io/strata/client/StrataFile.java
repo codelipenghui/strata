@@ -27,8 +27,6 @@ public interface StrataFile {
     /** Fences any open writer, seal-recovers the open tail (§7.3), returns the sealed length. */
     SealInfo recoverAndSeal();
 
-    record AppendAck(long endOffset, long durableOffset) {}
-
     record SealInfo(long sealedLength) {}
 
     final class ReadResult implements AutoCloseable {
@@ -86,11 +84,21 @@ public interface StrataFile {
         /**
          * Pipelined; completes on the file's ack quorum. Offsets are file-logical.
          *
+         * <p>The returned future completes with this append's file-logical {@code endOffset} — the
+         * offset just past the last byte written. Completion implies those bytes are quorum-acked.
+         *
          * <p>The appender snapshots the remaining bytes before returning, so callers may reuse or
          * mutate {@code data} after this method returns.
          */
-        CompletableFuture<AppendAck> append(ByteBuffer data);
+        CompletableFuture<Long> append(ByteBuffer data);
 
+        /**
+         * Current durable high-watermark: the file-logical offset through which writes are
+         * quorum-acked. A moving snapshot, not a per-append fact. Note this reflects
+         * quorum-<em>acknowledged</em> bytes, which is weaker than recovery-durable (issue #29):
+         * the window between the quorum-ack and the replica-confirmed durable floor is the
+         * acked-loss window.
+         */
         long durableOffset();
 
         /** Seals the open chunk at the durable offset and the file at its total length. */

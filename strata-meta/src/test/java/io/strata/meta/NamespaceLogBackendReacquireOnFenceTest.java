@@ -62,6 +62,15 @@ class NamespaceLogBackendReacquireOnFenceTest {
             // No data loss across the fence: A recovered both its pre-fence file and B's file.
             assertTrue(ownerA.getFile(NS, id0).isPresent(), "re-acquire must preserve the pre-fence file (id 0)");
             assertTrue(ownerA.getFile(NS, id1).isPresent(), "re-acquire must recover the superseding owner's file (id 1)");
+
+            // The fence-driven reacquire is an in-place epoch bump, NOT an ownership handoff: it must count
+            // as a reacquisition, never as an owner change (else the namespace-owner-changes dashboard would
+            // double-count churn and show false handoffs). A's only owner change is its original cold open.
+            long[] aStats = ownerA.metrics().stats().get(NS.value());
+            assertEquals(1, aStats[NamespaceLogMetrics.OWNER_CHANGES],
+                    "fence reacquire must NOT increment ownerChanges (only the cold acquisition counts)");
+            assertTrue(aStats[NamespaceLogMetrics.REACQUISITIONS] >= 1,
+                    "the fence churn is counted as a reacquisition");
         }
     }
 
