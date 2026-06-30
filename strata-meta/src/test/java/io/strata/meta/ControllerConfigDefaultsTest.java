@@ -23,4 +23,39 @@ class ControllerConfigDefaultsTest {
         assertThrows(IllegalArgumentException.class,
                 () -> new ControllerConfig("zk:2181", 0, 1000, 500, 0, 1, 1));
     }
+
+    @Test
+    void newTuningFieldsDefault() {
+        ControllerConfig c = new ControllerConfig("zk:2181", 9100, 3000, 60000, 300000, 5000, 30000);
+        assertEquals(2_000, c.verifyIntervalMs());
+        assertEquals(256, c.verifyBatchSize());
+        assertEquals(30_000, c.systemVerifyIntervalMs());
+        assertEquals(600_000L, c.deletedTombstoneTtlMs());
+        assertEquals(16, c.maxCommandsPerHeartbeat());
+        assertEquals(100, c.zkRetryBaseMs());
+        assertEquals(5, c.zkRetryMaxRetries());
+    }
+
+    @Test
+    void withSettersOverrideTuning() {
+        ControllerConfig c = new ControllerConfig("zk:2181", 9100, 3000, 60000, 300000, 5000, 30000)
+                .withVerifyIntervalMs(500).withVerifyBatchSize(64).withSystemVerifyIntervalMs(10_000)
+                .withDeletedTombstoneTtlMs(120_000).withMaxCommandsPerHeartbeat(64)
+                .withZkRetryBaseMs(50).withZkRetryMaxRetries(9);
+        assertEquals(500, c.verifyIntervalMs());
+        assertEquals(64, c.verifyBatchSize());
+        assertEquals(10_000, c.systemVerifyIntervalMs());
+        assertEquals(120_000L, c.deletedTombstoneTtlMs());
+        assertEquals(64, c.maxCommandsPerHeartbeat());
+        assertEquals(50, c.zkRetryBaseMs());
+        assertEquals(9, c.zkRetryMaxRetries());
+    }
+
+    @Test
+    void rejectsTombstoneTtlNotExceedingRepairScan() {
+        // deletedTombstoneTtlMs (1000) must exceed repairScanIntervalMs (5000) -> invalid
+        assertThrows(IllegalArgumentException.class,
+                () -> new ControllerConfig("zk:2181", 9100, 3000, 60000, 300000, 5000, 30000)
+                        .withDeletedTombstoneTtlMs(1_000));
+    }
 }
