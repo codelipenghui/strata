@@ -309,30 +309,21 @@ public final class Controller implements AutoCloseable {
         return out;
     }
 
-    /** Metadata-log records appended ({@code rate()} = metadata-mutation ops/s); 0 under ZK. */
-    public long metadataLogAppendRecords() {
-        return store instanceof NamespaceLogMetadataStore log ? log.metrics().appendRecords() : 0L;
+    /**
+     * Per-namespace namespace-log counters for the namespaces this controller owns; empty under the ZK
+     * backend. Value is the fixed index order documented on {@code NamespaceLogMetrics.stats()}:
+     * [appendRecords, appendBytes, readRecords, readBytes, compactions, recoveries, reacquisitions,
+     * ownerChanges]. Drives the per-namespace write-log / read-log / compaction / owner-change panels;
+     * the global controller view is {@code sum without(namespace)}.
+     */
+    public java.util.Map<String, long[]> namespaceLogStats() {
+        return store instanceof NamespaceLogMetadataStore log ? log.metrics().stats() : java.util.Map.of();
     }
 
-    /** Metadata-log bytes appended ({@code rate()} = metadata write throughput); 0 under ZK. */
-    public long metadataLogAppendBytes() {
-        return store instanceof NamespaceLogMetadataStore log ? log.metrics().appendBytes() : 0L;
-    }
-
-    /** Metadata-log snapshot+roll compactions; cadence of open-log truncation; 0 under ZK. */
-    public long metadataLogCompactions() {
-        return store instanceof NamespaceLogMetadataStore log ? log.metrics().compactions() : 0L;
-    }
-
-    /** Namespace repositories (re)opened from a manifest; a spike = failover/restart churn; 0 under ZK. */
-    public long metadataLogRecoveries() {
-        return store instanceof NamespaceLogMetadataStore log ? log.metrics().recoveries() : 0L;
-    }
-
-    /** Stale-epoch meta-log re-acquisitions (a fenced append re-opened the namespace); a spike = ownership
-     *  contention / membership churn; 0 under ZK. */
-    public long metadataLogReacquisitions() {
-        return store instanceof NamespaceLogMetadataStore log ? log.metrics().reacquisitions() : 0L;
+    /** This controller's rendezvous endpoint identity — the {@code owner} label for the namespace-owner
+     *  gauge ({@code strata_controller_namespace_owner}); same value the latch advertises. */
+    public String localControllerEndpoint() {
+        return ownership.localEndpoint();
     }
 
     /** Consensus-root requests this service has issued against a {@code /strata} subtree, by op kind. */

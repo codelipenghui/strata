@@ -313,6 +313,9 @@ final class NamespaceLogBackend implements AutoCloseable {
                 long epoch = root.allocateMetadataEpoch();
                 r = NamespaceMetadataLogRepository.open(namespace, fileStore, root, epoch, metrics);
                 repos.put(namespace, r);   // publish only after recovery
+                // Cold acquisition = this node started owning a namespace it had no repository for: an
+                // ownership handoff to this node. The fence-driven reacquire() path is NOT counted here.
+                metrics.recordOwnerAcquired(namespace);
             }
             return r;
         } finally {
@@ -349,7 +352,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             }
             log.warn("namespace {} meta-log append fenced (stale epoch) — re-acquiring and retrying once",
                     namespace, e);
-            metrics.recordReacquire();
+            metrics.recordReacquire(namespace);
         }
         return runLocked(reacquire(namespace, repo), txn);
     }

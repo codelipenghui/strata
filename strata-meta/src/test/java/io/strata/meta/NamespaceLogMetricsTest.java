@@ -71,6 +71,32 @@ class NamespaceLogMetricsTest {
         }
     }
 
+    @Test
+    void countersAreKeyedByNamespace() {
+        NamespaceLogMetrics m = new NamespaceLogMetrics();
+        StrataNamespace a = StrataNamespace.of("a");
+        StrataNamespace b = StrataNamespace.of("b");
+        m.recordAppend(a, 100);
+        m.recordAppend(a, 50);
+        m.recordLogRead(a, 3, 300);
+        m.recordCompaction(b);
+        m.recordOwnerAcquired(b);
+
+        // stats() index order: [appendRecords, appendBytes, readRecords, readBytes, compactions,
+        //                       recoveries, reacquisitions, ownerChanges]
+        long[] sa = m.stats().get("a");
+        long[] sb = m.stats().get("b");
+        assertEquals(2, sa[0], "a appendRecords");
+        assertEquals(150, sa[1], "a appendBytes");
+        assertEquals(3, sa[2], "a readRecords");
+        assertEquals(300, sa[3], "a readBytes");
+        assertEquals(1, sb[4], "b compactions");
+        assertEquals(1, sb[7], "b ownerChanges");
+        // The global aggregate accessors still sum across namespaces (back-compat).
+        assertEquals(2, m.appendRecords(), "global appendRecords = sum over namespaces");
+        assertEquals(1, m.compactions(), "global compactions = sum over namespaces");
+    }
+
     private static Records.FileRecord file(FileId id, String ns, String path) {
         return new Records.FileRecord(id, StrataNamespace.of(ns), StrataPath.of(path), 3, 2, true,
                 FileState.OPEN, 1_000, List.of(), 1, 1);

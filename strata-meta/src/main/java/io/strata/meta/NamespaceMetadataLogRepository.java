@@ -64,7 +64,7 @@ final class NamespaceMetadataLogRepository {
         NamespaceMetadataLogRepository repo =
                 new NamespaceMetadataLogRepository(namespace, fileStore, rootStore, metadataEpoch, metrics);
         repo.recoverAndRepublish();
-        metrics.recordRecovery();
+        metrics.recordRecovery(namespace);
         return repo;
     }
 
@@ -128,7 +128,7 @@ final class NamespaceMetadataLogRepository {
             // Buffer it so publishFrozen can carry it into the new segment without re-reading the open log.
             compactionTail.add(frame);
         }
-        metrics.recordAppend(frame.length);
+        metrics.recordAppend(namespace, frame.length);
         return appliedOffset;
     }
 
@@ -198,7 +198,7 @@ final class NamespaceMetadataLogRepository {
             }
         }
         if (published) {
-            metrics.recordCompaction();
+            metrics.recordCompaction(namespace);
         }
         return true;
     }
@@ -260,6 +260,7 @@ final class NamespaceMetadataLogRepository {
         Optional<Records.NamespaceManifest> manifest = current.map(MetadataStore.Versioned::value);
         NamespaceMetadataRecovery.Recovered recovered =
                 NamespaceMetadataRecovery.recover(namespace, fileStore, manifest);
+        metrics.recordLogRead(namespace, recovered.recordsReplayed(), recovered.bytesRead());
         this.state = recovered.state();
         this.generation = manifest.map(Records.NamespaceManifest::generation).orElse(0L);
         int expectedVersion = current.map(MetadataStore.Versioned::version).orElse(-1);

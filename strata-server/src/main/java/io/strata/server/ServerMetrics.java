@@ -91,19 +91,22 @@ final class ServerMetrics {
                 .description("configured controller-endpoint membership = controllers sharing the namespaces; max() = fleet count").register(reg);
         Gauge.builder("strata_controller_sharding_active", s, m -> m.shardingActive() ? 1 : 0)
                 .description("1 if namespaces are sharded across multiple controllers; 0 = single global leader").register(reg);
-        FunctionCounter.builder("strata_controller_log_append_records", s, Controller::metadataLogAppendRecords)
-                .tag("backend", backend).description("metadata-log records appended (rate() = metadata ops/s)").register(reg);
-        FunctionCounter.builder("strata_controller_log_append_bytes", s, Controller::metadataLogAppendBytes)
-                .tag("backend", backend).description("metadata-log bytes appended (rate() = metadata write throughput)").register(reg);
-        FunctionCounter.builder("strata_controller_log_compactions", s, Controller::metadataLogCompactions)
-                .tag("backend", backend).description("metadata-log snapshot+roll compactions").register(reg);
-        FunctionCounter.builder("strata_controller_log_recoveries", s, Controller::metadataLogRecoveries)
-                .tag("backend", backend).description("namespace repositories (re)opened from a manifest (failover/restart churn)").register(reg);
-        FunctionCounter.builder("strata_controller_log_reacquisitions", s, Controller::metadataLogReacquisitions)
-                .tag("backend", backend).description("stale-epoch meta-log re-acquisitions (ownership contention / membership churn)").register(reg);
+        // Namespace-log activity (append/read/compaction/recovery/reacquisition) is now per-namespace —
+        // registered lazily in registerPerNamespace below as strata_controller_namespace_log_*{namespace}.
+        // The global controller view is sum without(namespace)(...). (design §3.4)
 
         registerPerNamespace(reg, s);
     }
+
+    private static final long[] EMPTY8 = new long[8];
+    // strata_controller_namespace_log_* index order matches NamespaceLogMetrics.stats():
+    // 0 appendRecords, 1 appendBytes, 2 readRecords, 3 readBytes, 4 compactions, 5 recoveries, 6 reacquisitions.
+    // (index 7 ownerChanges is exported separately as strata_controller_namespace_owner_changes.)
+    private static final String[] CONTROLLER_NS_LOG_COUNTERS = {
+            "strata_controller_namespace_log_append_records", "strata_controller_namespace_log_append_bytes",
+            "strata_controller_namespace_log_read_records", "strata_controller_namespace_log_read_bytes",
+            "strata_controller_namespace_log_compactions", "strata_controller_namespace_log_recoveries",
+            "strata_controller_namespace_log_reacquisitions"};
 
     /**
      * Per-namespace gauges (namespace-stacked dashboard panels): live files + open metadata-log bytes,
@@ -117,6 +120,11 @@ final class ServerMetrics {
                 .description("live files per namespace owned by this controller").register(reg);
         MultiGauge logBytes = MultiGauge.builder("strata_controller_namespace_log_bytes")
                 .description("open metadata-log bytes per namespace owned by this controller").register(reg);
+        // The current owner of each namespace: emitted as 1 ONLY by the controller that owns it (the rows
+        // come from namespaceStats(), which only lists owned namespaces), tagged with this controller's
+        // endpoint. A state-timeline over this series shows the owner and visibly flips on handoff (design §3.5).
+        MultiGauge owner = MultiGauge.builder("strata_controller_namespace_owner")
+                .description("=1 from the controller that currently owns the namespace (owner = its endpoint)").register(reg);
         var refresh = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "controller-ns-metrics");
             t.setDaemon(true);
@@ -130,7 +138,39 @@ final class ServerMetrics {
             logBytes.register(stats.entrySet().stream()
                     .map(e -> MultiGauge.Row.of(Tags.of("namespace", e.getKey()), e.getValue()[1]))
                     .collect(java.util.stream.Collectors.toList()), true);
+            String self = s.localControllerEndpoint();
+            owner.register(stats.keySet().stream()
+                    .map(ns -> MultiGauge.Row.of(Tags.of("namespace", ns, "owner", self), 1))
+                    .collect(java.util.stream.Collectors.toList()), true);
+            registerNewControllerNamespaceCounters(reg, s);
         }, 0, 10, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Idempotently registers the per-namespace namespace-log function-counters (and the owner-change
+     * counter) for any namespace now present in the controller's log stats but not yet registered. Called
+     * by the refresh timer; also callable directly (tests) to register without waiting for a tick.
+     */
+    static void registerNewControllerNamespaceCounters(MeterRegistry reg, Controller s) {
+        for (String ns : s.namespaceLogStats().keySet()) {
+            for (int i = 0; i < CONTROLLER_NS_LOG_COUNTERS.length; i++) {
+                String name = CONTROLLER_NS_LOG_COUNTERS[i];
+                if (reg.find(name).tag("namespace", ns).functionCounter() == null) {
+                    final int idx = i;
+                    FunctionCounter.builder(name, s, m -> m.namespaceLogStats().getOrDefault(ns, EMPTY8)[idx])
+                            .tag("namespace", ns)
+                            .description("per-namespace metadata-log activity (rate() = ops/s or bytes/s)")
+                            .register(reg);
+                }
+            }
+            if (reg.find("strata_controller_namespace_owner_changes").tag("namespace", ns).functionCounter() == null) {
+                FunctionCounter.builder("strata_controller_namespace_owner_changes", s,
+                                m -> m.namespaceLogStats().getOrDefault(ns, EMPTY8)[7])
+                        .tag("namespace", ns)
+                        .description("ownership handoffs to a controller (cold repository acquisitions)")
+                        .register(reg);
+            }
+        }
     }
 
     /** Data plane: capacity, chunk state, write throughput, fsync force rate, registration. */
