@@ -35,8 +35,6 @@ import static io.strata.common.Checks.addChunkLength;
  */
 final class Recovery {
     private static final Logger log = LoggerFactory.getLogger(Recovery.class);
-    private static final int COPY_CHUNK_BYTES = 4 * 1024 * 1024;
-
     private final ControllerClient controller;
     private final NodePool appendPool;
     private final NodePool readPool;
@@ -312,7 +310,7 @@ final class Recovery {
             if (rs.state == ChunkState.SEALED || rs.end >= target) continue;
             try {
                 while (rs.end < target) {
-                    int want = (int) Math.min(COPY_CHUNK_BYTES, target - rs.end);
+                    int want = (int) Math.min(config.recoveryCopyChunkBytes(), target - rs.end);
                     byte[] data = catchUpBytes(chunkId, reachable, rs, rs.end, rs.end + want, ackQuorum);
                     if (data == null) {
                         throw new ScpException(ErrorCode.INTERNAL, "no donor for catch-up");

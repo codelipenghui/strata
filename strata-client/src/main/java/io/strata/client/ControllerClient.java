@@ -62,7 +62,7 @@ final class ControllerClient implements AutoCloseable {
      * errors back off and retry. {@code routingKey} null = un-routed (no owner concept).
      */
     private ByteBuffer call(Opcode op, byte[] header, Object routingKey) {
-        long deadline = System.currentTimeMillis() + Math.max(15_000, config.callTimeoutMs());
+        long deadline = System.currentTimeMillis() + Math.max(config.controllerRetryDeadlineMs(), config.callTimeoutMs());
         String target = routingKey == null ? null : ownerByKey.get(routingKey);
         if (target == null) {
             target = nextSeed();
@@ -99,7 +99,7 @@ final class ControllerClient implements AutoCloseable {
 
     private void sleep() {
         try {
-            Thread.sleep(200);
+            Thread.sleep(config.controllerRetryBackoffMs());
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             throw new ScpException(ErrorCode.INTERNAL, "interrupted");
