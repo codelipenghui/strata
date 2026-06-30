@@ -10,9 +10,10 @@ package io.strata.proto;
 public interface RequestObserver {
     /**
      * @param opcode       the request opcode name (e.g. "APPEND"), or "unknown"
+     * @param namespace    the request's namespace (via {@link RequestContext}), or "-" for cluster-scope ops
      * @param durationNanos handler latency: from when the request was picked up to response-ready
      *                      (for async ops like a group-committed APPEND, this includes the fsync wait)
      * @param success      false if the handler threw or its future completed exceptionally
      */
-    void observe(String opcode, long durationNanos, boolean success);
+    void observe(String opcode, String namespace, long durationNanos, boolean success);
 }

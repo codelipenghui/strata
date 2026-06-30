@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import java.util.function.BiFunction;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -46,6 +47,31 @@ class ControllerNamespaceLogBackendTest {
                 var codes = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
                         new Messages.DeleteFiles(StrataNamespace.of("tenant-a"), java.util.List.of(created.fileId())).encode(), null, 5_000));
                 assertEquals(io.strata.common.ErrorCode.OK.code, codes.codes().get(0));
+            }
+        }
+    }
+
+    @Test
+    void perNamespaceLogStatsTrackOwnedNamespaceActivity() throws Exception {
+        try (TestingServer zk = new TestingServer(true)) {
+            TestNamespaceMetadataFileStore fileStore = new TestNamespaceMetadataFileStore();
+            BiFunction<ZkMetadataStore, String, MetadataStore> backend =
+                    (root, endpoint) -> new NamespaceLogMetadataStore(new NamespaceLogBackend(root, fileStore, true));
+            try (Controller service =
+                         new Controller(ControllerConfig.forTests(zk.getConnectString()), null, backend);
+                 ScpClient client = new ScpClient("127.0.0.1", service.port(), ScpClient.KIND_TOOL, "nslog")) {
+                awaitLeader(service);
+                client.call(Opcode.CREATE_FILE, new Messages.CreateFile("tenant-a", "/logs/seg-0",
+                        new Messages.WritePolicy(3, 2, true)).encode(), null, 5_000);
+
+                long[] stat = service.namespaceLogStats().get("tenant-a");
+                assertNotNull(stat, "namespace-log stats must be keyed by the owned namespace");
+                assertTrue(stat[NamespaceLogMetrics.APPEND_RECORDS] >= 1, "create appended a metadata-log record");
+                assertEquals(1, stat[NamespaceLogMetrics.OWNER_CHANGES],
+                        "tenant-a was cold-acquired exactly once (an ownership handoff to this controller)");
+                assertTrue(service.namespaceStats().containsKey("tenant-a"),
+                        "this controller owns tenant-a (so it emits the owner gauge for it)");
+                assertNotNull(service.localControllerEndpoint(), "owner label for the namespace-owner gauge");
             }
         }
     }

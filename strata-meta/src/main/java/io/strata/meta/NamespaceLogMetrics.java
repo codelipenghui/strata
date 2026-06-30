@@ -1,67 +1,127 @@
 package io.strata.meta;
 
+import io.strata.common.StrataNamespace;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * Process-wide counters for the namespace-log metadata backend, surfaced as Prometheus metrics through
- * {@code Controller} / {@code ServerMetrics}. Plain monotonic {@link LongAdder}s (lock-free, no
- * hot-path cost). Held on the backend rather than per-repository so they survive namespace
- * re-recovery — a repository is rebuilt on every failover/restart, but the counters must not reset.
+ * Per-namespace counters for the namespace-log metadata backend, surfaced as Prometheus metrics through
+ * {@code Controller} / {@code ServerMetrics}. Lock-free {@link LongAdder}s (no hot-path cost). Held on the
+ * backend rather than per-repository so they survive namespace re-recovery — a repository is rebuilt on
+ * every failover/restart, but the counters must not reset.
  *
- * <p>What each one observes operationally:
- * <ul>
- *   <li>{@code appendRecords}/{@code appendBytes} — the metadata-mutation rate and write throughput of
- *       the metadata log itself ({@code rate()} of these is "metadata ops/s" and "metadata bytes/s").</li>
- *   <li>{@code compactions} — snapshot + open-log roll cycles; cadence shows how fast the open log is
- *       being truncated (design §10).</li>
- *   <li>{@code recoveries} — namespace repositories (re)opened from a published manifest; a spike means
- *       failover/restart churn (design §13).</li>
- * </ul>
- * The durability of the metadata log's own chunks is already covered by {@code strata_chunks_*} because
- * the reserved {@code strata-meta} namespace is in the repair scan — no separate gauge needed here.
+ * <p>{@link #stats()} returns a per-namespace snapshot in this fixed index order:
+ * <ol start="0">
+ *   <li>appendRecords / <li>appendBytes — metadata mutation rate + write throughput of the log
+ *   <li>readRecords / <li>readBytes — records/bytes REPLAYED from the open log during recovery (read-log)
+ *   <li>compactions — snapshot + open-log roll cycles (design §10)
+ *   <li>recoveries — repositories (re)opened from a published manifest (failover/restart churn, §13)
+ *   <li>reacquisitions — stale-epoch meta-log re-acquisitions (ownership contention)
+ *   <li>ownerChanges — cold acquisitions of a namespace by this node (ownership handoffs, §6)
+ * </ol>
+ * The aggregate accessors ({@link #appendRecords()} etc.) sum across namespaces.
  */
 final class NamespaceLogMetrics {
-    private final LongAdder appendRecords = new LongAdder();
-    private final LongAdder appendBytes = new LongAdder();
-    private final LongAdder compactions = new LongAdder();
-    private final LongAdder recoveries = new LongAdder();
-    private final LongAdder reacquisitions = new LongAdder();
+    static final int APPEND_RECORDS = 0, APPEND_BYTES = 1, READ_RECORDS = 2, READ_BYTES = 3,
+            COMPACTIONS = 4, RECOVERIES = 5, REACQUISITIONS = 6, OWNER_CHANGES = 7;
+    private static final int N = 8;
 
-    void recordAppend(long bytes) {
-        appendRecords.increment();
-        appendBytes.add(bytes);
+    private final ConcurrentHashMap<String, LongAdder[]> byNs = new ConcurrentHashMap<>();
+
+    private LongAdder[] of(StrataNamespace ns) {
+        return byNs.computeIfAbsent(ns.value(), k -> {
+            LongAdder[] a = new LongAdder[N];
+            for (int i = 0; i < N; i++) {
+                a[i] = new LongAdder();
+            }
+            return a;
+        });
     }
 
-    void recordCompaction() {
-        compactions.increment();
+    void recordAppend(StrataNamespace ns, long bytes) {
+        LongAdder[] a = of(ns);
+        a[APPEND_RECORDS].increment();
+        a[APPEND_BYTES].add(bytes);
     }
 
-    void recordRecovery() {
-        recoveries.increment();
+    /** Records/bytes replayed from the open log during recovery — the namespace's read-log throughput. */
+    void recordLogRead(StrataNamespace ns, long records, long bytes) {
+        LongAdder[] a = of(ns);
+        a[READ_RECORDS].add(records);
+        a[READ_BYTES].add(bytes);
+    }
+
+    void recordCompaction(StrataNamespace ns) {
+        of(ns)[COMPACTIONS].increment();
+    }
+
+    void recordRecovery(StrataNamespace ns) {
+        of(ns)[RECOVERIES].increment();
     }
 
     /** A fenced (stale-epoch) meta-log append forced this node to re-acquire and retry — owner churn. */
-    void recordReacquire() {
-        reacquisitions.increment();
+    void recordReacquire(StrataNamespace ns) {
+        of(ns)[REACQUISITIONS].increment();
+    }
+
+    /** This node cold-acquired the namespace (first repository open) — an ownership handoff to this node. */
+    void recordOwnerAcquired(StrataNamespace ns) {
+        of(ns)[OWNER_CHANGES].increment();
+    }
+
+    /** Per-namespace snapshot keyed by namespace value; value is the N-element index order documented above. */
+    Map<String, long[]> stats() {
+        Map<String, long[]> out = new HashMap<>(byNs.size());
+        byNs.forEach((ns, a) -> {
+            long[] v = new long[N];
+            for (int i = 0; i < N; i++) {
+                v[i] = a[i].sum();
+            }
+            out.put(ns, v);
+        });
+        return out;
+    }
+
+    /** Namespaces with recorded activity — drives lazy per-namespace meter registration (no snapshot alloc). */
+    java.util.Set<String> namespaces() {
+        return byNs.keySet();
+    }
+
+    /** One per-namespace counter by index (see class doc); 0 if absent. O(1) — bound per Micrometer
+     *  FunctionCounter so each scrape is a single {@code LongAdder.sum()} rather than a full-map rebuild. */
+    long value(String namespace, int index) {
+        LongAdder[] a = byNs.get(namespace);
+        return a == null ? 0L : a[index].sum();
+    }
+
+    private long sum(int idx) {
+        long total = 0;
+        for (LongAdder[] a : byNs.values()) {
+            total += a[idx].sum();
+        }
+        return total;
     }
 
     long appendRecords() {
-        return appendRecords.sum();
+        return sum(APPEND_RECORDS);
     }
 
     long appendBytes() {
-        return appendBytes.sum();
+        return sum(APPEND_BYTES);
     }
 
     long compactions() {
-        return compactions.sum();
+        return sum(COMPACTIONS);
     }
 
     long recoveries() {
-        return recoveries.sum();
+        return sum(RECOVERIES);
     }
 
     long reacquisitions() {
-        return reacquisitions.sum();
+        return sum(REACQUISITIONS);
     }
 }

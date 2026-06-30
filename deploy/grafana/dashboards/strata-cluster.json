@@ -596,7 +596,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(strata_controller_log_append_records_total[$__rate_interval]))",
+          "expr": "sum(rate(strata_controller_namespace_log_append_records_total[$__rate_interval]))",
           "refId": "A",
           "instant": true
         }
@@ -693,7 +693,7 @@
     {
       "id": 21,
       "type": "timeseries",
-      "title": "Files per namespace",
+      "title": "Total files (fleet)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -706,20 +706,17 @@
       },
       "targets": [
         {
-          "expr": "sum by (namespace)(strata_controller_namespace_files)",
+          "expr": "sum(strata_controller_namespace_files)",
           "refId": "A",
-          "legendFormat": "{{namespace}}"
+          "legendFormat": "files"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "custom": {
-            "fillOpacity": 20,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "normal"
-            }
+            "fillOpacity": 10,
+            "showPoints": "never"
           }
         }
       },
@@ -738,12 +735,12 @@
           "sort": "desc"
         }
       },
-      "description": "live files per namespace across the fleet (data nodes don't know namespaces \u2014 control-plane only)"
+      "description": "total live files across the fleet (per-namespace breakdown: Strata \u2014 Namespace dashboard)"
     },
     {
       "id": 22,
       "type": "timeseries",
-      "title": "Metadata-log bytes per namespace",
+      "title": "Total metadata-log bytes (fleet)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -756,20 +753,17 @@
       },
       "targets": [
         {
-          "expr": "sum by (namespace)(strata_controller_namespace_log_bytes)",
+          "expr": "sum(strata_controller_namespace_log_bytes)",
           "refId": "A",
-          "legendFormat": "{{namespace}}"
+          "legendFormat": "bytes"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "bytes",
           "custom": {
-            "fillOpacity": 20,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "normal"
-            }
+            "fillOpacity": 10,
+            "showPoints": "never"
           }
         }
       },
@@ -788,7 +782,7 @@
           "sort": "desc"
         }
       },
-      "description": "open metadata-log size per namespace (sum across owners)"
+      "description": "total open metadata-log bytes across the fleet (per-namespace: Strata \u2014 Namespace dashboard)"
     },
     {
       "id": 30,

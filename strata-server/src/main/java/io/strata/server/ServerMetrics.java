@@ -91,19 +91,21 @@ final class ServerMetrics {
                 .description("configured controller-endpoint membership = controllers sharing the namespaces; max() = fleet count").register(reg);
         Gauge.builder("strata_controller_sharding_active", s, m -> m.shardingActive() ? 1 : 0)
                 .description("1 if namespaces are sharded across multiple controllers; 0 = single global leader").register(reg);
-        FunctionCounter.builder("strata_controller_log_append_records", s, Controller::metadataLogAppendRecords)
-                .tag("backend", backend).description("metadata-log records appended (rate() = metadata ops/s)").register(reg);
-        FunctionCounter.builder("strata_controller_log_append_bytes", s, Controller::metadataLogAppendBytes)
-                .tag("backend", backend).description("metadata-log bytes appended (rate() = metadata write throughput)").register(reg);
-        FunctionCounter.builder("strata_controller_log_compactions", s, Controller::metadataLogCompactions)
-                .tag("backend", backend).description("metadata-log snapshot+roll compactions").register(reg);
-        FunctionCounter.builder("strata_controller_log_recoveries", s, Controller::metadataLogRecoveries)
-                .tag("backend", backend).description("namespace repositories (re)opened from a manifest (failover/restart churn)").register(reg);
-        FunctionCounter.builder("strata_controller_log_reacquisitions", s, Controller::metadataLogReacquisitions)
-                .tag("backend", backend).description("stale-epoch meta-log re-acquisitions (ownership contention / membership churn)").register(reg);
+        // Namespace-log activity (append/read/compaction/recovery/reacquisition) is now per-namespace —
+        // registered lazily in registerPerNamespace below as strata_controller_namespace_log_*{namespace}.
+        // The global controller view is sum without(namespace)(...). (design §3.4)
 
         registerPerNamespace(reg, s);
     }
+
+    // Per-namespace controller counter names, index-aligned with NamespaceLogMetrics.stats(): 0 appendRecords,
+    // 1 appendBytes, 2 readRecords, 3 readBytes, 4 compactions, 5 recoveries, 6 reacquisitions, 7 ownerChanges
+    // (owner_changes is just index 7 — registered uniformly with the rest, no special case).
+    private static final String[] CONTROLLER_NS_COUNTERS = {
+            "strata_controller_namespace_log_append_records", "strata_controller_namespace_log_append_bytes",
+            "strata_controller_namespace_log_read_records", "strata_controller_namespace_log_read_bytes",
+            "strata_controller_namespace_log_compactions", "strata_controller_namespace_log_recoveries",
+            "strata_controller_namespace_log_reacquisitions", "strata_controller_namespace_owner_changes"};
 
     /**
      * Per-namespace gauges (namespace-stacked dashboard panels): live files + open metadata-log bytes,
@@ -117,6 +119,11 @@ final class ServerMetrics {
                 .description("live files per namespace owned by this controller").register(reg);
         MultiGauge logBytes = MultiGauge.builder("strata_controller_namespace_log_bytes")
                 .description("open metadata-log bytes per namespace owned by this controller").register(reg);
+        // The current owner of each namespace: emitted as 1 ONLY by the controller that owns it (the rows
+        // come from namespaceStats(), which only lists owned namespaces), tagged with this controller's
+        // endpoint. A state-timeline over this series shows the owner and visibly flips on handoff (design §3.5).
+        MultiGauge owner = MultiGauge.builder("strata_controller_namespace_owner")
+                .description("=1 from the controller that currently owns the namespace (owner = its endpoint)").register(reg);
         var refresh = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "controller-ns-metrics");
             t.setDaemon(true);
@@ -130,7 +137,23 @@ final class ServerMetrics {
             logBytes.register(stats.entrySet().stream()
                     .map(e -> MultiGauge.Row.of(Tags.of("namespace", e.getKey()), e.getValue()[1]))
                     .collect(java.util.stream.Collectors.toList()), true);
+            String self = s.localControllerEndpoint();
+            owner.register(stats.keySet().stream()
+                    .map(ns -> MultiGauge.Row.of(Tags.of("namespace", ns, "owner", self), 1))
+                    .collect(java.util.stream.Collectors.toList()), true);
+            registerNewControllerNamespaceCounters(reg, s);
         }, 0, 10, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Idempotently registers the per-namespace namespace-log + owner-change function-counters for any
+     * namespace this controller now owns but hasn't registered yet. Called by the refresh timer; also
+     * callable directly (tests) to register without waiting for a tick.
+     */
+    static void registerNewControllerNamespaceCounters(MeterRegistry reg, Controller s) {
+        registerLazyNsCounters(reg, s, s.namespaceLogNamespaces(), CONTROLLER_NS_COUNTERS,
+                "per-namespace metadata-log activity / ownership handoffs (rate() = ops/s or bytes/s)",
+                Controller::namespaceLogValue);
     }
 
     /** Data plane: capacity, chunk state, write throughput, fsync force rate, registration. */
@@ -153,14 +176,9 @@ final class ServerMetrics {
 
         FunctionCounter.builder("strata_data_node_groupcommit_force", n, DataNode::fsyncForceCount)
                 .description("group-commit force()/fsync calls").register(reg);
-        FunctionCounter.builder("strata_data_node_append_ops", n, DataNode::appendOps)
-                .description("appended records (rate() = write ops/sec)").register(reg);
-        FunctionCounter.builder("strata_data_node_append_bytes", n, DataNode::appendBytes)
-                .description("appended payload bytes (rate() = write throughput)").register(reg);
-        FunctionCounter.builder("strata_data_node_read_ops", n, DataNode::readOps)
-                .description("client READ operations served (rate() = read ops/sec)").register(reg);
-        FunctionCounter.builder("strata_data_node_read_bytes", n, DataNode::readBytes)
-                .description("client READ payload bytes served (rate() = read throughput)").register(reg);
+        // append/read ops+bytes are now per-namespace (strata_data_node_{append,read}_{ops,bytes}_total
+        // carry a {namespace} tag) — registered lazily below as namespaces first see I/O. The fleet rollup
+        // is sum without(namespace)(...). Namespace is the data plane's primary metrics axis (design §3.3).
         FunctionCounter.builder("strata_data_node_background_flush", n, DataNode::backgroundFlushes)
                 .description("background-writeback fsyncs of open chunks").register(reg);
 
@@ -177,6 +195,54 @@ final class ServerMetrics {
                 .tag("event", "miss").register(reg);
         FunctionCounter.builder("strata_data_node_filechannel_cache", n, DataNode::channelCacheEvictions)
                 .tag("event", "eviction").register(reg);
+
+        // Per-namespace data throughput: register a function-counter per namespace as it first appears
+        // (via ioNamespaces()). Refreshed off a daemon timer because the namespace set changes at runtime.
+        var refresh = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "data-node-ns-metrics");
+            t.setDaemon(true);
+            return t;
+        });
+        refresh.scheduleAtFixedRate(() -> registerNewDataNodeNamespaces(reg, n), 0, 10, TimeUnit.SECONDS);
+    }
+
+    private static final String[] DATA_NODE_NS_COUNTERS = {
+            "strata_data_node_append_ops", "strata_data_node_append_bytes",
+            "strata_data_node_read_ops", "strata_data_node_read_bytes"};
+
+    /** Reads one per-namespace counter value (index into the source's namespace-counter array). */
+    @FunctionalInterface
+    interface NsCounterReader<T> {
+        double valueOf(T source, String namespace, int index);
+    }
+
+    /**
+     * Idempotently registers, per namespace, one monotonic function-counter per name — each bound to read a
+     * SINGLE counter via {@code reader} (O(1) per scrape, no per-scrape map allocation). A counter is never
+     * deregistered once its namespace goes idle (its value freezes), so cardinality is bounded by namespaces
+     * ever seen and counter semantics stay monotonic.
+     */
+    private static <T> void registerLazyNsCounters(MeterRegistry reg, T source, Iterable<String> namespaces,
+            String[] names, String description, NsCounterReader<T> reader) {
+        for (String ns : namespaces) {
+            for (int i = 0; i < names.length; i++) {
+                if (reg.find(names[i]).tag("namespace", ns).functionCounter() == null) {
+                    final int idx = i;
+                    final String namespace = ns;
+                    FunctionCounter.builder(names[i], source, src -> reader.valueOf(src, namespace, idx))
+                            .tag("namespace", namespace).description(description).register(reg);
+                }
+            }
+        }
+    }
+
+    /**
+     * Idempotently registers the per-namespace data-throughput function-counters for any namespace that has
+     * seen I/O. Called by the refresh timer; also callable directly (tests) to register without a tick.
+     */
+    static void registerNewDataNodeNamespaces(MeterRegistry reg, DataNode n) {
+        registerLazyNsCounters(reg, n, n.ioNamespaces(), DATA_NODE_NS_COUNTERS,
+                "per-namespace data throughput (rate() = ops/s or bytes/s)", DataNode::ioValue);
     }
 
     /**
@@ -191,12 +257,13 @@ final class ServerMetrics {
      */
     static RequestObserver requestObserver(MeterRegistry reg) {
         Map<String, Timer> timers = new ConcurrentHashMap<>();
-        return (opcode, durationNanos, success) -> {
+        return (opcode, namespace, durationNanos, success) -> {
             String status = success ? "ok" : "error";
-            timers.computeIfAbsent(opcode + ':' + status, k -> Timer.builder("strata_scp_request_duration")
-                            .description("request handler latency by opcode (incl. async durability wait)")
+            timers.computeIfAbsent(opcode + ':' + status + ':' + namespace, k -> Timer.builder("strata_scp_request_duration")
+                            .description("request handler latency by opcode + namespace (incl. async durability wait)")
                             .tag("opcode", opcode)
                             .tag("status", status)
+                            .tag("namespace", namespace)
                             .serviceLevelObjectives(
                                     Duration.ofMillis(1), Duration.ofMillis(2), Duration.ofMillis(5),
                                     Duration.ofMillis(10), Duration.ofMillis(25), Duration.ofMillis(50),
