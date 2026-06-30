@@ -85,6 +85,18 @@ final class NamespaceLogMetrics {
         return out;
     }
 
+    /** Namespaces with recorded activity — drives lazy per-namespace meter registration (no snapshot alloc). */
+    java.util.Set<String> namespaces() {
+        return byNs.keySet();
+    }
+
+    /** One per-namespace counter by index (see class doc); 0 if absent. O(1) — bound per Micrometer
+     *  FunctionCounter so each scrape is a single {@code LongAdder.sum()} rather than a full-map rebuild. */
+    long value(String namespace, int index) {
+        LongAdder[] a = byNs.get(namespace);
+        return a == null ? 0L : a[index].sum();
+    }
+
     private long sum(int idx) {
         long total = 0;
         for (LongAdder[] a : byNs.values()) {

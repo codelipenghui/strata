@@ -320,6 +320,18 @@ public final class Controller implements AutoCloseable {
         return store instanceof NamespaceLogMetadataStore log ? log.metrics().stats() : java.util.Map.of();
     }
 
+    /** Namespaces this controller has namespace-log activity for — drives lazy per-namespace meter
+     *  registration without a snapshot allocation; empty under the ZK backend. */
+    public java.util.Set<String> namespaceLogNamespaces() {
+        return store instanceof NamespaceLogMetadataStore log ? log.metrics().namespaces() : java.util.Set.of();
+    }
+
+    /** One per-namespace namespace-log counter by index (see {@link #namespaceLogStats}); 0 under ZK or if
+     *  absent. O(1) — bound per Micrometer FunctionCounter so each scrape avoids rebuilding the stats map. */
+    public long namespaceLogValue(String namespace, int index) {
+        return store instanceof NamespaceLogMetadataStore log ? log.metrics().value(namespace, index) : 0L;
+    }
+
     /** This controller's rendezvous endpoint identity — the {@code owner} label for the namespace-owner
      *  gauge ({@code strata_controller_namespace_owner}); same value the latch advertises. */
     public String localControllerEndpoint() {

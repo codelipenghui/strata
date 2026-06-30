@@ -92,7 +92,7 @@ class NamespaceLogMetricsTest {
         assertEquals(300, sa[3], "a readBytes");
         assertEquals(1, sb[4], "b compactions");
         assertEquals(1, sb[7], "b ownerChanges");
-        // The global aggregate accessors still sum across namespaces (back-compat).
+        // The aggregate accessors roll up across namespaces (convenience for the meta tests' totals).
         assertEquals(2, m.appendRecords(), "global appendRecords = sum over namespaces");
         assertEquals(1, m.compactions(), "global compactions = sum over namespaces");
     }

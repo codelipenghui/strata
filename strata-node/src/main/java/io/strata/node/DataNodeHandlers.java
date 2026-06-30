@@ -140,6 +140,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 if (!(Messages.Command.read(h) instanceof Messages.ReplicateCmd cmd)) {
                     throw new ScpException(ErrorCode.PRECONDITION_FAILED, "EXEC_REPLICATE requires a ReplicateCmd");
                 }
+                io.strata.proto.RequestContext.setNamespace(cmd.namespace().value());
                 loop.replicate(cmd);
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }

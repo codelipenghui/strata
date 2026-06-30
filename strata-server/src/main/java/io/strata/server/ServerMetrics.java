@@ -98,15 +98,14 @@ final class ServerMetrics {
         registerPerNamespace(reg, s);
     }
 
-    private static final long[] EMPTY8 = new long[8];
-    // strata_controller_namespace_log_* index order matches NamespaceLogMetrics.stats():
-    // 0 appendRecords, 1 appendBytes, 2 readRecords, 3 readBytes, 4 compactions, 5 recoveries, 6 reacquisitions.
-    // (index 7 ownerChanges is exported separately as strata_controller_namespace_owner_changes.)
-    private static final String[] CONTROLLER_NS_LOG_COUNTERS = {
+    // Per-namespace controller counter names, index-aligned with NamespaceLogMetrics.stats(): 0 appendRecords,
+    // 1 appendBytes, 2 readRecords, 3 readBytes, 4 compactions, 5 recoveries, 6 reacquisitions, 7 ownerChanges
+    // (owner_changes is just index 7 — registered uniformly with the rest, no special case).
+    private static final String[] CONTROLLER_NS_COUNTERS = {
             "strata_controller_namespace_log_append_records", "strata_controller_namespace_log_append_bytes",
             "strata_controller_namespace_log_read_records", "strata_controller_namespace_log_read_bytes",
             "strata_controller_namespace_log_compactions", "strata_controller_namespace_log_recoveries",
-            "strata_controller_namespace_log_reacquisitions"};
+            "strata_controller_namespace_log_reacquisitions", "strata_controller_namespace_owner_changes"};
 
     /**
      * Per-namespace gauges (namespace-stacked dashboard panels): live files + open metadata-log bytes,
@@ -147,30 +146,14 @@ final class ServerMetrics {
     }
 
     /**
-     * Idempotently registers the per-namespace namespace-log function-counters (and the owner-change
-     * counter) for any namespace now present in the controller's log stats but not yet registered. Called
-     * by the refresh timer; also callable directly (tests) to register without waiting for a tick.
+     * Idempotently registers the per-namespace namespace-log + owner-change function-counters for any
+     * namespace this controller now owns but hasn't registered yet. Called by the refresh timer; also
+     * callable directly (tests) to register without waiting for a tick.
      */
     static void registerNewControllerNamespaceCounters(MeterRegistry reg, Controller s) {
-        for (String ns : s.namespaceLogStats().keySet()) {
-            for (int i = 0; i < CONTROLLER_NS_LOG_COUNTERS.length; i++) {
-                String name = CONTROLLER_NS_LOG_COUNTERS[i];
-                if (reg.find(name).tag("namespace", ns).functionCounter() == null) {
-                    final int idx = i;
-                    FunctionCounter.builder(name, s, m -> m.namespaceLogStats().getOrDefault(ns, EMPTY8)[idx])
-                            .tag("namespace", ns)
-                            .description("per-namespace metadata-log activity (rate() = ops/s or bytes/s)")
-                            .register(reg);
-                }
-            }
-            if (reg.find("strata_controller_namespace_owner_changes").tag("namespace", ns).functionCounter() == null) {
-                FunctionCounter.builder("strata_controller_namespace_owner_changes", s,
-                                m -> m.namespaceLogStats().getOrDefault(ns, EMPTY8)[7])
-                        .tag("namespace", ns)
-                        .description("ownership handoffs to a controller (cold repository acquisitions)")
-                        .register(reg);
-            }
-        }
+        registerLazyNsCounters(reg, s, s.namespaceLogNamespaces(), CONTROLLER_NS_COUNTERS,
+                "per-namespace metadata-log activity / ownership handoffs (rate() = ops/s or bytes/s)",
+                Controller::namespaceLogValue);
     }
 
     /** Data plane: capacity, chunk state, write throughput, fsync force rate, registration. */
@@ -213,10 +196,8 @@ final class ServerMetrics {
         FunctionCounter.builder("strata_data_node_filechannel_cache", n, DataNode::channelCacheEvictions)
                 .tag("event", "eviction").register(reg);
 
-        // Per-namespace data throughput: register a function-counter per namespace as it first appears in
-        // namespaceIoStats(). Refreshed off a daemon timer because the namespace set changes at runtime; a
-        // counter is never deregistered once a namespace goes idle (its value freezes), so cardinality is
-        // bounded by namespaces ever seen on this node and counter semantics stay monotonic.
+        // Per-namespace data throughput: register a function-counter per namespace as it first appears
+        // (via ioNamespaces()). Refreshed off a daemon timer because the namespace set changes at runtime.
         var refresh = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "data-node-ns-metrics");
             t.setDaemon(true);
@@ -225,29 +206,43 @@ final class ServerMetrics {
         refresh.scheduleAtFixedRate(() -> registerNewDataNodeNamespaces(reg, n), 0, 10, TimeUnit.SECONDS);
     }
 
-    private static final long[] EMPTY4 = new long[4];
     private static final String[] DATA_NODE_NS_COUNTERS = {
             "strata_data_node_append_ops", "strata_data_node_append_bytes",
             "strata_data_node_read_ops", "strata_data_node_read_bytes"};
 
+    /** Reads one per-namespace counter value (index into the source's namespace-counter array). */
+    @FunctionalInterface
+    interface NsCounterReader<T> {
+        double valueOf(T source, String namespace, int index);
+    }
+
     /**
-     * Idempotently registers the per-namespace data-throughput function-counters for any namespace now
-     * present in the node's I/O stats but not yet registered. Called by the refresh timer; also callable
-     * directly (tests) to register without waiting for a tick.
+     * Idempotently registers, per namespace, one monotonic function-counter per name — each bound to read a
+     * SINGLE counter via {@code reader} (O(1) per scrape, no per-scrape map allocation). A counter is never
+     * deregistered once its namespace goes idle (its value freezes), so cardinality is bounded by namespaces
+     * ever seen and counter semantics stay monotonic.
      */
-    static void registerNewDataNodeNamespaces(MeterRegistry reg, DataNode n) {
-        for (String ns : n.namespaceIoStats().keySet()) {
-            for (int i = 0; i < DATA_NODE_NS_COUNTERS.length; i++) {
-                String name = DATA_NODE_NS_COUNTERS[i];
-                if (reg.find(name).tag("namespace", ns).functionCounter() == null) {
+    private static <T> void registerLazyNsCounters(MeterRegistry reg, T source, Iterable<String> namespaces,
+            String[] names, String description, NsCounterReader<T> reader) {
+        for (String ns : namespaces) {
+            for (int i = 0; i < names.length; i++) {
+                if (reg.find(names[i]).tag("namespace", ns).functionCounter() == null) {
                     final int idx = i;
-                    FunctionCounter.builder(name, n, x -> x.namespaceIoStats().getOrDefault(ns, EMPTY4)[idx])
-                            .tag("namespace", ns)
-                            .description("per-namespace data throughput (rate() = ops/s or bytes/s)")
-                            .register(reg);
+                    final String namespace = ns;
+                    FunctionCounter.builder(names[i], source, src -> reader.valueOf(src, namespace, idx))
+                            .tag("namespace", namespace).description(description).register(reg);
                 }
             }
         }
+    }
+
+    /**
+     * Idempotently registers the per-namespace data-throughput function-counters for any namespace that has
+     * seen I/O. Called by the refresh timer; also callable directly (tests) to register without a tick.
+     */
+    static void registerNewDataNodeNamespaces(MeterRegistry reg, DataNode n) {
+        registerLazyNsCounters(reg, n, n.ioNamespaces(), DATA_NODE_NS_COUNTERS,
+                "per-namespace data throughput (rate() = ops/s or bytes/s)", DataNode::ioValue);
     }
 
     /**

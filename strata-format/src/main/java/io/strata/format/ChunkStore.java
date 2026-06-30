@@ -258,6 +258,18 @@ public final class ChunkStore implements AutoCloseable {
         return out;
     }
 
+    /** Namespaces that have seen I/O — drives lazy per-namespace meter registration (no snapshot alloc). */
+    public java.util.Set<String> ioNamespaces() {
+        return nsIo.keySet();
+    }
+
+    /** One per-namespace I/O counter (index: 0 appendOps, 1 appendBytes, 2 readOps, 3 readBytes); 0 if absent.
+     *  O(1) — bound per Micrometer FunctionCounter so each scrape is a single {@code LongAdder.sum()}. */
+    public long ioValue(String namespace, int index) {
+        java.util.concurrent.atomic.LongAdder[] a = nsIo.get(namespace);
+        return a == null ? 0L : a[index].sum();
+    }
+
     /** Open (being-written) chunk count — best-effort snapshot for observability. */
     public int openChunks() {
         return countByState(ChunkState.OPEN);
