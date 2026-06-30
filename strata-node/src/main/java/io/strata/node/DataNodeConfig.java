@@ -42,7 +42,7 @@ public record DataNodeConfig(
                       long capacityBytes, int scrubIntervalMs) {
         this(dataDir, listenPort, advertisedHost, advertisedEndpointOverride, controllerEndpoints,
                 zone, rack, host, capacityBytes, scrubIntervalMs, ConnectionPolicy.DEFAULT, -1,
-                0L, 0L, 0L, 0, 0, 0, null);
+                6_000L, 3_000L, 6_000L, 5_000, 10_000, 4 * 1024 * 1024, ChunkStoreConfig.DEFAULT);
     }
 
     public DataNodeConfig {
@@ -76,13 +76,25 @@ public record DataNodeConfig(
             throw new IllegalArgumentException("nodeId must be -1 (standalone) or >= 1: " + nodeId);
         }
         connectionPolicy = Objects.requireNonNull(connectionPolicy, "connectionPolicy");
-        if (orphanGraceMs <= 0) { orphanGraceMs = 6_000; }
-        if (orphanScanIntervalMs <= 0) { orphanScanIntervalMs = 3_000; }
-        if (orphanStartupGraceMs <= 0) { orphanStartupGraceMs = 6_000; }
-        if (orphanConfirmTimeoutMs <= 0) { orphanConfirmTimeoutMs = 5_000; }
-        if (controlCallTimeoutMs <= 0) { controlCallTimeoutMs = 10_000; }
-        if (repairFetchBytes <= 0) { repairFetchBytes = 4 * 1024 * 1024; }
-        if (chunkStoreConfig == null) { chunkStoreConfig = ChunkStoreConfig.DEFAULT; }
+        if (orphanGraceMs <= 0) {
+            throw new IllegalArgumentException("orphanGraceMs must be positive: " + orphanGraceMs);
+        }
+        if (orphanScanIntervalMs <= 0) {
+            throw new IllegalArgumentException("orphanScanIntervalMs must be positive: " + orphanScanIntervalMs);
+        }
+        if (orphanStartupGraceMs <= 0) {
+            throw new IllegalArgumentException("orphanStartupGraceMs must be positive: " + orphanStartupGraceMs);
+        }
+        if (orphanConfirmTimeoutMs <= 0) {
+            throw new IllegalArgumentException("orphanConfirmTimeoutMs must be positive: " + orphanConfirmTimeoutMs);
+        }
+        if (controlCallTimeoutMs <= 0) {
+            throw new IllegalArgumentException("controlCallTimeoutMs must be positive: " + controlCallTimeoutMs);
+        }
+        if (repairFetchBytes <= 0) {
+            throw new IllegalArgumentException("repairFetchBytes must be positive: " + repairFetchBytes);
+        }
+        chunkStoreConfig = java.util.Objects.requireNonNull(chunkStoreConfig, "chunkStoreConfig");
     }
 
     private static void requireText(String value, String field) {

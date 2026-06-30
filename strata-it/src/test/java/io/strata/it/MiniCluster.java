@@ -63,7 +63,7 @@ final class MiniCluster implements AutoCloseable {
         List<String> eligible = List.copyOf(endpoints);
         return new MiniCluster(dataNodeCount, null, controllerCount, (zk, idx) ->
                 new ControllerConfig(zk, ports[idx], 200, 1_000, 1_500, 300, 3_000, 60_000, 5_000, 20_000,
-                        "127.0.0.1", 90_000, eligible, 1, 0, 0, 0, 0, 0, 0, -1));
+                        "127.0.0.1", 90_000, eligible, 1, 2_000, 256, 30_000, 600_000L, 16, 100, 5));
     }
 
     private static int freePort() throws IOException {

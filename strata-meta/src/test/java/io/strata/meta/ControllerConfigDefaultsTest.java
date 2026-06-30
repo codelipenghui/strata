@@ -1,5 +1,6 @@
 package io.strata.meta;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import org.junit.jupiter.api.Test;
@@ -49,6 +50,18 @@ class ControllerConfigDefaultsTest {
         assertEquals(64, c.maxCommandsPerHeartbeat());
         assertEquals(50, c.zkRetryBaseMs());
         assertEquals(9, c.zkRetryMaxRetries());
+    }
+
+    @Test
+    void failFastOnNonPositiveTuningOverrides() {
+        ControllerConfig base = new ControllerConfig("zk:2181", 9100, 3000, 60000, 300000, 5000, 30000);
+        assertThrows(IllegalArgumentException.class, () -> base.withVerifyIntervalMs(0));
+        assertThrows(IllegalArgumentException.class, () -> base.withVerifyBatchSize(-1));
+        assertThrows(IllegalArgumentException.class, () -> base.withMaxCommandsPerHeartbeat(0));
+        assertThrows(IllegalArgumentException.class, () -> base.withZkRetryMaxRetries(-1));
+        // 0 retries is valid (means no retry)
+        assertDoesNotThrow(() -> base.withZkRetryMaxRetries(0));
+        assertEquals(0, base.withZkRetryMaxRetries(0).zkRetryMaxRetries());
     }
 
     @Test

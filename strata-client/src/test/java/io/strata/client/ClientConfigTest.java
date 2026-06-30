@@ -40,6 +40,13 @@ class ClientConfigTest {
     }
 
     @Test
+    void failFastOnNonPositiveClientTuningOverrides() {
+        ClientConfig base = ClientConfig.of("host:123");
+        assertThrows(IllegalArgumentException.class, () -> base.withControllerRetryDeadlineMs(0));
+        assertThrows(IllegalArgumentException.class, () -> base.withRecoveryCopyChunkBytes(-1));
+    }
+
+    @Test
     void newClientTuningFieldsDefault() {
         ClientConfig c = ClientConfig.of("host:123");
         assertEquals(15_000L, c.controllerRetryDeadlineMs());

@@ -109,7 +109,7 @@ class DataNodeConfigTest {
                 null, List.of(), "zone", "rack", "host", 1, 0));
         assertThrows(NullPointerException.class, () -> new DataNodeConfig(Path.of("data"), 0, "127.0.0.1",
                 null, List.of(), "zone", "rack", "host", 1, 1, null, -1,
-                0L, 0L, 0L, 0, 0, 0, null));
+                6_000L, 3_000L, 6_000L, 5_000, 10_000, 4 * 1024 * 1024, io.strata.format.ChunkStoreConfig.DEFAULT));
     }
 
     @Test
@@ -123,6 +123,14 @@ class DataNodeConfigTest {
         assertEquals(10_000, c.controlCallTimeoutMs());
         assertEquals(4 * 1024 * 1024, c.repairFetchBytes());
         assertEquals(io.strata.format.ChunkStoreConfig.DEFAULT, c.chunkStoreConfig());
+    }
+
+    @Test
+    void failFastOnNonPositiveNodeTuningOverrides() {
+        DataNodeConfig base = new DataNodeConfig(Path.of("data"), 0, "10.0.0.1", null,
+                List.of("meta:9000"), "zone", "rack", "host", 1234, 55);
+        assertThrows(IllegalArgumentException.class, () -> base.withOrphanGraceMs(0));
+        assertThrows(IllegalArgumentException.class, () -> base.withControlCallTimeoutMs(-1));
     }
 
     @Test

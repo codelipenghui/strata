@@ -54,25 +54,25 @@ public record ControllerConfig(
             controllerReplicaCount = 3;
         }
         if (verifyIntervalMs <= 0) {
-            verifyIntervalMs = 2_000;
+            throw new IllegalArgumentException("verifyIntervalMs must be positive: " + verifyIntervalMs);
         }
         if (verifyBatchSize <= 0) {
-            verifyBatchSize = 256;
+            throw new IllegalArgumentException("verifyBatchSize must be positive: " + verifyBatchSize);
         }
         if (systemVerifyIntervalMs <= 0) {
-            systemVerifyIntervalMs = 30_000;
+            throw new IllegalArgumentException("systemVerifyIntervalMs must be positive: " + systemVerifyIntervalMs);
         }
         if (deletedTombstoneTtlMs <= 0) {
-            deletedTombstoneTtlMs = 600_000;
+            throw new IllegalArgumentException("deletedTombstoneTtlMs must be positive: " + deletedTombstoneTtlMs);
         }
         if (maxCommandsPerHeartbeat <= 0) {
-            maxCommandsPerHeartbeat = 16;
+            throw new IllegalArgumentException("maxCommandsPerHeartbeat must be positive: " + maxCommandsPerHeartbeat);
         }
         if (zkRetryBaseMs <= 0) {
-            zkRetryBaseMs = 100;
+            throw new IllegalArgumentException("zkRetryBaseMs must be positive: " + zkRetryBaseMs);
         }
         if (zkRetryMaxRetries < 0) {
-            zkRetryMaxRetries = 5;
+            throw new IllegalArgumentException("zkRetryMaxRetries must be >= 0: " + zkRetryMaxRetries);
         }
         // A DELETED tombstone fences a delayed CREATE replay; it must outlive the reconcile sweep cadence.
         if (deletedTombstoneTtlMs <= repairScanIntervalMs) {
@@ -85,7 +85,7 @@ public record ControllerConfig(
                       int deadGraceMs, int repairScanIntervalMs, int repairCommandTimeoutMs) {
         this(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs, repairScanIntervalMs,
                 repairCommandTimeoutMs, 60_000, 60_000, 15_000, "127.0.0.1", 90_000, List.of(), 3,
-                0, 0, 0, 0, 0, 0, -1);
+                2_000, 256, 30_000, 600_000L, 16, 100, 5);
     }
 
     /** Full v0 tuning tuple without namespace sharding (kept so existing callers compile unchanged). */
@@ -95,7 +95,7 @@ public record ControllerConfig(
                       long replicaMissingGraceMs) {
         this(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs, repairScanIntervalMs,
                 repairCommandTimeoutMs, 60_000, zkSessionTimeoutMs, zkConnectionTimeoutMs, advertisedHost,
-                replicaMissingGraceMs, List.of(), 3, 0, 0, 0, 0, 0, 0, -1);
+                replicaMissingGraceMs, List.of(), 3, 2_000, 256, 30_000, 600_000L, 16, 100, 5);
     }
 
     public ControllerConfig withAdvertisedHost(String host) {
@@ -195,6 +195,6 @@ public record ControllerConfig(
 
     public static ControllerConfig forTests(String zkConnect) {
         return new ControllerConfig(zkConnect, 0, 200, 1_000, 1_500, 300, 3_000, 5_000, 5_000, 20_000, "127.0.0.1",
-                90_000, List.of(), 3, 0, 0, 0, 0, 0, 0, -1);
+                90_000, List.of(), 3, 2_000, 256, 30_000, 600_000L, 16, 100, 5);
     }
 }

@@ -10,6 +10,7 @@ import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
 import io.strata.format.ChunkStore;
+import io.strata.format.ChunkStoreConfig;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -835,7 +836,7 @@ class ControlLoopTest {
         int customFetchBytes = 512;
         DataNodeConfig customConfig = new DataNodeConfig(Path.of("."), 0, "127.0.0.1", null, List.of(),
                 "z", "r", "h", 1L << 20, 60_000, ConnectionPolicy.DEFAULT, -1,
-                0L, 0L, 0L, 0, 0, customFetchBytes, null);
+                6_000L, 3_000L, 6_000L, 5_000, 10_000, customFetchBytes, ChunkStoreConfig.DEFAULT);
         long minLength = ChunkFormats.HEADER_SIZE + ChunkFormats.TRAILER_SIZE;
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpServer source = new ScpServer(0, 77, 0, 0, req -> {
@@ -887,7 +888,7 @@ class ControlLoopTest {
         ConnectionPolicy testPolicy = new ConnectionPolicy(1_000, 1_000, 100, 1_000, 1, 1);
         return new DataNodeConfig(Path.of("."), 0, "127.0.0.1", null, controllerEndpoints,
                 "z", "r", "h", 1L << 20, inventoryIntervalMs, testPolicy, -1,
-                0L, 0L, 0L, 0, 0, 0, null);
+                6_000L, 3_000L, 6_000L, 5_000, 10_000, 4 * 1024 * 1024, ChunkStoreConfig.DEFAULT);
     }
 
     private static DataNodeConfig configWithoutMetadata() {
