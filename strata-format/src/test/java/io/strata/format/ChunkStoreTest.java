@@ -41,6 +41,7 @@ import java.util.stream.Stream;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -1129,7 +1130,7 @@ class ChunkStoreTest {
     }
 
     @Test
-    void failedImportAfterMoveCleansPartialFilesForRetry(@TempDir Path otherDir) throws Exception {
+    void importedSealedChunkWritesNoSidecarAndRecoversFromTrailer(@TempDir Path otherDir) throws Exception {
         byte[] fileBytes;
         long sealedLength;
         int dataCrc;
@@ -1141,23 +1142,20 @@ class ChunkStoreTest {
         }
 
         String rel = ChunkFormats.chunkRelativePath(TEST_NS, id);
-        Path dataPath = otherDir.resolve(rel + ".chunk");
         Path metaPath = otherDir.resolve(rel + ".meta");
-        Files.createDirectories(dataPath.getParent());
-        // Block the sidecar path by placing a directory there
-        Files.createDirectory(metaPath);
-        Files.write(metaPath.resolve("blocker"), new byte[] {1});
 
+        // Durability-v2 (Lever 1): an imported sealed chunk writes no .meta sidecar — its SEALED state
+        // is carried by the verified trailer, and recovery classifies it from the trailer alone.
         try (ChunkStore other = new ChunkStore(otherDir)) {
-            assertThrows(IOException.class, () -> other.importSealed(TEST_NS, id, fileBytes, sealedLength, dataCrc));
-            assertTrue(Files.notExists(dataPath));
-            assertEquals(ErrorCode.CHUNK_NOT_FOUND,
-                    assertThrows(ScpException.class, () -> other.stat(TEST_NS, id)).code());
-
-            Files.delete(metaPath.resolve("blocker"));
-            Files.delete(metaPath);
             other.importSealed(TEST_NS, id, fileBytes, sealedLength, dataCrc);
             assertTrue(other.contains(TEST_NS, id));
+            assertFalse(Files.exists(metaPath), "imported sealed chunk carries no .meta sidecar");
+        }
+
+        try (ChunkStore reopened = new ChunkStore(otherDir)) {
+            var stat = reopened.stat(TEST_NS, id);
+            assertEquals(ChunkState.SEALED, stat.state());
+            assertEquals(sealedLength, stat.sealedLength());
         }
     }
 
