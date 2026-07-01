@@ -836,7 +836,8 @@ class ControlLoopTest {
         int customFetchBytes = 512;
         DataNodeConfig customConfig = new DataNodeConfig(Path.of("."), 0, "127.0.0.1", null, List.of(),
                 "z", "r", "h", 1L << 20, 60_000, ConnectionPolicy.DEFAULT, -1,
-                6_000L, 3_000L, 6_000L, 5_000, 10_000, customFetchBytes, ChunkStoreConfig.DEFAULT);
+                6_000L, 3_000L, 6_000L, 5_000, 10_000, customFetchBytes, 1, 0,
+                ChunkStoreConfig.DEFAULT);
         long minLength = ChunkFormats.HEADER_SIZE + ChunkFormats.TRAILER_SIZE;
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpServer source = new ScpServer(0, 77, 0, 0, req -> {
@@ -888,7 +889,8 @@ class ControlLoopTest {
         ConnectionPolicy testPolicy = new ConnectionPolicy(1_000, 1_000, 100, 1_000, 1, 1);
         return new DataNodeConfig(Path.of("."), 0, "127.0.0.1", null, controllerEndpoints,
                 "z", "r", "h", 1L << 20, inventoryIntervalMs, testPolicy, -1,
-                6_000L, 3_000L, 6_000L, 5_000, 10_000, 4 * 1024 * 1024, ChunkStoreConfig.DEFAULT);
+                6_000L, 3_000L, 6_000L, 5_000, 10_000, 4 * 1024 * 1024, 1, 0,
+                ChunkStoreConfig.DEFAULT);
     }
 
     private static DataNodeConfig configWithoutMetadata() {

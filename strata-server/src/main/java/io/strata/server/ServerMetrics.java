@@ -188,6 +188,10 @@ final class ServerMetrics {
                 .description("configured channel-cache capacity").register(reg);
         Gauge.builder("strata_data_node_open_fds", n, DataNode::openFds)
                 .description("process open file descriptors (-1 if unavailable)").register(reg);
+        Gauge.builder("strata_data_node_delete_waiting", n, DataNode::deleteWaiting)
+                .description("delete callers waiting for the physical-delete QoS gate").register(reg);
+        Gauge.builder("strata_data_node_delete_inflight", n, DataNode::deleteInFlight)
+                .description("physical chunk deletes currently running").register(reg);
 
         FunctionCounter.builder("strata_data_node_filechannel_cache", n, DataNode::channelCacheHits)
                 .tag("event", "hit").description("sealed-chunk channel cache events").register(reg);
@@ -195,6 +199,12 @@ final class ServerMetrics {
                 .tag("event", "miss").register(reg);
         FunctionCounter.builder("strata_data_node_filechannel_cache", n, DataNode::channelCacheEvictions)
                 .tag("event", "eviction").register(reg);
+        FunctionCounter.builder("strata_data_node_delete", n, DataNode::deleteOkCount)
+                .tag("result", "ok").description("physical chunk delete completions").register(reg);
+        FunctionCounter.builder("strata_data_node_delete", n, DataNode::deleteNotFoundCount)
+                .tag("result", "not_found").register(reg);
+        FunctionCounter.builder("strata_data_node_delete", n, DataNode::deleteFailedCount)
+                .tag("result", "failed").register(reg);
 
         // Per-namespace data throughput: register a function-counter per namespace as it first appears
         // (via ioNamespaces()). Refreshed off a daemon timer because the namespace set changes at runtime.

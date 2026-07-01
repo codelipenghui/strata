@@ -17,11 +17,17 @@ import java.util.List;
 final class DataNodeHandlers implements ScpServer.Handler {
     private final ChunkStore store;
     private final DataNode node;
+    private final ChunkDeleteService deletes;
     private volatile ControlLoop controlLoop; // wired after the control loop starts (owner-repair path)
 
     DataNodeHandlers(ChunkStore store, DataNode node) {
+        this(store, node, new ChunkDeleteService(store, 1, 0));
+    }
+
+    DataNodeHandlers(ChunkStore store, DataNode node, ChunkDeleteService deletes) {
         this.store = store;
         this.node = node;
+        this.deletes = deletes;
     }
 
     /** Wires the control loop so this node can serve direct owner-driven EXEC_REPLICATE repairs. */
@@ -117,7 +123,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 var m = Messages.DeleteChunks.decode(h);
                 io.strata.proto.RequestContext.setNamespace(m.namespace().value());
                 List<Short> codes = new ArrayList<>(m.chunkIds().size());
-                for (var id : m.chunkIds()) codes.add(store.delete(m.namespace(), id).code);
+                for (var id : m.chunkIds()) codes.add(deletes.delete(m.namespace(), id).code);
                 yield ScpServer.ok(req, new Messages.DeleteChunksResp(m.chunkIds(), codes).encode(), null);
             }
 

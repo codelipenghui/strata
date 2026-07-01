@@ -27,6 +27,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -1611,7 +1613,7 @@ class AppenderImplTest {
     }
 
     @Test
-    void appendAdmissionToleratesOneSlowReplicaButBlocksWhenQuorumLacksCapacity() throws Exception {
+    void appendAdmissionBlocksOnAnyLiveReplicaWithoutCapacityButIgnoresFailedReplica() throws Exception {
         AppenderImpl appender = appender();   // WritePolicy.DEFAULT: replicationFactor=3, ackQuorum=2
         Object session = chunkSession();      // 3 replicas, no connections established yet
 
@@ -1625,15 +1627,72 @@ class AppenderImplTest {
                 "hasAppendConnectionCapacity", session.getClass());
         hasCapacity.setAccessible(true);
 
-        // One saturated (slow) replica must NOT gate produce: the other two still meet ackQuorum.
+        // A live replica must receive every append for this open chunk; a saturated live replica
+        // backpressures instead of being sent past the connection's hard pending limit.
         inFlight[0] = watermark;
-        assertTrue((boolean) hasCapacity.invoke(appender, session),
-                "a single saturated replica must not block appends while ackQuorum replicas have capacity");
-
-        // Two saturated replicas: only one has capacity, below ackQuorum=2 -> appends must throttle.
-        inFlight[1] = watermark;
         assertFalse((boolean) hasCapacity.invoke(appender, session),
-                "appends must block when fewer than ackQuorum replicas have capacity");
+                "appends must block when any live replica lacks capacity");
+
+        // Once that replica is failed out of the current chunk, the remaining quorum may proceed.
+        setBooleanArray(session, "failed", 0, true);
+        assertTrue((boolean) hasCapacity.invoke(appender, session),
+                "failed replicas no longer gate the live append quorum");
+    }
+
+    @Test
+    void appendRetriesOnActiveSessionAfterBackpressureWaitSeesRolledSession() throws Exception {
+        FileId fileId = FileId.of(37);
+        AtomicInteger oldAppends = new AtomicInteger();
+        AtomicInteger newAppends = new AtomicInteger();
+
+        try (ScpServer old1 = countedDataNodeServer(1, oldAppends);
+             ScpServer old2 = countedDataNodeServer(2, oldAppends);
+             ScpServer old3 = countedDataNodeServer(3, oldAppends);
+             ScpServer new1 = countedDataNodeServer(4, newAppends);
+             ScpServer new2 = countedDataNodeServer(5, newAppends);
+             ScpServer new3 = countedDataNodeServer(6, newAppends);
+             NodePool pool = new NodePool()) {
+            ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500);
+            AppenderImpl appender = new AppenderImpl(null, pool, config, fileId, StrataNamespace.of("test"),
+                    1, Messages.WritePolicy.DEFAULT, 0);
+            Object oldSession = chunkSession(new ChunkId(fileId, 0),
+                    new Messages.Replica(1, endpoint(old1)),
+                    new Messages.Replica(2, endpoint(old2)),
+                    new Messages.Replica(3, endpoint(old3)));
+            Object newSession = chunkSession(new ChunkId(fileId, 1),
+                    new Messages.Replica(4, endpoint(new1)),
+                    new Messages.Replica(5, endpoint(new2)),
+                    new Messages.Replica(6, endpoint(new3)));
+            setSession(appender, oldSession);
+
+            Field wmField = AppenderImpl.class.getDeclaredField("APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK");
+            wmField.setAccessible(true);
+            inFlight(oldSession)[0] = wmField.getInt(null);
+
+            AtomicReference<CompletableFuture<Long>> appendResult = new AtomicReference<>();
+            AtomicReference<Throwable> appendFailure = new AtomicReference<>();
+            Thread appendThread = Thread.ofVirtual().start(() -> {
+                try {
+                    appendResult.set(appender.append(ByteBuffer.wrap(new byte[] {1, 2, 3})));
+                } catch (Throwable t) {
+                    appendFailure.set(t);
+                }
+            });
+
+            waitForProgressWaiter(appender);
+            setSessionUnderLock(appender, newSession);
+            onReplicaResponse(appender, oldSession, 0, 0, appendResp(0), null);
+
+            appendThread.join(2_000);
+            assertFalse(appendThread.isAlive(), "append should return after retrying on the active session");
+            assertEquals(null, appendFailure.get());
+            CompletableFuture<Long> result = appendResult.get();
+            assertNotNull(result);
+            assertEquals(3L, result.get(1, TimeUnit.SECONDS));
+            waitFor(() -> newAppends.get() == 3);
+            assertEquals(0, oldAppends.get(), "stale session must not receive the append after the wait");
+            assertEquals(3, newAppends.get());
+        }
     }
 
     private static AppenderImpl appender() {
@@ -1707,6 +1766,41 @@ class AppenderImplTest {
         return field.get(appender);
     }
 
+    private static void setSessionUnderLock(AppenderImpl appender, Object session) throws Exception {
+        ReentrantLock lock = appenderLock(appender);
+        lock.lock();
+        try {
+            setSession(appender, session);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static ReentrantLock appenderLock(AppenderImpl appender) throws Exception {
+        Field field = AppenderImpl.class.getDeclaredField("lock");
+        field.setAccessible(true);
+        return (ReentrantLock) field.get(appender);
+    }
+
+    private static Condition appenderProgress(AppenderImpl appender) throws Exception {
+        Field field = AppenderImpl.class.getDeclaredField("progress");
+        field.setAccessible(true);
+        return (Condition) field.get(appender);
+    }
+
+    private static void waitForProgressWaiter(AppenderImpl appender) throws Exception {
+        ReentrantLock lock = appenderLock(appender);
+        Condition progress = appenderProgress(appender);
+        waitFor(() -> {
+            lock.lock();
+            try {
+                return lock.hasWaiters(progress);
+            } finally {
+                lock.unlock();
+            }
+        });
+    }
+
     private static void setLong(Object target, String fieldName, long value) throws Exception {
         Field field = target.getClass().getDeclaredField(fieldName);
         field.setAccessible(true);
@@ -1744,6 +1838,12 @@ class AppenderImplTest {
         Field field = session.getClass().getDeclaredField("connections");
         field.setAccessible(true);
         return (ManagedScpConnection[]) field.get(session);
+    }
+
+    private static int[] inFlight(Object session) throws Exception {
+        Field field = session.getClass().getDeclaredField("inFlight");
+        field.setAccessible(true);
+        return (int[]) field.get(session);
     }
 
     @SuppressWarnings("unchecked")

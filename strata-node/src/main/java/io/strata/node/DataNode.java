@@ -30,6 +30,7 @@ public final class DataNode implements AutoCloseable {
 
     private final DataNodeConfig config;
     private final ChunkStore store;
+    private final ChunkDeleteService deleteService;
     private final ScpServer server;
     private final ControlLoop controlLoop;
     private final OrphanGc orphanGc; // node-local orphan GC (design §20.4); null in standalone mode
@@ -64,23 +65,26 @@ public final class DataNode implements AutoCloseable {
         OrphanGc startedGc = null;
         try {
             openedStore = new ChunkStore(config.dataDir().resolve("chunks"), config.chunkStoreConfig());
-            DataNodeHandlers dataHandler = new DataNodeHandlers(openedStore, this);
+            ChunkDeleteService deletes = new ChunkDeleteService(openedStore,
+                    config.deleteMaxConcurrent(), config.deleteMinIntervalMs());
+            DataNodeHandlers dataHandler = new DataNodeHandlers(openedStore, this, deletes);
             ScpServer.Handler handler = controllerHandler == null
                     ? dataHandler
                     : ScpServer.Handler.route(dataHandler, controllerHandler);
             openedServer = new ScpServer(config.listenPort(), nodeId,
                     incarnation.getMostSignificantBits(), incarnation.getLeastSignificantBits(), handler);
             this.store = openedStore;
+            this.deleteService = deletes;
             this.server = openedServer;
             if (!config.controllerEndpoints().isEmpty()) {
-                startedLoop = new ControlLoop(this, config, openedStore);
+                startedLoop = new ControlLoop(this, config, openedStore, deletes);
                 this.controlLoop = startedLoop;
                 dataHandler.controlLoop(startedLoop); // serve direct owner-repair EXEC_REPLICATE
                 startedLoop.start();
                 // Node-local orphan GC (design §20.4): reclaim sealed chunks no owner references, after
                 // confirming with the namespace owner. Only a registered node runs it (it needs a nodeId
                 // to recognise itself in a descriptor and controller endpoints to ask).
-                startedGc = new OrphanGc(openedStore, nodeId, config.controllerEndpoints(),
+                startedGc = new OrphanGc(openedStore, deletes, nodeId, config.controllerEndpoints(),
                         config.orphanGraceMs(), config.orphanScanIntervalMs(), config.orphanStartupGraceMs(),
                         config.orphanConfirmTimeoutMs());
                 this.orphanGc = startedGc;
@@ -195,6 +199,12 @@ public final class DataNode implements AutoCloseable {
     public int cachedChannels() { return store.cachedChannels(); }
     public int channelCacheCapacity() { return store.channelCacheCapacity(); }
     public long openFds() { return store.openFds(); }
+
+    public int deleteWaiting() { return deleteService.waitingDeletes(); }
+    public int deleteInFlight() { return deleteService.inFlightDeletes(); }
+    public long deleteOkCount() { return deleteService.okDeletes(); }
+    public long deleteNotFoundCount() { return deleteService.notFoundDeletes(); }
+    public long deleteFailedCount() { return deleteService.failedDeletes(); }
 
     /** Installs a per-request latency observer on the data-plane server (used by the metrics layer). */
     public void setRequestObserver(io.strata.proto.RequestObserver observer) {

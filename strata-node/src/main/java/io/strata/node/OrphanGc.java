@@ -53,6 +53,7 @@ final class OrphanGc implements AutoCloseable {
     private static final int DEFAULT_CONFIRM_TIMEOUT_MS = 5_000;
 
     private final ChunkStore store;
+    private final ChunkDeleteService deletes;
     private final int nodeId;
     private final List<String> controllerEndpoints;
     private final long graceMs;
@@ -71,7 +72,14 @@ final class OrphanGc implements AutoCloseable {
 
     OrphanGc(ChunkStore store, int nodeId, List<String> controllerEndpoints,
              long graceMs, long scanIntervalMs, long startupGraceMs, int confirmTimeoutMs) {
+        this(store, new ChunkDeleteService(store, 1, 0), nodeId, controllerEndpoints,
+                graceMs, scanIntervalMs, startupGraceMs, confirmTimeoutMs);
+    }
+
+    OrphanGc(ChunkStore store, ChunkDeleteService deletes, int nodeId, List<String> controllerEndpoints,
+             long graceMs, long scanIntervalMs, long startupGraceMs, int confirmTimeoutMs) {
         this.store = store;
+        this.deletes = deletes;
         this.nodeId = nodeId;
         this.controllerEndpoints = List.copyOf(controllerEndpoints);
         this.graceMs = graceMs;
@@ -111,7 +119,7 @@ final class OrphanGc implements AutoCloseable {
             }
             switch (confirm(s.namespace(), s.chunkId())) {
                 case ORPHAN -> {
-                    ErrorCode result = store.delete(s.namespace(), s.chunkId());
+                    ErrorCode result = deletes.delete(s.namespace(), s.chunkId());
                     if (result == ErrorCode.OK) {
                         log.info("orphan GC: deleted unreferenced sealed chunk {} in ns={}",
                                 s.chunkId(), s.namespace());
