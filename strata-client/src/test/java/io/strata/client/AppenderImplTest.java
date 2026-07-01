@@ -1640,6 +1640,53 @@ class AppenderImplTest {
     }
 
     @Test
+    void partialOpenQuorumAcceptsFirstAppendBeforeRollingShortSession() throws Exception {
+        FileId fileId = FileId.of(38);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicInteger appends = new AtomicInteger();
+        AtomicInteger createCalls = new AtomicInteger();
+        AtomicInteger sealedMetadata = new AtomicInteger();
+
+        try (ScpServer ok1 = countedDataNodeServer(1, appends);
+             ScpServer ok2 = countedDataNodeServer(2, appends);
+             ScpServer failed = failingOpenServer(3);
+             ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
+                 Opcode op = Opcode.fromCode(req.opcode());
+                 if (op == Opcode.CREATE_CHUNK) {
+                     Messages.CreateChunk.decode(req.headerSlice());
+                     if (createCalls.incrementAndGet() > 1) {
+                         throw new ScpException(ErrorCode.NO_CAPACITY, "need 3 nodes, found 2");
+                     }
+                     return ScpServer.ok(req, new Messages.CreateChunkResp(chunkId, 1, List.of(
+                             new Messages.Replica(1, endpoint(ok1)),
+                             new Messages.Replica(2, endpoint(ok2)),
+                             new Messages.Replica(3, endpoint(failed)))).encode(), null);
+                 }
+                 if (op == Opcode.SEAL_CHUNK_META) {
+                     Messages.SealChunkMeta.decode(req.headerSlice());
+                     sealedMetadata.incrementAndGet();
+                     return ScpServer.ok(req, Messages.okHeader(), null);
+                 }
+                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+             })) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+
+                CompletableFuture<Long> appended = appender.append(ByteBuffer.wrap(new byte[] {1, 2, 3}));
+
+                assertEquals(3L, appended.get(1, TimeUnit.SECONDS));
+                assertEquals(1, createCalls.get(), "first append must not immediately roll the short session");
+                assertEquals(0, sealedMetadata.get(), "short session should not seal before accepting first append");
+                assertEquals(2, appends.get(), "append should fan out to the remaining quorum");
+                assertTrue(booleanField(currentSession(appender), "needRoll"));
+                appender.close();
+            }
+        }
+    }
+
+    @Test
     void appendRetriesOnActiveSessionAfterBackpressureWaitSeesRolledSession() throws Exception {
         FileId fileId = FileId.of(37);
         AtomicInteger oldAppends = new AtomicInteger();

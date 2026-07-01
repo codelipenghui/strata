@@ -152,7 +152,7 @@ final class AppenderImpl implements StrataFile.Appender {
             while (true) {
                 awaitNotRolling();
                 throwIfDead();
-                if (session == null || session.needRoll || session.end >= config.chunkRollBytes()) {
+                if (session == null || shouldRollBeforeAppend(session) || session.end >= config.chunkRollBytes()) {
                     roll();
                     throwIfDead();
                     continue;
@@ -160,7 +160,7 @@ final class AppenderImpl implements StrataFile.Appender {
                 ChunkSession s = session;
                 awaitAppendConnectionCapacityLocked(s);
                 throwIfDead();
-                if (s != session || s.needRoll || s.end >= config.chunkRollBytes()) {
+                if (s != session || shouldRollBeforeAppend(s) || s.end >= config.chunkRollBytes()) {
                     continue;
                 }
                 long base = s.end;
@@ -198,6 +198,10 @@ final class AppenderImpl implements StrataFile.Appender {
             progress.signalAll();
             lock.unlock();
         }
+    }
+
+    private boolean shouldRollBeforeAppend(ChunkSession s) {
+        return s.needRoll && s.end > 0;
     }
 
     private void onReplicaResponse(ChunkSession s, int replicaIndex, long expectedEnd, Frame frame, Throwable err) {
