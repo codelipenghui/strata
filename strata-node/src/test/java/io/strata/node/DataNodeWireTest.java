@@ -166,7 +166,7 @@ class DataNodeWireTest {
         // recovery. Frame.request leaves flags=0, reproducing exactly that case at the handler boundary.
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ChunkStore store = new ChunkStore(dir.resolve("guard-chunks"))) {
-            DataNodeHandlers handlers = new DataNodeHandlers(store, node);
+            DataNodeHandlers handlers = dataNodeHandlers(store, node);
             Frame malformed = Frame.request(Opcode.APPEND,
                     new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
                     ByteBuffer.wrap("no-crc-flag".getBytes()), 7L);
@@ -376,7 +376,7 @@ class DataNodeWireTest {
                     () -> client.call(Opcode.CREATE_FILE, new byte[0], null, 5000));
             assertEquals(ErrorCode.UNKNOWN_OPCODE, metadataOpcode.code());
 
-            DataNodeHandlers handlers = new DataNodeHandlers(node.store(), node);
+            DataNodeHandlers handlers = dataNodeHandlers(node.store(), node);
             ScpException numeric = assertThrows(ScpException.class, () -> handlers.handle(
                     new Frame((short) 0x7FFF, (short) 1, (short) 0, 99,
                             ByteBuffer.allocate(0), ByteBuffer.allocate(0))));
@@ -432,8 +432,9 @@ class DataNodeWireTest {
                     ByteBuffer.wrap(new byte[] {1}));
         });
              ScpClient src = new ScpClient("127.0.0.1", source.port(),
-                     ScpClient.KIND_DATA_NODE, "repair-test")) {
-            ControlLoop loop = new ControlLoop(null, DataNodeConfig.standalone(dir), null);
+                     ScpClient.KIND_DATA_NODE, "repair-test");
+             ChunkStore store = new ChunkStore(dir.resolve("oversized-repair-store"))) {
+            ControlLoop loop = controlLoop(null, DataNodeConfig.standalone(dir), store);
             var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS);
             Path output = dir.resolve("oversized-repair-fetch.chunk");
 
@@ -451,8 +452,9 @@ class DataNodeWireTest {
                 new Messages.FetchResp(fileBytes.length, ChunkState.SEALED).encode(),
                 ByteBuffer.wrap(fileBytes)));
              ScpClient src = new ScpClient("127.0.0.1", source.port(),
-                     ScpClient.KIND_DATA_NODE, "repair-test")) {
-            ControlLoop loop = new ControlLoop(null, DataNodeConfig.standalone(dir), null);
+                     ScpClient.KIND_DATA_NODE, "repair-test");
+             ChunkStore store = new ChunkStore(dir.resolve("valid-repair-store"))) {
+            ControlLoop loop = controlLoop(null, DataNodeConfig.standalone(dir), store);
             var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS);
             Path output = dir.resolve("valid-repair-fetch.chunk");
 
@@ -464,87 +466,99 @@ class DataNodeWireTest {
     @Test
     void repairFetchRejectsMalformedSourceProgress() throws Exception {
         ChunkId repairChunk = new ChunkId(FileId.of(6), 0);
-        ControlLoop loop = new ControlLoop(null, DataNodeConfig.standalone(dir), null);
-        var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS);
+        try (ChunkStore store = new ChunkStore(dir.resolve("malformed-source-store"))) {
+            ControlLoop loop = controlLoop(null, DataNodeConfig.standalone(dir), store);
+            var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS);
 
-        try (ScpServer openSource = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
+            try (ScpServer openSource = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
                 new Messages.FetchResp(4096 + 4 + 64, ChunkState.OPEN).encode(),
                 ByteBuffer.wrap(new byte[] {1})));
-             ScpClient src = new ScpClient("127.0.0.1", openSource.port(),
-                     ScpClient.KIND_DATA_NODE, "repair-test")) {
-            assertEquals(ErrorCode.INTERNAL,
-                    assertThrows(ScpException.class,
-                            () -> loop.fetchWholeFile(src, cmd, dir.resolve("open-source-fetch.chunk"))).code());
-        }
+                 ScpClient src = new ScpClient("127.0.0.1", openSource.port(),
+                         ScpClient.KIND_DATA_NODE, "repair-test")) {
+                assertEquals(ErrorCode.INTERNAL,
+                        assertThrows(ScpException.class,
+                                () -> loop.fetchWholeFile(src, cmd, dir.resolve("open-source-fetch.chunk"))).code());
+            }
 
-        try (ScpServer malformedHeader = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
+            try (ScpServer malformedHeader = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
                 new byte[] {0}, ByteBuffer.wrap(new byte[] {1})));
-             ScpClient src = new ScpClient("127.0.0.1", malformedHeader.port(),
-                     ScpClient.KIND_DATA_NODE, "repair-test")) {
-            assertEquals(ErrorCode.CORRUPT_CHUNK,
-                    assertThrows(ScpException.class,
-                            () -> loop.fetchWholeFile(src, cmd, dir.resolve("malformed-source-fetch.chunk"))).code());
-        }
+                 ScpClient src = new ScpClient("127.0.0.1", malformedHeader.port(),
+                         ScpClient.KIND_DATA_NODE, "repair-test")) {
+                assertEquals(ErrorCode.CORRUPT_CHUNK,
+                        assertThrows(ScpException.class,
+                                () -> loop.fetchWholeFile(src, cmd, dir.resolve("malformed-source-fetch.chunk"))).code());
+            }
 
-        AtomicInteger calls = new AtomicInteger();
-        try (ScpServer changingLength = new ScpServer(0, 1, 0, 0, req -> {
-            int call = calls.incrementAndGet();
-            long len = call == 1 ? 4096 + 4 + 64 : 4096 + 5 + 64;
-            return ScpServer.ok(req, new Messages.FetchResp(len, ChunkState.SEALED).encode(),
-                    ByteBuffer.wrap(new byte[] {1}));
-        });
-             ScpClient src = new ScpClient("127.0.0.1", changingLength.port(),
-                     ScpClient.KIND_DATA_NODE, "repair-test")) {
-            assertEquals(ErrorCode.CORRUPT_CHUNK,
-                    assertThrows(ScpException.class,
-                            () -> loop.fetchWholeFile(src, cmd, dir.resolve("changing-source-fetch.chunk"))).code());
-        }
+            AtomicInteger calls = new AtomicInteger();
+            try (ScpServer changingLength = new ScpServer(0, 1, 0, 0, req -> {
+                int call = calls.incrementAndGet();
+                long len = call == 1 ? 4096 + 4 + 64 : 4096 + 5 + 64;
+                return ScpServer.ok(req, new Messages.FetchResp(len, ChunkState.SEALED).encode(),
+                        ByteBuffer.wrap(new byte[] {1}));
+            });
+                 ScpClient src = new ScpClient("127.0.0.1", changingLength.port(),
+                         ScpClient.KIND_DATA_NODE, "repair-test")) {
+                assertEquals(ErrorCode.CORRUPT_CHUNK,
+                        assertThrows(ScpException.class,
+                                () -> loop.fetchWholeFile(src, cmd, dir.resolve("changing-source-fetch.chunk"))).code());
+            }
 
-        try (ScpServer pastEof = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
+            try (ScpServer pastEof = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
                 new Messages.FetchResp(4096 + 64, ChunkState.SEALED).encode(),
                 ByteBuffer.wrap(new byte[4096 + 65])));
-             ScpClient src = new ScpClient("127.0.0.1", pastEof.port(),
-                     ScpClient.KIND_DATA_NODE, "repair-test")) {
-            assertEquals(ErrorCode.CORRUPT_CHUNK,
-                    assertThrows(ScpException.class,
-                            () -> loop.fetchWholeFile(src, cmd, dir.resolve("past-eof-fetch.chunk"))).code());
-        }
+                 ScpClient src = new ScpClient("127.0.0.1", pastEof.port(),
+                         ScpClient.KIND_DATA_NODE, "repair-test")) {
+                assertEquals(ErrorCode.CORRUPT_CHUNK,
+                        assertThrows(ScpException.class,
+                                () -> loop.fetchWholeFile(src, cmd, dir.resolve("past-eof-fetch.chunk"))).code());
+            }
 
-        byte[] overFetchLimit = new byte[(4 * 1024 * 1024) + 1];
-        try (ScpServer ignoresRequestLimit = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
+            byte[] overFetchLimit = new byte[(4 * 1024 * 1024) + 1];
+            try (ScpServer ignoresRequestLimit = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
                 new Messages.FetchResp(4096L + overFetchLimit.length + 64, ChunkState.SEALED).encode(),
                 ByteBuffer.wrap(overFetchLimit)));
-             ScpClient src = new ScpClient("127.0.0.1", ignoresRequestLimit.port(),
-                     ScpClient.KIND_DATA_NODE, "repair-test")) {
-            assertEquals(ErrorCode.CORRUPT_CHUNK,
-                    assertThrows(ScpException.class,
-                            () -> loop.fetchWholeFile(src, cmd, dir.resolve("over-limit-fetch.chunk"))).code());
-        }
+                 ScpClient src = new ScpClient("127.0.0.1", ignoresRequestLimit.port(),
+                         ScpClient.KIND_DATA_NODE, "repair-test")) {
+                assertEquals(ErrorCode.CORRUPT_CHUNK,
+                        assertThrows(ScpException.class,
+                                () -> loop.fetchWholeFile(src, cmd, dir.resolve("over-limit-fetch.chunk"))).code());
+            }
 
-        try (ScpServer shortFetch = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
+            try (ScpServer shortFetch = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
                 new Messages.FetchResp(4096 + 4 + 64, ChunkState.SEALED).encode(),
                 ByteBuffer.wrap(new byte[0])));
-             ScpClient src = new ScpClient("127.0.0.1", shortFetch.port(),
-                     ScpClient.KIND_DATA_NODE, "repair-test")) {
-            assertEquals(ErrorCode.INTERNAL,
-                    assertThrows(ScpException.class,
-                            () -> loop.fetchWholeFile(src, cmd, dir.resolve("short-fetch.chunk"))).code());
+                 ScpClient src = new ScpClient("127.0.0.1", shortFetch.port(),
+                         ScpClient.KIND_DATA_NODE, "repair-test")) {
+                assertEquals(ErrorCode.INTERNAL,
+                        assertThrows(ScpException.class,
+                                () -> loop.fetchWholeFile(src, cmd, dir.resolve("short-fetch.chunk"))).code());
+            }
         }
     }
 
     @Test
-    void repairFetchRejectsInvalidExpectedLengthsBeforeNetworkUse() {
-        ControlLoop loop = new ControlLoop(null, DataNodeConfig.standalone(dir), null);
+    void repairFetchRejectsInvalidExpectedLengthsBeforeNetworkUse() throws Exception {
         ChunkId repairChunk = new ChunkId(FileId.of(7), 0);
         Path output = dir.resolve("invalid-expected-length-fetch.chunk");
+        try (ChunkStore store = new ChunkStore(dir.resolve("invalid-length-store"))) {
+            ControlLoop loop = controlLoop(null, DataNodeConfig.standalone(dir), store);
 
-        assertEquals(ErrorCode.CORRUPT_CHUNK,
-                assertThrows(ScpException.class, () -> loop.fetchWholeFile(null,
-                        new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, -1, TEST_NS), output)).code());
-        assertEquals(ErrorCode.CORRUPT_CHUNK,
-                assertThrows(ScpException.class, () -> loop.fetchWholeFile(null,
-                        new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0,
-                                Long.MAX_VALUE, TEST_NS), output)).code());
+            assertEquals(ErrorCode.CORRUPT_CHUNK,
+                    assertThrows(ScpException.class, () -> loop.fetchWholeFile(null,
+                            new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, -1, TEST_NS), output)).code());
+            assertEquals(ErrorCode.CORRUPT_CHUNK,
+                    assertThrows(ScpException.class, () -> loop.fetchWholeFile(null,
+                            new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0,
+                                    Long.MAX_VALUE, TEST_NS), output)).code());
+        }
+    }
+
+    private static DataNodeHandlers dataNodeHandlers(ChunkStore store, DataNode node) {
+        return new DataNodeHandlers(store, node, new ChunkDeleteService(store, 1, 0));
+    }
+
+    private static ControlLoop controlLoop(DataNode node, DataNodeConfig config, ChunkStore store) {
+        return new ControlLoop(node, config, store, new ChunkDeleteService(store, 1, 0));
     }
 
     private static void corruptChunkDataByte(Path dir, ChunkId chunkId, long dataOffset) throws IOException {

@@ -53,6 +53,7 @@ final class OrphanGc implements AutoCloseable {
     private static final int DEFAULT_CONFIRM_TIMEOUT_MS = 5_000;
 
     private final ChunkStore store;
+    private final ChunkDeleteService deletes;
     private final int nodeId;
     private final List<String> controllerEndpoints;
     private final long graceMs;
@@ -63,15 +64,10 @@ final class OrphanGc implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean();
     private volatile Thread thread;
 
-    OrphanGc(ChunkStore store, int nodeId, List<String> controllerEndpoints) {
-        this(store, nodeId, controllerEndpoints,
-                DEFAULT_GRACE_MS, DEFAULT_SCAN_INTERVAL_MS, DEFAULT_STARTUP_GRACE_MS,
-                DEFAULT_CONFIRM_TIMEOUT_MS);
-    }
-
-    OrphanGc(ChunkStore store, int nodeId, List<String> controllerEndpoints,
+    OrphanGc(ChunkStore store, ChunkDeleteService deletes, int nodeId, List<String> controllerEndpoints,
              long graceMs, long scanIntervalMs, long startupGraceMs, int confirmTimeoutMs) {
-        this.store = store;
+        this.store = java.util.Objects.requireNonNull(store, "store");
+        this.deletes = java.util.Objects.requireNonNull(deletes, "deletes");
         this.nodeId = nodeId;
         this.controllerEndpoints = List.copyOf(controllerEndpoints);
         this.graceMs = graceMs;
@@ -103,7 +99,7 @@ final class OrphanGc implements AutoCloseable {
     }
 
     /** One GC pass: confirm each suspect with its owner and delete only confirmed orphans. */
-    void gcOnce() {
+    void gcOnce() throws InterruptedException {
         long now = System.currentTimeMillis();
         for (ChunkStore.SuspectChunk s : store.orphanSuspects(graceMs, now)) {
             if (closed.get()) {
@@ -111,7 +107,7 @@ final class OrphanGc implements AutoCloseable {
             }
             switch (confirm(s.namespace(), s.chunkId())) {
                 case ORPHAN -> {
-                    ErrorCode result = store.delete(s.namespace(), s.chunkId());
+                    ErrorCode result = deletes.delete(s.namespace(), s.chunkId());
                     if (result == ErrorCode.OK) {
                         log.info("orphan GC: deleted unreferenced sealed chunk {} in ns={}",
                                 s.chunkId(), s.namespace());

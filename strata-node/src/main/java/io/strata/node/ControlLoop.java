@@ -50,6 +50,7 @@ final class ControlLoop implements AutoCloseable {
     private final DataNode node;
     private final DataNodeConfig config;
     private final ChunkStore store;
+    private final ChunkDeleteService deletes;
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final LinkedBlockingQueue<Messages.Command> commandQueue = new LinkedBlockingQueue<>(MAX_QUEUED_COMMANDS);
     private final ConcurrentLinkedQueue<Messages.CompletedCommand> completed = new ConcurrentLinkedQueue<>();
@@ -62,11 +63,12 @@ final class ControlLoop implements AutoCloseable {
     private volatile int endpointIndex = 0;
     private final Backoff backoff;
 
-    ControlLoop(DataNode node, DataNodeConfig config, ChunkStore store) {
+    ControlLoop(DataNode node, DataNodeConfig config, ChunkStore store, ChunkDeleteService deletes) {
         this.node = node;
-        this.config = config;
-        this.store = store;
-        ConnectionPolicy policy = config != null ? config.connectionPolicy() : ConnectionPolicy.DEFAULT;
+        this.config = java.util.Objects.requireNonNull(config, "config");
+        this.store = java.util.Objects.requireNonNull(store, "store");
+        this.deletes = java.util.Objects.requireNonNull(deletes, "deletes");
+        ConnectionPolicy policy = config.connectionPolicy();
         this.backoff = new Backoff(policy.reconnectInitialBackoffMs(), policy.reconnectMaxBackoffMs());
     }
 
@@ -214,7 +216,7 @@ final class ControlLoop implements AutoCloseable {
                     case Messages.ReplicateCmd r -> replicate(r);
                     case Messages.DeleteCmd d -> {
                         for (var id : d.chunkIds()) {
-                            ErrorCode result = store.delete(d.namespace(), id);
+                            ErrorCode result = deletes.delete(d.namespace(), id);
                             if (result != ErrorCode.OK && result != ErrorCode.CHUNK_NOT_FOUND) {
                                 throw new ScpException(result, "delete " + id + " failed");
                             }
@@ -222,6 +224,9 @@ final class ControlLoop implements AutoCloseable {
                     }
                     case Messages.DrainCmd dr -> node.setDraining(true);
                 }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
             } catch (ScpException e) {
                 log.warn("command {} failed: {}", cmd.commandId(), e.getMessage());
                 status = e.code().code;
@@ -233,7 +238,7 @@ final class ControlLoop implements AutoCloseable {
         }
     }
 
-    void replicate(Messages.ReplicateCmd cmd) throws IOException {
+    void replicate(Messages.ReplicateCmd cmd) throws IOException, InterruptedException {
         if (store.contains(cmd.namespace(), cmd.chunkId())) {
             // command replay — but only a VALID copy counts: a local chunk whose seal state or
             // crc/length mismatch the descriptor is corrupt and must be replaced, not trusted
@@ -245,7 +250,7 @@ final class ControlLoop implements AutoCloseable {
             }
             log.warn("local copy of {} mismatches descriptor (state={} len={} crc={}) — re-pulling",
                     cmd.chunkId(), stat.state(), stat.sealedLength(), stat.dataCrc());
-            ErrorCode deleteResult = store.delete(cmd.namespace(), cmd.chunkId());
+            ErrorCode deleteResult = deletes.delete(cmd.namespace(), cmd.chunkId());
             if (deleteResult != ErrorCode.OK && deleteResult != ErrorCode.CHUNK_NOT_FOUND) {
                 throw new ScpException(deleteResult, "delete stale local copy of " + cmd.chunkId() + " failed");
             }

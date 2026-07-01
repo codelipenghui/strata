@@ -122,6 +122,8 @@ public final class StrataServer {
                 .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
                 .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
                 .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
+                .withDeleteMaxConcurrent(intEnv("STRATA_DELETE_MAX_CONCURRENT", 1))
+                .withDeleteMinIntervalMs(longEnv("STRATA_DELETE_MIN_INTERVAL_MS", 50))
                 .withChunkStoreConfig(new io.strata.format.ChunkStoreConfig(
                         intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
                         longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
@@ -202,6 +204,8 @@ public final class StrataServer {
                 .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
                 .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
                 .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
+                .withDeleteMaxConcurrent(intEnv("STRATA_DELETE_MAX_CONCURRENT", 1))
+                .withDeleteMinIntervalMs(longEnv("STRATA_DELETE_MIN_INTERVAL_MS", 50))
                 .withChunkStoreConfig(new io.strata.format.ChunkStoreConfig(
                         intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
                         longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),

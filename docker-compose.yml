@@ -107,6 +107,9 @@ services:
       # STRATA_SCP_MAX_INFLIGHT_BYTES: "1073741824"
       # Per-namespace metrics refresh period (server, default 10 s).
       # STRATA_METRICS_NS_REFRESH_INTERVAL_MS: "10000"
+      # Physical delete QoS (data-node, defaults 1 concurrent delete and 50 ms between starts).
+      # STRATA_DELETE_MAX_CONCURRENT: "1"
+      # STRATA_DELETE_MIN_INTERVAL_MS: "50"
     volumes:
       - node1-data:/data
     depends_on:

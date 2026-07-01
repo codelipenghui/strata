@@ -35,6 +35,8 @@ public record DataNodeConfig(
         int orphanConfirmTimeoutMs,
         int controlCallTimeoutMs,
         int repairFetchBytes,
+        int deleteMaxConcurrent,
+        long deleteMinIntervalMs,
         ChunkStoreConfig chunkStoreConfig
 ) {
     public DataNodeConfig(Path dataDir, int listenPort, String advertisedHost, String advertisedEndpointOverride,
@@ -42,7 +44,8 @@ public record DataNodeConfig(
                       long capacityBytes, int scrubIntervalMs) {
         this(dataDir, listenPort, advertisedHost, advertisedEndpointOverride, controllerEndpoints,
                 zone, rack, host, capacityBytes, scrubIntervalMs, ConnectionPolicy.DEFAULT, -1,
-                6_000L, 3_000L, 6_000L, 5_000, 10_000, 4 * 1024 * 1024, ChunkStoreConfig.DEFAULT);
+                6_000L, 3_000L, 6_000L, 5_000, 10_000, 4 * 1024 * 1024, 1, 50L,
+                ChunkStoreConfig.DEFAULT);
     }
 
     public DataNodeConfig {
@@ -94,6 +97,12 @@ public record DataNodeConfig(
         if (repairFetchBytes <= 0) {
             throw new IllegalArgumentException("repairFetchBytes must be positive: " + repairFetchBytes);
         }
+        if (deleteMaxConcurrent <= 0) {
+            throw new IllegalArgumentException("deleteMaxConcurrent must be positive: " + deleteMaxConcurrent);
+        }
+        if (deleteMinIntervalMs < 0) {
+            throw new IllegalArgumentException("deleteMinIntervalMs must be non-negative: " + deleteMinIntervalMs);
+        }
         chunkStoreConfig = java.util.Objects.requireNonNull(chunkStoreConfig, "chunkStoreConfig");
     }
 
@@ -121,76 +130,90 @@ public record DataNodeConfig(
         return new DataNodeConfig(dataDir, port, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
+                controlCallTimeoutMs, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
     }
 
     public DataNodeConfig withAdvertisedEndpoint(String endpoint) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, endpoint,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
+                controlCallTimeoutMs, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
     }
 
     public DataNodeConfig withConnectionPolicy(ConnectionPolicy policy) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, policy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
+                controlCallTimeoutMs, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
     }
 
     public DataNodeConfig withNodeId(int id) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, id,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
+                controlCallTimeoutMs, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
     }
 
     public DataNodeConfig withOrphanGraceMs(long v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 v, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
+                controlCallTimeoutMs, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
     }
 
     public DataNodeConfig withOrphanScanIntervalMs(long v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, v, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
+                controlCallTimeoutMs, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
     }
 
     public DataNodeConfig withOrphanStartupGraceMs(long v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, v, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
+                controlCallTimeoutMs, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
     }
 
     public DataNodeConfig withOrphanConfirmTimeoutMs(int v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, v,
-                controlCallTimeoutMs, repairFetchBytes, chunkStoreConfig);
+                controlCallTimeoutMs, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
     }
 
     public DataNodeConfig withControlCallTimeoutMs(int v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                v, repairFetchBytes, chunkStoreConfig);
+                v, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
     }
 
     public DataNodeConfig withRepairFetchBytes(int v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, v, chunkStoreConfig);
+                controlCallTimeoutMs, v, deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
+    }
+
+    public DataNodeConfig withDeleteMaxConcurrent(int v) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                controlCallTimeoutMs, repairFetchBytes, v, deleteMinIntervalMs, chunkStoreConfig);
+    }
+
+    public DataNodeConfig withDeleteMinIntervalMs(long v) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                controlCallTimeoutMs, repairFetchBytes, deleteMaxConcurrent, v, chunkStoreConfig);
     }
 
     public DataNodeConfig withChunkStoreConfig(ChunkStoreConfig v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, repairFetchBytes, v);
+                controlCallTimeoutMs, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs, v);
     }
 }

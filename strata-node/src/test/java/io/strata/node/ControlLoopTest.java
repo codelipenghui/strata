@@ -63,7 +63,7 @@ class ControlLoopTest {
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
              DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
+            ControlLoop loop = controlLoop(node, config(metaServer, 60_000));
             getClosed(loop).set(true);
 
             invoke(loop, "ensureRegistered"); // the control thread runs this each iteration
@@ -77,7 +77,7 @@ class ControlLoopTest {
     @Test
     void startLaunchesWorkersAndCloseStopsThem() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            ControlLoop loop = controlLoop(node, configWithoutMetadata());
 
             loop.start();
             List<Thread> threads = get(loop, "threads");
@@ -109,7 +109,7 @@ class ControlLoopTest {
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
              DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
+            ControlLoop loop = controlLoop(node, config(metaServer, 60_000));
 
             Thread worker = Thread.ofVirtual().name("control-loop-test-interrupt").start(() -> {
                 try {
@@ -146,7 +146,7 @@ class ControlLoopTest {
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
              DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
+            ControlLoop loop = controlLoop(node, config(metaServer, 60_000));
             closedRef.set(getClosed(loop));
 
             Thread worker = Thread.ofVirtual().name("control-loop-test-not-registered").start(() -> {
@@ -184,7 +184,7 @@ class ControlLoopTest {
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
              DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
+            ControlLoop loop = controlLoop(node, config(metaServer, 60_000));
             closedRef.set(getClosed(loop));
 
             Thread worker = Thread.ofVirtual().name("control-loop-test-lease-expired").start(() -> {
@@ -222,7 +222,7 @@ class ControlLoopTest {
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
              DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
+            ControlLoop loop = controlLoop(node, config(metaServer, 60_000));
             closedRef.set(getClosed(loop));
 
             Thread worker = Thread.ofVirtual().name("control-loop-test-not-leader").start(() -> {
@@ -261,7 +261,7 @@ class ControlLoopTest {
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
              DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
+            ControlLoop loop = controlLoop(node, config(metaServer, 60_000));
             closedRef.set(getClosed(loop));
 
             Thread worker = Thread.ofVirtual().name("control-loop-test-generic-scp").start(() -> {
@@ -303,7 +303,7 @@ class ControlLoopTest {
              // nodeId is now externally supplied (STRATA_NODE_ID): the node registers under its own
              // volume-bound id 7, and the controller's RegisterResp just echoes it back.
              DataNode node = new DataNode(DataNodeConfig.standalone(dir).withNodeId(7))) {
-            ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
+            ControlLoop loop = controlLoop(node, config(metaServer, 60_000));
 
             invoke(loop, "ensureRegistered");
             assertEquals(7, node.nodeId());
@@ -339,7 +339,7 @@ class ControlLoopTest {
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
              DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, config(metaServer, 60_000), node.store());
+            ControlLoop loop = controlLoop(node, config(metaServer, 60_000));
             invoke(loop, "ensureRegistered");
 
             ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
@@ -392,8 +392,8 @@ class ControlLoopTest {
                  throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
              });
              DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node,
-                    config(List.of(endpoint(standby), endpoint(leader)), 60_000), node.store());
+            ControlLoop loop = controlLoop(node,
+                    config(List.of(endpoint(standby), endpoint(leader)), 60_000));
             closedRef.set(getClosed(loop));
             ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
             completed.add(new Messages.CompletedCommand(99, ErrorCode.OK.code));
@@ -423,7 +423,7 @@ class ControlLoopTest {
     @Test
     void executeCommandsReportsDrainDeleteAndReplicateFailures() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            ControlLoop loop = controlLoop(node, configWithoutMetadata());
             LinkedBlockingQueue<Messages.Command> commands = get(loop, "commandQueue");
             ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
 
@@ -456,7 +456,7 @@ class ControlLoopTest {
     @Test
     void executeCommandsReportsDeleteFailureStatus() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            ControlLoop loop = controlLoop(node, configWithoutMetadata());
             LinkedBlockingQueue<Messages.Command> commands = get(loop, "commandQueue");
             ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
             ChunkId id = new ChunkId(FileId.of(3), 0);
@@ -488,53 +488,57 @@ class ControlLoopTest {
 
     @Test
     void executeCommandsReportsUnexpectedRuntimeFailureStatus() throws Exception {
-        ControlLoop loop = new ControlLoop(null, configWithoutMetadata(), null);
-        LinkedBlockingQueue<Messages.Command> commands = get(loop, "commandQueue");
-        ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
-        commands.add(new Messages.DrainCmd(77));
+        try (ChunkStore store = new ChunkStore(dir.resolve("runtime-failure-store"))) {
+            ControlLoop loop = controlLoop(null, configWithoutMetadata(), store);
+            LinkedBlockingQueue<Messages.Command> commands = get(loop, "commandQueue");
+            ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
+            commands.add(new Messages.DrainCmd(77));
 
-        Thread worker = Thread.ofVirtual().name("control-loop-test-runtime-failure").start(() -> {
-            try {
-                invoke(loop, "executeCommands");
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        });
-        waitFor(() -> completed.size() == 1);
-        getClosed(loop).set(true);
-        worker.interrupt();
-        worker.join(2_000);
+            Thread worker = Thread.ofVirtual().name("control-loop-test-runtime-failure").start(() -> {
+                try {
+                    invoke(loop, "executeCommands");
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            waitFor(() -> completed.size() == 1);
+            getClosed(loop).set(true);
+            worker.interrupt();
+            worker.join(2_000);
 
-        assertEquals(ErrorCode.INTERNAL.code, completed.peek().status());
+            assertEquals(ErrorCode.INTERNAL.code, completed.peek().status());
+        }
     }
 
     @Test
     void acceptCommandsNacksCommandsThatOverflowTheBoundedQueue() throws Exception {
-        ControlLoop loop = new ControlLoop(null, configWithoutMetadata(), null);
-        LinkedBlockingQueue<Messages.Command> q = get(loop, "commandQueue");
-        ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
+        try (ChunkStore store = new ChunkStore(dir.resolve("overflow-store"))) {
+            ControlLoop loop = controlLoop(null, configWithoutMetadata(), store);
+            LinkedBlockingQueue<Messages.Command> q = get(loop, "commandQueue");
+            ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
 
-        int cap = q.remainingCapacity();
-        java.util.List<Messages.Command> fill = new java.util.ArrayList<>();
-        for (int i = 0; i < cap; i++) fill.add(new Messages.DrainCmd(1000 + i));
-        loop.acceptCommands(fill);
-        assertEquals(cap, q.size(), "the bounded queue should fill exactly to capacity");
-        assertTrue(completed.isEmpty(), "nothing overflows until the queue is full");
+            int cap = q.remainingCapacity();
+            java.util.List<Messages.Command> fill = new java.util.ArrayList<>();
+            for (int i = 0; i < cap; i++) fill.add(new Messages.DrainCmd(1000 + i));
+            loop.acceptCommands(fill);
+            assertEquals(cap, q.size(), "the bounded queue should fill exactly to capacity");
+            assertTrue(completed.isEmpty(), "nothing overflows until the queue is full");
 
-        // two more commands cannot be queued → NACK'd as THROTTLED so the controller drops them from
-        // inflight and the next reconcile scan re-drives them (bounded backlog, no unbounded growth)
-        loop.acceptCommands(List.of(new Messages.DrainCmd(7777), new Messages.DrainCmd(7778)));
-        assertEquals(cap, q.size(), "queue stays bounded at capacity");
-        Map<Long, Short> byId = completed.stream().collect(Collectors.toMap(
-                Messages.CompletedCommand::commandId, Messages.CompletedCommand::status));
-        assertEquals(ErrorCode.THROTTLED.code, byId.get(7777L));
-        assertEquals(ErrorCode.THROTTLED.code, byId.get(7778L));
+            // two more commands cannot be queued → NACK'd as THROTTLED so the controller drops them from
+            // inflight and the next reconcile scan re-drives them (bounded backlog, no unbounded growth)
+            loop.acceptCommands(List.of(new Messages.DrainCmd(7777), new Messages.DrainCmd(7778)));
+            assertEquals(cap, q.size(), "queue stays bounded at capacity");
+            Map<Long, Short> byId = completed.stream().collect(Collectors.toMap(
+                    Messages.CompletedCommand::commandId, Messages.CompletedCommand::status));
+            assertEquals(ErrorCode.THROTTLED.code, byId.get(7777L));
+            assertEquals(ErrorCode.THROTTLED.code, byId.get(7778L));
+        }
     }
 
     @Test
     void replicateReturnsForValidLocalCopyAndDeletesMismatchedReplay() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            ControlLoop loop = controlLoop(node, configWithoutMetadata());
             ChunkStore store = node.store();
 
             ChunkId valid = new ChunkId(FileId.of(4), 0);
@@ -577,7 +581,7 @@ class ControlLoopTest {
     @Test
     void replicateDeletesOpenLocalReplayBeforeTryingSources() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            ControlLoop loop = controlLoop(node, configWithoutMetadata());
             ChunkId open = new ChunkId(FileId.of(7), 0);
             node.store().open(TEST_NS, open, false, 1, 1L);
 
@@ -593,7 +597,7 @@ class ControlLoopTest {
     @Test
     void replicateThrowsLastSourceFailureWhenAllSourcesFail() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            ControlLoop loop = controlLoop(node, configWithoutMetadata());
             ChunkId chunkId = new ChunkId(FileId.of(8), 0);
 
             ScpException e = assertThrows(ScpException.class,
@@ -626,7 +630,7 @@ class ControlLoopTest {
                 }
                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
             })) {
-                ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+                ControlLoop loop = controlLoop(node, configWithoutMetadata());
                 invokeReplicate(loop, new Messages.ReplicateCmd(13, chunkId, List.of(
                         new Messages.Replica(11, "127.0.0.1:1"),
                         new Messages.Replica(77, endpoint(source))), (byte) 0, crc, data.length, TEST_NS));
@@ -656,7 +660,7 @@ class ControlLoopTest {
                 }
                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
             })) {
-                ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+                ControlLoop loop = controlLoop(node, configWithoutMetadata());
                 invokeReplicate(loop, new Messages.ReplicateCmd(12, chunkId, List.of(
                         new Messages.Replica(11, "malformed-source"),
                         new Messages.Replica(77, endpoint(source))), (byte) 0, crc, data.length, TEST_NS));
@@ -669,7 +673,7 @@ class ControlLoopTest {
     @Test
     void replicateIgnoresSelfSourcesBeforeReportingNoUsableSource() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            ControlLoop loop = controlLoop(node, configWithoutMetadata());
             ChunkId chunkId = new ChunkId(FileId.of(11), 0);
 
             ScpException e = assertThrows(ScpException.class,
@@ -700,7 +704,7 @@ class ControlLoopTest {
     @Test
     void fetchWholeFileRejectsInvalidRepairLengthBeforeUsingSource() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            ControlLoop loop = controlLoop(node, configWithoutMetadata());
             ChunkId chunkId = new ChunkId(FileId.of(12), 0);
             Path output = dir.resolve("invalid-repair-fetch.chunk");
 
@@ -728,7 +732,7 @@ class ControlLoopTest {
              });
              ScpClient client = new ScpClient("127.0.0.1", source.port(),
                      ScpClient.KIND_DATA_NODE, "fetch-large-length-test")) {
-            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            ControlLoop loop = controlLoop(node, configWithoutMetadata());
             Path output = dir.resolve("large-repair-fetch.chunk");
 
             ScpException e = assertThrows(ScpException.class,
@@ -789,7 +793,7 @@ class ControlLoopTest {
              });
              ScpClient client = new ScpClient("127.0.0.1", source.port(),
                      ScpClient.KIND_DATA_NODE, "fetch-multipart-test")) {
-            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            ControlLoop loop = controlLoop(node, configWithoutMetadata());
             Path output = dir.resolve("fetch-multipart.chunk");
 
             long fetchedLength = loop.fetchWholeFile(client, new Messages.ReplicateCmd(23, chunkId,
@@ -806,7 +810,7 @@ class ControlLoopTest {
     @Test
     void closeRestoresInterruptWhenInterruptedDuringJoin() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            ControlLoop loop = controlLoop(node, configWithoutMetadata());
             List<Thread> threads = get(loop, "threads");
             Thread sleeper = Thread.ofVirtual().name("control-loop-test-sleeper").start(() -> {
                 try {
@@ -836,7 +840,8 @@ class ControlLoopTest {
         int customFetchBytes = 512;
         DataNodeConfig customConfig = new DataNodeConfig(Path.of("."), 0, "127.0.0.1", null, List.of(),
                 "z", "r", "h", 1L << 20, 60_000, ConnectionPolicy.DEFAULT, -1,
-                6_000L, 3_000L, 6_000L, 5_000, 10_000, customFetchBytes, ChunkStoreConfig.DEFAULT);
+                6_000L, 3_000L, 6_000L, 5_000, 10_000, customFetchBytes, 1, 0,
+                ChunkStoreConfig.DEFAULT);
         long minLength = ChunkFormats.HEADER_SIZE + ChunkFormats.TRAILER_SIZE;
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpServer source = new ScpServer(0, 77, 0, 0, req -> {
@@ -846,7 +851,7 @@ class ControlLoopTest {
              });
              ScpClient client = new ScpClient("127.0.0.1", source.port(),
                      ScpClient.KIND_DATA_NODE, "fetch-custom-limit-test")) {
-            ControlLoop loop = new ControlLoop(node, customConfig, node.store());
+            ControlLoop loop = controlLoop(node, customConfig);
             Path output = dir.resolve("custom-fetch-limit.chunk");
             ScpException e = assertThrows(ScpException.class,
                     () -> loop.fetchWholeFile(client, new Messages.ReplicateCmd(30,
@@ -888,12 +893,21 @@ class ControlLoopTest {
         ConnectionPolicy testPolicy = new ConnectionPolicy(1_000, 1_000, 100, 1_000, 1, 1);
         return new DataNodeConfig(Path.of("."), 0, "127.0.0.1", null, controllerEndpoints,
                 "z", "r", "h", 1L << 20, inventoryIntervalMs, testPolicy, -1,
-                6_000L, 3_000L, 6_000L, 5_000, 10_000, 4 * 1024 * 1024, ChunkStoreConfig.DEFAULT);
+                6_000L, 3_000L, 6_000L, 5_000, 10_000, 4 * 1024 * 1024, 1, 0,
+                ChunkStoreConfig.DEFAULT);
     }
 
     private static DataNodeConfig configWithoutMetadata() {
         return new DataNodeConfig(Path.of("."), 0, "127.0.0.1", null, List.of(),
                 "z", "r", "h", 1L << 20, 60_000);
+    }
+
+    private static ControlLoop controlLoop(DataNode node, DataNodeConfig config) {
+        return controlLoop(node, config, node.store());
+    }
+
+    private static ControlLoop controlLoop(DataNode node, DataNodeConfig config, ChunkStore store) {
+        return new ControlLoop(node, config, store, new ChunkDeleteService(store, 1, 0));
     }
 
     private static void invokeReplicate(ControlLoop loop, Messages.ReplicateCmd cmd) throws Exception {
@@ -943,7 +957,7 @@ class ControlLoopTest {
              });
              ScpClient client = new ScpClient("127.0.0.1", source.port(),
                      ScpClient.KIND_DATA_NODE, "fetch-test")) {
-            ControlLoop loop = new ControlLoop(node, configWithoutMetadata(), node.store());
+            ControlLoop loop = controlLoop(node, configWithoutMetadata());
             Path output = Files.createTempFile(dir, "fetch-failure.", ".chunk");
             ScpException e = assertThrows(ScpException.class,
                     () -> loop.fetchWholeFile(client, new Messages.ReplicateCmd(22,

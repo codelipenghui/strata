@@ -109,7 +109,8 @@ class DataNodeConfigTest {
                 null, List.of(), "zone", "rack", "host", 1, 0));
         assertThrows(NullPointerException.class, () -> new DataNodeConfig(Path.of("data"), 0, "127.0.0.1",
                 null, List.of(), "zone", "rack", "host", 1, 1, null, -1,
-                6_000L, 3_000L, 6_000L, 5_000, 10_000, 4 * 1024 * 1024, io.strata.format.ChunkStoreConfig.DEFAULT));
+                6_000L, 3_000L, 6_000L, 5_000, 10_000, 4 * 1024 * 1024, 1, 50L,
+                io.strata.format.ChunkStoreConfig.DEFAULT));
     }
 
     @Test
@@ -122,6 +123,8 @@ class DataNodeConfigTest {
         assertEquals(5_000, c.orphanConfirmTimeoutMs());
         assertEquals(10_000, c.controlCallTimeoutMs());
         assertEquals(4 * 1024 * 1024, c.repairFetchBytes());
+        assertEquals(1, c.deleteMaxConcurrent());
+        assertEquals(50, c.deleteMinIntervalMs());
         assertEquals(io.strata.format.ChunkStoreConfig.DEFAULT, c.chunkStoreConfig());
     }
 
@@ -131,6 +134,8 @@ class DataNodeConfigTest {
                 List.of("meta:9000"), "zone", "rack", "host", 1234, 55);
         assertThrows(IllegalArgumentException.class, () -> base.withOrphanGraceMs(0));
         assertThrows(IllegalArgumentException.class, () -> base.withControlCallTimeoutMs(-1));
+        assertThrows(IllegalArgumentException.class, () -> base.withDeleteMaxConcurrent(0));
+        assertThrows(IllegalArgumentException.class, () -> base.withDeleteMinIntervalMs(-1));
     }
 
     @Test
@@ -139,6 +144,7 @@ class DataNodeConfigTest {
                 List.of("meta:9000"), "zone", "rack", "host", 1234, 55)
                 .withOrphanGraceMs(1000).withOrphanScanIntervalMs(500).withOrphanStartupGraceMs(1500)
                 .withOrphanConfirmTimeoutMs(2500).withControlCallTimeoutMs(8000).withRepairFetchBytes(1 << 20)
+                .withDeleteMaxConcurrent(2).withDeleteMinIntervalMs(25)
                 .withChunkStoreConfig(io.strata.format.ChunkStoreConfig.DEFAULT.withMaxRequestBytes(4096));
         assertEquals(1000, c.orphanGraceMs());
         assertEquals(500, c.orphanScanIntervalMs());
@@ -146,6 +152,8 @@ class DataNodeConfigTest {
         assertEquals(2500, c.orphanConfirmTimeoutMs());
         assertEquals(8000, c.controlCallTimeoutMs());
         assertEquals(1 << 20, c.repairFetchBytes());
+        assertEquals(2, c.deleteMaxConcurrent());
+        assertEquals(25, c.deleteMinIntervalMs());
         assertEquals(4096, c.chunkStoreConfig().maxRequestBytes());
     }
 }

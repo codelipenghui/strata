@@ -47,7 +47,7 @@ final class AppenderImpl implements StrataFile.Appender {
             java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
     private static final int APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK =
             intConf("strata.append.replicaInflightHighWatermark",
-                    "STRATA_APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK", 8);
+                    "STRATA_APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK", 64);
     private static final long APPEND_BACKPRESSURE_WARN_NANOS = TimeUnit.SECONDS.toNanos(10);
     private static final int DEFAULT_APPEND_CONNECTION_PENDING_HIGH_WATERMARK =
             Math.max(1, (io.strata.proto.ScpClient.maxPendingRequests() * 3) / 4);
@@ -149,47 +149,61 @@ final class AppenderImpl implements StrataFile.Appender {
                 session.pending.addLast(new Pending(session.end, callerFuture));
                 return callerFuture;
             }
-            if (session == null || session.needRoll || session.end >= config.chunkRollBytes()) {
-                roll();
+            while (true) {
+                awaitNotRolling();
                 throwIfDead();
-            }
-            ChunkSession s = session;
-            awaitAppendConnectionCapacityLocked(s);
-            throwIfDead();
-            long base = s.end;
-            long newEnd = checkedAdd(base, len, "chunk offset");
-            s.end = newEnd;
-            CompletableFuture<Long> callerFuture = new CompletableFuture<>();
-            s.pending.addLast(new Pending(newEnd, callerFuture));
-
-            byte[] header = new Messages.Append(s.chunkId, epoch, base, s.durable, namespace).encode();
-            for (int i = 0; i < s.replicas.size(); i++) {
-                if (dead) break;
-                if (s.failed[i]) continue;
-                final int replicaIndex = i;
-                CompletableFuture<Frame> f;
-                try {
-                    ManagedScpConnection client = s.connections[i] != null
-                            ? s.connections[i] : pool.get(s.replicas.get(i).endpoint());
-                    beginReplicaRequestLocked(s, replicaIndex);
-                    f = s.connectionGenerations[i] >= 0
-                            ? client.sendWithTimeout(Opcode.APPEND, header, data.duplicate(), config.callTimeoutMs(),
-                                    s.connectionGenerations[i])
-                            : client.sendWithTimeout(Opcode.APPEND, header, data.duplicate(), config.callTimeoutMs());
-                } catch (ScpException e) {
-                    completeReplicaRequestLocked(s, replicaIndex);
-                    onReplicaFailureLocked(s, replicaIndex, e);
+                if (session == null || shouldRollBeforeAppend(session) || session.end >= config.chunkRollBytes()) {
+                    roll();
+                    throwIfDead();
                     continue;
                 }
-                // per-replica timeout: a black-holed connection must fail THIS replica (seal-and-
-                // roll path), not stall the whole appender into quorum loss
-                f.whenCompleteAsync((frame, err) -> onReplicaResponse(s, replicaIndex, newEnd, frame, err), CALLBACKS);
+                ChunkSession s = session;
+                awaitAppendConnectionCapacityLocked(s);
+                throwIfDead();
+                if (s != session || shouldRollBeforeAppend(s) || s.end >= config.chunkRollBytes()) {
+                    continue;
+                }
+                long base = s.end;
+                long newEnd = checkedAdd(base, len, "chunk offset");
+                s.end = newEnd;
+                CompletableFuture<Long> callerFuture = new CompletableFuture<>();
+                s.pending.addLast(new Pending(newEnd, callerFuture));
+
+                byte[] header = new Messages.Append(s.chunkId, epoch, base, s.durable, namespace).encode();
+                for (int i = 0; i < s.replicas.size(); i++) {
+                    if (dead) break;
+                    if (s.failed[i]) continue;
+                    final int replicaIndex = i;
+                    CompletableFuture<Frame> f;
+                    try {
+                        ManagedScpConnection client = s.connections[i] != null
+                                ? s.connections[i] : pool.get(s.replicas.get(i).endpoint());
+                        beginReplicaRequestLocked(s, replicaIndex);
+                        f = s.connectionGenerations[i] >= 0
+                                ? client.sendWithTimeout(Opcode.APPEND, header, data.duplicate(), config.callTimeoutMs(),
+                                        s.connectionGenerations[i])
+                                : client.sendWithTimeout(Opcode.APPEND, header, data.duplicate(), config.callTimeoutMs());
+                    } catch (ScpException e) {
+                        completeReplicaRequestLocked(s, replicaIndex);
+                        onReplicaFailureLocked(s, replicaIndex, e);
+                        continue;
+                    }
+                    // per-replica timeout: a black-holed connection must fail THIS replica (seal-and-
+                    // roll path), not stall the whole appender into quorum loss
+                    f.whenCompleteAsync((frame, err) -> onReplicaResponse(s, replicaIndex, newEnd, frame, err), CALLBACKS);
+                }
+                return callerFuture;
             }
-            return callerFuture;
         } finally {
             progress.signalAll();
             lock.unlock();
         }
+    }
+
+    private boolean shouldRollBeforeAppend(ChunkSession s) {
+        // A freshly opened partial-quorum chunk must accept the append that opened it; rolling at
+        // end==0 immediately asks metadata for another full-RF placement and can loop on NO_CAPACITY.
+        return s.needRoll && s.end > 0;
     }
 
     private void onReplicaResponse(ChunkSession s, int replicaIndex, long expectedEnd, Frame frame, Throwable err) {
@@ -303,21 +317,24 @@ final class AppenderImpl implements StrataFile.Appender {
     }
 
     private boolean hasAppendConnectionCapacity(ChunkSession s) {
-        // Admit the next append while at least ackQuorum non-failed replicas have capacity. A slow
-        // minority replica (in-flight or connection-pending backed up) must NOT gate produce — the
-        // quorum still acks through the healthy replicas, and a persistently slow replica is dropped by
-        // the per-replica call timeout. Throttle only once fewer than ackQuorum replicas can keep up,
-        // which is the real backpressure case and keeps the in-flight window bounded.
-        int withCapacity = 0;
+        // A live replica must receive every append for this open chunk; otherwise a later append would
+        // leave a hole in that replica's chunk. Backpressure on any live replica instead of continuing
+        // to enqueue into its SCP connection until the hard 1024-pending limit trips.
+        int live = 0;
         for (int i = 0; i < s.replicas.size(); i++) {
             if (s.failed[i]) continue;
-            if (s.inFlight[i] >= APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK) continue;
-            ManagedScpConnection connection = s.connections[i];
-            if (connection != null
-                    && connection.pendingCount() >= APPEND_CONNECTION_PENDING_HIGH_WATERMARK) continue;
-            withCapacity++;
+            live++;
+            if (!replicaHasAppendCapacity(s, i)) return false;
         }
-        return withCapacity >= ackQuorum;
+        return live >= ackQuorum;
+    }
+
+    private boolean replicaHasAppendCapacity(ChunkSession s, int replicaIndex) {
+        if (s.failed[replicaIndex]) return false;
+        if (s.inFlight[replicaIndex] >= APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK) return false;
+        ManagedScpConnection connection = s.connections[replicaIndex];
+        return connection == null
+                || connection.pendingCount() < APPEND_CONNECTION_PENDING_HIGH_WATERMARK;
     }
 
     private void beginReplicaRequestLocked(ChunkSession s, int replicaIndex) {
