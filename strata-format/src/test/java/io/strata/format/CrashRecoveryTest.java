@@ -160,6 +160,61 @@ class CrashRecoveryTest {
     }
 
     @Test
+    void sealedChunkWithRetainedLedgerAndOpenSidecarRecoversAsSealed() throws Exception {
+        ChunkStore store = new ChunkStore(dir); // non-fsync: the ledger is retained until reclaim
+        open(store);
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("payload".getBytes()));
+        store.seal(TEST_NS, id, 1, 7, null);
+        assertTrue(Files.exists(ledgerPath()), "non-fsync seal retains the ledger as the recovery net");
+
+        // Durability-v2 (Lever 1) no longer writes a SEALED sidecar: in the pre-reclaim window the
+        // sidecar still reads OPEN while the durable SEALED signal is the trailer. Recovery must treat
+        // the trailer as authoritative. The retained ledger covers exactly [0, dataLength), which
+        // distinguishes a real sealed chunk from an OPEN chunk whose payload merely looks like a footer
+        // (whose ledger would cover the whole appended payload, strictly past dataLength).
+        Files.write(metaPath(), new ChunkFormats.Sidecar(1, -1, 7, ChunkState.OPEN).encode());
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            var stat = recovered.stat(TEST_NS, id);
+            assertEquals(ChunkState.SEALED, stat.state());
+            assertEquals(7, stat.sealedLength());
+            assertArrayEquals("payload".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
+        }
+    }
+
+    @Test
+    void fsyncSealLeavesNoSidecar() throws Exception {
+        ChunkStore store = new ChunkStore(dir, true); // sealFsync=true: ledger + sidecar dropped at seal
+        open(store);
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("payload".getBytes()));
+        store.seal(TEST_NS, id, 1, 7, null);
+        assertFalse(Files.exists(metaPath()), "fsync-sealed chunk carries no .meta sidecar");
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            var stat = recovered.stat(TEST_NS, id);
+            assertEquals(ChunkState.SEALED, stat.state());
+            assertEquals(7, stat.sealedLength());
+            assertArrayEquals("payload".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
+        }
+    }
+
+    @Test
+    void reclaimedSealedChunkLeavesNoSidecarOrLedger() throws Exception {
+        ChunkStore store = new ChunkStore(dir); // non-fsync: ledger retained until reclaim
+        open(store);
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("payload".getBytes()));
+        store.seal(TEST_NS, id, 1, 7, null);
+        store.reclaimSealedLedgersOnce();
+        assertFalse(Files.exists(metaPath()), "reclaimed sealed chunk carries no .meta sidecar");
+        assertFalse(Files.exists(ledgerPath()), "reclaim drops the retained ledger");
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            var stat = recovered.stat(TEST_NS, id);
+            assertEquals(ChunkState.SEALED, stat.state());
+            assertEquals(7, stat.sealedLength());
+            assertArrayEquals("payload".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
+        }
+    }
+
+    @Test
     void corruptFooterIsDetectedAtRecoveryAndChunkQuarantined() throws Exception {
         byte[] repairImage;
         int dataCrc;
@@ -237,6 +292,38 @@ class CrashRecoveryTest {
             assertEquals(payload.length, stat.localEndOffset());
             assertArrayEquals(payload, recovered.read(TEST_NS, id, 0, payload.length).bytes());
             assertTrue(Files.exists(ledgerPath()), "ledger must not be deleted by false sealed recovery");
+        }
+    }
+
+    @Test
+    void openChunkWithFooterShapedPayloadAndTornLedgerTailRecoversAsOpen() throws Exception {
+        // Reviewer repro (PR #37): an OPEN chunk whose payload suffix is footer-shaped AND whose last
+        // ledger entry is torn. A backward scan over the torn tail lands on the PREVIOUS intact entry,
+        // which here ends exactly at the fake trailer's dataLength — so the trailer disambiguator would
+        // wrongly install SEALED and delete the sidecar/ledger. Recovery MUST keep the chunk OPEN.
+        byte[] live = "live".getBytes();
+        byte[] payload = footerShapedPayload(live);   // live + footer + trailer; fake trailer.dataLength == live.length
+        byte[] tail = java.util.Arrays.copyOfRange(payload, live.length, payload.length);
+
+        ChunkStore store = new ChunkStore(dir);
+        store.open(TEST_NS, id, true, 1, 1718000000000L);
+        // two appends split exactly at the fake dataLength, so ledger entry #1 ends at live.length (== dataLength)
+        store.appendAsync(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(live)).get(5, TimeUnit.SECONDS);
+        store.appendAsync(TEST_NS, id, 1, live.length, 0, ByteBuffer.wrap(tail)).get(5, TimeUnit.SECONDS);
+        store.close();
+
+        Files.delete(metaPath());
+        // tear the second (last) ledger entry so the backward scan falls back to entry #1 (ends at dataLength)
+        try (FileChannel j = FileChannel.open(ledgerPath(), StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            ByteBuffer one = ByteBuffer.allocate(1);
+            j.read(one, ChunkFormats.LEDGER_ENTRY_SIZE);   // first byte of entry #2
+            j.write(ByteBuffer.wrap(new byte[]{(byte) (one.get(0) ^ 0xFF)}), ChunkFormats.LEDGER_ENTRY_SIZE);
+        }
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            assertEquals(ChunkState.OPEN, recovered.stat(TEST_NS, id).state(),
+                    "footer-shaped payload + torn ledger tail must not be misread as SEALED");
+            assertTrue(Files.exists(ledgerPath()), "the OPEN chunk's ledger must not be deleted by a false sealed recovery");
         }
     }
 

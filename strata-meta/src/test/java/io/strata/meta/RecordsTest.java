@@ -150,6 +150,37 @@ class RecordsTest {
         assertThrows(IllegalArgumentException.class, () -> Records.NodeRecord.decode(invalid));
     }
 
+    @Test
+    void recordEncodingCarriesCrcThatCatchesSilentCorruption() {
+        Records.ChunkRecord chunk = new Records.ChunkRecord(3, ChunkState.SEALED, 4096, 0xAA, 5,
+                List.of(7, 8), 33, 44);
+        Records.FileRecord record = new Records.FileRecord(FileId.of(1), "test", "/crc-file",
+                3, 2, true, FileState.OPEN, 1234, List.of(chunk), 11, 22);
+        byte[] enc = record.encode();
+        assertEquals(record, Records.FileRecord.decode(enc));   // round-trip is intact
+
+        // A silent single-bit flip anywhere in the encoded record (a ZooKeeper bit-rot) must be caught
+        // by the trailing CRC32C envelope, not decoded as a different-but-plausible record.
+        byte[] corrupt = enc.clone();
+        corrupt[enc.length / 2] ^= 0x01;
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> Records.FileRecord.decode(corrupt));
+        assertTrue(e.getMessage().contains("crc"));
+    }
+
+    @Test
+    void preEnvelopeRecordBytesAreRejected() {
+        // Clean break (no back-compat / no migration shim — project policy): a record written by pre-PR
+        // code carries no CRC envelope, so its trailing 4 bytes are real record fields, not a checksum.
+        // Decode must fail closed rather than parse it as a plausible record. (ZK is redeployed fresh, so
+        // there is no legacy data to migrate; this documents and pins the intentional break.)
+        Records.FileRecord record = new Records.FileRecord(FileId.of(1), "test", "/pre-envelope",
+                3, 2, false, FileState.OPEN, 1234, List.of());
+        byte[] enveloped = record.encode();
+        byte[] preEnvelope = java.util.Arrays.copyOf(enveloped, enveloped.length - 4); // strip CRC = old format
+        assertThrows(IllegalArgumentException.class, () -> Records.FileRecord.decode(preEnvelope));
+    }
+
     private static byte[] legacyFileRecordBytes(FileId fileId) {
         BufWriter w = new BufWriter();
         w.u8(1);
@@ -158,7 +189,7 @@ class RecordsTest {
         w.varint(1);
         w.u32(4).u8(ChunkState.OPEN.value).u64(10).u32(0xBEEF).i32(6);
         w.varint(2).u32(1).u32(2);
-        return w.toBytes();
+        return Records.sealRecord(w.toBytes());
     }
 
     private static byte[] fileRecordWithChunkCount(int count) {
@@ -169,7 +200,7 @@ class RecordsTest {
         w.u32(3).u32(2).u8(0).i32(0).u8(FileState.OPEN.value).u64(1);
         w.u64(0).u64(0);
         w.varint(count);
-        return w.toBytes();
+        return Records.sealRecord(w.toBytes());
     }
 
     private static byte[] fileRecordWithReplicaCount(int count) {
@@ -183,7 +214,7 @@ class RecordsTest {
         w.u32(0).u8(ChunkState.OPEN.value).u64(0).u32(0).i32(1);
         w.u64(0).u64(0);
         w.varint(count);
-        return w.toBytes();
+        return Records.sealRecord(w.toBytes());
     }
 
     private static byte[] nodeRecordWithEndpointCount(int count) {
@@ -191,6 +222,6 @@ class RecordsTest {
         w.u8(1);
         w.u32(1).u64(1).u64(2);
         w.varint(count);
-        return w.toBytes();
+        return Records.sealRecord(w.toBytes());
     }
 }

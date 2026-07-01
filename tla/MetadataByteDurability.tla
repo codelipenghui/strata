@@ -1,7 +1,7 @@
 -------------------------- MODULE MetadataByteDurability --------------------------
 (***************************************************************************)
-(* Byte-level durability of the namespace metadata log (sections 14, 15 of  *)
-(* strata-metadata-scaling-design.md, plus the review's durability           *)
+(* Byte-level durability of the namespace metadata log (§4 of               *)
+(* strata-tech-design.md, plus the review's durability                       *)
 (* findings). The metadata-log bytes are stored as ordinary replicated       *)
 (* Strata chunks: "system metadata files use the same Strata chunk           *)
 (* replication, seal verification, and checksum model"; "a metadata mutation *)
@@ -130,7 +130,7 @@ CatchUp(p) ==
   /\ UNCHANGED <<trueVal, ackedVal, appended, up, corrupts, readResult, readDone, readAcked>>
 
 \* Acknowledge position p as durable once the policy threshold of replicas hold
-\* the true content. This is exactly the section-15 rule: ack only after the
+\* the true content. This is exactly the §4 durability rule: ack only after the
 \* append is durable under the configured policy.
 Ack(p) ==
   /\ p \in appended

@@ -2,6 +2,7 @@ package io.strata.meta;
 
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
+import io.strata.common.Crc;
 import io.strata.common.FileId;
 import io.strata.common.FileState;
 import io.strata.common.StrataNamespace;
@@ -21,6 +22,29 @@ import java.util.Optional;
  */
 public final class Records {
     private Records() {}
+
+    // Every persistent metadata record stored in the consensus root is wrapped with a trailing CRC32C so
+    // a silent ZooKeeper bit-flip is caught on decode instead of parsed as a different-but-plausible
+    // record. Mirrors the envelope NamespaceMetadataSnapshotCodec already uses for snapshots.
+
+    /** Appends a CRC32C of {@code body}, producing the persisted form. */
+    static byte[] sealRecord(byte[] body) {
+        return new BufWriter(body.length + 4).raw(body).u32(Crc.of(body)).toBytes();
+    }
+
+    /** Verifies and strips the trailing CRC32C added by {@link #sealRecord}, failing closed on a mismatch
+     *  (or a too-short buffer) BEFORE any field — including length counts — is read. */
+    static byte[] openRecord(byte[] bytes) {
+        if (bytes.length < 4) {
+            throw new IllegalArgumentException("record too short for crc envelope: " + bytes.length);
+        }
+        int bodyLen = bytes.length - 4;
+        int expectedCrc = ByteBuffer.wrap(bytes, bodyLen, 4).getInt();
+        if (Crc.of(bytes, 0, bodyLen) != expectedCrc) {
+            throw new IllegalArgumentException("record crc mismatch");
+        }
+        return java.util.Arrays.copyOf(bytes, bodyLen);
+    }
 
     public enum NodeState {
         REGISTERED(0), DRAINING(1), DEAD(2);
@@ -184,11 +208,11 @@ public final class Records {
                 w.varint(c.replicas().size());
                 for (int n : c.replicas()) w.u32(n);
             }
-            return w.toBytes();
+            return sealRecord(w.toBytes());
         }
 
         public static FileRecord decode(byte[] bytes) {
-            ByteBuffer b = ByteBuffer.wrap(bytes);
+            ByteBuffer b = ByteBuffer.wrap(openRecord(bytes));
             byte version = b.get();
             if (version != 7) throw new IllegalArgumentException("file record version " + version);
             FileId id = FileId.readFrom(b);
@@ -244,11 +268,11 @@ public final class Records {
             for (String e : endpoints) w.string(e);
             w.string(zone).string(rack).string(host);
             w.u64(capacityBytes).u8(state.value);
-            return w.toBytes();
+            return sealRecord(w.toBytes());
         }
 
         public static NodeRecord decode(byte[] bytes) {
-            ByteBuffer b = ByteBuffer.wrap(bytes);
+            ByteBuffer b = ByteBuffer.wrap(openRecord(bytes));
             byte version = b.get();
             if (version != 2) throw new IllegalArgumentException("node record version " + version);
             int id = b.getInt();
@@ -286,11 +310,11 @@ public final class Records {
             w.u8(1); // record version
             w.string(namespace.toString()).i32(generation).varint(replicaSet.size());
             for (String e : replicaSet) w.string(e);
-            return w.toBytes();
+            return sealRecord(w.toBytes());
         }
 
         public static NamespaceAssignment decode(byte[] bytes) {
-            ByteBuffer b = ByteBuffer.wrap(bytes);
+            ByteBuffer b = ByteBuffer.wrap(openRecord(bytes));
             byte version = b.get();
             if (version != 1) throw new IllegalArgumentException("namespace assignment version " + version);
             StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
@@ -326,11 +350,11 @@ public final class Records {
                 w.raw(rec);
                 w.u64(e.freeBytes());
             }
-            return w.toBytes();
+            return sealRecord(w.toBytes());
         }
 
         public static ClusterLiveNodes decode(byte[] bytes) {
-            ByteBuffer b = ByteBuffer.wrap(bytes);
+            ByteBuffer b = ByteBuffer.wrap(openRecord(bytes));
             byte version = b.get();
             if (version != 1) throw new IllegalArgumentException("cluster live-nodes version " + version);
             long publishedAtMs = b.getLong();
@@ -370,11 +394,11 @@ public final class Records {
                     .u64(logStartOffset).u64(publishedLogOffset);
             encodeOptionalFileId(w, snapshotFileId);
             encodeOptionalFileId(w, logFileId);
-            return w.toBytes();
+            return sealRecord(w.toBytes());
         }
 
         public static NamespaceManifest decode(byte[] bytes) {
-            ByteBuffer b = ByteBuffer.wrap(bytes);
+            ByteBuffer b = ByteBuffer.wrap(openRecord(bytes));
             byte version = b.get();
             if (version != 1) throw new IllegalArgumentException("namespace manifest version " + version);
             StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));

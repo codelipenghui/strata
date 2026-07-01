@@ -1,8 +1,8 @@
 -------------------------- MODULE MetadataTombstoneSweep --------------------------
 (***************************************************************************)
 (* Models the tombstone-sweep retention safety condition for one deleted    *)
-(* file/path in one namespace (section 10 of                                *)
-(* strata-metadata-scaling-design.md).                                      *)
+(* file/path in one namespace (retention safety, §4 of                      *)
+(* strata-tech-design.md).                                                  *)
 (*                                                                         *)
 (* The design states a TWO-PART condition for emitting TombstoneSwept:       *)
 (*   (1) the retention window has elapsed, AND                              *)
@@ -137,7 +137,7 @@ NoStaleResurrection ==
 \* Leg 2 (durability): a tombstone is never swept before it was captured in a
 \* published snapshot -- otherwise the snapshot lineage has no fence and a
 \* recovery from it loses the deletion. This is the published-snapshot half of
-\* the section-10 condition.
+\* the §4 retention condition.
 SweptImpliesPublished ==
   (status = "Swept") => tombPublished
 

@@ -7,6 +7,7 @@ import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
+import io.strata.format.ChunkStore;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -134,6 +135,44 @@ class DataNodeWireTest {
         IOException e = assertThrows(IOException.class,
                 () -> new DataNode(DataNodeConfig.standalone(dir).withNodeId(43)));
         assertTrue(e.getMessage().contains("does not match this volume's recorded node id"));
+    }
+
+    @Test
+    void appendStoresTheClientFramePayloadCrc() throws Exception {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
+             ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
+                    1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
+
+            byte[] payload = "client-computed".getBytes();
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
+                    ByteBuffer.wrap(payload), 5000);
+
+            ByteBuffer lh = client.call(Opcode.READ_LEDGER,
+                    new Messages.ReadLedger(id, 0, TEST_NS).encode(), null, 5000);
+            var ledger = Messages.ReadLedgerResp.decode(lh);
+            assertEquals(1, ledger.entries().size());
+            assertEquals(io.strata.common.Crc.of(ByteBuffer.wrap(payload)),
+                    ledger.entries().get(0).payloadCrc());
+        }
+    }
+
+    @Test
+    void nonEmptyAppendWithoutPayloadCrcFlagIsRejected() throws Exception {
+        // The per-record digest is writer-origin: a non-empty append must carry the client's payload CRC
+        // (FLAG_PAYLOAD_CRC), which the node stores verbatim as the ledger digest. The wire encoder always
+        // sets that flag for a non-empty payload, so a frame lacking it is a malformed/non-conforming
+        // client; the node must reject it rather than silently store a 0 digest that defeats torn-tail
+        // recovery. Frame.request leaves flags=0, reproducing exactly that case at the handler boundary.
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
+             ChunkStore store = new ChunkStore(dir.resolve("guard-chunks"))) {
+            DataNodeHandlers handlers = new DataNodeHandlers(store, node);
+            Frame malformed = Frame.request(Opcode.APPEND,
+                    new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
+                    ByteBuffer.wrap("no-crc-flag".getBytes()), 7L);
+            ScpException e = assertThrows(ScpException.class, () -> handlers.handleAsync(malformed));
+            assertEquals(ErrorCode.PRECONDITION_FAILED, e.code());
+        }
     }
 
     @Test

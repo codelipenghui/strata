@@ -119,6 +119,7 @@ public final class FrameIO {
         if ((flags & Frame.FLAG_PAYLOAD_CRC) != 0 && payloadLen > 0) {
             checkPayloadCrc(payloadCrc, Crc.of(payload.duplicate()));
         }
-        return new Frame(opcode, apiVersion, flags, correlationId, header, payload);
+        // Frame normalizes payloadCrc to 0 on an unflagged/empty frame (the accessor contract)
+        return Frame.decoded(opcode, apiVersion, flags, correlationId, header, payload, payloadCrc);
     }
 }

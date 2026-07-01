@@ -32,15 +32,16 @@ public final class Frame implements AutoCloseable {
     private final ByteBuffer payload;
     private final FilePayload filePayload;
     private final ByteBuf owner;
+    private final int payloadCrc;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     public Frame(short opcode, short apiVersion, short flags, long correlationId,
                  ByteBuffer header, ByteBuffer payload) {
-        this(opcode, apiVersion, flags, correlationId, readOnlySlice(header), readOnlySlice(payload), null, null);
+        this(opcode, apiVersion, flags, correlationId, readOnlySlice(header), readOnlySlice(payload), null, null, 0);
     }
 
     private Frame(short opcode, short apiVersion, short flags, long correlationId,
-                  ByteBuffer header, ByteBuffer payload, FilePayload filePayload, ByteBuf owner) {
+                  ByteBuffer header, ByteBuffer payload, FilePayload filePayload, ByteBuf owner, int payloadCrc) {
         this.opcode = opcode;
         this.apiVersion = apiVersion;
         this.flags = flags;
@@ -49,13 +50,34 @@ public final class Frame implements AutoCloseable {
         this.payload = payload;
         this.filePayload = filePayload;
         this.owner = owner;
+        this.payloadCrc = payloadCrc;
     }
 
     static Frame fromOwnedBuffer(short opcode, short apiVersion, short flags, long correlationId,
-                                 ByteBuf owner, int headerIndex, int headerLen, int payloadIndex, int payloadLen) {
+                                 ByteBuf owner, int headerIndex, int headerLen, int payloadIndex, int payloadLen,
+                                 int payloadCrc) {
         ByteBuffer header = owner.nioBuffer(headerIndex, headerLen).asReadOnlyBuffer();
         ByteBuffer payload = owner.nioBuffer(payloadIndex, payloadLen).asReadOnlyBuffer();
-        return new Frame(opcode, apiVersion, flags, correlationId, header, payload, null, owner);
+        return new Frame(opcode, apiVersion, flags, correlationId, header, payload, null, owner,
+                retainedPayloadCrc(flags, payloadLen, payloadCrc));
+    }
+
+    static Frame decoded(short opcode, short apiVersion, short flags, long correlationId,
+                         ByteBuffer header, ByteBuffer payload, int payloadCrc) {
+        ByteBuffer payloadSlice = readOnlySlice(payload);
+        return new Frame(opcode, apiVersion, flags, correlationId,
+                readOnlySlice(header), payloadSlice, null, null,
+                retainedPayloadCrc(flags, payloadSlice.remaining(), payloadCrc));
+    }
+
+    /**
+     * The payload CRC to retain on a decoded frame: the sender's value only when a non-empty payload
+     * actually carried {@link #FLAG_PAYLOAD_CRC}, else 0. Centralizing the rule here — rather than at
+     * each decode site — keeps the {@link #payloadCrc()} contract (0 on an unflagged or empty frame)
+     * enforced at construction for every decode path, including any added later.
+     */
+    private static int retainedPayloadCrc(short flags, int payloadLen, int payloadCrc) {
+        return (flags & FLAG_PAYLOAD_CRC) != 0 && payloadLen > 0 ? payloadCrc : 0;
     }
 
     public record FilePayload(FileChannel channel, long position, int length, Runnable releaser)
@@ -117,6 +139,11 @@ public final class Frame implements AutoCloseable {
         return filePayload != null ? filePayload.length() : payload.remaining();
     }
 
+    /** CRC32C of the payload as computed by the sender and verified at decode; 0 when no payload CRC. */
+    public int payloadCrc() {
+        return payloadCrc;
+    }
+
     public boolean hasFilePayload() {
         return filePayload != null;
     }
@@ -132,7 +159,8 @@ public final class Frame implements AutoCloseable {
         if (filePayload != null) {
             throw new IllegalStateException("file payload cannot be copied to heap");
         }
-        return new Frame(opcode, apiVersion, flags, correlationId, copy(header), copy(payload));
+        return new Frame(opcode, apiVersion, flags, correlationId,
+                readOnlySlice(copy(header)), readOnlySlice(copy(payload)), null, null, payloadCrc);
     }
 
     public boolean ownsBuffer() {
@@ -188,6 +216,6 @@ public final class Frame implements AutoCloseable {
 
     public static Frame fileResponse(Frame req, byte[] header, FilePayload filePayload) {
         return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
-                headerBuffer(header), EMPTY.duplicate(), filePayload, null);
+                readOnlySlice(headerBuffer(header)), readOnlySlice(EMPTY.duplicate()), filePayload, null, 0);
     }
 }

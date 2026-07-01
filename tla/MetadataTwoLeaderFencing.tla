@@ -8,8 +8,8 @@
 (* the open metadata-log tail while the successor recovers. It does NOT      *)
 (* describe a design that allows two leaders; it exists only to PROVE that   *)
 (* the epoch + fence/seal/roll machinery keeps the namespace single-writer   *)
-(* and loses no acknowledged record across the overlap (sections 8.1, 9,     *)
-(* 13, 15 of strata-metadata-scaling-design.md).                            *)
+(* and loses no acknowledged record across the overlap (the metadata         *)
+(* plane; §4 of strata-tech-design.md).                                     *)
 (*                                                                         *)
 (* Storage model: the durable log is committed \o openTail. openTail is the  *)
 (* current open chunk. Only the leader whose epoch OWNS the chunk may append, *)
@@ -98,7 +98,7 @@ FenceSeal(l) ==
                 phase, leaderEpoch, memState, ackedLog>>
 
 \* Recover the sealed durable prefix, fold it into committed, and roll to a
-\* fresh open chunk owned by this leader's epoch (section 8.1 fencing rule).
+\* fresh open chunk owned by this leader's epoch (the §4 fencing rule).
 FoldAndRoll(l) ==
   /\ phase[l] = "Recovering"
   /\ leaderEpoch[l] = epochCounter

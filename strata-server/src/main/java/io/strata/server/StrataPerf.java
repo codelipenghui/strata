@@ -408,7 +408,7 @@ final class StrataPerf {
             return;
         }
         try (StrataFile.Reader reader = client.openById(file.namespace, file.id).openForRead()) {
-            long reads = 0;
+            TailCursor cursor = new TailCursor();
             while (!file.aborted.get()) {
                 if (stop) {
                     file.abort();
@@ -419,11 +419,12 @@ final class StrataPerf {
                     return;
                 }
                 if (claim.waitForMore()) {
-                    reader.refresh();
+                    // Caught up to the writer's in-process durable watermark; it advances as the writer
+                    // appends, so just wait — no LOOKUP_FILE is needed to learn the new durable offset.
                     sleepInterruptibly(5);
                     continue;
                 }
-                reads = readClaim(reader, file, claim, reads, readStats);
+                readClaim(reader, file, claim, cursor, readStats);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -435,18 +436,15 @@ final class StrataPerf {
         }
     }
 
-    private static long readClaim(StrataFile.Reader reader, PerfFile file, ReadClaim claim,
-                                  long reads, Stats readStats) throws InterruptedException {
+    private static void readClaim(StrataFile.Reader reader, PerfFile file, ReadClaim claim,
+                                  TailCursor cursor, Stats readStats) throws InterruptedException {
         long offset = claim.offset();
         int remaining = claim.length();
         int retries = 0;
         while (remaining > 0 && !file.aborted.get()) {
             if (stop) {
                 file.abort();
-                return reads;
-            }
-            if ((reads++ & 0xff) == 0) {
-                reader.refresh();
+                return;
             }
             long t0 = System.nanoTime();
             int n;
@@ -462,21 +460,48 @@ final class StrataPerf {
                 }
                 readStats.recordError("perf read range", e);
                 file.abort();
-                return reads;
+                return;
             }
             readStats.record(elapsedNanos);
             if (n == 0) {
-                reader.refresh();
+                // A 0-byte read at a claimed (in-process-durable) offset is one of two things: the replica's
+                // durable offset just hasn't caught up to the writer's watermark yet (transient — wait), or
+                // the offset has crossed into a chunk the cached LookupFile predates (a roll — needs a
+                // refresh). Only the second persists, so refresh once the empty reads stop making progress:
+                // that isolates a real chunk-boundary/not-found from ordinary replica lag, instead of the
+                // old per-poll refresh that drove LOOKUP_FILE to ~1k/s.
+                if (cursor.recordEmpty() >= EMPTY_READS_BEFORE_REFRESH) {
+                    reader.refresh();
+                    cursor.resetEmpty();
+                }
                 sleepInterruptibly(5);
                 continue;
             }
+            cursor.resetEmpty();
             retries = 0;
             readStats.ops.increment();
             readStats.bytes.add(n);
             offset += n;
             remaining -= n;
         }
-        return reads;
+    }
+
+    /** Consecutive empty reads before a tailing reader re-resolves its chunk map (a roll the cached
+     *  LookupFile predates); ordinary replica-durable lag clears in fewer, so it never triggers a refresh. */
+    private static final int EMPTY_READS_BEFORE_REFRESH = 4;
+
+    /** Per-reader-file tail state: counts consecutive no-progress (empty) reads so a stale chunk map
+     *  triggers a single LOOKUP_FILE, while transient replica-durable lag does not. */
+    private static final class TailCursor {
+        private int emptyStreak;
+
+        int recordEmpty() {
+            return ++emptyStreak;
+        }
+
+        void resetEmpty() {
+            emptyStreak = 0;
+        }
     }
 
     private static void completeReader(StrataClient client, PerfFile file, LongAdder filesDeleted,

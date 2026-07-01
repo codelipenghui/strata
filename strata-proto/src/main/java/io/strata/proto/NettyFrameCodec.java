@@ -110,8 +110,9 @@ final class NettyFrameCodec {
                 if ((flags & Frame.FLAG_PAYLOAD_CRC) != 0 && payloadLen > 0) {
                     FrameIO.checkPayloadCrc(payloadCrc, Crc.of(frame.nioBuffer(payloadIndex, payloadLen)));
                 }
+                // Frame normalizes payloadCrc to 0 on an unflagged/empty frame (the accessor contract)
                 out.add(Frame.fromOwnedBuffer(opcode, apiVersion, flags, correlationId,
-                        frame, headerIndex, headerLen, payloadIndex, payloadLen));
+                        frame, headerIndex, headerLen, payloadIndex, payloadLen, payloadCrc));
                 emitted = true;
             } finally {
                 if (!emitted) {

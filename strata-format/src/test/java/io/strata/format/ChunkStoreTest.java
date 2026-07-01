@@ -43,6 +43,7 @@ import java.util.stream.Stream;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -88,6 +89,21 @@ class ChunkStoreTest {
         store.append(TEST_NS, chunkId, 1, 0, 0, ByteBuffer.wrap(bytes));
         store.seal(TEST_NS, chunkId, 1, bytes.length, null);
         return store.fetch(TEST_NS, chunkId, 0, Integer.MAX_VALUE).bytes();
+    }
+
+    @Test
+    void appendStoresTheSuppliedDigestVerbatim() throws Exception {
+        try (ChunkStore store = newStore()) {
+            store.open(TEST_NS, id, false, 1, 1718000000000L);
+            // a digest that is deliberately NOT Crc.of(payload): proves the node stores the
+            // caller's value rather than recomputing its own.
+            int suppliedDigest = 0x1234_5678;
+            store.appendAsync(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("payload".getBytes()), suppliedDigest).join();
+
+            var entries = store.readLedger(TEST_NS, id, 0);
+            assertEquals(1, entries.size());
+            assertEquals(suppliedDigest, entries.get(0).payloadCrc());
+        }
     }
 
     @Test
@@ -1163,7 +1179,7 @@ class ChunkStoreTest {
     }
 
     @Test
-    void failedImportAfterMoveCleansPartialFilesForRetry(@TempDir Path otherDir) throws Exception {
+    void importedSealedChunkWritesNoSidecarAndRecoversFromTrailer(@TempDir Path otherDir) throws Exception {
         byte[] fileBytes;
         long sealedLength;
         int dataCrc;
@@ -1175,23 +1191,20 @@ class ChunkStoreTest {
         }
 
         String rel = ChunkFormats.chunkRelativePath(TEST_NS, id);
-        Path dataPath = otherDir.resolve(rel + ".chunk");
         Path metaPath = otherDir.resolve(rel + ".meta");
-        Files.createDirectories(dataPath.getParent());
-        // Block the sidecar path by placing a directory there
-        Files.createDirectory(metaPath);
-        Files.write(metaPath.resolve("blocker"), new byte[] {1});
 
+        // Durability-v2 (Lever 1): an imported sealed chunk writes no .meta sidecar — its SEALED state
+        // is carried by the verified trailer, and recovery classifies it from the trailer alone.
         try (ChunkStore other = new ChunkStore(otherDir)) {
-            assertThrows(IOException.class, () -> other.importSealed(TEST_NS, id, fileBytes, sealedLength, dataCrc));
-            assertTrue(Files.notExists(dataPath));
-            assertEquals(ErrorCode.CHUNK_NOT_FOUND,
-                    assertThrows(ScpException.class, () -> other.stat(TEST_NS, id)).code());
-
-            Files.delete(metaPath.resolve("blocker"));
-            Files.delete(metaPath);
             other.importSealed(TEST_NS, id, fileBytes, sealedLength, dataCrc);
             assertTrue(other.contains(TEST_NS, id));
+            assertFalse(Files.exists(metaPath), "imported sealed chunk carries no .meta sidecar");
+        }
+
+        try (ChunkStore reopened = new ChunkStore(otherDir)) {
+            var stat = reopened.stat(TEST_NS, id);
+            assertEquals(ChunkState.SEALED, stat.state());
+            assertEquals(sealedLength, stat.sealedLength());
         }
     }
 
