@@ -42,30 +42,34 @@ final class ChunkDeleteService {
         this.minStartIntervalNanos = TimeUnit.MILLISECONDS.toNanos(minIntervalMs);
     }
 
-    ErrorCode delete(StrataNamespace namespace, ChunkId chunkId) {
+    ErrorCode delete(StrataNamespace namespace, ChunkId chunkId) throws InterruptedException {
         waiting.incrementAndGet();
         boolean acquired = false;
         try {
-            permits.acquire();
-            acquired = true;
-            waiting.decrementAndGet();
-            awaitStartSlot();
+            try {
+                permits.acquire();
+                acquired = true;
+                waiting.decrementAndGet();
+                awaitStartSlot();
+            } catch (InterruptedException e) {
+                if (!acquired) {
+                    waiting.decrementAndGet();
+                }
+                throw e;
+            }
             inFlight.incrementAndGet();
             try {
                 ErrorCode result = store.delete(namespace, chunkId);
                 record(result);
                 return result;
+            } catch (RuntimeException e) {
+                failed.increment();
+                throw e;
             } finally {
                 inFlight.decrementAndGet();
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            failed.increment();
-            return ErrorCode.INTERNAL;
         } finally {
-            if (!acquired) {
-                waiting.decrementAndGet();
-            } else {
+            if (acquired) {
                 permits.release();
             }
         }

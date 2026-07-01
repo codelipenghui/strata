@@ -201,6 +201,8 @@ final class AppenderImpl implements StrataFile.Appender {
     }
 
     private boolean shouldRollBeforeAppend(ChunkSession s) {
+        // A freshly opened partial-quorum chunk must accept the append that opened it; rolling at
+        // end==0 immediately asks metadata for another full-RF placement and can loop on NO_CAPACITY.
         return s.needRoll && s.end > 0;
     }
 

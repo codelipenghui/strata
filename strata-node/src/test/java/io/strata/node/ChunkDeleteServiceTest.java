@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -57,10 +58,88 @@ class ChunkDeleteServiceTest {
         }
     }
 
+    @Test
+    void interruptedPacingWaitIsNotCountedAsFailedDelete() throws Exception {
+        try (ChunkStore store = new ChunkStore(dir.resolve("interrupt-chunks"))) {
+            ChunkId first = new ChunkId(FileId.of(3), 0);
+            ChunkId second = new ChunkId(FileId.of(4), 0);
+            seal(store, first);
+            seal(store, second);
+
+            ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 60_000);
+            assertEquals(ErrorCode.OK, deletes.delete(NS, first));
+
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread worker = Thread.ofVirtual().start(() -> {
+                try {
+                    deletes.delete(NS, second);
+                } catch (Throwable t) {
+                    failure.set(t);
+                }
+            });
+
+            waitFor(() -> deletes.waitingDeletes() == 0 && deletes.inFlightDeletes() == 0);
+            worker.interrupt();
+            worker.join(TimeUnit.SECONDS.toMillis(5));
+
+            assertTrue(failure.get() instanceof InterruptedException);
+            assertEquals(0, deletes.failedDeletes(), "shutdown interrupt must not look like delete failure");
+            assertEquals(1, deletes.okDeletes());
+            assertEquals(0, deletes.inFlightDeletes());
+            assertEquals(0, deletes.waitingDeletes());
+        }
+    }
+
+    @Test
+    void resultCountersTrackNotFoundAndStoreFailures() throws Exception {
+        try (ChunkStore store = new ChunkStore(dir.resolve("counter-chunks"))) {
+            ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
+
+            assertEquals(ErrorCode.CHUNK_NOT_FOUND, deletes.delete(NS, new ChunkId(FileId.of(5), 0)));
+            assertEquals(1, deletes.notFoundDeletes());
+
+            ChunkId creating = new ChunkId(FileId.of(6), 0);
+            creatingSet(store).add(newNsChunkId(creating));
+            assertEquals(ErrorCode.INTERNAL, deletes.delete(NS, creating));
+            assertEquals(1, deletes.failedDeletes());
+        }
+    }
+
     private static void seal(ChunkStore store, ChunkId id) throws Exception {
         byte[] bytes = ("payload-" + id.index()).getBytes();
         store.open(NS, id, false, 1, 1L);
         store.append(NS, id, 1, 0, 0, ByteBuffer.wrap(bytes));
         store.seal(NS, id, 1, bytes.length, null);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static java.util.Set<Object> creatingSet(ChunkStore store) throws Exception {
+        java.lang.reflect.Field field = ChunkStore.class.getDeclaredField("creating");
+        field.setAccessible(true);
+        return (java.util.Set<Object>) field.get(store);
+    }
+
+    private static Object newNsChunkId(ChunkId id) throws Exception {
+        Class<?> type = Class.forName("io.strata.common.NsChunkId");
+        java.lang.reflect.Constructor<?> ctor =
+                type.getDeclaredConstructor(StrataNamespace.class, ChunkId.class);
+        ctor.setAccessible(true);
+        return ctor.newInstance(NS, id);
+    }
+
+    private static void waitFor(BooleanSupplier condition) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        assertTrue(condition.getAsBoolean());
+    }
+
+    @FunctionalInterface
+    private interface BooleanSupplier {
+        boolean getAsBoolean();
     }
 }

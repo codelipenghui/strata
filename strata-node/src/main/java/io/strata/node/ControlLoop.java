@@ -63,16 +63,12 @@ final class ControlLoop implements AutoCloseable {
     private volatile int endpointIndex = 0;
     private final Backoff backoff;
 
-    ControlLoop(DataNode node, DataNodeConfig config, ChunkStore store) {
-        this(node, config, store, store == null ? null : new ChunkDeleteService(store, 1, 0));
-    }
-
     ControlLoop(DataNode node, DataNodeConfig config, ChunkStore store, ChunkDeleteService deletes) {
         this.node = node;
-        this.config = config;
-        this.store = store;
-        this.deletes = deletes;
-        ConnectionPolicy policy = config != null ? config.connectionPolicy() : ConnectionPolicy.DEFAULT;
+        this.config = java.util.Objects.requireNonNull(config, "config");
+        this.store = java.util.Objects.requireNonNull(store, "store");
+        this.deletes = java.util.Objects.requireNonNull(deletes, "deletes");
+        ConnectionPolicy policy = config.connectionPolicy();
         this.backoff = new Backoff(policy.reconnectInitialBackoffMs(), policy.reconnectMaxBackoffMs());
     }
 
@@ -228,6 +224,9 @@ final class ControlLoop implements AutoCloseable {
                     }
                     case Messages.DrainCmd dr -> node.setDraining(true);
                 }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
             } catch (ScpException e) {
                 log.warn("command {} failed: {}", cmd.commandId(), e.getMessage());
                 status = e.code().code;
@@ -239,7 +238,7 @@ final class ControlLoop implements AutoCloseable {
         }
     }
 
-    void replicate(Messages.ReplicateCmd cmd) throws IOException {
+    void replicate(Messages.ReplicateCmd cmd) throws IOException, InterruptedException {
         if (store.contains(cmd.namespace(), cmd.chunkId())) {
             // command replay — but only a VALID copy counts: a local chunk whose seal state or
             // crc/length mismatch the descriptor is corrupt and must be replaced, not trusted

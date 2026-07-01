@@ -20,14 +20,10 @@ final class DataNodeHandlers implements ScpServer.Handler {
     private final ChunkDeleteService deletes;
     private volatile ControlLoop controlLoop; // wired after the control loop starts (owner-repair path)
 
-    DataNodeHandlers(ChunkStore store, DataNode node) {
-        this(store, node, new ChunkDeleteService(store, 1, 0));
-    }
-
     DataNodeHandlers(ChunkStore store, DataNode node, ChunkDeleteService deletes) {
-        this.store = store;
+        this.store = java.util.Objects.requireNonNull(store, "store");
         this.node = node;
-        this.deletes = deletes;
+        this.deletes = java.util.Objects.requireNonNull(deletes, "deletes");
     }
 
     /** Wires the control loop so this node can serve direct owner-driven EXEC_REPLICATE repairs. */
