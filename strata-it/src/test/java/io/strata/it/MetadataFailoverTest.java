@@ -195,19 +195,28 @@ class MetadataFailoverTest {
 
     private static void waitForFileDeleted(MiniCluster cluster, FileId fileId) throws Exception {
         long deadline = System.currentTimeMillis() + 30_000;
+        ScpException lastFailure = null;
         while (System.currentTimeMillis() < deadline) {
             Thread.sleep(250);
             try {
                 lookupThroughAnyEndpoint(cluster, fileId);
+                lastFailure = null;
             } catch (ScpException e) {
-                assertEquals(ErrorCode.FILE_NOT_FOUND, e.code());
-                return;
+                if (e.code() == ErrorCode.FILE_NOT_FOUND) {
+                    return;
+                }
+                lastFailure = e;
             }
         }
-        throw new AssertionError("file record did not converge to deleted");
+        AssertionError failure = new AssertionError("file record did not converge to deleted");
+        if (lastFailure != null) {
+            failure.addSuppressed(lastFailure);
+        }
+        throw failure;
     }
 
     private static Messages.LookupFileResp lookupThroughAnyEndpoint(MiniCluster cluster, FileId fileId) {
+        ScpException fileNotFound = null;
         ScpException last = null;
         for (String endpoint : cluster.metaEndpoints()) {
             String[] hp = endpoint.split(":");
@@ -217,10 +226,17 @@ class MetadataFailoverTest {
                         new Messages.LookupFile(StrataNamespace.of("test"), fileId).encode(), null, 5_000);
                 return Messages.LookupFileResp.decode(h);
             } catch (ScpException e) {
-                last = e;
+                if (e.code() == ErrorCode.FILE_NOT_FOUND) {
+                    fileNotFound = e;
+                } else {
+                    last = e;
+                }
             } catch (Exception e) {
                 last = new ScpException(ErrorCode.INTERNAL, e.toString());
             }
+        }
+        if (fileNotFound != null) {
+            throw fileNotFound;
         }
         throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no controller endpoint");
     }

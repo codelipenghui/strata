@@ -401,15 +401,13 @@ class ChunkStoreLockConcurrencyTest {
         }
     }
 
-    // ---- Phase 3: readRegion()'s zero-copy open/acquire moved off the chunk lock ----
+    // ---- Phase 3: readRegion() verifies durable-prefix bytes without tearing ----
 
     /**
-     * readRegion resolves the OPEN client fast path by opening a transient READ FD; Phase 3 moves that
-     * blocking open OFF the chunk lock (snapshot under lock, open outside). The durable prefix [0,
-     * lastKnownDO) is stable even after the lock is released — a concurrent seal can never truncate below
-     * lastKnownDO — so a concurrent writer must never make a reader see a torn/short region. Eight readers
-     * hammer readRegion while a writer appends; each reader fully reads the returned region and checks
-     * every byte. No deadlock, no corruption, no unexpected throw.
+     * readRegion resolves the OPEN client path by materializing and ledger-verifying bytes below
+     * lastKnownDO. A concurrent writer must never make a reader see a torn/short region. Eight readers
+     * hammer readRegion while a writer appends; each reader checks every returned byte. No deadlock, no
+     * corruption, no unexpected throw.
      */
     @Test
     void concurrentReadRegionDuringAppendsReturnsStableDurablePrefix() throws Exception {
@@ -445,15 +443,12 @@ class ChunkStoreLockConcurrencyTest {
                     try {
                         go.await();
                         while (!writerDone.get()) {
-                            try (ChunkStore.ReadRegionResult region = store.readRegion(TEST_NS, id, 0, 1 << 20)) {
-                                int len = region.length();
-                                var ch = region.channel();
-                                if (len == 0 || ch == null) continue; // empty/non-channel shape
-                                byte[] got = new byte[len];
-                                ChunkFormats.readFully(ch, ByteBuffer.wrap(got), region.filePosition());
-                                for (int b = 0; b < len; b++) {
-                                    if (got[b] != 'X') throw new AssertionError("torn region byte at " + b + " = " + got[b]);
-                                }
+                            ChunkStore.ReadRegionResult region = store.readRegion(TEST_NS, id, 0, 1 << 20);
+                            int len = region.length();
+                            byte[] got = region.bytes();
+                            if (len == 0) continue;
+                            for (int b = 0; b < len; b++) {
+                                if (got[b] != 'X') throw new AssertionError("torn region byte at " + b + " = " + got[b]);
                             }
                         }
                     } catch (Throwable t) {

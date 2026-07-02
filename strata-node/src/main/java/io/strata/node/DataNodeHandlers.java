@@ -79,8 +79,8 @@ final class DataNodeHandlers implements ScpServer.Handler {
             // APPEND is served by handleAsync (deferred ack for group commit)
 
             case READ -> {
-                // Client read: open reads are bounded to the replica-known durable high watermark, so
-                // both open durable-prefix reads and sealed reads can use a zero-copy file region.
+                // Client read: open reads are bounded to the replica-known durable high watermark, and
+                // both open durable-prefix reads and sealed reads are CRC-verified before the response.
                 var m = Messages.Read.decode(h);
                 RequestContext.setNamespace(m.namespace().value());
                 yield readRegionResponse(req, store.readRegion(m.namespace(), m.chunkId(), m.offset(), m.maxBytes()));
@@ -178,16 +178,10 @@ final class DataNodeHandlers implements ScpServer.Handler {
         };
     }
 
-    /** Wire-encodes a {@link ChunkStore.ReadRegionResult}: a zero-copy region or materialized
-     * bytes. The server releases the read resource via Frame.close() — a channel-cache lease for
-     * sealed chunks, or the transient FD for open chunks. */
+    /** Wire-encodes a verified, materialized {@link ChunkStore.ReadRegionResult}. */
     private static Frame readRegionResponse(Frame req, ChunkStore.ReadRegionResult r) {
         byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
-        if (r.channel() != null) {
-            return ScpServer.okFileRegion(req, header, r.channel(), r.filePosition(), r.length(),
-                    r.releaser());
-        }
         byte[] bytes = r.bytes();
-        return ScpServer.ok(req, header, bytes != null && bytes.length > 0 ? ByteBuffer.wrap(bytes) : null);
+        return ScpServer.ok(req, header, bytes.length > 0 ? ByteBuffer.wrap(bytes) : null);
     }
 }

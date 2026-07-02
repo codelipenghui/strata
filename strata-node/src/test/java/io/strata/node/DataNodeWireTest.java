@@ -346,11 +346,9 @@ class DataNodeWireTest {
     }
 
     @Test
-    void sealedReadRegionIsZeroCopyAndUnverified() throws Exception {
-        // Trade-off (sealed reads reverted to zero-copy for throughput): the fast client read path
-        // (readRegion / wire READ) hands back a zero-copy region and does NOT re-CRC per read — a
-        // corrupt sealed data region is served as-is. Integrity is caught by the verified read() /
-        // fetch() / import paths and background scrub, not at read time.
+    void sealedWireReadRejectsCorruptDataAtReadTime() throws Exception {
+        // Client READ must not silently serve a corrupt sealed data region while waiting for the
+        // background scrub loop to discover and repair the replica.
         byte[] payload = "sealed-payload".getBytes();
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
@@ -366,16 +364,13 @@ class DataNodeWireTest {
             assertEquals(ErrorCode.CRC_MISMATCH,
                     assertThrows(ScpException.class, () -> node.store().read(TEST_NS, id, 0, payload.length)).code());
 
-            // zero-copy readRegion does NOT verify — it returns a channel region over the bytes
-            try (var region = node.store().readRegion(TEST_NS, id, 0, payload.length)) {
-                assertEquals(payload.length, region.length());
-                assertNotNull(region.channel(), "sealed readRegion must be a zero-copy channel region");
-            }
+            ScpException regionError = assertThrows(ScpException.class,
+                    () -> node.store().readRegion(TEST_NS, id, 0, payload.length));
+            assertEquals(ErrorCode.CRC_MISMATCH, regionError.code());
 
-            // the wire READ (zero-copy) succeeds without a read-time CRC error
-            Frame frame = client.callFrame(Opcode.READ,
-                    new Messages.Read(id, 0, payload.length, TEST_NS).encode(), null, 5000);
-            Resp.check(frame.headerSlice());
+            ScpException wireError = assertThrows(ScpException.class, () -> client.call(Opcode.READ,
+                    new Messages.Read(id, 0, payload.length, TEST_NS).encode(), null, 5000));
+            assertEquals(ErrorCode.CRC_MISMATCH, wireError.code());
         }
     }
 

@@ -158,7 +158,7 @@ public final class ScpServer implements AutoCloseable {
     private final class ConnectionHandler extends SimpleChannelInboundHandler<Frame> {
         private final ExecutorService requestExecutor;
         private final Set<Frame> inFlightAsyncRequests = ConcurrentHashMap.newKeySet();
-        private final ConcurrentHashMap<Frame, Integer> reservedBytesByFrame = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<Frame, Long> reservedBytesByFrame = new ConcurrentHashMap<>();
         private final AtomicInteger inflightRequests = new AtomicInteger();
         private final AtomicLong inflightBytes = new AtomicLong();
         private final AtomicBoolean connectionOpen = new AtomicBoolean(true);
@@ -177,7 +177,9 @@ public final class ScpServer implements AutoCloseable {
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, Frame frame) {
             if (!reserveInbound(frame)) {
-                writeResponse(ctx, Frame.response(frame,
+                // This request was never admitted into reservedBytesByFrame. Send the small
+                // close response without reserving it against request accounting.
+                writeUnreservedResponse(ctx, Frame.response(frame,
                         Resp.error(ErrorCode.THROTTLED, "too many in-flight requests", maxInflightRequests),
                         null), true, frame);
                 return;
@@ -192,7 +194,7 @@ public final class ScpServer implements AutoCloseable {
         }
 
         private boolean reserveInbound(Frame frame) {
-            int frameBytes = Frame.PREAMBLE_AFTER_LEN + frame.headerSlice().remaining() + frame.payloadLength();
+            long frameBytes = frameWireBytes(frame);
             int requests = inflightRequests.incrementAndGet();
             long bytes = inflightBytes.addAndGet(frameBytes);
             if (requests <= maxInflightRequests && bytes <= maxInflightBytes) {
@@ -204,8 +206,24 @@ public final class ScpServer implements AutoCloseable {
             return false;
         }
 
+        private boolean reserveOutbound(Frame response, Frame request) {
+            long frameBytes = frameWireBytes(response);
+            long bytes = inflightBytes.addAndGet(frameBytes);
+            if (bytes <= maxInflightBytes) {
+                reservedBytesByFrame.merge(request, frameBytes, Long::sum);
+                return true;
+            }
+            inflightBytes.addAndGet(-frameBytes);
+            return false;
+        }
+
+        private long frameWireBytes(Frame frame) {
+            long payloadBytes = frame.hasFilePayload() ? frame.filePayload().length() : frame.payloadLength();
+            return Frame.PREAMBLE_AFTER_LEN + frame.headerSlice().remaining() + payloadBytes;
+        }
+
         private void releaseInbound(Frame frame) {
-            Integer bytes = reservedBytesByFrame.remove(frame);
+            Long bytes = reservedBytesByFrame.remove(frame);
             if (bytes != null) {
                 inflightRequests.decrementAndGet();
                 inflightBytes.addAndGet(-bytes);
@@ -349,6 +367,22 @@ public final class ScpServer implements AutoCloseable {
 
         private void writeResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
                                    Frame releaseAfterWrite) {
+            if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
+                closeFrames(frame, releaseAfterWrite);
+                return;
+            }
+            if (!reserveOutbound(frame, releaseAfterWrite)) {
+                frame.close();
+                writeUnreservedResponse(ctx, Frame.response(releaseAfterWrite,
+                        Resp.error(ErrorCode.THROTTLED, "too many in-flight response bytes", maxInflightBytes),
+                        null), true, releaseAfterWrite);
+                return;
+            }
+            writeUnreservedResponse(ctx, frame, closeAfterWrite, releaseAfterWrite);
+        }
+
+        private void writeUnreservedResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
+                                             Frame releaseAfterWrite) {
             if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
                 closeFrames(frame, releaseAfterWrite);
                 return;

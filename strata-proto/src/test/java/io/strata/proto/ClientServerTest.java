@@ -429,6 +429,18 @@ class ClientServerTest {
     }
 
     @Test
+    void serverRejectsResponsesBeyondConnectionAdmissionByteWindow() throws Exception {
+        ScpServer.Handler largeResponse = req -> ScpServer.ok(req, Messages.okHeader(),
+                ByteBuffer.wrap(new byte[2048]));
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, largeResponse, 8, 1024);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "admission")) {
+            ScpException e = assertThrows(ScpException.class,
+                    () -> client.call(Opcode.PING, emptyHeader(), null, 5_000));
+            assertEquals(ErrorCode.THROTTLED, e.code());
+        }
+    }
+
+    @Test
     void nullHandlerResponsesBecomeTypedErrors() throws Exception {
         try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> null);
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
