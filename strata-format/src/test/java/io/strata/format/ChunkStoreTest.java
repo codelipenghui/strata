@@ -1476,7 +1476,7 @@ class ChunkStoreTest {
             store.append(TEST_NS, chunkId, 1, 0, 0, bytes("sealed"));
             store.seal(TEST_NS, chunkId, 1, 6, null);
         }
-        Files.write(ledgerPath, new byte[] {1, 2, 3});
+        Files.write(ledgerPath, new ChunkFormats.LedgerEntry(6, Crc.of("sealed".getBytes()), 1).encode());
 
         try (ChunkStore recovered = newStore()) {
             assertTrue(recovered.contains(TEST_NS, chunkId));
