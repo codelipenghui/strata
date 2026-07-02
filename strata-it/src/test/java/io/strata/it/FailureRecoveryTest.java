@@ -123,6 +123,55 @@ class FailureRecoveryTest {
     }
 
     @Test
+    void chunkRecoveryPreservesExactOffsetsAcrossRolledChunks() throws Exception {
+        ClientConfig config = ClientConfig.of(cluster.metaEndpoint())
+                .withChunkRollBytes(256)
+                .withDataNodeConnectionsPerEndpoint(3);
+        try (StrataClient smallRollClient = StrataClient.connect(config)) {
+            FileId fileId = smallRollClient.create(
+                    StrataClient.FileSpec.log("test", "/recover-rolled-chunk-offsets")).id();
+            Workload workload = new Workload();
+            StrataFile.Appender abandoned =
+                    smallRollClient.openById(StrataNamespace.of("test"), fileId).openForAppend();
+            boolean appenderClosed = false;
+            try {
+                long lastAck = workload.appendAckedAndVerifyOffsets(abandoned, 0, 90);
+                assertEquals(workload.ackedBytes(), lastAck,
+                        "last append future must return the logical file end offset");
+
+                Messages.LookupFileResp beforeRecovery = lookupFile(fileId);
+                assertTrue(beforeRecovery.chunks().size() >= 4,
+                        "test must create several chunks, got " + beforeRecovery.chunks().size());
+                long openChunkBase = sealedPrefixLength(beforeRecovery);
+                assertTrue(openChunkBase > 0, "test must recover an open tail after sealed chunks");
+                Messages.ChunkInfo openChunk =
+                        beforeRecovery.chunks().get(beforeRecovery.chunks().size() - 1);
+                assertEquals(ChunkState.OPEN, openChunk.state(),
+                        "test setup needs an open tail for recoverAndSeal");
+
+                cluster.killNode(nodeIndex(openChunk.replicas().get(0).nodeId()));
+
+                StrataFile.SealInfo recovered =
+                        smallRollClient.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
+                assertEquals(workload.ackedBytes(), recovered.sealedLength(),
+                        "chunk recovery returned the wrong file end offset");
+
+                abandoned.close();
+                appenderClosed = true;
+
+                Messages.LookupFileResp sealed = ConsistencyVerifier.assertSealedFileConsistent(
+                        cluster, smallRollClient, fileId, recovered.sealedLength());
+                ConsistencyVerifier.assertReadsAtChunkOffsets(
+                        smallRollClient, fileId, sealed, workload.expectedBytes());
+            } finally {
+                if (!appenderClosed) {
+                    abandoned.close();
+                }
+            }
+        }
+    }
+
+    @Test
     void fixedSeedPooledStressWithReplicaFaultAndRecoveryPreservesAckedPrefix() throws Exception {
         long seed = 0x5eed_5eed_2026_0612L;
         Random random = new Random(seed);
@@ -624,6 +673,18 @@ class FailureRecoveryTest {
         for (int i = 0; i < nodeIds.size(); i++) {
             waitForNodeId(cluster.nodes.get(i), nodeIds.get(i));
         }
+    }
+
+    private static long sealedPrefixLength(Messages.LookupFileResp file) {
+        long total = 0;
+        for (int i = 0; i < file.chunks().size(); i++) {
+            Messages.ChunkInfo chunk = file.chunks().get(i);
+            if (chunk.state() != ChunkState.SEALED) {
+                return total;
+            }
+            total += chunk.length();
+        }
+        return total;
     }
 
     private Messages.LookupFileResp lookupFile(FileId fileId) throws Exception {

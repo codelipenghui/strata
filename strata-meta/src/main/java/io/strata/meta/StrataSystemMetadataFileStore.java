@@ -33,17 +33,28 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
     private final Supplier<String> metaEndpoint;
     private final StrataClient.WritePolicy policy;
     private final int readChunkBytes;
+    private final long chunkRollBytes;
     private final Object initLock = new Object();
     private volatile StrataClient client;
     private final Map<FileId, StrataFile.Appender> openLogAppenders = new ConcurrentHashMap<>();
 
     StrataSystemMetadataFileStore(Supplier<String> metaEndpoint, int replicationFactor, int ackQuorum,
                                   boolean fsyncOnAck, int readChunkBytes) {
+        this(metaEndpoint, replicationFactor, ackQuorum, fsyncOnAck, readChunkBytes,
+                ControllerConfig.DEFAULT_NAMESPACE_LOG_CHUNK_ROLL_BYTES);
+    }
+
+    StrataSystemMetadataFileStore(Supplier<String> metaEndpoint, int replicationFactor, int ackQuorum,
+                                  boolean fsyncOnAck, int readChunkBytes, long chunkRollBytes) {
         this.metaEndpoint = metaEndpoint;
         if (readChunkBytes <= 0) {
             throw new IllegalArgumentException("readChunkBytes must be positive: " + readChunkBytes);
         }
+        if (chunkRollBytes <= 0) {
+            throw new IllegalArgumentException("chunkRollBytes must be positive: " + chunkRollBytes);
+        }
         this.readChunkBytes = readChunkBytes;
+        this.chunkRollBytes = chunkRollBytes;
         // Durability is by REPLICATION, not single-node fsync: the metadata log is a Strata file with RF
         // replicas, acked once the ack quorum holds the record. fsyncOnAck=false (default) keeps it
         // page-cache durable on the quorum — fully safe against process/JVM/container crashes (the page
@@ -193,7 +204,8 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
         if (c == null) {
             synchronized (initLock) {
                 if (client == null) {
-                    client = StrataClient.connect(ClientConfig.of(metaEndpoint.get()));
+                    client = StrataClient.connect(ClientConfig.of(metaEndpoint.get())
+                            .withChunkRollBytes(chunkRollBytes));
                 }
                 c = client;
             }

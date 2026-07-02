@@ -32,6 +32,7 @@ public record ControllerConfig(
         MetadataBackendConfig metadataBackendConfig
 ) {
     public static final int DEFAULT_NAMESPACE_LOG_RETENTION_MS = 5 * 60_000;
+    public static final long DEFAULT_NAMESPACE_LOG_CHUNK_ROLL_BYTES = 2L << 30;
 
     public record MetadataBackendConfig(
             String backend,
@@ -42,7 +43,8 @@ public record ControllerConfig(
             int namespaceLogCompactIntervalMs,
             boolean namespaceLogOrphanGc,
             int namespaceLogRetentionMs,
-            int namespaceLogReadChunkBytes) {
+            int namespaceLogReadChunkBytes,
+            long namespaceLogChunkRollBytes) {
 
         public MetadataBackendConfig {
             backend = (backend == null || backend.isBlank()) ? "zk" : backend.trim();
@@ -70,16 +72,40 @@ public record ControllerConfig(
                 throw new IllegalArgumentException("namespaceLogReadChunkBytes must be positive: "
                         + namespaceLogReadChunkBytes);
             }
+            if (namespaceLogChunkRollBytes <= 0) {
+                throw new IllegalArgumentException("namespaceLogChunkRollBytes must be positive: "
+                        + namespaceLogChunkRollBytes);
+            }
         }
 
         public static MetadataBackendConfig zk() {
             return new MetadataBackendConfig("zk", 3, 2, false, 4 * 1024 * 1024, 30_000,
-                    true, DEFAULT_NAMESPACE_LOG_RETENTION_MS, 4 * 1024 * 1024);
+                    true, DEFAULT_NAMESPACE_LOG_RETENTION_MS, 4 * 1024 * 1024,
+                    DEFAULT_NAMESPACE_LOG_CHUNK_ROLL_BYTES);
         }
 
         public static MetadataBackendConfig namespaceLog() {
             return new MetadataBackendConfig("namespace-log", 3, 2, false, 4 * 1024 * 1024,
-                    30_000, true, DEFAULT_NAMESPACE_LOG_RETENTION_MS, 4 * 1024 * 1024);
+                    30_000, true, DEFAULT_NAMESPACE_LOG_RETENTION_MS, 4 * 1024 * 1024,
+                    DEFAULT_NAMESPACE_LOG_CHUNK_ROLL_BYTES);
+        }
+
+        public MetadataBackendConfig withNamespaceLogChunkRollBytes(long bytes) {
+            return new MetadataBackendConfig(backend, namespaceLogReplicationFactor, namespaceLogAckQuorum,
+                    namespaceLogFsync, namespaceLogCompactBytes, namespaceLogCompactIntervalMs,
+                    namespaceLogOrphanGc, namespaceLogRetentionMs, namespaceLogReadChunkBytes, bytes);
+        }
+
+        public MetadataBackendConfig withNamespaceLogReadChunkBytes(int bytes) {
+            return new MetadataBackendConfig(backend, namespaceLogReplicationFactor, namespaceLogAckQuorum,
+                    namespaceLogFsync, namespaceLogCompactBytes, namespaceLogCompactIntervalMs,
+                    namespaceLogOrphanGc, namespaceLogRetentionMs, bytes, namespaceLogChunkRollBytes);
+        }
+
+        public MetadataBackendConfig withNamespaceLogCompaction(int compactBytes, int compactIntervalMs) {
+            return new MetadataBackendConfig(backend, namespaceLogReplicationFactor, namespaceLogAckQuorum,
+                    namespaceLogFsync, compactBytes, compactIntervalMs, namespaceLogOrphanGc,
+                    namespaceLogRetentionMs, namespaceLogReadChunkBytes, namespaceLogChunkRollBytes);
         }
 
         public boolean namespaceLogEnabled() {

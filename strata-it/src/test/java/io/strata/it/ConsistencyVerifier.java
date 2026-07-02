@@ -23,6 +23,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -128,6 +129,18 @@ final class ConsistencyVerifier {
         assertClientReadsExactlySealedLength(client, namespace, fileId, sealedLength);
         assertSealedReplicasAreByteIdentical(lookup);
         return lookup;
+    }
+
+    static void assertReadsAtChunkOffsets(StrataClient client, FileId fileId,
+                                          Messages.LookupFileResp sealed,
+                                          byte[] expectedBytes) {
+        assertReadsAtChunkOffsets(client, TEST_NS, fileId, sealed, expectedBytes, true);
+    }
+
+    static void assertAckedPrefixReadsAtChunkOffsets(StrataClient client, FileId fileId,
+                                                     Messages.LookupFileResp sealed,
+                                                     byte[] expectedPrefix) {
+        assertReadsAtChunkOffsets(client, TEST_NS, fileId, sealed, expectedPrefix, false);
     }
 
     static Messages.LookupFileResp assertSealedDescriptorConsistent(MiniCluster cluster,
@@ -335,6 +348,56 @@ final class ConsistencyVerifier {
         }
         assertEquals(sealedLength, out.size(),
                 "client-visible sealed length must match metadata descriptor length");
+    }
+
+    private static void assertReadsAtChunkOffsets(StrataClient client, StrataNamespace namespace,
+                                                  FileId fileId, Messages.LookupFileResp sealed,
+                                                  byte[] expectedBytes, boolean requireExactLength) {
+        long chunkBase = 0;
+        try (StrataFile.Reader reader = client.openById(namespace, fileId).openForRead()) {
+            for (Messages.ChunkInfo chunk : sealed.chunks()) {
+                long chunkStart = chunkBase;
+                long chunkEnd = chunkBase + chunk.length();
+                if (chunkStart < expectedBytes.length) {
+                    int headLength = (int) Math.min(32,
+                            Math.min(chunk.length(), expectedBytes.length - chunkStart));
+                    if (headLength > 0) {
+                        assertReadMatches(reader, chunkStart, headLength, expectedBytes,
+                                "chunk " + chunk.chunkId() + " base offset");
+                    }
+                    if (chunk.length() > 1) {
+                        long tailOffset = Math.min(chunkEnd - 1, expectedBytes.length - 1L);
+                        if (tailOffset > chunkStart) {
+                            assertReadMatches(reader, tailOffset, 1, expectedBytes,
+                                    "chunk " + chunk.chunkId() + " tail offset");
+                        }
+                    }
+                }
+                chunkBase = chunkEnd;
+            }
+        }
+        if (requireExactLength) {
+            assertEquals(expectedBytes.length, chunkBase,
+                    "sum of recovered chunk lengths must equal expected file length");
+        } else {
+            assertTrue(chunkBase >= expectedBytes.length,
+                    "recovered descriptor length " + chunkBase
+                            + " is shorter than the acked prefix " + expectedBytes.length);
+        }
+    }
+
+    private static void assertReadMatches(StrataFile.Reader reader, long offset, int length,
+                                          byte[] expectedBytes, String context) {
+        assertTrue(offset + length <= expectedBytes.length,
+                context + " read extends beyond expected bytes at offset " + offset);
+        try (StrataFile.ReadResult result = reader.read(offset, length)) {
+            assertEquals(length, result.length(),
+                    context + " read length mismatch at offset " + offset);
+            byte[] got = new byte[length];
+            result.buffer().get(got);
+            assertArrayEquals(Arrays.copyOfRange(expectedBytes, (int) offset, (int) offset + length), got,
+                    context + " returned bytes from the wrong file offset");
+        }
     }
 
     private static void validateReplicaStat(Messages.Replica replica, Messages.ChunkInfo chunk) throws Exception {
