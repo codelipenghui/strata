@@ -21,6 +21,8 @@ import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -107,6 +109,28 @@ class CrashRecoveryTest {
         try (ChunkStore recovered = new ChunkStore(dir)) {
             assertEquals(4, recovered.stat(TEST_NS, id).localEndOffset());
         }
+    }
+
+    @Test
+    void openRecoveryForcesTruncatedLedgerAndDataBeforeReportingLength() throws Exception {
+        ChunkStore store = new ChunkStore(dir);
+        open(store);
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("aaaa".getBytes()));
+        store.append(TEST_NS, id, 1, 4, 0, ByteBuffer.wrap("bbbb".getBytes()));
+        try (FileChannel ch = FileChannel.open(dataPath(), StandardOpenOption.WRITE)) {
+            ch.truncate(ChunkFormats.DATA_START + 6);
+        }
+
+        AtomicBoolean forced = new AtomicBoolean();
+        FailureInjector.arm("format.recovery.afterOpenTruncateForce", p -> forced.set(true));
+        try {
+            try (ChunkStore recovered = new ChunkStore(dir)) {
+                assertEquals(4, recovered.stat(TEST_NS, id).localEndOffset());
+            }
+        } finally {
+            FailureInjector.reset();
+        }
+        assertTrue(forced.get(), "OPEN recovery must force the truncation before exposing the recovered length");
     }
 
     @Test
@@ -219,6 +243,53 @@ class CrashRecoveryTest {
             assertEquals(ChunkState.SEALED, stat.state());
             assertEquals(7, stat.sealedLength());
             assertArrayEquals("payload".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
+        }
+    }
+
+    @Test
+    void reclaimRetriesWhenSidecarDirFsyncFailsAfterUnlink() throws Exception {
+        byte[] payload = "payload".getBytes();
+        Path shardDir = dataPath().getParent().toAbsolutePath().normalize();
+        AtomicInteger shardForces = new AtomicInteger();
+        ChunkStore.DirectorySyncer syncer = path -> {
+            if (path.toAbsolutePath().normalize().equals(shardDir)
+                    && shardForces.incrementAndGet() == 2) {
+                throw new IOException("injected sidecar dir fsync failure");
+            }
+        };
+
+        try (ChunkStore store = new ChunkStore(dir, false, 1024, ChunkStoreConfig.DEFAULT, syncer)) {
+            open(store);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(TEST_NS, id, 1, payload.length, null);
+
+            store.reclaimSealedLedgersOnce();
+            assertEquals(0, store.sealedLedgerReclaims(),
+                    "failed sidecar dir fsync must not clear the pending reclaim");
+
+            store.reclaimSealedLedgersOnce();
+            assertEquals(1, store.sealedLedgerReclaims(),
+                    "a later reclaim round must retry the sidecar unlink durability step");
+        }
+    }
+
+    @Test
+    void retainedLedgerEndingBeforeSealLengthDoesNotOverrideDurableTrailer() throws Exception {
+        byte[] fullPayload = "aaaabbbb".getBytes();
+        byte[] sealedPayload = "aaaabb".getBytes();
+        ChunkStore store = new ChunkStore(dir); // non-fsync: stale OPEN sidecar + retained ledger remain
+        open(store);
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("aaaa".getBytes()));
+        store.append(TEST_NS, id, 1, 4, 0, ByteBuffer.wrap("bbbb".getBytes()));
+        store.seal(TEST_NS, id, 1, sealedPayload.length, null);
+
+        assertEquals(fullPayload.length, 8, "test setup sanity");
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            var stat = recovered.stat(TEST_NS, id);
+            assertEquals(ChunkState.SEALED, stat.state(),
+                    "valid trailer must win even when the retained ledger ends before the seal length");
+            assertEquals(sealedPayload.length, stat.sealedLength());
+            assertArrayEquals(sealedPayload, recovered.read(TEST_NS, id, 0, 100).bytes());
         }
     }
 

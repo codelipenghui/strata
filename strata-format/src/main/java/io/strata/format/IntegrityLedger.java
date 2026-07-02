@@ -123,6 +123,10 @@ public final class IntegrityLedger implements AutoCloseable {
         return entries.size();
     }
 
+    public long lastEndOffset() {
+        return entries.isEmpty() ? 0 : entries.get(entries.size() - 1).endOffset();
+    }
+
     /** Entries with endOffset > fromOffset, in order. */
     public List<ChunkFormats.LedgerEntry> entriesAfter(long fromOffset) {
         List<ChunkFormats.LedgerEntry> out = new ArrayList<>();
