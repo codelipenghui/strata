@@ -326,18 +326,25 @@ final class Recovery {
      * are ignored. A byte-value held by {@code >= ackQuorum} reachable replicas is returned as a
      * {@code quorum} result (it wins outright, dropping divergent outliers, §14.6). Otherwise a single
      * CRC-valid value (no competitor) is returned as a non-quorum result only if it could still have
-     * been producer-acked — its holders plus the replicas we could not fence reach {@code ackQuorum}
-     * (issue #29); the caller then verifies that single copy against the other reachable replicas
-     * before committing it. Multiple distinct CRC-valid values (a split with no quorum) yield
-     * {@code null}, so the seal stops at the floor.
+     * been producer-acked — its holders plus the replicas we could not fence, or that claimed the
+     * range at fence time but could not be byte-verified, reach {@code ackQuorum} (issues #29/#42);
+     * the caller then verifies that single copy against the other readable replicas before committing
+     * it. Multiple distinct CRC-valid values (a split with no quorum) yield {@code null}, so the seal
+     * stops at the floor.
      */
     private Agreed agreedContinuation(ChunkId chunkId, List<ReplicaState> reachable, long from, long to,
                                       Set<Integer> validCrcs, int ackQuorum, int unreachableReplicas) {
         List<CandidateCount> counts = new ArrayList<>();
+        int unverifiedHolders = 0;
         for (ReplicaState rs : reachable) {
             if (rs.end < to) continue;
             byte[] data = readRange(chunkId, rs, from, to);
-            if (data == null || !validCrcs.contains(Crc.of(data))) {
+            if (data == null) {
+                // Null includes transient failures and short responses; both retain fence-time holder credit.
+                unverifiedHolders++;
+                continue;
+            }
+            if (!validCrcs.contains(Crc.of(data))) {
                 continue;
             }
             boolean merged = false;
@@ -354,7 +361,8 @@ final class Recovery {
                 counts.add(new CandidateCount(data));
             }
         }
-        if (counts.size() == 1 && counts.get(0).count + unreachableReplicas >= ackQuorum) {
+        if (counts.size() == 1
+                && counts.get(0).count + unreachableReplicas + unverifiedHolders >= ackQuorum) {
             return new Agreed(counts.get(0).bytes, false);
         }
         return null;
