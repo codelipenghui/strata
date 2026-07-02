@@ -10,8 +10,11 @@ import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -84,7 +87,9 @@ class NamespaceLogBackendReacquireOnFenceTest {
             assertEquals(FileId.of(0), owner.createFileOwnerAssigned(template("/a", 1)));
 
             fileStore.failNextAppendAfterWritingFrame();
-            assertScpInternal(thrownBy(() -> owner.createFileOwnerAssigned(template("/b", 2))));
+            ScpException failedAppend = assertThrows(ScpException.class,
+                    () -> owner.createFileOwnerAssigned(template("/b", 2)));
+            assertEquals(ErrorCode.INTERNAL, failedAppend.code());
 
             FileId retried = owner.createFileOwnerAssigned(template("/b", 2));
             assertEquals(FileId.of(1), retried,
@@ -100,23 +105,160 @@ class NamespaceLogBackendReacquireOnFenceTest {
         }
     }
 
-    private static void assertScpInternal(Throwable t) {
-        assertTrue(t instanceof ScpException se && se.code() == ErrorCode.INTERNAL,
-                "expected INTERNAL ScpException, got " + t);
-    }
+    @Test
+    void poisonedRepoStillServesLastAppliedReadsUntilNextMutationReAcquires() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            DurablyFailingFileStore fileStore = new DurablyFailingFileStore();
+            NamespaceLogBackend owner = new NamespaceLogBackend(root, fileStore, false);
 
-    private static Throwable thrownBy(ThrowingRunnable runnable) {
-        try {
-            runnable.run();
-            return null;
-        } catch (Throwable t) {
-            return t;
+            FileId id0 = owner.createFileOwnerAssigned(template("/a", 1));
+            assertEquals(FileId.of(0), id0);
+
+            fileStore.failNextAppendAfterWritingFrame();
+            ScpException failedAppend = assertThrows(ScpException.class,
+                    () -> owner.createFileOwnerAssigned(template("/b", 2)));
+            assertEquals(ErrorCode.INTERNAL, failedAppend.code());
+
+            assertTrue(owner.getFile(NS, id0).isPresent(), "reads serve the last-applied state");
+            assertEquals(List.of(id0), owner.listFiles(NS));
+            assertEquals(List.of(id0), owner.listFileIds(NS));
+            assertEquals(id0, owner.resolvePath(NS, StrataPath.of("/a")).orElseThrow());
+            assertTrue(owner.listNamespaces().contains(NS),
+                    "one poisoned cached repo must not break namespace enumeration");
+
+            FileId retried = owner.createFileOwnerAssigned(template("/b", 2));
+            assertEquals(FileId.of(1), retried);
+            assertTrue(owner.getFile(NS, retried).isPresent(),
+                    "the next mutation re-acquires and recovers the durable failed append");
         }
     }
 
-    @FunctionalInterface
-    private interface ThrowingRunnable {
-        void run() throws Exception;
+    @Test
+    void compactionSkipsPoisonedRepoUntilMutationReAcquiresDurableTail() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            DurablyFailingFileStore fileStore = new DurablyFailingFileStore();
+            NamespaceLogBackend owner = new NamespaceLogBackend(root, fileStore, false);
+
+            assertEquals(FileId.of(0), owner.createFileOwnerAssigned(template("/a", 1)));
+
+            fileStore.failNextAppendAfterWritingFrame();
+            ScpException failedAppend = assertThrows(ScpException.class,
+                    () -> owner.createFileOwnerAssigned(template("/b", 2)));
+            assertEquals(ErrorCode.INTERNAL, failedAppend.code());
+
+            assertEquals(0, owner.compactOversizedRepos(1),
+                    "a poisoned repo must not compact a stale appliedOffset cut");
+
+            FileId id2 = owner.createFileOwnerAssigned(template("/c", 3));
+            assertEquals(FileId.of(2), id2,
+                    "re-acquire must recover /b before assigning the next id to /c");
+            assertTrue(owner.getFile(NS, FileId.of(1)).isPresent(),
+                    "the durable-but-unacked /b frame must survive until re-acquire");
+        }
+    }
+
+    @Test
+    void inFlightCompactionAbortsWhenRepoIsPoisonedBeforePublish() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            DurablyFailingFileStore fileStore = new DurablyFailingFileStore();
+            NamespaceLogCowCompactionTest.BlockingSnapshotFileStore blocking =
+                    new NamespaceLogCowCompactionTest.BlockingSnapshotFileStore(fileStore);
+            NamespaceLogBackend owner = new NamespaceLogBackend(root, blocking, false);
+
+            assertEquals(FileId.of(0), owner.createFileOwnerAssigned(template("/a", 1)));
+            blocking.armed = true;
+
+            CompletableFuture<Integer> compaction = CompletableFuture.supplyAsync(() ->
+                    sup(() -> owner.compactOversizedRepos(1)));
+            try {
+                assertTrue(blocking.entered.await(2, TimeUnit.SECONDS), "compaction parked off-lock");
+
+                fileStore.failNextAppendAfterWritingFrame();
+                ScpException failedAppend = assertThrows(ScpException.class,
+                        () -> owner.createFileOwnerAssigned(template("/b", 2)));
+                assertEquals(ErrorCode.INTERNAL, failedAppend.code());
+            } finally {
+                blocking.block.countDown();
+            }
+
+            assertEquals(0, (int) compaction.get(5, TimeUnit.SECONDS),
+                    "in-flight compaction must abort rather than publish a stale cut");
+            FileId id2 = owner.createFileOwnerAssigned(template("/c", 3));
+            assertEquals(FileId.of(2), id2,
+                    "re-acquire must recover /b before assigning the next id to /c");
+            assertTrue(owner.getFile(NS, FileId.of(1)).isPresent(),
+                    "the durable-but-unacked /b frame must survive the aborted compaction");
+        }
+    }
+
+    @Test
+    void tombstoneSweepReAcquiresPoisonedRepoAndDoesNotWedge() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            DurablyFailingFileStore fileStore = new DurablyFailingFileStore();
+            NamespaceLogBackend owner = new NamespaceLogBackend(root, fileStore, false);
+
+            FileId id0 = owner.createFileOwnerAssigned(template("/a", 1));
+            int version = owner.getFile(NS, id0).orElseThrow().version();
+            assertTrue(owner.deleteFile(NS, id0, version));
+
+            fileStore.failNextAppendAfterWritingFrame();
+            ScpException failedAppend = assertThrows(ScpException.class,
+                    () -> owner.createFileOwnerAssigned(template("/b", 2)));
+            assertEquals(ErrorCode.INTERNAL, failedAppend.code());
+
+            assertEquals(1, owner.sweepOwnedNamespaceTombstones(0),
+                    "sweep must re-acquire before appending TombstoneSwept on a poisoned repo");
+            FileId id2 = owner.createFileOwnerAssigned(template("/c", 3));
+            assertEquals(FileId.of(2), id2,
+                    "sweep recovery must preserve the durable-but-unacked /b frame");
+        }
+    }
+
+    @Test
+    void failedReAcquireRestoresPoisonedRepoSoOwnerChangesStayStable() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            DurablyFailingFileStore fileStore = new DurablyFailingFileStore();
+            NamespaceLogBackend owner = new NamespaceLogBackend(root, fileStore, false);
+
+            assertEquals(FileId.of(0), owner.createFileOwnerAssigned(template("/a", 1)));
+
+            fileStore.failNextAppendAfterWritingFrame();
+            ScpException failedAppend = assertThrows(ScpException.class,
+                    () -> owner.createFileOwnerAssigned(template("/b", 2)));
+            assertEquals(ErrorCode.INTERNAL, failedAppend.code());
+
+            fileStore.failNextReadLog();
+            ScpException failedReAcquire = assertThrows(ScpException.class,
+                    () -> owner.createFileOwnerAssigned(template("/c", 3)));
+            assertEquals(ErrorCode.INTERNAL, failedReAcquire.code());
+
+            FileId id2 = owner.createFileOwnerAssigned(template("/c", 3));
+            assertEquals(FileId.of(2), id2,
+                    "the second re-acquire must recover /b before assigning /c");
+
+            long[] stats = owner.metrics().stats().get(NS.value());
+            assertEquals(1, stats[NamespaceLogMetrics.OWNER_CHANGES],
+                    "a failed re-acquire must not turn the next successful open into a phantom owner change");
+            assertTrue(stats[NamespaceLogMetrics.REACQUISITIONS] >= 2,
+                    "both re-acquire attempts are counted as churn, not owner handoffs");
+        }
+    }
+
+    private interface ThrowingSupplier<T> {
+        T get() throws Exception;
+    }
+
+    private static <T> T sup(ThrowingSupplier<T> s) {
+        try {
+            return s.get();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private static Records.FileRecord template(String path, long opId) {
@@ -130,13 +272,12 @@ class NamespaceLogBackendReacquireOnFenceTest {
      * Strata data plane fences a deposed meta-log writer. Reads are never fenced (recovery must still read
      * the superseded tail).
      */
-    private static final class FenceStaleLogFileStore implements NamespaceMetadataFileStore {
-        private final TestNamespaceMetadataFileStore delegate = new TestNamespaceMetadataFileStore();
+    private static final class FenceStaleLogFileStore extends TestNamespaceMetadataFileStore {
         private volatile FileId latestLog;
 
         @Override
         public FileId createLogFile(StrataNamespace ns, long generation) throws Exception {
-            FileId id = delegate.createLogFile(ns, generation);
+            FileId id = super.createLogFile(ns, generation);
             latestLog = id;
             return id;
         }
@@ -147,27 +288,7 @@ class NamespaceLogBackendReacquireOnFenceTest {
                 throw new ScpException(ErrorCode.FENCED_EPOCH,
                         "FENCED_EPOCH: stale meta-log writer " + logFileId + " superseded by " + latestLog);
             }
-            delegate.appendLog(logFileId, frameBytes);
-        }
-
-        @Override
-        public byte[] readLog(FileId logFileId) throws Exception {
-            return delegate.readLog(logFileId);
-        }
-
-        @Override
-        public FileId writeSnapshot(StrataNamespace ns, long generation, byte[] snapshotBytes) throws Exception {
-            return delegate.writeSnapshot(ns, generation, snapshotBytes);
-        }
-
-        @Override
-        public byte[] readSnapshot(FileId snapshotFileId) throws Exception {
-            return delegate.readSnapshot(snapshotFileId);
-        }
-
-        @Override
-        public void deleteFile(FileId fileId) throws Exception {
-            delegate.deleteFile(fileId);
+            super.appendLog(logFileId, frameBytes);
         }
     }
 
@@ -176,9 +297,9 @@ class NamespaceLogBackendReacquireOnFenceTest {
      * already be durable, but the appender returns INTERNAL and every later append to the same log repeats
      * that death cause until recovery reads/seals the log.
      */
-    private static final class DurablyFailingFileStore implements NamespaceMetadataFileStore {
-        private final TestNamespaceMetadataFileStore delegate = new TestNamespaceMetadataFileStore();
+    private static final class DurablyFailingFileStore extends TestNamespaceMetadataFileStore {
         private boolean failNextAppendAfterWritingFrame;
+        private boolean failNextReadLog;
         private FileId deadLog;
         private ScpException deathCause;
 
@@ -186,9 +307,8 @@ class NamespaceLogBackendReacquireOnFenceTest {
             failNextAppendAfterWritingFrame = true;
         }
 
-        @Override
-        public FileId createLogFile(StrataNamespace ns, long generation) throws Exception {
-            return delegate.createLogFile(ns, generation);
+        void failNextReadLog() {
+            failNextReadLog = true;
         }
 
         @Override
@@ -198,36 +318,25 @@ class NamespaceLogBackendReacquireOnFenceTest {
             }
             if (failNextAppendAfterWritingFrame) {
                 failNextAppendAfterWritingFrame = false;
-                delegate.appendLog(logFileId, frameBytes);
+                super.appendLog(logFileId, frameBytes);
                 deadLog = logFileId;
                 deathCause = new ScpException(ErrorCode.INTERNAL, "quorum lost injected");
                 throw deathCause;
             }
-            delegate.appendLog(logFileId, frameBytes);
+            super.appendLog(logFileId, frameBytes);
         }
 
         @Override
         public synchronized byte[] readLog(FileId logFileId) throws Exception {
+            if (failNextReadLog) {
+                failNextReadLog = false;
+                throw new ScpException(ErrorCode.INTERNAL, "readLog injected");
+            }
             if (logFileId.equals(deadLog)) {
                 deadLog = null;
                 deathCause = null;
             }
-            return delegate.readLog(logFileId);
-        }
-
-        @Override
-        public FileId writeSnapshot(StrataNamespace ns, long generation, byte[] snapshotBytes) throws Exception {
-            return delegate.writeSnapshot(ns, generation, snapshotBytes);
-        }
-
-        @Override
-        public byte[] readSnapshot(FileId snapshotFileId) throws Exception {
-            return delegate.readSnapshot(snapshotFileId);
-        }
-
-        @Override
-        public void deleteFile(FileId fileId) throws Exception {
-            delegate.deleteFile(fileId);
+            return super.readLog(logFileId);
         }
     }
 }

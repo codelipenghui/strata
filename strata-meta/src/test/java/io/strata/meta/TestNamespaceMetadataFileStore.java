@@ -12,38 +12,38 @@ import java.util.concurrent.atomic.AtomicLong;
  * In-memory {@link NamespaceMetadataFileStore} for tests (design §8 "TestNamespaceMetadataFileStore"):
  * a deterministic backend for recovery and append-ordering validation, with no Strata data nodes.
  */
-final class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore {
+class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore {
     private final Map<FileId, ByteArrayOutputStream> logs = new ConcurrentHashMap<>();
     private final Map<FileId, byte[]> snapshots = new ConcurrentHashMap<>();
     private final AtomicLong ids = new AtomicLong(1);
 
     @Override
-    public FileId createLogFile(StrataNamespace ns, long generation) {
+    public FileId createLogFile(StrataNamespace ns, long generation) throws Exception {
         FileId id = nextId();
         logs.put(id, new ByteArrayOutputStream());
         return id;
     }
 
     @Override
-    public synchronized void appendLog(FileId logFileId, byte[] frameBytes) {
+    public synchronized void appendLog(FileId logFileId, byte[] frameBytes) throws Exception {
         logs.computeIfAbsent(logFileId, k -> new ByteArrayOutputStream()).writeBytes(frameBytes);
     }
 
     @Override
-    public synchronized byte[] readLog(FileId logFileId) {
+    public synchronized byte[] readLog(FileId logFileId) throws Exception {
         ByteArrayOutputStream b = logs.get(logFileId);
         return b == null ? new byte[0] : b.toByteArray();
     }
 
     @Override
-    public FileId writeSnapshot(StrataNamespace ns, long generation, byte[] snapshotBytes) {
+    public FileId writeSnapshot(StrataNamespace ns, long generation, byte[] snapshotBytes) throws Exception {
         FileId id = nextId();
         snapshots.put(id, snapshotBytes.clone());
         return id;
     }
 
     @Override
-    public byte[] readSnapshot(FileId snapshotFileId) {
+    public byte[] readSnapshot(FileId snapshotFileId) throws Exception {
         byte[] b = snapshots.get(snapshotFileId);
         if (b == null) {
             throw new IllegalStateException("no snapshot file " + snapshotFileId);
@@ -52,7 +52,7 @@ final class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore
     }
 
     @Override
-    public void deleteFile(FileId fileId) {
+    public void deleteFile(FileId fileId) throws Exception {
         logs.remove(fileId);
         snapshots.remove(fileId);
     }
