@@ -817,6 +817,8 @@ class RepairCoordinator implements AutoCloseable {
                 execDelete(node, chunkId, ns);
             }
         } else if (r.length() != exp.length() || r.crc() != exp.crc()) {
+            // Corrupt sealed bytes are still protected by the store's digest check, so honor grace
+            // before delete; immediate delete could let one bogus verdict destroy the last live copy.
             if (replicaUnhealthyPastGrace(key, now)) {
                 replicaMissingSince.remove(key);
                 log.warn("verify: node {} holds corrupt sealed chunk {} (len {}/{} crc {}/{}, >= {}ms) "

@@ -724,7 +724,9 @@ class RepairCoordinatorTest {
             List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
             assertEquals(List.of(c.nodeId()), replicas,
                     "the final live replica is kept even though the pass began with three corrupt verdicts");
-            assertEquals(List.of(a.nodeId(), b.nodeId()), deletes,
+            assertEquals(2, deletes.size(), "only two replicas should be physically deleted");
+            assertFalse(deletes.contains(c.nodeId()), "the last live replica must not be physically deleted");
+            assertEquals(new TreeSet<>(List.of(a.nodeId(), b.nodeId())), new TreeSet<>(deletes),
                     "only replicas with a replacement survivor should be physically deleted");
         }
     }
