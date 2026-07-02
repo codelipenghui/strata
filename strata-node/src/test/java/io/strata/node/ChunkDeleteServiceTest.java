@@ -8,8 +8,11 @@ import io.strata.format.ChunkStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
@@ -113,15 +116,15 @@ class ChunkDeleteServiceTest {
     }
 
     @SuppressWarnings("unchecked")
-    private static java.util.Set<Object> creatingSet(ChunkStore store) throws Exception {
-        java.lang.reflect.Field field = ChunkStore.class.getDeclaredField("creating");
+    private static Set<Object> creatingSet(ChunkStore store) throws Exception {
+        Field field = ChunkStore.class.getDeclaredField("creating");
         field.setAccessible(true);
-        return (java.util.Set<Object>) field.get(store);
+        return (Set<Object>) field.get(store);
     }
 
     private static Object newNsChunkId(ChunkId id) throws Exception {
         Class<?> type = Class.forName("io.strata.common.NsChunkId");
-        java.lang.reflect.Constructor<?> ctor =
+        Constructor<?> ctor =
                 type.getDeclaredConstructor(StrataNamespace.class, ChunkId.class);
         ctor.setAccessible(true);
         return ctor.newInstance(NS, id);

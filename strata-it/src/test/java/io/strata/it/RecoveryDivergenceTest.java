@@ -3,6 +3,8 @@ package io.strata.it;
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
+import io.strata.common.ChunkState;
+import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
@@ -39,7 +41,7 @@ class RecoveryDivergenceTest {
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
                 var lookup = Messages.LookupFileResp.decode(meta.call(Opcode.LOOKUP_FILE,
                         new Messages.LookupFile(StrataNamespace.of("test"), setup.fileId()).encode(), null, 5000));
-                assertEquals(io.strata.common.ChunkState.SEALED, lookup.chunks().get(0).state());
+                assertEquals(ChunkState.SEALED, lookup.chunks().get(0).state());
                 assertEquals(2, lookup.chunks().get(0).replicas().size(),
                         "metadata must retain only the agreeing seal quorum");
             }
@@ -69,7 +71,7 @@ class RecoveryDivergenceTest {
             try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
                 var lookup = Messages.LookupFileResp.decode(meta.call(Opcode.LOOKUP_FILE,
                         new Messages.LookupFile(StrataNamespace.of("test"), setup.fileId()).encode(), null, 5000));
-                assertEquals(io.strata.common.ChunkState.SEALED, lookup.chunks().get(0).state());
+                assertEquals(ChunkState.SEALED, lookup.chunks().get(0).state());
                 assertEquals(0, lookup.chunks().get(0).length());
             }
         }
@@ -88,13 +90,13 @@ class RecoveryDivergenceTest {
         }
     }
 
-    private record OpenChunkSetup(io.strata.common.FileId fileId, Messages.CreateChunkResp chunk) {}
+    private record OpenChunkSetup(FileId fileId, Messages.CreateChunkResp chunk) {}
 
     private static OpenChunkSetup createOpenChunkWithReplicaPayloads(MiniCluster cluster, String path,
                                                                     List<byte[]> payloads) throws Exception {
         String[] hp = cluster.metaEndpoint().split(":");
         Messages.CreateChunkResp chunk;
-        io.strata.common.FileId fileId;
+        FileId fileId;
         try (ScpClient meta = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "t")) {
             var file = Messages.CreateFileResp.decode(meta.call(Opcode.CREATE_FILE,
                     new Messages.CreateFile("test", path).encode(), null, 5000));

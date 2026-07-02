@@ -3,8 +3,8 @@ package io.strata.client;
 import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
-import io.strata.common.StrataNamespace;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Frame;
 import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.Messages;
@@ -18,10 +18,12 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -88,7 +90,7 @@ class AppenderImplTest {
         Object staleSession = chunkSession();
 
         onReplicaResponse(appender, staleSession, null,
-                new java.util.concurrent.CompletionException(
+                new CompletionException(
                         new ScpException(ErrorCode.FENCED_EPOCH, "stale fenced", 21)));
 
         ScpException e = assertThrows(ScpException.class,
@@ -103,8 +105,8 @@ class AppenderImplTest {
         Object staleSession = chunkSession();
 
         onReplicaResponse(appender, staleSession, null,
-                new java.util.concurrent.CompletionException(
-                        new java.util.concurrent.CompletionException(
+                new CompletionException(
+                        new CompletionException(
                                 new ScpException(ErrorCode.FENCED_EPOCH, "nested fenced", 22))));
 
         ScpException e = assertThrows(ScpException.class,
@@ -313,7 +315,7 @@ class AppenderImplTest {
         CompletableFuture<Long> ack = appender.append(ByteBuffer.allocate(0));
 
         onReplicaResponse(appender, session, 0, null,
-                new java.util.concurrent.CompletionException(
+                new CompletionException(
                         new ScpException(ErrorCode.FENCED_EPOCH, "wrapped fenced", 13)));
 
         assertTrue(ack.isCompletedExceptionally());
@@ -353,7 +355,7 @@ class AppenderImplTest {
         CompletableFuture<Long> ack = appender.append(ByteBuffer.allocate(0));
 
         onReplicaResponse(appender, session, 0, null,
-                new java.util.concurrent.CompletionException("closed", null));
+                new CompletionException("closed", null));
         assertFalse(ack.isDone());
         onReplicaResponse(appender, session, 1, appendResp(5), null);
         assertFalse(ack.isDone());
@@ -1877,7 +1879,7 @@ class AppenderImplTest {
         assertNotNull(sealedReplicas);
         assertTrue(sealedReplicas.size() >= Messages.WritePolicy.DEFAULT.ackQuorum());
         assertTrue(sealedReplicas.size() <= Messages.WritePolicy.DEFAULT.replicationFactor());
-        assertEquals(sealedReplicas.size(), new java.util.HashSet<>(sealedReplicas).size());
+        assertEquals(sealedReplicas.size(), new HashSet<>(sealedReplicas).size());
         assertTrue(List.of(1, 2, 3).containsAll(sealedReplicas));
     }
 

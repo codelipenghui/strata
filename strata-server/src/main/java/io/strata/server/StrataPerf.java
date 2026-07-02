@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -27,6 +28,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -178,7 +180,7 @@ final class StrataPerf {
         LongAdder filesDeleted = new LongAdder();
         AtomicInteger activeWriters = new AtomicInteger(config.files());
         AtomicInteger fileSeq = new AtomicInteger();
-        List<PerfFile> cleanupFiles = java.util.Collections.synchronizedList(new ArrayList<>());
+        List<PerfFile> cleanupFiles = Collections.synchronizedList(new ArrayList<>());
 
         logReaderDistribution(lanes);
         Thread writeReporter = startReporter(writeStats, config.recordSize(), "write");
@@ -560,7 +562,7 @@ final class StrataPerf {
             file.completed.get(30, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-        } catch (ExecutionException | java.util.concurrent.TimeoutException ignored) {
+        } catch (ExecutionException | TimeoutException ignored) {
         }
     }
 

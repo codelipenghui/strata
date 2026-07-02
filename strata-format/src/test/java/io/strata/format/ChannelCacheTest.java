@@ -7,6 +7,7 @@ import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
@@ -229,7 +230,7 @@ class ChannelCacheTest {
     @Test
     void acquireMissingFileThrows() {
         try (ChannelCache cache = new ChannelCache(4)) {
-            assertThrows(java.io.IOException.class,
+            assertThrows(IOException.class,
                     () -> cache.acquire(id(99), dir.resolve("nope.chunk")));
         }
     }

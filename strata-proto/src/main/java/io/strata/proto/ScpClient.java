@@ -10,6 +10,8 @@ import io.netty.channel.ChannelOption;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.util.concurrent.ScheduledFuture;
+import io.strata.common.ConnectionPolicy;
 import io.strata.common.EnvConfig;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
@@ -51,7 +53,7 @@ public final class ScpClient implements AutoCloseable {
     private final Messages.HelloResp serverHello;
 
     public ScpClient(String host, int port, byte clientKind, String clientId) throws IOException {
-        this(host, port, clientKind, clientId, io.strata.common.ConnectionPolicy.DEFAULT.connectTimeoutMs());
+        this(host, port, clientKind, clientId, ConnectionPolicy.DEFAULT.connectTimeoutMs());
     }
 
     public ScpClient(String host, int port, byte clientKind, String clientId, int connectTimeoutMs) throws IOException {
@@ -297,7 +299,7 @@ public final class ScpClient implements AutoCloseable {
         // scheduled then immediately cancelled) that single delay-queue heap is a top CPU cost
         // (schedule + heap-remove per request, ~135k/s); per-event-loop timers spread the load
         // across the I/O threads and Netty's scheduled-task cancellation is cheap.
-        io.netty.util.concurrent.ScheduledFuture<?> deadline = channel.eventLoop().schedule(
+        ScheduledFuture<?> deadline = channel.eventLoop().schedule(
                 () -> fut.completeExceptionally(new TimeoutException("timed out after " + timeoutMs + "ms")),
                 timeoutMs, TimeUnit.MILLISECONDS);
         fut.whenComplete((frame, err) -> {

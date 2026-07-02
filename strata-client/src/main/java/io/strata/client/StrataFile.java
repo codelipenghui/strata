@@ -1,6 +1,8 @@
 package io.strata.client;
 
+import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 
@@ -68,8 +70,8 @@ public interface StrataFile {
                 } catch (RuntimeException e) {
                     throw e;
                 } catch (Exception e) {
-                    throw new io.strata.common.ScpException(
-                            io.strata.common.ErrorCode.INTERNAL, "failed to release read buffer: " + e);
+                    throw new ScpException(
+                            ErrorCode.INTERNAL, "failed to release read buffer: " + e);
                 }
             }
         }

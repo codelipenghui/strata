@@ -13,6 +13,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
+import java.nio.ReadOnlyBufferException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -221,7 +222,7 @@ class ProtocolCoverageTest {
     void smallFrameAndBufferHelpers() throws Exception {
         Frame request = Frame.request(Opcode.PING, Messages.okHeader(), null, 11);
         assertFalse(request.isResponse());
-        assertThrows(java.nio.ReadOnlyBufferException.class, () -> request.headerSlice().put((byte) 0));
+        assertThrows(ReadOnlyBufferException.class, () -> request.headerSlice().put((byte) 0));
         Frame response = Frame.response(request, Messages.okHeader(), null);
         assertTrue(response.isResponse());
         Frame nullHeader = Frame.request(Opcode.PING, null, null, 12);
@@ -240,9 +241,9 @@ class ProtocolCoverageTest {
         w.u8(1).u16(2);
         assertEquals(3, w.size());
 
-        ExecutionException wrapped = new ExecutionException(new java.util.concurrent.TimeoutException());
+        ExecutionException wrapped = new ExecutionException(new TimeoutException());
         // This future shape is what CompletableFuture#get produces for timed pipelined calls.
-        assertEquals(java.util.concurrent.TimeoutException.class, wrapped.getCause().getClass());
+        assertEquals(TimeoutException.class, wrapped.getCause().getClass());
     }
 
     private static void assertFrameReadFails(byte[] wire, String messageFragment) {

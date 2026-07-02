@@ -2,8 +2,10 @@ package io.strata.client;
 
 import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
+import io.strata.common.FileId;
 import io.strata.common.FileState;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Frame;
 import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.Messages;
@@ -26,14 +28,14 @@ final class ReaderImpl implements StrataFile.Reader {
     private final ControllerClient controller;
     private final NodePool pool;
     private final ClientConfig config;
-    private final io.strata.common.FileId fileId;
-    private final io.strata.common.StrataNamespace namespace;
+    private final FileId fileId;
+    private final StrataNamespace namespace;
     private final Map<String, ManagedScpConnection> pinnedConnections = new ConcurrentHashMap<>();
 
     private volatile Messages.LookupFileResp file;
 
-    ReaderImpl(ControllerClient controller, NodePool pool, ClientConfig config, io.strata.common.FileId fileId,
-               io.strata.common.StrataNamespace namespace) {
+    ReaderImpl(ControllerClient controller, NodePool pool, ClientConfig config, FileId fileId,
+               StrataNamespace namespace) {
         this.controller = controller;
         this.pool = pool;
         this.config = config;
@@ -117,7 +119,7 @@ final class ReaderImpl implements StrataFile.Reader {
                     continue;
                 }
                 if (!open && resp.localEndOffset() < chunk.length()) {
-                    last = new ScpException(io.strata.common.ErrorCode.CORRUPT_CHUNK,
+                    last = new ScpException(ErrorCode.CORRUPT_CHUNK,
                             "replica " + r.nodeId() + " short for sealed chunk " + chunk.chunkId()
                                     + ": " + resp.localEndOffset() + " < " + chunk.length());
                     continue;

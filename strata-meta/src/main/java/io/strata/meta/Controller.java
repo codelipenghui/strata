@@ -8,9 +8,12 @@ import io.strata.common.FileId;
 import io.strata.common.FileState;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
+import io.strata.proto.RequestContext;
+import io.strata.proto.RequestObserver;
 import io.strata.proto.ScpServer;
 import org.apache.curator.framework.recipes.leader.LeaderLatch;
 import org.apache.zookeeper.KeeperException;
@@ -20,11 +23,14 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.BiFunction;
+import java.util.function.UnaryOperator;
 
 /**
  * Controller (tech design §4): the metadata plane — a ZooKeeper-backed MetadataStore behind the SCP
@@ -304,11 +310,11 @@ public final class Controller implements AutoCloseable {
      * openLogBytes]}. Empty under the ZK backend. For the per-namespace dashboard panels (namespace-
      * stacked) — cardinality grows with the namespace count, so it is namespace-log + control-plane only.
      */
-    public java.util.Map<String, long[]> namespaceStats() {
+    public Map<String, long[]> namespaceStats() {
         if (!(store instanceof NamespaceLogMetadataStore log)) {
-            return java.util.Map.of();
+            return Map.of();
         }
-        java.util.Map<String, long[]> out = new java.util.HashMap<>();
+        Map<String, long[]> out = new HashMap<>();
         log.namespaceStats().forEach((ns, stat) -> out.put(ns.value(), stat));
         return out;
     }
@@ -320,14 +326,14 @@ public final class Controller implements AutoCloseable {
      * ownerChanges]. Drives the per-namespace write-log / read-log / compaction / owner-change panels;
      * the global controller view is {@code sum without(namespace)}.
      */
-    public java.util.Map<String, long[]> namespaceLogStats() {
-        return store instanceof NamespaceLogMetadataStore log ? log.metrics().stats() : java.util.Map.of();
+    public Map<String, long[]> namespaceLogStats() {
+        return store instanceof NamespaceLogMetadataStore log ? log.metrics().stats() : Map.of();
     }
 
     /** Namespaces this controller has namespace-log activity for — drives lazy per-namespace meter
      *  registration without a snapshot allocation; empty under the ZK backend. */
-    public java.util.Set<String> namespaceLogNamespaces() {
-        return store instanceof NamespaceLogMetadataStore log ? log.metrics().namespaces() : java.util.Set.of();
+    public Set<String> namespaceLogNamespaces() {
+        return store instanceof NamespaceLogMetadataStore log ? log.metrics().namespaces() : Set.of();
     }
 
     /** One per-namespace namespace-log counter by index (see {@link #namespaceLogStats}); 0 under ZK or if
@@ -403,7 +409,7 @@ public final class Controller implements AutoCloseable {
     }
 
     /** Installs a per-request latency observer on the control-plane server (used by the metrics layer). */
-    public void setRequestObserver(io.strata.proto.RequestObserver observer) {
+    public void setRequestObserver(RequestObserver observer) {
         if (server != null) {  // embedded mode: requests are observed on the host node's server
             server.setRequestObserver(observer);
         }
@@ -450,7 +456,7 @@ public final class Controller implements AutoCloseable {
      */
     private void requireNamespaceOwner(StrataNamespace namespace) {
         // Tag this request's metrics with its namespace (read back by ScpServer's request observer).
-        io.strata.proto.RequestContext.setNamespace(namespace.value());
+        RequestContext.setNamespace(namespace.value());
         if (NamespaceLogBackend.isSystem(namespace)) {
             // Metadata-log system files live in the shared ZK root (CAS-guarded), so any node may serve
             // them — a non-controller owner writes its own namespace's metadata-log files here.
@@ -913,8 +919,8 @@ public final class Controller implements AutoCloseable {
                 file.state().value, chunks);
     }
 
-    private FileId lookupPath(io.strata.common.StrataNamespace namespace,
-                              io.strata.common.StrataPath path) throws Exception {
+    private FileId lookupPath(StrataNamespace namespace,
+                              StrataPath path) throws Exception {
         var id = store.resolvePath(namespace, path);
         if (id.isEmpty()) {
             throw new ScpException(ErrorCode.FILE_NOT_FOUND, namespace + ":" + path);
@@ -931,7 +937,7 @@ public final class Controller implements AutoCloseable {
     }
 
     private void mutateFile(StrataNamespace namespace, FileId id,
-                            java.util.function.UnaryOperator<Records.FileRecord> fn) throws Exception {
+                            UnaryOperator<Records.FileRecord> fn) throws Exception {
         for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
             var opt = getFile(namespace, id);
             if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, id.toString());

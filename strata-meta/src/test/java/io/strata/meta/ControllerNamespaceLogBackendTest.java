@@ -1,5 +1,6 @@
 package io.strata.meta;
 
+import io.strata.common.ErrorCode;
 import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -7,6 +8,7 @@ import io.strata.proto.ScpClient;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.function.BiFunction;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -45,8 +47,8 @@ class ControllerNamespaceLogBackendTest {
                 assertEquals(created.fileId(), byPath.fileId());
 
                 var codes = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
-                        new Messages.DeleteFiles(StrataNamespace.of("tenant-a"), java.util.List.of(created.fileId())).encode(), null, 5_000));
-                assertEquals(io.strata.common.ErrorCode.OK.code, codes.codes().get(0));
+                        new Messages.DeleteFiles(StrataNamespace.of("tenant-a"), List.of(created.fileId())).encode(), null, 5_000));
+                assertEquals(ErrorCode.OK.code, codes.codes().get(0));
             }
         }
     }

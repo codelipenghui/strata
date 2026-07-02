@@ -1,12 +1,16 @@
 package io.strata.meta;
 
-import io.strata.common.FileState;
+import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
+import io.strata.common.FileState;
+import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 import io.strata.proto.BufWriter;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -58,8 +62,8 @@ class RecordsTest {
         Records.FileRecord record = new Records.FileRecord(fileId, "test", "/test-file",
                 3, 2, true, FileState.OPEN, 1234, List.of(chunk), 11, 22);
 
-        assertEquals(new io.strata.common.ChunkId(fileId, 3), record.chunkId(3));
-        assertEquals(io.strata.common.StrataNamespace.of("test"), record.namespace());
+        assertEquals(new ChunkId(fileId, 3), record.chunkId(3));
+        assertEquals(StrataNamespace.of("test"), record.namespace());
         assertEquals(3, record.replicationFactor());
         assertEquals(2, record.ackQuorum());
         assertTrue(record.fsyncOnAck());
@@ -70,25 +74,25 @@ class RecordsTest {
         assertEquals(0, record.withChunks(List.of()).chunks().size());
         assertEquals(5, record.withChunks(List.of()).writerEpoch());
         assertEquals(6, record.withWriterEpoch(6).writerEpoch());
-        Records.FileRecord typed = new Records.FileRecord(fileId, io.strata.common.StrataNamespace.of("typed"),
-                io.strata.common.StrataPath.of("/typed-file"), 3, 2, false,
+        Records.FileRecord typed = new Records.FileRecord(fileId, StrataNamespace.of("typed"),
+                StrataPath.of("/typed-file"), 3, 2, false,
                 FileState.OPEN, 1234, List.of());
         assertTrue(typed.createdBy(0, 0));
-        assertEquals(io.strata.common.StrataPath.of("/typed-file"), typed.path());
+        assertEquals(StrataPath.of("/typed-file"), typed.path());
         assertEquals(record, Records.FileRecord.decode(record.encode()));
         assertThrows(IllegalArgumentException.class,
-                () -> new Records.FileRecord(fileId, io.strata.common.StrataNamespace.of("test"),
-                        io.strata.common.StrataPath.of("/bad-negative-writer-epoch"),
+                () -> new Records.FileRecord(fileId, StrataNamespace.of("test"),
+                        StrataPath.of("/bad-negative-writer-epoch"),
                         3, 2, false, -1, FileState.OPEN, 1234,
                         List.of(), 0, 0));
         assertThrows(IllegalArgumentException.class,
-                () -> new Records.FileRecord(fileId, io.strata.common.StrataNamespace.of("test"),
-                        io.strata.common.StrataPath.of("/bad-stale-writer-epoch"),
+                () -> new Records.FileRecord(fileId, StrataNamespace.of("test"),
+                        StrataPath.of("/bad-stale-writer-epoch"),
                         3, 2, false, 4, FileState.OPEN, 1234,
                         List.of(chunk), 0, 0));
         assertThrows(IllegalArgumentException.class,
-                () -> new Records.FileRecord(fileId, io.strata.common.StrataNamespace.of("test"),
-                        io.strata.common.StrataPath.of("/bad-non-intersecting-quorum"),
+                () -> new Records.FileRecord(fileId, StrataNamespace.of("test"),
+                        StrataPath.of("/bad-non-intersecting-quorum"),
                         4, 2, false, FileState.OPEN, 1234,
                         List.of()));
 
@@ -177,7 +181,7 @@ class RecordsTest {
         Records.FileRecord record = new Records.FileRecord(FileId.of(1), "test", "/pre-envelope",
                 3, 2, false, FileState.OPEN, 1234, List.of());
         byte[] enveloped = record.encode();
-        byte[] preEnvelope = java.util.Arrays.copyOf(enveloped, enveloped.length - 4); // strip CRC = old format
+        byte[] preEnvelope = Arrays.copyOf(enveloped, enveloped.length - 4); // strip CRC = old format
         assertThrows(IllegalArgumentException.class, () -> Records.FileRecord.decode(preEnvelope));
     }
 

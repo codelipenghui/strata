@@ -3,6 +3,7 @@ package io.strata.it;
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
+import io.strata.common.ChunkId;
 import io.strata.common.FileId;
 import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
@@ -85,7 +86,7 @@ class FsyncEndToEndTest {
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
     }
 
-    private byte[] fetchHeader(String endpoint, io.strata.common.ChunkId chunkId) throws Exception {
+    private byte[] fetchHeader(String endpoint, ChunkId chunkId) throws Exception {
         String[] hp = endpoint.split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "hdr")) {
             var frame = direct.callFrame(Opcode.FETCH_CHUNK,

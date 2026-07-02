@@ -17,8 +17,10 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -30,6 +32,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
 
 /**
  * The repair coordinator (tech design §7.2, §9): a periodic reconciliation scan is the single
@@ -78,13 +83,13 @@ class RepairCoordinator implements AutoCloseable {
     private final MetadataStore store;
     private final NodeRegistry registry;
     private final ControllerConfig config;
-    private final java.util.function.BooleanSupplier isLeader;
+    private final BooleanSupplier isLeader;
     // Whether this node owns every namespace (non-sharded / single-endpoint). When false (sharded), an
     // inventory chunk whose file this node cannot see may belong to a namespace owned by another meta
     // node, so it must NOT be deleted as an orphan (design §11 single-writer safety / data-loss guard).
-    private final java.util.function.BooleanSupplier ownsAll;
+    private final BooleanSupplier ownsAll;
     // Whether this node is the controller owner of a namespace — scopes the non-controller owner repair pass.
-    private final java.util.function.Predicate<StrataNamespace> ownsNamespace;
+    private final Predicate<StrataNamespace> ownsNamespace;
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicLong commandIds = new AtomicLong(System.currentTimeMillis());
     private final Map<Long, Action> inflight = new ConcurrentHashMap<>();
@@ -109,7 +114,7 @@ class RepairCoordinator implements AutoCloseable {
     // the chunksBeingRepaired dedup add succeeds — never on a dedup-skip, placement miss, or failure.
     private final AtomicLong eventRepairs = new AtomicLong();
     private final AtomicLong reconcileRepairs = new AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong reconcileSkippedFiles = new java.util.concurrent.atomic.AtomicLong();
+    private final AtomicLong reconcileSkippedFiles = new AtomicLong();
     private volatile Thread scanThread;
 
     // Deleted-tombstone TTL is now sourced from config.deletedTombstoneTtlMs() (default 600 000 ms).
@@ -168,20 +173,20 @@ class RepairCoordinator implements AutoCloseable {
     private record ReplicaKey(StrataNamespace namespace, ChunkId chunkId, int nodeId) {}
 
     RepairCoordinator(MetadataStore store, NodeRegistry registry, ControllerConfig config,
-                      java.util.function.BooleanSupplier isLeader) {
+                      BooleanSupplier isLeader) {
         this(store, registry, config, isLeader, () -> true, ns -> true);
     }
 
     RepairCoordinator(MetadataStore store, NodeRegistry registry, ControllerConfig config,
-                      java.util.function.BooleanSupplier isLeader,
-                      java.util.function.BooleanSupplier ownsAllNamespaces) {
+                      BooleanSupplier isLeader,
+                      BooleanSupplier ownsAllNamespaces) {
         this(store, registry, config, isLeader, ownsAllNamespaces, ns -> true);
     }
 
     RepairCoordinator(MetadataStore store, NodeRegistry registry, ControllerConfig config,
-                      java.util.function.BooleanSupplier isLeader,
-                      java.util.function.BooleanSupplier ownsAllNamespaces,
-                      java.util.function.Predicate<StrataNamespace> ownsNamespace) {
+                      BooleanSupplier isLeader,
+                      BooleanSupplier ownsAllNamespaces,
+                      Predicate<StrataNamespace> ownsNamespace) {
         this.store = store;
         this.registry = registry;
         this.config = config;
@@ -222,8 +227,8 @@ class RepairCoordinator implements AutoCloseable {
      * {@code synchronized(this)} monitor). A ReentrantLock does not pin the virtual-thread carrier across
      * the blocking store/ZK and node-RPC I/O these methods perform, unlike {@code synchronized} on Java 21.
      */
-    private final java.util.concurrent.locks.ReentrantLock reconcileLock =
-            new java.util.concurrent.locks.ReentrantLock();
+    private final ReentrantLock reconcileLock =
+            new ReentrantLock();
 
     private void scanLoop() {
         long lastTombstoneSweep = 0;
@@ -481,7 +486,7 @@ class RepairCoordinator implements AutoCloseable {
         chunksAtMinRedundancy = atMin[0];
 
         // exposure priority: fewest live replicas first (tech design §7.2)
-        repairs.sort(java.util.Comparator.comparingInt(Repair::liveReplicas));
+        repairs.sort(Comparator.comparingInt(Repair::liveReplicas));
         for (Repair r : repairs) {
             issueReplicate(r.ns(), r.fileId(), r.file(), r.chunk(), RepairTrigger.RECONCILE);
         }
@@ -694,7 +699,7 @@ class RepairCoordinator implements AutoCloseable {
             return; // deletion, not verification, drives a DELETING file's chunks
         }
         Records.FileRecord file = opt.get().value();
-        Map<Integer, List<ChunkId>> byNode = new java.util.LinkedHashMap<>();
+        Map<Integer, List<ChunkId>> byNode = new LinkedHashMap<>();
         Map<ChunkId, Records.ChunkRecord> expected = new HashMap<>();
         for (Records.ChunkRecord c : file.chunks()) {
             if (c.state() != ChunkState.SEALED) {
@@ -915,7 +920,7 @@ class RepairCoordinator implements AutoCloseable {
      * non-controller owner has no heartbeat command channel, so it deletes its own namespaces' chunks
      * this way. True if the node acked the chunk gone (deleted, or already absent).
      */
-    private boolean execDelete(Records.NodeRecord node, ChunkId chunkId, io.strata.common.StrataNamespace ns) {
+    private boolean execDelete(Records.NodeRecord node, ChunkId chunkId, StrataNamespace ns) {
         return directNodeCall(node, chunkId, "owner-delete", (client, timeoutMs) -> {
             ByteBuffer resp = client.call(Opcode.DELETE_CHUNKS,
                     new Messages.DeleteChunks(List.of(chunkId), ns).encode(), null, timeoutMs);

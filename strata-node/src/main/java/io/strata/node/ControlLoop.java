@@ -10,9 +10,10 @@ import io.strata.common.ScpConnectionException;
 import io.strata.common.ScpException;
 import io.strata.format.ChunkFormats;
 import io.strata.format.ChunkStore;
-import io.strata.proto.Messages;
 import io.strata.proto.ManagedScpConnection;
+import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
+import io.strata.proto.Resp;
 import io.strata.proto.ScpClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,9 +26,11 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Data-node control plane (tech design §10.4): register, heartbeat (commands ride the
@@ -65,14 +68,14 @@ final class ControlLoop implements AutoCloseable {
 
     ControlLoop(DataNode node, DataNodeConfig config, ChunkStore store, ChunkDeleteService deletes) {
         this.node = node;
-        this.config = java.util.Objects.requireNonNull(config, "config");
-        this.store = java.util.Objects.requireNonNull(store, "store");
-        this.deletes = java.util.Objects.requireNonNull(deletes, "deletes");
+        this.config = Objects.requireNonNull(config, "config");
+        this.store = Objects.requireNonNull(store, "store");
+        this.deletes = Objects.requireNonNull(deletes, "deletes");
         ConnectionPolicy policy = config.connectionPolicy();
         this.backoff = new Backoff(policy.reconnectInitialBackoffMs(), policy.reconnectMaxBackoffMs());
     }
 
-    private final java.util.List<Thread> threads = new java.util.ArrayList<>(3);
+    private final List<Thread> threads = new ArrayList<>(3);
 
     /** Whether the node currently holds a metadata registration (lease session). */
     boolean registered() {
@@ -122,8 +125,8 @@ final class ControlLoop implements AutoCloseable {
         }
     }
 
-    private final java.util.concurrent.locks.ReentrantLock connLock =
-            new java.util.concurrent.locks.ReentrantLock();
+    private final ReentrantLock connLock =
+            new ReentrantLock();
 
     private void ensureRegistered() throws IOException {
         connLock.lock();
@@ -243,7 +246,7 @@ final class ControlLoop implements AutoCloseable {
             // command replay — but only a VALID copy counts: a local chunk whose seal state or
             // crc/length mismatch the descriptor is corrupt and must be replaced, not trusted
             var stat = store.stat(cmd.namespace(), cmd.chunkId());
-            if (stat.state() == io.strata.common.ChunkState.SEALED
+            if (stat.state() == ChunkState.SEALED
                     && stat.sealedLength() == cmd.expectedLength()
                     && stat.dataCrc() == cmd.expectedCrc()) {
                 return;
@@ -300,7 +303,7 @@ final class ControlLoop implements AutoCloseable {
                 Messages.FetchResp resp;
                 try {
                     ByteBuffer hb = frame.headerSlice();
-                    io.strata.proto.Resp.check(hb);
+                    Resp.check(hb);
                     resp = Messages.FetchResp.decode(hb);
                 } catch (ScpException e) {
                     throw e;

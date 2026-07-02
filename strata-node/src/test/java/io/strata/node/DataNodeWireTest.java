@@ -2,6 +2,7 @@ package io.strata.node;
 
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
+import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
@@ -152,7 +153,7 @@ class DataNodeWireTest {
                     new Messages.ReadLedger(id, 0, TEST_NS).encode(), null, 5000);
             var ledger = Messages.ReadLedgerResp.decode(lh);
             assertEquals(1, ledger.entries().size());
-            assertEquals(io.strata.common.Crc.of(ByteBuffer.wrap(payload)),
+            assertEquals(Crc.of(ByteBuffer.wrap(payload)),
                     ledger.entries().get(0).payloadCrc());
         }
     }

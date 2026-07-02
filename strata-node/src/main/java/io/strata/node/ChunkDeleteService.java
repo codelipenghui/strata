@@ -5,6 +5,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkStore;
 
+import java.util.Objects;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -37,7 +38,7 @@ final class ChunkDeleteService {
         if (minIntervalMs < 0) {
             throw new IllegalArgumentException("minIntervalMs must be non-negative: " + minIntervalMs);
         }
-        this.store = java.util.Objects.requireNonNull(store, "store");
+        this.store = Objects.requireNonNull(store, "store");
         this.permits = new Semaphore(maxConcurrent, true);
         this.minStartIntervalNanos = TimeUnit.MILLISECONDS.toNanos(minIntervalMs);
     }

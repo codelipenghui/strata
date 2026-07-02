@@ -1,6 +1,7 @@
 package io.strata.proto;
 
 import io.strata.common.Crc;
+import io.strata.common.EnvConfig;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -11,7 +12,7 @@ import java.nio.ByteBuffer;
 /** Blocking frame reader/writer for raw stream tests/tools. Payload CRC verified when present. */
 public final class FrameIO {
     public static final int MAX_FRAME_BYTES =
-            io.strata.common.EnvConfig.intEnv("STRATA_MAX_FRAME_BYTES", 64 * 1024 * 1024);
+            EnvConfig.intEnv("STRATA_MAX_FRAME_BYTES", 64 * 1024 * 1024);
 
     private FrameIO() {}
 

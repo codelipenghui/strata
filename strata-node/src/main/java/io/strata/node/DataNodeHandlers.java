@@ -7,11 +7,14 @@ import io.strata.format.ChunkStore;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
+import io.strata.proto.RequestContext;
 import io.strata.proto.ScpServer;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 
 /** Maps SCP data-plane opcodes onto the ChunkStore engine (tech design §10.3). */
 final class DataNodeHandlers implements ScpServer.Handler {
@@ -21,9 +24,9 @@ final class DataNodeHandlers implements ScpServer.Handler {
     private volatile ControlLoop controlLoop; // wired after the control loop starts (owner-repair path)
 
     DataNodeHandlers(ChunkStore store, DataNode node, ChunkDeleteService deletes) {
-        this.store = java.util.Objects.requireNonNull(store, "store");
+        this.store = Objects.requireNonNull(store, "store");
         this.node = node;
-        this.deletes = java.util.Objects.requireNonNull(deletes, "deletes");
+        this.deletes = Objects.requireNonNull(deletes, "deletes");
     }
 
     /** Wires the control loop so this node can serve direct owner-driven EXEC_REPLICATE repairs. */
@@ -32,7 +35,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
     }
 
     @Override
-    public java.util.concurrent.CompletableFuture<Frame> handleAsync(Frame req) throws Exception {
+    public CompletableFuture<Frame> handleAsync(Frame req) throws Exception {
         if (req.opcode() == Opcode.APPEND.code) {
             // The per-record digest is writer-origin: a non-empty append MUST carry the client's payload
             // CRC (FLAG_PAYLOAD_CRC), which the node stores verbatim as the ledger digest. Reject a
@@ -47,12 +50,12 @@ final class DataNodeHandlers implements ScpServer.Handler {
             // defers until durability per the chunk's policy — for ack-on-fsync that means a
             // covering group-commit force, while this connection keeps processing frames
             var m = Messages.Append.decode(req.headerSlice());
-            io.strata.proto.RequestContext.setNamespace(m.namespace().value());
+            RequestContext.setNamespace(m.namespace().value());
             return store.appendAsync(m.namespace(), m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
                             req.payloadSlice(), req.payloadCrc())
                     .thenApply(r -> ScpServer.ok(req, new Messages.AppendResp(r.endOffset()).encode(), null));
         }
-        return java.util.concurrent.CompletableFuture.completedFuture(handle(req));
+        return CompletableFuture.completedFuture(handle(req));
     }
 
     @Override
@@ -65,7 +68,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
 
             case OPEN_CHUNK -> {
                 var m = Messages.OpenChunk.decode(h);
-                io.strata.proto.RequestContext.setNamespace(m.namespace().value());
+                RequestContext.setNamespace(m.namespace().value());
                 if (node.isDraining()) {
                     throw new ScpException(ErrorCode.NO_CAPACITY, "node draining");
                 }
@@ -79,7 +82,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 // Client read: open reads are bounded to the replica-known durable high watermark, so
                 // both open durable-prefix reads and sealed reads can use a zero-copy file region.
                 var m = Messages.Read.decode(h);
-                io.strata.proto.RequestContext.setNamespace(m.namespace().value());
+                RequestContext.setNamespace(m.namespace().value());
                 yield readRegionResponse(req, store.readRegion(m.namespace(), m.chunkId(), m.offset(), m.maxBytes()));
             }
 
@@ -87,13 +90,13 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 // Seal recovery reads the never-acked tail above the durable watermark (clamped away
                 // from client READs) to re-prove and re-replicate bytes a quorum still holds.
                 var m = Messages.Read.decode(h);
-                io.strata.proto.RequestContext.setNamespace(m.namespace().value());
+                RequestContext.setNamespace(m.namespace().value());
                 yield readRegionResponse(req, store.readRegionForRecovery(m.namespace(), m.chunkId(), m.offset(), m.maxBytes()));
             }
 
             case FENCE -> {
                 var m = Messages.Fence.decode(h);
-                io.strata.proto.RequestContext.setNamespace(m.namespace().value());
+                RequestContext.setNamespace(m.namespace().value());
                 var r = store.fence(m.namespace(), m.chunkId(), m.fenceEpoch());
                 yield ScpServer.ok(req, new Messages.FenceResp(r.persistedFenceEpoch(), r.localEndOffset(),
                         r.lastKnownDO(), r.state()).encode(), null);
@@ -101,7 +104,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
 
             case STAT_CHUNK -> {
                 var m = Messages.StatChunk.decode(h);
-                io.strata.proto.RequestContext.setNamespace(m.namespace().value());
+                RequestContext.setNamespace(m.namespace().value());
                 var r = store.stat(m.namespace(), m.chunkId());
                 yield ScpServer.ok(req, new Messages.StatResp(r.state(), r.localEndOffset(), r.lastKnownDO(),
                         r.writeEpoch(), r.fenceEpoch(), r.sealedLength(), r.dataCrc()).encode(), null);
@@ -109,7 +112,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
 
             case SEAL_CHUNK -> {
                 var m = Messages.SealChunk.decode(h);
-                io.strata.proto.RequestContext.setNamespace(m.namespace().value());
+                RequestContext.setNamespace(m.namespace().value());
                 var r = store.seal(m.namespace(), m.chunkId(), m.writeEpoch(), m.dataLength(),
                         req.payloadLength() > 0 ? req.payloadSlice() : null);
                 yield ScpServer.ok(req, new Messages.SealResp(r.finalLength(), r.dataCrc()).encode(), null);
@@ -117,7 +120,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
 
             case DELETE_CHUNKS -> {
                 var m = Messages.DeleteChunks.decode(h);
-                io.strata.proto.RequestContext.setNamespace(m.namespace().value());
+                RequestContext.setNamespace(m.namespace().value());
                 List<Short> codes = new ArrayList<>(m.chunkIds().size());
                 for (var id : m.chunkIds()) codes.add(deletes.delete(m.namespace(), id).code);
                 yield ScpServer.ok(req, new Messages.DeleteChunksResp(m.chunkIds(), codes).encode(), null);
@@ -125,7 +128,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
 
             case FETCH_CHUNK -> {
                 var m = Messages.FetchChunk.decode(h);
-                io.strata.proto.RequestContext.setNamespace(m.namespace().value());
+                RequestContext.setNamespace(m.namespace().value());
                 var r = store.fetch(m.namespace(), m.chunkId(), m.offset(), m.maxBytes());
                 yield ScpServer.ok(req, new Messages.FetchResp(r.fileLength(), r.state()).encode(),
                         ByteBuffer.wrap(r.bytes()));
@@ -133,7 +136,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
 
             case READ_LEDGER -> {
                 var m = Messages.ReadLedger.decode(h);
-                io.strata.proto.RequestContext.setNamespace(m.namespace().value());
+                RequestContext.setNamespace(m.namespace().value());
                 List<ChunkFormats.LedgerEntry> entries = store.readLedger(m.namespace(), m.chunkId(), m.fromOffset());
                 List<Messages.LedgerEntry> wire = new ArrayList<>(entries.size());
                 for (var e : entries) wire.add(new Messages.LedgerEntry(e.endOffset(), e.payloadCrc(), e.writeEpoch()));
@@ -151,7 +154,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 if (!(Messages.Command.read(h) instanceof Messages.ReplicateCmd cmd)) {
                     throw new ScpException(ErrorCode.PRECONDITION_FAILED, "EXEC_REPLICATE requires a ReplicateCmd");
                 }
-                io.strata.proto.RequestContext.setNamespace(cmd.namespace().value());
+                RequestContext.setNamespace(cmd.namespace().value());
                 loop.replicate(cmd);
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
@@ -161,7 +164,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 // requested chunk (present/state/length/crc) and stamp the present ones as freshly
                 // verified, feeding node-local orphan GC (§20.4). The owner judges missing/corrupt.
                 var m = Messages.VerifyChunks.decode(h);
-                io.strata.proto.RequestContext.setNamespace(m.namespace().value());
+                RequestContext.setNamespace(m.namespace().value());
                 node.noteVerifiedBy(m.verifierEndpoint());
                 List<Messages.VerifyChunkResult> results = new ArrayList<>(m.chunkIds().size());
                 for (ChunkStore.VerifyResult r : store.verify(m.namespace(), m.chunkIds())) {

@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -66,8 +67,8 @@ final class OrphanGc implements AutoCloseable {
 
     OrphanGc(ChunkStore store, ChunkDeleteService deletes, int nodeId, List<String> controllerEndpoints,
              long graceMs, long scanIntervalMs, long startupGraceMs, int confirmTimeoutMs) {
-        this.store = java.util.Objects.requireNonNull(store, "store");
-        this.deletes = java.util.Objects.requireNonNull(deletes, "deletes");
+        this.store = Objects.requireNonNull(store, "store");
+        this.deletes = Objects.requireNonNull(deletes, "deletes");
         this.nodeId = nodeId;
         this.controllerEndpoints = List.copyOf(controllerEndpoints);
         this.graceMs = graceMs;

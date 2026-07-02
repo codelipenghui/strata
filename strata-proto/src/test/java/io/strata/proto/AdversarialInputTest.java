@@ -9,6 +9,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 
@@ -18,6 +19,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -64,7 +66,7 @@ class AdversarialInputTest {
         assertTrue(e.getMessage().contains("count"), "got: " + e.getMessage());
 
         // sane messages still decode
-        var del = new Messages.DeleteChunks(java.util.List.of(new ChunkId(FileId.of(1), 0)), StrataNamespace.of("test"));
+        var del = new Messages.DeleteChunks(List.of(new ChunkId(FileId.of(1), 0)), StrataNamespace.of("test"));
         assertEquals(del, Messages.DeleteChunks.decode(ByteBuffer.wrap(del.encode())));
     }
 
@@ -101,7 +103,7 @@ class AdversarialInputTest {
                 Frame resp = FrameIO.read(new DataInputStream(s.getInputStream()));
                 assertNotNull(resp, "server must answer with a typed error, not a silent close");
                 ByteBuffer rh = resp.headerSlice();
-                var e = assertThrows(io.strata.common.ScpException.class, () -> Resp.check(rh));
+                var e = assertThrows(ScpException.class, () -> Resp.check(rh));
                 assertEquals(ErrorCode.UNSUPPORTED_VERSION, e.code());
             }
         }

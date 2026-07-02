@@ -10,6 +10,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeSet;
 
 class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest {
 
@@ -150,7 +151,7 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
         public List<StrataNamespace> listNamespaces() {
             synchronized (state) {
                 ensureOpen();
-                java.util.TreeSet<StrataNamespace> namespaces = new java.util.TreeSet<>();
+                TreeSet<StrataNamespace> namespaces = new TreeSet<>();
                 for (Versioned<Records.FileRecord> v : state.files.values()) {
                     if (v.value().state() != FileState.DELETED) {  // namespaces with at least one live file
                         namespaces.add(v.value().namespace());

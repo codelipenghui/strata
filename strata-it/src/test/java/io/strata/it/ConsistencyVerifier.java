@@ -17,7 +17,9 @@ import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
 
@@ -506,12 +508,12 @@ final class ConsistencyVerifier {
     }
 
     private static void assertRawChunkImageMatchesMetadata(byte[] raw, Messages.ChunkInfo chunk) {
-        byte[] header = java.util.Arrays.copyOfRange(raw, 0, ChunkFormats.HEADER_SIZE);
+        byte[] header = Arrays.copyOfRange(raw, 0, ChunkFormats.HEADER_SIZE);
         assertEquals(chunk.chunkId(), ChunkFormats.Header.decode(header).chunkId(),
                 "raw chunk header id differs for " + chunk.chunkId());
 
         int trailerOffset = raw.length - ChunkFormats.TRAILER_SIZE;
-        byte[] trailerBytes = java.util.Arrays.copyOfRange(raw, trailerOffset, raw.length);
+        byte[] trailerBytes = Arrays.copyOfRange(raw, trailerOffset, raw.length);
         ChunkFormats.Trailer trailer = ChunkFormats.Trailer.decode(trailerBytes);
         assertEquals(chunk.length(), trailer.dataLength(),
                 "raw chunk trailer length differs for " + chunk.chunkId());
@@ -531,6 +533,6 @@ final class ConsistencyVerifier {
     }
 
     private static String sha256(byte[] bytes) throws Exception {
-        return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
     }
 }

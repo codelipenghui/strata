@@ -6,6 +6,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpServer;
@@ -34,9 +35,9 @@ class StrataClientBehaviorTest {
         assertEquals("test", path.namespace().toString());
         assertEquals("/test-file", path.path().toString());
         assertThrows(NullPointerException.class,
-                () -> new StrataClient.FilePath(null, io.strata.common.StrataPath.of("/test-file")));
+                () -> new StrataClient.FilePath(null, StrataPath.of("/test-file")));
         assertThrows(NullPointerException.class,
-                () -> new StrataClient.FilePath(io.strata.common.StrataNamespace.of("test"), null));
+                () -> new StrataClient.FilePath(StrataNamespace.of("test"), null));
         assertThrows(NullPointerException.class, () -> StrataClient.connect(null));
     }
 
@@ -359,7 +360,7 @@ class StrataClientBehaviorTest {
         }
     }
 
-    private static byte[] drain(java.nio.ByteBuffer b) {
+    private static byte[] drain(ByteBuffer b) {
         byte[] a = new byte[b.remaining()];
         b.get(a);
         return a;

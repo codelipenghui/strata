@@ -2,6 +2,7 @@ package io.strata.client;
 
 import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
+import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.proto.Frame;
@@ -9,6 +10,7 @@ import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.Resp;
+import io.strata.proto.ScpClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -22,6 +24,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -43,14 +47,14 @@ import static io.strata.common.Checks.checkedAdd;
 final class AppenderImpl implements StrataFile.Appender {
     private static final Logger log = LoggerFactory.getLogger(AppenderImpl.class);
     /** Replica responses are dispatched off transport event-loop threads. */
-    private static final java.util.concurrent.Executor CALLBACKS =
-            java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
+    private static final Executor CALLBACKS =
+            Executors.newVirtualThreadPerTaskExecutor();
     private static final int APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK =
             intConf("strata.append.replicaInflightHighWatermark",
                     "STRATA_APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK", 64);
     private static final long APPEND_BACKPRESSURE_WARN_NANOS = TimeUnit.SECONDS.toNanos(10);
     private static final int DEFAULT_APPEND_CONNECTION_PENDING_HIGH_WATERMARK =
-            Math.max(1, (io.strata.proto.ScpClient.maxPendingRequests() * 3) / 4);
+            Math.max(1, (ScpClient.maxPendingRequests() * 3) / 4);
     private static final int APPEND_CONNECTION_PENDING_HIGH_WATERMARK =
             intConf("strata.append.connectionPendingHighWatermark",
                     "STRATA_APPEND_CONNECTION_PENDING_HIGH_WATERMARK",
@@ -59,7 +63,7 @@ final class AppenderImpl implements StrataFile.Appender {
     private final ControllerClient controller;
     private final NodePool pool;
     private final ClientConfig config;
-    private final io.strata.common.FileId fileId;
+    private final FileId fileId;
     private final StrataNamespace namespace;
     private final int epoch;
     private final int replicationFactor;
@@ -116,8 +120,8 @@ final class AppenderImpl implements StrataFile.Appender {
 
     private record Pending(long chunkEnd, CompletableFuture<Long> future) {}
 
-    AppenderImpl(ControllerClient controller, NodePool pool, ClientConfig config, io.strata.common.FileId fileId,
-                 io.strata.common.StrataNamespace namespace, int epoch, Messages.WritePolicy writePolicy,
+    AppenderImpl(ControllerClient controller, NodePool pool, ClientConfig config, FileId fileId,
+                 StrataNamespace namespace, int epoch, Messages.WritePolicy writePolicy,
                  long existingFileLength) {
         this.controller = controller;
         this.pool = pool;
@@ -668,8 +672,8 @@ final class AppenderImpl implements StrataFile.Appender {
 
     private boolean validReplicaSet(List<Messages.Replica> replicas) {
         if (replicas.size() != replicationFactor) return false;
-        java.util.HashSet<Integer> nodeIds = new java.util.HashSet<>();
-        java.util.HashSet<String> endpoints = new java.util.HashSet<>();
+        HashSet<Integer> nodeIds = new HashSet<>();
+        HashSet<String> endpoints = new HashSet<>();
         for (Messages.Replica r : replicas) {
             if (r.nodeId() <= 0) return false;
             if (r.endpoint() == null || r.endpoint().isBlank()) return false;

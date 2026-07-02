@@ -7,6 +7,7 @@ import io.strata.common.FileState;
 import io.strata.proto.Messages;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -96,7 +97,7 @@ class ConsistencyVerifierTest {
 
     private static Messages.ChunkInfo chunk(FileId fileId, int index, ChunkState state,
                                             long length, int... nodeIds) {
-        List<Messages.Replica> replicas = java.util.Arrays.stream(nodeIds)
+        List<Messages.Replica> replicas = Arrays.stream(nodeIds)
                 .mapToObj(ConsistencyVerifierTest::replica)
                 .toList();
         return chunk(fileId, index, state, length, replicas);
@@ -115,7 +116,7 @@ class ConsistencyVerifierTest {
 
     private static Messages.ChunkInfo chunkWithCrc(FileId fileId, int index, ChunkState state,
                                                    long length, int crc, int... nodeIds) {
-        List<Messages.Replica> replicas = java.util.Arrays.stream(nodeIds)
+        List<Messages.Replica> replicas = Arrays.stream(nodeIds)
                 .mapToObj(ConsistencyVerifierTest::replica)
                 .toList();
         return new Messages.ChunkInfo(new ChunkId(fileId, index), state, length, crc, 1, replicas);

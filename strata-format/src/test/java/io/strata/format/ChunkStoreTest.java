@@ -27,6 +27,7 @@ import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermission;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -37,10 +38,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
 import java.util.stream.Stream;
 
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -49,6 +50,7 @@ import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class ChunkStoreTest {
 
@@ -840,7 +842,7 @@ class ChunkStoreTest {
 
         ChunkId blocked = new ChunkId(FileId.of(3), 0);
         try (ChunkStore store = newStore()) {
-            java.nio.file.Files.write(dir.resolve(relMkdirs(blocked) + ".chunk"), new byte[]{1});
+            Files.write(dir.resolve(relMkdirs(blocked) + ".chunk"), new byte[]{1});
             assertEquals(ErrorCode.CHUNK_ALREADY_EXISTS,
                     assertThrows(ScpException.class, () -> open(store, blocked, 1)).code());
         }
@@ -974,7 +976,7 @@ class ChunkStoreTest {
             store.append(TEST_NS, id, 1, 13, 13, ByteBuffer.allocate(0)); // make the full range readable
 
             Path data = dir.resolve(rel(id) + ".chunk");
-            try (FileChannel ch = FileChannel.open(data, java.nio.file.StandardOpenOption.WRITE)) {
+            try (FileChannel ch = FileChannel.open(data, StandardOpenOption.WRITE)) {
                 ch.write(ByteBuffer.wrap(new byte[] {'X'}), ChunkFormats.DATA_START + 4);
             }
 
@@ -1446,8 +1448,8 @@ class ChunkStoreTest {
 
             // bit-rot in the data region: the STORED crc still matches the descriptor, so only
             // recomputation can catch it
-            try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(
-                    dir.resolve(rel(id) + ".chunk"), java.nio.file.StandardOpenOption.WRITE)) {
+            try (FileChannel ch = FileChannel.open(
+                    dir.resolve(rel(id) + ".chunk"), StandardOpenOption.WRITE)) {
                 ch.write(ByteBuffer.wrap(new byte[]{0x7F}), ChunkFormats.DATA_START + 3);
             }
             assertEquals(sealed.dataCrc(), store.describeChunks().get(0).crc(),
@@ -1916,8 +1918,8 @@ class ChunkStoreTest {
             // cannot complete until we release it.
             Field lockField = handle.getClass().getDeclaredField("lock");
             lockField.setAccessible(true);
-            java.util.concurrent.locks.ReentrantLock lock =
-                    (java.util.concurrent.locks.ReentrantLock) lockField.get(handle);
+            ReentrantLock lock =
+                    (ReentrantLock) lockField.get(handle);
 
             AtomicReference<Integer> openCount = new AtomicReference<>();
             AtomicReference<Throwable> failure = new AtomicReference<>();
@@ -2203,7 +2205,7 @@ class ChunkStoreTest {
         try (ChunkStore store = newStore()) {
             ChunkId c = new ChunkId(FileId.of(1), 0);
             open(store, c, 1);
-            byte[] payload = "hello".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] payload = "hello".getBytes(StandardCharsets.UTF_8);
             store.appendAsync(TEST_NS, c, 1, 0, 0, ByteBuffer.wrap(payload)).join();
             store.seal(TEST_NS, c, 1, payload.length, null);   // sealed → fully readable region
             store.readRegion(TEST_NS, c, 0, Integer.MAX_VALUE);

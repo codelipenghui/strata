@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -189,7 +190,7 @@ class MessageRoundtripTest {
         assertEquals(hr, decodeResp(hr.encode(), Messages.HelloResp::decode));
     }
 
-    private static <T> T decodeResp(byte[] bytes, java.util.function.Function<ByteBuffer, T> decoder) {
+    private static <T> T decodeResp(byte[] bytes, Function<ByteBuffer, T> decoder) {
         ByteBuffer b = ByteBuffer.wrap(bytes);
         Resp.check(b);
         return decoder.apply(b);

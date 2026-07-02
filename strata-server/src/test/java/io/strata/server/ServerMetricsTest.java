@@ -4,15 +4,17 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.strata.common.ChunkId;
 import io.strata.common.FileId;
 import io.strata.common.StrataNamespace;
-import io.strata.node.DataNodeConfig;
 import io.strata.node.DataNode;
+import io.strata.node.DataNodeConfig;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
+import io.strata.proto.RequestObserver;
 import io.strata.proto.ScpClient;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -59,7 +61,7 @@ class ServerMetricsTest {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             StrataNamespace ns = StrataNamespace.of("ns1");
             ChunkId chunk = new ChunkId(FileId.of(1), 0);
-            byte[] payload = "namespace-throughput".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] payload = "namespace-throughput".getBytes(StandardCharsets.UTF_8);
             // Drive a real OPEN_CHUNK + APPEND straight at the node's data plane (no controller/placement),
             // so its ChunkStore records per-namespace I/O for "ns1".
             try (ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_TOOL, "ns-metrics-test")) {
@@ -84,7 +86,7 @@ class ServerMetricsTest {
     @Test
     void requestObserverTagsNamespace() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
-        io.strata.proto.RequestObserver obs = ServerMetrics.requestObserver(registry,
+        RequestObserver obs = ServerMetrics.requestObserver(registry,
                 new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
         obs.observe("READ", "orders", 1_000_000L, true);
         assertNotNull(registry.find("strata_scp_request_duration")
