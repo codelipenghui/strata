@@ -19,8 +19,10 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -1138,6 +1140,59 @@ class RecoveryTest {
         assertEquals(null, readRangeFromServer(new Messages.ReadResp(4, -1), 4));
         assertEquals(null, readRangeFromServer(new Messages.ReadResp(4, 5), 4));
         assertEquals(null, readRangeFromServer(new Messages.ReadResp(4, 4), 3));
+    }
+
+    @Test
+    void readRangeAcceptsServerCappedPartialResponses() throws Exception {
+        AtomicInteger reads = new AtomicInteger();
+        byte[] source = new byte[] {1, 2, 3, 4};
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
+            if (isReadOp(Opcode.fromCode(req.opcode()))) {
+                reads.incrementAndGet();
+                Messages.Read read = Messages.Read.decode(req.headerSlice());
+                int offset = (int) read.offset();
+                int length = Math.min(2, source.length - offset);
+                return ScpServer.ok(req, new Messages.ReadResp(source.length, source.length).encode(),
+                        ByteBuffer.wrap(source, offset, length));
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + req.opcode());
+        })) {
+            ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500);
+            try (NodePool pool = new NodePool()) {
+                Recovery recovery = new Recovery(null, pool, config, StrataNamespace.of("test"));
+                ChunkId chunkId = new ChunkId(FileId.of(34), 0);
+                Object sourceReplica = replicaState(new Messages.Replica(1, endpoint(server)), 4, 4, ChunkState.OPEN);
+
+                assertArrayEquals(source, invokeReadRange(recovery, chunkId, sourceReplica, 0, 4));
+                assertEquals(2, reads.get());
+            }
+        }
+    }
+
+    @Test
+    void readRangeStopsDribblingDonorAfterBoundedAttempts() throws Exception {
+        AtomicInteger reads = new AtomicInteger();
+        byte[] source = new byte[] {1, 2, 3};
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
+            if (isReadOp(Opcode.fromCode(req.opcode()))) {
+                reads.incrementAndGet();
+                Messages.Read read = Messages.Read.decode(req.headerSlice());
+                int offset = (int) read.offset();
+                return ScpServer.ok(req, new Messages.ReadResp(source.length, source.length).encode(),
+                        ByteBuffer.wrap(source, offset, 1));
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + req.opcode());
+        })) {
+            ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500);
+            try (NodePool pool = new NodePool()) {
+                Recovery recovery = new Recovery(null, pool, config, StrataNamespace.of("test"));
+                ChunkId chunkId = new ChunkId(FileId.of(37), 0);
+                Object sourceReplica = replicaState(new Messages.Replica(1, endpoint(server)), 3, 3, ChunkState.OPEN);
+
+                assertEquals(null, invokeReadRange(recovery, chunkId, sourceReplica, 0, 3));
+                assertEquals(2, reads.get());
+            }
+        }
     }
 
     @Test
