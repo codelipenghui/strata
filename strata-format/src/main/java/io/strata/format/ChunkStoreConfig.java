@@ -1,6 +1,7 @@
 package io.strata.format;
 
 import com.sun.management.UnixOperatingSystemMXBean;
+import io.strata.common.ChunkLimits;
 
 import java.lang.management.ManagementFactory;
 
@@ -20,7 +21,8 @@ public record ChunkStoreConfig(
 
     public static final ChunkStoreConfig DEFAULT =
             new ChunkStoreConfig(8 * 1024 * 1024, 10_000L, 1_000_000L, 50_000_000L,
-                    false, 500L, 4L << 20, 1_000L, 500L, defaultChannelCacheCapacity(), 262_144);
+                    false, 500L, 4L << 20, 1_000L, 500L, defaultChannelCacheCapacity(),
+                    ChunkLimits.DEFAULT_MAX_OPEN_CHUNK_LEDGER_ENTRIES);
 
     public ChunkStoreConfig(int maxRequestBytes, long groupCommitDrainTimeoutMs,
                             long groupCommitMinAccumulationNanos,
@@ -29,18 +31,6 @@ public record ChunkStoreConfig(
                 groupCommitMaxAccumulationNanos, DEFAULT.sealFsync, DEFAULT.backgroundFlushIntervalMs,
                 DEFAULT.backgroundFlushThresholdBytes, DEFAULT.slowAppendLogMs, DEFAULT.slowMutationLogMs,
                 DEFAULT.channelCacheMaxSize, DEFAULT.maxOpenChunkLedgerEntries);
-    }
-
-    public ChunkStoreConfig(int maxRequestBytes, long groupCommitDrainTimeoutMs,
-                            long groupCommitMinAccumulationNanos,
-                            long groupCommitMaxAccumulationNanos,
-                            boolean sealFsync, long backgroundFlushIntervalMs,
-                            long backgroundFlushThresholdBytes, long slowAppendLogMs,
-                            long slowMutationLogMs, int channelCacheMaxSize) {
-        this(maxRequestBytes, groupCommitDrainTimeoutMs, groupCommitMinAccumulationNanos,
-                groupCommitMaxAccumulationNanos, sealFsync, backgroundFlushIntervalMs,
-                backgroundFlushThresholdBytes, slowAppendLogMs, slowMutationLogMs, channelCacheMaxSize,
-                DEFAULT.maxOpenChunkLedgerEntries);
     }
 
     public ChunkStoreConfig {

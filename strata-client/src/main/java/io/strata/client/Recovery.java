@@ -481,7 +481,7 @@ final class Recovery {
     private void appendAndVerify(ChunkId chunkId, int epoch, ReplicaState target, long durableOffset,
                                  ByteBuffer payload, long expectedEnd) {
         ByteBuffer h = appendPool.get(target.replica.endpoint()).call(Opcode.APPEND,
-                new Messages.Append(chunkId, epoch, target.end, durableOffset, namespace).encode(),
+                Messages.Append.recovery(chunkId, epoch, target.end, durableOffset, namespace).encode(),
                 payload, config.callTimeoutMs());
         long actualEnd;
         try {

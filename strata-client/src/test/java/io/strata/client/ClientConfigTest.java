@@ -1,5 +1,6 @@
 package io.strata.client;
 
+import io.strata.common.ChunkLimits;
 import io.strata.common.ConnectionPolicy;
 import org.junit.jupiter.api.Test;
 
@@ -8,6 +9,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ClientConfigTest {
 
@@ -61,7 +63,8 @@ class ClientConfigTest {
         assertEquals(64, c.appendReplicaInflightHighWatermark());
         assertEquals(Math.max(1, (io.strata.proto.ScpClient.maxPendingRequests() * 3) / 4),
                 c.appendConnectionPendingHighWatermark());
-        assertEquals(262_144, c.maxChunkRecords());
+        assertEquals(ChunkLimits.DEFAULT_MAX_CLIENT_CHUNK_RECORDS, c.maxChunkRecords());
+        assertTrue(c.maxChunkRecords() < ChunkLimits.DEFAULT_MAX_OPEN_CHUNK_LEDGER_ENTRIES);
     }
 
     @Test

@@ -287,6 +287,33 @@ class AppenderImplTest {
     }
 
     @Test
+    void activeChunkSealedResponseRequestsRollWithoutFailingReplica() throws Exception {
+        AppenderImpl appender = appender();
+        Object session = chunkSession();
+        setSession(appender, session);
+
+        onReplicaResponse(appender, session, 0, errorResp(ErrorCode.CHUNK_SEALED, "cap reached", 5), null);
+
+        assertTrue(booleanField(session, "needRoll"));
+        assertFalse(booleanArray(session, "failed")[0]);
+        assertTrue(excludedPlacementNodes(appender).isEmpty());
+    }
+
+    @Test
+    void activeChunkSealedAsyncFailureRequestsRollWithoutFailingReplica() throws Exception {
+        AppenderImpl appender = appender();
+        Object session = chunkSession();
+        setSession(appender, session);
+
+        onReplicaResponse(appender, session, 0, null,
+                new CompletionException(new ScpException(ErrorCode.CHUNK_SEALED, "cap reached", 5)));
+
+        assertTrue(booleanField(session, "needRoll"));
+        assertFalse(booleanArray(session, "failed")[0]);
+        assertTrue(excludedPlacementNodes(appender).isEmpty());
+    }
+
+    @Test
     void activeAsyncFencedFailureKillsAppender() throws Exception {
         AppenderImpl appender = appender();
         Object session = chunkSession();
@@ -1986,6 +2013,19 @@ class AppenderImplTest {
         field.setAccessible(true);
         boolean[] values = (boolean[]) field.get(target);
         values[index] = value;
+    }
+
+    private static boolean[] booleanArray(Object target, String fieldName) throws Exception {
+        Field field = target.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return (boolean[]) field.get(target);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Set<Integer> excludedPlacementNodes(AppenderImpl appender) throws Exception {
+        Field field = AppenderImpl.class.getDeclaredField("excludedPlacementNodes");
+        field.setAccessible(true);
+        return (Set<Integer>) field.get(appender);
     }
 
     private static void assertCommittedDefaultSealQuorum(List<Integer> sealedReplicas) {

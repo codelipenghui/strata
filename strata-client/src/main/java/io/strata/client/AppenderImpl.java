@@ -147,7 +147,7 @@ final class AppenderImpl implements StrataFile.Appender {
             while (true) {
                 awaitNotRolling();
                 throwIfDead();
-                if (session == null || shouldRollBeforeAppend(session) || session.end >= config.chunkRollBytes()) {
+                if (session == null || shouldRollBeforeAppend(session)) {
                     roll();
                     throwIfDead();
                     continue;
@@ -155,7 +155,7 @@ final class AppenderImpl implements StrataFile.Appender {
                 ChunkSession s = session;
                 awaitAppendConnectionCapacityLocked(s);
                 throwIfDead();
-                if (rolling || s != session || shouldRollBeforeAppend(s) || s.end >= config.chunkRollBytes()) {
+                if (rolling || s != session || shouldRollBeforeAppend(s)) {
                     continue;
                 }
                 long base = s.end;
@@ -199,7 +199,9 @@ final class AppenderImpl implements StrataFile.Appender {
     private boolean shouldRollBeforeAppend(ChunkSession s) {
         // A freshly opened partial-quorum chunk must accept the append that opened it; rolling at
         // end==0 immediately asks metadata for another full-RF placement and can loop on NO_CAPACITY.
-        return (s.needRoll && s.end > 0) || s.recordCount >= config.maxChunkRecords();
+        return (s.needRoll && s.end > 0)
+                || s.end >= config.chunkRollBytes()
+                || s.recordCount >= config.maxChunkRecords();
     }
 
     private void onReplicaResponse(ChunkSession s, int replicaIndex, long expectedEnd, Frame frame, Throwable err) {
@@ -214,6 +216,8 @@ final class AppenderImpl implements StrataFile.Appender {
                 ScpException e = asScpException(err);
                 if (e != null && e.code() == ErrorCode.FENCED_EPOCH) {
                     dieLocked(e);
+                } else if (e != null && e.code() == ErrorCode.CHUNK_SEALED) {
+                    onChunkSealedLocked(s);
                 } else {
                     onReplicaFailureLocked(s, replicaIndex, e != null ? e
                             : new ScpException(ErrorCode.INTERNAL, String.valueOf(err)));
@@ -236,6 +240,8 @@ final class AppenderImpl implements StrataFile.Appender {
             } catch (ScpException e) {
                 if (e.code() == ErrorCode.FENCED_EPOCH) {
                     dieLocked(e);
+                } else if (e.code() == ErrorCode.CHUNK_SEALED) {
+                    onChunkSealedLocked(s);
                 } else {
                     onReplicaFailureLocked(s, replicaIndex, e);
                 }
@@ -345,6 +351,11 @@ final class AppenderImpl implements StrataFile.Appender {
         // (roll IS the ensemble change)
         s.needRoll = true;
         advanceDurableLocked(s);
+        progress.signalAll();
+    }
+
+    private void onChunkSealedLocked(ChunkSession s) {
+        s.needRoll = true;
         progress.signalAll();
     }
 

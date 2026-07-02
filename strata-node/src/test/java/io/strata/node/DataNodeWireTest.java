@@ -9,6 +9,7 @@ import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
 import io.strata.format.ChunkStore;
+import io.strata.format.ChunkStoreConfig;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -155,6 +156,28 @@ class DataNodeWireTest {
             assertEquals(1, ledger.entries().size());
             assertEquals(Crc.of(ByteBuffer.wrap(payload)),
                     ledger.entries().get(0).payloadCrc());
+        }
+    }
+
+    @Test
+    void recoveryAppendCanBypassOpenChunkLedgerEntryCap() throws Exception {
+        DataNodeConfig config = DataNodeConfig.standalone(dir)
+                .withChunkStoreConfig(ChunkStoreConfig.DEFAULT.withMaxOpenChunkLedgerEntries(1));
+        try (DataNode node = new DataNode(config);
+             ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
+                    1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
+
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
+                    ByteBuffer.wrap("seed".getBytes()), 5000);
+            ScpException sealed = assertThrows(ScpException.class,
+                    () -> client.call(Opcode.APPEND, new Messages.Append(id, 1, 4, 4, TEST_NS).encode(),
+                            ByteBuffer.wrap("tail".getBytes()), 5000));
+            assertEquals(ErrorCode.CHUNK_SEALED, sealed.code());
+
+            ByteBuffer h = client.call(Opcode.APPEND, Messages.Append.recovery(id, 1, 4, 4, TEST_NS).encode(),
+                    ByteBuffer.wrap("tail".getBytes()), 5000);
+            assertEquals(8, Messages.AppendResp.decode(h).endOffset());
         }
     }
 

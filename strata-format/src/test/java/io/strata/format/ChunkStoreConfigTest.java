@@ -1,5 +1,6 @@
 package io.strata.format;
 
+import io.strata.common.ChunkLimits;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -12,7 +13,7 @@ class ChunkStoreConfigTest {
         assertEquals(10_000L, c.groupCommitDrainTimeoutMs());
         assertEquals(1_000_000L, c.groupCommitMinAccumulationNanos());
         assertEquals(50_000_000L, c.groupCommitMaxAccumulationNanos());
-        assertEquals(262_144, c.maxOpenChunkLedgerEntries());
+        assertEquals(ChunkLimits.DEFAULT_MAX_OPEN_CHUNK_LEDGER_ENTRIES, c.maxOpenChunkLedgerEntries());
     }
 
     @Test

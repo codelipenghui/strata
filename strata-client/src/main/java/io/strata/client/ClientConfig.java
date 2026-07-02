@@ -1,5 +1,6 @@
 package io.strata.client;
 
+import io.strata.common.ChunkLimits;
 import io.strata.common.ConnectionPolicy;
 import io.strata.common.Endpoint;
 import io.strata.proto.ScpClient;
@@ -16,7 +17,8 @@ public record ClientConfig(List<String> controllerEndpoints, long chunkRollBytes
     private static final int DEFAULT_APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK = 64;
     private static final int DEFAULT_APPEND_CONNECTION_PENDING_HIGH_WATERMARK =
             Math.max(1, (ScpClient.maxPendingRequests() * 3) / 4);
-    private static final int DEFAULT_MAX_CHUNK_RECORDS = 262_144;
+    private static final int DEFAULT_MAX_CHUNK_RECORDS =
+            ChunkLimits.DEFAULT_MAX_CLIENT_CHUNK_RECORDS;
 
     public ClientConfig(List<String> controllerEndpoints, long chunkRollBytes, long callTimeoutMs) {
         this(controllerEndpoints, chunkRollBytes, callTimeoutMs, ConnectionPolicy.DEFAULT, 1, 15_000L, 200,
@@ -37,17 +39,6 @@ public record ClientConfig(List<String> controllerEndpoints, long chunkRollBytes
                 controllerRetryDeadlineMs, controllerRetryBackoffMs, recoveryCopyChunkBytes,
                 DEFAULT_APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK,
                 DEFAULT_APPEND_CONNECTION_PENDING_HIGH_WATERMARK,
-                DEFAULT_MAX_CHUNK_RECORDS);
-    }
-
-    public ClientConfig(List<String> controllerEndpoints, long chunkRollBytes, long callTimeoutMs,
-                        ConnectionPolicy connectionPolicy, int dataNodeConnectionsPerEndpoint,
-                        long controllerRetryDeadlineMs, int controllerRetryBackoffMs,
-                        int recoveryCopyChunkBytes, int appendReplicaInflightHighWatermark,
-                        int appendConnectionPendingHighWatermark) {
-        this(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy, dataNodeConnectionsPerEndpoint,
-                controllerRetryDeadlineMs, controllerRetryBackoffMs, recoveryCopyChunkBytes,
-                appendReplicaInflightHighWatermark, appendConnectionPendingHighWatermark,
                 DEFAULT_MAX_CHUNK_RECORDS);
     }
 
