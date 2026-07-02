@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * In-memory {@link NamespaceMetadataFileStore} for tests (design §8 "TestNamespaceMetadataFileStore"):
  * a deterministic backend for recovery and append-ordering validation, with no Strata data nodes.
  */
-final class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore {
+class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore {
     private final Map<FileId, ByteArrayOutputStream> logs = new ConcurrentHashMap<>();
     private final Map<FileId, byte[]> snapshots = new ConcurrentHashMap<>();
     private final Map<FileId, Integer> corruptSnapshotReads = new ConcurrentHashMap<>();

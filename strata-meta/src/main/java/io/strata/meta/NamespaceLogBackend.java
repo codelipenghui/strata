@@ -346,7 +346,8 @@ final class NamespaceLogBackend implements AutoCloseable {
     /**
      * Runs a mutating transaction against this node's repository for {@code namespace}, re-acquiring the
      * meta-log and retrying ONCE if the append is fenced ({@link ErrorCode#FENCED_EPOCH}) because another
-     * opener republished the manifest at a higher epoch.
+     * opener republished the manifest at a higher epoch, or if a previous ambiguous append failure poisoned
+     * the cached repo.
      *
      * <p>Without this, a controller that briefly co-owned a namespace during a membership settle keeps a
      * cached repository at the stale epoch, so every meta-log append fences forever — the file never
@@ -360,7 +361,11 @@ final class NamespaceLogBackend implements AutoCloseable {
     private <T> T withRepoReacquiringOnFence(StrataNamespace namespace, RepoTxn<T> txn) throws Exception {
         NamespaceMetadataLogRepository repo = repo(namespace);
         try {
-            return runLocked(repo, txn);
+            return runLockedMutation(repo, txn);
+        } catch (PoisonedMetadataLogRepositoryException e) {
+            log.warn("namespace {} meta-log repository poisoned after append failure ({}) — re-acquiring and retrying once",
+                    namespace, causeSummary(e.getCause()));
+            metrics.recordReacquire(namespace);
         } catch (Exception e) {
             if (!isFencedEpoch(e)) {
                 throw e;
@@ -369,7 +374,11 @@ final class NamespaceLogBackend implements AutoCloseable {
                     namespace, e);
             metrics.recordReacquire(namespace);
         }
-        return runLocked(reacquire(namespace, repo), txn);
+        try {
+            return runLockedMutation(reacquire(namespace, repo), txn);
+        } catch (PoisonedMetadataLogRepositoryException e) {
+            throw poisonFailure(e);
+        }
     }
 
     private static <T> T runLocked(NamespaceMetadataLogRepository repo, RepoTxn<T> txn) throws Exception {
@@ -378,6 +387,34 @@ final class NamespaceLogBackend implements AutoCloseable {
             return txn.run(repo);
         } finally {
             repo.unlock();
+        }
+    }
+
+    private static <T> T runLockedMutation(NamespaceMetadataLogRepository repo, RepoTxn<T> txn) throws Exception {
+        return runLocked(repo, locked -> {
+            if (locked.poisoned()) {
+                throw new PoisonedMetadataLogRepositoryException(locked.poisonCause());
+            }
+            return txn.run(locked);
+        });
+    }
+
+    private static Exception poisonFailure(PoisonedMetadataLogRepositoryException e) {
+        Throwable cause = e.getCause();
+        if (cause instanceof Exception ex) {
+            return ex;
+        }
+        return new ScpException(ErrorCode.INTERNAL,
+                "metadata-log repository poisoned by append failure", e);
+    }
+
+    private static String causeSummary(Throwable cause) {
+        return cause == null ? "unknown" : cause.toString();
+    }
+
+    private static final class PoisonedMetadataLogRepositoryException extends Exception {
+        private PoisonedMetadataLogRepositoryException(Throwable cause) {
+            super("metadata-log repository poisoned by append failure", cause, false, false);
         }
     }
 
@@ -390,10 +427,17 @@ final class NamespaceLogBackend implements AutoCloseable {
             NamespaceMetadataLogRepository stale) throws Exception {
         repoCreateLock.lock();
         try {
-            repos.remove(namespace, stale); // no-op if another thread already re-acquired
-            // In-place epoch bump on a namespace this node already owns — NOT an ownership handoff, so it
-            // must not increment ownerChanges (recordReacquire already counts this churn separately).
-            return openLocked(namespace, false);
+            boolean removed = repos.remove(namespace, stale); // no-op if another thread already re-acquired
+            try {
+                // In-place epoch bump on a namespace this node already owns — NOT an ownership handoff, so it
+                // must not increment ownerChanges (recordReacquire already counts this churn separately).
+                return openLocked(namespace, false);
+            } catch (Exception e) {
+                if (removed) {
+                    repos.putIfAbsent(namespace, stale);
+                }
+                throw e;
+            }
         } finally {
             repoCreateLock.unlock();
         }
@@ -669,15 +713,21 @@ final class NamespaceLogBackend implements AutoCloseable {
         int reaped = 0;
         // Iterate the repos lock-free, but lock EACH repo around its own sweep so the tombstone append
         // stays under that namespace's mutation lock (no cross-namespace head-of-line blocking).
-        for (NamespaceMetadataLogRepository repo : repos.values()) {
-            repo.lock();
+        for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
+            StrataNamespace namespace = e.getKey();
             try {
-                for (FileId id : repo.state().tombstonesDeletedAtOrBefore(cutoff)) {
-                    repo.append(new MetadataLogRecord.TombstoneSwept(id));
-                    reaped++;
+                reaped += withRepoReacquiringOnFence(namespace, repo -> {
+                    int swept = 0;
+                    for (FileId id : repo.state().tombstonesDeletedAtOrBefore(cutoff)) {
+                        repo.append(new MetadataLogRecord.TombstoneSwept(id));
+                        swept++;
+                    }
+                    return swept;
+                });
+            } catch (Exception ex) {
+                if (!closed) {
+                    log.warn("namespace {} tombstone sweep failed; will retry next sweep", namespace, ex);
                 }
-            } finally {
-                repo.unlock();
             }
         }
         return reaped;
