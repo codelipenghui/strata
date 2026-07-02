@@ -20,6 +20,7 @@ import java.lang.management.ManagementFactory;
 import java.lang.management.OperatingSystemMXBean;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -420,13 +421,21 @@ public final class ChunkStore implements AutoCloseable {
                     deleteLedgerDurably(h.id, h.ledgerPath, h.shardDir);
                     FailureInjector.point("format.reclaim.afterLedgerDurableBeforeMetaDelete");
                     Files.deleteIfExists(h.metaPath);
-                    h.sealedLedgerPending = false;
-                    closeAndNullData(h);                // release the writable FD; reads use the cache
-                    reclaimed = true;
                 } finally {
                     h.lock.unlock();
                 }
                 forceDirectory(h.shardDir); // make the unlink durable (recovery's SEALED branch re-deletes otherwise)
+                h.lock.lock();
+                try {
+                    if (chunks.get(h.nsKey) == h && h.data == data
+                            && h.state == ChunkState.SEALED && h.sealedLedgerPending) {
+                        h.sealedLedgerPending = false;
+                        closeAndNullData(h);                // release the writable FD; reads use the cache
+                        reclaimed = true;
+                    }
+                } finally {
+                    h.lock.unlock();
+                }
             } catch (IOException | RuntimeException e) {
                 log.warn("sealed-ledger reclaim of {} failed (will retry)", h.id, e);
                 continue;
@@ -628,15 +637,33 @@ public final class ChunkStore implements AutoCloseable {
 
         void persistSidecar(boolean sync) throws IOException {
             byte[] bytes = new ChunkFormats.Sidecar(writeEpoch, fenceEpoch, lastKnownDO, state).encode();
-            boolean existed = Files.exists(metaPath);
-            try (FileChannel ch = FileChannel.open(metaPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
-                writeFully(ch, ByteBuffer.wrap(bytes), 0);
-                if (sync) {
-                    ch.force(true);
+            Path tmp = metaPath.resolveSibling(metaPath.getFileName() + ".tmp-"
+                    + Thread.currentThread().threadId() + "-" + System.nanoTime());
+            boolean moved = false;
+            try {
+                try (FileChannel ch = FileChannel.open(tmp, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+                    writeFully(ch, ByteBuffer.wrap(bytes), 0);
+                    if (sync) {
+                        ch.force(true);
+                    }
                 }
-            }
-            if (sync && !existed) {
-                forceDirectory(shardDir);
+                try {
+                    Files.move(tmp, metaPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                } catch (AtomicMoveNotSupportedException e) {
+                    Files.move(tmp, metaPath, StandardCopyOption.REPLACE_EXISTING);
+                }
+                moved = true;
+                if (sync) {
+                    forceDirectory(shardDir);
+                }
+            } finally {
+                if (!moved) {
+                    try {
+                        Files.deleteIfExists(tmp);
+                    } catch (IOException e) {
+                        log.warn("failed to clean up sidecar temp {}", tmp, e);
+                    }
+                }
             }
         }
 
@@ -1242,7 +1269,7 @@ public final class ChunkStore implements AutoCloseable {
     private SealPrep prepareSealLocked(Handle h, ByteBuffer callerSections, long dataLength) throws IOException {
         CallerSections caller = readCallerSections(callerSections);
         CrcScan scan = dataLength == h.end ? h.snapshotRunningCrcs() : scanDataCrcs(h.data, dataLength);
-        int ledgerEntryCount = ledgerEntriesThrough(h.ledger, dataLength);
+        int ledgerEntryCount = ledgerEntriesThroughSeal(h.ledger, dataLength);
         return new SealPrep(caller, scan, ledgerEntryCount);
     }
 
@@ -1262,6 +1289,7 @@ public final class ChunkStore implements AutoCloseable {
         if (dataLength < h.end) {
             h.data.truncate(checkedAdd(DATA_START, dataLength, "chunk file offset"));
             h.ledger.truncateTo(dataLength);
+            appendSealBoundaryLedgerEntryIfNeeded(h, dataLength);
             h.end = dataLength;
         }
         long tTruncate = System.nanoTime();
@@ -1347,13 +1375,46 @@ public final class ChunkStore implements AutoCloseable {
 
     private record CallerSections(int count, byte[] bytes) {}
 
-    private static int ledgerEntriesThrough(IntegrityLedger ledger, long endOffset) {
+    private static int ledgerEntriesThroughSeal(IntegrityLedger ledger, long endOffset) {
         int count = 0;
+        long lastEnd = 0;
         for (ChunkFormats.LedgerEntry e : ledger.entries()) {
             if (e.endOffset() > endOffset) break;
             count++;
+            lastEnd = e.endOffset();
+        }
+        if (endOffset > lastEnd) {
+            count++;
         }
         return count;
+    }
+
+    private void appendSealBoundaryLedgerEntryIfNeeded(Handle h, long dataLength) throws IOException {
+        long ledgerEnd = h.ledger.lastEndOffset();
+        if (ledgerEnd == dataLength) {
+            return;
+        }
+        if (ledgerEnd > dataLength) {
+            throw new ScpException(ErrorCode.INTERNAL,
+                    "seal ledger boundary beyond data length: " + ledgerEnd + " > " + dataLength);
+        }
+        int crc = crcDataRange(h.data, ledgerEnd, dataLength);
+        h.ledger.append(new ChunkFormats.LedgerEntry(dataLength, crc, h.writeEpoch));
+        h.ledger.force();
+    }
+
+    private int crcDataRange(FileChannel data, long start, long end) throws IOException {
+        CRC32C crc = new CRC32C();
+        byte[] buf = new byte[1 << 20];
+        long pos = start;
+        while (pos < end) {
+            int n = (int) Math.min(buf.length, end - pos);
+            ByteBuffer bb = ByteBuffer.wrap(buf, 0, n);
+            readFully(data, bb, checkedAdd(DATA_START, pos, "chunk file offset"));
+            crc.update(buf, 0, n);
+            pos += n;
+        }
+        return (int) crc.getValue();
     }
 
     private static CallerSections readCallerSections(ByteBuffer callerSections) {
@@ -2032,6 +2093,8 @@ public final class ChunkStore implements AutoCloseable {
                 h.fenceEpoch = sidecar.fenceEpoch();
                 h.lastKnownDO = sidecar.lastKnownDO();
                 // OPEN: replay ledger, verify tail data CRCs, truncate to the last verified boundary
+                long dataSizeBeforeRecovery = h.data.size();
+                long ledgerSizeBeforeRecovery = Files.exists(h.ledgerPath) ? Files.size(h.ledgerPath) : 0;
                 if (!Files.exists(h.ledgerPath) && h.data.size() > HEADER_SIZE) {
                     // the ledger should only ever be absent for SEALED chunks; an open chunk with
                     // data but no ledger means external damage — its bytes are unverifiable and the
@@ -2062,7 +2125,14 @@ public final class ChunkStore implements AutoCloseable {
                     verifiedEnd = e.endOffset();
                 }
                 h.ledger.truncateTo(verifiedEnd);
-                h.data.truncate(checkedAdd(DATA_START, verifiedEnd, "chunk file offset"));
+                long recoveredDataSize = checkedAdd(DATA_START, verifiedEnd, "chunk file offset");
+                h.data.truncate(recoveredDataSize);
+                long recoveredLedgerSize = (long) h.ledger.size() * ChunkFormats.LEDGER_ENTRY_SIZE;
+                if (dataSizeBeforeRecovery != recoveredDataSize || ledgerSizeBeforeRecovery != recoveredLedgerSize) {
+                    h.data.force(false);
+                    h.ledger.force();
+                    FailureInjector.point("format.recovery.afterOpenTruncateForce");
+                }
                 h.state = ChunkState.OPEN;
                 h.end = verifiedEnd;
                 h.lastKnownDO = Math.min(h.lastKnownDO, verifiedEnd);
@@ -2218,7 +2288,10 @@ public final class ChunkStore implements AutoCloseable {
     private static boolean ledgerEndsCleanlyAt(Path ledgerPath, long dataLength) {
         try {
             long size = Files.size(ledgerPath);
-            if (size == 0 || size % ChunkFormats.LEDGER_ENTRY_SIZE != 0) {
+            if (size == 0) {
+                return dataLength == 0;
+            }
+            if (size % ChunkFormats.LEDGER_ENTRY_SIZE != 0) {
                 return false;
             }
             byte[] buf = new byte[ChunkFormats.LEDGER_ENTRY_SIZE];
@@ -2472,7 +2545,7 @@ public final class ChunkStore implements AutoCloseable {
                 }
                 if (h.state != ChunkState.SEALED) {
                     try {
-                        h.persistSidecar(); // persist advisory DO/epochs on clean shutdown
+                        h.persistSidecar(sealFsync || h.header.fsyncOnAck()); // persist advisory DO/epochs on clean shutdown
                     } catch (IOException | RuntimeException e) {
                         log.warn("close {} failed", h.id, e);
                         failure = Closeables.suppress(failure, e);
