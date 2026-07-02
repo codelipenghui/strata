@@ -881,6 +881,12 @@ public final class ChunkStore implements AutoCloseable {
             if (len == 0) {
                 return CompletableFuture.completedFuture(new AppendResult(h.end)); // DO beacon
             }
+            if (h.ledger.size() >= csConfig.maxOpenChunkLedgerEntries()) {
+                throw new ScpException(ErrorCode.CHUNK_SEALED,
+                        "open chunk ledger entry cap reached for " + id + ": "
+                                + h.ledger.size() + " >= " + csConfig.maxOpenChunkLedgerEntries(),
+                        h.end);
+            }
             newEnd = checkedAdd(baseOffset, len, "chunk offset");
             long writePos = checkedAdd(DATA_START, baseOffset, "chunk file offset");
             writeFully(h.data, payload.duplicate(), writePos);

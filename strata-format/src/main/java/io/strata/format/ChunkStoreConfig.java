@@ -15,11 +15,12 @@ public record ChunkStoreConfig(
         long backgroundFlushThresholdBytes,
         long slowAppendLogMs,
         long slowMutationLogMs,
-        int channelCacheMaxSize) {
+        int channelCacheMaxSize,
+        int maxOpenChunkLedgerEntries) {
 
     public static final ChunkStoreConfig DEFAULT =
             new ChunkStoreConfig(8 * 1024 * 1024, 10_000L, 1_000_000L, 50_000_000L,
-                    false, 500L, 4L << 20, 1_000L, 500L, defaultChannelCacheCapacity());
+                    false, 500L, 4L << 20, 1_000L, 500L, defaultChannelCacheCapacity(), 262_144);
 
     public ChunkStoreConfig(int maxRequestBytes, long groupCommitDrainTimeoutMs,
                             long groupCommitMinAccumulationNanos,
@@ -27,7 +28,19 @@ public record ChunkStoreConfig(
         this(maxRequestBytes, groupCommitDrainTimeoutMs, groupCommitMinAccumulationNanos,
                 groupCommitMaxAccumulationNanos, DEFAULT.sealFsync, DEFAULT.backgroundFlushIntervalMs,
                 DEFAULT.backgroundFlushThresholdBytes, DEFAULT.slowAppendLogMs, DEFAULT.slowMutationLogMs,
-                DEFAULT.channelCacheMaxSize);
+                DEFAULT.channelCacheMaxSize, DEFAULT.maxOpenChunkLedgerEntries);
+    }
+
+    public ChunkStoreConfig(int maxRequestBytes, long groupCommitDrainTimeoutMs,
+                            long groupCommitMinAccumulationNanos,
+                            long groupCommitMaxAccumulationNanos,
+                            boolean sealFsync, long backgroundFlushIntervalMs,
+                            long backgroundFlushThresholdBytes, long slowAppendLogMs,
+                            long slowMutationLogMs, int channelCacheMaxSize) {
+        this(maxRequestBytes, groupCommitDrainTimeoutMs, groupCommitMinAccumulationNanos,
+                groupCommitMaxAccumulationNanos, sealFsync, backgroundFlushIntervalMs,
+                backgroundFlushThresholdBytes, slowAppendLogMs, slowMutationLogMs, channelCacheMaxSize,
+                DEFAULT.maxOpenChunkLedgerEntries);
     }
 
     public ChunkStoreConfig {
@@ -61,48 +74,64 @@ public record ChunkStoreConfig(
         if (channelCacheMaxSize <= 0) {
             throw new IllegalArgumentException("channelCacheMaxSize must be positive: " + channelCacheMaxSize);
         }
+        if (maxOpenChunkLedgerEntries <= 0) {
+            throw new IllegalArgumentException("maxOpenChunkLedgerEntries must be positive: "
+                    + maxOpenChunkLedgerEntries);
+        }
     }
 
     public ChunkStoreConfig withMaxRequestBytes(int v) {
         return new ChunkStoreConfig(v, groupCommitDrainTimeoutMs, groupCommitMinAccumulationNanos,
                 groupCommitMaxAccumulationNanos, sealFsync, backgroundFlushIntervalMs,
-                backgroundFlushThresholdBytes, slowAppendLogMs, slowMutationLogMs, channelCacheMaxSize);
+                backgroundFlushThresholdBytes, slowAppendLogMs, slowMutationLogMs, channelCacheMaxSize,
+                maxOpenChunkLedgerEntries);
     }
 
     public ChunkStoreConfig withGroupCommitDrainTimeoutMs(long v) {
         return new ChunkStoreConfig(maxRequestBytes, v, groupCommitMinAccumulationNanos,
                 groupCommitMaxAccumulationNanos, sealFsync, backgroundFlushIntervalMs,
-                backgroundFlushThresholdBytes, slowAppendLogMs, slowMutationLogMs, channelCacheMaxSize);
+                backgroundFlushThresholdBytes, slowAppendLogMs, slowMutationLogMs, channelCacheMaxSize,
+                maxOpenChunkLedgerEntries);
     }
 
     public ChunkStoreConfig withGroupCommitAccumulationNanos(long min, long max) {
         return new ChunkStoreConfig(maxRequestBytes, groupCommitDrainTimeoutMs, min, max, sealFsync,
                 backgroundFlushIntervalMs, backgroundFlushThresholdBytes, slowAppendLogMs, slowMutationLogMs,
-                channelCacheMaxSize);
+                channelCacheMaxSize, maxOpenChunkLedgerEntries);
     }
 
     public ChunkStoreConfig withSealFsync(boolean enabled) {
         return new ChunkStoreConfig(maxRequestBytes, groupCommitDrainTimeoutMs, groupCommitMinAccumulationNanos,
                 groupCommitMaxAccumulationNanos, enabled, backgroundFlushIntervalMs,
-                backgroundFlushThresholdBytes, slowAppendLogMs, slowMutationLogMs, channelCacheMaxSize);
+                backgroundFlushThresholdBytes, slowAppendLogMs, slowMutationLogMs, channelCacheMaxSize,
+                maxOpenChunkLedgerEntries);
     }
 
     public ChunkStoreConfig withBackgroundFlush(long intervalMs, long thresholdBytes) {
         return new ChunkStoreConfig(maxRequestBytes, groupCommitDrainTimeoutMs, groupCommitMinAccumulationNanos,
                 groupCommitMaxAccumulationNanos, sealFsync, intervalMs, thresholdBytes, slowAppendLogMs,
-                slowMutationLogMs, channelCacheMaxSize);
+                slowMutationLogMs, channelCacheMaxSize, maxOpenChunkLedgerEntries);
     }
 
     public ChunkStoreConfig withSlowLogThresholds(long appendMs, long mutationMs) {
         return new ChunkStoreConfig(maxRequestBytes, groupCommitDrainTimeoutMs, groupCommitMinAccumulationNanos,
                 groupCommitMaxAccumulationNanos, sealFsync, backgroundFlushIntervalMs,
-                backgroundFlushThresholdBytes, appendMs, mutationMs, channelCacheMaxSize);
+                backgroundFlushThresholdBytes, appendMs, mutationMs, channelCacheMaxSize,
+                maxOpenChunkLedgerEntries);
     }
 
     public ChunkStoreConfig withChannelCacheMaxSize(int maxSize) {
         return new ChunkStoreConfig(maxRequestBytes, groupCommitDrainTimeoutMs, groupCommitMinAccumulationNanos,
                 groupCommitMaxAccumulationNanos, sealFsync, backgroundFlushIntervalMs,
-                backgroundFlushThresholdBytes, slowAppendLogMs, slowMutationLogMs, maxSize);
+                backgroundFlushThresholdBytes, slowAppendLogMs, slowMutationLogMs, maxSize,
+                maxOpenChunkLedgerEntries);
+    }
+
+    public ChunkStoreConfig withMaxOpenChunkLedgerEntries(int maxEntries) {
+        return new ChunkStoreConfig(maxRequestBytes, groupCommitDrainTimeoutMs, groupCommitMinAccumulationNanos,
+                groupCommitMaxAccumulationNanos, sealFsync, backgroundFlushIntervalMs,
+                backgroundFlushThresholdBytes, slowAppendLogMs, slowMutationLogMs, channelCacheMaxSize,
+                maxEntries);
     }
 
     /**

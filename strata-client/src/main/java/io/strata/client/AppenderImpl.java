@@ -85,6 +85,7 @@ final class AppenderImpl implements StrataFile.Appender {
         final int[] inFlight;
         long end;                      // chunk-local next append offset
         long durable;                  // chunk-local DO (ack-quorum threshold)
+        int recordCount;               // non-empty append records admitted to this chunk
         final ArrayDeque<Pending> pending = new ArrayDeque<>();
         boolean needRoll;
 
@@ -160,6 +161,7 @@ final class AppenderImpl implements StrataFile.Appender {
                 long base = s.end;
                 long newEnd = checkedAdd(base, len, "chunk offset");
                 s.end = newEnd;
+                s.recordCount++;
                 CompletableFuture<Long> callerFuture = new CompletableFuture<>();
                 s.pending.addLast(new Pending(newEnd, callerFuture));
 
@@ -197,7 +199,7 @@ final class AppenderImpl implements StrataFile.Appender {
     private boolean shouldRollBeforeAppend(ChunkSession s) {
         // A freshly opened partial-quorum chunk must accept the append that opened it; rolling at
         // end==0 immediately asks metadata for another full-RF placement and can loop on NO_CAPACITY.
-        return s.needRoll && s.end > 0;
+        return (s.needRoll && s.end > 0) || s.recordCount >= config.maxChunkRecords();
     }
 
     private void onReplicaResponse(ChunkSession s, int replicaIndex, long expectedEnd, Frame frame, Throwable err) {

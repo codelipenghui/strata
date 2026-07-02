@@ -12,6 +12,7 @@ class ChunkStoreConfigTest {
         assertEquals(10_000L, c.groupCommitDrainTimeoutMs());
         assertEquals(1_000_000L, c.groupCommitMinAccumulationNanos());
         assertEquals(50_000_000L, c.groupCommitMaxAccumulationNanos());
+        assertEquals(262_144, c.maxOpenChunkLedgerEntries());
     }
 
     @Test
@@ -20,6 +21,12 @@ class ChunkStoreConfigTest {
         assertThrows(IllegalArgumentException.class, () -> new ChunkStoreConfig(8 << 20, 0L, 1_000_000L, 50_000_000L));
         // max < min -> invalid
         assertThrows(IllegalArgumentException.class, () -> new ChunkStoreConfig(8 << 20, 10_000L, 50_000_000L, 1_000_000L));
+    }
+
+    @Test
+    void rejectsNonPositiveMaxOpenChunkLedgerEntries() {
+        assertThrows(IllegalArgumentException.class,
+                () -> ChunkStoreConfig.DEFAULT.withMaxOpenChunkLedgerEntries(0));
     }
 
     @Test
@@ -44,10 +51,12 @@ class ChunkStoreConfigTest {
     void withSettersOverride() {
         ChunkStoreConfig c = ChunkStoreConfig.DEFAULT.withMaxRequestBytes(4 << 20)
                 .withGroupCommitDrainTimeoutMs(20_000L)
-                .withGroupCommitAccumulationNanos(2_000_000L, 80_000_000L);
+                .withGroupCommitAccumulationNanos(2_000_000L, 80_000_000L)
+                .withMaxOpenChunkLedgerEntries(128);
         assertEquals(4 << 20, c.maxRequestBytes());
         assertEquals(20_000L, c.groupCommitDrainTimeoutMs());
         assertEquals(2_000_000L, c.groupCommitMinAccumulationNanos());
         assertEquals(80_000_000L, c.groupCommitMaxAccumulationNanos());
+        assertEquals(128, c.maxOpenChunkLedgerEntries());
     }
 }

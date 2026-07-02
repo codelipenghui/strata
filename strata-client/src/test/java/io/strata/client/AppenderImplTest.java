@@ -1689,6 +1689,55 @@ class AppenderImplTest {
     }
 
     @Test
+    void appendRollsBeforeExceedingMaxChunkRecords() throws Exception {
+        FileId fileId = FileId.of(39);
+        AtomicInteger createCalls = new AtomicInteger();
+        AtomicInteger oldChunkAppends = new AtomicInteger();
+        AtomicInteger newChunkAppends = new AtomicInteger();
+        AtomicReference<Long> sealedChunkLength = new AtomicReference<>();
+
+        try (ScpServer s1 = countedByChunkDataNodeServer(1, fileId, oldChunkAppends, newChunkAppends);
+             ScpServer s2 = countedByChunkDataNodeServer(2, fileId, oldChunkAppends, newChunkAppends);
+             ScpServer s3 = countedByChunkDataNodeServer(3, fileId, oldChunkAppends, newChunkAppends);
+             ScpServer metaServer = new ScpServer(0, 0, 0, 0, req -> {
+                 Opcode op = Opcode.fromCode(req.opcode());
+                 if (op == Opcode.CREATE_CHUNK) {
+                     Messages.CreateChunk.decode(req.headerSlice());
+                     int chunkIndex = createCalls.getAndIncrement();
+                     ChunkId created = new ChunkId(fileId, chunkIndex);
+                     return ScpServer.ok(req, new Messages.CreateChunkResp(created, 1, List.of(
+                             new Messages.Replica(1, endpoint(s1)),
+                             new Messages.Replica(2, endpoint(s2)),
+                             new Messages.Replica(3, endpoint(s3)))).encode(), null);
+                 }
+                 if (op == Opcode.SEAL_CHUNK_META) {
+                     Messages.SealChunkMeta seal = Messages.SealChunkMeta.decode(req.headerSlice());
+                     sealedChunkLength.set(seal.length());
+                     return ScpServer.ok(req, Messages.okHeader(), null);
+                 }
+                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+             })) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
+                    .withMaxChunkRecords(2);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+
+                assertEquals(1L, appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS));
+                assertEquals(2L, appender.append(ByteBuffer.wrap(new byte[] {2})).get(1, TimeUnit.SECONDS));
+                waitFor(() -> oldChunkAppends.get() == 6 && appendsQuiesced(appender));
+
+                assertEquals(3L, appender.append(ByteBuffer.wrap(new byte[] {3})).get(1, TimeUnit.SECONDS));
+
+                assertEquals(2, createCalls.get(), "third record must roll to a successor chunk");
+                assertEquals(2L, sealedChunkLength.get());
+                assertEquals(6, oldChunkAppends.get());
+                assertEquals(3, newChunkAppends.get());
+            }
+        }
+    }
+
+    @Test
     void appendRetriesOnActiveSessionAfterBackpressureWaitSeesRolledSession() throws Exception {
         FileId fileId = FileId.of(37);
         AtomicInteger oldAppends = new AtomicInteger();
@@ -2014,6 +2063,32 @@ class AppenderImplTest {
             if (op == Opcode.APPEND) {
                 appends.incrementAndGet();
                 Messages.Append append = Messages.Append.decode(req.headerSlice());
+                return ScpServer.ok(req,
+                        new Messages.AppendResp(append.baseOffset() + req.payloadLength()).encode(), null);
+            }
+            if (op == Opcode.SEAL_CHUNK) {
+                Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
+                return ScpServer.ok(req, new Messages.SealResp(seal.dataLength(), 123).encode(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+    }
+
+    private static ScpServer countedByChunkDataNodeServer(int nodeId, FileId fileId,
+                                                          AtomicInteger chunk0Appends,
+                                                          AtomicInteger chunk1Appends) throws Exception {
+        return new ScpServer(0, nodeId, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.OPEN_CHUNK) {
+                return ScpServer.ok(req, Messages.okHeader(), null);
+            }
+            if (op == Opcode.APPEND) {
+                Messages.Append append = Messages.Append.decode(req.headerSlice());
+                if (append.chunkId().equals(new ChunkId(fileId, 0))) {
+                    chunk0Appends.incrementAndGet();
+                } else if (append.chunkId().equals(new ChunkId(fileId, 1))) {
+                    chunk1Appends.incrementAndGet();
+                }
                 return ScpServer.ok(req,
                         new Messages.AppendResp(append.baseOffset() + req.payloadLength()).encode(), null);
             }

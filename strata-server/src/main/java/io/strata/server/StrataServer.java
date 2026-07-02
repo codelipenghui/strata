@@ -139,7 +139,9 @@ public final class StrataServer {
                         longEnv("STRATA_SLOW_APPEND_LOG_MS", 1_000),
                         longEnv("STRATA_SLOW_MUTATION_LOG_MS", 500),
                         intEnv("STRATA_FILE_CHANNEL_CACHE_MAX_SIZE",
-                                ChunkStoreConfig.DEFAULT.channelCacheMaxSize())));
+                                ChunkStoreConfig.DEFAULT.channelCacheMaxSize()),
+                        intEnv("STRATA_MAX_OPEN_CHUNK_LEDGER_ENTRIES",
+                                ChunkStoreConfig.DEFAULT.maxOpenChunkLedgerEntries())));
         DataNode node = new DataNode(config);
         log.info("data node started: endpoint={} dataDir={} controller={}",
                 node.endpoint(), config.dataDir(), config.controllerEndpoints());
@@ -231,7 +233,9 @@ public final class StrataServer {
                         longEnv("STRATA_SLOW_APPEND_LOG_MS", 1_000),
                         longEnv("STRATA_SLOW_MUTATION_LOG_MS", 500),
                         intEnv("STRATA_FILE_CHANNEL_CACHE_MAX_SIZE",
-                                ChunkStoreConfig.DEFAULT.channelCacheMaxSize())));
+                                ChunkStoreConfig.DEFAULT.channelCacheMaxSize()),
+                        intEnv("STRATA_MAX_OPEN_CHUNK_LEDGER_ENTRIES",
+                                ChunkStoreConfig.DEFAULT.maxOpenChunkLedgerEntries())));
         Combined combined = startCombined(controllerConfig, nodeConfig);
         log.info("combined node started: scp={} zk={}", combined.node().endpoint(), controllerConfig.zkConnect());
         awaitShutdown("combined node", combined);
