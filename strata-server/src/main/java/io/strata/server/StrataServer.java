@@ -380,7 +380,8 @@ public final class StrataServer {
         String backend = env("STRATA_CONTROLLER_BACKEND", "zk");
         if (!"namespace-log".equalsIgnoreCase(backend)) {
             return new ControllerConfig.MetadataBackendConfig(backend, 3, 2, false,
-                    4 * 1024 * 1024, 30_000, true, 0, 4 * 1024 * 1024);
+                    4 * 1024 * 1024, 30_000, true,
+                    ControllerConfig.DEFAULT_NAMESPACE_LOG_RETENTION_MS, 4 * 1024 * 1024);
         }
         return new ControllerConfig.MetadataBackendConfig("namespace-log",
                 intEnv("STRATA_CONTROLLER_LOG_RF", 3),
@@ -389,7 +390,8 @@ public final class StrataServer {
                 intEnv("STRATA_CONTROLLER_LOG_COMPACT_BYTES", 4 * 1024 * 1024),
                 intEnv("STRATA_CONTROLLER_LOG_COMPACT_INTERVAL_MS", 30_000),
                 boolEnv("STRATA_CONTROLLER_LOG_ORPHAN_GC", true),
-                intEnv("STRATA_CONTROLLER_LOG_RETENTION_MS", 0),
+                intEnv("STRATA_CONTROLLER_LOG_RETENTION_MS",
+                        ControllerConfig.DEFAULT_NAMESPACE_LOG_RETENTION_MS),
                 intEnv("STRATA_CONTROLLER_LOG_READ_CHUNK_BYTES", 4 * 1024 * 1024));
     }
 

@@ -13,19 +13,39 @@ import java.util.Optional;
 final class NamespaceMetadataRecovery {
     private NamespaceMetadataRecovery() {}
 
-    record Recovered(NamespaceMetadataState state, long durableEndOffset, long recordsReplayed, long bytesRead) {}
+    record Recovered(NamespaceMetadataState state, long durableEndOffset, long recordsReplayed, long bytesRead,
+                     Optional<Records.NamespaceManifest> sourceManifest) {}
 
     static Recovered recover(StrataNamespace namespace, NamespaceMetadataFileStore fileStore,
                              Optional<Records.NamespaceManifest> manifest) throws Exception {
-        NamespaceMetadataState state = new NamespaceMetadataState(namespace);
         if (manifest.isEmpty()) {
-            return new Recovered(state, 0L, 0L, 0L); // never published — a fresh namespace
+            return new Recovered(new NamespaceMetadataState(namespace), 0L, 0L, 0L, Optional.empty());
         }
-        Records.NamespaceManifest m = manifest.get();
+        return recoverFromManifest(namespace, fileStore, manifest.get(), true);
+    }
+
+    private static Recovered recoverFromManifest(StrataNamespace namespace, NamespaceMetadataFileStore fileStore,
+                                                 Records.NamespaceManifest m, boolean allowPreviousFallback)
+            throws Exception {
+        NamespaceMetadataState state = new NamespaceMetadataState(namespace);
         if (m.snapshotFileId().isPresent()) {
-            NamespaceMetadataState.Snapshot snapshot =
-                    NamespaceMetadataSnapshotCodec.decode(fileStore.readSnapshot(m.snapshotFileId().get()));
-            state.restore(snapshot);
+            try {
+                NamespaceMetadataState.Snapshot snapshot =
+                        NamespaceMetadataSnapshotCodec.decode(fileStore.readSnapshot(m.snapshotFileId().get()));
+                state.restore(snapshot);
+            } catch (IllegalArgumentException snapshotFailure) {
+                if (!allowPreviousFallback || m.previous().isEmpty()) {
+                    throw snapshotFailure;
+                }
+                Records.NamespaceManifest previous =
+                        m.previous().get().toManifest(namespace, m.metadataEpoch());
+                try {
+                    return recoverFromManifest(namespace, fileStore, previous, false);
+                } catch (Exception fallbackFailure) {
+                    snapshotFailure.addSuppressed(fallbackFailure);
+                    throw snapshotFailure;
+                }
+            }
         }
         long durableEnd = m.logStartOffset();
         long recordsReplayed = 0;
@@ -42,6 +62,6 @@ final class NamespaceMetadataRecovery {
             recordsReplayed = prefix.records().size();
             bytesRead = prefix.validBytes();
         }
-        return new Recovered(state, durableEnd, recordsReplayed, bytesRead);
+        return new Recovered(state, durableEnd, recordsReplayed, bytesRead, Optional.of(m));
     }
 }

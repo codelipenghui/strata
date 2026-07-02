@@ -206,7 +206,7 @@ public final class Controller implements AutoCloseable {
         boolean orphanGc = backend.namespaceLogOrphanGc();
         // Safety delay (design §10 step 6 / issue #8): retain a superseded metadata-log generation this many
         // ms after it is superseded before the sweep reclaims it — a rollback margin against a bad newest
-        // generation. 0 (default) disables the window: superseded generations are reclaimed on the next sweep.
+        // generation. 0 disables the window: superseded generations are reclaimed on the next sweep.
         int retentionMs = backend.namespaceLogRetentionMs();
         int readChunkBytes = backend.namespaceLogReadChunkBytes();
         return (root, endpoint) -> {

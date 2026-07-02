@@ -51,6 +51,16 @@ final class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore
         return b.clone();
     }
 
+    synchronized void corruptSnapshot(FileId snapshotFileId) {
+        byte[] b = snapshots.get(snapshotFileId);
+        if (b == null) {
+            throw new IllegalStateException("no snapshot file " + snapshotFileId);
+        }
+        byte[] corrupt = b.clone();
+        corrupt[0] ^= 0x01;
+        snapshots.put(snapshotFileId, corrupt);
+    }
+
     @Override
     public void deleteFile(FileId fileId) {
         logs.remove(fileId);

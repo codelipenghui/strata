@@ -31,6 +31,8 @@ public record ControllerConfig(
         int zkRetryMaxRetries,       // Curator ExponentialBackoffRetry max retries
         MetadataBackendConfig metadataBackendConfig
 ) {
+    public static final int DEFAULT_NAMESPACE_LOG_RETENTION_MS = 5 * 60_000;
+
     public record MetadataBackendConfig(
             String backend,
             int namespaceLogReplicationFactor,
@@ -72,12 +74,12 @@ public record ControllerConfig(
 
         public static MetadataBackendConfig zk() {
             return new MetadataBackendConfig("zk", 3, 2, false, 4 * 1024 * 1024, 30_000,
-                    true, 0, 4 * 1024 * 1024);
+                    true, DEFAULT_NAMESPACE_LOG_RETENTION_MS, 4 * 1024 * 1024);
         }
 
         public static MetadataBackendConfig namespaceLog() {
             return new MetadataBackendConfig("namespace-log", 3, 2, false, 4 * 1024 * 1024,
-                    30_000, true, 0, 4 * 1024 * 1024);
+                    30_000, true, DEFAULT_NAMESPACE_LOG_RETENTION_MS, 4 * 1024 * 1024);
         }
 
         public boolean namespaceLogEnabled() {

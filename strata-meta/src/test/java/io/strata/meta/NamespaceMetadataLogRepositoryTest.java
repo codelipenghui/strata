@@ -71,6 +71,33 @@ class NamespaceMetadataLogRepositoryTest {
     }
 
     @Test
+    void recoveryFallsBackToPreviousGenerationWhenCurrentSnapshotCrcFails() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            TestNamespaceMetadataFileStore fs = new TestNamespaceMetadataFileStore();
+            NamespaceMetadataLogRepository repo = NamespaceMetadataLogRepository.open(NS, fs, root, 1);
+
+            FileId a = FileId.of(1);
+            repo.append(fileCreated(a, "/a", 1));
+            repo.compactAndPublish(); // generation 2: snapshot has /a, log will carry /b below
+
+            FileId b = FileId.of(2);
+            repo.append(fileCreated(b, "/b", 2));
+            repo.compactAndPublish(); // generation 3: current snapshot has /a + /b
+
+            Records.NamespaceManifest current = root.getNamespaceManifest(NS).orElseThrow().value();
+            fs.corruptSnapshot(current.snapshotFileId().orElseThrow());
+
+            NamespaceMetadataLogRepository successor = NamespaceMetadataLogRepository.open(NS, fs, root, 2);
+
+            assertTrue(successor.state().file(a).isPresent(), "fallback snapshot recovers pre-compaction file");
+            assertTrue(successor.state().file(b).isPresent(), "fallback log recovers tail file");
+            assertTrue(successor.generation() > current.generation(),
+                    "successful fallback is republished as a fresh generation");
+        }
+    }
+
+    @Test
     void compactionRetainsTheSupersededGenerationRatherThanDeletingItInline() throws Exception {
         // Issue #8: publishCompacted must NOT delete the just-superseded snapshot/log pair inline the instant
         // the new manifest is durable. The prior generation is retained as a rollback margin and reclaimed

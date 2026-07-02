@@ -382,26 +382,56 @@ public final class Records {
      */
     public record NamespaceManifest(StrataNamespace namespace, long metadataEpoch, long generation,
                                     long logStartOffset, long publishedLogOffset,
-                                    Optional<FileId> snapshotFileId, Optional<FileId> logFileId) {
+                                    Optional<FileId> snapshotFileId, Optional<FileId> logFileId,
+                                    Optional<NamespaceManifestRef> previous) {
+        public NamespaceManifest(StrataNamespace namespace, long metadataEpoch, long generation,
+                                 long logStartOffset, long publishedLogOffset,
+                                 Optional<FileId> snapshotFileId, Optional<FileId> logFileId) {
+            this(namespace, metadataEpoch, generation, logStartOffset, publishedLogOffset,
+                    snapshotFileId, logFileId, Optional.empty());
+        }
+
         public NamespaceManifest {
             namespace = Objects.requireNonNull(namespace, "namespace");
             snapshotFileId = Objects.requireNonNull(snapshotFileId, "snapshotFileId");
             logFileId = Objects.requireNonNull(logFileId, "logFileId");
+            previous = Objects.requireNonNull(previous, "previous");
+        }
+
+        public record NamespaceManifestRef(long generation, long logStartOffset, long publishedLogOffset,
+                                           Optional<FileId> snapshotFileId, Optional<FileId> logFileId) {
+            public NamespaceManifestRef {
+                snapshotFileId = Objects.requireNonNull(snapshotFileId, "snapshotFileId");
+                logFileId = Objects.requireNonNull(logFileId, "logFileId");
+            }
+
+            static NamespaceManifestRef from(NamespaceManifest manifest) {
+                return new NamespaceManifestRef(manifest.generation(), manifest.logStartOffset(),
+                        manifest.publishedLogOffset(), manifest.snapshotFileId(), manifest.logFileId());
+            }
+
+            NamespaceManifest toManifest(StrataNamespace namespace, long metadataEpoch) {
+                return new NamespaceManifest(namespace, metadataEpoch, generation, logStartOffset,
+                        publishedLogOffset, snapshotFileId, logFileId);
+            }
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter(96);
-            w.u8(1).string(namespace.toString()).u64(metadataEpoch).u64(generation)
+            w.u8(2).string(namespace.toString()).u64(metadataEpoch).u64(generation)
                     .u64(logStartOffset).u64(publishedLogOffset);
             encodeOptionalFileId(w, snapshotFileId);
             encodeOptionalFileId(w, logFileId);
+            encodeOptionalManifestRef(w, previous);
             return sealRecord(w.toBytes());
         }
 
         public static NamespaceManifest decode(byte[] bytes) {
             ByteBuffer b = ByteBuffer.wrap(openRecord(bytes));
             byte version = b.get();
-            if (version != 1) throw new IllegalArgumentException("namespace manifest version " + version);
+            if (version != 1 && version != 2) {
+                throw new IllegalArgumentException("namespace manifest version " + version);
+            }
             StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             long metadataEpoch = b.getLong();
             long generation = b.getLong();
@@ -409,8 +439,10 @@ public final class Records {
             long publishedLogOffset = b.getLong();
             Optional<FileId> snapshotFileId = decodeOptionalFileId(b);
             Optional<FileId> logFileId = decodeOptionalFileId(b);
+            Optional<NamespaceManifestRef> previous = version == 2
+                    ? decodeOptionalManifestRef(b) : Optional.empty();
             return new NamespaceManifest(namespace, metadataEpoch, generation, logStartOffset,
-                    publishedLogOffset, snapshotFileId, logFileId);
+                    publishedLogOffset, snapshotFileId, logFileId, previous);
         }
 
         private static void encodeOptionalFileId(BufWriter w, Optional<FileId> id) {
@@ -423,6 +455,30 @@ public final class Records {
 
         private static Optional<FileId> decodeOptionalFileId(ByteBuffer b) {
             return b.get() == 1 ? Optional.of(FileId.readFrom(b)) : Optional.empty();
+        }
+
+        private static void encodeOptionalManifestRef(BufWriter w, Optional<NamespaceManifestRef> ref) {
+            if (ref.isEmpty()) {
+                w.u8(0);
+                return;
+            }
+            NamespaceManifestRef r = ref.get();
+            w.u8(1).u64(r.generation()).u64(r.logStartOffset()).u64(r.publishedLogOffset());
+            encodeOptionalFileId(w, r.snapshotFileId());
+            encodeOptionalFileId(w, r.logFileId());
+        }
+
+        private static Optional<NamespaceManifestRef> decodeOptionalManifestRef(ByteBuffer b) {
+            if (b.get() != 1) {
+                return Optional.empty();
+            }
+            long generation = b.getLong();
+            long logStartOffset = b.getLong();
+            long publishedLogOffset = b.getLong();
+            Optional<FileId> snapshotFileId = decodeOptionalFileId(b);
+            Optional<FileId> logFileId = decodeOptionalFileId(b);
+            return Optional.of(new NamespaceManifestRef(generation, logStartOffset,
+                    publishedLogOffset, snapshotFileId, logFileId));
         }
     }
 }
