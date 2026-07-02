@@ -19,6 +19,7 @@ import java.net.ServerSocket;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -94,6 +95,92 @@ class ReaderImplTest {
                     assertArrayEquals(new byte[] {1, 2, 3}, drain(result.buffer()));
                     assertFalse(result.endOfFile());
                 }
+            }
+        }
+    }
+
+    @Test
+    void sealedReadAcceptsServerCappedPartialPayload() throws Exception {
+        FileId fileId = FileId.of(13);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+
+        try (ScpServer replica = new ScpServer(0, 1, 0, 0, req -> {
+            if (Opcode.fromCode(req.opcode()) == Opcode.READ) {
+                Messages.Read read = Messages.Read.decode(req.headerSlice());
+                if (read.offset() == 0) {
+                    assertEquals(3, read.maxBytes());
+                    return ScpServer.ok(req, new Messages.ReadResp(3, 3).encode(),
+                            ByteBuffer.wrap(new byte[] {1, 2}));
+                }
+                assertEquals(2, read.offset());
+                return ScpServer.ok(req, new Messages.ReadResp(3, 3).encode(),
+                        ByteBuffer.wrap(new byte[] {3}));
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + req.opcode());
+        });
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1,
+                             List.of(chunk(chunkId, ChunkState.SEALED, 3,
+                                     new Messages.Replica(1, endpoint(replica)))))))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId, StrataNamespace.of("test"));
+
+                try (StrataFile.ReadResult result = reader.read(0, 3)) {
+                    assertArrayEquals(new byte[] {1, 2}, drain(result.buffer()));
+                    assertFalse(result.endOfFile());
+                }
+                try (StrataFile.ReadResult result = reader.read(2, 3)) {
+                    assertArrayEquals(new byte[] {3}, drain(result.buffer()));
+                    assertTrue(result.endOfFile());
+                }
+            }
+        }
+    }
+
+    @Test
+    void sealedReplicaWithLaggingDurableOffsetIsRejected() throws Exception {
+        FileId fileId = FileId.of(14);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+
+        try (ScpServer replica = readReplica(new Messages.ReadResp(3, 2), new byte[] {1, 2});
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1,
+                             List.of(chunk(chunkId, ChunkState.SEALED, 3,
+                                     new Messages.Replica(1, endpoint(replica)))))))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId, StrataNamespace.of("test"));
+
+                ScpException e = assertThrows(ScpException.class, () -> reader.read(0, 3));
+                assertEquals(ErrorCode.CORRUPT_CHUNK, e.code());
+            }
+        }
+    }
+
+    @Test
+    void zeroLengthReadDoesNotCallReplica() throws Exception {
+        FileId fileId = FileId.of(15);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicInteger reads = new AtomicInteger();
+
+        try (ScpServer replica = new ScpServer(0, 1, 0, 0, req -> {
+            reads.incrementAndGet();
+            throw new ScpException(ErrorCode.INTERNAL, "zero-length read should not reach replica");
+        });
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1,
+                             List.of(chunk(chunkId, ChunkState.SEALED, 3,
+                                     new Messages.Replica(1, endpoint(replica)))))))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId, StrataNamespace.of("test"));
+
+                try (StrataFile.ReadResult result = reader.read(0, 0)) {
+                    assertEquals(0, result.buffer().remaining());
+                    assertFalse(result.endOfFile());
+                }
+                assertEquals(0, reads.get());
             }
         }
     }

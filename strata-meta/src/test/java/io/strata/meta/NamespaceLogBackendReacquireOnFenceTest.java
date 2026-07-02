@@ -276,14 +276,14 @@ class NamespaceLogBackendReacquireOnFenceTest {
         private volatile FileId latestLog;
 
         @Override
-        public FileId createLogFile(StrataNamespace ns, long generation) throws Exception {
+        public FileId createLogFile(StrataNamespace ns, long generation) {
             FileId id = super.createLogFile(ns, generation);
             latestLog = id;
             return id;
         }
 
         @Override
-        public void appendLog(FileId logFileId, byte[] frameBytes) throws Exception {
+        public void appendLog(FileId logFileId, byte[] frameBytes) {
             if (!logFileId.equals(latestLog)) {
                 throw new ScpException(ErrorCode.FENCED_EPOCH,
                         "FENCED_EPOCH: stale meta-log writer " + logFileId + " superseded by " + latestLog);
@@ -312,7 +312,7 @@ class NamespaceLogBackendReacquireOnFenceTest {
         }
 
         @Override
-        public synchronized void appendLog(FileId logFileId, byte[] frameBytes) throws Exception {
+        public synchronized void appendLog(FileId logFileId, byte[] frameBytes) {
             if (logFileId.equals(deadLog)) {
                 throw deathCause;
             }
@@ -327,7 +327,7 @@ class NamespaceLogBackendReacquireOnFenceTest {
         }
 
         @Override
-        public synchronized byte[] readLog(FileId logFileId) throws Exception {
+        public synchronized byte[] readLog(FileId logFileId) {
             if (failNextReadLog) {
                 failNextReadLog = false;
                 throw new ScpException(ErrorCode.INTERNAL, "readLog injected");

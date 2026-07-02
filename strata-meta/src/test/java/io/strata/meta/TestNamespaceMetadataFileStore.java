@@ -15,44 +15,73 @@ import java.util.concurrent.atomic.AtomicLong;
 class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore {
     private final Map<FileId, ByteArrayOutputStream> logs = new ConcurrentHashMap<>();
     private final Map<FileId, byte[]> snapshots = new ConcurrentHashMap<>();
+    private final Map<FileId, Integer> corruptSnapshotReads = new ConcurrentHashMap<>();
     private final AtomicLong ids = new AtomicLong(1);
 
     @Override
-    public FileId createLogFile(StrataNamespace ns, long generation) throws Exception {
+    public FileId createLogFile(StrataNamespace ns, long generation) {
         FileId id = nextId();
         logs.put(id, new ByteArrayOutputStream());
         return id;
     }
 
     @Override
-    public synchronized void appendLog(FileId logFileId, byte[] frameBytes) throws Exception {
+    public synchronized void appendLog(FileId logFileId, byte[] frameBytes) {
         logs.computeIfAbsent(logFileId, k -> new ByteArrayOutputStream()).writeBytes(frameBytes);
     }
 
     @Override
-    public synchronized byte[] readLog(FileId logFileId) throws Exception {
+    public synchronized byte[] readLog(FileId logFileId) {
         ByteArrayOutputStream b = logs.get(logFileId);
         return b == null ? new byte[0] : b.toByteArray();
     }
 
     @Override
-    public FileId writeSnapshot(StrataNamespace ns, long generation, byte[] snapshotBytes) throws Exception {
+    public FileId writeSnapshot(StrataNamespace ns, long generation, byte[] snapshotBytes) {
         FileId id = nextId();
         snapshots.put(id, snapshotBytes.clone());
         return id;
     }
 
     @Override
-    public byte[] readSnapshot(FileId snapshotFileId) throws Exception {
+    public synchronized byte[] readSnapshot(FileId snapshotFileId) {
         byte[] b = snapshots.get(snapshotFileId);
         if (b == null) {
             throw new IllegalStateException("no snapshot file " + snapshotFileId);
         }
+        Integer reads = corruptSnapshotReads.get(snapshotFileId);
+        if (reads != null && reads > 0) {
+            if (reads == 1) {
+                corruptSnapshotReads.remove(snapshotFileId);
+            } else {
+                corruptSnapshotReads.put(snapshotFileId, reads - 1);
+            }
+            byte[] corrupt = b.clone();
+            corrupt[0] ^= 0x01;
+            return corrupt;
+        }
         return b.clone();
     }
 
+    synchronized void corruptSnapshot(FileId snapshotFileId) {
+        byte[] b = snapshots.get(snapshotFileId);
+        if (b == null) {
+            throw new IllegalStateException("no snapshot file " + snapshotFileId);
+        }
+        byte[] corrupt = b.clone();
+        corrupt[0] ^= 0x01;
+        snapshots.put(snapshotFileId, corrupt);
+    }
+
+    synchronized void corruptSnapshotOnNextRead(FileId snapshotFileId) {
+        if (!snapshots.containsKey(snapshotFileId)) {
+            throw new IllegalStateException("no snapshot file " + snapshotFileId);
+        }
+        corruptSnapshotReads.put(snapshotFileId, 1);
+    }
+
     @Override
-    public void deleteFile(FileId fileId) throws Exception {
+    public void deleteFile(FileId fileId) {
         logs.remove(fileId);
         snapshots.remove(fileId);
     }

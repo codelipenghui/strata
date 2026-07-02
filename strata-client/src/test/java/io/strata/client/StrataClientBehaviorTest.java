@@ -329,9 +329,9 @@ class StrataClientBehaviorTest {
              ScpServer badOffsets = new ScpServer(0, 2, 0, 0, req ->
                      ScpServer.ok(req, new Messages.ReadResp(2, 3).encode(),
                              ByteBuffer.wrap(new byte[] {1})));
-             ScpServer shortSealed = new ScpServer(0, 3, 0, 0, req ->
+             ScpServer emptySealed = new ScpServer(0, 3, 0, 0, req ->
                      ScpServer.ok(req, new Messages.ReadResp(3, 3).encode(),
-                             ByteBuffer.wrap(new byte[] {1, 2})));
+                             ByteBuffer.allocate(0)));
              ScpServer meta = metadataServer(lookup);
              StrataClient client = StrataClient.connect(ClientConfig.of(endpoint(meta)))) {
             lookup.set(new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1,
@@ -344,7 +344,7 @@ class StrataClientBehaviorTest {
 
             lookup.set(new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1,
                     List.of(chunk(chunkId, ChunkState.SEALED, 3, 0, 1,
-                            new Messages.Replica(3, endpoint(shortSealed))))));
+                            new Messages.Replica(3, endpoint(emptySealed))))));
             try (StrataFile.Reader reader = client.openById(StrataNamespace.of("test"), fileId).openForRead()) {
                 assertEquals(ErrorCode.CORRUPT_CHUNK,
                         assertThrows(ScpException.class, () -> reader.read(0, 3)).code());

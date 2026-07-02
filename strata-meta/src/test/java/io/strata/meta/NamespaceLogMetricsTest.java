@@ -81,20 +81,23 @@ class NamespaceLogMetricsTest {
         m.recordLogRead(a, 3, 300);
         m.recordCompaction(b);
         m.recordOwnerAcquired(b);
+        m.recordSnapshotFallback(a);
 
         // stats() index order: [appendRecords, appendBytes, readRecords, readBytes, compactions,
-        //                       recoveries, reacquisitions, ownerChanges]
+        //                       recoveries, reacquisitions, ownerChanges, snapshotFallbacks]
         long[] sa = m.stats().get("a");
         long[] sb = m.stats().get("b");
         assertEquals(2, sa[0], "a appendRecords");
         assertEquals(150, sa[1], "a appendBytes");
         assertEquals(3, sa[2], "a readRecords");
         assertEquals(300, sa[3], "a readBytes");
+        assertEquals(1, sa[NamespaceLogMetrics.SNAPSHOT_FALLBACKS], "a snapshotFallbacks");
         assertEquals(1, sb[4], "b compactions");
         assertEquals(1, sb[7], "b ownerChanges");
         // The aggregate accessors roll up across namespaces (convenience for the meta tests' totals).
         assertEquals(2, m.appendRecords(), "global appendRecords = sum over namespaces");
         assertEquals(1, m.compactions(), "global compactions = sum over namespaces");
+        assertEquals(1, m.snapshotFallbacks(), "global snapshotFallbacks = sum over namespaces");
     }
 
     private static Records.FileRecord file(FileId id, String ns, String path) {

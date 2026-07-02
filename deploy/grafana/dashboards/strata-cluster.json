@@ -271,7 +271,7 @@
       },
       "targets": [
         {
-          "expr": "sum(strata_data_nodes{state=\"alive\"})",
+          "expr": "sum(strata_data_nodes{state=\"alive\"} * on(instance, job) group_left() strata_controller_is_leader)",
           "refId": "A",
           "instant": true
         }
@@ -319,7 +319,7 @@
       },
       "targets": [
         {
-          "expr": "sum(strata_data_nodes{state=~\"suspect|dead\"})",
+          "expr": "sum(strata_data_nodes{state=~\"suspect|dead\"} * on(instance, job) group_left() strata_controller_is_leader)",
           "refId": "A",
           "instant": true
         }

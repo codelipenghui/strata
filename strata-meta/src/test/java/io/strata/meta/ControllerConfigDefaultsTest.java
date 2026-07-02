@@ -36,6 +36,8 @@ class ControllerConfigDefaultsTest {
         assertEquals(100, c.zkRetryBaseMs());
         assertEquals(5, c.zkRetryMaxRetries());
         assertEquals("zk", c.metadataBackendConfig().backend());
+        assertEquals(ControllerConfig.DEFAULT_NAMESPACE_LOG_RETENTION_MS,
+                c.metadataBackendConfig().namespaceLogRetentionMs());
     }
 
     @Test
@@ -54,6 +56,8 @@ class ControllerConfigDefaultsTest {
         assertEquals("namespace-log", c.metadataBackendConfig().backend());
         assertEquals(3, c.metadataBackendConfig().namespaceLogReplicationFactor());
         assertEquals(2, c.metadataBackendConfig().namespaceLogAckQuorum());
+        assertEquals(ControllerConfig.DEFAULT_NAMESPACE_LOG_RETENTION_MS,
+                c.metadataBackendConfig().namespaceLogRetentionMs());
     }
 
     @Test

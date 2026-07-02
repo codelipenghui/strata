@@ -4,6 +4,7 @@ import io.strata.common.Crc;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -49,5 +50,16 @@ final class MetadataLogSegmentCodec {
             valid = b.position();
         }
         return new Prefix(records, valid);
+    }
+
+    static Prefix recoverPrefix(byte[] bytes, int skipBytes) {
+        if (skipBytes <= 0) {
+            return recoverPrefix(bytes);
+        }
+        if (skipBytes >= bytes.length) {
+            return new Prefix(List.of(), bytes.length);
+        }
+        Prefix suffix = recoverPrefix(Arrays.copyOfRange(bytes, skipBytes, bytes.length));
+        return new Prefix(suffix.records(), skipBytes + suffix.validBytes());
     }
 }
