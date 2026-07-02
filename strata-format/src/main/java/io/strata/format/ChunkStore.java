@@ -938,9 +938,9 @@ public final class ChunkStore implements AutoCloseable {
     /**
      * A read response that is either a zero-copy file region or a heap snapshot of the bytes.
      * Client reads of open chunks are bounded by the replica-known durable high watermark and may
-     * return a zero-copy channel region without per-read ledger verification. Recovery reads can
-     * include the undurable open tail, so they are snapshotted before any concurrent seal-truncate
-     * can alter the transferred payload.
+     * return a zero-copy channel region without per-read ledger verification. Open recovery reads can
+     * include the undurable tail, so they are snapshotted before any concurrent seal-truncate can alter
+     * the transferred payload.
      * Exactly one of {@code channel} / {@code bytes} is set for a non-empty result.
      */
     public record ReadRegionResult(FileChannel channel, long filePosition, int length, byte[] bytes,
@@ -998,8 +998,8 @@ public final class ChunkStore implements AutoCloseable {
      * local end, INCLUDING the never-acked tail above the durable high watermark. Recovery must see
      * that tail to decide whether a quorum still holds it (tech design §7.3); clamping it away — as
      * the client read path does — makes recovery seal short and drop quorum-durable bytes. Reads are
-     * still integrity-ledger verified, and the recovery path does not count toward client read
-     * throughput metrics.
+     * still integrity-verified (open chunks against the ledger, sealed chunks against footer CRC
+     * ranges), and the recovery path does not count toward client read throughput metrics.
      */
     public ReadRegionResult readRegionForRecovery(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
         return readRegion(ns, id, offset, maxBytes, true);
@@ -1017,6 +1017,8 @@ public final class ChunkStore implements AutoCloseable {
         int n;
         Path dataPath;
         NsChunkId nsKey;
+        long sealedLength = -1;
+        List<Integer> sealedRangeCrcs = null;
         h.lock.lock();
         try {
             localEnd = h.currentEnd();
@@ -1047,6 +1049,10 @@ public final class ChunkStore implements AutoCloseable {
                 readOpenVerified(h, offset, out);
                 return new ReadRegionResult(null, 0, n, out, localEnd, lastKnownDO, null);
             }
+            if (h.state == ChunkState.SEALED && includeUndurableTail) {
+                sealedLength = h.sealedLength;
+                sealedRangeCrcs = h.sealedRangeCrcs;
+            }
             // Snapshot what the off-lock open needs. The bytes we will expose are stable once the lock is
             // released: an OPEN client read is clamped to lastKnownDO (which no concurrent seal can truncate
             // below), and a SEALED chunk's data region is immutable. So the blocking open/acquire below need
@@ -1061,6 +1067,16 @@ public final class ChunkStore implements AutoCloseable {
         // Test seam: lets a test delete + re-import this id in the window between the lock release and the
         // off-lock open/acquire below, to exercise the post-open handle revalidation.
         FailureInjector.point("format.readRegion.beforeOpen");
+        if (sealed && includeUndurableTail) {
+            // Recovery can promote a sealed donor's bytes into the committed replica set, so it must not
+            // use the client zero-copy sealed fast path that relies on deferred scrub for rot detection.
+            byte[] out = new byte[n];
+            try (ChannelCache.Lease lease = channelCache.acquire(nsKey, dataPath)) {
+                requireCurrentHandle(h, nsKey, id);
+                readSealedVerified(lease.channel(), sealedLength, sealedRangeCrcs, id, offset, out);
+            }
+            return new ReadRegionResult(null, 0, n, out, localEnd, lastKnownDO, null);
+        }
         if (!sealed) {
             // OPEN client fast path: independent transient READ FD, opened OFF the chunk lock. We do NOT
             // re-run readOpenVerified here (it would materialize + CRC the range, removing the zero-copy
@@ -1078,14 +1094,15 @@ public final class ChunkStore implements AutoCloseable {
                 throw e;
             }
         }
-        // SEALED: the data region is immutable (no further append/seal/truncate), so hand back a zero-copy
-        // region the transport streams via sendfile. We do NOT re-verify range CRCs per read here: that
-        // forced a full CRC-range read + a 4 MiB allocation per request (~20x slower, measured); integrity
-        // is covered by background scrub and the verified read()/fetch()/import paths. The exclusive leased
-        // cache channel is acquired OFF the chunk lock (never shared across readers — FileChannel is
-        // interruptible, so a shared FD would close for all on any reader's interrupt). A concurrent delete
-        // only unlinks the path while this independent FD keeps the inode alive, so the deferred transfer is
-        // safe. The lease is released (returning the channel to the idle pool) when the response Frame closes.
+        // SEALED client fast path: the data region is immutable (no further append/seal/truncate), so hand
+        // back a zero-copy region the transport streams via sendfile. We do NOT re-verify range CRCs per
+        // client read here: that forced a full CRC-range read + a 4 MiB allocation per request (~20x slower,
+        // measured); integrity is covered by background scrub and the verified read()/fetch()/import paths.
+        // The exclusive leased cache channel is acquired OFF the chunk lock (never shared across readers —
+        // FileChannel is interruptible, so a shared FD would close for all on any reader's interrupt). A
+        // concurrent delete only unlinks the path while this independent FD keeps the inode alive, so the
+        // deferred transfer is safe. The lease is released (returning the channel to the idle pool) when
+        // the response Frame closes.
         ChannelCache.Lease lease = channelCache.acquire(nsKey, dataPath);
         try {
             requireCurrentHandle(h, nsKey, id);
