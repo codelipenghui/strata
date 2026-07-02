@@ -1754,60 +1754,63 @@ class AppenderImplTest {
             ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500);
             AppenderImpl appender = new AppenderImpl(null, pool, config, fileId, StrataNamespace.of("test"),
                     1, Messages.WritePolicy.DEFAULT, 0);
-            Object session = chunkSession(new ChunkId(fileId, 0),
-                    new Messages.Replica(1, endpoint(s1)),
-                    new Messages.Replica(2, endpoint(s2)),
-                    new Messages.Replica(3, endpoint(s3)));
-            setSession(appender, session);
-
-            inFlight(session)[0] = config.appendReplicaInflightHighWatermark();
-
-            AtomicReference<CompletableFuture<Long>> appendResult = new AtomicReference<>();
-            AtomicReference<Throwable> appendFailure = new AtomicReference<>();
-            Thread appendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    appendResult.set(appender.append(ByteBuffer.wrap(new byte[] {1, 2, 3})));
-                } catch (Throwable t) {
-                    appendFailure.set(t);
-                }
-            });
-
-            waitForProgressWaiter(appender);
-            ReentrantLock lock = appenderLock(appender);
-            Condition progress = appenderProgress(appender);
-            lock.lock();
             try {
-                setBoolean(appender, "rolling", true);
-                inFlight(session)[0] = 0;
-                progress.signalAll();
-            } finally {
-                lock.unlock();
-            }
+                Object session = chunkSession(new ChunkId(fileId, 0),
+                        new Messages.Replica(1, endpoint(s1)),
+                        new Messages.Replica(2, endpoint(s2)),
+                        new Messages.Replica(3, endpoint(s3)));
+                setSession(appender, session);
 
-            try {
-                TimeUnit.MILLISECONDS.sleep(200);
-                assertEquals(0, appends.get(), "append must not enter a session while seal/roll owns it");
-                assertNull(appendResult.get());
-                assertNull(appendFailure.get());
-                assertTrue(appendThread.isAlive(), "append should still be waiting for rolling to finish");
-            } finally {
+                inFlight(session)[0] = config.appendReplicaInflightHighWatermark();
+
+                AtomicReference<CompletableFuture<Long>> appendResult = new AtomicReference<>();
+                AtomicReference<Throwable> appendFailure = new AtomicReference<>();
+                Thread appendThread = Thread.ofVirtual().start(() -> {
+                    try {
+                        appendResult.set(appender.append(ByteBuffer.wrap(new byte[] {1, 2, 3})));
+                    } catch (Throwable t) {
+                        appendFailure.set(t);
+                    }
+                });
+
+                waitForProgressWaiter(appender);
+                ReentrantLock lock = appenderLock(appender);
+                Condition progress = appenderProgress(appender);
                 lock.lock();
                 try {
-                    setBoolean(appender, "rolling", false);
+                    setBoolean(appender, "rolling", true);
+                    inFlight(session)[0] = 0;
                     progress.signalAll();
                 } finally {
                     lock.unlock();
                 }
-                appendThread.join(2_000);
+
+                try {
+                    TimeUnit.MILLISECONDS.sleep(200);
+                    assertEquals(0, appends.get(), "append must not enter a session while seal/roll owns it");
+                    assertNull(appendResult.get());
+                    assertNull(appendFailure.get());
+                    assertTrue(appendThread.isAlive(), "append should still be waiting for rolling to finish");
+                } finally {
+                    lock.lock();
+                    try {
+                        setBoolean(appender, "rolling", false);
+                        progress.signalAll();
+                    } finally {
+                        lock.unlock();
+                    }
+                    appendThread.join(2_000);
+                }
+
+                assertFalse(appendThread.isAlive(), "append should proceed once rolling clears");
+                assertNull(appendFailure.get());
+                assertNotNull(appendResult.get());
+                assertEquals(3L, appendResult.get().get(1, TimeUnit.SECONDS));
+                waitFor(() -> appends.get() == 3);
+                assertEquals(3, appends.get());
+            } finally {
                 appender.close();
             }
-
-            assertFalse(appendThread.isAlive(), "append should proceed once rolling clears");
-            assertNull(appendFailure.get());
-            assertNotNull(appendResult.get());
-            assertEquals(3L, appendResult.get().get(1, TimeUnit.SECONDS));
-            waitFor(() -> appends.get() == 3);
-            assertEquals(3, appends.get());
         }
     }
 
