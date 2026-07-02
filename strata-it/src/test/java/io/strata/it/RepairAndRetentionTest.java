@@ -9,6 +9,7 @@ import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
+import io.strata.meta.ControllerConfig;
 import io.strata.node.DataNode;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -36,13 +37,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class RepairAndRetentionTest {
     private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
+    private static final int TEST_REPLICA_UNHEALTHY_GRACE_MS = 2_000;
 
     private MiniCluster cluster;
     private StrataClient client;
 
     @BeforeEach
     void setup() throws Exception {
-        cluster = new MiniCluster(4);
+        cluster = new MiniCluster(4, null, 1,
+                (zk, idx) -> ControllerConfig.forTests(zk)
+                        .withReplicaMissingGraceMs(TEST_REPLICA_UNHEALTHY_GRACE_MS));
         client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint())
                 .withChunkRollBytes(4096)
                 .withDataNodeConnectionsPerEndpoint(3));
