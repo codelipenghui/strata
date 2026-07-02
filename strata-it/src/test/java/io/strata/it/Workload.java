@@ -54,6 +54,10 @@ final class Workload {
         return expected.length();
     }
 
+    synchronized byte[] expectedBytes() {
+        return expected.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
     synchronized String ackedSha256() {
         try {
             byte[] expectedBytes = expected.toString().getBytes(StandardCharsets.UTF_8);
@@ -66,6 +70,30 @@ final class Workload {
 
     synchronized int ackedCount() {
         return ackedPayloads.size();
+    }
+
+    long appendAckedAndVerifyOffsets(StrataFile.Appender appender, int from, int n) {
+        long expectedEnd = ackedBytes();
+        long lastEnd = -1;
+        List<CompletableFuture<Long>> futures = new ArrayList<>(n);
+        List<byte[]> payloads = new ArrayList<>(n);
+        for (int i = from; i < from + n; i++) {
+            byte[] p = payload(i);
+            payloads.add(p);
+            futures.add(appender.append(ByteBuffer.wrap(p)));
+        }
+        for (int i = 0; i < n; i++) {
+            byte[] payload = payloads.get(i);
+            expectedEnd += payload.length;
+            long ack = futures.get(i).join();
+            if (ack != expectedEnd) {
+                throw new AssertionError("append returned end offset " + ack
+                        + " but expected " + expectedEnd + " for record " + (from + i));
+            }
+            recordAcked(payload);
+            lastEnd = ack;
+        }
+        return lastEnd;
     }
 
     /** Asserts the file's prefix equals every acked byte, in order. */
