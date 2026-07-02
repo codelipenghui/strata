@@ -1627,6 +1627,13 @@ class ChunkStoreTest {
                         ChunkFormats.DATA_START);
             }
 
+            try (ChunkStore.ReadRegionResult client =
+                         store.readRegion(TEST_NS, chunkId, 0, payload.length)) {
+                assertEquals(payload.length, client.length(), "sealed client read must still serve the range");
+                assertNotNull(client.channel(), "sealed client read must stay on the zero-copy fast path");
+                assertNull(client.bytes(), "sealed client read must not materialize bytes");
+            }
+
             ScpException e = assertThrows(ScpException.class, () -> {
                 try (ChunkStore.ReadRegionResult ignored =
                              store.readRegionForRecovery(TEST_NS, chunkId, 0, payload.length)) {
