@@ -64,7 +64,7 @@ public final class Controller implements AutoCloseable {
      * redirect hint). Null = standalone: bind an own server on {@code config.listenPort()}.
      */
     public Controller(ControllerConfig config, String advertisedEndpoint) throws Exception {
-        this(config, advertisedEndpoint, defaultBackendFactory());
+        this(config, advertisedEndpoint, defaultBackendFactory(config));
     }
 
     /**
@@ -186,34 +186,29 @@ public final class Controller implements AutoCloseable {
      * default and gated by {@code STRATA_CONTROLLER_LOG_FSYNC}); anything else uses the ZooKeeper store
      * directly (the default).
      */
-    private static BiFunction<ZkMetadataStore, String, MetadataStore> defaultBackendFactory() {
-        String backend = setting("STRATA_CONTROLLER_BACKEND", "strata.controller.backend", "zk");
-        if (!"namespace-log".equalsIgnoreCase(backend)) {
+    private static BiFunction<ZkMetadataStore, String, MetadataStore> defaultBackendFactory(ControllerConfig config) {
+        ControllerConfig.MetadataBackendConfig backend = config.metadataBackendConfig();
+        if (!backend.namespaceLogEnabled()) {
             return (root, endpoint) -> root;
         }
-        int replicationFactor = intSetting("STRATA_CONTROLLER_LOG_RF", "strata.controller.log.rf", 3);
-        int ackQuorum = intSetting("STRATA_CONTROLLER_LOG_ACK", "strata.controller.log.ack", 2);
+        int replicationFactor = backend.namespaceLogReplicationFactor();
+        int ackQuorum = backend.namespaceLogAckQuorum();
         // Durability by replication (RF/ack); per-append fsync off by default — see StrataSystemMetadataFileStore.
-        boolean logFsync = boolSetting("STRATA_CONTROLLER_LOG_FSYNC", "strata.controller.log.fsync", false);
+        boolean logFsync = backend.namespaceLogFsync();
         // Steady-state open-log compaction: snapshot+roll an owned namespace once its open log passes this
         // size, so a stable leader's log is bounded by snapshot cadence (design §8/§10) rather than only
-        // compacting at open/failover. <=0 on either knob disables the background sweep.
-        int compactBytes = intSetting("STRATA_CONTROLLER_LOG_COMPACT_BYTES",
-                "strata.controller.log.compact.bytes", 4 * 1024 * 1024);
-        int compactIntervalMs = intSetting("STRATA_CONTROLLER_LOG_COMPACT_INTERVAL_MS",
-                "strata.controller.log.compact.interval.ms", 30_000);
+        // compacting at open/failover. 0 on either knob disables the background sweep.
+        int compactBytes = backend.namespaceLogCompactBytes();
+        int compactIntervalMs = backend.namespaceLogCompactIntervalMs();
         // Reap snapshot/log system files orphaned by a crash between file-create and manifest CAS. Safe by
         // construction: a file is reaped only if no manifest references it AND its generation is <= its
         // namespace's currently-published generation (an in-flight publish is always at a higher generation).
-        boolean orphanGc = boolSetting("STRATA_CONTROLLER_LOG_ORPHAN_GC",
-                "strata.controller.log.orphan.gc", true);
+        boolean orphanGc = backend.namespaceLogOrphanGc();
         // Safety delay (design §10 step 6 / issue #8): retain a superseded metadata-log generation this many
         // ms after it is superseded before the sweep reclaims it — a rollback margin against a bad newest
         // generation. 0 (default) disables the window: superseded generations are reclaimed on the next sweep.
-        int retentionMs = intSetting("STRATA_CONTROLLER_LOG_RETENTION_MS",
-                "strata.controller.log.retention.ms", 0);
-        int readChunkBytes = intSetting("STRATA_CONTROLLER_LOG_READ_CHUNK_BYTES",
-                "strata.controller.log.read.chunk.bytes", 4 * 1024 * 1024);
+        int retentionMs = backend.namespaceLogRetentionMs();
+        int readChunkBytes = backend.namespaceLogReadChunkBytes();
         return (root, endpoint) -> {
             NamespaceLogBackend logBackend = new NamespaceLogBackend(root,
                     new StrataSystemMetadataFileStore(() -> endpoint, replicationFactor, ackQuorum, logFsync,
@@ -222,33 +217,6 @@ public final class Controller implements AutoCloseable {
             logBackend.startBackgroundCompaction(compactBytes, compactIntervalMs, orphanGc);
             return new NamespaceLogMetadataStore(logBackend);
         };
-    }
-
-    /** Reads an environment variable, falling back to a JVM system property (settable in tests). */
-    private static String setting(String envName, String propName, String fallback) {
-        String value = System.getenv(envName);
-        if (value == null || value.isBlank()) {
-            value = System.getProperty(propName);
-        }
-        return value == null || value.isBlank() ? fallback : value;
-    }
-
-    private static int intSetting(String envName, String propName, int fallback) {
-        String value = setting(envName, propName, null);
-        if (value == null) {
-            return fallback;
-        }
-        try {
-            return Integer.parseInt(value.trim());
-        } catch (NumberFormatException e) {
-            log.warn("ignoring non-numeric {}/{}='{}', using default {}", envName, propName, value, fallback);
-            return fallback;
-        }
-    }
-
-    private static boolean boolSetting(String envName, String propName, boolean fallback) {
-        String value = setting(envName, propName, null);
-        return value == null ? fallback : Boolean.parseBoolean(value.trim());
     }
 
     public int port() {

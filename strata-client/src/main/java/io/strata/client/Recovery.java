@@ -65,7 +65,7 @@ final class Recovery {
     }
 
     /** Mutable per-replica recovery state; `end` tracks our view of its local end offset. */
-    private static final class ReplicaState {
+    static final class ReplicaState {
         final Messages.Replica replica;
         long end;
         long durable;

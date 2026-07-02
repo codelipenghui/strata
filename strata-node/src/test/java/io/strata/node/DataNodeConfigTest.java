@@ -123,6 +123,8 @@ class DataNodeConfigTest {
         assertEquals(6_000, c.orphanStartupGraceMs());
         assertEquals(5_000, c.orphanConfirmTimeoutMs());
         assertEquals(10_000, c.controlCallTimeoutMs());
+        assertEquals(8, c.controlCommandParallelism());
+        assertEquals(1024, c.controlMaxQueuedCommands());
         assertEquals(4 * 1024 * 1024, c.repairFetchBytes());
         assertEquals(1, c.deleteMaxConcurrent());
         assertEquals(50, c.deleteMinIntervalMs());
@@ -135,6 +137,8 @@ class DataNodeConfigTest {
                 List.of("meta:9000"), "zone", "rack", "host", 1234, 55);
         assertThrows(IllegalArgumentException.class, () -> base.withOrphanGraceMs(0));
         assertThrows(IllegalArgumentException.class, () -> base.withControlCallTimeoutMs(-1));
+        assertThrows(IllegalArgumentException.class, () -> base.withControlCommandLimits(0, 1024));
+        assertThrows(IllegalArgumentException.class, () -> base.withControlCommandLimits(8, 7));
         assertThrows(IllegalArgumentException.class, () -> base.withDeleteMaxConcurrent(0));
         assertThrows(IllegalArgumentException.class, () -> base.withDeleteMinIntervalMs(-1));
     }
@@ -145,13 +149,15 @@ class DataNodeConfigTest {
                 List.of("meta:9000"), "zone", "rack", "host", 1234, 55)
                 .withOrphanGraceMs(1000).withOrphanScanIntervalMs(500).withOrphanStartupGraceMs(1500)
                 .withOrphanConfirmTimeoutMs(2500).withControlCallTimeoutMs(8000).withRepairFetchBytes(1 << 20)
-                .withDeleteMaxConcurrent(2).withDeleteMinIntervalMs(25)
+                .withControlCommandLimits(4, 128).withDeleteMaxConcurrent(2).withDeleteMinIntervalMs(25)
                 .withChunkStoreConfig(ChunkStoreConfig.DEFAULT.withMaxRequestBytes(4096));
         assertEquals(1000, c.orphanGraceMs());
         assertEquals(500, c.orphanScanIntervalMs());
         assertEquals(1500, c.orphanStartupGraceMs());
         assertEquals(2500, c.orphanConfirmTimeoutMs());
         assertEquals(8000, c.controlCallTimeoutMs());
+        assertEquals(4, c.controlCommandParallelism());
+        assertEquals(128, c.controlMaxQueuedCommands());
         assertEquals(1 << 20, c.repairFetchBytes());
         assertEquals(2, c.deleteMaxConcurrent());
         assertEquals(25, c.deleteMinIntervalMs());

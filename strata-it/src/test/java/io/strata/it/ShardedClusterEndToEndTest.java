@@ -37,9 +37,6 @@ class ShardedClusterEndToEndTest {
     @BeforeAll
     void setup() throws Exception {
         // Sharding requires the namespace-log backend (per-namespace owner-assigned ids + ownership routing).
-        System.setProperty("strata.controller.backend", "namespace-log");
-        System.setProperty("strata.controller.log.rf", "3");
-        System.setProperty("strata.controller.log.ack", "2");
         cluster = MiniCluster.sharded(3, 2);
         endpoints = cluster.metaEndpoints();
         // Seed the client with the FIRST controller only: every namespace owned by the second controller
@@ -56,12 +53,8 @@ class ShardedClusterEndToEndTest {
         } catch (Exception ignore) {
             // best-effort
         }
-        try {
-            if (cluster != null) cluster.close();
-        } finally {
-            System.clearProperty("strata.controller.backend");
-            System.clearProperty("strata.controller.log.rf");
-            System.clearProperty("strata.controller.log.ack");
+        if (cluster != null) {
+            cluster.close();
         }
     }
 

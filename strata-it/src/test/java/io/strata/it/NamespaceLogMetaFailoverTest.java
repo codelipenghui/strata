@@ -32,24 +32,16 @@ class NamespaceLogMetaFailoverTest {
 
     @BeforeAll
     void setup() throws Exception {
-        System.setProperty("strata.controller.backend", "namespace-log");
-        System.setProperty("strata.controller.log.rf", "3");
-        System.setProperty("strata.controller.log.ack", "2");
         int metaPort = freePort();
         cluster = new MiniCluster(3, null, 1,
-                (zk, idx) -> new ControllerConfig(zk, metaPort, 200, 1_000, 1_500, 300, 3_000));
+                (zk, idx) -> new ControllerConfig(zk, metaPort, 200, 1_000, 1_500, 300, 3_000)
+                        .withNamespaceLogBackend());
     }
 
     @AfterAll
     void teardown() throws Exception {
-        try {
-            if (cluster != null) {
-                cluster.close();
-            }
-        } finally {
-            System.clearProperty("strata.controller.backend");
-            System.clearProperty("strata.controller.log.rf");
-            System.clearProperty("strata.controller.log.ack");
+        if (cluster != null) {
+            cluster.close();
         }
     }
 

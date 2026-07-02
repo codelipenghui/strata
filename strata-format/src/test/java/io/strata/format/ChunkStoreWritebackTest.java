@@ -18,6 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Background writeback ({@link ChunkStore#backgroundFlushOnce}) periodically fsyncs OPEN, non-ack-on-
@@ -128,20 +129,13 @@ class ChunkStoreWritebackTest {
     }
 
     @Test
-    void writebackConfPrefersPropertyAndFallsBackSafely() {
-        String prop = "strata.test.bgFlush.cfg";
-        String env = "STRATA_NONEXISTENT_ENV_XYZ"; // unset in the test JVM
-        System.clearProperty(prop);
-        try {
-            assertEquals(500L, ChunkStore.longConf(prop, env, 500L), "unset → default");
-            System.setProperty(prop, "150");
-            assertEquals(150L, ChunkStore.longConf(prop, env, 500L), "system property wins");
-            System.setProperty(prop, "not-a-number");
-            assertEquals(500L, ChunkStore.longConf(prop, env, 500L), "malformed → default");
-            System.setProperty(prop, "0");
-            assertEquals(500L, ChunkStore.longConf(prop, env, 500L), "non-positive → default");
-        } finally {
-            System.clearProperty(prop);
-        }
+    void writebackConfigValidatesPositiveValues() {
+        assertEquals(500L, ChunkStoreConfig.DEFAULT.backgroundFlushIntervalMs());
+        assertEquals(4L << 20, ChunkStoreConfig.DEFAULT.backgroundFlushThresholdBytes());
+
+        assertThrows(IllegalArgumentException.class,
+                () -> ChunkStoreConfig.DEFAULT.withBackgroundFlush(0, 4L << 20));
+        assertThrows(IllegalArgumentException.class,
+                () -> ChunkStoreConfig.DEFAULT.withBackgroundFlush(500, 0));
     }
 }

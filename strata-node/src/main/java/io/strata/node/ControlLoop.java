@@ -41,21 +41,18 @@ import java.util.concurrent.locks.ReentrantLock;
 final class ControlLoop implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ControlLoop.class);
     private static final long MAX_REPAIR_FOOTER_BYTES = 64L * 1024 * 1024;
-    // Bounded command execution (Phase 4): COMMAND_PARALLELISM consumer vthreads drain a bounded queue so
+    // Bounded command execution (Phase 4): configured consumer vthreads drain a bounded queue so
     // a slow REPLICATE (whole-chunk network pull) cannot head-of-line-block fast DELETE/DRAIN commands, and
     // the backlog cannot grow without bound. Overflow is NACK'd (THROTTLED) so the controller re-drives it
-    // on its next reconcile scan. Both tunable via system property.
-    static final int COMMAND_PARALLELISM =
-            Math.max(1, Integer.getInteger("strata.node.commandParallelism", 8));
-    private static final int MAX_QUEUED_COMMANDS =
-            Math.max(COMMAND_PARALLELISM, Integer.getInteger("strata.node.maxQueuedCommands", 1024));
+    // on its next reconcile scan.
 
     private final DataNode node;
     private final DataNodeConfig config;
     private final ChunkStore store;
     private final ChunkDeleteService deletes;
+    private final int commandParallelism;
     private final AtomicBoolean closed = new AtomicBoolean(false);
-    private final LinkedBlockingQueue<Messages.Command> commandQueue = new LinkedBlockingQueue<>(MAX_QUEUED_COMMANDS);
+    private final LinkedBlockingQueue<Messages.Command> commandQueue;
     private final ConcurrentLinkedQueue<Messages.CompletedCommand> completed = new ConcurrentLinkedQueue<>();
 
     private volatile ManagedScpConnection controller;
@@ -71,6 +68,8 @@ final class ControlLoop implements AutoCloseable {
         this.config = Objects.requireNonNull(config, "config");
         this.store = Objects.requireNonNull(store, "store");
         this.deletes = Objects.requireNonNull(deletes, "deletes");
+        this.commandParallelism = config.controlCommandParallelism();
+        this.commandQueue = new LinkedBlockingQueue<>(config.controlMaxQueuedCommands());
         ConnectionPolicy policy = config.connectionPolicy();
         this.backoff = new Backoff(policy.reconnectInitialBackoffMs(), policy.reconnectMaxBackoffMs());
     }
@@ -84,7 +83,7 @@ final class ControlLoop implements AutoCloseable {
 
     void start() {
         threads.add(Thread.ofVirtual().name("node-control-" + node.incarnation()).start(this::run));
-        for (int i = 0; i < COMMAND_PARALLELISM; i++) {
+        for (int i = 0; i < commandParallelism; i++) {
             threads.add(Thread.ofVirtual().name("node-cmd-exec-" + node.incarnation() + "-" + i)
                     .start(this::executeCommands));
         }

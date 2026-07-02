@@ -6,6 +6,7 @@ import io.strata.common.ConnectionPolicy;
 import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
@@ -19,7 +20,6 @@ import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -80,11 +80,12 @@ class ControlLoopTest {
     @Test
     void startLaunchesWorkersAndCloseStopsThem() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            ControlLoop loop = controlLoop(node, configWithoutMetadata());
+            DataNodeConfig config = configWithoutMetadata();
+            ControlLoop loop = controlLoop(node, config);
 
             loop.start();
             List<Thread> threads = get(loop, "threads");
-            assertEquals(2 + ControlLoop.COMMAND_PARALLELISM, threads.size()); // control + N cmd-exec + scrub
+            assertEquals(2 + config.controlCommandParallelism(), threads.size()); // control + N cmd-exec + scrub
 
             loop.close();
             for (Thread thread : threads) {
@@ -465,11 +466,7 @@ class ControlLoopTest {
             ChunkId id = new ChunkId(FileId.of(3), 0);
             // Simulate a chunk mid-creation: add to the NsChunkId set via reflection.
             Set<Object> creating = getField(node.store(), "creating");
-            Class<?> nsChunkIdClass = Class.forName("io.strata.common.NsChunkId");
-            Constructor<?> ctor =
-                    nsChunkIdClass.getDeclaredConstructor(StrataNamespace.class, ChunkId.class);
-            ctor.setAccessible(true);
-            creating.add(ctor.newInstance(TEST_NS, id));
+            creating.add(new NsChunkId(TEST_NS, id));
 
             commands.add(new Messages.DeleteCmd(55, List.of(id), TEST_NS));
 

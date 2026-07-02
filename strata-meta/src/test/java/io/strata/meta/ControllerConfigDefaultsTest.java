@@ -35,6 +35,7 @@ class ControllerConfigDefaultsTest {
         assertEquals(16, c.maxCommandsPerHeartbeat());
         assertEquals(100, c.zkRetryBaseMs());
         assertEquals(5, c.zkRetryMaxRetries());
+        assertEquals("zk", c.metadataBackendConfig().backend());
     }
 
     @Test
@@ -42,7 +43,7 @@ class ControllerConfigDefaultsTest {
         ControllerConfig c = new ControllerConfig("zk:2181", 9100, 3000, 60000, 300000, 5000, 30000)
                 .withVerifyIntervalMs(500).withVerifyBatchSize(64).withSystemVerifyIntervalMs(10_000)
                 .withDeletedTombstoneTtlMs(120_000).withMaxCommandsPerHeartbeat(64)
-                .withZkRetryBaseMs(50).withZkRetryMaxRetries(9);
+                .withZkRetryBaseMs(50).withZkRetryMaxRetries(9).withNamespaceLogBackend();
         assertEquals(500, c.verifyIntervalMs());
         assertEquals(64, c.verifyBatchSize());
         assertEquals(10_000, c.systemVerifyIntervalMs());
@@ -50,6 +51,9 @@ class ControllerConfigDefaultsTest {
         assertEquals(64, c.maxCommandsPerHeartbeat());
         assertEquals(50, c.zkRetryBaseMs());
         assertEquals(9, c.zkRetryMaxRetries());
+        assertEquals("namespace-log", c.metadataBackendConfig().backend());
+        assertEquals(3, c.metadataBackendConfig().namespaceLogReplicationFactor());
+        assertEquals(2, c.metadataBackendConfig().namespaceLogAckQuorum());
     }
 
     @Test
@@ -59,6 +63,9 @@ class ControllerConfigDefaultsTest {
         assertThrows(IllegalArgumentException.class, () -> base.withVerifyBatchSize(-1));
         assertThrows(IllegalArgumentException.class, () -> base.withMaxCommandsPerHeartbeat(0));
         assertThrows(IllegalArgumentException.class, () -> base.withZkRetryMaxRetries(-1));
+        assertThrows(IllegalArgumentException.class, () -> base.withMetadataBackend(
+                new ControllerConfig.MetadataBackendConfig("namespace-log", 2, 3, false,
+                        4 * 1024 * 1024, 30_000, true, 0, 4 * 1024 * 1024)));
         // 0 retries is valid (means no retry)
         assertDoesNotThrow(() -> base.withZkRetryMaxRetries(0));
         assertEquals(0, base.withZkRetryMaxRetries(0).zkRetryMaxRetries());

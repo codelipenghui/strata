@@ -13,7 +13,6 @@ import io.strata.proto.Resp;
 import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
@@ -1617,12 +1616,12 @@ class AppenderImplTest {
 
     @Test
     void appendAdmissionBlocksOnAnyLiveReplicaWithoutCapacityButIgnoresFailedReplica() throws Exception {
-        AppenderImpl appender = appender();   // WritePolicy.DEFAULT: replicationFactor=3, ackQuorum=2
         Object session = chunkSession();      // 3 replicas, no connections established yet
 
-        Field wmField = AppenderImpl.class.getDeclaredField("APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK");
-        wmField.setAccessible(true);
-        int watermark = wmField.getInt(null);
+        int watermark = 64;
+        AppenderImpl appender = new AppenderImpl(null, null,
+                new ClientConfig(List.of("127.0.0.1:1"), 1024, 100).withAppendWatermarks(watermark, 1),
+                FileId.of(35), StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
         Field inFlightField = session.getClass().getDeclaredField("inFlight");
         inFlightField.setAccessible(true);
         int[] inFlight = (int[]) inFlightField.get(session);
@@ -1715,9 +1714,7 @@ class AppenderImplTest {
                     new Messages.Replica(6, endpoint(new3)));
             setSession(appender, oldSession);
 
-            Field wmField = AppenderImpl.class.getDeclaredField("APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK");
-            wmField.setAccessible(true);
-            inFlight(oldSession)[0] = wmField.getInt(null);
+            inFlight(oldSession)[0] = config.appendReplicaInflightHighWatermark();
 
             AtomicReference<CompletableFuture<Long>> appendResult = new AtomicReference<>();
             AtomicReference<Throwable> appendFailure = new AtomicReference<>();
@@ -1763,9 +1760,7 @@ class AppenderImplTest {
                     new Messages.Replica(3, endpoint(s3)));
             setSession(appender, session);
 
-            Field wmField = AppenderImpl.class.getDeclaredField("APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK");
-            wmField.setAccessible(true);
-            inFlight(session)[0] = wmField.getInt(null);
+            inFlight(session)[0] = config.appendReplicaInflightHighWatermark();
 
             AtomicReference<CompletableFuture<Long>> appendResult = new AtomicReference<>();
             AtomicReference<Throwable> appendFailure = new AtomicReference<>();
@@ -1829,10 +1824,7 @@ class AppenderImplTest {
     }
 
     private static Object chunkSession(ChunkId chunkId, Messages.Replica... replicas) throws Exception {
-        Class<?> type = Class.forName("io.strata.client.AppenderImpl$ChunkSession");
-        Constructor<?> ctor = type.getDeclaredConstructor(ChunkId.class, List.class, long.class, long.class);
-        ctor.setAccessible(true);
-        return ctor.newInstance(chunkId, List.of(replicas), 0L, 0L);
+        return new AppenderImpl.ChunkSession(chunkId, List.of(replicas), 0L, 0L);
     }
 
     private static void onReplicaResponse(AppenderImpl appender, Object session,
@@ -1975,10 +1967,7 @@ class AppenderImplTest {
     }
 
     private static Object pending(long chunkEnd, CompletableFuture<Long> future) throws Exception {
-        Class<?> type = Class.forName("io.strata.client.AppenderImpl$Pending");
-        Constructor<?> ctor = type.getDeclaredConstructor(long.class, CompletableFuture.class);
-        ctor.setAccessible(true);
-        return ctor.newInstance(chunkEnd, future);
+        return new AppenderImpl.Pending(chunkEnd, future);
     }
 
     @SuppressWarnings("unchecked")

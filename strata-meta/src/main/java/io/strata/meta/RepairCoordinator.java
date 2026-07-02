@@ -64,8 +64,8 @@ class RepairCoordinator implements AutoCloseable {
         long issuedAtMs();
     }
 
-    private record ReplicateAction(StrataNamespace namespace, FileId fileId, ChunkId chunkId,
-                                   int deadNode, int targetNode, long issuedAtMs) implements Action {
+    record ReplicateAction(StrataNamespace namespace, FileId fileId, ChunkId chunkId,
+                           int deadNode, int targetNode, long issuedAtMs) implements Action {
         @Override
         public int executingNode() {
             return targetNode;
