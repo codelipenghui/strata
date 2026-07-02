@@ -701,6 +701,7 @@ class RepairCoordinator implements AutoCloseable {
         Records.FileRecord file = opt.get().value();
         Map<Integer, List<ChunkId>> byNode = new LinkedHashMap<>();
         Map<ChunkId, Records.ChunkRecord> expected = new HashMap<>();
+        Map<ChunkId, Set<Integer>> droppedThisPass = new HashMap<>();
         for (Records.ChunkRecord c : file.chunks()) {
             if (c.state() != ChunkState.SEALED) {
                 continue;
@@ -734,7 +735,7 @@ class RepairCoordinator implements AutoCloseable {
                 for (Messages.VerifyChunkResult r : results) {
                     Records.ChunkRecord exp = expected.get(r.chunkId());
                     if (exp != null) {
-                        applyVerifyVerdict(ns, fileId, exp, e.getKey(), node, r, now, nodes);
+                        applyVerifyVerdict(ns, fileId, exp, e.getKey(), node, r, now, nodes, droppedThisPass);
                     }
                 }
             }
@@ -766,12 +767,13 @@ class RepairCoordinator implements AutoCloseable {
     /**
      * Compares one VERIFY_CHUNKS result against the descriptor and drops the replica when it is missing,
      * non-SEALED past grace, or corrupt — the owner-pull equivalent of the inventory-push reconciliation.
-     * A freshly-repaired replica is protected from a stale verdict; corrupt/bad bytes are physically
-     * deleted now so a re-pick of this node cannot read them (the under-replication scan re-replicates).
+     * A freshly-repaired replica is protected from a stale verdict; corrupt/bad bytes are physically deleted
+     * after grace so a re-pick of this node cannot read them (the under-replication scan re-replicates).
      */
     private void applyVerifyVerdict(StrataNamespace ns, FileId fileId, Records.ChunkRecord exp, int nodeId,
                                     Records.NodeRecord node, Messages.VerifyChunkResult r, long now,
-                                    Map<Integer, Records.NodeRecord> nodes)
+                                    Map<Integer, Records.NodeRecord> nodes,
+                                    Map<ChunkId, Set<Integer>> droppedThisPass)
             throws Exception {
         ChunkId chunkId = r.chunkId();
         if (isRepairProtected(ns, chunkId, nodeId)) {
@@ -784,11 +786,14 @@ class RepairCoordinator implements AutoCloseable {
         // live replica of a chunk. A false-positive verdict — a transient miss or a bogus crc — must not
         // turn a recoverable degraded chunk into an unavailable one (0 live replicas). The reconcile scan
         // re-replicates once a healthy peer exists; until then keeping the (possibly bad) last copy
-        // referenced is strictly safer than dropping it. The anomaly stays tracked, so the drop fires as
-        // soon as another live replica exists. Liveness is judged from the persisted snapshot (not
+        // referenced is strictly safer than dropping it. Liveness is judged from the persisted snapshot (not
         // registry.isDead), so a non-leader owner with a frozen in-memory registry does not miscount a
-        // genuinely-DEAD peer as live and drop the last actually-live copy.
-        if (!healthy && exp.replicas().stream().filter(n -> n != nodeId && isPersistedLive(n, nodes)).count() == 0) {
+        // genuinely-DEAD peer as live and drop the last actually-live copy. Already-dropped replicas from
+        // this verify pass also cannot count as survivors, because they may already be physically unlinked.
+        Set<Integer> dropped = droppedThisPass.getOrDefault(chunkId, Set.of());
+        if (!healthy && exp.replicas().stream()
+                .filter(n -> n != nodeId && !dropped.contains(n) && isPersistedLive(n, nodes))
+                .count() == 0) {
             log.warn("verify: keeping last live replica {} of chunk {} despite verdict "
                             + "(present={} state={}) — dropping it would leave 0 live replicas",
                     nodeId, chunkId, r.present(), r.state());
@@ -800,6 +805,7 @@ class RepairCoordinator implements AutoCloseable {
                         nodeId, chunkId, config.replicaMissingGraceMs());
                 replicaMissingSince.remove(key);
                 applyDeleteConfirmed(ns, fileId, chunkId, nodeId);
+                recordDroppedThisPass(droppedThisPass, chunkId, nodeId);
             }
         } else if (r.state() != ChunkState.SEALED) {
             if (replicaUnhealthyPastGrace(key, now)) {
@@ -807,17 +813,27 @@ class RepairCoordinator implements AutoCloseable {
                         nodeId, r.state(), chunkId, config.replicaMissingGraceMs());
                 replicaMissingSince.remove(key);
                 applyDeleteConfirmed(ns, fileId, chunkId, nodeId);
+                recordDroppedThisPass(droppedThisPass, chunkId, nodeId);
                 execDelete(node, chunkId, ns);
             }
         } else if (r.length() != exp.length() || r.crc() != exp.crc()) {
-            replicaMissingSince.remove(key);
-            log.warn("verify: node {} holds corrupt sealed chunk {} (len {}/{} crc {}/{}) — dropping replica",
-                    nodeId, chunkId, r.length(), exp.length(), r.crc(), exp.crc());
-            applyDeleteConfirmed(ns, fileId, chunkId, nodeId);
-            execDelete(node, chunkId, ns);
+            if (replicaUnhealthyPastGrace(key, now)) {
+                replicaMissingSince.remove(key);
+                log.warn("verify: node {} holds corrupt sealed chunk {} (len {}/{} crc {}/{}, >= {}ms) "
+                                + "— dropping replica",
+                        nodeId, chunkId, r.length(), exp.length(), r.crc(), exp.crc(),
+                        config.replicaMissingGraceMs());
+                applyDeleteConfirmed(ns, fileId, chunkId, nodeId);
+                recordDroppedThisPass(droppedThisPass, chunkId, nodeId);
+                execDelete(node, chunkId, ns);
+            }
         } else {
             replicaMissingSince.remove(key); // healthy attestation — clear any pending anomaly
         }
+    }
+
+    private void recordDroppedThisPass(Map<ChunkId, Set<Integer>> droppedThisPass, ChunkId chunkId, int nodeId) {
+        droppedThisPass.computeIfAbsent(chunkId, k -> new HashSet<>()).add(nodeId);
     }
 
     private void ownerRepairChunk(StrataNamespace ns, Records.FileRecord file, Records.ChunkRecord chunk,

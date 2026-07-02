@@ -699,6 +699,63 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void verifyPassKeepsOneLiveReplicaWhenAllVerdictsUseSameStaleSnapshot() throws Exception {
+        // The last-live guard must account for replicas already dropped earlier in this verify pass. Otherwise
+        // the stale FileRecord snapshot can count an already-deleted peer as a survivor and delete every copy.
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        List<Integer> deletes = new CopyOnWriteArrayList<>();
+
+        try (ScpServer nodeA = corruptingVerifyNode(1101, deletes);
+             ScpServer nodeB = corruptingVerifyNode(1102, deletes);
+             ScpServer nodeC = corruptingVerifyNode(1103, deletes)) {
+            Registered a = registerAt(registry, 1101, "a-host", "127.0.0.1:" + nodeA.port());
+            Registered b = registerAt(registry, 1102, "b-host", "127.0.0.1:" + nodeB.port());
+            Registered c = registerAt(registry, 1103, "c-host", "127.0.0.1:" + nodeC.port());
+
+            FileId fileId = fileId(0x4040);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(a.nodeId(), b.nodeId(), c.nodeId())))));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
+                    () -> false, () -> false, ns -> true);
+            owner.verifyPass();
+
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertEquals(List.of(c.nodeId()), replicas,
+                    "the final live replica is kept even though the pass began with three corrupt verdicts");
+            assertEquals(List.of(a.nodeId(), b.nodeId()), deletes,
+                    "only replicas with a replacement survivor should be physically deleted");
+        }
+    }
+
+    @Test
+    void corruptVerifyVerdictMustPassGraceBeforeDelete() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        List<Integer> deletes = new CopyOnWriteArrayList<>();
+
+        try (ScpServer node = corruptingVerifyNode(1201, deletes)) {
+            Registered corrupt = registerAt(registry, 1201, "corrupt-host", "127.0.0.1:" + node.port());
+            Registered peer = register(registry, 1202, "peer-host");
+
+            FileId fileId = fileId(0x5050);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(corrupt.nodeId(), peer.nodeId())))));
+
+            ControllerConfig graced = config(5000).withReplicaMissingGraceMs(60_000);
+            RepairCoordinator owner = new RepairCoordinator(store, registry, graced,
+                    () -> false, () -> false, ns -> true);
+            owner.verifyPass();
+
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertEquals(List.of(corrupt.nodeId(), peer.nodeId()), replicas,
+                    "a first corrupt verdict is tracked but not dropped before grace expires");
+            assertTrue(deletes.isEmpty(), "corrupt verdict must not physically delete before grace expires");
+        }
+    }
+
+    @Test
     void ownerRepairThatLosesEveryCasDoesNotReportFalseSuccess() throws Exception {
         FakeStore store = new FakeStore();
         store.failUpdateFileAttempts = 10; // > CAS_RETRIES: every descriptor-swap CAS loses
@@ -941,6 +998,26 @@ class RepairCoordinatorTest {
                 (int) incMsb, incMsb, incLsb, List.of(endpoint), "zone", "rack", host,
                 List.of(new Messages.StorageCapacity(1_000_000)), 1, 0));
         return new Registered(resp.nodeId(), incMsb, incLsb, resp.sessionEpoch());
+    }
+
+    private static ScpServer corruptingVerifyNode(int serverNodeId, List<Integer> deletes) throws Exception {
+        return new ScpServer(0, serverNodeId, serverNodeId, serverNodeId + 1L, req -> {
+            if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                List<Messages.VerifyChunkResult> results = new ArrayList<>();
+                for (ChunkId id : vc.chunkIds()) {
+                    results.add(new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096, 0xBAD));
+                }
+                return ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
+            }
+            if (req.opcode() == Opcode.DELETE_CHUNKS.code) {
+                Messages.DeleteChunks dc = Messages.DeleteChunks.decode(req.headerSlice());
+                deletes.add(serverNodeId);
+                return ScpServer.ok(req, new Messages.DeleteChunksResp(dc.chunkIds(),
+                        dc.chunkIds().stream().map(id -> ErrorCode.OK.code).toList()).encode(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode " + req.opcode());
+        });
     }
 
     @Test
