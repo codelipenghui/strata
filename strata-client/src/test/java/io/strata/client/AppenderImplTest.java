@@ -37,6 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -1741,6 +1742,77 @@ class AppenderImplTest {
             waitFor(() -> newAppends.get() == 3);
             assertEquals(0, oldAppends.get(), "stale session must not receive the append after the wait");
             assertEquals(3, newAppends.get());
+        }
+    }
+
+    @Test
+    void appendWaitsAfterBackpressureIfSameSessionStartsRolling() throws Exception {
+        FileId fileId = FileId.of(44);
+        AtomicInteger appends = new AtomicInteger();
+
+        try (ScpServer s1 = countedDataNodeServer(1, appends);
+             ScpServer s2 = countedDataNodeServer(2, appends);
+             ScpServer s3 = countedDataNodeServer(3, appends);
+             NodePool pool = new NodePool()) {
+            ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500);
+            AppenderImpl appender = new AppenderImpl(null, pool, config, fileId, StrataNamespace.of("test"),
+                    1, Messages.WritePolicy.DEFAULT, 0);
+            Object session = chunkSession(new ChunkId(fileId, 0),
+                    new Messages.Replica(1, endpoint(s1)),
+                    new Messages.Replica(2, endpoint(s2)),
+                    new Messages.Replica(3, endpoint(s3)));
+            setSession(appender, session);
+
+            Field wmField = AppenderImpl.class.getDeclaredField("APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK");
+            wmField.setAccessible(true);
+            inFlight(session)[0] = wmField.getInt(null);
+
+            AtomicReference<CompletableFuture<Long>> appendResult = new AtomicReference<>();
+            AtomicReference<Throwable> appendFailure = new AtomicReference<>();
+            Thread appendThread = Thread.ofVirtual().start(() -> {
+                try {
+                    appendResult.set(appender.append(ByteBuffer.wrap(new byte[] {1, 2, 3})));
+                } catch (Throwable t) {
+                    appendFailure.set(t);
+                }
+            });
+
+            waitForProgressWaiter(appender);
+            ReentrantLock lock = appenderLock(appender);
+            Condition progress = appenderProgress(appender);
+            lock.lock();
+            try {
+                setBoolean(appender, "rolling", true);
+                inFlight(session)[0] = 0;
+                progress.signalAll();
+            } finally {
+                lock.unlock();
+            }
+
+            try {
+                TimeUnit.MILLISECONDS.sleep(200);
+                assertEquals(0, appends.get(), "append must not enter a session while seal/roll owns it");
+                assertNull(appendResult.get());
+                assertNull(appendFailure.get());
+                assertTrue(appendThread.isAlive(), "append should still be waiting for rolling to finish");
+            } finally {
+                lock.lock();
+                try {
+                    setBoolean(appender, "rolling", false);
+                    progress.signalAll();
+                } finally {
+                    lock.unlock();
+                }
+                appendThread.join(2_000);
+                appender.close();
+            }
+
+            assertFalse(appendThread.isAlive(), "append should proceed once rolling clears");
+            assertNull(appendFailure.get());
+            assertNotNull(appendResult.get());
+            assertEquals(3L, appendResult.get().get(1, TimeUnit.SECONDS));
+            waitFor(() -> appends.get() == 3);
+            assertEquals(3, appends.get());
         }
     }
 

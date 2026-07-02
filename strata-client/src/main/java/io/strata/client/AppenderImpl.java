@@ -164,7 +164,7 @@ final class AppenderImpl implements StrataFile.Appender {
                 ChunkSession s = session;
                 awaitAppendConnectionCapacityLocked(s);
                 throwIfDead();
-                if (s != session || shouldRollBeforeAppend(s) || s.end >= config.chunkRollBytes()) {
+                if (rolling || s != session || shouldRollBeforeAppend(s) || s.end >= config.chunkRollBytes()) {
                     continue;
                 }
                 long base = s.end;
@@ -295,7 +295,7 @@ final class AppenderImpl implements StrataFile.Appender {
     private void awaitAppendConnectionCapacityLocked(ChunkSession s) {
         long waitStart = System.nanoTime();
         long nextWarn = waitStart + APPEND_BACKPRESSURE_WARN_NANOS;
-        while (!dead && !hasAppendConnectionCapacity(s)) {
+        while (!dead && !rolling && !hasAppendConnectionCapacity(s)) {
             try {
                 progress.await(1, TimeUnit.SECONDS);
                 long now = System.nanoTime();
