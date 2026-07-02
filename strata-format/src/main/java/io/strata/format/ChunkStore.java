@@ -65,6 +65,7 @@ import static io.strata.format.ChunkFormats.writeFully;
  */
 public final class ChunkStore implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ChunkStore.class);
+    static final long REPAIR_IMPORT_ORPHAN_PROTECTION_MS = 90_000;
 
     @FunctionalInterface
     interface DirectorySyncer {
@@ -521,6 +522,10 @@ public final class ChunkStore implements AutoCloseable {
         // node first learned of the chunk so a freshly-created/recovered chunk gets the full orphan grace
         // (§20.4) before it can be considered a suspect. In-memory only: a restart re-earns verification.
         volatile long lastVerifiedAtMs = System.currentTimeMillis();
+        // Repair imports are locally durable before the controller commits the descriptor swap. During that
+        // window LOOKUP_FILE truthfully does not list this node yet, so node-local orphan GC must not confirm
+        // and delete the just-copied replica before the completion heartbeat and swap/retry path can land.
+        volatile long orphanProtectedUntilMs;
 
         // Running CRC state for an OPEN chunk: the whole-chunk CRC and the per-CRC_RANGE_SIZE range
         // CRCs are folded as bytes are appended (and rebuilt from the verified prefix on recovery),
@@ -1574,6 +1579,9 @@ public final class ChunkStore implements AutoCloseable {
                 h.writeEpoch = header.createWriteEpoch();
                 h.fenceEpoch = -1;
                 h.lastKnownDO = trailer.dataLength();
+                long now = System.currentTimeMillis();
+                h.lastVerifiedAtMs = now;
+                h.orphanProtectedUntilMs = now + REPAIR_IMPORT_ORPHAN_PROTECTION_MS;
                 // Durability-v2 (Lever 1): an imported sealed chunk carries a verified trailer and no
                 // ledger, which recovery classifies as SEALED — no sidecar written.
                 Files.deleteIfExists(h.ledgerPath);
@@ -1764,7 +1772,9 @@ public final class ChunkStore implements AutoCloseable {
         for (Handle h : chunks.values()) {
             h.lock.lock();
             try {
-                if (h.state == ChunkState.SEALED && now - h.lastVerifiedAtMs >= olderThanMs) {
+                if (h.state == ChunkState.SEALED
+                        && now >= h.orphanProtectedUntilMs
+                        && now - h.lastVerifiedAtMs >= olderThanMs) {
                     out.add(new SuspectChunk(h.ns, h.id));
                 }
             } finally {
