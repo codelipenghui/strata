@@ -940,11 +940,11 @@ public final class ChunkStore implements AutoCloseable {
     public record ReadResult(byte[] bytes, long localEndOffset, long lastKnownDO) {}
 
     /**
-     * A read response that is either a zero-copy file region or a heap snapshot of the bytes.
-     * Client reads of open chunks are bounded by the replica-known durable high watermark and may
-     * return a zero-copy channel region without per-read ledger verification. Open recovery reads can
-     * include the undurable tail, so they are snapshotted before any concurrent seal-truncate can alter
-     * the transferred payload.
+     * A read response that is either a channel-backed file region or a heap snapshot of the bytes.
+     * Client reads of open chunks are bounded by the replica-known durable high watermark and are
+     * materialized with per-read CRC verification before being returned. Open recovery reads can include
+     * the undurable tail, so they are snapshotted before any concurrent seal-truncate can alter the
+     * transferred payload.
      * Exactly one of {@code channel} / {@code bytes} is set for a non-empty result.
      */
     public record ReadRegionResult(FileChannel channel, long filePosition, int length, byte[] bytes,
@@ -1014,10 +1014,8 @@ public final class ChunkStore implements AutoCloseable {
         requireNonNegative(offset, "read offset");
         requireNonNegative(maxBytes, "read maxBytes");
         Handle h = lookup(ns, id);
-        boolean sealed;
         long localEnd;
         long lastKnownDO;
-        long filePos;
         int n;
         Path dataPath;
         NsChunkId nsKey;
@@ -1045,24 +1043,20 @@ public final class ChunkStore implements AutoCloseable {
                 nsCounters[2].increment();
                 nsCounters[3].add(n);
             }
-            filePos = checkedAdd(DATA_START, offset, "chunk file offset");
-            if (h.state != ChunkState.SEALED && includeUndurableTail) {
-                // Recovery reads may inspect bytes above lastKnownDO. Keep them materialized and verified
-                // UNDER the chunk lock because that tail can be truncated by a later seal.
+            if (h.state != ChunkState.SEALED) {
+                // READs over open chunks must be materialized + ledger-verified under the chunk lock. The
+                // recovery path may inspect bytes above lastKnownDO, and even the client durable prefix uses
+                // the same ledger CRCs to avoid silently serving local disk rot.
                 byte[] out = new byte[n];
                 readOpenVerified(h, offset, out);
                 return new ReadRegionResult(null, 0, n, out, localEnd, lastKnownDO, null);
             }
-            if (h.state == ChunkState.SEALED && includeUndurableTail) {
-                sealedLength = h.sealedLength;
-                sealedRangeCrcs = h.sealedRangeCrcs;
-            }
+            sealedLength = h.sealedLength;
+            sealedRangeCrcs = h.sealedRangeCrcs;
             // Snapshot what the off-lock open needs. The bytes we will expose are stable once the lock is
-            // released: an OPEN client read is clamped to lastKnownDO (which no concurrent seal can truncate
-            // below), and a SEALED chunk's data region is immutable. So the blocking open/acquire below need
-            // not hold the chunk lock — keeping it off-lock stops a blocking open from serializing every
-            // other op on this chunk.
-            sealed = h.state == ChunkState.SEALED;
+            // released: a SEALED chunk's data region is immutable. So the blocking acquire below need not
+            // hold the chunk lock — keeping it off-lock stops a blocking open from serializing every other
+            // op on this chunk.
             dataPath = h.dataPath;
             nsKey = h.nsKey;
         } finally {
@@ -1071,51 +1065,15 @@ public final class ChunkStore implements AutoCloseable {
         // Test seam: lets a test delete + re-import this id in the window between the lock release and the
         // off-lock open/acquire below, to exercise the post-open handle revalidation.
         FailureInjector.point("format.readRegion.beforeOpen");
-        if (sealed && includeUndurableTail) {
-            // Recovery can promote a sealed donor's bytes into the committed replica set, so it must not
-            // use the client zero-copy sealed fast path that relies on deferred scrub for rot detection.
-            byte[] out = new byte[n];
-            try (ChannelCache.Lease lease = channelCache.acquire(nsKey, dataPath)) {
-                requireCurrentHandle(h, nsKey, id);
-                readSealedVerified(lease.channel(), sealedLength, sealedRangeCrcs, id, offset, out);
-            }
-            return new ReadRegionResult(null, 0, n, out, localEnd, lastKnownDO, null);
-        }
-        if (!sealed) {
-            // OPEN client fast path: independent transient READ FD, opened OFF the chunk lock. We do NOT
-            // re-run readOpenVerified here (it would materialize + CRC the range, removing the zero-copy
-            // throughput benefit); read-time rot detection in the durable prefix is deferred to the verified
-            // read()/READ_RECOVERY paths, crash recovery, and sealed scrub. A concurrent delete may unlink
-            // the file first → open throws the expected delete/read race; clients retry. The FD is released
-            // by closing it; the transport streams the region via sendfile.
-            FileChannel readChannel = FileChannel.open(dataPath, StandardOpenOption.READ);
-            try {
-                requireCurrentHandle(h, nsKey, id);
-                return new ReadRegionResult(readChannel, filePos, n, null, localEnd, lastKnownDO,
-                        () -> closeQuietly(readChannel));
-            } catch (RuntimeException e) {
-                closeQuietly(readChannel);
-                throw e;
-            }
-        }
-        // SEALED client fast path: the data region is immutable (no further append/seal/truncate), so hand
-        // back a zero-copy region the transport streams via sendfile. We do NOT re-verify range CRCs per
-        // client read here: that forced a full CRC-range read + a 4 MiB allocation per request (~20x slower,
-        // measured); integrity is covered by background scrub and the verified read()/fetch()/import paths.
-        // The exclusive leased cache channel is acquired OFF the chunk lock (never shared across readers —
-        // FileChannel is interruptible, so a shared FD would close for all on any reader's interrupt). A
-        // concurrent delete only unlinks the path while this independent FD keeps the inode alive, so the
-        // deferred transfer is safe. The lease is released (returning the channel to the idle pool) when
-        // the response Frame closes.
-        ChannelCache.Lease lease = channelCache.acquire(nsKey, dataPath);
-        try {
+        // SEALED READs are immutable, so we can verify off-lock against the footer CRC ranges. Both client
+        // reads and recovery reads use this path: a corrupt local block fails before the node writes a READ
+        // response, instead of waiting for background scrub.
+        byte[] out = new byte[n];
+        try (ChannelCache.Lease lease = channelCache.acquire(nsKey, dataPath)) {
             requireCurrentHandle(h, nsKey, id);
-            return new ReadRegionResult(lease.channel(), filePos, n, null, localEnd, lastKnownDO,
-                    lease::release);
-        } catch (RuntimeException e) {
-            lease.release();
-            throw e;
+            readSealedVerified(lease.channel(), sealedLength, sealedRangeCrcs, id, offset, out);
         }
+        return new ReadRegionResult(null, 0, n, out, localEnd, lastKnownDO, null);
     }
 
     /**
@@ -1125,7 +1083,7 @@ public final class ChunkStore implements AutoCloseable {
      * (length/state) to the freshly-replaced physical file. A {@code Handle} is in the map iff it has not
      * been deleted, so an identity mismatch means the snapshot is stale: fail with CHUNK_NOT_FOUND and let
      * the client retry — the same contract as opening an already-unlinked file. The verified read() path
-     * needs no equivalent: it CRC-checks the bytes against the snapshot, so a replaced file fails the check.
+     * needs no equivalent: open reads stay under the chunk lock until bytes are CRC-verified.
      */
     private void requireCurrentHandle(Handle h, NsChunkId nsKey, ChunkId id) {
         if (chunks.get(nsKey) != h) {
@@ -1193,11 +1151,9 @@ public final class ChunkStore implements AutoCloseable {
             if (dataLength > h.end) {
                 throw new ScpException(ErrorCode.INTERNAL, "seal beyond end: " + dataLength + " > " + h.end);
             }
-            // Load-bearing invariant: a seal may never floor below the durable high watermark. The
-            // zero-copy open-read fast path (readRegion) hands back a bare file region clamped to
-            // lastKnownDO without re-snapshotting under the lock; that is only safe because a concurrent
-            // seal can never truncate the data out from under [0, lastKnownDO). Recovery relies on it too
-            // (it must not drop quorum-durable bytes). Do not relax without revisiting both.
+            // Load-bearing invariant: a seal may never floor below the durable high watermark. Client
+            // reads clamp open chunks to lastKnownDO, and recovery relies on the floor too because it must
+            // not drop quorum-durable bytes. Do not relax without revisiting both.
             if (dataLength < h.lastKnownDO) {
                 throw new ScpException(ErrorCode.INTERNAL,
                         "seal below durable watermark: " + dataLength + " < " + h.lastKnownDO, h.lastKnownDO);

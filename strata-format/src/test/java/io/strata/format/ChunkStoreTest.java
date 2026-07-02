@@ -49,7 +49,6 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -638,7 +637,7 @@ class ChunkStoreTest {
             try (var region = store.readRegion(TEST_NS, id, 6, 1024)) {
                 assertEquals(5, region.length());
                 assertEquals(11, region.localEndOffset());
-                // SEALED reads are zero-copy regions (bytes() == null); read via the channel.
+                assertNull(region.channel(), "sealed readRegion should return verified bytes");
                 assertArrayEquals("world".getBytes(), consumeRegion(region));
             }
 
@@ -985,11 +984,9 @@ class ChunkStoreTest {
     }
 
     @Test
-    void openReadRegionDurablePrefixIsZeroCopyAcrossConcurrentSealTruncate() throws Exception {
-        // A reader resolves a region on an OPEN chunk; the data plane transfers that region LATER,
-        // off the chunk lock. readRegion must only expose bytes below the replica-known durable high
-        // watermark, and an independent read FD must keep those bytes stable if a concurrent seal
-        // truncates the never-acked tail.
+    void openReadRegionDurablePrefixIsVerifiedSnapshotAcrossConcurrentSealTruncate() throws Exception {
+        // readRegion must only expose bytes below the replica-known durable high watermark. The returned
+        // bytes are already materialized and CRC-verified, so a later seal cannot alter the payload.
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
             store.append(TEST_NS, id, 1, 0, 0, bytes("COMMITTED"));      // [0,9) survives the seal
@@ -1002,17 +999,17 @@ class ChunkStoreTest {
             assertEquals(21, tail.localEndOffset());
             assertEquals(9, tail.lastKnownDO());
 
-            // The committed prefix is served as a zero-copy channel region over an independent FD.
+            // The committed prefix is served as verified materialized bytes.
             ChunkStore.ReadRegionResult region = store.readRegion(TEST_NS, id, 0, 1024);
             assertEquals(9, region.length());
-            assertTrue(region.channel() != null, "durable open read should use a zero-copy channel");
-            assertEquals(null, region.bytes());
+            assertNull(region.channel(), "durable open read should be materialized after verification");
+            assertArrayEquals("COMMITTED".getBytes(), region.bytes());
             try {
                 // a concurrent seal truncates the never-acked tail after this region was resolved
                 var sealed = store.seal(TEST_NS, id, 1, 9, null);
                 assertEquals(9, sealed.finalLength());
 
-                // the region handed out BEFORE the seal must still yield the original committed bytes
+                // the snapshot handed out BEFORE the seal must still yield the original committed bytes
                 byte[] got = consumeRegion(region);
                 assertArrayEquals("COMMITTED".getBytes(), got,
                         "readRegion result must be a stable snapshot unaffected by a concurrent seal-truncate");
@@ -1047,7 +1044,7 @@ class ChunkStoreTest {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
             store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(new byte[4096]));
-            store.seal(TEST_NS, id, 1, 4096, null); // SEALED → readRegion takes the off-lock zero-copy branch
+            store.seal(TEST_NS, id, 1, 4096, null); // SEALED -> readRegion verifies off the chunk lock
 
             AtomicBoolean swapped = new AtomicBoolean(false);
             FailureInjector.arm("format.readRegion.beforeOpen", p -> {
@@ -1071,7 +1068,7 @@ class ChunkStoreTest {
     }
 
     @Test
-    void openReadRejectsLedgerCoveredDataRotButReadRegionIsZeroCopyUnverified() throws Exception {
+    void openReadRegionRejectsLedgerCoveredDataRot() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
             store.append(TEST_NS, id, 1, 0, 0, bytes("verified-open"));
@@ -1084,16 +1081,16 @@ class ChunkStoreTest {
 
             assertEquals(ErrorCode.CRC_MISMATCH,
                     assertThrows(ScpException.class, () -> store.read(TEST_NS, id, 0, 13)).code());
-            try (var region = store.readRegion(TEST_NS, id, 0, 13)) {
-                assertEquals(13, region.length());
-                assertTrue(region.channel() != null, "client open readRegion should be zero-copy");
-                byte[] got = consumeRegion(region);
-                assertEquals('X', got[4]);
-            }
+            ScpException e = assertThrows(ScpException.class, () -> {
+                try (var ignored = store.readRegion(TEST_NS, id, 0, 13)) {
+                    // Should fail before returning a readable region.
+                }
+            });
+            assertEquals(ErrorCode.CRC_MISMATCH, e.code());
         }
     }
 
-    /** Reads a region result whether it is a heap snapshot or a zero-copy channel. */
+    /** Reads a region result whether it is a heap snapshot or a channel-backed result. */
     private static byte[] consumeRegion(ChunkStore.ReadRegionResult r) throws Exception {
         if (r.bytes() != null) {
             return r.bytes();
@@ -1687,15 +1684,17 @@ class ChunkStoreTest {
             }
             try (ChunkStore.ReadRegionResult clientPrefix = store.readRegion(TEST_NS, chunkId, 0, total)) {
                 assertEquals(d, clientPrefix.length(), "client read serves only the durable prefix");
-                assertTrue(clientPrefix.bytes() == null,
-                        "durable-prefix open read is zero-copy (a channel, not materialized bytes)");
+                assertNull(clientPrefix.channel(),
+                        "durable-prefix open read is materialized after ledger verification");
+                assertArrayEquals(durable, clientPrefix.bytes(),
+                        "client read returns the verified durable prefix");
             }
 
-            // Recovery read includes the undurable tail, materialized + integrity-verified (not a
-            // zero-copy channel), so seal recovery sees quorum-durable bytes instead of sealing short.
+            // Recovery read includes the undurable tail, materialized + integrity-verified, so seal recovery
+            // sees quorum-durable bytes instead of sealing short.
             try (ChunkStore.ReadRegionResult recovery = store.readRegionForRecovery(TEST_NS, chunkId, 0, total)) {
                 assertEquals(total, recovery.length(), "recovery read must include the undurable tail");
-                assertTrue(recovery.channel() == null, "recovery tail must be materialized, not zero-copy");
+                assertNull(recovery.channel(), "recovery tail must be materialized");
                 assertArrayEquals(all, recovery.bytes(), "recovery read must return the full verified bytes");
             }
         }
@@ -1714,7 +1713,7 @@ class ChunkStoreTest {
             try (ChunkStore.ReadRegionResult recovery =
                          store.readRegionForRecovery(TEST_NS, chunkId, 0, payload.length)) {
                 assertEquals(payload.length, recovery.length(), "sealed recovery read must serve the data");
-                assertNull(recovery.channel(), "sealed recovery read must be materialized, not zero-copy");
+                assertNull(recovery.channel(), "sealed recovery read must be materialized");
                 assertArrayEquals(payload, recovery.bytes(), "sealed recovery read must return verified bytes");
             }
 
@@ -1724,12 +1723,13 @@ class ChunkStoreTest {
                         ChunkFormats.DATA_START);
             }
 
-            try (ChunkStore.ReadRegionResult client =
-                         store.readRegion(TEST_NS, chunkId, 0, payload.length)) {
-                assertEquals(payload.length, client.length(), "sealed client read must still serve the range");
-                assertNotNull(client.channel(), "sealed client read must stay on the zero-copy fast path");
-                assertNull(client.bytes(), "sealed client read must not materialize bytes");
-            }
+            ScpException clientError = assertThrows(ScpException.class, () -> {
+                try (ChunkStore.ReadRegionResult ignored =
+                             store.readRegion(TEST_NS, chunkId, 0, payload.length)) {
+                    // Should fail before returning bytes.
+                }
+            });
+            assertEquals(ErrorCode.CRC_MISMATCH, clientError.code());
 
             ScpException e = assertThrows(ScpException.class, () -> {
                 try (ChunkStore.ReadRegionResult ignored =
@@ -2201,17 +2201,16 @@ class ChunkStoreTest {
     }
 
     @Test
-    void sealedConcurrentReadRegionsUseExclusiveFds() throws Exception {
+    void sealedConcurrentReadRegionsReturnVerifiedSnapshots() throws Exception {
         try (ChunkStore store = newStore()) {
-            sealedBytes(store, id, "shared-zero-copy");
+            sealedBytes(store, id, "verified-sealed");
             ChunkStore.ReadRegionResult r1 = store.readRegion(TEST_NS, id, 0, 6);
             ChunkStore.ReadRegionResult r2 = store.readRegion(TEST_NS, id, 6, 4);
             try {
-                assertTrue(r1.channel() != null && r2.channel() != null, "sealed reads are zero-copy");
-                assertNotSame(r1.channel(), r2.channel(),
-                        "concurrent sealed readers must get exclusive FDs (interrupt-safety), not one shared FD");
-                assertArrayEquals("shared".getBytes(), consumeRegion(r1));
-                assertArrayEquals("-zer".getBytes(), consumeRegion(r2));
+                assertNull(r1.channel(), "sealed reads are materialized after CRC verification");
+                assertNull(r2.channel(), "sealed reads are materialized after CRC verification");
+                assertArrayEquals("verifi".getBytes(), consumeRegion(r1));
+                assertArrayEquals("ed-s".getBytes(), consumeRegion(r2));
             } finally {
                 r1.close();
                 r2.close();
@@ -2222,14 +2221,15 @@ class ChunkStoreTest {
     }
 
     @Test
-    void sealedReadRegionLeaseKeepsFdOpenUntilReleased() throws Exception {
+    void sealedReadRegionReturnsVerifiedBytesAndCachesLease() throws Exception {
         try (ChunkStore store = newStore()) {
             sealedBytes(store, id, "lease-lifetime");
-            ChunkStore.ReadRegionResult r = store.readRegion(TEST_NS, id, 0, 5);
-            FileChannel ch = r.channel();
-            assertTrue(ch.isOpen());
-            r.close(); // releases the lease; channel stays cached/open
-            assertTrue(ch.isOpen(), "release returns the FD to the cache, does not close it");
+            try (ChunkStore.ReadRegionResult r = store.readRegion(TEST_NS, id, 0, 5)) {
+                assertNull(r.channel(), "sealed readRegion returns verified materialized bytes");
+                assertArrayEquals("lease".getBytes(), r.bytes());
+            }
+            assertTrue(store.cachedChannels() >= 1,
+                    "sealed read verification returns the borrowed FD to the channel cache");
         }
     }
 
