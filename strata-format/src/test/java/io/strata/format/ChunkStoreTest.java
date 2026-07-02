@@ -1605,6 +1605,46 @@ class ChunkStoreTest {
     }
 
     @Test
+    void recoveryReadOfSealedChunkVerifiesFooterRangeCrcs() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(43), 0);
+        byte[] payload = "sealed-recovery-payload".getBytes(StandardCharsets.UTF_8);
+
+        try (ChunkStore store = newStore()) {
+            open(store, chunkId, 1);
+            store.append(TEST_NS, chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(TEST_NS, chunkId, 1, payload.length, null);
+
+            try (ChunkStore.ReadRegionResult recovery =
+                         store.readRegionForRecovery(TEST_NS, chunkId, 0, payload.length)) {
+                assertEquals(payload.length, recovery.length(), "sealed recovery read must serve the data");
+                assertNull(recovery.channel(), "sealed recovery read must be materialized, not zero-copy");
+                assertArrayEquals(payload, recovery.bytes(), "sealed recovery read must return verified bytes");
+            }
+
+            Path dataPath = dir.resolve(rel(chunkId) + ".chunk");
+            try (FileChannel ch = FileChannel.open(dataPath, StandardOpenOption.WRITE)) {
+                ch.write(ByteBuffer.wrap(new byte[] {(byte) (payload[0] ^ 0x7f)}),
+                        ChunkFormats.DATA_START);
+            }
+
+            try (ChunkStore.ReadRegionResult client =
+                         store.readRegion(TEST_NS, chunkId, 0, payload.length)) {
+                assertEquals(payload.length, client.length(), "sealed client read must still serve the range");
+                assertNotNull(client.channel(), "sealed client read must stay on the zero-copy fast path");
+                assertNull(client.bytes(), "sealed client read must not materialize bytes");
+            }
+
+            ScpException e = assertThrows(ScpException.class, () -> {
+                try (ChunkStore.ReadRegionResult ignored =
+                             store.readRegionForRecovery(TEST_NS, chunkId, 0, payload.length)) {
+                    // Should fail before returning bytes.
+                }
+            });
+            assertEquals(ErrorCode.CRC_MISMATCH, e.code());
+        }
+    }
+
+    @Test
     void recoverySkipsUnparseableAndTruncatedChunkFiles() throws Exception {
         Path invalidName = dir.resolve("not-a-valid-chunk-name.chunk");
         Files.write(invalidName, new byte[] {1});
