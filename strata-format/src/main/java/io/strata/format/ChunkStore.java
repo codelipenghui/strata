@@ -342,10 +342,10 @@ public final class ChunkStore implements AutoCloseable {
      * a crash before they reach disk leaves a stale OPEN sidecar, and recovery's OPEN branch rebuilds
      * the chunk by replaying the ledger. Removing the ledger before the SEALED state is durable would
      * make recovery truncate acknowledged data to zero (C1). So this re-establishes the seal-time
-     * durability ordering off the seal hot path: force the data (footer/trailer), then force the
-     * SEALED sidecar, and only THEN unlink the ledger. The data force runs outside the chunk lock
-     * (it is slow); the lock is held only to snapshot and to finish. Package-private so tests can
-     * drive a round deterministically.
+     * durability ordering off the seal hot path: force the data (footer/trailer), durably unlink the
+     * ledger, and only THEN unlink the stale OPEN sidecar. The data force runs outside the chunk lock
+     * (it is slow); finish work is off the hot path. Package-private so tests can drive a round
+     * deterministically.
      */
     void reclaimSealedLedgersOnce() {
         for (Handle h : chunks.values()) {
@@ -382,9 +382,11 @@ public final class ChunkStore implements AutoCloseable {
                         continue; // superseded after the force — leave it to the winner
                     }
                     // Durability-v2 (Lever 1): the trailer (forced durable above) is the SEALED signal.
-                    // Drop the retained ledger and the now-stale OPEN sidecar; with no ledger, recovery
-                    // classifies SEALED from the trailer alone (unambiguous).
-                    Files.deleteIfExists(h.ledgerPath);
+                    // Drop the retained ledger durably before deleting the now-stale OPEN sidecar, so a
+                    // crash cannot make the sidecar unlink durable while a stale pre-truncate ledger
+                    // resurrects for a chunk sealed shorter than its old end.
+                    deleteLedgerDurably(h.id, h.ledgerPath, h.shardDir);
+                    FailureInjector.point("format.reclaim.afterLedgerDurableBeforeMetaDelete");
                     Files.deleteIfExists(h.metaPath);
                     h.sealedLedgerPending = false;
                     closeAndNullData(h);                // release the writable FD; reads use the cache
@@ -1961,7 +1963,7 @@ public final class ChunkStore implements AutoCloseable {
                 forceDirectory(probe.shardDir);
             }
         } else if (sealedProbe == null && !hasSidecar && !Files.exists(probe.ledgerPath)
-                && hasTrailerMagic(probe.dataPath)) {
+                && mayHaveSealedTrailer(probe.dataPath)) {
             throw new CorruptChunkException("corrupt sealed footer/trailer for " + id);
         } else if (hasSidecar) {
             sidecar = ChunkFormats.Sidecar.decode(Files.readAllBytes(probe.metaPath));
@@ -2141,19 +2143,8 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    private static boolean hasTrailerMagic(Path dataPath) {
-        try (FileChannel ch = FileChannel.open(dataPath, StandardOpenOption.READ)) {
-            long fileLen = ch.size();
-            if (fileLen < DATA_START + TRAILER_SIZE) {
-                return false;
-            }
-            ByteBuffer magic = ByteBuffer.allocate(Integer.BYTES);
-            readFully(ch, magic, fileLen - Integer.BYTES);
-            magic.flip();
-            return magic.getInt() == ChunkFormats.MAGIC_TRAILER;
-        } catch (IOException | RuntimeException e) {
-            return false;
-        }
+    private static boolean mayHaveSealedTrailer(Path dataPath) throws IOException {
+        return Files.size(dataPath) >= DATA_START + TRAILER_SIZE;
     }
 
     private static SealedProbe readSealedFooterFromPath(Path dataPath, ChunkId id) throws IOException {

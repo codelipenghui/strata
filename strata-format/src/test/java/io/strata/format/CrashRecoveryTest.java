@@ -4,6 +4,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
+import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
@@ -260,6 +261,65 @@ class CrashRecoveryTest {
             assertEquals(ChunkState.SEALED, stat.state());
             assertEquals(7, stat.sealedLength());
             assertArrayEquals("payload".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
+        }
+    }
+
+    @Test
+    void reclaimCrashAfterLedgerDurableBeforeMetaUnlinkLeavesShortSealRecoverable() throws Exception {
+        byte[] fullPayload = "payload-tail".getBytes();
+        byte[] sealedPayload = "payload".getBytes();
+        ChunkStore store = new ChunkStore(dir);
+        open(store);
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(fullPayload));
+        store.seal(TEST_NS, id, 1, sealedPayload.length, null);
+
+        FailureInjector.arm("format.reclaim.afterLedgerDurableBeforeMetaDelete", p -> {
+            throw new RuntimeException("stop after ledger unlink is durable");
+        });
+        try {
+            store.reclaimSealedLedgersOnce();
+        } finally {
+            FailureInjector.reset();
+        }
+
+        assertFalse(Files.exists(ledgerPath()), "ledger unlink must be durable before sidecar unlink starts");
+        assertTrue(Files.exists(metaPath()), "OPEN sidecar must remain if reclaim stops after ledger unlink");
+        store.close();
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            var stat = recovered.stat(TEST_NS, id);
+            assertEquals(ChunkState.SEALED, stat.state());
+            assertEquals(sealedPayload.length, stat.sealedLength());
+            assertArrayEquals(sealedPayload, recovered.read(TEST_NS, id, 0, sealedPayload.length).bytes());
+        }
+    }
+
+    @Test
+    void reclaimedSealedChunkWithRottedTrailerMagicIsQuarantined() throws Exception {
+        byte[] repairImage;
+        int dataCrc;
+        try (ChunkStore store = new ChunkStore(dir)) {
+            open(store);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("sealed-data".getBytes()));
+            dataCrc = store.seal(TEST_NS, id, 1, 11, null).dataCrc();
+            store.reclaimSealedLedgersOnce();
+            repairImage = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE).bytes();
+        }
+
+        try (FileChannel ch = FileChannel.open(dataPath(), StandardOpenOption.WRITE)) {
+            ch.write(ByteBuffer.wrap(new byte[]{0, 0, 0, 0}), Files.size(dataPath()) - Integer.BYTES);
+        }
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            assertEquals(0, recovered.describeChunks().size(),
+                    "rotted trailer-magic chunk must not be recovered as healthy");
+            assertFalse(Files.exists(dataPath()), "live chunk name must be free for repair import");
+            try (Stream<Path> files = Files.list(dataPath().getParent())) {
+                assertEquals(1, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
+                        "quarantine must preserve the rotted sealed evidence");
+            }
+            recovered.importSealed(TEST_NS, id, repairImage, 11, dataCrc);
+            assertArrayEquals("sealed-data".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
         }
     }
 
