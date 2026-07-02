@@ -731,6 +731,40 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void verifyPassResealsOpenReplicaOfDescriptorSealedChunkBeforeDropping() throws Exception {
+        // Correlated crash after SEAL_CHUNK_META but before every replica's non-fsync trailer reaches disk:
+        // descriptor is SEALED, but replicas recover OPEN at the descriptor length with matching data CRC.
+        // These intact copies must be re-sealed, not deleted down to one unusable OPEN source.
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        List<Integer> seals = new CopyOnWriteArrayList<>();
+        List<Integer> deletes = new CopyOnWriteArrayList<>();
+
+        try (ScpServer nodeA = resealableOpenVerifyNode(1301, 4096, 0xCAFE, seals, deletes);
+             ScpServer nodeB = resealableOpenVerifyNode(1302, 4096, 0xCAFE, seals, deletes);
+             ScpServer nodeC = resealableOpenVerifyNode(1303, 4096, 0xCAFE, seals, deletes)) {
+            Registered a = registerAt(registry, 1301, "open-a-host", "127.0.0.1:" + nodeA.port());
+            Registered b = registerAt(registry, 1302, "open-b-host", "127.0.0.1:" + nodeB.port());
+            Registered c = registerAt(registry, 1303, "open-c-host", "127.0.0.1:" + nodeC.port());
+
+            FileId fileId = fileId(0x4949);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(a.nodeId(), b.nodeId(), c.nodeId())))));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
+                    () -> false, () -> false, ns -> true);
+            owner.verifyPass();
+
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertEquals(List.of(a.nodeId(), b.nodeId(), c.nodeId()), replicas,
+                    "re-sealed OPEN replicas stay referenced in the SEALED descriptor");
+            assertEquals(new TreeSet<>(List.of(a.nodeId(), b.nodeId(), c.nodeId())), new TreeSet<>(seals),
+                    "every OPEN replica was re-sealed in place");
+            assertTrue(deletes.isEmpty(), "intact OPEN replicas must not be physically deleted");
+        }
+    }
+
+    @Test
     void corruptVerifyVerdictMustPassGraceBeforeDelete() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
@@ -1010,6 +1044,36 @@ class RepairCoordinatorTest {
                     results.add(new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096, 0xBAD));
                 }
                 return ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
+            }
+            if (req.opcode() == Opcode.DELETE_CHUNKS.code) {
+                Messages.DeleteChunks dc = Messages.DeleteChunks.decode(req.headerSlice());
+                deletes.add(serverNodeId);
+                return ScpServer.ok(req, new Messages.DeleteChunksResp(dc.chunkIds(),
+                        dc.chunkIds().stream().map(id -> ErrorCode.OK.code).toList()).encode(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode " + req.opcode());
+        });
+    }
+
+    private static ScpServer resealableOpenVerifyNode(int serverNodeId, long length, int crc,
+                                                      List<Integer> seals, List<Integer> deletes)
+            throws Exception {
+        return new ScpServer(0, serverNodeId, serverNodeId, serverNodeId + 1L, req -> {
+            if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                List<Messages.VerifyChunkResult> results = new ArrayList<>();
+                for (ChunkId id : vc.chunkIds()) {
+                    results.add(new Messages.VerifyChunkResult(id, true, ChunkState.OPEN, length, crc));
+                }
+                return ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
+            }
+            if (req.opcode() == Opcode.SEAL_CHUNK.code) {
+                Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
+                if (seal.dataLength() != length || seal.writeEpoch() != 1) {
+                    throw new ScpException(ErrorCode.PRECONDITION_FAILED, "unexpected re-seal request");
+                }
+                seals.add(serverNodeId);
+                return ScpServer.ok(req, new Messages.SealResp(length, crc).encode(), null);
             }
             if (req.opcode() == Opcode.DELETE_CHUNKS.code) {
                 Messages.DeleteChunks dc = Messages.DeleteChunks.decode(req.headerSlice());
