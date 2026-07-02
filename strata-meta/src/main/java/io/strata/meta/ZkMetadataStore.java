@@ -494,7 +494,9 @@ public final class ZkMetadataStore implements MetadataStore {
             return Optional.empty();
         }
         if (body.length != 1 + 8 || body[0] != PATH_MARKER_FILE_ID) {
-            throw new IllegalArgumentException("bad namespace file marker envelope length " + body.length);
+            String tag = body.length == 0 ? "missing" : Byte.toString(body[0]);
+            throw new IllegalArgumentException("bad namespace file marker tag " + tag
+                    + ", length " + body.length);
         }
         ByteBuffer buf = ByteBuffer.wrap(body);
         buf.get();

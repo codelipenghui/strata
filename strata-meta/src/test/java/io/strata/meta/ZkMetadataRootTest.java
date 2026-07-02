@@ -72,6 +72,21 @@ class ZkMetadataRootTest {
     }
 
     @Test
+    void countersRejectCrcMismatchOnSealedLongs() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
+            assertEquals(1L, store.allocateMetadataEpoch());
+
+            byte[] corrupt = Records.sealRecord(ByteBuffer.allocate(8).putLong(1L).array());
+            corrupt[0] ^= 0x01;
+            store.curator().setData().forPath("/strata/meta/epoch", corrupt);
+
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class, store::allocateMetadataEpoch);
+            assertTrue(e.getMessage().contains("crc"));
+        }
+    }
+
+    @Test
     void concurrentEpochAllocationsAreAllDistinct() throws Exception {
         try (TestingServer zk = new TestingServer(true);
              ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
