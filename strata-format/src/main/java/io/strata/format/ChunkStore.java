@@ -80,6 +80,8 @@ public final class ChunkStore implements AutoCloseable {
     private final Map<NsChunkId, Handle> chunks = new ConcurrentHashMap<>();
     private final ChannelCache channelCache;
     private final Set<NsChunkId> creating = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<Path, Object> directoryDurabilityLocks = new ConcurrentHashMap<>();
+    private final Set<Path> durableDirectories = ConcurrentHashMap.newKeySet();
     private final AtomicLong forceCount =
             new AtomicLong();
     private final AtomicLong appendOps =
@@ -254,28 +256,44 @@ public final class ChunkStore implements AutoCloseable {
             Files.createDirectories(targetDir);
             return;
         }
+        Path root = dir.toAbsolutePath().normalize();
         Path normalized = targetDir.toAbsolutePath().normalize();
-        if (Files.isDirectory(normalized)) {
+        if (normalized.equals(root)) {
             return;
         }
-        List<Path> missing = new ArrayList<>();
-        for (Path p = normalized; p != null && !Files.isDirectory(p); p = p.getParent()) {
-            missing.add(p);
+        if (!normalized.startsWith(root)) {
+            ensureDirectoryDurable(normalized);
+            return;
         }
-        for (int i = missing.size() - 1; i >= 0; i--) {
-            Path p = missing.get(i);
-            boolean created = false;
+        Path current = root;
+        for (Path segment : root.relativize(normalized)) {
+            current = current.resolve(segment);
+            ensureDirectoryDurable(current);
+        }
+    }
+
+    private void ensureDirectoryDurable(Path directory) throws IOException {
+        Path normalized = directory.toAbsolutePath().normalize();
+        if (durableDirectories.contains(normalized)) {
+            return;
+        }
+        Object lock = directoryDurabilityLocks.computeIfAbsent(normalized, ignored -> new Object());
+        synchronized (lock) {
+            if (durableDirectories.contains(normalized)) {
+                return;
+            }
             try {
-                Files.createDirectory(p);
-                created = true;
+                Files.createDirectory(normalized);
             } catch (FileAlreadyExistsException e) {
-                if (!Files.isDirectory(p)) {
+                if (!Files.isDirectory(normalized)) {
                     throw e;
                 }
             }
-            if (created && p.getParent() != null) {
-                forceDirectory(p.getParent());
+            Path parent = normalized.getParent();
+            if (parent != null) {
+                forceDirectory(parent);
             }
+            durableDirectories.add(normalized);
         }
     }
 
@@ -2028,7 +2046,7 @@ public final class ChunkStore implements AutoCloseable {
             try {
                 sidecar = ChunkFormats.Sidecar.decode(Files.readAllBytes(probe.metaPath));
             } catch (CorruptChunkException | IllegalArgumentException e) {
-                sidecar = recoverMalformedSidecar(id, header, e);
+                sidecar = recoverMalformedSidecar(id, probe, header, e);
                 if (sidecar == null) {
                     return;
                 }
@@ -2139,9 +2157,9 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    private ChunkFormats.Sidecar recoverMalformedSidecar(ChunkId id, ChunkFormats.Header header,
+    private ChunkFormats.Sidecar recoverMalformedSidecar(ChunkId id, Handle probe, ChunkFormats.Header header,
                                                          RuntimeException cause) {
-        if (header.fsyncOnAck()) {
+        if (header.fsyncOnAck() && Files.exists(probe.ledgerPath)) {
             log.warn("chunk {} has malformed sidecar but is fsync-on-ack — reconstructing fenced OPEN state",
                     id, cause);
             return reconstructedOpenSidecar(header);

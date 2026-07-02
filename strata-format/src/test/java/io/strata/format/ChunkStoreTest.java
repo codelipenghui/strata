@@ -34,7 +34,11 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -136,6 +140,51 @@ class ChunkStoreTest {
         }
 
         assertTrue(forced.isEmpty(), "ack-on-replicate open must stay off the fsync path when seal fsync is disabled");
+    }
+
+    @Test
+    void concurrentFsyncOnAckOpenWaitsForCreatedShardDirentFsync() throws Exception {
+        ChunkId first = new ChunkId(FileId.of(0x0102), 0);
+        ChunkId second = new ChunkId(FileId.of(0x1_0102), 0);
+        Path l1Dir = dir.resolve(TEST_NS.value()).resolve("02").toAbsolutePath().normalize();
+        CountDownLatch shardDirForceStarted = new CountDownLatch(1);
+        CountDownLatch releaseShardDirForce = new CountDownLatch(1);
+        AtomicBoolean blocked = new AtomicBoolean();
+        ChunkStore.DirectorySyncer syncer = path -> {
+            if (path.toAbsolutePath().normalize().equals(l1Dir) && blocked.compareAndSet(false, true)) {
+                shardDirForceStarted.countDown();
+                try {
+                    if (!releaseShardDirForce.await(5, TimeUnit.SECONDS)) {
+                        throw new IOException("timed out waiting to release shard dir fsync");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted while waiting to release shard dir fsync", e);
+                }
+            }
+        };
+
+        try (ChunkStore store = new ChunkStore(dir, false, 1024, ChunkStoreConfig.DEFAULT, syncer)) {
+            CompletableFuture<Void> firstOpen = CompletableFuture.runAsync(() -> openFsync(store, first));
+            assertTrue(shardDirForceStarted.await(5, TimeUnit.SECONDS),
+                    "first open must reach the shard dirent fsync");
+
+            CompletableFuture<Void> secondOpen = CompletableFuture.runAsync(() -> openFsync(store, second));
+            assertThrows(TimeoutException.class, () -> secondOpen.get(200, TimeUnit.MILLISECONDS),
+                    "second open in the same new shard must wait for the first dirent fsync to complete");
+
+            releaseShardDirForce.countDown();
+            firstOpen.get(5, TimeUnit.SECONDS);
+            secondOpen.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private void openFsync(ChunkStore store, ChunkId chunkId) {
+        try {
+            store.open(TEST_NS, chunkId, true, 1, 1718000000000L);
+        } catch (IOException e) {
+            throw new CompletionException(e);
+        }
     }
 
     @Test

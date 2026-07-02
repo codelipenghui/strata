@@ -18,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
@@ -245,6 +246,44 @@ class CrashRecoveryTest {
             }
             recovered.importSealed(TEST_NS, id, repairImage, 11, dataCrc);
             assertArrayEquals("sealed-data".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
+        }
+    }
+
+    @Test
+    void malformedSidecarWithoutLedgerIsQuarantinedInsteadOfTruncatedToOpen() throws Exception {
+        byte[] payload = "sealed-data".getBytes();
+        try (ChunkStore store = new ChunkStore(dir, true)) {
+            store.open(TEST_NS, id, true, 1, 1718000000000L);
+            store.appendAsync(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
+            store.seal(TEST_NS, id, 1, payload.length, null);
+        }
+        assertFalse(Files.exists(ledgerPath()), "sealed fsync chunk should not retain a ledger");
+
+        // Corrupt both durability witnesses that would otherwise classify the chunk as SEALED:
+        // footer rot makes the trailer probe fail; sidecar rot must not fall back to destructive OPEN replay
+        // when there is no ledger to prove an acked OPEN prefix.
+        try (FileChannel ch = FileChannel.open(dataPath(), StandardOpenOption.WRITE)) {
+            ch.write(ByteBuffer.wrap(new byte[]{0x7F}), ChunkFormats.DATA_START + payload.length + 4);
+        }
+        Files.write(metaPath(), new byte[ChunkFormats.SIDECAR_SIZE]);
+        long sealedFileSize = Files.size(dataPath());
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            assertEquals(0, recovered.describeChunks().size(),
+                    "double-rotted sealed chunk must be quarantined, not reconstructed as OPEN");
+            assertFalse(Files.exists(dataPath()), "live chunk name must be free after quarantine");
+            Path shardDir = dataPath().getParent();
+            try (Stream<Path> files = Files.list(shardDir)) {
+                List<Path> quarantined = files.filter(p -> p.getFileName().toString().contains(".quarantine-"))
+                        .toList();
+                assertEquals(2, quarantined.size(), "quarantine must preserve chunk+meta evidence");
+                Path quarantinedChunk = quarantined.stream()
+                        .filter(p -> p.getFileName().toString().contains(".chunk.quarantine-"))
+                        .findFirst()
+                        .orElseThrow();
+                assertEquals(sealedFileSize, Files.size(quarantinedChunk),
+                        "quarantine must not truncate the sealed payload before preserving it");
+            }
         }
     }
 
