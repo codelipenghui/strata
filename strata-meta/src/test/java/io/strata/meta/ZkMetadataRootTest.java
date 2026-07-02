@@ -6,6 +6,7 @@ import io.strata.common.StrataNamespace;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -14,6 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -34,6 +36,38 @@ class ZkMetadataRootTest {
             try (ZkMetadataStore c = new ZkMetadataStore(zk.getConnectString())) {
                 assertEquals(4L, c.allocateMetadataEpoch());
             }
+        }
+    }
+
+    @Test
+    void countersRejectTruncatedDataInsteadOfRewinding() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
+            StrataNamespace ns = StrataNamespace.of("tenant-a");
+            assertEquals(1L, store.allocateMetadataEpoch());
+            assertEquals(1L, store.nextSystemFileId());
+            assertEquals(FileId.of(1), store.assignFileId(ns));
+
+            store.curator().setData().forPath("/strata/meta/epoch", new byte[] {1, 2, 3});
+            store.curator().setData().forPath("/strata/meta/sys-file-id", new byte[] {4, 5, 6});
+            store.curator().setData().forPath("/strata/meta/global-file-id", new byte[] {7, 8, 9});
+
+            assertThrows(IllegalArgumentException.class, store::allocateMetadataEpoch);
+            assertThrows(IllegalArgumentException.class, store::nextSystemFileId);
+            assertThrows(IllegalArgumentException.class, () -> store.assignFileId(ns));
+        }
+    }
+
+    @Test
+    void countersRejectRawUnenvelopedLongs() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
+            assertEquals(1L, store.allocateMetadataEpoch());
+
+            store.curator().setData().forPath("/strata/meta/epoch",
+                    ByteBuffer.allocate(8).putLong(1L).array());
+
+            assertThrows(IllegalArgumentException.class, store::allocateMetadataEpoch);
         }
     }
 

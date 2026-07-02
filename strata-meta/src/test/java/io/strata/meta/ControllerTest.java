@@ -566,9 +566,10 @@ class ControllerTest {
     }
 
     private static byte[] fileIdBytes(FileId fileId) {
-        ByteBuffer b = ByteBuffer.allocate(8);
+        ByteBuffer b = ByteBuffer.allocate(1 + 8);
+        b.put((byte) 1);
         fileId.writeTo(b);
-        return b.array();
+        return Records.sealRecord(b.array());
     }
 
     private MetadataStore replaceStore(MetadataStore replacement) throws Exception {

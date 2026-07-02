@@ -105,7 +105,7 @@ class ZkMetadataStoreCasTest {
                 store.createFile(file);
 
                 FileId other = FileId.of(3);
-                store.curator().setData().forPath(markerPath("test", "/marker-owner"), fileIdBytes(other));
+                store.curator().setData().forPath(markerPath("test", "/marker-owner"), pathMarkerBytes(other));
                 assertEquals(other, store.resolvePath(file.namespace(), file.path()).orElseThrow());
                 assertFalse(store.deletePath(file.namespace(), file.path(), fileId));
 
@@ -115,11 +115,52 @@ class ZkMetadataStoreCasTest {
         }
     }
 
+    @Test
+    void pathMarkersRejectRawUnenvelopedFileIds() throws Exception {
+        try (TestingServer zk = new TestingServer(true)) {
+            try (ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
+                FileId fileId = FileId.of(4);
+                Records.FileRecord file = new Records.FileRecord(fileId, "test", "/raw-marker", 3, 2, false, FileState.OPEN,
+                        System.currentTimeMillis(), List.of());
+                store.createFile(file);
+
+                store.curator().setData().forPath(markerPath("test", "/raw-marker"), rawFileIdBytes(FileId.of(5)));
+
+                assertThrows(IllegalArgumentException.class, () -> store.resolvePath(file.namespace(), file.path()));
+            }
+        }
+    }
+
+    @Test
+    void pathMarkersRejectEmptyAndTruncatedDataInsteadOfTreatingAsTombstones() throws Exception {
+        try (TestingServer zk = new TestingServer(true)) {
+            try (ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
+                FileId fileId = FileId.of(6);
+                Records.FileRecord file = new Records.FileRecord(fileId, "test", "/bad-marker", 3, 2, false, FileState.OPEN,
+                        System.currentTimeMillis(), List.of());
+                store.createFile(file);
+
+                store.curator().setData().forPath(markerPath("test", "/bad-marker"), new byte[] {1, 2, 3});
+                assertThrows(IllegalArgumentException.class, () -> store.resolvePath(file.namespace(), file.path()));
+
+                store.curator().setData().forPath(markerPath("test", "/bad-marker"), new byte[0]);
+                assertThrows(IllegalArgumentException.class, () -> store.resolvePath(file.namespace(), file.path()));
+            }
+        }
+    }
+
     private static String markerPath(String namespace, String path) {
         return "/strata/namespaces/" + namespace + "/paths" + path + "/__file";
     }
 
-    private static byte[] fileIdBytes(FileId id) {
+    private static byte[] pathMarkerBytes(FileId id) {
+        ByteBuffer body = ByteBuffer.allocate(1 + 8);
+        body.put((byte) 1);
+        id.writeTo(body);
+        return Records.sealRecord(body.array());
+    }
+
+    private static byte[] rawFileIdBytes(FileId id) {
         return ByteBuffer.allocate(8).putLong(id.id()).array();
     }
 }
