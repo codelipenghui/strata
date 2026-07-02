@@ -259,6 +259,31 @@ class ChunkStoreTest {
         }
     }
 
+    @Test
+    void orphanSuspectsProtectsFreshRepairImportsThroughCommitWindow() throws Exception {
+        ChunkId imported = new ChunkId(FileId.of(3), 0);
+        byte[] payload = "repair-copy".getBytes(StandardCharsets.UTF_8);
+        byte[] fileBytes;
+        Path sourceDir = Files.createTempDirectory(dir.getParent(), "strata-source-");
+        try (ChunkStore source = new ChunkStore(sourceDir)) {
+            fileBytes = sealedBytes(source, imported, "repair-copy");
+        }
+
+        try (ChunkStore target = newStore()) {
+            long beforeImport = System.currentTimeMillis();
+            target.importSealed(TEST_NS, imported, fileBytes, payload.length, Crc.of(payload));
+            long now = System.currentTimeMillis();
+
+            assertTrue(target.orphanSuspects(
+                            0, beforeImport + ChunkStore.REPAIR_IMPORT_ORPHAN_PROTECTION_MS - 1).isEmpty(),
+                    "a freshly imported repair target must not be orphan-GC eligible before "
+                            + "the descriptor-swap/command-timeout window has elapsed");
+            assertEquals(List.of(new ChunkStore.SuspectChunk(TEST_NS, imported)),
+                    target.orphanSuspects(0, now + ChunkStore.REPAIR_IMPORT_ORPHAN_PROTECTION_MS + 1),
+                    "once the repair-import protection expires, normal owner-confirm orphan GC resumes");
+        }
+    }
+
     private static ChunkFormats.Trailer trailer(byte[] fileBytes) {
         return ChunkFormats.Trailer.decode(Arrays.copyOfRange(
                 fileBytes, fileBytes.length - ChunkFormats.TRAILER_SIZE, fileBytes.length));

@@ -28,7 +28,7 @@ import java.util.concurrent.atomic.LongAdder;
  * ZooKeeper backend (tech design §4.4, v0 only — development/prototype; retired at v1 GA).
  * Layout: /strata/files/<fileId> (FileRecord, CAS by znode version; a deleted file is left as a
  * DELETED tombstone that fences a replayed CREATE until the sweeper reaps it),
- * /strata/namespaces/<namespace>/paths/<path segments>/__file (FileId binding or empty tombstone),
+ * /strata/namespaces/<namespace>/paths/<path segments>/__file (sealed FileId binding or sealed tombstone),
  * /strata/namespaces/<namespace>/files/<fileId> (per-namespace file index for namespace-scoped
  * enumeration without a global /strata/files scan),
  * /strata/nodes/<nodeId> (node identity record; ids are externally supplied via STRATA_NODE_ID).
@@ -39,7 +39,9 @@ public final class ZkMetadataStore implements MetadataStore {
     private static final String NAMESPACES = "/strata/namespaces";
     private static final String NODES = "/strata/nodes";
     private static final String FILE_MARKER = "__file";
-    private static final byte[] DELETED_FILE_MARKER = new byte[0];
+    private static final byte PATH_MARKER_TOMBSTONE = 0;
+    private static final byte PATH_MARKER_FILE_ID = 1;
+    private static final byte[] DELETED_FILE_MARKER = pathMarkerBytes(Optional.empty());
     // Namespace-sharding consensus root (design §5, §6.1): a single global metadata-epoch counter
     // and one assignment record per namespace. Distinct from /strata/namespaces (user path/file
     // bindings) so the two never collide.
@@ -225,8 +227,8 @@ public final class ZkMetadataStore implements MetadataStore {
         }
         try {
             curator.setData().withVersion(marker.get().version())
-                    .forPath(fileMarkerPath(namespace, path), DELETED_FILE_MARKER);
-            record(NAMESPACES, true, 0);
+                .forPath(fileMarkerPath(namespace, path), DELETED_FILE_MARKER);
+            record(NAMESPACES, true, DELETED_FILE_MARKER.length);
             return true;
         } catch (KeeperException.BadVersionException | KeeperException.NoNodeException e) {
             return pathNoLongerBinds(namespace, path, expectedFileId);
@@ -259,7 +261,7 @@ public final class ZkMetadataStore implements MetadataStore {
                 );
                 curator.transaction().forOperations(ops);
                 record(FILES, true, tombstone.length);
-                record(NAMESPACES, true, 0);
+                record(NAMESPACES, true, DELETED_FILE_MARKER.length);
             } else {
                 curator.setData().withVersion(expectedVersion).forPath(filePath, tombstone);
                 record(FILES, true, tombstone.length);
@@ -473,19 +475,46 @@ public final class ZkMetadataStore implements MetadataStore {
     }
 
     private static byte[] fileIdBytes(FileId id) {
-        ByteBuffer buf = ByteBuffer.allocate(8);
-        id.writeTo(buf);
-        return buf.array();
+        return pathMarkerBytes(Optional.of(id));
+    }
+
+    private static byte[] pathMarkerBytes(Optional<FileId> id) {
+        if (id.isEmpty()) {
+            return Records.sealRecord(new byte[] {PATH_MARKER_TOMBSTONE});
+        }
+        ByteBuffer buf = ByteBuffer.allocate(1 + 8);
+        buf.put(PATH_MARKER_FILE_ID);
+        id.get().writeTo(buf);
+        return Records.sealRecord(buf.array());
     }
 
     private static Optional<FileId> readFileId(byte[] bytes) {
-        if (bytes.length == 0) {
+        byte[] body = Records.openRecord(bytes);
+        if (body.length == 1 && body[0] == PATH_MARKER_TOMBSTONE) {
             return Optional.empty();
         }
-        if (bytes.length != 8) {
-            throw new IllegalArgumentException("bad namespace file id length " + bytes.length);
+        if (body.length != 1 + 8 || body[0] != PATH_MARKER_FILE_ID) {
+            String tag = body.length == 0 ? "missing" : Byte.toString(body[0]);
+            throw new IllegalArgumentException("bad namespace file marker tag " + tag
+                    + ", length " + body.length);
         }
-        return Optional.of(FileId.readFrom(ByteBuffer.wrap(bytes)));
+        ByteBuffer buf = ByteBuffer.wrap(body);
+        buf.get();
+        return Optional.of(FileId.readFrom(buf));
+    }
+
+    private static byte[] zkCounterBytes(long value) {
+        ByteBuffer buf = ByteBuffer.allocate(8);
+        buf.putLong(value);
+        return Records.sealRecord(buf.array());
+    }
+
+    private static long readZkCounter(String zkPath, byte[] bytes) {
+        byte[] body = Records.openRecord(bytes);
+        if (body.length != 8) {
+            throw new IllegalArgumentException("bad zk counter envelope length " + body.length + " at " + zkPath);
+        }
+        return ByteBuffer.wrap(body).getLong();
     }
 
     private Optional<PathMarker> readPathMarker(StrataNamespace namespace, StrataPath path) throws Exception {
@@ -564,11 +593,11 @@ public final class ZkMetadataStore implements MetadataStore {
             try {
                 Stat stat = new Stat();
                 byte[] data = curator.getData().storingStatIn(stat).forPath(zkPath);
-                long current = data.length == 8 ? ByteBuffer.wrap(data).getLong() : 0L;
+                long current = readZkCounter(zkPath, data);
                 long next = current + 1;
                 try {
                     curator.setData().withVersion(stat.getVersion())
-                            .forPath(zkPath, ByteBuffer.allocate(8).putLong(next).array());
+                            .forPath(zkPath, zkCounterBytes(next));
                     return next;
                 } catch (KeeperException.BadVersionException retry) {
                     // lost the CAS race; re-read and try again
@@ -576,7 +605,7 @@ public final class ZkMetadataStore implements MetadataStore {
             } catch (KeeperException.NoNodeException e) {
                 try {
                     curator.create().creatingParentsIfNeeded()
-                            .forPath(zkPath, ByteBuffer.allocate(8).putLong(1L).array());
+                            .forPath(zkPath, zkCounterBytes(1L));
                     return 1L;
                 } catch (KeeperException.NodeExistsException created) {
                     // another writer created it first; loop to CAS-increment off its value
