@@ -782,6 +782,13 @@ class RepairCoordinator implements AutoCloseable {
         String key = nodeId + ":" + ns + ":" + chunkId;
         boolean healthy = r.present() && r.state() == ChunkState.SEALED
                 && r.length() == exp.length() && r.crc() == exp.crc();
+        if (!healthy && r.present() && r.state() == ChunkState.OPEN && r.length() >= exp.length()
+                && execReseal(node, chunkId, ns, exp)) {
+            log.info("verify: re-sealed OPEN copy of descriptor-sealed chunk {} on node {} at len {}",
+                    chunkId, nodeId, exp.length());
+            replicaMissingSince.remove(key);
+            return;
+        }
         // Last-live-replica guard (data-loss hardening): never let a verdict drop the only remaining
         // live replica of a chunk. A false-positive verdict — a transient miss or a bogus crc — must not
         // turn a recoverable degraded chunk into an unavailable one (0 live replicas). The reconcile scan
@@ -900,9 +907,8 @@ class RepairCoordinator implements AutoCloseable {
 
     /**
      * Shared owner-direct transport: opens a one-shot tool connection to {@code node} and runs {@code call},
-     * returning its result. Logs and returns false on a bad endpoint or any RPC failure. Both owner lanes —
-     * repair ({@link #execReplicate}) and delete ({@link #execDelete}) — route through here so endpoint
-     * parsing, timeout, connection lifecycle, and failure logging stay in one place.
+     * returning its result. Logs and returns false on a bad endpoint or any RPC failure. Owner lanes route
+     * through here so endpoint parsing, timeout, connection lifecycle, and failure logging stay in one place.
      */
     private boolean directNodeCall(Records.NodeRecord node, ChunkId chunkId, String label, NodeCall call) {
         Endpoint endpoint;
@@ -928,6 +934,26 @@ class RepairCoordinator implements AutoCloseable {
         Messages.Command.write(w, cmd);
         return directNodeCall(target.record, cmd.chunkId(), "owner-repair", (client, timeoutMs) -> {
             client.call(Opcode.EXEC_REPLICATE, w.toBytes(), null, timeoutMs);
+            return true;
+        });
+    }
+
+    /**
+     * Re-seals an intact OPEN local copy whose descriptor is already SEALED. This recovers the
+     * non-fsync correlated-crash window where the retained ledger can prove the data prefix, but the
+     * unforced trailer did not survive restart, so the replica reports OPEN at or beyond the descriptor end.
+     */
+    private boolean execReseal(Records.NodeRecord node, ChunkId chunkId, StrataNamespace ns,
+                               Records.ChunkRecord exp) {
+        return directNodeCall(node, chunkId, "owner-reseal", (client, timeoutMs) -> {
+            ByteBuffer resp = client.call(Opcode.SEAL_CHUNK,
+                    new Messages.SealChunk(chunkId, exp.writeEpoch(), exp.length(), ns).encode(), null, timeoutMs);
+            Messages.SealResp r = Messages.SealResp.decode(resp);
+            if (r.finalLength() != exp.length() || r.chunkCrc() != exp.crc()) {
+                log.warn("owner-reseal of {} on node {} returned len/crc {}/{} expected {}/{}",
+                        chunkId, node.nodeId(), r.finalLength(), r.chunkCrc(), exp.length(), exp.crc());
+                return false;
+            }
             return true;
         });
     }
