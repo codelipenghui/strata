@@ -1977,12 +1977,17 @@ class ChunkStoreTest {
             assertEquals(3, store.readOps());
             assertEquals(27, store.readBytes());
 
-            Path dataPath = dir.resolve(rel(id) + ".chunk");
+            ChunkId corruptId = new ChunkId(FileId.of(99), 0);
+            byte[] corruptPayload = "bad-sealed".getBytes(StandardCharsets.UTF_8);
+            open(store, corruptId, 1);
+            store.append(TEST_NS, corruptId, 1, 0, 0, ByteBuffer.wrap(corruptPayload));
+            store.seal(TEST_NS, corruptId, 1, corruptPayload.length, null);
+            Path dataPath = dir.resolve(rel(corruptId) + ".chunk");
             try (FileChannel ch = FileChannel.open(dataPath, StandardOpenOption.WRITE)) {
                 ch.write(ByteBuffer.wrap(new byte[] {'X'}), ChunkFormats.DATA_START);
             }
             assertEquals(ErrorCode.CRC_MISMATCH,
-                    assertThrows(ScpException.class, () -> store.readRegion(TEST_NS, id, 0, 1024)).code());
+                    assertThrows(ScpException.class, () -> store.readRegion(TEST_NS, corruptId, 0, 1024)).code());
             assertEquals(3, store.readOps(), "failed read must not count as served");
             assertEquals(27, store.readBytes(), "failed read bytes must not inflate throughput");
         }
@@ -2188,6 +2193,30 @@ class ChunkStoreTest {
             assertArrayEquals("lease".getBytes(), r.bytes());
             assertTrue(store.cachedChannels() >= 1,
                     "sealed read verification returns the borrowed FD to the channel cache");
+        }
+    }
+
+    @Test
+    void sealedReadRegionReusesVerifiedRangeAfterFirstRead() throws Exception {
+        try (ChunkStore store = newStore()) {
+            byte[] payload = new byte[ChunkFormats.CRC_RANGE_SIZE];
+            for (int i = 0; i < payload.length; i++) {
+                payload[i] = (byte) i;
+            }
+            open(store, id, 1);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(TEST_NS, id, 1, payload.length, null);
+
+            byte[] expected = Arrays.copyOfRange(payload, 0, 4);
+            assertArrayEquals(expected, store.readRegion(TEST_NS, id, 0, expected.length).bytes());
+
+            Path dataPath = dir.resolve(rel(id) + ".chunk");
+            try (FileChannel ch = FileChannel.open(dataPath, StandardOpenOption.WRITE)) {
+                ch.write(ByteBuffer.wrap(new byte[] {(byte) (payload[1024] ^ 0x7F)}),
+                        ChunkFormats.DATA_START + 1024);
+            }
+
+            assertArrayEquals(expected, store.readRegion(TEST_NS, id, 0, expected.length).bytes());
         }
     }
 

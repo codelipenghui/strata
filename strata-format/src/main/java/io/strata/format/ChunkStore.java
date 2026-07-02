@@ -26,6 +26,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -517,6 +518,9 @@ public final class ChunkStore implements AutoCloseable {
         long sealedLength = -1;
         int dataCrc;
         List<Integer> sealedRangeCrcs = List.of();
+        // Sealed chunks are immutable. The first read of a CRC range attests it against the footer;
+        // later reads of that range can serve only the requested bytes instead of re-reading 4 MiB.
+        final BitSet sealedVerifiedRanges = new BitSet();
         // Last time an owner attested this replica via VERIFY_CHUNKS (design §20.3); seeded to when this
         // node first learned of the chunk so a freshly-created/recovered chunk gets the full orphan grace
         // (§20.4) before it can be considered a suspect. In-memory only: a restart re-earns verification.
@@ -1037,7 +1041,7 @@ public final class ChunkStore implements AutoCloseable {
         byte[] out = new byte[n];
         try (ChannelCache.Lease lease = channelCache.acquire(nsKey, dataPath)) {
             requireCurrentHandle(h, nsKey, id);
-            readSealedVerified(lease.channel(), sealedLength, sealedRangeCrcs, id, offset, out);
+            readSealedVerified(lease.channel(), h, sealedLength, sealedRangeCrcs, !includeUndurableTail, id, offset, out);
         }
         if (!includeUndurableTail) {
             countClientRead(ns, n);
@@ -2190,34 +2194,55 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    private void readSealedVerified(FileChannel data, long sealedLength, List<Integer> rangeCrcs,
-                                    ChunkId id, long offset, byte[] out) throws IOException {
+    private void readSealedVerified(FileChannel data, Handle h, long sealedLength, List<Integer> rangeCrcs,
+                                    boolean useVerifiedRangeCache, ChunkId id, long offset, byte[] out)
+            throws IOException {
         if (out.length == 0) return;
         if (rangeCrcs.isEmpty()) {
             throw new ScpException(ErrorCode.CORRUPT_CHUNK, "sealed chunk missing CRC ranges: " + id);
         }
         long firstRange = offset / ChunkFormats.CRC_RANGE_SIZE;
         long lastRange = (offset + out.length - 1) / ChunkFormats.CRC_RANGE_SIZE;
-        byte[] rangeBuf = new byte[ChunkFormats.CRC_RANGE_SIZE];
         for (long range = firstRange; range <= lastRange; range++) {
             if (range >= rangeCrcs.size()) {
                 throw new ScpException(ErrorCode.CORRUPT_CHUNK, "CRC range missing for " + id);
             }
+            int rangeIndex = Math.toIntExact(range);
             long rangeStart = range * (long) ChunkFormats.CRC_RANGE_SIZE;
             int rangeLen = (int) Math.min(ChunkFormats.CRC_RANGE_SIZE, sealedLength - rangeStart);
-            readFully(data, ByteBuffer.wrap(rangeBuf, 0, rangeLen),
-                    checkedAdd(DATA_START, rangeStart, "chunk file offset"));
+            long copyStart = Math.max(offset, rangeStart);
+            long copyEnd = Math.min(offset + out.length, rangeStart + rangeLen);
+            int copyLen = (int) (copyEnd - copyStart);
+            if (useVerifiedRangeCache && isSealedRangeVerified(h, rangeIndex)) {
+                readFully(data, ByteBuffer.wrap(out, (int) (copyStart - offset), copyLen),
+                        checkedAdd(DATA_START, copyStart, "chunk file offset"));
+                continue;
+            }
+            byte[] rangeBuf = new byte[rangeLen];
+            readFully(data, ByteBuffer.wrap(rangeBuf), checkedAdd(DATA_START, rangeStart, "chunk file offset"));
             int actual = Crc.of(rangeBuf, 0, rangeLen);
-            int expected = rangeCrcs.get((int) range);
+            int expected = rangeCrcs.get(rangeIndex);
             if (actual != expected) {
                 throw new ScpException(ErrorCode.CRC_MISMATCH,
                         "sealed range crc mismatch on " + id + " range " + range);
             }
-            // serve the requested bytes from the just-verified range instead of re-reading disk
-            long copyStart = Math.max(offset, rangeStart);
-            long copyEnd = Math.min(offset + out.length, rangeStart + rangeLen);
-            System.arraycopy(rangeBuf, (int) (copyStart - rangeStart),
-                    out, (int) (copyStart - offset), (int) (copyEnd - copyStart));
+            if (useVerifiedRangeCache) {
+                markSealedRangeVerified(h, rangeIndex);
+            }
+            System.arraycopy(rangeBuf, (int) (copyStart - rangeStart), out,
+                    (int) (copyStart - offset), copyLen);
+        }
+    }
+
+    private boolean isSealedRangeVerified(Handle h, int range) {
+        synchronized (h.sealedVerifiedRanges) {
+            return h.sealedVerifiedRanges.get(range);
+        }
+    }
+
+    private void markSealedRangeVerified(Handle h, int range) {
+        synchronized (h.sealedVerifiedRanges) {
+            h.sealedVerifiedRanges.set(range);
         }
     }
 
