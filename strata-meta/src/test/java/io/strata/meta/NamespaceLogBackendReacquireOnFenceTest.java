@@ -74,6 +74,51 @@ class NamespaceLogBackendReacquireOnFenceTest {
         }
     }
 
+    @Test
+    void ambiguousAppendFailurePoisonsRepoSoNextMutationReAcquires() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            DurablyFailingFileStore fileStore = new DurablyFailingFileStore();
+            NamespaceLogBackend owner = new NamespaceLogBackend(root, fileStore, false);
+
+            assertEquals(FileId.of(0), owner.createFileOwnerAssigned(template("/a", 1)));
+
+            fileStore.failNextAppendAfterWritingFrame();
+            assertScpInternal(thrownBy(() -> owner.createFileOwnerAssigned(template("/b", 2))));
+
+            FileId retried = owner.createFileOwnerAssigned(template("/b", 2));
+            assertEquals(FileId.of(1), retried,
+                    "the poisoned repo must be re-acquired before the next metadata mutation");
+            assertTrue(owner.getFile(NS, retried).isPresent(),
+                    "re-acquire must recover the durable-but-unacked FileCreated record");
+
+            long[] stats = owner.metrics().stats().get(NS.value());
+            assertEquals(1, stats[NamespaceLogMetrics.OWNER_CHANGES],
+                    "append-failure re-acquire must not count as an ownership handoff");
+            assertTrue(stats[NamespaceLogMetrics.REACQUISITIONS] >= 1,
+                    "append-failure recovery is counted as a re-acquisition");
+        }
+    }
+
+    private static void assertScpInternal(Throwable t) {
+        assertTrue(t instanceof ScpException se && se.code() == ErrorCode.INTERNAL,
+                "expected INTERNAL ScpException, got " + t);
+    }
+
+    private static Throwable thrownBy(ThrowingRunnable runnable) {
+        try {
+            runnable.run();
+            return null;
+        } catch (Throwable t) {
+            return t;
+        }
+    }
+
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
+    }
+
     private static Records.FileRecord template(String path, long opId) {
         return new Records.FileRecord(FileId.of(0), NS, StrataPath.of(path),
                 3, 2, true, FileState.OPEN, 100L, List.of(), opId, opId);
@@ -107,6 +152,66 @@ class NamespaceLogBackendReacquireOnFenceTest {
 
         @Override
         public byte[] readLog(FileId logFileId) throws Exception {
+            return delegate.readLog(logFileId);
+        }
+
+        @Override
+        public FileId writeSnapshot(StrataNamespace ns, long generation, byte[] snapshotBytes) throws Exception {
+            return delegate.writeSnapshot(ns, generation, snapshotBytes);
+        }
+
+        @Override
+        public byte[] readSnapshot(FileId snapshotFileId) throws Exception {
+            return delegate.readSnapshot(snapshotFileId);
+        }
+
+        @Override
+        public void deleteFile(FileId fileId) throws Exception {
+            delegate.deleteFile(fileId);
+        }
+    }
+
+    /**
+     * Simulates the production dead-appender shape for a non-fenced append failure: one append frame may
+     * already be durable, but the appender returns INTERNAL and every later append to the same log repeats
+     * that death cause until recovery reads/seals the log.
+     */
+    private static final class DurablyFailingFileStore implements NamespaceMetadataFileStore {
+        private final TestNamespaceMetadataFileStore delegate = new TestNamespaceMetadataFileStore();
+        private boolean failNextAppendAfterWritingFrame;
+        private FileId deadLog;
+        private ScpException deathCause;
+
+        void failNextAppendAfterWritingFrame() {
+            failNextAppendAfterWritingFrame = true;
+        }
+
+        @Override
+        public FileId createLogFile(StrataNamespace ns, long generation) throws Exception {
+            return delegate.createLogFile(ns, generation);
+        }
+
+        @Override
+        public synchronized void appendLog(FileId logFileId, byte[] frameBytes) throws Exception {
+            if (logFileId.equals(deadLog)) {
+                throw deathCause;
+            }
+            if (failNextAppendAfterWritingFrame) {
+                failNextAppendAfterWritingFrame = false;
+                delegate.appendLog(logFileId, frameBytes);
+                deadLog = logFileId;
+                deathCause = new ScpException(ErrorCode.INTERNAL, "quorum lost injected");
+                throw deathCause;
+            }
+            delegate.appendLog(logFileId, frameBytes);
+        }
+
+        @Override
+        public synchronized byte[] readLog(FileId logFileId) throws Exception {
+            if (logFileId.equals(deadLog)) {
+                deadLog = null;
+                deathCause = null;
+            }
             return delegate.readLog(logFileId);
         }
 

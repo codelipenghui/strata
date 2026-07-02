@@ -346,7 +346,8 @@ final class NamespaceLogBackend implements AutoCloseable {
     /**
      * Runs a mutating transaction against this node's repository for {@code namespace}, re-acquiring the
      * meta-log and retrying ONCE if the append is fenced ({@link ErrorCode#FENCED_EPOCH}) because another
-     * opener republished the manifest at a higher epoch.
+     * opener republished the manifest at a higher epoch, or if a previous ambiguous append failure poisoned
+     * the cached repo.
      *
      * <p>Without this, a controller that briefly co-owned a namespace during a membership settle keeps a
      * cached repository at the stale epoch, so every meta-log append fences forever — the file never
@@ -361,6 +362,10 @@ final class NamespaceLogBackend implements AutoCloseable {
         NamespaceMetadataLogRepository repo = repo(namespace);
         try {
             return runLocked(repo, txn);
+        } catch (PoisonedMetadataLogRepositoryException e) {
+            log.warn("namespace {} meta-log repository poisoned after append failure ({}) — re-acquiring and retrying once",
+                    namespace, causeSummary(e.getCause()));
+            metrics.recordReacquire(namespace);
         } catch (Exception e) {
             if (!isFencedEpoch(e)) {
                 throw e;
@@ -375,9 +380,22 @@ final class NamespaceLogBackend implements AutoCloseable {
     private static <T> T runLocked(NamespaceMetadataLogRepository repo, RepoTxn<T> txn) throws Exception {
         repo.lock();
         try {
+            if (repo.poisoned()) {
+                throw new PoisonedMetadataLogRepositoryException(repo.poisonCause());
+            }
             return txn.run(repo);
         } finally {
             repo.unlock();
+        }
+    }
+
+    private static String causeSummary(Throwable cause) {
+        return cause == null ? "unknown" : cause.toString();
+    }
+
+    private static final class PoisonedMetadataLogRepositoryException extends Exception {
+        private PoisonedMetadataLogRepositoryException(Throwable cause) {
+            super("metadata-log repository poisoned by append failure", cause);
         }
     }
 
