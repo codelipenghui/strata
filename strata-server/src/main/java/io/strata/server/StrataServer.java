@@ -128,18 +128,7 @@ public final class StrataServer {
                 .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
                 .withDeleteMaxConcurrent(intEnv("STRATA_DELETE_MAX_CONCURRENT", 1))
                 .withDeleteMinIntervalMs(longEnv("STRATA_DELETE_MIN_INTERVAL_MS", 50))
-                .withChunkStoreConfig(new ChunkStoreConfig(
-                        intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
-                        longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
-                        longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
-                        longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000),
-                        boolEnv("STRATA_SEAL_FSYNC", false),
-                        longEnv("STRATA_BG_FLUSH_INTERVAL_MS", 500),
-                        longEnv("STRATA_BG_FLUSH_THRESHOLD_BYTES", 4L << 20),
-                        longEnv("STRATA_SLOW_APPEND_LOG_MS", 1_000),
-                        longEnv("STRATA_SLOW_MUTATION_LOG_MS", 500),
-                        intEnv("STRATA_FILE_CHANNEL_CACHE_MAX_SIZE",
-                                ChunkStoreConfig.DEFAULT.channelCacheMaxSize())));
+                .withChunkStoreConfig(chunkStoreConfigFromEnv());
         DataNode node = new DataNode(config);
         log.info("data node started: endpoint={} dataDir={} controller={}",
                 node.endpoint(), config.dataDir(), config.controllerEndpoints());
@@ -220,18 +209,7 @@ public final class StrataServer {
                 .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
                 .withDeleteMaxConcurrent(intEnv("STRATA_DELETE_MAX_CONCURRENT", 1))
                 .withDeleteMinIntervalMs(longEnv("STRATA_DELETE_MIN_INTERVAL_MS", 50))
-                .withChunkStoreConfig(new ChunkStoreConfig(
-                        intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
-                        longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
-                        longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
-                        longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000),
-                        boolEnv("STRATA_SEAL_FSYNC", false),
-                        longEnv("STRATA_BG_FLUSH_INTERVAL_MS", 500),
-                        longEnv("STRATA_BG_FLUSH_THRESHOLD_BYTES", 4L << 20),
-                        longEnv("STRATA_SLOW_APPEND_LOG_MS", 1_000),
-                        longEnv("STRATA_SLOW_MUTATION_LOG_MS", 500),
-                        intEnv("STRATA_FILE_CHANNEL_CACHE_MAX_SIZE",
-                                ChunkStoreConfig.DEFAULT.channelCacheMaxSize())));
+                .withChunkStoreConfig(chunkStoreConfigFromEnv());
         Combined combined = startCombined(controllerConfig, nodeConfig);
         log.info("combined node started: scp={} zk={}", combined.node().endpoint(), controllerConfig.zkConnect());
         awaitShutdown("combined node", combined);
@@ -278,6 +256,22 @@ public final class StrataServer {
             closeQuietly(controller);
             throw e;
         }
+    }
+
+    private static ChunkStoreConfig chunkStoreConfigFromEnv() {
+        return new ChunkStoreConfig(
+                intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
+                longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
+                longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
+                longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000),
+                boolEnv("STRATA_SEAL_FSYNC", false),
+                longEnv("STRATA_BG_FLUSH_INTERVAL_MS", 500),
+                longEnv("STRATA_BG_FLUSH_THRESHOLD_BYTES", 4L << 20),
+                longEnv("STRATA_SLOW_APPEND_LOG_MS", 1_000),
+                longEnv("STRATA_SLOW_MUTATION_LOG_MS", 500),
+                intEnv("STRATA_FILE_CHANNEL_CACHE_MAX_SIZE", ChunkStoreConfig.DEFAULT.channelCacheMaxSize()),
+                intEnv("STRATA_MAX_OPEN_CHUNK_LEDGER_ENTRIES",
+                        ChunkStoreConfig.DEFAULT.maxOpenChunkLedgerEntries()));
     }
 
     /** Co-resident controller + node + their shared metrics endpoint; closes node before controller on shutdown. */

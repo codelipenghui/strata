@@ -854,6 +854,12 @@ public final class ChunkStore implements AutoCloseable {
     public CompletableFuture<AppendResult> appendAsync(
             StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset,
             ByteBuffer payload, int payloadCrc) throws IOException {
+        return appendAsync(ns, id, epoch, baseOffset, durableOffset, payload, payloadCrc, false);
+    }
+
+    public CompletableFuture<AppendResult> appendAsync(
+            StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset,
+            ByteBuffer payload, int payloadCrc, boolean recoveryAppend) throws IOException {
         Handle h = lookup(ns, id);
         // payloadCrc is the writer's CRC32C over this payload, already verified by the frame decoder;
         // the node stores it as the per-record digest and never originates its own (no node-side CRC
@@ -885,6 +891,12 @@ public final class ChunkStore implements AutoCloseable {
             len = payload.remaining();
             if (len == 0) {
                 return CompletableFuture.completedFuture(new AppendResult(h.end)); // DO beacon
+            }
+            if (!recoveryAppend && h.ledger.size() >= csConfig.maxOpenChunkLedgerEntries()) {
+                throw new ScpException(ErrorCode.CHUNK_SEALED,
+                        "open chunk ledger entry cap reached for " + id + ": "
+                                + h.ledger.size() + " >= " + csConfig.maxOpenChunkLedgerEntries(),
+                        h.end);
             }
             newEnd = checkedAdd(baseOffset, len, "chunk offset");
             long writePos = checkedAdd(DATA_START, baseOffset, "chunk file offset");

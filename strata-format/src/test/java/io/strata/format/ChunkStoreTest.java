@@ -1161,6 +1161,42 @@ class ChunkStoreTest {
     }
 
     @Test
+    void appendRejectsBeyondMaxOpenChunkLedgerEntries() throws Exception {
+        ChunkStoreConfig cfg = ChunkStoreConfig.DEFAULT.withMaxOpenChunkLedgerEntries(2);
+        try (ChunkStore store = new ChunkStore(dir, cfg)) {
+            open(store, id, 1);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(new byte[] {1}));
+            store.append(TEST_NS, id, 1, 1, 1, ByteBuffer.wrap(new byte[] {2}));
+
+            ScpException e = assertThrows(ScpException.class,
+                    () -> store.append(TEST_NS, id, 1, 2, 2, ByteBuffer.wrap(new byte[] {3})));
+
+            assertEquals(ErrorCode.CHUNK_SEALED, e.code());
+            assertEquals(2, store.stat(TEST_NS, id).localEndOffset());
+            assertEquals(2, store.readLedger(TEST_NS, id, 0).size());
+        }
+    }
+
+    @Test
+    void recoveredOpenChunkHonorsMaxOpenChunkLedgerEntries() throws Exception {
+        ChunkStoreConfig cfg = ChunkStoreConfig.DEFAULT.withMaxOpenChunkLedgerEntries(2);
+        try (ChunkStore store = new ChunkStore(dir, cfg)) {
+            open(store, id, 1);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(new byte[] {1}));
+            store.append(TEST_NS, id, 1, 1, 1, ByteBuffer.wrap(new byte[] {2}));
+        }
+
+        try (ChunkStore recovered = new ChunkStore(dir, cfg)) {
+            ScpException e = assertThrows(ScpException.class,
+                    () -> recovered.append(TEST_NS, id, 1, 2, 2, ByteBuffer.wrap(new byte[] {3})));
+
+            assertEquals(ErrorCode.CHUNK_SEALED, e.code());
+            assertEquals(2, recovered.stat(TEST_NS, id).localEndOffset());
+            assertEquals(2, recovered.readLedger(TEST_NS, id, 0).size());
+        }
+    }
+
+    @Test
     void doNeverExceedsLocalEnd() throws Exception {
         try (ChunkStore store = newStore()) {
             open(store, id, 1);
