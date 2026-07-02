@@ -14,9 +14,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Node-local orphan GC (design §20.4). A sealed chunk no owner has verified within {@code graceMs}
@@ -32,15 +36,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>Two graces guard against false positives. A per-chunk grace (a freshly-known chunk is verified
  * before it can become a suspect) covers an in-flight create whose {@code FileCreated} is not yet
  * durable. A node-startup grace keeps a just-started node from GC'ing before the owner-pull verify
- * mechanism has had a cycle to attest its chunks. The confirm itself is authoritative because the
- * owner recovers its meta-log before answering {@code LOOKUP_FILE} (§14), so a {@code FILE_NOT_FOUND}
- * is never a stale empty-state false positive.
+ * mechanism has had a cycle to attest its chunks. Owner-confirm is the ordinary cleanup signal, and
+ * delete budgets below bound each pass so a metadata-plane loss cannot turn many stale descriptors into
+ * unbounded physical deletes.
  *
  * <p>Design note (§20.4 deviation): the spec's strict "trust no-owner-verified only after hearing a
  * verify from <em>every</em> owner" would deadlock when an owner has no described chunks on this node
- * (so it never contacts the node) — exactly the all-orphan case. Because the per-chunk confirm is
- * authoritative and fail-safe, a time-based startup grace plus that confirm is sufficient and cannot
- * deadlock. A dynamic owner-set change would reset the startup grace; the v0 owner set is static.
+ * (so it never contacts the node) — exactly the all-orphan case. A time-based startup grace plus
+ * owner-confirm and bounded per-pass deletes is sufficient for ordinary cleanup without deadlocking.
+ * A dynamic owner-set change would reset the startup grace; the v0 owner set is static.
  */
 final class OrphanGc implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(OrphanGc.class);
@@ -51,6 +55,9 @@ final class OrphanGc implements AutoCloseable {
     static final long DEFAULT_GRACE_MS = 6_000;
     static final long DEFAULT_SCAN_INTERVAL_MS = 3_000;
     static final long DEFAULT_STARTUP_GRACE_MS = 6_000;
+    static final int DEFAULT_MAX_CONFIRMED_DELETES_PER_NAMESPACE_PER_PASS = 64;
+    static final int DEFAULT_MAX_CONFIRMED_DELETE_PERCENT_PER_NAMESPACE_PER_PASS = 25;
+    static final int DEFAULT_MAX_CONFIRMED_DELETES_PER_NODE_PASS = 256;
     private static final int DEFAULT_CONFIRM_TIMEOUT_MS = 5_000;
 
     private final ChunkStore store;
@@ -61,12 +68,21 @@ final class OrphanGc implements AutoCloseable {
     private final long scanIntervalMs;
     private final long startupGraceMs;
     private final int confirmTimeoutMs;
+    private final int maxConfirmedDeletesPerNamespacePerPass;
+    private final int maxConfirmedDeletePercentPerNamespacePerPass;
+    private final int maxConfirmedDeletesPerNodePass;
+    private final AtomicLong budgetLimitedPasses = new AtomicLong();
+    private final AtomicLong budgetLimitedChunkTotal = new AtomicLong();
     private final long startedAtMs = System.currentTimeMillis();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private volatile int budgetLimitedNamespaces;
+    private volatile int budgetLimitedChunks;
     private volatile Thread thread;
 
     OrphanGc(ChunkStore store, ChunkDeleteService deletes, int nodeId, List<String> controllerEndpoints,
-             long graceMs, long scanIntervalMs, long startupGraceMs, int confirmTimeoutMs) {
+             long graceMs, long scanIntervalMs, long startupGraceMs, int confirmTimeoutMs,
+             int maxConfirmedDeletesPerNamespacePerPass, int maxConfirmedDeletePercentPerNamespacePerPass,
+             int maxConfirmedDeletesPerNodePass) {
         this.store = Objects.requireNonNull(store, "store");
         this.deletes = Objects.requireNonNull(deletes, "deletes");
         this.nodeId = nodeId;
@@ -75,6 +91,9 @@ final class OrphanGc implements AutoCloseable {
         this.scanIntervalMs = scanIntervalMs;
         this.startupGraceMs = startupGraceMs;
         this.confirmTimeoutMs = confirmTimeoutMs;
+        this.maxConfirmedDeletesPerNamespacePerPass = maxConfirmedDeletesPerNamespacePerPass;
+        this.maxConfirmedDeletePercentPerNamespacePerPass = maxConfirmedDeletePercentPerNamespacePerPass;
+        this.maxConfirmedDeletesPerNodePass = maxConfirmedDeletesPerNodePass;
     }
 
     void start() {
@@ -102,23 +121,96 @@ final class OrphanGc implements AutoCloseable {
     /** One GC pass: confirm each suspect with its owner and delete only confirmed orphans. */
     void gcOnce() throws InterruptedException {
         long now = System.currentTimeMillis();
+        Map<StrataNamespace, List<ChunkId>> confirmed = new LinkedHashMap<>();
+        Map<StrataNamespace, Integer> sealedByNamespace = store.sealedChunksByNamespace();
         for (ChunkStore.SuspectChunk s : store.orphanSuspects(graceMs, now)) {
             if (closed.get()) {
                 return;
             }
             switch (confirm(s.namespace(), s.chunkId())) {
-                case ORPHAN -> {
-                    ErrorCode result = deletes.delete(s.namespace(), s.chunkId());
-                    if (result == ErrorCode.OK) {
-                        log.info("orphan GC: deleted unreferenced sealed chunk {} in ns={}",
-                                s.chunkId(), s.namespace());
-                    } else {
-                        log.warn("orphan GC: confirmed orphan {} in ns={} failed to delete: {}",
-                                s.chunkId(), s.namespace(), result);
-                    }
-                }
+                case ORPHAN -> confirmed.computeIfAbsent(s.namespace(), ignored -> new ArrayList<>()).add(s.chunkId());
                 case KEEP, UNREACHABLE -> { /* fail-safe: never delete a kept or unconfirmed suspect */ }
             }
+        }
+        int limitedNamespaces = 0;
+        int limitedChunks = 0;
+        int nodeRemaining = maxConfirmedDeletesPerNodePass == 0
+                ? Integer.MAX_VALUE
+                : maxConfirmedDeletesPerNodePass;
+        for (Map.Entry<StrataNamespace, List<ChunkId>> e : confirmed.entrySet()) {
+            List<ChunkId> chunks = e.getValue();
+            if (chunks.isEmpty()) {
+                continue;
+            }
+            int namespaceBudget = namespaceBudget(sealedByNamespace.getOrDefault(e.getKey(), 0));
+            int allowed = Math.min(chunks.size(), Math.min(namespaceBudget, nodeRemaining));
+            if (allowed < chunks.size()) {
+                limitedNamespaces++;
+                limitedChunks += chunks.size() - allowed;
+            }
+            for (int i = 0; i < allowed; i++) {
+                ChunkId chunkId = chunks.get(i);
+                if (confirm(e.getKey(), chunkId) == Verdict.ORPHAN) {
+                    deleteConfirmed(e.getKey(), chunkId);
+                }
+            }
+            if (nodeRemaining != Integer.MAX_VALUE) {
+                nodeRemaining -= allowed;
+            }
+        }
+        recordBudgetLimit(limitedNamespaces, limitedChunks);
+    }
+
+    private int namespaceBudget(int sealedChunkCount) {
+        int budget = Integer.MAX_VALUE;
+        if (maxConfirmedDeletesPerNamespacePerPass > 0) {
+            budget = Math.min(budget, maxConfirmedDeletesPerNamespacePerPass);
+        }
+        if (maxConfirmedDeletePercentPerNamespacePerPass > 0) {
+            int percentBudget = sealedChunkCount <= 0
+                    ? 0
+                    : Math.max(1, (int) ((sealedChunkCount * (long) maxConfirmedDeletePercentPerNamespacePerPass) / 100));
+            budget = Math.min(budget, percentBudget);
+        }
+        return budget;
+    }
+
+    private void recordBudgetLimit(int limitedNamespaces, int limitedChunks) {
+        this.budgetLimitedNamespaces = limitedNamespaces;
+        this.budgetLimitedChunks = limitedChunks;
+        if (limitedChunks > 0) {
+            budgetLimitedPasses.incrementAndGet();
+            budgetLimitedChunkTotal.addAndGet(limitedChunks);
+            log.warn("orphan GC: deferred {} confirmed orphan deletes across {} namespaces due to delete budgets "
+                            + "(perNamespaceLimit={}, perNamespacePercent={}, perNodeLimit={})",
+                    limitedChunks, limitedNamespaces, maxConfirmedDeletesPerNamespacePerPass,
+                    maxConfirmedDeletePercentPerNamespacePerPass, maxConfirmedDeletesPerNodePass);
+        }
+    }
+
+    int budgetLimitedNamespaces() {
+        return budgetLimitedNamespaces;
+    }
+
+    int budgetLimitedChunks() {
+        return budgetLimitedChunks;
+    }
+
+    long budgetLimitedPasses() {
+        return budgetLimitedPasses.get();
+    }
+
+    long budgetLimitedChunkTotal() {
+        return budgetLimitedChunkTotal.get();
+    }
+
+    private void deleteConfirmed(StrataNamespace namespace, ChunkId chunkId) throws InterruptedException {
+        ErrorCode result = deletes.delete(namespace, chunkId);
+        if (result == ErrorCode.OK) {
+            log.info("orphan GC: deleted unreferenced sealed chunk {} in ns={}", chunkId, namespace);
+        } else {
+            log.warn("orphan GC: confirmed orphan {} in ns={} failed to delete: {}",
+                    chunkId, namespace, result);
         }
     }
 
@@ -156,7 +248,7 @@ final class OrphanGc implements AutoCloseable {
                 return Verdict.ORPHAN; // file exists but has no such chunk — orphan
             } catch (ScpException se) {
                 if (se.code() == ErrorCode.FILE_NOT_FOUND) {
-                    return Verdict.ORPHAN; // authoritative: the owner recovered its log; the file is gone
+                    return Verdict.ORPHAN; // ordinary cleanup signal; pass budgets still bound deletes
                 }
                 if (se.code() == ErrorCode.NOT_LEADER) {
                     continue; // this controller is not the owner — try the next endpoint

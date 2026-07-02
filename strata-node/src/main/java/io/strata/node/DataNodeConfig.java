@@ -33,6 +33,9 @@ public record DataNodeConfig(
         long orphanScanIntervalMs,
         long orphanStartupGraceMs,
         int orphanConfirmTimeoutMs,
+        int orphanDeleteMaxConfirmedPerNamespacePerPass, // 0 disables the absolute namespace budget
+        int orphanDeleteMaxNamespacePercentPerPass,      // 0 disables the percent namespace budget
+        int orphanDeleteMaxConfirmedPerNodePass,         // 0 disables the node-wide budget
         int controlCallTimeoutMs,
         int controlCommandParallelism,
         int controlMaxQueuedCommands,
@@ -41,12 +44,23 @@ public record DataNodeConfig(
         long deleteMinIntervalMs,
         ChunkStoreConfig chunkStoreConfig
 ) {
+    public static final int DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS =
+            OrphanGc.DEFAULT_MAX_CONFIRMED_DELETES_PER_NAMESPACE_PER_PASS;
+    public static final int DEFAULT_ORPHAN_DELETE_MAX_NAMESPACE_PERCENT_PER_PASS =
+            OrphanGc.DEFAULT_MAX_CONFIRMED_DELETE_PERCENT_PER_NAMESPACE_PER_PASS;
+    public static final int DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS =
+            OrphanGc.DEFAULT_MAX_CONFIRMED_DELETES_PER_NODE_PASS;
+
     public DataNodeConfig(Path dataDir, int listenPort, String advertisedHost, String advertisedEndpointOverride,
                       List<String> controllerEndpoints, String zone, String rack, String host,
                       long capacityBytes, int scrubIntervalMs) {
         this(dataDir, listenPort, advertisedHost, advertisedEndpointOverride, controllerEndpoints,
                 zone, rack, host, capacityBytes, scrubIntervalMs, ConnectionPolicy.DEFAULT, -1,
-                6_000L, 3_000L, 6_000L, 5_000, 10_000, 8, 1024, 4 * 1024 * 1024, 1, 50L,
+                6_000L, 3_000L, 6_000L, 5_000,
+                DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS,
+                DEFAULT_ORPHAN_DELETE_MAX_NAMESPACE_PERCENT_PER_PASS,
+                DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS,
+                10_000, 8, 1024, 4 * 1024 * 1024, 1, 50L,
                 ChunkStoreConfig.DEFAULT);
     }
 
@@ -58,8 +72,12 @@ public record DataNodeConfig(
                           int deleteMaxConcurrent, long deleteMinIntervalMs, ChunkStoreConfig chunkStoreConfig) {
         this(dataDir, listenPort, advertisedHost, advertisedEndpointOverride, controllerEndpoints, zone, rack,
                 host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId, orphanGraceMs,
-                orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs, controlCallTimeoutMs,
-                8, 1024, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
+                orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS,
+                DEFAULT_ORPHAN_DELETE_MAX_NAMESPACE_PERCENT_PER_PASS,
+                DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS,
+                controlCallTimeoutMs, 8, 1024, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs,
+                chunkStoreConfig);
     }
 
     public DataNodeConfig {
@@ -104,6 +122,18 @@ public record DataNodeConfig(
         }
         if (orphanConfirmTimeoutMs <= 0) {
             throw new IllegalArgumentException("orphanConfirmTimeoutMs must be positive: " + orphanConfirmTimeoutMs);
+        }
+        if (orphanDeleteMaxConfirmedPerNamespacePerPass < 0) {
+            throw new IllegalArgumentException("orphanDeleteMaxConfirmedPerNamespacePerPass must be non-negative: "
+                    + orphanDeleteMaxConfirmedPerNamespacePerPass);
+        }
+        if (orphanDeleteMaxNamespacePercentPerPass < 0 || orphanDeleteMaxNamespacePercentPerPass > 100) {
+            throw new IllegalArgumentException("orphanDeleteMaxNamespacePercentPerPass must be 0..100: "
+                    + orphanDeleteMaxNamespacePercentPerPass);
+        }
+        if (orphanDeleteMaxConfirmedPerNodePass < 0) {
+            throw new IllegalArgumentException("orphanDeleteMaxConfirmedPerNodePass must be non-negative: "
+                    + orphanDeleteMaxConfirmedPerNodePass);
         }
         if (controlCallTimeoutMs <= 0) {
             throw new IllegalArgumentException("controlCallTimeoutMs must be positive: " + controlCallTimeoutMs);
@@ -152,62 +182,105 @@ public record DataNodeConfig(
         return new DataNodeConfig(dataDir, port, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes,
-                deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs, controlCommandParallelism,
+                controlMaxQueuedCommands, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs,
+                chunkStoreConfig);
     }
 
     public DataNodeConfig withAdvertisedEndpoint(String endpoint) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, endpoint,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes,
-                deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs, controlCommandParallelism,
+                controlMaxQueuedCommands, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs,
+                chunkStoreConfig);
     }
 
     public DataNodeConfig withConnectionPolicy(ConnectionPolicy policy) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, policy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes,
-                deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs, controlCommandParallelism,
+                controlMaxQueuedCommands, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs,
+                chunkStoreConfig);
     }
 
     public DataNodeConfig withNodeId(int id) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, id,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes,
-                deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs, controlCommandParallelism,
+                controlMaxQueuedCommands, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs,
+                chunkStoreConfig);
     }
 
     public DataNodeConfig withOrphanGraceMs(long v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 v, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes,
-                deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs, controlCommandParallelism,
+                controlMaxQueuedCommands, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs,
+                chunkStoreConfig);
     }
 
     public DataNodeConfig withOrphanScanIntervalMs(long v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, v, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes,
-                deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs, controlCommandParallelism,
+                controlMaxQueuedCommands, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs,
+                chunkStoreConfig);
     }
 
     public DataNodeConfig withOrphanStartupGraceMs(long v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, v, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes,
-                deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs, controlCommandParallelism,
+                controlMaxQueuedCommands, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs,
+                chunkStoreConfig);
     }
 
     public DataNodeConfig withOrphanConfirmTimeoutMs(int v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, v,
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs, controlCommandParallelism,
+                controlMaxQueuedCommands, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs,
+                chunkStoreConfig);
+    }
+
+    public DataNodeConfig withOrphanDeleteMaxConfirmedPerNamespacePerPass(int v) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs, v,
+                orphanDeleteMaxNamespacePercentPerPass, orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs,
+                controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes, deleteMaxConcurrent,
+                deleteMinIntervalMs, chunkStoreConfig);
+    }
+
+    public DataNodeConfig withOrphanDeleteMaxNamespacePercentPerPass(int v) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                orphanDeleteMaxConfirmedPerNamespacePerPass, v, orphanDeleteMaxConfirmedPerNodePass,
+                controlCallTimeoutMs, controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes,
+                deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
+    }
+
+    public DataNodeConfig withOrphanDeleteMaxConfirmedPerNodePass(int v) {
+        return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
+                controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
+                orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass, v,
                 controlCallTimeoutMs, controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes,
                 deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
     }
@@ -216,47 +289,54 @@ public record DataNodeConfig(
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                v, controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes, deleteMaxConcurrent,
-                deleteMinIntervalMs, chunkStoreConfig);
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, v, controlCommandParallelism,
+                controlMaxQueuedCommands, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs,
+                chunkStoreConfig);
     }
 
     public DataNodeConfig withControlCommandLimits(int parallelism, int maxQueuedCommands) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, parallelism, maxQueuedCommands, repairFetchBytes, deleteMaxConcurrent,
-                deleteMinIntervalMs, chunkStoreConfig);
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs, parallelism,
+                maxQueuedCommands, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
     }
 
     public DataNodeConfig withRepairFetchBytes(int v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, controlCommandParallelism, controlMaxQueuedCommands, v, deleteMaxConcurrent,
-                deleteMinIntervalMs, chunkStoreConfig);
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs, controlCommandParallelism,
+                controlMaxQueuedCommands, v, deleteMaxConcurrent, deleteMinIntervalMs, chunkStoreConfig);
     }
 
     public DataNodeConfig withDeleteMaxConcurrent(int v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes, v,
-                deleteMinIntervalMs, chunkStoreConfig);
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs, controlCommandParallelism,
+                controlMaxQueuedCommands, repairFetchBytes, v, deleteMinIntervalMs, chunkStoreConfig);
     }
 
     public DataNodeConfig withDeleteMinIntervalMs(long v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes,
-                deleteMaxConcurrent, v, chunkStoreConfig);
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs, controlCommandParallelism,
+                controlMaxQueuedCommands, repairFetchBytes, deleteMaxConcurrent, v, chunkStoreConfig);
     }
 
     public DataNodeConfig withChunkStoreConfig(ChunkStoreConfig v) {
         return new DataNodeConfig(dataDir, listenPort, advertisedHost, advertisedEndpointOverride,
                 controllerEndpoints, zone, rack, host, capacityBytes, scrubIntervalMs, connectionPolicy, nodeId,
                 orphanGraceMs, orphanScanIntervalMs, orphanStartupGraceMs, orphanConfirmTimeoutMs,
-                controlCallTimeoutMs, controlCommandParallelism, controlMaxQueuedCommands, repairFetchBytes,
-                deleteMaxConcurrent, deleteMinIntervalMs, v);
+                orphanDeleteMaxConfirmedPerNamespacePerPass, orphanDeleteMaxNamespacePercentPerPass,
+                orphanDeleteMaxConfirmedPerNodePass, controlCallTimeoutMs, controlCommandParallelism,
+                controlMaxQueuedCommands, repairFetchBytes, deleteMaxConcurrent, deleteMinIntervalMs, v);
     }
 }

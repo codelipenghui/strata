@@ -132,7 +132,19 @@ public final class Messages {
     }
 
     public record Append(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset,
-                         StrataNamespace namespace) {
+                         StrataNamespace namespace, boolean recovery) {
+        private static final int TAG_RECOVERY_APPEND = 0;
+
+        public Append(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset,
+                      StrataNamespace namespace) {
+            this(chunkId, writeEpoch, baseOffset, durableOffset, namespace, false);
+        }
+
+        public static Append recovery(ChunkId chunkId, int writeEpoch, long baseOffset,
+                                      long durableOffset, StrataNamespace namespace) {
+            return new Append(chunkId, writeEpoch, baseOffset, durableOffset, namespace, true);
+        }
+
         public Append {
             namespace = Objects.requireNonNull(namespace, "namespace");
         }
@@ -141,15 +153,28 @@ public final class Messages {
             int len = namespace.value().length(); // ASCII namespace: UTF-8 length == char length
             BufWriter w = new BufWriter(33 + (len < 128 ? 1 : 2) + len);
             w.chunkId(chunkId).i32(writeEpoch).u64(baseOffset).u64(durableOffset)
-                    .string(namespace.toString()).noTags();
+                    .string(namespace.toString());
+            if (recovery) {
+                TaggedFields.of(Map.of(TAG_RECOVERY_APPEND, new byte[] {1})).writeTo(w);
+            } else {
+                w.noTags();
+            }
             return w.toBytes();
         }
 
         public static Append decode(ByteBuffer b) {
-            Append m = new Append(ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong(),
-                    StrataNamespace.of(Varint.readString(b)));
-            TaggedFields.readFrom(b);
-            return m;
+            ChunkId chunkId = ChunkId.readFrom(b);
+            int writeEpoch = b.getInt();
+            long baseOffset = b.getLong();
+            long durableOffset = b.getLong();
+            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            TaggedFields tags = TaggedFields.readFrom(b);
+            byte[] recovery = tags.get(TAG_RECOVERY_APPEND);
+            if (recovery != null && recovery.length != 1) {
+                throw new IllegalArgumentException("bad append recovery tag size: " + recovery.length);
+            }
+            return new Append(chunkId, writeEpoch, baseOffset, durableOffset, namespace,
+                    recovery != null && recovery[0] != 0);
         }
     }
 

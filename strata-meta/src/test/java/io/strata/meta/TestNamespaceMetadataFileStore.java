@@ -12,9 +12,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * In-memory {@link NamespaceMetadataFileStore} for tests (design §8 "TestNamespaceMetadataFileStore"):
  * a deterministic backend for recovery and append-ordering validation, with no Strata data nodes.
  */
-final class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore {
+class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore {
     private final Map<FileId, ByteArrayOutputStream> logs = new ConcurrentHashMap<>();
     private final Map<FileId, byte[]> snapshots = new ConcurrentHashMap<>();
+    private final Map<FileId, Integer> corruptSnapshotReads = new ConcurrentHashMap<>();
     private final AtomicLong ids = new AtomicLong(1);
 
     @Override
@@ -43,12 +44,40 @@ final class TestNamespaceMetadataFileStore implements NamespaceMetadataFileStore
     }
 
     @Override
-    public byte[] readSnapshot(FileId snapshotFileId) {
+    public synchronized byte[] readSnapshot(FileId snapshotFileId) {
         byte[] b = snapshots.get(snapshotFileId);
         if (b == null) {
             throw new IllegalStateException("no snapshot file " + snapshotFileId);
         }
+        Integer reads = corruptSnapshotReads.get(snapshotFileId);
+        if (reads != null && reads > 0) {
+            if (reads == 1) {
+                corruptSnapshotReads.remove(snapshotFileId);
+            } else {
+                corruptSnapshotReads.put(snapshotFileId, reads - 1);
+            }
+            byte[] corrupt = b.clone();
+            corrupt[0] ^= 0x01;
+            return corrupt;
+        }
         return b.clone();
+    }
+
+    synchronized void corruptSnapshot(FileId snapshotFileId) {
+        byte[] b = snapshots.get(snapshotFileId);
+        if (b == null) {
+            throw new IllegalStateException("no snapshot file " + snapshotFileId);
+        }
+        byte[] corrupt = b.clone();
+        corrupt[0] ^= 0x01;
+        snapshots.put(snapshotFileId, corrupt);
+    }
+
+    synchronized void corruptSnapshotOnNextRead(FileId snapshotFileId) {
+        if (!snapshots.containsKey(snapshotFileId)) {
+            throw new IllegalStateException("no snapshot file " + snapshotFileId);
+        }
+        corruptSnapshotReads.put(snapshotFileId, 1);
     }
 
     @Override

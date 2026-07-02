@@ -1,5 +1,6 @@
 package io.strata.client;
 
+import io.strata.common.ChunkLimits;
 import io.strata.common.ConnectionPolicy;
 import org.junit.jupiter.api.Test;
 
@@ -8,6 +9,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ClientConfigTest {
 
@@ -36,9 +38,11 @@ class ClientConfigTest {
         assertThrows(IllegalArgumentException.class,
                 () -> new ClientConfig(List.of("host:123"), 1, 1, ConnectionPolicy.DEFAULT, -1, 0L, 0, 0));
         assertThrows(IllegalArgumentException.class,
-                () -> new ClientConfig(List.of("host:123"), 1, 1, ConnectionPolicy.DEFAULT, 1, 1L, 1, 1, 0, 1));
+                () -> new ClientConfig(List.of("host:123"), 1, 1, ConnectionPolicy.DEFAULT, 1, 1L, 1, 1, 0, 1, 1));
         assertThrows(IllegalArgumentException.class,
-                () -> new ClientConfig(List.of("host:123"), 1, 1, ConnectionPolicy.DEFAULT, 1, 1L, 1, 1, 1, 0));
+                () -> new ClientConfig(List.of("host:123"), 1, 1, ConnectionPolicy.DEFAULT, 1, 1L, 1, 1, 1, 0, 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> ClientConfig.of("host:123").withMaxChunkRecords(0));
         assertThrows(NullPointerException.class,
                 () -> new ClientConfig(List.of("host:123"), 1, 1, null));
     }
@@ -59,6 +63,8 @@ class ClientConfigTest {
         assertEquals(64, c.appendReplicaInflightHighWatermark());
         assertEquals(Math.max(1, (io.strata.proto.ScpClient.maxPendingRequests() * 3) / 4),
                 c.appendConnectionPendingHighWatermark());
+        assertEquals(ChunkLimits.DEFAULT_MAX_CLIENT_CHUNK_RECORDS, c.maxChunkRecords());
+        assertTrue(c.maxChunkRecords() < ChunkLimits.DEFAULT_MAX_OPEN_CHUNK_LEDGER_ENTRIES);
     }
 
     @Test
@@ -66,12 +72,14 @@ class ClientConfigTest {
         ClientConfig c = ClientConfig.of("host:123")
                 .withControllerRetryDeadlineMs(30_000L).withControllerRetryBackoffMs(50)
                 .withRecoveryCopyChunkBytes(1 << 20)
-                .withAppendWatermarks(32, 128);
+                .withAppendWatermarks(32, 128)
+                .withMaxChunkRecords(512);
         assertEquals(30_000L, c.controllerRetryDeadlineMs());
         assertEquals(50, c.controllerRetryBackoffMs());
         assertEquals(1 << 20, c.recoveryCopyChunkBytes());
         assertEquals(32, c.appendReplicaInflightHighWatermark());
         assertEquals(128, c.appendConnectionPendingHighWatermark());
+        assertEquals(512, c.maxChunkRecords());
     }
 
     @Test

@@ -3,6 +3,8 @@ package io.strata.meta;
 import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
 import io.strata.common.StrataNamespace;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -25,6 +27,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * publication is the linearizable barrier validated in {@code tla/MetadataManifestCAS.tla}.
  */
 final class NamespaceMetadataLogRepository {
+    private static final Logger log = LoggerFactory.getLogger(NamespaceMetadataLogRepository.class);
+
     private final StrataNamespace namespace;
     private final NamespaceMetadataFileStore fileStore;
     private final MetadataStore rootStore;
@@ -40,7 +44,11 @@ final class NamespaceMetadataLogRepository {
     private long appliedOffset;  // durable end offset
     private long generation;
     private int manifestVersion; // znode version for the next CAS publish
+    private Records.NamespaceManifest publishedManifest; // last manifest this repo successfully CAS-published
     private boolean compacting;  // guarded by lock: one compaction in flight, blocks an overlapping one
+    // Set after an append throws: the log may contain a durable frame this repo has not applied.
+    private volatile boolean poisoned;
+    private volatile Exception poisonCause;
     // Guarded by lock: while a compaction is in flight, append() buffers each frame it writes here so the
     // publish phase can carry the freeze→CAS-window tail into the new segment WITHOUT reading (and, on the
     // production store, destructively sealing) the live open log. Cleared at each freeze and on completion.
@@ -104,6 +112,14 @@ final class NamespaceMetadataLogRepository {
         return metadataEpoch;
     }
 
+    boolean poisoned() {
+        return poisoned;
+    }
+
+    Exception poisonCause() {
+        return poisonCause;
+    }
+
     StrataNamespace namespace() {
         return namespace;
     }
@@ -120,19 +136,25 @@ final class NamespaceMetadataLogRepository {
     /** Durably appends a record (file store first), applies it to state, returns the new applied offset. */
     long append(MetadataLogRecord record) throws Exception {
         byte[] frame = MetadataLogSegmentCodec.frame(MetadataLogCodec.encode(record));
-        fileStore.appendLog(logFileId, frame); // durable first
-        // Crash window: the record is durable in the log but not yet applied/acked. A successor must
-        // still recover it (byte-durability, tla/MetadataByteDurability) — see the failure-injection test.
-        FailureInjector.point("meta.log.afterDurableAppend");
-        state.apply(record);                    // then visible
-        appliedOffset += frame.length;
-        if (compacting) {
-            // A compaction froze its snapshot at an earlier cut; this frame is in its freeze→CAS window.
-            // Buffer it so publishFrozen can carry it into the new segment without re-reading the open log.
-            compactionTail.add(frame);
+        try {
+            fileStore.appendLog(logFileId, frame); // durable first
+            // Crash window: the record is durable in the log but not yet applied/acked. A successor must
+            // still recover it (byte-durability, tla/MetadataByteDurability) — see the failure-injection test.
+            FailureInjector.point("meta.log.afterDurableAppend");
+            state.apply(record);                    // then visible
+            appliedOffset += frame.length;
+            if (compacting) {
+                // A compaction froze its snapshot at an earlier cut; this frame is in its freeze→CAS window.
+                // Buffer it so publishFrozen can carry it into the new segment without re-reading the open log.
+                compactionTail.add(frame);
+            }
+            metrics.recordAppend(namespace, frame.length);
+            return appliedOffset;
+        } catch (Exception e) {
+            poisoned = true;
+            poisonCause = e;
+            throw e;
         }
-        metrics.recordAppend(namespace, frame.length);
-        return appliedOffset;
     }
 
     /** Always-compact entry point for the threshold-free call sites (tests); see {@link #compact}. */
@@ -162,7 +184,7 @@ final class NamespaceMetadataLogRepository {
         Frozen frozen;
         lock();
         try {
-            if (compacting || openLogBytes() < thresholdBytes) {
+            if (poisoned || compacting || openLogBytes() < thresholdBytes) {
                 return false;
             }
             compacting = true;
@@ -186,8 +208,7 @@ final class NamespaceMetadataLogRepository {
             FileId newLog = fileStore.createLogFile(namespace, frozen.newGeneration());
             lock();
             try {
-                publishFrozen(frozen, newSnapshot, newLog);
-                published = true;
+                published = publishFrozen(frozen, newSnapshot, newLog);
             } finally {
                 unlock();
             }
@@ -203,7 +224,7 @@ final class NamespaceMetadataLogRepository {
         if (published) {
             metrics.recordCompaction(namespace);
         }
-        return true;
+        return published;
     }
 
     /** Immutable freeze of the state to compact, captured under the mutation lock (the short locked phase). */
@@ -225,15 +246,25 @@ final class NamespaceMetadataLogRepository {
      * and reclaimed by the retention-gated sweep. It never reads or seals the old open log, so a publish
      * failure leaves that log writable for the next op / re-acquire.
      */
-    private void publishFrozen(Frozen frozen, FileId newSnapshot, FileId newLog) throws Exception {
+    private boolean publishFrozen(Frozen frozen, FileId newSnapshot, FileId newLog) throws Exception {
+        if (poisoned) {
+            // An append may have durably reached the old open log but failed before apply/compactionTail.
+            // Publishing this frozen cut would make the durable frame unreachable from the manifest.
+            deleteQuietly(newSnapshot);
+            deleteQuietly(newLog);
+            return false;
+        }
         // Carry the freeze→CAS-window appends [cut, appliedOffset) — buffered by append() into
         // compactionTail — into the new segment so it physically starts at the snapshot cut. The frames are
         // already framed and quorum-durable in the old log; we re-append the bytes (a small, bounded write).
         for (byte[] frame : compactionTail) {
             fileStore.appendLog(newLog, frame);
         }
+        Optional<Records.NamespaceManifest.NamespaceManifestRef> previous =
+                Optional.ofNullable(publishedManifest).map(Records.NamespaceManifest.NamespaceManifestRef::from);
         Records.NamespaceManifest published = new Records.NamespaceManifest(namespace, metadataEpoch,
-                frozen.newGeneration(), frozen.cut(), appliedOffset, Optional.of(newSnapshot), Optional.of(newLog));
+                frozen.newGeneration(), frozen.cut(), appliedOffset, Optional.of(newSnapshot), Optional.of(newLog),
+                previous);
         // Crash window (same as publishCompacted): the new snapshot/log exist but the manifest still points
         // at the old generation; a crash here must leave the OLD manifest fully recoverable.
         FailureInjector.point("meta.log.beforeManifestPublish");
@@ -252,9 +283,11 @@ final class NamespaceMetadataLogRepository {
         // durable end is unchanged. (Do NOT reset to cut — that would drop the carried tail.)
         this.generation = frozen.newGeneration();
         this.manifestVersion = newVersion.getAsInt();
+        this.publishedManifest = published;
         // The just-superseded generation (old snapshot/log) is NOT deleted inline (issue #8, design §10 step
         // 6): it is retained as a rollback margin and reclaimed by the retention-gated sweep
         // (NamespaceLogBackend.gcOrphanedSystemFiles) once STRATA_CONTROLLER_LOG_RETENTION_MS has elapsed.
+        return true;
     }
 
     private void recoverAndRepublish() throws Exception {
@@ -264,19 +297,33 @@ final class NamespaceMetadataLogRepository {
         NamespaceMetadataRecovery.Recovered recovered =
                 NamespaceMetadataRecovery.recover(namespace, fileStore, manifest);
         metrics.recordLogRead(namespace, recovered.recordsReplayed(), recovered.bytesRead());
+        if (recovered.usedSnapshotFallback()) {
+            Records.NamespaceManifest currentManifest = manifest.orElseThrow();
+            Records.NamespaceManifest sourceManifest = recovered.sourceManifest().orElseThrow();
+            metrics.recordSnapshotFallback(namespace);
+            log.error("namespace metadata snapshot fallback recovered namespace={} badGeneration={} "
+                            + "sourceGeneration={} currentLogFile={} sourceSnapshotFile={} durableEnd={}",
+                    namespace, currentManifest.generation(), sourceManifest.generation(),
+                    currentManifest.logFileId().map(FileId::toString).orElse("<none>"),
+                    sourceManifest.snapshotFileId().map(FileId::toString).orElse("<none>"),
+                    recovered.durableEndOffset());
+        }
         this.state = recovered.state();
         this.generation = manifest.map(Records.NamespaceManifest::generation).orElse(0L);
         int expectedVersion = current.map(MetadataStore.Versioned::version).orElse(-1);
-        publishCompacted(recovered.durableEndOffset(), expectedVersion);
+        publishCompacted(recovered.durableEndOffset(), expectedVersion, recovered.sourceManifest());
     }
 
-    private void publishCompacted(long cut, int expectedVersion) throws Exception {
+    private void publishCompacted(long cut, int expectedVersion,
+                                  Optional<Records.NamespaceManifest> previousManifest) throws Exception {
         long newGeneration = generation + 1;
         FileId newSnapshot = fileStore.writeSnapshot(namespace, newGeneration,
                 NamespaceMetadataSnapshotCodec.encode(state.exportSnapshot(cut)));
         FileId newLog = fileStore.createLogFile(namespace, newGeneration);
+        Optional<Records.NamespaceManifest.NamespaceManifestRef> previous =
+                previousManifest.map(Records.NamespaceManifest.NamespaceManifestRef::from);
         Records.NamespaceManifest published = new Records.NamespaceManifest(namespace, metadataEpoch,
-                newGeneration, cut, cut, Optional.of(newSnapshot), Optional.of(newLog));
+                newGeneration, cut, cut, Optional.of(newSnapshot), Optional.of(newLog), previous);
         // Crash window: the new snapshot/log files exist but the manifest still points at the old
         // generation. A crash here must leave the OLD manifest fully recoverable — compaction is atomic
         // at the manifest CAS (design §10) — see the failure-injection test.
@@ -297,6 +344,7 @@ final class NamespaceMetadataLogRepository {
         // The CAS returns the new znode version directly — no read-back round-trip, and no window where a
         // transient read failure leaves manifestVersion stale (which would fence the namespace on next CAS).
         this.manifestVersion = newVersion.getAsInt();
+        this.publishedManifest = published;
         // The just-superseded generation (old snapshot/log) is NOT deleted inline (issue #8, design §10 step
         // 6): it is retained as a rollback margin and reclaimed by the retention-gated sweep
         // (NamespaceLogBackend.gcOrphanedSystemFiles) once STRATA_CONTROLLER_LOG_RETENTION_MS has elapsed

@@ -92,21 +92,24 @@ final class ServerMetrics {
                 .description("configured controller-endpoint membership = controllers sharing the namespaces; max() = fleet count").register(reg);
         Gauge.builder("strata_controller_sharding_active", s, m -> m.shardingActive() ? 1 : 0)
                 .description("1 if namespaces are sharded across multiple controllers; 0 = single global leader").register(reg);
-        // Namespace-log activity (append/read/compaction/recovery/reacquisition) is now per-namespace —
-        // registered lazily in registerPerNamespace below as strata_controller_namespace_log_*{namespace}.
+        // Namespace-log activity (append/read/compaction/recovery/reacquisition/fallback) is now
+        // per-namespace — registered lazily in registerPerNamespace below as
+        // strata_controller_namespace_log_*{namespace}.
         // The global controller view is sum without(namespace)(...). (design §3.4)
 
         registerPerNamespace(reg, s, refreshIntervalMs);
     }
 
     // Per-namespace controller counter names, index-aligned with NamespaceLogMetrics.stats(): 0 appendRecords,
-    // 1 appendBytes, 2 readRecords, 3 readBytes, 4 compactions, 5 recoveries, 6 reacquisitions, 7 ownerChanges
-    // (owner_changes is just index 7 — registered uniformly with the rest, no special case).
+    // 1 appendBytes, 2 readRecords, 3 readBytes, 4 compactions, 5 recoveries, 6 reacquisitions,
+    // 7 ownerChanges, 8 snapshotFallbacks (owner_changes is just index 7 — registered uniformly with
+    // the rest, no special case).
     private static final String[] CONTROLLER_NS_COUNTERS = {
             "strata_controller_namespace_log_append_records", "strata_controller_namespace_log_append_bytes",
             "strata_controller_namespace_log_read_records", "strata_controller_namespace_log_read_bytes",
             "strata_controller_namespace_log_compactions", "strata_controller_namespace_log_recoveries",
-            "strata_controller_namespace_log_reacquisitions", "strata_controller_namespace_owner_changes"};
+            "strata_controller_namespace_log_reacquisitions", "strata_controller_namespace_owner_changes",
+            "strata_controller_namespace_log_snapshot_fallbacks"};
 
     /**
      * Per-namespace gauges (namespace-stacked dashboard panels): live files + open metadata-log bytes,
@@ -206,6 +209,19 @@ final class ServerMetrics {
                 .tag("result", "not_found").register(reg);
         FunctionCounter.builder("strata_data_node_delete", n, DataNode::deleteFailedCount)
                 .tag("result", "failed").register(reg);
+        Gauge.builder("strata_data_node_orphan_gc_budget_limited_namespaces", n,
+                        DataNode::orphanGcBudgetLimitedNamespaces)
+                .description("namespaces with confirmed orphan deletes deferred by the last orphan-GC budgeted pass")
+                .register(reg);
+        Gauge.builder("strata_data_node_orphan_gc_budget_limited_chunks", n,
+                        DataNode::orphanGcBudgetLimitedChunks)
+                .description("confirmed orphan deletes deferred by the last orphan-GC budgeted pass").register(reg);
+        FunctionCounter.builder("strata_data_node_orphan_gc_budget_limited_passes", n,
+                        DataNode::orphanGcBudgetLimitedPasses)
+                .description("orphan-GC passes where confirmed deletes were deferred by budgets").register(reg);
+        FunctionCounter.builder("strata_data_node_orphan_gc_budget_limited_chunk_total", n,
+                        DataNode::orphanGcBudgetLimitedChunkTotal)
+                .description("confirmed orphan deletes deferred by orphan-GC budgets").register(reg);
 
         // Per-namespace data throughput: register a function-counter per namespace as it first appears
         // (via ioNamespaces()). Refreshed off a daemon timer because the namespace set changes at runtime.

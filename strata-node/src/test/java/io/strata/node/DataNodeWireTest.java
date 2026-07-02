@@ -9,6 +9,7 @@ import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
 import io.strata.format.ChunkStore;
+import io.strata.format.ChunkStoreConfig;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -155,6 +156,28 @@ class DataNodeWireTest {
             assertEquals(1, ledger.entries().size());
             assertEquals(Crc.of(ByteBuffer.wrap(payload)),
                     ledger.entries().get(0).payloadCrc());
+        }
+    }
+
+    @Test
+    void recoveryAppendCanBypassOpenChunkLedgerEntryCap() throws Exception {
+        DataNodeConfig config = DataNodeConfig.standalone(dir)
+                .withChunkStoreConfig(ChunkStoreConfig.DEFAULT.withMaxOpenChunkLedgerEntries(1));
+        try (DataNode node = new DataNode(config);
+             ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
+                    1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
+
+            client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
+                    ByteBuffer.wrap("seed".getBytes()), 5000);
+            ScpException sealed = assertThrows(ScpException.class,
+                    () -> client.call(Opcode.APPEND, new Messages.Append(id, 1, 4, 4, TEST_NS).encode(),
+                            ByteBuffer.wrap("tail".getBytes()), 5000));
+            assertEquals(ErrorCode.CHUNK_SEALED, sealed.code());
+
+            ByteBuffer h = client.call(Opcode.APPEND, Messages.Append.recovery(id, 1, 4, 4, TEST_NS).encode(),
+                    ByteBuffer.wrap("tail".getBytes()), 5000);
+            assertEquals(8, Messages.AppendResp.decode(h).endOffset());
         }
     }
 
@@ -391,6 +414,57 @@ class DataNodeWireTest {
             ScpException malformedFooter = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK,
                     new Messages.SealChunk(chunk, 1, 0, TEST_NS).encode(), ByteBuffer.wrap(new byte[] {1}), 5000));
             assertEquals(ErrorCode.PRECONDITION_FAILED, malformedFooter.code());
+        }
+    }
+
+    @Test
+    void recoveredOpenReplicaCanBeResealedOverWireAfterTrailerLoss() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(8), 0);
+        byte[] payload = "crash-recovered-prefix".getBytes();
+        int payloadCrc = Crc.of(ByteBuffer.wrap(payload));
+        Path chunksDir = dir.resolve("chunks");
+        Path dataPath = chunksDir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, chunk) + ".chunk");
+        Path metaPath = chunksDir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, chunk) + ".meta");
+        Path ledgerPath = chunksDir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, chunk) + ".j");
+
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
+             ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk, 1, false,
+                    1 << 20, 1L, TEST_NS).encode(), null, 5000);
+            client.call(Opcode.APPEND, new Messages.Append(chunk, 1, 0, 0, TEST_NS).encode(),
+                    ByteBuffer.wrap(payload), 5000);
+            ByteBuffer seal = client.call(Opcode.SEAL_CHUNK,
+                    new Messages.SealChunk(chunk, 1, payload.length, TEST_NS).encode(), null, 5000);
+            assertEquals(payload.length, Messages.SealResp.decode(seal).finalLength());
+        }
+
+        assertTrue(Files.exists(ledgerPath), "non-fsync seal must retain the ledger until reclaim");
+        try (FileChannel channel = FileChannel.open(dataPath, StandardOpenOption.WRITE)) {
+            channel.truncate(ChunkFormats.DATA_START + payload.length);
+        }
+        Files.write(metaPath, new ChunkFormats.Sidecar(1, -1, payload.length, ChunkState.OPEN).encode());
+
+        try (DataNode recovered = new DataNode(DataNodeConfig.standalone(dir));
+             ScpClient client = new ScpClient("127.0.0.1", recovered.port(), ScpClient.KIND_BROKER, "test")) {
+            ByteBuffer statOpen = client.call(Opcode.STAT_CHUNK,
+                    new Messages.StatChunk(chunk, TEST_NS).encode(), null, 5000);
+            var open = Messages.StatResp.decode(statOpen);
+            assertEquals(ChunkState.OPEN, open.state());
+            assertEquals(payload.length, open.localEndOffset());
+            assertEquals(payload.length, open.lastKnownDO());
+
+            ByteBuffer reseal = client.call(Opcode.SEAL_CHUNK,
+                    new Messages.SealChunk(chunk, 1, payload.length, TEST_NS).encode(), null, 5000);
+            var resealed = Messages.SealResp.decode(reseal);
+            assertEquals(payload.length, resealed.finalLength());
+            assertEquals(payloadCrc, resealed.chunkCrc());
+
+            ByteBuffer statSealed = client.call(Opcode.STAT_CHUNK,
+                    new Messages.StatChunk(chunk, TEST_NS).encode(), null, 5000);
+            var sealed = Messages.StatResp.decode(statSealed);
+            assertEquals(ChunkState.SEALED, sealed.state());
+            assertEquals(payload.length, sealed.sealedLength());
+            assertEquals(payloadCrc, sealed.sealedCrc());
         }
     }
 

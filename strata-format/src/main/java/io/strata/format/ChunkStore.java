@@ -66,6 +66,7 @@ import static io.strata.format.ChunkFormats.writeFully;
  */
 public final class ChunkStore implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ChunkStore.class);
+    static final long REPAIR_IMPORT_ORPHAN_PROTECTION_MS = 90_000;
 
     @FunctionalInterface
     interface DirectorySyncer {
@@ -310,6 +311,22 @@ public final class ChunkStore implements AutoCloseable {
         return countByState(ChunkState.SEALED);
     }
 
+    /** Sealed chunks by namespace — best-effort snapshot for orphan-GC delete budgets. */
+    public Map<StrataNamespace, Integer> sealedChunksByNamespace() {
+        Map<StrataNamespace, Integer> out = new HashMap<>();
+        for (Handle h : chunks.values()) {
+            h.lock.lock();
+            try {
+                if (h.state == ChunkState.SEALED) {
+                    out.merge(h.ns, 1, Integer::sum);
+                }
+            } finally {
+                h.lock.unlock();
+            }
+        }
+        return out;
+    }
+
     /** Sealed-chunk channel-cache hits (served an already-open FD) — observability. */
     public long channelCacheHits() { return channelCache.hits(); }
 
@@ -525,6 +542,10 @@ public final class ChunkStore implements AutoCloseable {
         // node first learned of the chunk so a freshly-created/recovered chunk gets the full orphan grace
         // (§20.4) before it can be considered a suspect. In-memory only: a restart re-earns verification.
         volatile long lastVerifiedAtMs = System.currentTimeMillis();
+        // Repair imports are locally durable before the controller commits the descriptor swap. During that
+        // window LOOKUP_FILE truthfully does not list this node yet, so node-local orphan GC must not confirm
+        // and delete the just-copied replica before the completion heartbeat and swap/retry path can land.
+        volatile long orphanProtectedUntilMs;
 
         // Running CRC state for an OPEN chunk: the whole-chunk CRC and the per-CRC_RANGE_SIZE range
         // CRCs are folded as bytes are appended (and rebuilt from the verified prefix on recovery),
@@ -853,6 +874,12 @@ public final class ChunkStore implements AutoCloseable {
     public CompletableFuture<AppendResult> appendAsync(
             StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset,
             ByteBuffer payload, int payloadCrc) throws IOException {
+        return appendAsync(ns, id, epoch, baseOffset, durableOffset, payload, payloadCrc, false);
+    }
+
+    public CompletableFuture<AppendResult> appendAsync(
+            StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset,
+            ByteBuffer payload, int payloadCrc, boolean recoveryAppend) throws IOException {
         Handle h = lookup(ns, id);
         // payloadCrc is the writer's CRC32C over this payload, already verified by the frame decoder;
         // the node stores it as the per-record digest and never originates its own (no node-side CRC
@@ -884,6 +911,12 @@ public final class ChunkStore implements AutoCloseable {
             len = payload.remaining();
             if (len == 0) {
                 return CompletableFuture.completedFuture(new AppendResult(h.end)); // DO beacon
+            }
+            if (!recoveryAppend && h.ledger.size() >= csConfig.maxOpenChunkLedgerEntries()) {
+                throw new ScpException(ErrorCode.CHUNK_SEALED,
+                        "open chunk ledger entry cap reached for " + id + ": "
+                                + h.ledger.size() + " >= " + csConfig.maxOpenChunkLedgerEntries(),
+                        h.end);
             }
             newEnd = checkedAdd(baseOffset, len, "chunk offset");
             long writePos = checkedAdd(DATA_START, baseOffset, "chunk file offset");
@@ -1521,6 +1554,9 @@ public final class ChunkStore implements AutoCloseable {
                 h.writeEpoch = header.createWriteEpoch();
                 h.fenceEpoch = -1;
                 h.lastKnownDO = trailer.dataLength();
+                long now = System.currentTimeMillis();
+                h.lastVerifiedAtMs = now;
+                h.orphanProtectedUntilMs = now + REPAIR_IMPORT_ORPHAN_PROTECTION_MS;
                 // Durability-v2 (Lever 1): an imported sealed chunk carries a verified trailer and no
                 // ledger, which recovery classifies as SEALED — no sidecar written.
                 Files.deleteIfExists(h.ledgerPath);
@@ -1711,7 +1747,9 @@ public final class ChunkStore implements AutoCloseable {
         for (Handle h : chunks.values()) {
             h.lock.lock();
             try {
-                if (h.state == ChunkState.SEALED && now - h.lastVerifiedAtMs >= olderThanMs) {
+                if (h.state == ChunkState.SEALED
+                        && now >= h.orphanProtectedUntilMs
+                        && now - h.lastVerifiedAtMs >= olderThanMs) {
                     out.add(new SuspectChunk(h.ns, h.id));
                 }
             } finally {

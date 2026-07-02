@@ -41,6 +41,10 @@ class ServerMetricsTest {
             assertNotNull(registry.find("strata_data_node_filechannel_cache_size").gauge());
             assertNotNull(registry.find("strata_data_node_filechannel_cache_capacity").gauge());
             assertNotNull(registry.find("strata_data_node_open_fds").gauge());
+            assertNotNull(registry.find("strata_data_node_orphan_gc_budget_limited_namespaces").gauge());
+            assertNotNull(registry.find("strata_data_node_orphan_gc_budget_limited_chunks").gauge());
+            assertNotNull(registry.find("strata_data_node_orphan_gc_budget_limited_passes").functionCounter());
+            assertNotNull(registry.find("strata_data_node_orphan_gc_budget_limited_chunk_total").functionCounter());
         }
     }
 

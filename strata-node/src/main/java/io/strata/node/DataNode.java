@@ -42,10 +42,9 @@ public final class DataNode implements AutoCloseable {
 
     private final int nodeId;
     private final UUID incarnation;
-    // Owners (by advertised endpoint) this node has heard a VERIFY_CHUNKS from. Node-local orphan GC
-    // (design §20.4) only trusts "no owner verified" once it has heard from every current owner, so it
-    // never deletes a chunk whose owner simply has not gotten around to verifying it yet. Populated here
-    // by the VERIFY_CHUNKS handler; consumed by the orphan-GC loop.
+    // Owners (by advertised endpoint) this node has heard a VERIFY_CHUNKS from. Retained as a
+    // diagnostic trace of owner-pull verification activity; orphan GC now relies on per-chunk
+    // owner-confirm plus bounded per-pass deletes instead of a global "heard from every owner" gate.
     private final Set<String> verifiersHeardFrom = ConcurrentHashMap.newKeySet();
 
     public DataNode(DataNodeConfig config) throws IOException {
@@ -90,7 +89,9 @@ public final class DataNode implements AutoCloseable {
                 // to recognise itself in a descriptor and controller endpoints to ask).
                 startedGc = new OrphanGc(openedStore, deletes, nodeId, config.controllerEndpoints(),
                         config.orphanGraceMs(), config.orphanScanIntervalMs(), config.orphanStartupGraceMs(),
-                        config.orphanConfirmTimeoutMs());
+                        config.orphanConfirmTimeoutMs(), config.orphanDeleteMaxConfirmedPerNamespacePerPass(),
+                        config.orphanDeleteMaxNamespacePercentPerPass(),
+                        config.orphanDeleteMaxConfirmedPerNodePass());
                 this.orphanGc = startedGc;
                 startedGc.start();
             } else {
@@ -209,6 +210,18 @@ public final class DataNode implements AutoCloseable {
     public long deleteOkCount() { return deleteService.okDeletes(); }
     public long deleteNotFoundCount() { return deleteService.notFoundDeletes(); }
     public long deleteFailedCount() { return deleteService.failedDeletes(); }
+    public int orphanGcBudgetLimitedNamespaces() {
+        return orphanGc == null ? 0 : orphanGc.budgetLimitedNamespaces();
+    }
+    public int orphanGcBudgetLimitedChunks() {
+        return orphanGc == null ? 0 : orphanGc.budgetLimitedChunks();
+    }
+    public long orphanGcBudgetLimitedPasses() {
+        return orphanGc == null ? 0 : orphanGc.budgetLimitedPasses();
+    }
+    public long orphanGcBudgetLimitedChunkTotal() {
+        return orphanGc == null ? 0 : orphanGc.budgetLimitedChunkTotal();
+    }
 
     /** Installs a per-request latency observer on the data-plane server (used by the metrics layer). */
     public void setRequestObserver(RequestObserver observer) {

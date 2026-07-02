@@ -122,24 +122,22 @@ public final class StrataServer {
                 .withOrphanScanIntervalMs(longEnv("STRATA_ORPHAN_SCAN_INTERVAL_MS", 3_000))
                 .withOrphanStartupGraceMs(longEnv("STRATA_ORPHAN_STARTUP_GRACE_MS", 6_000))
                 .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
+                .withOrphanDeleteMaxConfirmedPerNamespacePerPass(
+                        intEnv("STRATA_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS",
+                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS))
+                .withOrphanDeleteMaxNamespacePercentPerPass(
+                        intEnv("STRATA_ORPHAN_DELETE_MAX_NAMESPACE_PERCENT_PER_PASS",
+                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_NAMESPACE_PERCENT_PER_PASS))
+                .withOrphanDeleteMaxConfirmedPerNodePass(
+                        intEnv("STRATA_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS",
+                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS))
                 .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
                 .withControlCommandLimits(intEnv("STRATA_NODE_COMMAND_PARALLELISM", 8),
                         intEnv("STRATA_NODE_MAX_QUEUED_COMMANDS", 1024))
                 .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
                 .withDeleteMaxConcurrent(intEnv("STRATA_DELETE_MAX_CONCURRENT", 1))
                 .withDeleteMinIntervalMs(longEnv("STRATA_DELETE_MIN_INTERVAL_MS", 50))
-                .withChunkStoreConfig(new ChunkStoreConfig(
-                        intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
-                        longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
-                        longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
-                        longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000),
-                        boolEnv("STRATA_SEAL_FSYNC", false),
-                        longEnv("STRATA_BG_FLUSH_INTERVAL_MS", 500),
-                        longEnv("STRATA_BG_FLUSH_THRESHOLD_BYTES", 4L << 20),
-                        longEnv("STRATA_SLOW_APPEND_LOG_MS", 1_000),
-                        longEnv("STRATA_SLOW_MUTATION_LOG_MS", 500),
-                        intEnv("STRATA_FILE_CHANNEL_CACHE_MAX_SIZE",
-                                ChunkStoreConfig.DEFAULT.channelCacheMaxSize())));
+                .withChunkStoreConfig(chunkStoreConfigFromEnv());
         DataNode node = new DataNode(config);
         log.info("data node started: endpoint={} dataDir={} controller={}",
                 node.endpoint(), config.dataDir(), config.controllerEndpoints());
@@ -214,24 +212,22 @@ public final class StrataServer {
                 .withOrphanScanIntervalMs(longEnv("STRATA_ORPHAN_SCAN_INTERVAL_MS", 3_000))
                 .withOrphanStartupGraceMs(longEnv("STRATA_ORPHAN_STARTUP_GRACE_MS", 6_000))
                 .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
+                .withOrphanDeleteMaxConfirmedPerNamespacePerPass(
+                        intEnv("STRATA_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS",
+                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS))
+                .withOrphanDeleteMaxNamespacePercentPerPass(
+                        intEnv("STRATA_ORPHAN_DELETE_MAX_NAMESPACE_PERCENT_PER_PASS",
+                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_NAMESPACE_PERCENT_PER_PASS))
+                .withOrphanDeleteMaxConfirmedPerNodePass(
+                        intEnv("STRATA_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS",
+                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS))
                 .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
                 .withControlCommandLimits(intEnv("STRATA_NODE_COMMAND_PARALLELISM", 8),
                         intEnv("STRATA_NODE_MAX_QUEUED_COMMANDS", 1024))
                 .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
                 .withDeleteMaxConcurrent(intEnv("STRATA_DELETE_MAX_CONCURRENT", 1))
                 .withDeleteMinIntervalMs(longEnv("STRATA_DELETE_MIN_INTERVAL_MS", 50))
-                .withChunkStoreConfig(new ChunkStoreConfig(
-                        intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
-                        longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
-                        longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
-                        longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000),
-                        boolEnv("STRATA_SEAL_FSYNC", false),
-                        longEnv("STRATA_BG_FLUSH_INTERVAL_MS", 500),
-                        longEnv("STRATA_BG_FLUSH_THRESHOLD_BYTES", 4L << 20),
-                        longEnv("STRATA_SLOW_APPEND_LOG_MS", 1_000),
-                        longEnv("STRATA_SLOW_MUTATION_LOG_MS", 500),
-                        intEnv("STRATA_FILE_CHANNEL_CACHE_MAX_SIZE",
-                                ChunkStoreConfig.DEFAULT.channelCacheMaxSize())));
+                .withChunkStoreConfig(chunkStoreConfigFromEnv());
         Combined combined = startCombined(controllerConfig, nodeConfig);
         log.info("combined node started: scp={} zk={}", combined.node().endpoint(), controllerConfig.zkConnect());
         awaitShutdown("combined node", combined);
@@ -278,6 +274,22 @@ public final class StrataServer {
             closeQuietly(controller);
             throw e;
         }
+    }
+
+    private static ChunkStoreConfig chunkStoreConfigFromEnv() {
+        return new ChunkStoreConfig(
+                intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
+                longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
+                longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
+                longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000),
+                boolEnv("STRATA_SEAL_FSYNC", false),
+                longEnv("STRATA_BG_FLUSH_INTERVAL_MS", 500),
+                longEnv("STRATA_BG_FLUSH_THRESHOLD_BYTES", 4L << 20),
+                longEnv("STRATA_SLOW_APPEND_LOG_MS", 1_000),
+                longEnv("STRATA_SLOW_MUTATION_LOG_MS", 500),
+                intEnv("STRATA_FILE_CHANNEL_CACHE_MAX_SIZE", ChunkStoreConfig.DEFAULT.channelCacheMaxSize()),
+                intEnv("STRATA_MAX_OPEN_CHUNK_LEDGER_ENTRIES",
+                        ChunkStoreConfig.DEFAULT.maxOpenChunkLedgerEntries()));
     }
 
     /** Co-resident controller + node + their shared metrics endpoint; closes node before controller on shutdown. */
@@ -380,7 +392,8 @@ public final class StrataServer {
         String backend = env("STRATA_CONTROLLER_BACKEND", "zk");
         if (!"namespace-log".equalsIgnoreCase(backend)) {
             return new ControllerConfig.MetadataBackendConfig(backend, 3, 2, false,
-                    4 * 1024 * 1024, 30_000, true, 0, 4 * 1024 * 1024);
+                    4 * 1024 * 1024, 30_000, true,
+                    ControllerConfig.DEFAULT_NAMESPACE_LOG_RETENTION_MS, 4 * 1024 * 1024);
         }
         return new ControllerConfig.MetadataBackendConfig("namespace-log",
                 intEnv("STRATA_CONTROLLER_LOG_RF", 3),
@@ -389,7 +402,8 @@ public final class StrataServer {
                 intEnv("STRATA_CONTROLLER_LOG_COMPACT_BYTES", 4 * 1024 * 1024),
                 intEnv("STRATA_CONTROLLER_LOG_COMPACT_INTERVAL_MS", 30_000),
                 boolEnv("STRATA_CONTROLLER_LOG_ORPHAN_GC", true),
-                intEnv("STRATA_CONTROLLER_LOG_RETENTION_MS", 0),
+                intEnv("STRATA_CONTROLLER_LOG_RETENTION_MS",
+                        ControllerConfig.DEFAULT_NAMESPACE_LOG_RETENTION_MS),
                 intEnv("STRATA_CONTROLLER_LOG_READ_CHUNK_BYTES", 4 * 1024 * 1024));
     }
 

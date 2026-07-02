@@ -12,7 +12,9 @@ import java.util.Map;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class MessageRoundtripTest {
 
@@ -31,6 +33,11 @@ class MessageRoundtripTest {
 
         var append = new Messages.Append(c, 5, 1024, 512, ns);
         assertEquals(append, Messages.Append.decode(buf(append.encode())));
+        assertFalse(append.recovery());
+
+        var recoveryAppend = Messages.Append.recovery(c, 5, 1024, 512, ns);
+        assertEquals(recoveryAppend, Messages.Append.decode(buf(recoveryAppend.encode())));
+        assertTrue(recoveryAppend.recovery());
 
         var read = new Messages.Read(c, 99, 65536, ns);
         assertEquals(read, Messages.Read.decode(buf(read.encode())));
