@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
 
 import static io.strata.common.Checks.addChunkLength;
 
@@ -44,6 +45,8 @@ import static io.strata.common.Checks.addChunkLength;
  */
 final class Recovery {
     private static final Logger log = LoggerFactory.getLogger(Recovery.class);
+    private static final int RECOVERY_READ_MIN_ATTEMPTS = 2;
+    private static final int RECOVERY_READ_MIN_PROGRESS_BYTES = 4 * 1024;
     private final ControllerClient controller;
     private final NodePool appendPool;
     private final NodePool readPool;
@@ -435,7 +438,7 @@ final class Recovery {
         return counts.isEmpty() ? null : counts.get(0).bytes;
     }
 
-    /** Reads [from, to) from one replica; null on failure or short read. */
+    /** Reads [from, to) from one replica; null on failure or malformed/zero-progress reads. */
     private byte[] readRange(ChunkId chunkId, ReplicaState source, long from, long to) {
         long len = to - from;
         if (from < 0 || to < 0 || len <= 0 || len > Integer.MAX_VALUE) {
@@ -443,31 +446,62 @@ final class Recovery {
                     source.replica.endpoint());
             return null;
         }
+        byte[] data = new byte[(int) len];
+        int filled = 0;
+        int attempts = 0;
+        int maxAttempts = maxRecoveryReadAttempts(len);
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.callTimeoutMs());
         try {
-            // READ_RECOVERY (not client READ): recovery must see the never-acked tail above the
-            // donor's durable high watermark — that is exactly the range it is re-proving for seal.
-            Frame frame = readPool.get(source.replica.endpoint()).callFrame(Opcode.READ_RECOVERY,
-                    new Messages.Read(chunkId, from, (int) len, namespace).encode(), null,
-                    config.callTimeoutMs());
-            ByteBuffer h = frame.headerSlice();
-            Resp.check(h);
-            Messages.ReadResp resp = Messages.ReadResp.decode(h);
-            if (resp.localEndOffset() < to || resp.durableOffset() < 0
-                    || resp.durableOffset() > resp.localEndOffset() || frame.payloadLength() != (int) len) {
-                return null;
+            while (filled < data.length) {
+                if (attempts++ >= maxAttempts) {
+                    return null;
+                }
+                long timeoutMs = remainingTimeoutMs(deadlineNanos);
+                if (timeoutMs <= 0) {
+                    return null;
+                }
+                int want = data.length - filled;
+                // READ_RECOVERY (not client READ): recovery must see the never-acked tail above the
+                // donor's durable high watermark — that is exactly the range it is re-proving for seal.
+                try (Frame frame = readPool.get(source.replica.endpoint()).callFrame(Opcode.READ_RECOVERY,
+                        new Messages.Read(chunkId, from + filled, want, namespace).encode(), null,
+                        timeoutMs)) {
+                    ByteBuffer h = frame.headerSlice();
+                    Resp.check(h);
+                    Messages.ReadResp resp = Messages.ReadResp.decode(h);
+                    int payloadLength = frame.payloadLength();
+                    if (resp.localEndOffset() < to || resp.durableOffset() < 0
+                            || resp.durableOffset() > resp.localEndOffset()
+                            || payloadLength <= 0 || payloadLength > want) {
+                        return null;
+                    }
+                    frame.payloadSlice().get(data, filled, payloadLength);
+                    filled += payloadLength;
+                }
             }
-            byte[] data = new byte[frame.payloadLength()];
-            frame.payloadSlice().get(data);
             return data;
         } catch (ScpException e) {
-            log.warn("recovery read {}@{} from {} failed: {}", chunkId, from,
+            log.warn("recovery read {}@{} from {} failed: {}", chunkId, from + filled,
                     source.replica.endpoint(), e.getMessage());
             return null;
         } catch (RuntimeException e) {
-            log.warn("recovery read {}@{} from {} returned malformed response: {}", chunkId, from,
+            log.warn("recovery read {}@{} from {} returned malformed response: {}", chunkId, from + filled,
                     source.replica.endpoint(), e.toString());
             return null;
         }
+    }
+
+    private static int maxRecoveryReadAttempts(long len) {
+        return Math.max(RECOVERY_READ_MIN_ATTEMPTS,
+                (int) ((len + RECOVERY_READ_MIN_PROGRESS_BYTES - 1L) / RECOVERY_READ_MIN_PROGRESS_BYTES));
+    }
+
+    private static long remainingTimeoutMs(long deadlineNanos) {
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        if (remainingNanos <= 0) {
+            return 0;
+        }
+        return Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos));
     }
 
     private static void validateFenceResp(ChunkId chunkId, Messages.Replica replica, Messages.FenceResp fence) {

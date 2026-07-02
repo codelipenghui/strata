@@ -113,7 +113,8 @@ public interface StrataFile {
     interface Reader extends AutoCloseable {
         /**
          * Reads up to maxBytes from fileOffset (may return fewer — at most to a chunk boundary,
-         * and never beyond the durable offset of an open chunk).
+         * never beyond the durable offset of an open chunk, and at most to the server's per-request
+         * byte limit).
          *
          * <p>The returned result is {@link AutoCloseable}; the caller owns it and MUST close it
          * (try-with-resources). The buffer it exposes is valid only until close.

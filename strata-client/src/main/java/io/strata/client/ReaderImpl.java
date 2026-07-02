@@ -67,6 +67,9 @@ final class ReaderImpl implements StrataFile.Reader {
                 if (fileOffset < chunkEnd) {
                     long chunkOffset = fileOffset - base;
                     int want = (int) Math.min(maxBytes, chunk.length() - chunkOffset);
+                    if (want == 0) {
+                        return StrataFile.ReadResult.empty(false);
+                    }
                     Borrowed b = readFromReplicas(chunk, chunkOffset, want, false);
                     // Ownership of b.owner() has transferred to us here; everything between this
                     // point and wrapping it in the (AutoCloseable) ReadResult must stay
@@ -78,6 +81,9 @@ final class ReaderImpl implements StrataFile.Reader {
                 }
                 base = chunkEnd;
             } else {
+                if (maxBytes == 0) {
+                    return StrataFile.ReadResult.empty(false);
+                }
                 long chunkOffset = fileOffset - base;
                 Borrowed b = readFromReplicas(chunk, chunkOffset, maxBytes, true);
                 return new StrataFile.ReadResult(b.view(), false, b.owner());
@@ -124,16 +130,23 @@ final class ReaderImpl implements StrataFile.Reader {
                                     + ": " + resp.localEndOffset() + " < " + chunk.length());
                     continue;
                 }
-                if (frame.payloadLength() > maxBytes) {
+                if (!open && resp.durableOffset() < chunk.length()) {
                     last = new ScpException(ErrorCode.CORRUPT_CHUNK,
-                            "replica " + r.nodeId() + " returned " + frame.payloadLength()
+                            "replica " + r.nodeId() + " not fully durable for sealed chunk "
+                                    + chunk.chunkId());
+                    continue;
+                }
+                int payloadLength = frame.payloadLength();
+                if (payloadLength > maxBytes) {
+                    last = new ScpException(ErrorCode.CORRUPT_CHUNK,
+                            "replica " + r.nodeId() + " returned " + payloadLength
                                     + " bytes for max " + maxBytes);
                     continue;
                 }
-                if (!open && frame.payloadLength() != maxBytes) {
+                if (!open && payloadLength == 0) {
                     last = new ScpException(ErrorCode.CORRUPT_CHUNK,
-                            "replica " + r.nodeId() + " returned short sealed read "
-                                    + frame.payloadLength() + " != " + maxBytes);
+                            "replica " + r.nodeId() + " returned empty sealed read for "
+                                    + chunk.chunkId() + " at offset " + offset);
                     continue;
                 }
                 ByteBuffer view = frame.payloadSlice();
