@@ -7,6 +7,7 @@ import io.strata.common.Closeables;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FailureInjector;
+import io.strata.common.Fsync;
 import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
@@ -19,6 +20,7 @@ import java.lang.management.ManagementFactory;
 import java.lang.management.OperatingSystemMXBean;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -28,6 +30,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -45,7 +48,6 @@ import java.util.stream.Stream;
 import java.util.zip.CRC32C;
 
 import static io.strata.common.Checks.checkedAdd;
-import static io.strata.common.Fsync.forceDirectory;
 import static io.strata.format.ChunkFormats.DATA_START;
 import static io.strata.format.ChunkFormats.HEADER_SIZE;
 import static io.strata.format.ChunkFormats.TRAILER_SIZE;
@@ -65,6 +67,11 @@ import static io.strata.format.ChunkFormats.writeFully;
 public final class ChunkStore implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ChunkStore.class);
 
+    @FunctionalInterface
+    interface DirectorySyncer {
+        void force(Path dir) throws IOException;
+    }
+
     private static final long MAX_IMPORT_FOOTER_BYTES = 64L * 1024 * 1024;
 
     private static final int RECOVERY_FENCE_REQUIRED = Integer.MAX_VALUE;
@@ -73,6 +80,8 @@ public final class ChunkStore implements AutoCloseable {
     private final Map<NsChunkId, Handle> chunks = new ConcurrentHashMap<>();
     private final ChannelCache channelCache;
     private final Set<NsChunkId> creating = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<Path, Object> directoryDurabilityLocks = new ConcurrentHashMap<>();
+    private final Set<Path> durableDirectories = ConcurrentHashMap.newKeySet();
     private final AtomicLong forceCount =
             new AtomicLong();
     private final AtomicLong appendOps =
@@ -105,10 +114,11 @@ public final class ChunkStore implements AutoCloseable {
     // data per open chunk, so a synchronized roll does not stampede the disk's fsync queue with many
     // large concurrent forces. Background writeback keeps the original 500ms / 4 MiB default.
     // STRATA_SEAL_FSYNC (default false) gates the best-effort, off-the-ack-path fsyncs at open, seal,
-    // and delete (header/sidecar/dir plus the seal-time data force) — NOT just seal. It does not affect
-    // ack durability (the group committer always forces data+ledger before acking on fsyncOnAck files),
-    // and even with it off a sealed chunk's ledger is retained until reclaimSealedLedgersOnce() forces
-    // the SEALED state durable, so recovery never discards acknowledged data.
+    // and delete (header/sidecar/dir plus the seal-time data force) — NOT just seal. fsyncOnAck chunks
+    // force their create-time header/sidecar/dirents regardless of this flag, then the group committer
+    // forces data+ledger before acking appends. With seal fsync off, a sealed chunk's ledger is retained
+    // until reclaimSealedLedgersOnce() forces the SEALED state durable, so recovery never discards
+    // acknowledged data.
     private static final boolean SEAL_FSYNC_DEFAULT =
             booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false);
     private static final long BG_FLUSH_INTERVAL_MS =
@@ -125,6 +135,7 @@ public final class ChunkStore implements AutoCloseable {
     /** Whether seal/open/delete force their metadata + data to disk synchronously. Defaults from
      *  STRATA_SEAL_FSYNC; overridable per instance so tests can exercise both durability paths. */
     private final boolean sealFsync;
+    private final DirectorySyncer directorySyncer;
     private final ChunkStoreConfig csConfig;
     private final ScheduledExecutorService flusher;
 
@@ -207,8 +218,14 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     ChunkStore(Path dir, boolean sealFsync, int channelCacheCapacity, ChunkStoreConfig csConfig) throws IOException {
+        this(dir, sealFsync, channelCacheCapacity, csConfig, Fsync::forceDirectory);
+    }
+
+    ChunkStore(Path dir, boolean sealFsync, int channelCacheCapacity, ChunkStoreConfig csConfig,
+               DirectorySyncer directorySyncer) throws IOException {
         this.dir = dir;
         this.sealFsync = sealFsync;
+        this.directorySyncer = Objects.requireNonNull(directorySyncer, "directorySyncer");
         this.csConfig = csConfig;
         this.channelCache = new ChannelCache(channelCacheCapacity);
         Files.createDirectories(dir);
@@ -222,6 +239,56 @@ public final class ChunkStore implements AutoCloseable {
                 BG_FLUSH_INTERVAL_MS, BG_FLUSH_THRESHOLD_BYTES, sealFsync);
         flusher.scheduleWithFixedDelay(this::backgroundFlushSafely,
                 BG_FLUSH_INTERVAL_MS, BG_FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private void forceDirectory(Path directory) throws IOException {
+        directorySyncer.force(directory);
+    }
+
+    private void createDirectories(Path targetDir, boolean syncCreatedDirents) throws IOException {
+        if (!syncCreatedDirents) {
+            Files.createDirectories(targetDir);
+            return;
+        }
+        Path root = dir.toAbsolutePath().normalize();
+        Path normalized = targetDir.toAbsolutePath().normalize();
+        if (normalized.equals(root)) {
+            return;
+        }
+        if (!normalized.startsWith(root)) {
+            ensureDirectoryDurable(normalized);
+            return;
+        }
+        Path current = root;
+        for (Path segment : root.relativize(normalized)) {
+            current = current.resolve(segment);
+            ensureDirectoryDurable(current);
+        }
+    }
+
+    private void ensureDirectoryDurable(Path directory) throws IOException {
+        Path normalized = directory.toAbsolutePath().normalize();
+        if (durableDirectories.contains(normalized)) {
+            return;
+        }
+        Object lock = directoryDurabilityLocks.computeIfAbsent(normalized, ignored -> new Object());
+        synchronized (lock) {
+            if (durableDirectories.contains(normalized)) {
+                return;
+            }
+            try {
+                Files.createDirectory(normalized);
+            } catch (FileAlreadyExistsException e) {
+                if (!Files.isDirectory(normalized)) {
+                    throw e;
+                }
+            }
+            Path parent = normalized.getParent();
+            if (parent != null) {
+                forceDirectory(parent);
+            }
+            durableDirectories.add(normalized);
+        }
     }
 
     /** Number of group-commit force() calls — observability + coalescing tests. */
@@ -696,8 +763,9 @@ public final class ChunkStore implements AutoCloseable {
         boolean installed = false;
         try {
             ChunkFormats.Header header = new ChunkFormats.Header(id, fsyncOnAck, writeEpoch, createdAtMs, 0, 0, 0);
+            boolean syncCreate = sealFsync || fsyncOnAck;
             h = new Handle(id, header, ns);
-            Files.createDirectories(h.shardDir);
+            createDirectories(h.shardDir, syncCreate);
             if (sealFsync) {
                 forceDirectory(h.shardDir);
             }
@@ -710,18 +778,18 @@ public final class ChunkStore implements AutoCloseable {
             dataCreated = true;
             writeFully(h.data, ByteBuffer.wrap(header.encode()), 0);
             tHeaderWrite = System.nanoTime();
-            if (sealFsync) {
+            if (syncCreate) {
                 h.data.force(true);
             }
             tDataForce = System.nanoTime();
-            if (sealFsync) {
+            if (syncCreate) {
                 forceDirectory(h.shardDir);
             }
             tDataDirForce = System.nanoTime();
             ledgerOwned = !ledgerPreexisted;
             h.ledger = IntegrityLedger.create(h.ledgerPath);
             tLedgerCreate = System.nanoTime();
-            if (sealFsync) {
+            if (syncCreate) {
                 forceDirectory(h.shardDir);
             }
             tLedgerDirForce = System.nanoTime();
@@ -731,7 +799,7 @@ public final class ChunkStore implements AutoCloseable {
             h.fenceEpoch = -1;
             h.lastKnownDO = 0;
             metaOwned = !metaPreexisted;
-            h.persistSidecar(sealFsync);
+            h.persistSidecar(syncCreate);
             tSidecar = System.nanoTime();
             h.startCommitterIfFsync(forceCount);
             chunks.put(new NsChunkId(ns, id), h);
@@ -740,10 +808,10 @@ public final class ChunkStore implements AutoCloseable {
                 log.info("slow open {} ns={} fsyncOnAck={} phases(ms): dataOpen={} headerWrite={} dataFsync={} "
                                 + "dataDirFsync={} ledgerCreate={} ledgerDirFsync={} sidecarPersist={} total={}",
                         id, ns, fsyncOnAck, msBetween(t0, tChannelOpen), msBetween(tChannelOpen, tHeaderWrite),
-                        sealFsync ? msBetween(tHeaderWrite, tDataForce) : "-1.0",
-                        sealFsync ? msBetween(tDataForce, tDataDirForce) : "-1.0",
+                        syncCreate ? msBetween(tHeaderWrite, tDataForce) : "-1.0",
+                        syncCreate ? msBetween(tDataForce, tDataDirForce) : "-1.0",
                         msBetween(tDataDirForce, tLedgerCreate),
-                        sealFsync ? msBetween(tLedgerCreate, tLedgerDirForce) : "-1.0",
+                        syncCreate ? msBetween(tLedgerCreate, tLedgerDirForce) : "-1.0",
                         msBetween(tLedgerDirForce, tSidecar), msBetween(t0, tInstall));
             }
             installed = true;
@@ -773,16 +841,17 @@ public final class ChunkStore implements AutoCloseable {
                 log.warn("failed to close incomplete chunk {}", h.dataPath, e);
             }
         }
-        deleteOwnedPath(dataCreated, h.dataPath, h.shardDir, "incomplete chunk data");
-        deleteOwnedPath(ledgerOwned, h.ledgerPath, h.shardDir, "incomplete chunk ledger");
-        deleteOwnedPath(metaOwned, h.metaPath, h.shardDir, "incomplete chunk sidecar");
+        boolean syncDelete = sealFsync || h.header.fsyncOnAck();
+        deleteOwnedPath(dataCreated, h.dataPath, h.shardDir, "incomplete chunk data", syncDelete);
+        deleteOwnedPath(ledgerOwned, h.ledgerPath, h.shardDir, "incomplete chunk ledger", syncDelete);
+        deleteOwnedPath(metaOwned, h.metaPath, h.shardDir, "incomplete chunk sidecar", syncDelete);
     }
 
-    private void deleteOwnedPath(boolean owned, Path path, Path containingDir, String description) {
+    private void deleteOwnedPath(boolean owned, Path path, Path containingDir, String description, boolean syncDelete) {
         if (!owned) return;
         try {
             Files.deleteIfExists(path);
-            if (sealFsync) {
+            if (syncDelete) {
                 forceDirectory(containingDir);
             }
         } catch (IOException e) {
@@ -1537,7 +1606,7 @@ public final class ChunkStore implements AutoCloseable {
             }
 
             Handle h = new Handle(id, header, ns);
-            Files.createDirectories(h.shardDir);
+            createDirectories(h.shardDir, true);
             if (Files.exists(h.dataPath)) throw chunkAlreadyExists(id);
             boolean movedData = false;
             boolean sidecarStarted = false;
@@ -1983,7 +2052,15 @@ public final class ChunkStore implements AutoCloseable {
                 && mayHaveSealedTrailer(probe.dataPath)) {
             throw new CorruptChunkException("corrupt sealed footer/trailer for " + id);
         } else if (hasSidecar) {
-            sidecar = ChunkFormats.Sidecar.decode(Files.readAllBytes(probe.metaPath));
+            try {
+                sidecar = ChunkFormats.Sidecar.decode(Files.readAllBytes(probe.metaPath));
+            } catch (CorruptChunkException | IllegalArgumentException e) {
+                sidecar = recoverMalformedSidecar(id, probe, header, e);
+                if (sidecar == null) {
+                    return;
+                }
+                reconstructedSidecar = true;
+            }
         } else {
             sidecar = recoverMissingSidecar(id, probe, header);
             if (sidecar == null) {
@@ -2087,6 +2164,16 @@ public final class ChunkStore implements AutoCloseable {
                 log.warn("failed to close unrecovered chunk {}", h.dataPath, e);
             }
         }
+    }
+
+    private ChunkFormats.Sidecar recoverMalformedSidecar(ChunkId id, Handle probe, ChunkFormats.Header header,
+                                                         RuntimeException cause) {
+        if (header.fsyncOnAck() && Files.exists(probe.ledgerPath)) {
+            log.warn("chunk {} has malformed sidecar but is fsync-on-ack — reconstructing fenced OPEN state",
+                    id, cause);
+            return reconstructedOpenSidecar(header);
+        }
+        throw cause;
     }
 
     private ChunkFormats.Sidecar recoverMissingSidecar(ChunkId id, Handle probe,
