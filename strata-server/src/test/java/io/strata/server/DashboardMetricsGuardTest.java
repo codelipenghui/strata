@@ -25,6 +25,9 @@ class DashboardMetricsGuardTest {
             "strata_controller_log_recoveries",
             "strata_controller_log_reacquisitions");
 
+    private static final String LEADER_FILTER =
+            "* on(instance, job) group_left() strata_controller_is_leader";
+
     @Test
     void noDashboardReferencesRemovedMetrics() throws Exception {
         Path dir = locateDashboards();
@@ -41,6 +44,20 @@ class DashboardMetricsGuardTest {
             }
         }
         assertTrue(checked >= 4, "expected to scan the provisioned dashboards, found " + checked);
+    }
+
+    @Test
+    void clusterDataNodeLivenessUsesLeaderViewOnly() throws Exception {
+        String body = Files.readString(locateDashboards().resolve("strata-cluster.json"));
+
+        assertTrue(body.contains("strata_data_nodes{state=\\\"alive\\\"} " + LEADER_FILTER),
+                "Data nodes alive panel must use the active controller leader's liveness view");
+        assertTrue(body.contains("strata_data_nodes{state=~\\\"suspect|dead\\\"} " + LEADER_FILTER),
+                "Data nodes suspect/dead panel must use the active controller leader's liveness view");
+        assertFalse(body.contains("sum(strata_data_nodes{state=\\\"alive\\\"})"),
+                "raw cluster-wide sum double-counts follower controller liveness views");
+        assertFalse(body.contains("sum(strata_data_nodes{state=~\\\"suspect|dead\\\"})"),
+                "raw cluster-wide sum double-counts follower controller liveness views");
     }
 
     /** Walks up from the test working directory to the repo's {@code deploy/grafana/dashboards}. */
