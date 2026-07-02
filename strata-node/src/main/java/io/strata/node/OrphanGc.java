@@ -14,8 +14,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -32,9 +37,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>Two graces guard against false positives. A per-chunk grace (a freshly-known chunk is verified
  * before it can become a suspect) covers an in-flight create whose {@code FileCreated} is not yet
  * durable. A node-startup grace keeps a just-started node from GC'ing before the owner-pull verify
- * mechanism has had a cycle to attest its chunks. The confirm itself is authoritative because the
- * owner recovers its meta-log before answering {@code LOOKUP_FILE} (§14), so a {@code FILE_NOT_FOUND}
- * is never a stale empty-state false positive.
+ * mechanism has had a cycle to attest its chunks. A single owner-confirm is enough for ordinary cleanup,
+ * but a metadata-plane loss can make many old chunks look absent at once, so the mass-delete circuit below
+ * refuses a large confirmed-orphan wave without an operator override.
  *
  * <p>Design note (§20.4 deviation): the spec's strict "trust no-owner-verified only after hearing a
  * verify from <em>every</em> owner" would deadlock when an owner has no described chunks on this node
@@ -51,6 +56,7 @@ final class OrphanGc implements AutoCloseable {
     static final long DEFAULT_GRACE_MS = 6_000;
     static final long DEFAULT_SCAN_INTERVAL_MS = 3_000;
     static final long DEFAULT_STARTUP_GRACE_MS = 6_000;
+    static final int DEFAULT_MAX_CONFIRMED_DELETES_PER_NAMESPACE_PER_PASS = 64;
     private static final int DEFAULT_CONFIRM_TIMEOUT_MS = 5_000;
 
     private final ChunkStore store;
@@ -61,12 +67,19 @@ final class OrphanGc implements AutoCloseable {
     private final long scanIntervalMs;
     private final long startupGraceMs;
     private final int confirmTimeoutMs;
+    private final int maxConfirmedDeletesPerNamespacePerPass;
+    private final Set<StrataNamespace> deleteCircuitsOpen = ConcurrentHashMap.newKeySet();
     private final long startedAtMs = System.currentTimeMillis();
     private final AtomicBoolean closed = new AtomicBoolean();
     private volatile Thread thread;
 
     OrphanGc(ChunkStore store, ChunkDeleteService deletes, int nodeId, List<String> controllerEndpoints,
-             long graceMs, long scanIntervalMs, long startupGraceMs, int confirmTimeoutMs) {
+             long graceMs, long scanIntervalMs, long startupGraceMs, int confirmTimeoutMs,
+             int maxConfirmedDeletesPerNamespacePerPass) {
+        if (maxConfirmedDeletesPerNamespacePerPass < 0) {
+            throw new IllegalArgumentException("maxConfirmedDeletesPerNamespacePerPass must be non-negative: "
+                    + maxConfirmedDeletesPerNamespacePerPass);
+        }
         this.store = Objects.requireNonNull(store, "store");
         this.deletes = Objects.requireNonNull(deletes, "deletes");
         this.nodeId = nodeId;
@@ -75,6 +88,7 @@ final class OrphanGc implements AutoCloseable {
         this.scanIntervalMs = scanIntervalMs;
         this.startupGraceMs = startupGraceMs;
         this.confirmTimeoutMs = confirmTimeoutMs;
+        this.maxConfirmedDeletesPerNamespacePerPass = maxConfirmedDeletesPerNamespacePerPass;
     }
 
     void start() {
@@ -102,23 +116,52 @@ final class OrphanGc implements AutoCloseable {
     /** One GC pass: confirm each suspect with its owner and delete only confirmed orphans. */
     void gcOnce() throws InterruptedException {
         long now = System.currentTimeMillis();
+        Map<StrataNamespace, List<ChunkId>> confirmed = new LinkedHashMap<>();
         for (ChunkStore.SuspectChunk s : store.orphanSuspects(graceMs, now)) {
             if (closed.get()) {
                 return;
             }
+            if (deleteCircuitsOpen.contains(s.namespace())) {
+                continue;
+            }
             switch (confirm(s.namespace(), s.chunkId())) {
-                case ORPHAN -> {
-                    ErrorCode result = deletes.delete(s.namespace(), s.chunkId());
-                    if (result == ErrorCode.OK) {
-                        log.info("orphan GC: deleted unreferenced sealed chunk {} in ns={}",
-                                s.chunkId(), s.namespace());
-                    } else {
-                        log.warn("orphan GC: confirmed orphan {} in ns={} failed to delete: {}",
-                                s.chunkId(), s.namespace(), result);
-                    }
-                }
+                case ORPHAN -> recordConfirmedOrphan(confirmed, s.namespace(), s.chunkId());
                 case KEEP, UNREACHABLE -> { /* fail-safe: never delete a kept or unconfirmed suspect */ }
             }
+        }
+        for (Map.Entry<StrataNamespace, List<ChunkId>> e : confirmed.entrySet()) {
+            if (deleteCircuitsOpen.contains(e.getKey())) {
+                continue;
+            }
+            for (ChunkId chunkId : e.getValue()) {
+                deleteConfirmed(e.getKey(), chunkId);
+            }
+        }
+    }
+
+    private void recordConfirmedOrphan(Map<StrataNamespace, List<ChunkId>> confirmed,
+                                       StrataNamespace namespace, ChunkId chunkId) {
+        List<ChunkId> nsConfirmed = confirmed.computeIfAbsent(namespace, ignored -> new ArrayList<>());
+        nsConfirmed.add(chunkId);
+        if (maxConfirmedDeletesPerNamespacePerPass == 0
+                || nsConfirmed.size() <= maxConfirmedDeletesPerNamespacePerPass) {
+            return;
+        }
+        confirmed.remove(namespace);
+        if (deleteCircuitsOpen.add(namespace)) {
+            log.error("orphan GC: mass-delete circuit opened for ns={} after {} confirmed orphans in one pass "
+                            + "(limit {}); refusing deletes for this namespace until restart or operator override",
+                    namespace, nsConfirmed.size(), maxConfirmedDeletesPerNamespacePerPass);
+        }
+    }
+
+    private void deleteConfirmed(StrataNamespace namespace, ChunkId chunkId) throws InterruptedException {
+        ErrorCode result = deletes.delete(namespace, chunkId);
+        if (result == ErrorCode.OK) {
+            log.info("orphan GC: deleted unreferenced sealed chunk {} in ns={}", chunkId, namespace);
+        } else {
+            log.warn("orphan GC: confirmed orphan {} in ns={} failed to delete: {}",
+                    chunkId, namespace, result);
         }
     }
 

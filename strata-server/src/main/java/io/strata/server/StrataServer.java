@@ -122,6 +122,9 @@ public final class StrataServer {
                 .withOrphanScanIntervalMs(longEnv("STRATA_ORPHAN_SCAN_INTERVAL_MS", 3_000))
                 .withOrphanStartupGraceMs(longEnv("STRATA_ORPHAN_STARTUP_GRACE_MS", 6_000))
                 .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
+                .withOrphanDeleteMaxConfirmedPerNamespacePerPass(
+                        intEnv("STRATA_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS",
+                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS))
                 .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
                 .withControlCommandLimits(intEnv("STRATA_NODE_COMMAND_PARALLELISM", 8),
                         intEnv("STRATA_NODE_MAX_QUEUED_COMMANDS", 1024))
@@ -214,6 +217,9 @@ public final class StrataServer {
                 .withOrphanScanIntervalMs(longEnv("STRATA_ORPHAN_SCAN_INTERVAL_MS", 3_000))
                 .withOrphanStartupGraceMs(longEnv("STRATA_ORPHAN_STARTUP_GRACE_MS", 6_000))
                 .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
+                .withOrphanDeleteMaxConfirmedPerNamespacePerPass(
+                        intEnv("STRATA_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS",
+                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS))
                 .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
                 .withControlCommandLimits(intEnv("STRATA_NODE_COMMAND_PARALLELISM", 8),
                         intEnv("STRATA_NODE_MAX_QUEUED_COMMANDS", 1024))

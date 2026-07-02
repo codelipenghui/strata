@@ -122,6 +122,8 @@ class DataNodeConfigTest {
         assertEquals(3_000, c.orphanScanIntervalMs());
         assertEquals(6_000, c.orphanStartupGraceMs());
         assertEquals(5_000, c.orphanConfirmTimeoutMs());
+        assertEquals(DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS,
+                c.orphanDeleteMaxConfirmedPerNamespacePerPass());
         assertEquals(10_000, c.controlCallTimeoutMs());
         assertEquals(8, c.controlCommandParallelism());
         assertEquals(1024, c.controlMaxQueuedCommands());
@@ -136,11 +138,15 @@ class DataNodeConfigTest {
         DataNodeConfig base = new DataNodeConfig(Path.of("data"), 0, "10.0.0.1", null,
                 List.of("meta:9000"), "zone", "rack", "host", 1234, 55);
         assertThrows(IllegalArgumentException.class, () -> base.withOrphanGraceMs(0));
+        assertThrows(IllegalArgumentException.class,
+                () -> base.withOrphanDeleteMaxConfirmedPerNamespacePerPass(-1));
         assertThrows(IllegalArgumentException.class, () -> base.withControlCallTimeoutMs(-1));
         assertThrows(IllegalArgumentException.class, () -> base.withControlCommandLimits(0, 1024));
         assertThrows(IllegalArgumentException.class, () -> base.withControlCommandLimits(8, 7));
         assertThrows(IllegalArgumentException.class, () -> base.withDeleteMaxConcurrent(0));
         assertThrows(IllegalArgumentException.class, () -> base.withDeleteMinIntervalMs(-1));
+        assertEquals(0, base.withOrphanDeleteMaxConfirmedPerNamespacePerPass(0)
+                .orphanDeleteMaxConfirmedPerNamespacePerPass());
     }
 
     @Test
@@ -148,13 +154,15 @@ class DataNodeConfigTest {
         DataNodeConfig c = new DataNodeConfig(Path.of("data"), 0, "10.0.0.1", null,
                 List.of("meta:9000"), "zone", "rack", "host", 1234, 55)
                 .withOrphanGraceMs(1000).withOrphanScanIntervalMs(500).withOrphanStartupGraceMs(1500)
-                .withOrphanConfirmTimeoutMs(2500).withControlCallTimeoutMs(8000).withRepairFetchBytes(1 << 20)
+                .withOrphanConfirmTimeoutMs(2500).withOrphanDeleteMaxConfirmedPerNamespacePerPass(3)
+                .withControlCallTimeoutMs(8000).withRepairFetchBytes(1 << 20)
                 .withControlCommandLimits(4, 128).withDeleteMaxConcurrent(2).withDeleteMinIntervalMs(25)
                 .withChunkStoreConfig(ChunkStoreConfig.DEFAULT.withMaxRequestBytes(4096));
         assertEquals(1000, c.orphanGraceMs());
         assertEquals(500, c.orphanScanIntervalMs());
         assertEquals(1500, c.orphanStartupGraceMs());
         assertEquals(2500, c.orphanConfirmTimeoutMs());
+        assertEquals(3, c.orphanDeleteMaxConfirmedPerNamespacePerPass());
         assertEquals(8000, c.controlCallTimeoutMs());
         assertEquals(4, c.controlCommandParallelism());
         assertEquals(128, c.controlMaxQueuedCommands());

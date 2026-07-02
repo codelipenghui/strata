@@ -140,6 +140,54 @@ class OrphanGcTest {
         }
     }
 
+    @Test
+    void massConfirmedOrphansTripCircuitWithoutPartialDelete() throws Exception {
+        ChunkId first = new ChunkId(FileId.of(1), 0);
+        ChunkId second = new ChunkId(FileId.of(2), 0);
+        ChunkId third = new ChunkId(FileId.of(3), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileNotFoundServer()) {
+            seal(store, first);
+            seal(store, second);
+            seal(store, third);
+            String endpoint = "127.0.0.1:" + owner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 2);
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, first), "mass-confirmed orphan pass must not partially delete");
+            assertTrue(store.contains(NS, second), "mass-confirmed orphan pass must not partially delete");
+            assertTrue(store.contains(NS, third), "mass-confirmed orphan pass must not partially delete");
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, first), "open circuit must keep refusing orphan deletes");
+            assertTrue(store.contains(NS, second), "open circuit must keep refusing orphan deletes");
+            assertTrue(store.contains(NS, third), "open circuit must keep refusing orphan deletes");
+        }
+    }
+
+    @Test
+    void zeroMassDeleteLimitIsOperatorOverride() throws Exception {
+        ChunkId first = new ChunkId(FileId.of(1), 0);
+        ChunkId second = new ChunkId(FileId.of(2), 0);
+        ChunkId third = new ChunkId(FileId.of(3), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileNotFoundServer()) {
+            seal(store, first);
+            seal(store, second);
+            seal(store, third);
+            String endpoint = "127.0.0.1:" + owner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 0);
+
+            gc.gcOnce();
+
+            assertFalse(store.contains(NS, first), "zero limit is an explicit operator override");
+            assertFalse(store.contains(NS, second), "zero limit is an explicit operator override");
+            assertFalse(store.contains(NS, third), "zero limit is an explicit operator override");
+        }
+    }
+
     private static ScpServer notLeaderServer() throws Exception {
         return new ScpServer(0, 0, 0, 0, req -> {
             if (req.opcode() != Opcode.LOOKUP_FILE.code) {
@@ -161,8 +209,17 @@ class OrphanGcTest {
     private static OrphanGc orphanGc(ChunkStore store, List<String> controllerEndpoints,
                                      long graceMs, long scanIntervalMs,
                                      long startupGraceMs, int confirmTimeoutMs) {
+        return orphanGc(store, controllerEndpoints, graceMs, scanIntervalMs, startupGraceMs,
+                confirmTimeoutMs, OrphanGc.DEFAULT_MAX_CONFIRMED_DELETES_PER_NAMESPACE_PER_PASS);
+    }
+
+    private static OrphanGc orphanGc(ChunkStore store, List<String> controllerEndpoints,
+                                     long graceMs, long scanIntervalMs,
+                                     long startupGraceMs, int confirmTimeoutMs,
+                                     int maxConfirmedDeletesPerNamespacePerPass) {
         ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
         return new OrphanGc(store, deletes, NODE_ID, controllerEndpoints,
-                graceMs, scanIntervalMs, startupGraceMs, confirmTimeoutMs);
+                graceMs, scanIntervalMs, startupGraceMs, confirmTimeoutMs,
+                maxConfirmedDeletesPerNamespacePerPass);
     }
 }

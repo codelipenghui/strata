@@ -90,7 +90,7 @@ public final class DataNode implements AutoCloseable {
                 // to recognise itself in a descriptor and controller endpoints to ask).
                 startedGc = new OrphanGc(openedStore, deletes, nodeId, config.controllerEndpoints(),
                         config.orphanGraceMs(), config.orphanScanIntervalMs(), config.orphanStartupGraceMs(),
-                        config.orphanConfirmTimeoutMs());
+                        config.orphanConfirmTimeoutMs(), config.orphanDeleteMaxConfirmedPerNamespacePerPass());
                 this.orphanGc = startedGc;
                 startedGc.start();
             } else {
