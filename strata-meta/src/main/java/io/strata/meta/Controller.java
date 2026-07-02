@@ -291,8 +291,8 @@ public final class Controller implements AutoCloseable {
      * Per-namespace namespace-log counters for the namespaces this controller owns; empty under the ZK
      * backend. Value is the fixed index order documented on {@code NamespaceLogMetrics.stats()}:
      * [appendRecords, appendBytes, readRecords, readBytes, compactions, recoveries, reacquisitions,
-     * ownerChanges]. Drives the per-namespace write-log / read-log / compaction / owner-change panels;
-     * the global controller view is {@code sum without(namespace)}.
+     * ownerChanges, snapshotFallbacks]. Drives the per-namespace write-log / read-log / compaction /
+     * owner-change / recovery-fallback panels; the global controller view is {@code sum without(namespace)}.
      */
     public Map<String, long[]> namespaceLogStats() {
         return store instanceof NamespaceLogMetadataStore log ? log.metrics().stats() : Map.of();

@@ -3,6 +3,8 @@ package io.strata.meta;
 import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
 import io.strata.common.StrataNamespace;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -25,6 +27,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * publication is the linearizable barrier validated in {@code tla/MetadataManifestCAS.tla}.
  */
 final class NamespaceMetadataLogRepository {
+    private static final Logger log = LoggerFactory.getLogger(NamespaceMetadataLogRepository.class);
+
     private final StrataNamespace namespace;
     private final NamespaceMetadataFileStore fileStore;
     private final MetadataStore rootStore;
@@ -269,6 +273,17 @@ final class NamespaceMetadataLogRepository {
         NamespaceMetadataRecovery.Recovered recovered =
                 NamespaceMetadataRecovery.recover(namespace, fileStore, manifest);
         metrics.recordLogRead(namespace, recovered.recordsReplayed(), recovered.bytesRead());
+        if (recovered.usedSnapshotFallback()) {
+            Records.NamespaceManifest currentManifest = manifest.orElseThrow();
+            Records.NamespaceManifest sourceManifest = recovered.sourceManifest().orElseThrow();
+            metrics.recordSnapshotFallback(namespace);
+            log.error("namespace metadata snapshot fallback recovered namespace={} badGeneration={} "
+                            + "sourceGeneration={} currentLogFile={} sourceSnapshotFile={} durableEnd={}",
+                    namespace, currentManifest.generation(), sourceManifest.generation(),
+                    currentManifest.logFileId().map(FileId::toString).orElse("<none>"),
+                    sourceManifest.snapshotFileId().map(FileId::toString).orElse("<none>"),
+                    recovered.durableEndOffset());
+        }
         this.state = recovered.state();
         this.generation = manifest.map(Records.NamespaceManifest::generation).orElse(0L);
         int expectedVersion = current.map(MetadataStore.Versioned::version).orElse(-1);

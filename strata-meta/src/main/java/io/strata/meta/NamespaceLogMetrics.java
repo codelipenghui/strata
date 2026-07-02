@@ -22,13 +22,14 @@ import java.util.concurrent.atomic.LongAdder;
  *   <li>recoveries — repositories (re)opened from a published manifest (failover/restart churn, §13)
  *   <li>reacquisitions — stale-epoch meta-log re-acquisitions (ownership contention)
  *   <li>ownerChanges — cold acquisitions of a namespace by this node (ownership handoffs, §6)
+ *   <li>snapshotFallbacks — CRC-bad published snapshots recovered from a previous generation plus current log
  * </ol>
  * The aggregate accessors ({@link #appendRecords()} etc.) sum across namespaces.
  */
 final class NamespaceLogMetrics {
     static final int APPEND_RECORDS = 0, APPEND_BYTES = 1, READ_RECORDS = 2, READ_BYTES = 3,
-            COMPACTIONS = 4, RECOVERIES = 5, REACQUISITIONS = 6, OWNER_CHANGES = 7;
-    private static final int N = 8;
+            COMPACTIONS = 4, RECOVERIES = 5, REACQUISITIONS = 6, OWNER_CHANGES = 7, SNAPSHOT_FALLBACKS = 8;
+    private static final int N = 9;
 
     private final ConcurrentHashMap<String, LongAdder[]> byNs = new ConcurrentHashMap<>();
 
@@ -61,6 +62,10 @@ final class NamespaceLogMetrics {
 
     void recordRecovery(StrataNamespace ns) {
         of(ns)[RECOVERIES].increment();
+    }
+
+    void recordSnapshotFallback(StrataNamespace ns) {
+        of(ns)[SNAPSHOT_FALLBACKS].increment();
     }
 
     /** A fenced (stale-epoch) meta-log append forced this node to re-acquire and retry — owner churn. */
@@ -124,5 +129,9 @@ final class NamespaceLogMetrics {
 
     long reacquisitions() {
         return sum(REACQUISITIONS);
+    }
+
+    long snapshotFallbacks() {
+        return sum(SNAPSHOT_FALLBACKS);
     }
 }

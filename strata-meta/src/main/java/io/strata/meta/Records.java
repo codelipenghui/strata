@@ -411,6 +411,8 @@ public final class Records {
             }
 
             NamespaceManifest toManifest(StrataNamespace namespace, long metadataEpoch) {
+                // The ref intentionally carries only immutable recovery coordinates. The epoch supplied
+                // here is not the original publisher epoch; recovery consumes only file ids and offsets.
                 return new NamespaceManifest(namespace, metadataEpoch, generation, logStartOffset,
                         publishedLogOffset, snapshotFileId, logFileId);
             }
