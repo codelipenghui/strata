@@ -33,7 +33,11 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -105,6 +109,107 @@ class ChunkStoreTest {
             assertEquals(1, entries.size());
             assertEquals(suppliedDigest, entries.get(0).payloadCrc());
         }
+    }
+
+    @Test
+    void fsyncOnAckOpenForcesCreatedShardAncestorDirentsWhenSealFsyncDisabled() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102), 0);
+        List<Path> forced = new ArrayList<>();
+
+        try (ChunkStore store = new ChunkStore(dir, false, 1024, ChunkStoreConfig.DEFAULT, forced::add)) {
+            store.open(TEST_NS, chunkId, true, 1, 1718000000000L);
+        }
+
+        Path nsDir = dir.resolve(TEST_NS.value());
+        Path l1Dir = nsDir.resolve("02");
+        Path shardDir = l1Dir.resolve("01");
+        assertTrue(forced.contains(dir), "new namespace dirent must be forced in the store root");
+        assertTrue(forced.contains(nsDir), "new L1 dirent must be forced in the namespace directory");
+        assertTrue(forced.contains(l1Dir), "new shard dirent must be forced in the L1 directory");
+        assertTrue(forced.contains(shardDir), "chunk file dirents must be forced in the shard directory");
+    }
+
+    @Test
+    void replicateOpenDoesNotForceCreatedShardDirentsWhenSealFsyncDisabled() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102), 0);
+        List<Path> forced = new ArrayList<>();
+
+        try (ChunkStore store = new ChunkStore(dir, false, 1024, ChunkStoreConfig.DEFAULT, forced::add)) {
+            store.open(TEST_NS, chunkId, false, 1, 1718000000000L);
+        }
+
+        assertTrue(forced.isEmpty(), "ack-on-replicate open must stay off the fsync path when seal fsync is disabled");
+    }
+
+    @Test
+    void concurrentFsyncOnAckOpenWaitsForCreatedShardDirentFsync() throws Exception {
+        ChunkId first = new ChunkId(FileId.of(0x0102), 0);
+        ChunkId second = new ChunkId(FileId.of(0x1_0102), 0);
+        Path l1Dir = dir.resolve(TEST_NS.value()).resolve("02").toAbsolutePath().normalize();
+        CountDownLatch shardDirForceStarted = new CountDownLatch(1);
+        CountDownLatch releaseShardDirForce = new CountDownLatch(1);
+        AtomicBoolean blocked = new AtomicBoolean();
+        ChunkStore.DirectorySyncer syncer = path -> {
+            if (path.toAbsolutePath().normalize().equals(l1Dir) && blocked.compareAndSet(false, true)) {
+                shardDirForceStarted.countDown();
+                try {
+                    if (!releaseShardDirForce.await(5, TimeUnit.SECONDS)) {
+                        throw new IOException("timed out waiting to release shard dir fsync");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted while waiting to release shard dir fsync", e);
+                }
+            }
+        };
+
+        try (ChunkStore store = new ChunkStore(dir, false, 1024, ChunkStoreConfig.DEFAULT, syncer)) {
+            CompletableFuture<Void> firstOpen = CompletableFuture.runAsync(() -> openFsync(store, first));
+            assertTrue(shardDirForceStarted.await(5, TimeUnit.SECONDS),
+                    "first open must reach the shard dirent fsync");
+
+            CompletableFuture<Void> secondOpen = CompletableFuture.runAsync(() -> openFsync(store, second));
+            assertThrows(TimeoutException.class, () -> secondOpen.get(200, TimeUnit.MILLISECONDS),
+                    "second open in the same new shard must wait for the first dirent fsync to complete");
+
+            releaseShardDirForce.countDown();
+            firstOpen.get(5, TimeUnit.SECONDS);
+            secondOpen.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private void openFsync(ChunkStore store, ChunkId chunkId) {
+        try {
+            store.open(TEST_NS, chunkId, true, 1, 1718000000000L);
+        } catch (IOException e) {
+            throw new CompletionException(e);
+        }
+    }
+
+    @Test
+    void importSealedForcesCreatedShardAncestorDirents() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102), 0);
+        byte[] payload = "sealed".getBytes(StandardCharsets.UTF_8);
+        byte[] fileBytes;
+        Path sourceDir = Files.createTempDirectory(dir.getParent(), "strata-source-");
+        try (ChunkStore source = new ChunkStore(sourceDir)) {
+            fileBytes = sealedBytes(source, chunkId, "sealed");
+        }
+        Path sourceFile = dir.resolve("sealed.import");
+        Files.write(sourceFile, fileBytes);
+        List<Path> forced = new ArrayList<>();
+
+        try (ChunkStore target = new ChunkStore(dir, false, 1024, ChunkStoreConfig.DEFAULT, forced::add)) {
+            target.importSealed(TEST_NS, chunkId, sourceFile, payload.length, Crc.of(payload));
+        }
+
+        Path nsDir = dir.resolve(TEST_NS.value());
+        Path l1Dir = nsDir.resolve("02");
+        Path shardDir = l1Dir.resolve("01");
+        assertTrue(forced.contains(dir), "new namespace dirent must be forced in the store root");
+        assertTrue(forced.contains(nsDir), "new L1 dirent must be forced in the namespace directory");
+        assertTrue(forced.contains(l1Dir), "new shard dirent must be forced in the L1 directory");
+        assertTrue(forced.contains(shardDir), "imported chunk dirent must be forced in the shard directory");
     }
 
     @Test
@@ -1473,7 +1578,7 @@ class ChunkStoreTest {
             store.append(TEST_NS, chunkId, 1, 0, 0, bytes("sealed"));
             store.seal(TEST_NS, chunkId, 1, 6, null);
         }
-        Files.write(ledgerPath, new byte[] {1, 2, 3});
+        Files.write(ledgerPath, new ChunkFormats.LedgerEntry(6, Crc.of("sealed".getBytes()), 1).encode());
 
         try (ChunkStore recovered = newStore()) {
             assertTrue(recovered.contains(TEST_NS, chunkId));
@@ -1593,6 +1698,46 @@ class ChunkStoreTest {
                 assertTrue(recovery.channel() == null, "recovery tail must be materialized, not zero-copy");
                 assertArrayEquals(all, recovery.bytes(), "recovery read must return the full verified bytes");
             }
+        }
+    }
+
+    @Test
+    void recoveryReadOfSealedChunkVerifiesFooterRangeCrcs() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(43), 0);
+        byte[] payload = "sealed-recovery-payload".getBytes(StandardCharsets.UTF_8);
+
+        try (ChunkStore store = newStore()) {
+            open(store, chunkId, 1);
+            store.append(TEST_NS, chunkId, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(TEST_NS, chunkId, 1, payload.length, null);
+
+            try (ChunkStore.ReadRegionResult recovery =
+                         store.readRegionForRecovery(TEST_NS, chunkId, 0, payload.length)) {
+                assertEquals(payload.length, recovery.length(), "sealed recovery read must serve the data");
+                assertNull(recovery.channel(), "sealed recovery read must be materialized, not zero-copy");
+                assertArrayEquals(payload, recovery.bytes(), "sealed recovery read must return verified bytes");
+            }
+
+            Path dataPath = dir.resolve(rel(chunkId) + ".chunk");
+            try (FileChannel ch = FileChannel.open(dataPath, StandardOpenOption.WRITE)) {
+                ch.write(ByteBuffer.wrap(new byte[] {(byte) (payload[0] ^ 0x7f)}),
+                        ChunkFormats.DATA_START);
+            }
+
+            try (ChunkStore.ReadRegionResult client =
+                         store.readRegion(TEST_NS, chunkId, 0, payload.length)) {
+                assertEquals(payload.length, client.length(), "sealed client read must still serve the range");
+                assertNotNull(client.channel(), "sealed client read must stay on the zero-copy fast path");
+                assertNull(client.bytes(), "sealed client read must not materialize bytes");
+            }
+
+            ScpException e = assertThrows(ScpException.class, () -> {
+                try (ChunkStore.ReadRegionResult ignored =
+                             store.readRegionForRecovery(TEST_NS, chunkId, 0, payload.length)) {
+                    // Should fail before returning bytes.
+                }
+            });
+            assertEquals(ErrorCode.CRC_MISMATCH, e.code());
         }
     }
 

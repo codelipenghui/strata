@@ -592,6 +592,58 @@ class RecoveryTest {
     }
 
     @Test
+    void ackedTailSurvivesTransientReadFailureFromFencedHolder() throws Exception {
+        // Issue #42: the second holder fenced successfully and reported end=4, but its READ_RECOVERY
+        // transiently fails. That is holder evidence, unlike a CRC-mismatching read, so a single
+        // CRC-valid copy plus the read-failed holder can still represent an acked batch.
+        FileId fileId = FileId.of(40);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean laggingAppend = new AtomicBoolean();
+        byte[] data = new byte[] {1, 2, 3, 4};
+        int crc = Crc.of(data);
+        List<Messages.LedgerEntry> ledger = List.of(new Messages.LedgerEntry(data.length, crc, 1));
+
+        try (ScpServer holder = ledgerOrderingReplica(1, data.length, ledger, data, null);
+             ScpServer readFailingHolder = new ScpServer(0, 2, 0, 0, req -> {
+                 Opcode op = Opcode.fromCode(req.opcode());
+                 if (op == Opcode.FENCE) {
+                     return ScpServer.ok(req, new Messages.FenceResp(2, data.length, 0, ChunkState.OPEN).encode(),
+                             null);
+                 }
+                 if (op == Opcode.READ_LEDGER) {
+                     return ScpServer.ok(req, new Messages.ReadLedgerResp(ledger).encode(), null);
+                 }
+                 if (op == Opcode.READ_RECOVERY) {
+                     throw new ScpException(ErrorCode.INTERNAL, "transient recovery read failure");
+                 }
+                 if (op == Opcode.SEAL_CHUNK) {
+                     Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
+                     return ScpServer.ok(req, new Messages.SealResp(seal.dataLength(), 777).encode(), null);
+                 }
+                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+             });
+             ScpServer lagging = ledgerOrderingReplica(3, 0, List.of(), data, laggingAppend);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(holder)),
+                             new Messages.Replica(2, endpoint(readFailingHolder)),
+                             new Messages.Replica(3, endpoint(lagging))))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                        .recoverAndSeal(fileId, 2);
+
+                assertEquals(4, sealedInfo.sealedLength(),
+                        "a producer-acked tail must survive a transient read failure from a fenced holder");
+                assertEquals(4L, sealedFileLength.get());
+                assertTrue(laggingAppend.get(),
+                        "the surviving CRC-valid copy must be re-replicated to the lagging replica");
+            }
+        }
+    }
+
+    @Test
     void conflictingSingleHolderContinuationsAboveFloorTruncateToFloor() throws Exception {
         // PR #34 review: with one replica unreachable, two reachable replicas can each hold a CRC-valid
         // but DIFFERENT continuation from the floor — R1 has A[0,4), R2 has B[0,8) with a different
