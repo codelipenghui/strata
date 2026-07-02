@@ -103,13 +103,12 @@ public final class ChunkStore implements AutoCloseable {
     // syscall rate against seal-time fsync size: a shorter interval / smaller threshold keeps less dirty
     // data per open chunk, so a synchronized roll does not stampede the disk's fsync queue with many
     // large concurrent forces. Background writeback keeps the original 500ms / 4 MiB default.
-    // STRATA_SEAL_FSYNC (default false) gates the best-effort, off-the-ack-path fsyncs at open, seal,
-    // and delete (header/sidecar/dir plus the seal-time data force) — NOT just seal. It does not affect
+    // ChunkStoreConfig.sealFsync (default false) gates the best-effort, off-the-ack-path fsyncs at open,
+    // seal, and delete (header/sidecar/dir plus the seal-time data force) — NOT just seal. It does not affect
     // ack durability (the group committer always forces data+ledger before acking on fsyncOnAck files),
     // and even with it off a sealed chunk's ledger is retained until reclaimSealedLedgersOnce() forces
     // the SEALED state durable, so recovery never discards acknowledged data.
-    /** Whether seal/open/delete force their metadata + data to disk synchronously. Defaults from
-     *  STRATA_SEAL_FSYNC; overridable per instance so tests can exercise both durability paths. */
+    /** Whether seal/open/delete force their metadata + data to disk synchronously. */
     private final boolean sealFsync;
     private final ChunkStoreConfig csConfig;
     private final ScheduledExecutorService flusher;
@@ -291,7 +290,7 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     /**
-     * Reclaims the integrity ledger of chunks sealed under {@code STRATA_SEAL_FSYNC=false}. seal()
+     * Reclaims the integrity ledger of chunks sealed under {@code ChunkStoreConfig.sealFsync=false}. seal()
      * deliberately retains that ledger because the SEALED footer/sidecar are left in the page cache:
      * a crash before they reach disk leaves a stale OPEN sidecar, and recovery's OPEN branch rebuilds
      * the chunk by replaying the ledger. Removing the ledger before the SEALED state is durable would
@@ -419,7 +418,7 @@ public final class ChunkStore implements AutoCloseable {
 
     /* ---------------- per-chunk state ---------------- */
 
-    private final class Handle {
+    final class Handle {
         // Serializes all access to this chunk's mutable state. Deliberately a ReentrantLock, NOT the
         // intrinsic monitor: critical sections block on FileChannel I/O (write/force/open/truncate) and
         // on the group-commit flusher join, and on Java 21 a virtual thread that blocks while holding
@@ -581,10 +580,6 @@ public final class ChunkStore implements AutoCloseable {
                 committer = null;
             }
         }
-    }
-
-    Object handleForTests(ChunkId id, ChunkFormats.Header header, StrataNamespace ns) {
-        return new Handle(id, header, ns);
     }
 
     private Handle lookup(StrataNamespace ns, ChunkId id) {

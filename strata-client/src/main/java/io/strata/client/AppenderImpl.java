@@ -71,7 +71,7 @@ final class AppenderImpl implements StrataFile.Appender {
     private ScpException deathCause;
     private final Set<Integer> excludedPlacementNodes = new HashSet<>();
 
-    private static final class ChunkSession {
+    static final class ChunkSession {
         final ChunkId chunkId;
         final List<Messages.Replica> replicas;
         // the create-op id this appender minted for this chunk incarnation; echoed on seal so the
@@ -108,16 +108,7 @@ final class AppenderImpl implements StrataFile.Appender {
         }
     }
 
-    private record Pending(long chunkEnd, CompletableFuture<Long> future) {}
-
-    static Object chunkSessionForTests(ChunkId chunkId, List<Messages.Replica> replicas,
-                                       long createOpMsb, long createOpLsb) {
-        return new ChunkSession(chunkId, replicas, createOpMsb, createOpLsb);
-    }
-
-    static Object pendingForTests(long chunkEnd, CompletableFuture<Long> future) {
-        return new Pending(chunkEnd, future);
-    }
+    record Pending(long chunkEnd, CompletableFuture<Long> future) {}
 
     AppenderImpl(ControllerClient controller, NodePool pool, ClientConfig config, FileId fileId,
                  StrataNamespace namespace, int epoch, Messages.WritePolicy writePolicy,

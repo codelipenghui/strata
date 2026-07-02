@@ -1416,7 +1416,7 @@ class RecoveryTest {
 
     private static Object replicaState(Messages.Replica replica, long localEnd, long durable, ChunkState state)
             throws Exception {
-        return Recovery.replicaStateForTests(replica, localEnd, durable, state);
+        return new Recovery.ReplicaState(replica, new Messages.FenceResp(2, localEnd, durable, state));
     }
 
     private static byte[] invokeReadRange(Recovery recovery, ChunkId chunkId, Object source, long from, long to)

@@ -1754,7 +1754,7 @@ class AppenderImplTest {
     }
 
     private static Object chunkSession(ChunkId chunkId, Messages.Replica... replicas) throws Exception {
-        return AppenderImpl.chunkSessionForTests(chunkId, List.of(replicas), 0L, 0L);
+        return new AppenderImpl.ChunkSession(chunkId, List.of(replicas), 0L, 0L);
     }
 
     private static void onReplicaResponse(AppenderImpl appender, Object session,
@@ -1897,7 +1897,7 @@ class AppenderImplTest {
     }
 
     private static Object pending(long chunkEnd, CompletableFuture<Long> future) throws Exception {
-        return AppenderImpl.pendingForTests(chunkEnd, future);
+        return new AppenderImpl.Pending(chunkEnd, future);
     }
 
     @SuppressWarnings("unchecked")

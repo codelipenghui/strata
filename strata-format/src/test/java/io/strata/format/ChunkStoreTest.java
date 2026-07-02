@@ -326,7 +326,7 @@ class ChunkStoreTest {
 
     private static Object newHandle(ChunkStore store, ChunkId chunkId) throws Exception {
         // Handle(ChunkId id, ChunkFormats.Header header, StrataNamespace ns)
-        return store.handleForTests(chunkId,
+        return store.new Handle(chunkId,
                 new ChunkFormats.Header(chunkId, false, 1, 1718000000000L, 0, 0, 0), TEST_NS);
     }
 

@@ -80,7 +80,7 @@ public final class StrataServer {
         // client (ControllerClient) is sharding-aware: it keeps one connection per owner and routes each op
         // to its namespace's owner, learning owners from NOT_LEADER redirect hints — so concurrent ops
         // across owners do not thrash a single connection. Off by default to gate fleet-wide rollout.
-        if (Boolean.parseBoolean(env("STRATA_CONTROLLER_SHARDING", "false"))) {
+        if (boolEnv("STRATA_CONTROLLER_SHARDING", false)) {
             config = config.withControllerEndpoints(endpoints(required("STRATA_CONTROLLER_ENDPOINTS")),
                     intEnv("STRATA_CONTROLLER_REPLICA_COUNT", 3));
         }
@@ -133,7 +133,7 @@ public final class StrataServer {
                         longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
                         longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
                         longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000),
-                        Boolean.parseBoolean(env("STRATA_SEAL_FSYNC", "false")),
+                        boolEnv("STRATA_SEAL_FSYNC", false),
                         longEnv("STRATA_BG_FLUSH_INTERVAL_MS", 500),
                         longEnv("STRATA_BG_FLUSH_THRESHOLD_BYTES", 4L << 20),
                         longEnv("STRATA_SLOW_APPEND_LOG_MS", 1_000),
@@ -194,7 +194,7 @@ public final class StrataServer {
         // (ControllerClient) keeps one connection per owner and routes each op to its namespace's owner,
         // so it does not thrash a single connection. Off by default to gate rollout. See runController /
         // STRATA_CONTROLLER_SHARDING.
-        if (Boolean.parseBoolean(env("STRATA_CONTROLLER_SHARDING", "false"))) {
+        if (boolEnv("STRATA_CONTROLLER_SHARDING", false)) {
             controllerConfig = controllerConfig.withControllerEndpoints(endpoints(required("STRATA_CONTROLLER_ENDPOINTS")),
                     intEnv("STRATA_CONTROLLER_REPLICA_COUNT", 3));
         }
@@ -225,7 +225,7 @@ public final class StrataServer {
                         longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
                         longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
                         longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000),
-                        Boolean.parseBoolean(env("STRATA_SEAL_FSYNC", "false")),
+                        boolEnv("STRATA_SEAL_FSYNC", false),
                         longEnv("STRATA_BG_FLUSH_INTERVAL_MS", 500),
                         longEnv("STRATA_BG_FLUSH_THRESHOLD_BYTES", 4L << 20),
                         longEnv("STRATA_SLOW_APPEND_LOG_MS", 1_000),
@@ -385,10 +385,10 @@ public final class StrataServer {
         return new ControllerConfig.MetadataBackendConfig("namespace-log",
                 intEnv("STRATA_CONTROLLER_LOG_RF", 3),
                 intEnv("STRATA_CONTROLLER_LOG_ACK", 2),
-                Boolean.parseBoolean(env("STRATA_CONTROLLER_LOG_FSYNC", "false")),
+                boolEnv("STRATA_CONTROLLER_LOG_FSYNC", false),
                 intEnv("STRATA_CONTROLLER_LOG_COMPACT_BYTES", 4 * 1024 * 1024),
                 intEnv("STRATA_CONTROLLER_LOG_COMPACT_INTERVAL_MS", 30_000),
-                Boolean.parseBoolean(env("STRATA_CONTROLLER_LOG_ORPHAN_GC", "true")),
+                boolEnv("STRATA_CONTROLLER_LOG_ORPHAN_GC", true),
                 intEnv("STRATA_CONTROLLER_LOG_RETENTION_MS", 0),
                 intEnv("STRATA_CONTROLLER_LOG_READ_CHUNK_BYTES", 4 * 1024 * 1024));
     }
@@ -417,8 +417,20 @@ public final class StrataServer {
     }
 
     private static boolean boolEnv(String key, boolean def) {
-        String v = env(key, null);
-        return v == null ? def : Boolean.parseBoolean(v);
+        return parseBoolEnv(key, env(key, null), def);
+    }
+
+    static boolean parseBoolEnv(String key, String value, boolean def) {
+        String v = value == null || value.isBlank() ? null : value.trim();
+        if (v == null) {
+            return def;
+        }
+        return switch (v) {
+            case "true" -> true;
+            case "false" -> false;
+            default -> throw new IllegalArgumentException(
+                    key + " must be 'true' or 'false' but was '" + v + "'");
+        };
     }
 
     /**

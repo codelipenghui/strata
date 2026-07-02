@@ -197,7 +197,7 @@ public final class Controller implements AutoCloseable {
         boolean logFsync = backend.namespaceLogFsync();
         // Steady-state open-log compaction: snapshot+roll an owned namespace once its open log passes this
         // size, so a stable leader's log is bounded by snapshot cadence (design §8/§10) rather than only
-        // compacting at open/failover. <=0 on either knob disables the background sweep.
+        // compacting at open/failover. 0 on either knob disables the background sweep.
         int compactBytes = backend.namespaceLogCompactBytes();
         int compactIntervalMs = backend.namespaceLogCompactIntervalMs();
         // Reap snapshot/log system files orphaned by a crash between file-create and manifest CAS. Safe by

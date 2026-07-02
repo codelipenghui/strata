@@ -1054,7 +1054,7 @@ class RepairCoordinatorTest {
 
     private static Object replicateAction(FileId fileId, ChunkId chunkId, int deadNode, int targetNode)
             throws Exception {
-        return RepairCoordinator.replicateActionForTests(TEST_NS, fileId, chunkId, deadNode, targetNode,
+        return new RepairCoordinator.ReplicateAction(TEST_NS, fileId, chunkId, deadNode, targetNode,
                 System.currentTimeMillis());
     }
 

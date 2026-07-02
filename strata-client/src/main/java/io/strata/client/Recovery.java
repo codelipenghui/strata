@@ -65,7 +65,7 @@ final class Recovery {
     }
 
     /** Mutable per-replica recovery state; `end` tracks our view of its local end offset. */
-    private static final class ReplicaState {
+    static final class ReplicaState {
         final Messages.Replica replica;
         long end;
         long durable;
@@ -77,10 +77,6 @@ final class Recovery {
             this.durable = fence.lastKnownDO();
             this.state = fence.state();
         }
-    }
-
-    static Object replicaStateForTests(Messages.Replica replica, long localEnd, long durable, ChunkState state) {
-        return new ReplicaState(replica, new Messages.FenceResp(2, localEnd, durable, state));
     }
 
     StrataFile.SealInfo recoverAndSeal(FileId fileId) {
