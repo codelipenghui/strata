@@ -310,6 +310,11 @@ public final class Controller implements AutoCloseable {
         return store instanceof NamespaceLogMetadataStore log ? log.metrics().value(namespace, index) : 0L;
     }
 
+    /** Corrupt/unreadable shared live-node snapshots seen by placement readers. */
+    public long clusterLiveNodesDecodeFailures() {
+        return registry.clusterLiveNodesDecodeFailures();
+    }
+
     /** This controller's rendezvous endpoint identity — the {@code owner} label for the namespace-owner
      *  gauge ({@code strata_controller_namespace_owner}); same value the latch advertises. */
     public String localControllerEndpoint() {

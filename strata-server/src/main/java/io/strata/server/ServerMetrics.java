@@ -55,6 +55,10 @@ final class ServerMetrics {
                 .description("repairs issued, by trigger lane (event = node-death driven, reconcile = backstop scan)").register(reg);
         FunctionCounter.builder("strata_controller_reconcile_skipped_files", s, Controller::reconcileSkippedFiles)
                 .description("files skipped in the reconcile pass due to per-file errors (rate() = error frequency)").register(reg);
+        FunctionCounter.builder("strata_controller_cluster_live_nodes_decode_failures", s,
+                        Controller::clusterLiveNodesDecodeFailures)
+                .description("published cluster live-node snapshots that failed to decode on placement readers")
+                .register(reg);
 
         Gauge.builder("strata_data_nodes", s, Controller::aliveNodes)
                 .tag("state", "alive").description("data nodes by liveness state").register(reg);
