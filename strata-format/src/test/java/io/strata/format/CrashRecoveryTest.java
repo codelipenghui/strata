@@ -4,6 +4,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
+import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
@@ -186,11 +187,15 @@ class CrashRecoveryTest {
 
     @Test
     void fsyncSealLeavesNoSidecar() throws Exception {
-        ChunkStore store = new ChunkStore(dir, true); // sealFsync=true: ledger + sidecar dropped at seal
-        open(store);
-        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("payload".getBytes()));
-        store.seal(TEST_NS, id, 1, 7, null);
-        assertFalse(Files.exists(metaPath()), "fsync-sealed chunk carries no .meta sidecar");
+        try (ChunkStore store = new ChunkStore(dir, true)) { // sealFsync=true: ledger + sidecar dropped at seal
+            open(store);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("payload".getBytes()));
+            store.seal(TEST_NS, id, 1, 7, null);
+            assertFalse(Files.exists(metaPath()), "fsync-sealed chunk carries no .meta sidecar");
+            assertFalse(Files.exists(ledgerPath()), "fsync-sealed chunk carries no retained ledger");
+        }
+        assertFalse(Files.exists(metaPath()), "clean close must not recreate a sealed .meta sidecar");
+        assertFalse(Files.exists(ledgerPath()), "clean close must not recreate a sealed ledger");
         try (ChunkStore recovered = new ChunkStore(dir)) {
             var stat = recovered.stat(TEST_NS, id);
             assertEquals(ChunkState.SEALED, stat.state());
@@ -217,6 +222,108 @@ class CrashRecoveryTest {
     }
 
     @Test
+    void closeMustNotPromotePendingSealPastRetainedOpenRecoveryNet() throws Exception {
+        byte[] payload = "payload".getBytes();
+        ChunkStore store = new ChunkStore(dir); // non-fsync: seal leaves trailer/page-cache durability pending
+        open(store);
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(payload));
+        store.seal(TEST_NS, id, 1, payload.length, null);
+        assertTrue(Files.exists(ledgerPath()), "retained ledger is the pre-reclaim recovery net");
+        store.close();
+
+        // Crash image: clean close happened, then power loss lost the still-unforced footer/trailer.
+        // The retained OPEN sidecar + ledger must remain the recovery net.
+        try (FileChannel data = FileChannel.open(dataPath(), StandardOpenOption.WRITE)) {
+            data.truncate(ChunkFormats.DATA_START + payload.length);
+        }
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            assertEquals(ChunkState.OPEN, recovered.stat(TEST_NS, id).state());
+            assertArrayEquals(payload, recovered.read(TEST_NS, id, 0, payload.length).bytes());
+        }
+    }
+
+    @Test
+    void closeDoesNotRecreateSidecarForReclaimedSealedChunk() throws Exception {
+        try (ChunkStore store = new ChunkStore(dir)) {
+            open(store);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("payload".getBytes()));
+            store.seal(TEST_NS, id, 1, 7, null);
+            store.reclaimSealedLedgersOnce();
+            assertFalse(Files.exists(metaPath()), "reclaimed sealed chunk carries no .meta sidecar");
+            assertFalse(Files.exists(ledgerPath()), "reclaimed sealed chunk carries no retained ledger");
+        }
+        assertFalse(Files.exists(metaPath()), "clean close must not recreate a reclaimed sealed .meta sidecar");
+        assertFalse(Files.exists(ledgerPath()), "clean close must not recreate a reclaimed sealed ledger");
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            var stat = recovered.stat(TEST_NS, id);
+            assertEquals(ChunkState.SEALED, stat.state());
+            assertEquals(7, stat.sealedLength());
+            assertArrayEquals("payload".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
+        }
+    }
+
+    @Test
+    void reclaimCrashAfterLedgerDurableBeforeMetaUnlinkLeavesShortSealRecoverable() throws Exception {
+        byte[] fullPayload = "payload-tail".getBytes();
+        byte[] sealedPayload = "payload".getBytes();
+        ChunkStore store = new ChunkStore(dir);
+        open(store);
+        store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(fullPayload));
+        store.seal(TEST_NS, id, 1, sealedPayload.length, null);
+
+        FailureInjector.arm("format.reclaim.afterLedgerDurableBeforeMetaDelete", p -> {
+            throw new RuntimeException("stop after ledger unlink is durable");
+        });
+        try {
+            store.reclaimSealedLedgersOnce();
+        } finally {
+            FailureInjector.reset();
+        }
+
+        assertFalse(Files.exists(ledgerPath()), "ledger unlink must be durable before sidecar unlink starts");
+        assertTrue(Files.exists(metaPath()), "OPEN sidecar must remain if reclaim stops after ledger unlink");
+        store.close();
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            var stat = recovered.stat(TEST_NS, id);
+            assertEquals(ChunkState.SEALED, stat.state());
+            assertEquals(sealedPayload.length, stat.sealedLength());
+            assertArrayEquals(sealedPayload, recovered.read(TEST_NS, id, 0, sealedPayload.length).bytes());
+        }
+    }
+
+    @Test
+    void reclaimedSealedChunkWithRottedTrailerMagicIsQuarantined() throws Exception {
+        byte[] repairImage;
+        int dataCrc;
+        try (ChunkStore store = new ChunkStore(dir)) {
+            open(store);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("sealed-data".getBytes()));
+            dataCrc = store.seal(TEST_NS, id, 1, 11, null).dataCrc();
+            store.reclaimSealedLedgersOnce();
+            repairImage = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE).bytes();
+        }
+
+        try (FileChannel ch = FileChannel.open(dataPath(), StandardOpenOption.WRITE)) {
+            ch.write(ByteBuffer.wrap(new byte[]{0, 0, 0, 0}), Files.size(dataPath()) - Integer.BYTES);
+        }
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            assertEquals(0, recovered.describeChunks().size(),
+                    "rotted trailer-magic chunk must not be recovered as healthy");
+            assertFalse(Files.exists(dataPath()), "live chunk name must be free for repair import");
+            try (Stream<Path> files = Files.list(dataPath().getParent())) {
+                assertEquals(1, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
+                        "quarantine must preserve the rotted sealed evidence");
+            }
+            recovered.importSealed(TEST_NS, id, repairImage, 11, dataCrc);
+            assertArrayEquals("sealed-data".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
+        }
+    }
+
+    @Test
     void corruptFooterIsDetectedAtRecoveryAndChunkQuarantined() throws Exception {
         byte[] repairImage;
         int dataCrc;
@@ -224,6 +331,7 @@ class CrashRecoveryTest {
             open(store);
             store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("sealed-data".getBytes()));
             dataCrc = store.seal(TEST_NS, id, 1, 11, null).dataCrc();
+            store.reclaimSealedLedgersOnce();
             repairImage = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE).bytes();
         }
         // bit-rot inside the footer section area (between data end and the 64B trailer)
@@ -237,10 +345,9 @@ class CrashRecoveryTest {
             assertFalse(Files.exists(dataPath()), "live chunk name must be free for repair import");
             Path shardDir = dataPath().getParent();
             try (Stream<Path> files = Files.list(shardDir)) {
-                // .chunk + .meta + the retained integrity ledger (.j) — under STRATA_SEAL_FSYNC=false
-                // seal keeps the ledger until the SEALED state is forced durable, so it is still present
-                // at recovery and quarantined alongside the chunk as corrupt evidence.
-                assertEquals(3, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
+                // After reclaim, the trailer is the only SEALED signal; a corrupt sealed-looking trailer
+                // must quarantine the chunk evidence instead of being treated as an unacked remnant.
+                assertEquals(1, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
                         "quarantine must preserve the corrupt evidence under a non-live name");
             }
             recovered.importSealed(TEST_NS, id, repairImage, 11, dataCrc);
