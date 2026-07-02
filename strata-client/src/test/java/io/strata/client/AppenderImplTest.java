@@ -37,6 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -1791,8 +1792,8 @@ class AppenderImplTest {
             try {
                 TimeUnit.MILLISECONDS.sleep(200);
                 assertEquals(0, appends.get(), "append must not enter a session while seal/roll owns it");
-                assertEquals(null, appendResult.get());
-                assertEquals(null, appendFailure.get());
+                assertNull(appendResult.get());
+                assertNull(appendFailure.get());
                 assertTrue(appendThread.isAlive(), "append should still be waiting for rolling to finish");
             } finally {
                 lock.lock();
@@ -1807,9 +1808,10 @@ class AppenderImplTest {
             }
 
             assertFalse(appendThread.isAlive(), "append should proceed once rolling clears");
-            assertEquals(null, appendFailure.get());
+            assertNull(appendFailure.get());
             assertNotNull(appendResult.get());
             assertEquals(3L, appendResult.get().get(1, TimeUnit.SECONDS));
+            waitFor(() -> appends.get() == 3);
             assertEquals(3, appends.get());
         }
     }
