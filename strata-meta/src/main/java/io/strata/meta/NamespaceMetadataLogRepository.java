@@ -4,8 +4,11 @@ import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
 import io.strata.common.StrataNamespace;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Owns one namespace's metadata log: recovery, durable append, snapshot compaction, and manifest
@@ -27,8 +30,8 @@ final class NamespaceMetadataLogRepository {
     private final MetadataStore rootStore;
     private final long metadataEpoch;
     private final NamespaceLogMetrics metrics;
-    private final java.util.concurrent.locks.ReentrantLock lock =
-            new java.util.concurrent.locks.ReentrantLock();
+    private final ReentrantLock lock =
+            new ReentrantLock();
 
     private NamespaceMetadataState state;
     private FileId logFileId;
@@ -41,7 +44,7 @@ final class NamespaceMetadataLogRepository {
     // Guarded by lock: while a compaction is in flight, append() buffers each frame it writes here so the
     // publish phase can carry the freeze→CAS-window tail into the new segment WITHOUT reading (and, on the
     // production store, destructively sealing) the live open log. Cleared at each freeze and on completion.
-    private final java.util.List<byte[]> compactionTail = new java.util.ArrayList<>();
+    private final List<byte[]> compactionTail = new ArrayList<>();
 
     private NamespaceMetadataLogRepository(StrataNamespace namespace, NamespaceMetadataFileStore fileStore,
                                            MetadataStore rootStore, long metadataEpoch,

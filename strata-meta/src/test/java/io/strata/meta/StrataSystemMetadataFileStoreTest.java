@@ -2,6 +2,8 @@ package io.strata.meta;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.function.Supplier;
+
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class StrataSystemMetadataFileStoreTest {
@@ -9,7 +11,7 @@ class StrataSystemMetadataFileStoreTest {
     @Test
     void readChunkConstructorIsAvailable() throws Exception {
         StrataSystemMetadataFileStore.class.getDeclaredConstructor(
-                java.util.function.Supplier.class, int.class, int.class, boolean.class, int.class);
+                Supplier.class, int.class, int.class, boolean.class, int.class);
     }
 
     @Test

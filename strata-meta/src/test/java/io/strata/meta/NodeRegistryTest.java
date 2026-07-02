@@ -6,6 +6,7 @@ import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 import io.strata.proto.Messages;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -794,13 +795,13 @@ class NodeRegistryTest {
         }
 
         @Override
-        public Optional<Versioned<Records.FileRecord>> getFile(io.strata.common.StrataNamespace namespace, FileId id) {
+        public Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public Optional<FileId> resolvePath(io.strata.common.StrataNamespace namespace,
-                                            io.strata.common.StrataPath path) {
+        public Optional<FileId> resolvePath(StrataNamespace namespace,
+                                            StrataPath path) {
             throw new UnsupportedOperationException();
         }
 
@@ -815,23 +816,23 @@ class NodeRegistryTest {
         }
 
         @Override
-        public boolean deletePath(io.strata.common.StrataNamespace namespace, io.strata.common.StrataPath path,
+        public boolean deletePath(StrataNamespace namespace, StrataPath path,
                                   FileId expectedFileId) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public boolean deleteFile(io.strata.common.StrataNamespace namespace, FileId id, int expectedVersion) {
+        public boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public List<FileId> listFiles(io.strata.common.StrataNamespace namespace) {
+        public List<FileId> listFiles(StrataNamespace namespace) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public List<io.strata.common.StrataNamespace> listNamespaces() {
+        public List<StrataNamespace> listNamespaces() {
             throw new UnsupportedOperationException();
         }
 

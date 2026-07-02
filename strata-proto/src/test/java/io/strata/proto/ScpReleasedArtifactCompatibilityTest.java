@@ -4,6 +4,7 @@ import io.strata.common.ErrorCode;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
+import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -91,7 +92,7 @@ class ScpReleasedArtifactCompatibilityTest {
         command.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
         command.add("-Dorg.slf4j.simpleLogger.defaultLogLevel=warn");
         command.add("-cp");
-        command.add(Path.of("target", "test-classes") + java.io.File.pathSeparator + referenceCp);
+        command.add(Path.of("target", "test-classes") + File.pathSeparator + referenceCp);
         command.add(ScpCompatPeerMain.class.getName());
         command.addAll(List.of(peerArgs));
         ProcessBuilder builder = new ProcessBuilder(command);

@@ -5,11 +5,12 @@ import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
-import io.strata.common.StrataNamespace;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpServer;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Constructor;
@@ -219,7 +220,7 @@ class RecoveryTest {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
                 assertEquals(ErrorCode.INTERNAL, e.code());
-                org.junit.jupiter.api.Assertions.assertTrue(e.getMessage().contains("second seal failed"));
+                Assertions.assertTrue(e.getMessage().contains("second seal failed"));
             }
         }
     }

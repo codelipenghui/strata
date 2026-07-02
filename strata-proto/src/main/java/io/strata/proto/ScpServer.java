@@ -5,10 +5,10 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
-import io.netty.channel.DefaultFileRegion;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
+import io.netty.channel.DefaultFileRegion;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.group.DefaultChannelGroup;
@@ -28,9 +28,11 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -317,7 +319,7 @@ public final class ScpServer implements AutoCloseable {
                     observeRequest(req, startNanos, err == null, ns);
                     Frame frame = resp;
                     if (err != null) {
-                        Throwable cause = err instanceof java.util.concurrent.CompletionException
+                        Throwable cause = err instanceof CompletionException
                                 ? err.getCause() : err;
                         frame = cause instanceof ScpException se
                                 ? Frame.response(req, Resp.error(se.code(), se.getMessage(), se.detail(), se.leaderHint()), null)
@@ -471,7 +473,7 @@ public final class ScpServer implements AutoCloseable {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
-        serverChannel.close().awaitUninterruptibly(1, java.util.concurrent.TimeUnit.SECONDS);
-        connections.close().awaitUninterruptibly(1, java.util.concurrent.TimeUnit.SECONDS);
+        serverChannel.close().awaitUninterruptibly(1, TimeUnit.SECONDS);
+        connections.close().awaitUninterruptibly(1, TimeUnit.SECONDS);
     }
 }

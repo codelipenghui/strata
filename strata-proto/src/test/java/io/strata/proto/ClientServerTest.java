@@ -2,10 +2,13 @@ package io.strata.proto;
 
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.embedded.EmbeddedChannel;
-import io.strata.common.ErrorCode;
+import io.strata.common.ChunkId;
 import io.strata.common.ConnectionPolicy;
+import io.strata.common.ErrorCode;
 import io.strata.common.FailureInjector;
+import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 
 import java.io.DataInputStream;
@@ -21,13 +24,18 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
@@ -75,8 +83,8 @@ class ClientServerTest {
                 // server-side ScpException becomes a typed client-side exception
                 ScpException e = assertThrows(ScpException.class,
                         () -> client.call(Opcode.READ, new Messages.Read(
-                                new io.strata.common.ChunkId(io.strata.common.FileId.of(1), 0), 0, 1,
-                                io.strata.common.StrataNamespace.of("test")).encode(), null, 2000));
+                                new ChunkId(FileId.of(1), 0), 0, 1,
+                                StrataNamespace.of("test")).encode(), null, 2000));
                 assertEquals(ErrorCode.UNKNOWN_OPCODE, e.code());
             }
         }
@@ -88,8 +96,8 @@ class ClientServerTest {
         byte[] payload = new byte[] {1, 2, 3, 4};
         byte[] originalHeader = header.clone();
         byte[] original = payload.clone();
-        java.util.concurrent.CountDownLatch encoderPaused = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.CountDownLatch releaseEncoder = new java.util.concurrent.CountDownLatch(1);
+        CountDownLatch encoderPaused = new CountDownLatch(1);
+        CountDownLatch releaseEncoder = new CountDownLatch(1);
 
         try (ScpServer server = new ScpServer(0, 0, 0, 0,
                 req -> {
@@ -107,8 +115,8 @@ class ClientServerTest {
 
             CompletableFuture<Frame> future = client.send(Opcode.PING, header, ByteBuffer.wrap(payload));
             assertTrue(encoderPaused.await(30, TimeUnit.SECONDS), "encoder did not reach request write seam");
-            java.util.Arrays.fill(header, (byte) 8);
-            java.util.Arrays.fill(payload, (byte) 9);
+            Arrays.fill(header, (byte) 8);
+            Arrays.fill(payload, (byte) 9);
             releaseEncoder.countDown();
 
             Frame response = future.get(30, TimeUnit.SECONDS);
@@ -134,7 +142,7 @@ class ClientServerTest {
 
     @Test
     void managedConnectionHeartbeatsIdleHealthyConnection() throws Exception {
-        java.util.concurrent.atomic.AtomicInteger pings = new java.util.concurrent.atomic.AtomicInteger();
+        AtomicInteger pings = new AtomicInteger();
         try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
                 if (Opcode.fromCode(req.opcode()) == Opcode.PING) {
                     pings.incrementAndGet();
@@ -151,8 +159,8 @@ class ClientServerTest {
 
     @Test
     void managedConnectionHeartbeatTimeoutClosesConnection() throws Exception {
-        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.atomic.AtomicInteger pings = new java.util.concurrent.atomic.AtomicInteger();
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger pings = new AtomicInteger();
         try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
                 if (Opcode.fromCode(req.opcode()) == Opcode.PING) {
                     if (pings.incrementAndGet() > 1) {
@@ -194,8 +202,8 @@ class ClientServerTest {
 
     @Test
     void managedConnectionDoesNotEvictPendingRequestAsIdle() throws Exception {
-        java.util.concurrent.CountDownLatch requestStarted = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.CountDownLatch releaseRequest = new java.util.concurrent.CountDownLatch(1);
+        CountDownLatch requestStarted = new CountDownLatch(1);
+        CountDownLatch releaseRequest = new CountDownLatch(1);
         try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
                 Opcode op = Opcode.fromCode(req.opcode());
                 if (op == Opcode.READ) {
@@ -243,7 +251,7 @@ class ClientServerTest {
             FileChannel channel = FileChannel.open(file, StandardOpenOption.READ);
             sentChannel.set(channel);
             return ScpServer.okFileRegion(req, Messages.okHeader(), channel, 2, 5, () -> {
-                try { channel.close(); } catch (java.io.IOException ignored) {}
+                try { channel.close(); } catch (IOException ignored) {}
             });
         };
 
@@ -271,7 +279,7 @@ class ClientServerTest {
 
     @Test
     void timedOutCallCleansUpItsPendingCorrelation() throws Exception {
-        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
         ScpServer.Handler hang = req -> {
             release.await(); // never answers until released
             return ScpServer.ok(req, Messages.okHeader(), null);
@@ -295,7 +303,7 @@ class ClientServerTest {
 
     @Test
     void timedOutPipelinedSendClosesConnection() throws Exception {
-        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
         ScpServer.Handler hang = req -> {
             release.await();
             return ScpServer.ok(req, Messages.okHeader(), null);
@@ -304,9 +312,9 @@ class ClientServerTest {
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
             try {
                 CompletableFuture<Frame> future = client.sendWithTimeout(Opcode.PING, emptyHeader(), null, 200);
-                var e = assertThrows(java.util.concurrent.ExecutionException.class,
-                        () -> future.get(30, java.util.concurrent.TimeUnit.SECONDS));
-                assertEquals(java.util.concurrent.TimeoutException.class, e.getCause().getClass());
+                var e = assertThrows(ExecutionException.class,
+                        () -> future.get(30, TimeUnit.SECONDS));
+                assertEquals(TimeoutException.class, e.getCause().getClass());
                 assertEquals(0, client.pendingCount(),
                         "timed-out pipelined request left its correlation entry behind");
                 assertEquals(true, client.isClosed(),
@@ -319,8 +327,8 @@ class ClientServerTest {
 
     @Test
     void closingConnectionDoesNotInterruptActiveServerRequest() throws Exception {
-        java.util.concurrent.CountDownLatch started = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
         AtomicBoolean interrupted = new AtomicBoolean(false);
         ScpServer.Handler blocked = req -> {
             started.countDown();
@@ -342,7 +350,7 @@ class ClientServerTest {
             assertFalse(interrupted.get(), "connection close must not interrupt active server storage work");
 
             release.countDown();
-            assertThrows(java.util.concurrent.ExecutionException.class,
+            assertThrows(ExecutionException.class,
                     () -> pending.get(30, TimeUnit.SECONDS));
         } finally {
             release.countDown();
@@ -352,7 +360,7 @@ class ClientServerTest {
     @Test
     void pipelinedSendAppliesAdmissionControlBeforeTimeoutWindowExplodes() throws Exception {
         int maxExpectedOutstanding = 1024;
-        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
         ScpServer.Handler blocked = req -> {
             release.await();
             return ScpServer.ok(req, Messages.okHeader(), null);
@@ -385,7 +393,7 @@ class ClientServerTest {
     @Test
     void serverRejectsRequestsBeyondConnectionAdmissionWindow() throws Exception {
         CompletableFuture<Frame> firstResponse = new CompletableFuture<>();
-        java.util.concurrent.CountDownLatch firstStarted = new java.util.concurrent.CountDownLatch(1);
+        CountDownLatch firstStarted = new CountDownLatch(1);
         AtomicReference<Frame> firstRequest = new AtomicReference<>();
         ScpServer.Handler blocked = new ScpServer.Handler() {
             @Override
@@ -511,7 +519,7 @@ class ClientServerTest {
             assertEquals(1, request.ownerRefCnt());
 
             server.close();
-            var e = assertThrows(java.util.concurrent.ExecutionException.class,
+            var e = assertThrows(ExecutionException.class,
                     () -> pending.get(30, TimeUnit.SECONDS));
             assertEquals(IOException.class, e.getCause().getClass());
             waitFor(() -> request.ownerRefCnt() == 0);
@@ -527,8 +535,8 @@ class ClientServerTest {
         // then the connection closes BEFORE handleRequest adds the request to inFlightAsyncRequests, so
         // channelInactive drains the still-empty set. The request buffer must still be released, not
         // orphaned until the (possibly-never-completed) future fires. A seam forces that ordering.
-        java.util.concurrent.CountDownLatch reachedSeam = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.CountDownLatch proceed = new java.util.concurrent.CountDownLatch(1);
+        CountDownLatch reachedSeam = new CountDownLatch(1);
+        CountDownLatch proceed = new CountDownLatch(1);
         CompletableFuture<Frame> delayed = new CompletableFuture<>(); // intentionally never completed
         AtomicReference<Frame> serverReq = new AtomicReference<>();
         ScpServer.Handler handler = new ScpServer.Handler() {
@@ -561,7 +569,7 @@ class ClientServerTest {
 
             // The orphaned request buffer must still be released (claimed by the post-add re-check).
             waitFor(() -> req.ownerRefCnt() == 0);
-            assertThrows(java.util.concurrent.ExecutionException.class,
+            assertThrows(ExecutionException.class,
                     () -> pending.get(30, TimeUnit.SECONDS));
         } finally {
             FailureInjector.reset();
@@ -586,7 +594,7 @@ class ClientServerTest {
                 req -> ScpServer.ok(req, Messages.okHeader(), null));
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
             CompletableFuture<Frame> invalid = client.send(null, null, null);
-            var e = assertThrows(java.util.concurrent.ExecutionException.class, invalid::get);
+            var e = assertThrows(ExecutionException.class, invalid::get);
             assertEquals(ErrorCode.UNKNOWN_OPCODE, ((ScpException) e.getCause()).code());
             assertEquals(0, client.pendingCount());
             assertEquals(false, client.isClosed());
@@ -615,7 +623,7 @@ class ClientServerTest {
 
             CompletableFuture<Frame> failed = client.send(Opcode.PING, emptyHeader(), null);
 
-            var e = assertThrows(java.util.concurrent.ExecutionException.class, failed::get);
+            var e = assertThrows(ExecutionException.class, failed::get);
             assertEquals(IOException.class, e.getCause().getClass());
             assertEquals(0, client.pendingCount());
         }
@@ -628,7 +636,7 @@ class ClientServerTest {
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
             CompletableFuture<Frame> failed = client.send(Opcode.PING, new byte[0x1_0000], null);
 
-            var e = assertThrows(java.util.concurrent.ExecutionException.class, failed::get);
+            var e = assertThrows(ExecutionException.class, failed::get);
             assertEquals(IOException.class, e.getCause().getClass());
             assertTrue(e.getCause().getMessage().contains("header too large"));
             assertEquals(0, client.pendingCount());
@@ -644,7 +652,7 @@ class ClientServerTest {
 
             CompletableFuture<Frame> failed = client.send(Opcode.PING, emptyHeader(), null);
 
-            var e = assertThrows(java.util.concurrent.ExecutionException.class, failed::get);
+            var e = assertThrows(ExecutionException.class, failed::get);
             assertEquals(IOException.class, e.getCause().getClass());
             assertTrue(e.getCause().getMessage().contains("sync write failed"));
             assertEquals(0, client.pendingCount());
@@ -673,7 +681,7 @@ class ClientServerTest {
                     ScpClient.KIND_TOOL, "t")) {
                 CompletableFuture<Frame> failed = client.send(Opcode.PING, emptyHeader(), null);
 
-                var e = assertThrows(java.util.concurrent.ExecutionException.class, failed::get);
+                var e = assertThrows(ExecutionException.class, failed::get);
                 assertEquals(IOException.class, e.getCause().getClass());
                 assertTrue(e.getCause().getMessage().contains("connection closed"));
                 assertEquals(0, client.pendingCount());
@@ -684,7 +692,7 @@ class ClientServerTest {
 
     @Test
     void interruptedCallFrameRestoresInterruptAndCleansPendingCorrelation() throws Exception {
-        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
         ScpServer.Handler hang = req -> {
             release.await();
             return ScpServer.ok(req, Messages.okHeader(), null);

@@ -11,6 +11,7 @@ import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
 import io.strata.format.ChunkStore;
 import io.strata.format.ChunkStoreConfig;
+import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -18,12 +19,14 @@ import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -463,7 +466,7 @@ class ControlLoopTest {
             // Simulate a chunk mid-creation: add to the NsChunkId set via reflection.
             Set<Object> creating = getField(node.store(), "creating");
             Class<?> nsChunkIdClass = Class.forName("io.strata.common.NsChunkId");
-            java.lang.reflect.Constructor<?> ctor =
+            Constructor<?> ctor =
                     nsChunkIdClass.getDeclaredConstructor(StrataNamespace.class, ChunkId.class);
             ctor.setAccessible(true);
             creating.add(ctor.newInstance(TEST_NS, id));
@@ -518,7 +521,7 @@ class ControlLoopTest {
             ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
 
             int cap = q.remainingCapacity();
-            java.util.List<Messages.Command> fill = new java.util.ArrayList<>();
+            List<Messages.Command> fill = new ArrayList<>();
             for (int i = 0; i < cap; i++) fill.add(new Messages.DrainCmd(1000 + i));
             loop.acceptCommands(fill);
             assertEquals(cap, q.size(), "the bounded queue should fill exactly to capacity");
@@ -868,7 +871,7 @@ class ControlLoopTest {
         // Verify that DataNode passes config.chunkStoreConfig() to ChunkStore so that
         // maxRequestBytes is respected. A custom cap of 4 bytes must truncate a 10-byte read.
         int cap = 4;
-        io.strata.format.ChunkStoreConfig smallCap = io.strata.format.ChunkStoreConfig.DEFAULT.withMaxRequestBytes(cap);
+        ChunkStoreConfig smallCap = ChunkStoreConfig.DEFAULT.withMaxRequestBytes(cap);
         DataNodeConfig cfg = DataNodeConfig.standalone(dir).withChunkStoreConfig(smallCap);
         try (DataNode node = new DataNode(cfg)) {
             ChunkStore store = node.store();
@@ -969,7 +972,7 @@ class ControlLoopTest {
 
     @FunctionalInterface
     private interface FetchResponder {
-        io.strata.proto.Frame respond(io.strata.proto.Frame req);
+        Frame respond(Frame req);
     }
 
     @SuppressWarnings("unchecked")

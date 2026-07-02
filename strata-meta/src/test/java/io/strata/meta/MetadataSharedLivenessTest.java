@@ -16,6 +16,7 @@ import java.net.ServerSocket;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -135,8 +136,8 @@ class MetadataSharedLivenessTest {
 
     /** A data node that registers and heartbeats but executes nothing. */
     private static final class FakeDataNode {
-        private static final java.util.concurrent.atomic.AtomicInteger ID_SEQ =
-                new java.util.concurrent.atomic.AtomicInteger(1);
+        private static final AtomicInteger ID_SEQ =
+                new AtomicInteger(1);
         private final UUID inc = UUID.randomUUID();
         private final int assignedNodeId = ID_SEQ.getAndIncrement();
         private final String host;

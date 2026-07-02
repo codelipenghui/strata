@@ -14,7 +14,9 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -88,8 +90,8 @@ class RecoveryCatchUpTest {
                     Resp.check(h);
                     byte[] bytes = new byte[frame.payloadLength()];
                     frame.payloadSlice().get(bytes);
-                    hashes.add(java.util.HexFormat.of().formatHex(
-                            java.security.MessageDigest.getInstance("SHA-256").digest(bytes)));
+                    hashes.add(HexFormat.of().formatHex(
+                            MessageDigest.getInstance("SHA-256").digest(bytes)));
                 }
             }
             assertEquals(1, hashes.size(), "replicas must be byte-identical after recovery");

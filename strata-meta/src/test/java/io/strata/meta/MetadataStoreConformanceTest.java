@@ -7,6 +7,7 @@ import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 import org.junit.jupiter.api.Test;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -436,7 +437,7 @@ abstract class MetadataStoreConformanceTest {
 
     private static Set<FileId> fileIds(MetadataStore store) throws Exception {
         // cluster-wide file set = per-namespace listing composed over all namespaces
-        java.util.Set<FileId> out = new java.util.HashSet<>();
+        Set<FileId> out = new HashSet<>();
         for (StrataNamespace ns : store.listNamespaces()) {
             out.addAll(store.listFiles(ns));
         }

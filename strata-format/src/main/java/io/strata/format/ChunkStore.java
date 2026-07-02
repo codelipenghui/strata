@@ -1,5 +1,6 @@
 package io.strata.format;
 
+import com.sun.management.UnixOperatingSystemMXBean;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.Closeables;
@@ -15,6 +16,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.management.ManagementFactory;
+import java.lang.management.OperatingSystemMXBean;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -22,9 +24,13 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -32,14 +38,16 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 import java.util.zip.CRC32C;
 
 import static io.strata.common.Checks.checkedAdd;
+import static io.strata.common.Fsync.forceDirectory;
 import static io.strata.format.ChunkFormats.DATA_START;
 import static io.strata.format.ChunkFormats.HEADER_SIZE;
-import static io.strata.common.Fsync.forceDirectory;
 import static io.strata.format.ChunkFormats.TRAILER_SIZE;
 import static io.strata.format.ChunkFormats.readFully;
 import static io.strata.format.ChunkFormats.writeFully;
@@ -65,26 +73,26 @@ public final class ChunkStore implements AutoCloseable {
     private final Map<NsChunkId, Handle> chunks = new ConcurrentHashMap<>();
     private final ChannelCache channelCache;
     private final Set<NsChunkId> creating = ConcurrentHashMap.newKeySet();
-    private final java.util.concurrent.atomic.AtomicLong forceCount =
-            new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong appendOps =
-            new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong appendBytes =
-            new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong readOps =
-            new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong readBytes =
-            new java.util.concurrent.atomic.AtomicLong();
+    private final AtomicLong forceCount =
+            new AtomicLong();
+    private final AtomicLong appendOps =
+            new AtomicLong();
+    private final AtomicLong appendBytes =
+            new AtomicLong();
+    private final AtomicLong readOps =
+            new AtomicLong();
+    private final AtomicLong readBytes =
+            new AtomicLong();
     // Per-namespace [appendOps, appendBytes, readOps, readBytes] for the namespace dashboard. A map of
     // LongAdder quads — the data-path cost is one lock-free lookup + adder increment. The global counters
     // above stay as the cluster rollup; ServerMetrics exports the per-namespace view and derives the fleet
     // line as sum without(namespace).
-    private final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.LongAdder[]> nsIo =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    private final java.util.concurrent.atomic.AtomicLong backgroundFlushes =
-            new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong sealedLedgerReclaims =
-            new java.util.concurrent.atomic.AtomicLong();
+    private final ConcurrentHashMap<String, LongAdder[]> nsIo =
+            new ConcurrentHashMap<>();
+    private final AtomicLong backgroundFlushes =
+            new AtomicLong();
+    private final AtomicLong sealedLedgerReclaims =
+            new AtomicLong();
 
     // Background writeback: a daemon periodically fsyncs OPEN, non-ack-on-fsync chunks that have
     // accumulated enough new data since their last flush, so the dirty-page backlog never grows to a
@@ -140,7 +148,7 @@ public final class ChunkStore implements AutoCloseable {
         String raw = System.getProperty(property);
         if (raw == null) raw = System.getenv(env);
         if (raw == null || raw.isBlank()) return def;
-        return switch (raw.trim().toLowerCase(java.util.Locale.ROOT)) {
+        return switch (raw.trim().toLowerCase(Locale.ROOT)) {
             case "true", "1", "yes", "y", "on" -> true;
             case "false", "0", "no", "n", "off" -> false;
             default -> {
@@ -157,8 +165,8 @@ public final class ChunkStore implements AutoCloseable {
      */
     static int defaultChannelCacheCapacity() {
         long max = -1;
-        java.lang.management.OperatingSystemMXBean os = ManagementFactory.getOperatingSystemMXBean();
-        if (os instanceof com.sun.management.UnixOperatingSystemMXBean unix) {
+        OperatingSystemMXBean os = ManagementFactory.getOperatingSystemMXBean();
+        if (os instanceof UnixOperatingSystemMXBean unix) {
             max = unix.getMaxFileDescriptorCount();
         }
         if (max <= 0) {
@@ -171,8 +179,8 @@ public final class ChunkStore implements AutoCloseable {
 
     /** Live process open file-descriptor count for observability; {@code -1} when unavailable. */
     public long openFds() {
-        java.lang.management.OperatingSystemMXBean os = ManagementFactory.getOperatingSystemMXBean();
-        if (os instanceof com.sun.management.UnixOperatingSystemMXBean unix) {
+        OperatingSystemMXBean os = ManagementFactory.getOperatingSystemMXBean();
+        if (os instanceof UnixOperatingSystemMXBean unix) {
             return unix.getOpenFileDescriptorCount();
         }
         return -1;
@@ -258,28 +266,28 @@ public final class ChunkStore implements AutoCloseable {
         return readBytes.get();
     }
 
-    private java.util.concurrent.atomic.LongAdder[] nsIoFor(StrataNamespace ns) {
-        return nsIo.computeIfAbsent(ns.value(), k -> new java.util.concurrent.atomic.LongAdder[]{
-                new java.util.concurrent.atomic.LongAdder(), new java.util.concurrent.atomic.LongAdder(),
-                new java.util.concurrent.atomic.LongAdder(), new java.util.concurrent.atomic.LongAdder()});
+    private LongAdder[] nsIoFor(StrataNamespace ns) {
+        return nsIo.computeIfAbsent(ns.value(), k -> new LongAdder[]{
+                new LongAdder(), new LongAdder(),
+                new LongAdder(), new LongAdder()});
     }
 
     /** Per-namespace [appendOps, appendBytes, readOps, readBytes] snapshot for the namespace dashboard. */
-    public java.util.Map<String, long[]> namespaceIoStats() {
-        java.util.Map<String, long[]> out = new java.util.HashMap<>(nsIo.size());
+    public Map<String, long[]> namespaceIoStats() {
+        Map<String, long[]> out = new HashMap<>(nsIo.size());
         nsIo.forEach((ns, a) -> out.put(ns, new long[]{a[0].sum(), a[1].sum(), a[2].sum(), a[3].sum()}));
         return out;
     }
 
     /** Namespaces that have seen I/O — drives lazy per-namespace meter registration (no snapshot alloc). */
-    public java.util.Set<String> ioNamespaces() {
+    public Set<String> ioNamespaces() {
         return nsIo.keySet();
     }
 
     /** One per-namespace I/O counter (index: 0 appendOps, 1 appendBytes, 2 readOps, 3 readBytes); 0 if absent.
      *  O(1) — bound per Micrometer FunctionCounter so each scrape is a single {@code LongAdder.sum()}. */
     public long ioValue(String namespace, int index) {
-        java.util.concurrent.atomic.LongAdder[] a = nsIo.get(namespace);
+        LongAdder[] a = nsIo.get(namespace);
         return a == null ? 0L : a[index].sum();
     }
 
@@ -597,7 +605,7 @@ public final class ChunkStore implements AutoCloseable {
             }
         }
 
-        void startCommitterIfFsync(java.util.concurrent.atomic.AtomicLong counter) {
+        void startCommitterIfFsync(AtomicLong counter) {
             if (header.fsyncOnAck()) {
                 committer = new GroupCommitter(id.toString(), () -> {
                     // both must be durable before acking; either alone is safe for recovery
@@ -834,7 +842,7 @@ public final class ChunkStore implements AutoCloseable {
      * returned future completes when the append is durable per the chunk's ack policy —
      * immediately for ack-on-replicate, after a covering group-commit force for ack-on-fsync.
      */
-    public java.util.concurrent.CompletableFuture<AppendResult> appendAsync(
+    public CompletableFuture<AppendResult> appendAsync(
             StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset,
             ByteBuffer payload, int payloadCrc) throws IOException {
         Handle h = lookup(ns, id);
@@ -867,7 +875,7 @@ public final class ChunkStore implements AutoCloseable {
             h.lastKnownDO = Math.max(h.lastKnownDO, Math.min(durableOffset, h.end));
             len = payload.remaining();
             if (len == 0) {
-                return java.util.concurrent.CompletableFuture.completedFuture(new AppendResult(h.end)); // DO beacon
+                return CompletableFuture.completedFuture(new AppendResult(h.end)); // DO beacon
             }
             newEnd = checkedAdd(baseOffset, len, "chunk offset");
             long writePos = checkedAdd(DATA_START, baseOffset, "chunk file offset");
@@ -900,14 +908,14 @@ public final class ChunkStore implements AutoCloseable {
                     msBetween(tLock, tRunningCrc), msBetween(t0, tUnlock));
         }
         if (committer == null) {
-            return java.util.concurrent.CompletableFuture.completedFuture(new AppendResult(newEnd));
+            return CompletableFuture.completedFuture(new AppendResult(newEnd));
         }
         long end = newEnd;
         return committer.awaitFlush(end).thenApply(v -> new AppendResult(end));
     }
 
     /** Convenience for tests/simple callers without a precomputed digest: computes it then delegates. */
-    public java.util.concurrent.CompletableFuture<AppendResult> appendAsync(
+    public CompletableFuture<AppendResult> appendAsync(
             StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset, ByteBuffer payload)
             throws IOException {
         return appendAsync(ns, id, epoch, baseOffset, durableOffset, payload,
@@ -919,7 +927,7 @@ public final class ChunkStore implements AutoCloseable {
                                ByteBuffer payload) throws IOException {
         try {
             return appendAsync(ns, id, epoch, baseOffset, durableOffset, payload).join();
-        } catch (java.util.concurrent.CompletionException e) {
+        } catch (CompletionException e) {
             if (e.getCause() instanceof ScpException se) throw se;
             throw new ScpException(ErrorCode.INTERNAL, String.valueOf(e.getCause()));
         }

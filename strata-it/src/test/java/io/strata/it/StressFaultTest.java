@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Random;
+import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -84,7 +85,7 @@ class StressFaultTest {
 
     private static List<FaultRun> selectedRuns(long baseSeed, String caseFilter) {
         if (caseFilter == null || caseFilter.isBlank() || "all".equalsIgnoreCase(caseFilter)) {
-            return java.util.stream.IntStream.range(0, FAULT_CASES.size())
+            return IntStream.range(0, FAULT_CASES.size())
                     .mapToObj(i -> new FaultRun(FAULT_CASES.get(i), baseSeed + i * CASE_SEED_STEP))
                     .toList();
         }

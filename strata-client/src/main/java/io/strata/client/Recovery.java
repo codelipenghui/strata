@@ -4,8 +4,10 @@ import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
+import io.strata.common.FileId;
 import io.strata.common.FileState;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
@@ -15,6 +17,7 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -45,15 +48,15 @@ final class Recovery {
     private final NodePool appendPool;
     private final NodePool readPool;
     private final ClientConfig config;
-    private final io.strata.common.StrataNamespace namespace;
+    private final StrataNamespace namespace;
 
     Recovery(ControllerClient controller, NodePool pool, ClientConfig config,
-             io.strata.common.StrataNamespace namespace) {
+             StrataNamespace namespace) {
         this(controller, pool, pool, config, namespace);
     }
 
     Recovery(ControllerClient controller, NodePool appendPool, NodePool readPool, ClientConfig config,
-             io.strata.common.StrataNamespace namespace) {
+             StrataNamespace namespace) {
         this.controller = controller;
         this.appendPool = appendPool;
         this.readPool = readPool;
@@ -76,7 +79,7 @@ final class Recovery {
         }
     }
 
-    StrataFile.SealInfo recoverAndSeal(io.strata.common.FileId fileId) {
+    StrataFile.SealInfo recoverAndSeal(FileId fileId) {
         Messages.LookupFileResp file = controller.lookupFile(namespace, fileId);
         boolean needsRecovery = file.chunks().stream().anyMatch(c -> c.state() != ChunkState.SEALED);
         int writerEpoch = 0;
@@ -87,12 +90,12 @@ final class Recovery {
         return recoverAndSeal(fileId, file, writerEpoch);
     }
 
-    StrataFile.SealInfo recoverAndSeal(io.strata.common.FileId fileId, int writerEpoch) {
+    StrataFile.SealInfo recoverAndSeal(FileId fileId, int writerEpoch) {
         Messages.LookupFileResp file = controller.lookupFile(namespace, fileId);
         return recoverAndSeal(fileId, file, writerEpoch);
     }
 
-    private StrataFile.SealInfo recoverAndSeal(io.strata.common.FileId fileId,
+    private StrataFile.SealInfo recoverAndSeal(FileId fileId,
                                                Messages.LookupFileResp file,
                                                int writerEpoch) {
         if (file.fileState() == FileState.DELETING.value) {
@@ -310,7 +313,7 @@ final class Recovery {
             byte[] held = readRange(chunkId, rs, p, overlapEnd);
             if (held == null) continue; // an unreadable replica is not positive evidence of divergence
             int len = (int) (overlapEnd - p);
-            if (!java.util.Arrays.equals(held, 0, len, candidate.bytes(), 0, len)) {
+            if (!Arrays.equals(held, 0, len, candidate.bytes(), 0, len)) {
                 return true;
             }
         }
@@ -339,7 +342,7 @@ final class Recovery {
             }
             boolean merged = false;
             for (CandidateCount candidate : counts) {
-                if (java.util.Arrays.equals(candidate.bytes, data)) {
+                if (Arrays.equals(candidate.bytes, data)) {
                     if (++candidate.count >= ackQuorum) {
                         return new Agreed(candidate.bytes, true);
                     }
@@ -404,7 +407,7 @@ final class Recovery {
                 continue;
             }
             for (CandidateCount candidate : counts) {
-                if (java.util.Arrays.equals(candidate.bytes, data)) {
+                if (Arrays.equals(candidate.bytes, data)) {
                     candidate.count++;
                     if (candidate.count >= ackQuorum) {
                         return candidate.bytes;

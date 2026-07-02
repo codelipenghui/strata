@@ -4,6 +4,7 @@ import io.strata.common.StrataNamespace;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -86,7 +87,7 @@ final class NamespaceLogMetrics {
     }
 
     /** Namespaces with recorded activity — drives lazy per-namespace meter registration (no snapshot alloc). */
-    java.util.Set<String> namespaces() {
+    Set<String> namespaces() {
         return byNs.keySet();
     }
 

@@ -16,6 +16,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 /**
  * Registers Strata's domain metrics on the meter registry by wiring Micrometer gauges/counters to
@@ -133,14 +134,14 @@ final class ServerMetrics {
             Map<String, long[]> stats = s.namespaceStats();
             files.register(stats.entrySet().stream()
                     .map(e -> MultiGauge.Row.of(Tags.of("namespace", e.getKey()), e.getValue()[0]))
-                    .collect(java.util.stream.Collectors.toList()), true);
+                    .collect(Collectors.toList()), true);
             logBytes.register(stats.entrySet().stream()
                     .map(e -> MultiGauge.Row.of(Tags.of("namespace", e.getKey()), e.getValue()[1]))
-                    .collect(java.util.stream.Collectors.toList()), true);
+                    .collect(Collectors.toList()), true);
             String self = s.localControllerEndpoint();
             owner.register(stats.keySet().stream()
                     .map(ns -> MultiGauge.Row.of(Tags.of("namespace", ns, "owner", self), 1))
-                    .collect(java.util.stream.Collectors.toList()), true);
+                    .collect(Collectors.toList()), true);
             registerNewControllerNamespaceCounters(reg, s);
         }, 0, refreshIntervalMs, TimeUnit.MILLISECONDS);
     }

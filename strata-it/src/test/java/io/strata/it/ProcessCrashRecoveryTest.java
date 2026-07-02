@@ -4,6 +4,7 @@ import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.ChunkId;
+import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
@@ -338,7 +339,7 @@ class ProcessCrashRecoveryTest {
                             Messages.LookupFileResp beforeCrash =
                                     ConsistencyVerifier.assertLiveFileDescriptorConsistent(cluster, fileId);
                             Messages.ChunkInfo openChunk = latestChunk(fileId);
-                            assertEquals(io.strata.common.ChunkState.OPEN, openChunk.state());
+                            assertEquals(ChunkState.OPEN, openChunk.state());
                             artifact.add("liveDescriptorVerifiedBeforeCrash=true",
                                     "openChunkBeforeCrash=" + openChunk.chunkId());
                             artifact.addDescriptor("beforeCrashDescriptor", beforeCrash);

@@ -1,6 +1,7 @@
 package io.strata.proto;
 
 import io.strata.common.ChunkId;
+import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
@@ -14,6 +15,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.HexFormat;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -49,7 +51,7 @@ class FrameGoldenTest {
                 // payloadLength 2
                 + "00000002"
                 // payloadCrc32c of DE AD
-                + HexFormat.of().toHexDigits(io.strata.common.Crc.of(new byte[]{(byte) 0xDE, (byte) 0xAD}))
+                + HexFormat.of().toHexDigits(Crc.of(new byte[]{(byte) 0xDE, (byte) 0xAD}))
                 // headerLength 38 = chunkId 12 (fileId 8 + index 4) + epoch 4 + base 8 + do 8 + namespace 5 + tags 1
                 + "0026"
                 // header: chunkId(fileId 8B + index 4B), epoch 5, baseOffset 100, durableOffset 50, namespace "test", empty tags
@@ -99,7 +101,7 @@ class FrameGoldenTest {
         BufWriter w = new BufWriter();
         FileId f = FileId.of(1);
         w.chunkId(new ChunkId(f, 0)).i32(1).u64(0).u64(0).string("test");
-        TaggedFields.of(java.util.Map.of(99, new byte[]{1, 2, 3})).writeTo(w);
+        TaggedFields.of(Map.of(99, new byte[]{1, 2, 3})).writeTo(w);
         var decoded = Messages.Append.decode(ByteBuffer.wrap(w.toBytes()));
         assertEquals(new Messages.Append(new ChunkId(f, 0), 1, 0, 0, StrataNamespace.of("test")), decoded);
     }

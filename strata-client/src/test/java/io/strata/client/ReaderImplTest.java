@@ -13,7 +13,9 @@ import io.strata.proto.Opcode;
 import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.lang.reflect.Field;
+import java.net.ServerSocket;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
@@ -283,7 +285,7 @@ class ReaderImplTest {
         }
     }
 
-    private static byte[] drain(java.nio.ByteBuffer b) {
+    private static byte[] drain(ByteBuffer b) {
         byte[] a = new byte[b.remaining()];
         b.get(a);
         return a;
@@ -341,8 +343,8 @@ class ReaderImplTest {
         }
     }
 
-    private static String unusedEndpoint() throws java.io.IOException {
-        try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
+    private static String unusedEndpoint() throws IOException {
+        try (ServerSocket s = new ServerSocket(0)) {
             return "127.0.0.1:" + s.getLocalPort(); // closed on return -> port refuses connections
         }
     }

@@ -3,15 +3,20 @@ package io.strata.it;
 import io.strata.client.ClientConfig;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
+import io.strata.common.ChunkId;
 import io.strata.common.FileId;
+import io.strata.common.FileState;
 import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
+import io.strata.meta.ZkMetadataStore;
+import io.strata.node.DataNode;
 import io.strata.proto.Messages;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 
+import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -123,9 +128,9 @@ class MultiNamespaceEndToEndTest {
         // Verify chunk paths: for FileId(0) the layout is <ns>/00/00/0000000000000000.0
         // The expected path fragment validates the Task-6 namespace-sharded disk layout.
         String expectedSuffix0 = ChunkFormats.chunkRelativePath(ns0,
-                new io.strata.common.ChunkId(FileId.of(0), 0)) + ".chunk";
+                new ChunkId(FileId.of(0), 0)) + ".chunk";
         String expectedSuffix1 = ChunkFormats.chunkRelativePath(ns1,
-                new io.strata.common.ChunkId(FileId.of(0), 0)) + ".chunk";
+                new ChunkId(FileId.of(0), 0)) + ".chunk";
         // ns-t1-0/00/00/0000000000000000.0.chunk
         assertTrue(expectedSuffix0.startsWith("ns-t1-0/00/00/"),
                 "path " + expectedSuffix0 + " must start with ns-t1-0/00/00/");
@@ -178,8 +183,8 @@ class MultiNamespaceEndToEndTest {
         // Allow a brief moment for the node to re-register and become active.
         long deadline = System.currentTimeMillis() + 15_000;
         while (System.currentTimeMillis() < deadline) {
-            try (io.strata.meta.ZkMetadataStore zk =
-                         new io.strata.meta.ZkMetadataStore(cluster.zk.getConnectString())) {
+            try (ZkMetadataStore zk =
+                         new ZkMetadataStore(cluster.zk.getConnectString())) {
                 if (zk.listNodes().size() >= 3) break;
             }
             Thread.sleep(100);
@@ -193,9 +198,9 @@ class MultiNamespaceEndToEndTest {
         Messages.LookupFileResp lookup1 =
                 ConsistencyVerifier.lookupFile(cluster.metaEndpoints(), ns1, fileId1);
 
-        assertEquals(io.strata.common.FileState.SEALED.value, lookup0.fileState(),
+        assertEquals(FileState.SEALED.value, lookup0.fileState(),
                 "ns-t2-0 file must be SEALED after restart");
-        assertEquals(io.strata.common.FileState.SEALED.value, lookup1.fileState(),
+        assertEquals(FileState.SEALED.value, lookup1.fileState(),
                 "ns-t2-1 file must be SEALED after restart");
         assertFalse(lookup0.chunks().isEmpty(), "ns-t2-0 file must have at least one chunk");
         assertFalse(lookup1.chunks().isEmpty(), "ns-t2-1 file must have at least one chunk");
@@ -250,11 +255,11 @@ class MultiNamespaceEndToEndTest {
         byte[] data0 = makeData(4096, 31);
         byte[] data1 = makeData(4096, 37);
         try (StrataFile.Appender a = client.openById(ns0, fileId0).openForAppend()) {
-            a.append(java.nio.ByteBuffer.wrap(data0)).get();
+            a.append(ByteBuffer.wrap(data0)).get();
             a.seal();
         }
         try (StrataFile.Appender a = client.openById(ns1, fileId1).openForAppend()) {
-            a.append(java.nio.ByteBuffer.wrap(data1)).get();
+            a.append(ByteBuffer.wrap(data1)).get();
             a.seal();
         }
 
@@ -285,7 +290,7 @@ class MultiNamespaceEndToEndTest {
 
     private static byte[] readAll(StrataClient client, StrataNamespace ns, FileId fileId) {
         try (StrataFile.Reader reader = client.openById(ns, fileId).openForRead()) {
-            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
             long offset = 0;
             int idle = 0;
             while (idle < 3) {
@@ -319,10 +324,10 @@ class MultiNamespaceEndToEndTest {
     private static void assertChunkFileExists(MiniCluster cluster,
                                                StrataNamespace ns, FileId fileId, int index,
                                                String message) {
-        io.strata.common.ChunkId chunkId = new io.strata.common.ChunkId(fileId, index);
+        ChunkId chunkId = new ChunkId(fileId, index);
         String rel = ChunkFormats.chunkRelativePath(ns, chunkId) + ".chunk";
         boolean found = false;
-        for (io.strata.node.DataNode node : cluster.nodes) {
+        for (DataNode node : cluster.nodes) {
             // ChunkStore root = dataDir/chunks (see DataNode constructor)
             Path chunkStoreDir = node.config().dataDir().resolve("chunks");
             Path chunkPath = chunkStoreDir.resolve(rel);

@@ -1,6 +1,7 @@
 package io.strata.common;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 
 /** Unsigned LEB128 varint codec (tech design §10.2 conventions). */
 public final class Varint {
@@ -30,13 +31,13 @@ public final class Varint {
     }
 
     public static void writeString(ByteBuffer buf, String s) {
-        byte[] bytes = s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
         writeUnsigned(buf, bytes.length);
         buf.put(bytes);
     }
 
     public static String readString(ByteBuffer buf) {
-        return new String(readBytes(buf), java.nio.charset.StandardCharsets.UTF_8);
+        return new String(readBytes(buf), StandardCharsets.UTF_8);
     }
 
     public static void writeBytes(ByteBuffer buf, byte[] b) {

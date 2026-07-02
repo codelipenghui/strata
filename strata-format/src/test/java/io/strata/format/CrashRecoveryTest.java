@@ -7,6 +7,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -16,8 +17,9 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.stream.Stream;
+import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -303,7 +305,7 @@ class CrashRecoveryTest {
         // wrongly install SEALED and delete the sidecar/ledger. Recovery MUST keep the chunk OPEN.
         byte[] live = "live".getBytes();
         byte[] payload = footerShapedPayload(live);   // live + footer + trailer; fake trailer.dataLength == live.length
-        byte[] tail = java.util.Arrays.copyOfRange(payload, live.length, payload.length);
+        byte[] tail = Arrays.copyOfRange(payload, live.length, payload.length);
 
         ChunkStore store = new ChunkStore(dir);
         store.open(TEST_NS, id, true, 1, 1718000000000L);
@@ -375,8 +377,8 @@ class CrashRecoveryTest {
         store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("a".getBytes()));
         store.fence(TEST_NS, id, 9); // persists sidecar
         try (ChunkStore recovered = new ChunkStore(dir)) {
-            assertEquals(io.strata.common.ErrorCode.FENCED_EPOCH,
-                    org.junit.jupiter.api.Assertions.assertThrows(io.strata.common.ScpException.class,
+            assertEquals(ErrorCode.FENCED_EPOCH,
+                    Assertions.assertThrows(ScpException.class,
                             () -> recovered.append(TEST_NS, id, 8, 1, 0, ByteBuffer.wrap("b".getBytes()))).code());
             assertEquals(2, recovered.append(TEST_NS, id, 9, 1, 0, ByteBuffer.wrap("b".getBytes())).endOffset());
         }

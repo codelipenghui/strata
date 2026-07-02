@@ -1,5 +1,6 @@
 package io.strata.common;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Objects;
 
@@ -44,7 +45,7 @@ public record StrataPath(String value) implements Comparable<StrataPath> {
         if (raw.endsWith("/")) {
             throw new IllegalArgumentException("path must not end with '/': " + raw);
         }
-        byte[] pathBytes = raw.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] pathBytes = raw.getBytes(StandardCharsets.UTF_8);
         if (pathBytes.length > MAX_PATH_BYTES) {
             throw new IllegalArgumentException("path too long: " + pathBytes.length);
         }
@@ -69,7 +70,7 @@ public record StrataPath(String value) implements Comparable<StrataPath> {
         if (segment.equals("__file")) {
             throw new IllegalArgumentException("path segment is reserved: " + segment);
         }
-        int bytes = segment.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        int bytes = segment.getBytes(StandardCharsets.UTF_8).length;
         if (bytes > MAX_SEGMENT_BYTES) {
             throw new IllegalArgumentException("path segment too long: " + segment);
         }

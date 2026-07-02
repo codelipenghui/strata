@@ -4,6 +4,7 @@ import io.strata.common.FileId;
 import io.strata.common.FileState;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
+import org.apache.curator.test.TestingServer;
 
 import java.util.List;
 
@@ -20,12 +21,12 @@ final class NamespaceLogTestSupport {
     }
 
     /** A fresh ZooKeeper-backed root store (manifest/epoch capable). Caller closes the returned server. */
-    static org.apache.curator.test.TestingServer testingServer() throws Exception {
-        return new org.apache.curator.test.TestingServer(true);
+    static TestingServer testingServer() throws Exception {
+        return new TestingServer(true);
     }
 
     /** The root {@link MetadataStore} over {@code zk}, exactly as the conformance/repository tests build it. */
-    static ZkMetadataStore inMemoryRoot(org.apache.curator.test.TestingServer zk) throws Exception {
+    static ZkMetadataStore inMemoryRoot(TestingServer zk) throws Exception {
         return new ZkMetadataStore(zk.getConnectString());
     }
 

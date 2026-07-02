@@ -1,8 +1,5 @@
 package io.strata.meta;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
-
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.FileId;
@@ -10,6 +7,7 @@ import io.strata.common.FileState;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 import io.strata.proto.Messages;
+import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
@@ -17,9 +15,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 
-import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Lane B (event-driven repair): a node death surfaced by {@code expireScan()} must start targeted
@@ -291,7 +291,7 @@ class RepairCoordinatorEventTest {
 
         @Override
         public List<StrataNamespace> listNamespaces() {
-            java.util.TreeSet<StrataNamespace> namespaces = new java.util.TreeSet<>();
+            TreeSet<StrataNamespace> namespaces = new TreeSet<>();
             for (var v : files.values()) {
                 namespaces.add(v.value().namespace());
             }

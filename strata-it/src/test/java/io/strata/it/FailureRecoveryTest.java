@@ -7,8 +7,9 @@ import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.FileState;
-import io.strata.common.StrataNamespace;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
+import io.strata.node.DataNode;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -17,6 +18,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -174,8 +176,8 @@ class FailureRecoveryTest {
     @Test
     void openReaderDoesNotExposeSingleReplicaUncommittedTail() throws Exception {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/dirty-open-tail")).id();
-        byte[] acked = "acked-prefix".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        byte[] dirtyTail = "never-acked-tail".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] acked = "acked-prefix".getBytes(StandardCharsets.UTF_8);
+        byte[] dirtyTail = "never-acked-tail".getBytes(StandardCharsets.UTF_8);
 
         StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         try {
@@ -214,8 +216,8 @@ class FailureRecoveryTest {
     @Test
     void sealRecoveryDoesNotCommitSingleReplicaUncommittedTail() throws Exception {
         FileId fileId = client.create(StrataClient.FileSpec.log("test", "/recover-dirty-tail")).id();
-        byte[] acked = "acked-prefix".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        byte[] dirtyTail = "never-acked-tail".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] acked = "acked-prefix".getBytes(StandardCharsets.UTF_8);
+        byte[] dirtyTail = "never-acked-tail".getBytes(StandardCharsets.UTF_8);
 
         StrataFile.Appender appender = client.openById(StrataNamespace.of("test"), fileId).openForAppend();
         try {
@@ -442,7 +444,7 @@ class FailureRecoveryTest {
         assertEquals(3, e.detail());
 
         var after = lookupFile(fileId);
-        assertEquals(io.strata.common.ChunkState.OPEN,
+        assertEquals(ChunkState.OPEN,
                 after.chunks().get(after.chunks().size() - 1).state(),
                 "stale recovery must not seal metadata after seeing a higher replica fence");
 
@@ -481,7 +483,7 @@ class FailureRecoveryTest {
             workload.appendAcked(abandoned, 0, 160);
 
             var openChunk = latestChunk(fileId);
-            assertEquals(io.strata.common.ChunkState.OPEN, openChunk.state());
+            assertEquals(ChunkState.OPEN, openChunk.state());
             Set<Integer> restartedNodeIds = new HashSet<>();
             for (var replica : openChunk.replicas()) {
                 int nodeId = replica.nodeId();
@@ -666,7 +668,7 @@ class FailureRecoveryTest {
         }
     }
 
-    private void waitForNodeId(io.strata.node.DataNode node, int expectedNodeId) throws InterruptedException {
+    private void waitForNodeId(DataNode node, int expectedNodeId) throws InterruptedException {
         long deadline = System.currentTimeMillis() + 10_000;
         while (node.nodeId() != expectedNodeId && System.currentTimeMillis() < deadline) {
             Thread.sleep(50);

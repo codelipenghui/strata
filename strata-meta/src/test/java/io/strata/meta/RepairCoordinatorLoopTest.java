@@ -1,11 +1,16 @@
 package io.strata.meta;
 
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
+import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * The repair loop runs two lanes at different cadences: light in-memory housekeeping ({@code tick()})
@@ -98,14 +103,14 @@ class RepairCoordinatorLoopTest {
         }
 
         @Override
-        public java.util.Optional<Versioned<Records.FileRecord>> getFile(io.strata.common.StrataNamespace namespace, io.strata.common.FileId id) {
-            return java.util.Optional.empty();
+        public Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) {
+            return Optional.empty();
         }
 
         @Override
-        public java.util.Optional<io.strata.common.FileId> resolvePath(io.strata.common.StrataNamespace namespace,
-                                                                       io.strata.common.StrataPath path) {
-            return java.util.Optional.empty();
+        public Optional<FileId> resolvePath(StrataNamespace namespace,
+                                                                       StrataPath path) {
+            return Optional.empty();
         }
 
         @Override
@@ -114,23 +119,23 @@ class RepairCoordinatorLoopTest {
         }
 
         @Override
-        public boolean deletePath(io.strata.common.StrataNamespace namespace, io.strata.common.StrataPath path,
-                                  io.strata.common.FileId expectedFileId) {
+        public boolean deletePath(StrataNamespace namespace, StrataPath path,
+                                  FileId expectedFileId) {
             return true;
         }
 
         @Override
-        public boolean deleteFile(io.strata.common.StrataNamespace namespace, io.strata.common.FileId id, int expectedVersion) {
+        public boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) {
             return true;
         }
 
         @Override
-        public List<io.strata.common.FileId> listFiles(io.strata.common.StrataNamespace namespace) {
+        public List<FileId> listFiles(StrataNamespace namespace) {
             return List.of();
         }
 
         @Override
-        public List<io.strata.common.StrataNamespace> listNamespaces() {
+        public List<StrataNamespace> listNamespaces() {
             return List.of();
         }
 
@@ -140,8 +145,8 @@ class RepairCoordinatorLoopTest {
         }
 
         @Override
-        public java.util.Optional<Versioned<Records.NodeRecord>> getNode(int nodeId) {
-            return java.util.Optional.empty();
+        public Optional<Versioned<Records.NodeRecord>> getNode(int nodeId) {
+            return Optional.empty();
         }
 
         @Override

@@ -21,6 +21,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Predicate;
 
@@ -42,7 +43,7 @@ final class NodeRegistry {
         // (record, recordVersion) is a coupled invariant updated by a read-modify-write from the
         // repair-scan thread, heartbeat handler threads, and register. ReentrantLock (not
         // synchronized) so the ZK I/O inside the critical section does not pin a virtual thread.
-        final java.util.concurrent.locks.ReentrantLock lock = new java.util.concurrent.locks.ReentrantLock();
+        final ReentrantLock lock = new ReentrantLock();
         // Session gate serializes heartbeat validation/completion staging against same-node
         // re-registration without holding the state lock across metadata-store callbacks.
         final ReentrantReadWriteLock sessionGate = new ReentrantReadWriteLock();
@@ -114,8 +115,8 @@ final class NodeRegistry {
     }
 
     // ReentrantLock, not synchronized: registration does ZK I/O and runs on server virtual threads
-    private final java.util.concurrent.locks.ReentrantLock registerLock =
-            new java.util.concurrent.locks.ReentrantLock();
+    private final ReentrantLock registerLock =
+            new ReentrantLock();
 
     /**
      * True while a REGISTERED node is still within its dead-grace window (lease not yet expired past

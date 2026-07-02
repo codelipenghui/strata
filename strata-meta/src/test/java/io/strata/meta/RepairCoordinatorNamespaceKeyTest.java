@@ -5,6 +5,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.FileId;
 import io.strata.common.FileState;
 import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 import io.strata.proto.Messages;
 import org.junit.jupiter.api.Test;
 
@@ -13,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -55,11 +57,11 @@ class RepairCoordinatorNamespaceKeyTest {
 
         // Both namespaces have FileId(0) under-replicated (RF=2, only 1 live replica each)
         FileId collidingId = FileId.of(0);
-        store.createFile(new Records.FileRecord(collidingId, NS_A, io.strata.common.StrataPath.of("/file-a"),
+        store.createFile(new Records.FileRecord(collidingId, NS_A, StrataPath.of("/file-a"),
                 3, 2, false, FileState.SEALED, 1234,
                 List.of(new Records.ChunkRecord(0, ChunkState.SEALED, 100, 1001, 1,
                         List.of(r1.nodeId())))));
-        store.createFile(new Records.FileRecord(collidingId, NS_B, io.strata.common.StrataPath.of("/file-b"),
+        store.createFile(new Records.FileRecord(collidingId, NS_B, StrataPath.of("/file-b"),
                 3, 2, false, FileState.SEALED, 1234,
                 List.of(new Records.ChunkRecord(0, ChunkState.SEALED, 200, 2002, 1,
                         List.of(r2.nodeId())))));
@@ -110,7 +112,7 @@ class RepairCoordinatorNamespaceKeyTest {
         }
 
         @Override
-        public Optional<FileId> resolvePath(StrataNamespace namespace, io.strata.common.StrataPath path) {
+        public Optional<FileId> resolvePath(StrataNamespace namespace, StrataPath path) {
             return Optional.empty();
         }
 
@@ -124,7 +126,7 @@ class RepairCoordinatorNamespaceKeyTest {
         }
 
         @Override
-        public boolean deletePath(StrataNamespace namespace, io.strata.common.StrataPath path, FileId expectedFileId) {
+        public boolean deletePath(StrataNamespace namespace, StrataPath path, FileId expectedFileId) {
             return true;
         }
 
@@ -149,7 +151,7 @@ class RepairCoordinatorNamespaceKeyTest {
 
         @Override
         public List<StrataNamespace> listNamespaces() {
-            java.util.TreeSet<StrataNamespace> ns = new java.util.TreeSet<>();
+            TreeSet<StrataNamespace> ns = new TreeSet<>();
             for (var e : files.values()) ns.add(e.value().namespace());
             return new ArrayList<>(ns);
         }

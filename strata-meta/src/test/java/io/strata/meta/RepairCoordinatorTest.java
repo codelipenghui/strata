@@ -1,12 +1,13 @@
 package io.strata.meta;
 
-import io.strata.common.ErrorCode;
-import io.strata.common.FileState;
 import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
-import io.strata.common.StrataNamespace;
+import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.FileState;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -21,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -870,7 +872,7 @@ class RepairCoordinatorTest {
 
         // nsA file in the store so scanOnce picks it up and populates inflight.
         store.createFile(new Records.FileRecord(sharedFileId, nsA,
-                io.strata.common.StrataPath.of("/da"), 3, 2, false,
+                StrataPath.of("/da"), 3, 2, false,
                 FileState.DELETING, 1,
                 List.of(sealed(0, 64, 0xAA, List.of(node.nodeId())))));
 
@@ -887,7 +889,7 @@ class RepairCoordinatorTest {
         // Drive driveDeletion for nsB with the SAME fileId and chunk index (identical ChunkId, different ns).
         // driveDeletion is private; call it reflectively, same pattern as issueReplicate above.
         Records.FileRecord fileBRecord = new Records.FileRecord(sharedFileId, nsB,
-                io.strata.common.StrataPath.of("/db"), 3, 2, false,
+                StrataPath.of("/db"), 3, 2, false,
                 FileState.DELETING, 1,
                 List.of(sealed(0, 64, 0xBB, List.of(node.nodeId()))));
         invokeDriveDeletion(coordinator, fileBRecord, 0 /* store version */);
@@ -1119,8 +1121,8 @@ class RepairCoordinatorTest {
         private final Map<FileId, Integer> getFileCalls = new LinkedHashMap<>();
         // a fileId that enumeration surfaces but getFile cannot resolve (orphan/race) lives under this
         // sentinel namespace, so per-namespace enumeration still exercises repair's skip-on-missing path
-        private static final io.strata.common.StrataNamespace ORPHAN_NS =
-                io.strata.common.StrataNamespace.of("orphan-listed");
+        private static final StrataNamespace ORPHAN_NS =
+                StrataNamespace.of("orphan-listed");
         private int failUpdateFileAttempts;
         private int failDeleteFileAttempts;
         private boolean throwOnGetFile;
@@ -1146,7 +1148,7 @@ class RepairCoordinatorTest {
         }
 
         @Override
-        public Optional<Versioned<Records.FileRecord>> getFile(io.strata.common.StrataNamespace namespace, FileId id) {
+        public Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) {
             getFileCalls.merge(id, 1, Integer::sum);
             if (throwOnGetFile) {
                 throw new IllegalStateException("getFile failure");
@@ -1162,8 +1164,8 @@ class RepairCoordinatorTest {
         }
 
         @Override
-        public Optional<FileId> resolvePath(io.strata.common.StrataNamespace namespace,
-                                            io.strata.common.StrataPath path) {
+        public Optional<FileId> resolvePath(StrataNamespace namespace,
+                                            StrataPath path) {
             return Optional.ofNullable(paths.get(new Name(namespace, path)));
         }
 
@@ -1183,7 +1185,7 @@ class RepairCoordinatorTest {
         }
 
         @Override
-        public boolean deletePath(io.strata.common.StrataNamespace namespace, io.strata.common.StrataPath path,
+        public boolean deletePath(StrataNamespace namespace, StrataPath path,
                                   FileId expectedFileId) {
             Name name = new Name(namespace, path);
             FileId current = paths.get(name);
@@ -1198,7 +1200,7 @@ class RepairCoordinatorTest {
         }
 
         @Override
-        public boolean deleteFile(io.strata.common.StrataNamespace namespace, FileId id, int expectedVersion) {
+        public boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) {
             Versioned<Records.FileRecord> current = files.get(id);
             if (current == null) {
                 return true;
@@ -1217,7 +1219,7 @@ class RepairCoordinatorTest {
         }
 
         @Override
-        public List<FileId> listFiles(io.strata.common.StrataNamespace namespace) {
+        public List<FileId> listFiles(StrataNamespace namespace) {
             if (throwOnListFiles) {
                 throw new IllegalStateException("listFiles failure");
             }
@@ -1234,11 +1236,11 @@ class RepairCoordinatorTest {
         }
 
         @Override
-        public List<io.strata.common.StrataNamespace> listNamespaces() {
+        public List<StrataNamespace> listNamespaces() {
             if (throwOnListFiles) {
                 throw new IllegalStateException("listFiles failure");
             }
-            java.util.TreeSet<io.strata.common.StrataNamespace> namespaces = new java.util.TreeSet<>();
+            TreeSet<StrataNamespace> namespaces = new TreeSet<>();
             for (var v : files.values()) {
                 namespaces.add(v.value().namespace());
             }
@@ -1280,5 +1282,5 @@ class RepairCoordinatorTest {
         }
     }
 
-    private record Name(io.strata.common.StrataNamespace namespace, io.strata.common.StrataPath path) {}
+    private record Name(StrataNamespace namespace, StrataPath path) {}
 }

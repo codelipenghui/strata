@@ -4,9 +4,11 @@ import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
@@ -16,7 +18,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -468,7 +472,7 @@ class ChunkStoreLockConcurrencyTest {
 
     private static ByteBuffer allBytes(int n, byte v) {
         byte[] b = new byte[n];
-        java.util.Arrays.fill(b, v);
+        Arrays.fill(b, v);
         return ByteBuffer.wrap(b);
     }
 
@@ -478,7 +482,7 @@ class ChunkStoreLockConcurrencyTest {
      * captured a throwable in {@code failure}.
      */
     private static void awaitNoFailure(Duration timeout, AtomicReference<Throwable> failure,
-                                       org.junit.jupiter.api.function.Executable body) {
+                                       Executable body) {
         assertTimeoutPreemptively(timeout, body);
         assertNull(failure.get(), () -> "a concurrent op failed: " + failure.get());
     }
@@ -486,8 +490,8 @@ class ChunkStoreLockConcurrencyTest {
     private static Object handleOf(ChunkStore store, ChunkId id) throws Exception {
         Field chunksField = ChunkStore.class.getDeclaredField("chunks");
         chunksField.setAccessible(true);
-        java.util.Map<?, ?> chunks = (java.util.Map<?, ?>) chunksField.get(store);
-        return chunks.get(new io.strata.common.NsChunkId(TEST_NS, id));
+        Map<?, ?> chunks = (Map<?, ?>) chunksField.get(store);
+        return chunks.get(new NsChunkId(TEST_NS, id));
     }
 
     private static void setBool(Object handle, String field, boolean v) throws Exception {

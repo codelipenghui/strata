@@ -1,6 +1,7 @@
 package io.strata.node;
 
 import io.strata.common.ConnectionPolicy;
+import io.strata.format.ChunkStoreConfig;
 import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
@@ -110,7 +111,7 @@ class DataNodeConfigTest {
         assertThrows(NullPointerException.class, () -> new DataNodeConfig(Path.of("data"), 0, "127.0.0.1",
                 null, List.of(), "zone", "rack", "host", 1, 1, null, -1,
                 6_000L, 3_000L, 6_000L, 5_000, 10_000, 4 * 1024 * 1024, 1, 50L,
-                io.strata.format.ChunkStoreConfig.DEFAULT));
+                ChunkStoreConfig.DEFAULT));
     }
 
     @Test
@@ -125,7 +126,7 @@ class DataNodeConfigTest {
         assertEquals(4 * 1024 * 1024, c.repairFetchBytes());
         assertEquals(1, c.deleteMaxConcurrent());
         assertEquals(50, c.deleteMinIntervalMs());
-        assertEquals(io.strata.format.ChunkStoreConfig.DEFAULT, c.chunkStoreConfig());
+        assertEquals(ChunkStoreConfig.DEFAULT, c.chunkStoreConfig());
     }
 
     @Test
@@ -145,7 +146,7 @@ class DataNodeConfigTest {
                 .withOrphanGraceMs(1000).withOrphanScanIntervalMs(500).withOrphanStartupGraceMs(1500)
                 .withOrphanConfirmTimeoutMs(2500).withControlCallTimeoutMs(8000).withRepairFetchBytes(1 << 20)
                 .withDeleteMaxConcurrent(2).withDeleteMinIntervalMs(25)
-                .withChunkStoreConfig(io.strata.format.ChunkStoreConfig.DEFAULT.withMaxRequestBytes(4096));
+                .withChunkStoreConfig(ChunkStoreConfig.DEFAULT.withMaxRequestBytes(4096));
         assertEquals(1000, c.orphanGraceMs());
         assertEquals(500, c.orphanScanIntervalMs());
         assertEquals(1500, c.orphanStartupGraceMs());

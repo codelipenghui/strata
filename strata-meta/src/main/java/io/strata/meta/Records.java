@@ -12,6 +12,7 @@ import io.strata.proto.BufWriter;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -43,7 +44,7 @@ public final class Records {
         if (Crc.of(bytes, 0, bodyLen) != expectedCrc) {
             throw new IllegalArgumentException("record crc mismatch");
         }
-        return java.util.Arrays.copyOf(bytes, bodyLen);
+        return Arrays.copyOf(bytes, bodyLen);
     }
 
     public enum NodeState {

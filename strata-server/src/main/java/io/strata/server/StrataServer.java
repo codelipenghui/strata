@@ -1,12 +1,13 @@
 package io.strata.server;
 
 import io.micrometer.core.instrument.MeterRegistry;
-import io.strata.meta.ControllerConfig;
+import io.strata.format.ChunkStoreConfig;
 import io.strata.meta.Controller;
+import io.strata.meta.ControllerConfig;
 import io.strata.metrics.MetricsServer;
 import io.strata.metrics.StrataMetrics;
-import io.strata.node.DataNodeConfig;
 import io.strata.node.DataNode;
+import io.strata.node.DataNodeConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -124,7 +125,7 @@ public final class StrataServer {
                 .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
                 .withDeleteMaxConcurrent(intEnv("STRATA_DELETE_MAX_CONCURRENT", 1))
                 .withDeleteMinIntervalMs(longEnv("STRATA_DELETE_MIN_INTERVAL_MS", 50))
-                .withChunkStoreConfig(new io.strata.format.ChunkStoreConfig(
+                .withChunkStoreConfig(new ChunkStoreConfig(
                         intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
                         longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
                         longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
@@ -206,7 +207,7 @@ public final class StrataServer {
                 .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
                 .withDeleteMaxConcurrent(intEnv("STRATA_DELETE_MAX_CONCURRENT", 1))
                 .withDeleteMinIntervalMs(longEnv("STRATA_DELETE_MIN_INTERVAL_MS", 50))
-                .withChunkStoreConfig(new io.strata.format.ChunkStoreConfig(
+                .withChunkStoreConfig(new ChunkStoreConfig(
                         intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
                         longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
                         longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),

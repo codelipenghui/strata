@@ -1,19 +1,21 @@
 package io.strata.it;
 
-import io.strata.meta.ControllerConfig;
 import io.strata.meta.Controller;
+import io.strata.meta.ControllerConfig;
 import io.strata.meta.ZkMetadataStore;
-import io.strata.node.DataNodeConfig;
 import io.strata.node.DataNode;
+import io.strata.node.DataNodeConfig;
 import org.apache.curator.test.TestingServer;
 
 import java.io.IOException;
+import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.net.ServerSocket;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.function.BiFunction;
+import java.util.stream.Stream;
 
 /**
  * In-process cluster for integration tests: embedded ZooKeeper + controller + N data nodes
@@ -268,8 +270,8 @@ final class MiniCluster implements AutoCloseable {
         if (dir == null) {
             return;
         }
-        try (java.util.stream.Stream<Path> walk = Files.walk(dir)) {
-            walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+        try (Stream<Path> walk = Files.walk(dir)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
                 try {
                     Files.deleteIfExists(p);
                 } catch (IOException ignored) {

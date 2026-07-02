@@ -11,6 +11,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 
+import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.List;
 
@@ -113,7 +114,7 @@ class ShardedClusterEndToEndTest {
 
     private byte[] readAll(StrataNamespace ns, FileId fileId) {
         try (StrataFile.Reader reader = client.openById(ns, fileId).openForRead()) {
-            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
             long offset = 0;
             int idle = 0;
             while (idle < 3) {

@@ -5,8 +5,10 @@ import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.function.Predicate;
 
 /**
  * The namespace-log {@link MetadataStore} backend (design §8, §16 Step 3). User file/path metadata is
@@ -23,7 +25,7 @@ public final class NamespaceLogMetadataStore implements MetadataStore {
     }
 
     /** Restricts eager namespace recovery to namespaces this node owns (wired from Controller). */
-    void setOwnership(java.util.function.Predicate<StrataNamespace> ownsNamespace) {
+    void setOwnership(Predicate<StrataNamespace> ownsNamespace) {
         backend.setOwnership(ownsNamespace);
     }
 
@@ -38,7 +40,7 @@ public final class NamespaceLogMetadataStore implements MetadataStore {
     }
 
     /** Per-namespace stats {@code namespace -> [liveFiles, openLogBytes]} for owned namespaces. */
-    java.util.Map<StrataNamespace, long[]> namespaceStats() {
+    Map<StrataNamespace, long[]> namespaceStats() {
         return backend.namespaceStats();
     }
 

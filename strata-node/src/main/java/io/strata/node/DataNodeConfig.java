@@ -103,7 +103,7 @@ public record DataNodeConfig(
         if (deleteMinIntervalMs < 0) {
             throw new IllegalArgumentException("deleteMinIntervalMs must be non-negative: " + deleteMinIntervalMs);
         }
-        chunkStoreConfig = java.util.Objects.requireNonNull(chunkStoreConfig, "chunkStoreConfig");
+        chunkStoreConfig = Objects.requireNonNull(chunkStoreConfig, "chunkStoreConfig");
     }
 
     private static void requireText(String value, String field) {

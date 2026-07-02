@@ -1,12 +1,13 @@
 package io.strata.client;
 
+import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
-import io.strata.proto.Messages;
 import io.strata.proto.ManagedScpConnection;
+import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
 
@@ -149,15 +150,15 @@ final class ControllerClient implements AutoCloseable {
         return decode(Opcode.ALLOCATE_WRITER_EPOCH, resp, Messages.AllocateWriterEpochResp::decode).writerEpoch();
     }
 
-    void sealChunkMeta(StrataNamespace namespace, io.strata.common.ChunkId chunkId, int writeEpoch, long length,
-                       int crc, java.util.List<Integer> sealedReplicas, long opIdMsb, long opIdLsb) {
+    void sealChunkMeta(StrataNamespace namespace, ChunkId chunkId, int writeEpoch, long length,
+                       int crc, List<Integer> sealedReplicas, long opIdMsb, long opIdLsb) {
         call(Opcode.SEAL_CHUNK_META,
                 new Messages.SealChunkMeta(namespace, chunkId, writeEpoch, length, crc, sealedReplicas,
                         opIdMsb, opIdLsb).encode(),
                 namespace);
     }
 
-    void abortChunkMeta(StrataNamespace namespace, io.strata.common.ChunkId chunkId, int writeEpoch,
+    void abortChunkMeta(StrataNamespace namespace, ChunkId chunkId, int writeEpoch,
                         long opIdMsb, long opIdLsb) {
         call(Opcode.ABORT_CHUNK_META,
                 new Messages.AbortChunkMeta(namespace, chunkId, writeEpoch, opIdMsb, opIdLsb).encode(),

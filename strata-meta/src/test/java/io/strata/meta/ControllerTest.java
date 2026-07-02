@@ -1,12 +1,13 @@
 package io.strata.meta;
 
-import io.strata.common.FileState;
-import io.strata.common.ChunkState;
 import io.strata.common.ChunkId;
+import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.FileState;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
+import io.strata.common.StrataPath;
 import io.strata.proto.Frame;
 import io.strata.proto.FrameIO;
 import io.strata.proto.Messages;
@@ -23,16 +24,18 @@ import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.lang.reflect.Field;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -145,8 +148,8 @@ class ControllerTest {
 
         var byId = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
                 new Messages.LookupFile(StrataNamespace.of("test"), created.fileId()).encode(), null, 5000));
-        assertEquals(io.strata.common.StrataNamespace.of("test"), byId.namespace());
-        assertEquals(io.strata.common.StrataPath.of("/namespace/topicA/0/segment-0"), byId.path());
+        assertEquals(StrataNamespace.of("test"), byId.namespace());
+        assertEquals(StrataPath.of("/namespace/topicA/0/segment-0"), byId.path());
 
         ScpException duplicate = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/namespace/topicA/0/segment-0")
@@ -188,7 +191,7 @@ class ControllerTest {
 
         var byId = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
                 new Messages.LookupFile(StrataNamespace.of("test"), first.fileId()).encode(), null, 5000));
-        assertEquals(io.strata.common.StrataPath.of("/marker-identity-a"), byId.path());
+        assertEquals(StrataPath.of("/marker-identity-a"), byId.path());
     }
 
     @Test
@@ -600,13 +603,13 @@ class ControllerTest {
         }
 
         @Override
-        public java.util.Optional<Versioned<Records.FileRecord>> getFile(io.strata.common.StrataNamespace namespace, FileId id) throws Exception {
+        public Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) throws Exception {
             return delegate.getFile(namespace, id);
         }
 
         @Override
-        public java.util.Optional<FileId> resolvePath(io.strata.common.StrataNamespace namespace,
-                                                      io.strata.common.StrataPath path) throws Exception {
+        public Optional<FileId> resolvePath(StrataNamespace namespace,
+                                                      StrataPath path) throws Exception {
             return delegate.resolvePath(namespace, path);
         }
 
@@ -626,23 +629,23 @@ class ControllerTest {
         }
 
         @Override
-        public boolean deletePath(io.strata.common.StrataNamespace namespace, io.strata.common.StrataPath path,
+        public boolean deletePath(StrataNamespace namespace, StrataPath path,
                                   FileId expectedFileId) throws Exception {
             return delegate.deletePath(namespace, path, expectedFileId);
         }
 
         @Override
-        public boolean deleteFile(io.strata.common.StrataNamespace namespace, FileId id, int expectedVersion) throws Exception {
+        public boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) throws Exception {
             return delegate.deleteFile(namespace, id, expectedVersion);
         }
 
         @Override
-        public List<FileId> listFiles(io.strata.common.StrataNamespace namespace) throws Exception {
+        public List<FileId> listFiles(StrataNamespace namespace) throws Exception {
             return delegate.listFiles(namespace);
         }
 
         @Override
-        public List<io.strata.common.StrataNamespace> listNamespaces() throws Exception {
+        public List<StrataNamespace> listNamespaces() throws Exception {
             return delegate.listNamespaces();
         }
 
@@ -652,7 +655,7 @@ class ControllerTest {
         }
 
         @Override
-        public java.util.Optional<Versioned<Records.NodeRecord>> getNode(int nodeId) throws Exception {
+        public Optional<Versioned<Records.NodeRecord>> getNode(int nodeId) throws Exception {
             return delegate.getNode(nodeId);
         }
 
@@ -688,7 +691,7 @@ class ControllerTest {
         }
 
         @Override
-        public boolean deletePath(io.strata.common.StrataNamespace namespace, io.strata.common.StrataPath path,
+        public boolean deletePath(StrataNamespace namespace, StrataPath path,
                                   FileId expectedFileId) {
             deletePathCalls++;
             return false;
@@ -1295,6 +1298,6 @@ class ControllerTest {
 
         assertEquals(3, chunkResp.replicas().size());
         assertEquals(3, chunkResp.replicas().stream().map(Messages.Replica::nodeId).collect(
-                java.util.stream.Collectors.toSet()).size());
+                Collectors.toSet()).size());
     }
 }

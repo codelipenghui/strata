@@ -1,5 +1,6 @@
 package io.strata.common;
 
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
@@ -92,6 +93,6 @@ class VarintTest {
         Varint.writeBytes(buf, new byte[]{1, 2, 3});
         buf.flip();
         assertEquals(value, Varint.readString(buf));
-        org.junit.jupiter.api.Assertions.assertArrayEquals(new byte[]{1, 2, 3}, Varint.readBytes(buf));
+        Assertions.assertArrayEquals(new byte[]{1, 2, 3}, Varint.readBytes(buf));
     }
 }

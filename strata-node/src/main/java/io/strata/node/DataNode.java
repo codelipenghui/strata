@@ -2,6 +2,7 @@ package io.strata.node;
 
 import io.strata.common.Closeables;
 import io.strata.format.ChunkStore;
+import io.strata.proto.RequestObserver;
 import io.strata.proto.ScpServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,10 +12,13 @@ import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static io.strata.common.Fsync.forceDirectory;
@@ -42,7 +46,7 @@ public final class DataNode implements AutoCloseable {
     // (design §20.4) only trusts "no owner verified" once it has heard from every current owner, so it
     // never deletes a chunk whose owner simply has not gotten around to verifying it yet. Populated here
     // by the VERIFY_CHUNKS handler; consumed by the orphan-GC loop.
-    private final java.util.Set<String> verifiersHeardFrom = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Set<String> verifiersHeardFrom = ConcurrentHashMap.newKeySet();
 
     public DataNode(DataNodeConfig config) throws IOException {
         this(config, null);
@@ -180,7 +184,7 @@ public final class DataNode implements AutoCloseable {
     }
 
     /** Namespaces that have seen I/O — drives lazy per-namespace meter registration. */
-    public java.util.Set<String> ioNamespaces() {
+    public Set<String> ioNamespaces() {
         return store.ioNamespaces();
     }
 
@@ -207,7 +211,7 @@ public final class DataNode implements AutoCloseable {
     public long deleteFailedCount() { return deleteService.failedDeletes(); }
 
     /** Installs a per-request latency observer on the data-plane server (used by the metrics layer). */
-    public void setRequestObserver(io.strata.proto.RequestObserver observer) {
+    public void setRequestObserver(RequestObserver observer) {
         server.setRequestObserver(observer);
     }
 
@@ -233,7 +237,7 @@ public final class DataNode implements AutoCloseable {
     }
 
     /** The set of owner endpoints this node has heard a VERIFY_CHUNKS from (orphan-GC membership grace). */
-    java.util.Set<String> verifiersHeardFrom() {
+    Set<String> verifiersHeardFrom() {
         return verifiersHeardFrom;
     }
 
@@ -313,8 +317,8 @@ public final class DataNode implements AutoCloseable {
             out.flush();
             ch.force(true);
         }
-        Files.move(tmp, f, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE);
         forceDirectory(dataDir);
     }
 

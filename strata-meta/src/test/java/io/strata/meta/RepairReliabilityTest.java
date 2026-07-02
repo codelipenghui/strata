@@ -19,6 +19,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -37,8 +38,8 @@ class RepairReliabilityTest {
 
     /** Minimal fake data node: registers, heartbeats, auto-acks received commands. */
     private final class FakeNode {
-        private static final java.util.concurrent.atomic.AtomicInteger ID_SEQ =
-                new java.util.concurrent.atomic.AtomicInteger(1);
+        private static final AtomicInteger ID_SEQ =
+                new AtomicInteger(1);
         final UUID inc = UUID.randomUUID();
         final int assignedNodeId = ID_SEQ.getAndIncrement();
         final String host;
