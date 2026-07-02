@@ -71,6 +71,136 @@ class NamespaceMetadataLogRepositoryTest {
     }
 
     @Test
+    void recoveryFallsBackToPreviousGenerationWhenCurrentSnapshotCrcFails() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            TestNamespaceMetadataFileStore fs = new TestNamespaceMetadataFileStore();
+            NamespaceLogMetrics metrics = new NamespaceLogMetrics();
+            NamespaceMetadataLogRepository repo = NamespaceMetadataLogRepository.open(NS, fs, root, 1, metrics);
+
+            FileId a = FileId.of(1);
+            repo.append(fileCreated(a, "/a", 1));
+            repo.compactAndPublish(); // generation 2: snapshot has /a, log will carry /b below
+
+            FileId b = FileId.of(2);
+            repo.append(fileCreated(b, "/b", 2));
+            repo.compactAndPublish(); // generation 3: current snapshot has /a + /b
+
+            FileId c = FileId.of(3);
+            repo.append(fileCreated(c, "/c", 3)); // current generation's open-log tail
+
+            Records.NamespaceManifest current = root.getNamespaceManifest(NS).orElseThrow().value();
+            fs.corruptSnapshot(current.snapshotFileId().orElseThrow());
+
+            NamespaceMetadataLogRepository successor = NamespaceMetadataLogRepository.open(NS, fs, root, 2, metrics);
+
+            assertTrue(successor.state().file(a).isPresent(), "fallback snapshot recovers pre-compaction file");
+            assertTrue(successor.state().file(b).isPresent(), "fallback log recovers tail file");
+            assertTrue(successor.state().file(c).isPresent(),
+                    "fallback must also replay the current generation's durable open-log tail");
+            assertTrue(successor.generation() > current.generation(),
+                    "successful fallback is republished as a fresh generation");
+            assertEquals(1, metrics.value(NS.value(), NamespaceLogMetrics.SNAPSHOT_FALLBACKS),
+                    "snapshot fallback is visible to operators");
+        }
+    }
+
+    @Test
+    void secondSnapshotFallbackFailsLoudlyWhenPreviousGenerationLeavesCurrentLogGap() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            TestNamespaceMetadataFileStore fs = new TestNamespaceMetadataFileStore();
+            NamespaceMetadataLogRepository repo = NamespaceMetadataLogRepository.open(NS, fs, root, 1);
+
+            FileId a = FileId.of(1);
+            repo.append(fileCreated(a, "/a", 1));
+            repo.compactAndPublish();
+
+            FileId b = FileId.of(2);
+            repo.append(fileCreated(b, "/b", 2));
+            repo.compactAndPublish();
+
+            FileId c = FileId.of(3);
+            repo.append(fileCreated(c, "/c", 3));
+
+            Records.NamespaceManifest current = root.getNamespaceManifest(NS).orElseThrow().value();
+            fs.corruptSnapshot(current.snapshotFileId().orElseThrow());
+
+            NamespaceMetadataLogRepository firstFallback = NamespaceMetadataLogRepository.open(NS, fs, root, 2);
+            assertTrue(firstFallback.state().file(c).isPresent(), "first fallback rescues the current log tail");
+
+            Records.NamespaceManifest republished = root.getNamespaceManifest(NS).orElseThrow().value();
+            fs.corruptSnapshot(republished.snapshotFileId().orElseThrow());
+
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> NamespaceMetadataLogRepository.open(NS, fs, root, 3));
+
+            assertTrue(e.getMessage().contains("snapshot crc"), "the current snapshot CRC failure stays primary");
+            assertTrue(List.of(e.getSuppressed()).stream()
+                    .anyMatch(t -> t instanceof IllegalStateException
+                            && t.getMessage().contains("fallback chain gap")),
+                    "fallback refuses to publish state with a missing log interval");
+            assertEquals(republished.generation(), root.getNamespaceManifest(NS).orElseThrow().value().generation(),
+                    "failed fallback must not publish a gappy successor manifest");
+        }
+    }
+
+    @Test
+    void recoveryRetriesCurrentSnapshotReadBeforePreviousGenerationFallback() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            TestNamespaceMetadataFileStore fs = new TestNamespaceMetadataFileStore();
+            NamespaceMetadataLogRepository repo = NamespaceMetadataLogRepository.open(NS, fs, root, 1);
+
+            FileId a = FileId.of(1);
+            repo.append(fileCreated(a, "/a", 1));
+            repo.compactAndPublish();
+
+            FileId b = FileId.of(2);
+            repo.append(fileCreated(b, "/b", 2));
+            repo.compactAndPublish();
+
+            Records.NamespaceManifest current = root.getNamespaceManifest(NS).orElseThrow().value();
+            fs.corruptSnapshotOnNextRead(current.snapshotFileId().orElseThrow());
+            Records.NamespaceManifest.NamespaceManifestRef previous = current.previous().orElseThrow();
+            previous.snapshotFileId().ifPresent(fs::deleteFile);
+            previous.logFileId().ifPresent(fs::deleteFile);
+
+            NamespaceMetadataLogRepository successor = NamespaceMetadataLogRepository.open(NS, fs, root, 2);
+
+            assertTrue(successor.state().file(a).isPresent(), "current snapshot retry recovers file /a");
+            assertTrue(successor.state().file(b).isPresent(), "current snapshot retry recovers file /b");
+        }
+    }
+
+    @Test
+    void fallbackFailurePreservesCurrentSnapshotCrcException() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            TestNamespaceMetadataFileStore fs = new TestNamespaceMetadataFileStore();
+            NamespaceMetadataLogRepository repo = NamespaceMetadataLogRepository.open(NS, fs, root, 1);
+
+            repo.append(fileCreated(FileId.of(1), "/a", 1));
+            repo.compactAndPublish();
+            repo.append(fileCreated(FileId.of(2), "/b", 2));
+            repo.compactAndPublish();
+
+            Records.NamespaceManifest current = root.getNamespaceManifest(NS).orElseThrow().value();
+            fs.corruptSnapshot(current.snapshotFileId().orElseThrow());
+            Records.NamespaceManifest.NamespaceManifestRef previous = current.previous().orElseThrow();
+            previous.snapshotFileId().ifPresent(fs::deleteFile);
+            previous.logFileId().ifPresent(fs::deleteFile);
+
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> NamespaceMetadataLogRepository.open(NS, fs, root, 2));
+
+            assertTrue(e.getMessage().contains("snapshot crc"), "the current snapshot CRC failure stays primary");
+            assertTrue(e.getSuppressed().length >= 1, "fallback failure is retained for diagnosis");
+            assertTrue(List.of(e.getSuppressed()).stream().anyMatch(IllegalStateException.class::isInstance));
+        }
+    }
+
+    @Test
     void compactionRetainsTheSupersededGenerationRatherThanDeletingItInline() throws Exception {
         // Issue #8: publishCompacted must NOT delete the just-superseded snapshot/log pair inline the instant
         // the new manifest is durable. The prior generation is retained as a rollback margin and reclaimed

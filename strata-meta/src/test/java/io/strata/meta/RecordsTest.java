@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -155,6 +156,34 @@ class RecordsTest {
     }
 
     @Test
+    void namespaceManifestV2RoundTripsPreviousReference() {
+        Records.NamespaceManifest.NamespaceManifestRef previous =
+                new Records.NamespaceManifest.NamespaceManifestRef(6, 128, 256,
+                        Optional.of(FileId.of(10)), Optional.of(FileId.of(11)));
+        Records.NamespaceManifest manifest = new Records.NamespaceManifest(StrataNamespace.of("test"), 3, 7,
+                256, 384, Optional.of(FileId.of(12)), Optional.of(FileId.of(13)), Optional.of(previous));
+
+        Records.NamespaceManifest decoded = Records.NamespaceManifest.decode(manifest.encode());
+
+        assertEquals(manifest, decoded);
+        assertEquals(previous, decoded.previous().orElseThrow());
+    }
+
+    @Test
+    void namespaceManifestV1BytesDecodeWithoutPreviousReference() {
+        Records.NamespaceManifest decoded = Records.NamespaceManifest.decode(namespaceManifestV1Bytes());
+
+        assertEquals(StrataNamespace.of("legacy"), decoded.namespace());
+        assertEquals(4, decoded.metadataEpoch());
+        assertEquals(5, decoded.generation());
+        assertEquals(1024, decoded.logStartOffset());
+        assertEquals(2048, decoded.publishedLogOffset());
+        assertEquals(Optional.of(FileId.of(21)), decoded.snapshotFileId());
+        assertEquals(Optional.of(FileId.of(22)), decoded.logFileId());
+        assertTrue(decoded.previous().isEmpty());
+    }
+
+    @Test
     void recordEncodingCarriesCrcThatCatchesSilentCorruption() {
         Records.ChunkRecord chunk = new Records.ChunkRecord(3, ChunkState.SEALED, 4096, 0xAA, 5,
                 List.of(7, 8), 33, 44);
@@ -194,6 +223,22 @@ class RecordsTest {
         w.u32(4).u8(ChunkState.OPEN.value).u64(10).u32(0xBEEF).i32(6);
         w.varint(2).u32(1).u32(2);
         return Records.sealRecord(w.toBytes());
+    }
+
+    private static byte[] namespaceManifestV1Bytes() {
+        BufWriter w = new BufWriter();
+        w.u8(1).string("legacy").u64(4).u64(5).u64(1024).u64(2048);
+        writeOptionalFileId(w, Optional.of(FileId.of(21)));
+        writeOptionalFileId(w, Optional.of(FileId.of(22)));
+        return Records.sealRecord(w.toBytes());
+    }
+
+    private static void writeOptionalFileId(BufWriter w, Optional<FileId> id) {
+        if (id.isPresent()) {
+            w.u8(1).fileId(id.get());
+        } else {
+            w.u8(0);
+        }
     }
 
     private static byte[] fileRecordWithChunkCount(int count) {
