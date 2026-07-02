@@ -76,6 +76,13 @@ final class NamespaceMetadataRecovery {
             throw snapshotFailure;
         }
 
+        if (current.logFileId().isPresent() && base.durableEndOffset() < current.logStartOffset()) {
+            snapshotFailure.addSuppressed(new IllegalStateException(
+                    "fallback chain gap: previous generation recovers to " + base.durableEndOffset()
+                            + " but current log starts at " + current.logStartOffset()));
+            throw snapshotFailure;
+        }
+
         try {
             LogReplay currentReplay = replayLog(base.state(), fileStore, current, base.durableEndOffset());
             long durableEnd = Math.max(base.durableEndOffset(), currentReplay.durableEndOffset());

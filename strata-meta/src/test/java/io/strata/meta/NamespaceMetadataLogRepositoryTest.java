@@ -106,6 +106,46 @@ class NamespaceMetadataLogRepositoryTest {
     }
 
     @Test
+    void secondSnapshotFallbackFailsLoudlyWhenPreviousGenerationLeavesCurrentLogGap() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            TestNamespaceMetadataFileStore fs = new TestNamespaceMetadataFileStore();
+            NamespaceMetadataLogRepository repo = NamespaceMetadataLogRepository.open(NS, fs, root, 1);
+
+            FileId a = FileId.of(1);
+            repo.append(fileCreated(a, "/a", 1));
+            repo.compactAndPublish();
+
+            FileId b = FileId.of(2);
+            repo.append(fileCreated(b, "/b", 2));
+            repo.compactAndPublish();
+
+            FileId c = FileId.of(3);
+            repo.append(fileCreated(c, "/c", 3));
+
+            Records.NamespaceManifest current = root.getNamespaceManifest(NS).orElseThrow().value();
+            fs.corruptSnapshot(current.snapshotFileId().orElseThrow());
+
+            NamespaceMetadataLogRepository firstFallback = NamespaceMetadataLogRepository.open(NS, fs, root, 2);
+            assertTrue(firstFallback.state().file(c).isPresent(), "first fallback rescues the current log tail");
+
+            Records.NamespaceManifest republished = root.getNamespaceManifest(NS).orElseThrow().value();
+            fs.corruptSnapshot(republished.snapshotFileId().orElseThrow());
+
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> NamespaceMetadataLogRepository.open(NS, fs, root, 3));
+
+            assertTrue(e.getMessage().contains("snapshot crc"), "the current snapshot CRC failure stays primary");
+            assertTrue(List.of(e.getSuppressed()).stream()
+                    .anyMatch(t -> t instanceof IllegalStateException
+                            && t.getMessage().contains("fallback chain gap")),
+                    "fallback refuses to publish state with a missing log interval");
+            assertEquals(republished.generation(), root.getNamespaceManifest(NS).orElseThrow().value().generation(),
+                    "failed fallback must not publish a gappy successor manifest");
+        }
+    }
+
+    @Test
     void recoveryRetriesCurrentSnapshotReadBeforePreviousGenerationFallback() throws Exception {
         try (TestingServer zk = new TestingServer(true);
              ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
