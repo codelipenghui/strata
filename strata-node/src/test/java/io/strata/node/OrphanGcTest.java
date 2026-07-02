@@ -19,8 +19,10 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -33,10 +35,14 @@ class OrphanGcTest {
     Path dir;
 
     private void seal(ChunkStore store, ChunkId id) throws IOException {
+        seal(store, NS, id);
+    }
+
+    private void seal(ChunkStore store, StrataNamespace ns, ChunkId id) throws IOException {
         byte[] bytes = "orphan-bytes".getBytes(StandardCharsets.UTF_8);
-        store.open(NS, id, false, 1, 1_700_000_000_000L);
-        store.append(NS, id, 1, 0, 0, ByteBuffer.wrap(bytes));
-        store.seal(NS, id, 1, bytes.length, null);
+        store.open(ns, id, false, 1, 1_700_000_000_000L);
+        store.append(ns, id, 1, 0, 0, ByteBuffer.wrap(bytes));
+        store.seal(ns, id, 1, bytes.length, null);
     }
 
     @Test
@@ -140,6 +146,142 @@ class OrphanGcTest {
         }
     }
 
+    @Test
+    void massConfirmedOrphansDrainUpToNamespaceLimitPerPass() throws Exception {
+        ChunkId first = new ChunkId(FileId.of(1), 0);
+        ChunkId second = new ChunkId(FileId.of(2), 0);
+        ChunkId third = new ChunkId(FileId.of(3), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileNotFoundServer()) {
+            seal(store, first);
+            seal(store, second);
+            seal(store, third);
+            String endpoint = "127.0.0.1:" + owner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 2, 0, 0);
+
+            gc.gcOnce();
+
+            assertEquals(1, present(store, NS, first, second, third),
+                    "a large orphan wave should drain up to the namespace budget instead of wedging");
+            assertEquals(1, gc.budgetLimitedNamespaces());
+            assertEquals(1, gc.budgetLimitedChunks());
+
+            gc.gcOnce();
+
+            assertEquals(0, present(store, NS, first, second, third),
+                    "deferred confirmed orphans should be reclaimed on later passes");
+            assertEquals(0, gc.budgetLimitedNamespaces());
+            assertEquals(0, gc.budgetLimitedChunks());
+        }
+    }
+
+    @Test
+    void smallNamespaceUsesPercentBudgetEvenWhenAbsoluteLimitIsHigh() throws Exception {
+        ChunkId first = new ChunkId(FileId.of(1), 0);
+        ChunkId second = new ChunkId(FileId.of(2), 0);
+        ChunkId third = new ChunkId(FileId.of(3), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileNotFoundServer()) {
+            seal(store, first);
+            seal(store, second);
+            seal(store, third);
+            String endpoint = "127.0.0.1:" + owner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 64, 34, 0);
+
+            gc.gcOnce();
+
+            assertEquals(2, present(store, NS, first, second, third),
+                    "the percent budget must prevent a small namespace from being fully deleted in one pass");
+            assertEquals(1, gc.budgetLimitedNamespaces());
+            assertEquals(2, gc.budgetLimitedChunks());
+        }
+    }
+
+    @Test
+    void nodeWideBudgetCapsDeletesAcrossNamespaces() throws Exception {
+        StrataNamespace a = StrataNamespace.of("a");
+        StrataNamespace b = StrataNamespace.of("b");
+        ChunkId a1 = new ChunkId(FileId.of(1), 0);
+        ChunkId a2 = new ChunkId(FileId.of(2), 0);
+        ChunkId b1 = new ChunkId(FileId.of(3), 0);
+        ChunkId b2 = new ChunkId(FileId.of(4), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileNotFoundServer()) {
+            seal(store, a, a1);
+            seal(store, a, a2);
+            seal(store, b, b1);
+            seal(store, b, b2);
+            String endpoint = "127.0.0.1:" + owner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 64, 0, 2);
+
+            gc.gcOnce();
+
+            int remaining = present(store, a, a1, a2) + present(store, b, b1, b2);
+            assertEquals(2, remaining, "the node-wide budget must cap total deletes across namespaces");
+            assertEquals(2, gc.budgetLimitedChunks());
+        }
+    }
+
+    @Test
+    void reconfirmsImmediatelyBeforeDelete() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger confirms = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 if (confirms.incrementAndGet() == 1) {
+                     throw new ScpException(ErrorCode.FILE_NOT_FOUND, "transiently absent");
+                 }
+                 Messages.ChunkInfo ci = new Messages.ChunkInfo(chunk, ChunkState.SEALED, 12, 0, 1,
+                         List.of(new Messages.Replica(NODE_ID, "127.0.0.1:1")));
+                 return ScpServer.ok(req, new Messages.LookupFileResp(NS, StrataPath.of("/f1"),
+                         Messages.WritePolicy.DEFAULT, (byte) 0, List.of(ci)).encode(), null);
+             })) {
+            seal(store, chunk);
+            String endpoint = "127.0.0.1:" + owner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 64, 0, 0);
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, chunk),
+                    "a chunk re-listed by its owner immediately before delete must be kept");
+            assertEquals(2, confirms.get(), "confirmed orphans must be checked again at delete time");
+        }
+    }
+
+    @Test
+    void zeroDeleteBudgetsDisableCaps() throws Exception {
+        ChunkId first = new ChunkId(FileId.of(1), 0);
+        ChunkId second = new ChunkId(FileId.of(2), 0);
+        ChunkId third = new ChunkId(FileId.of(3), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileNotFoundServer()) {
+            seal(store, first);
+            seal(store, second);
+            seal(store, third);
+            String endpoint = "127.0.0.1:" + owner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 0, 0, 0);
+
+            gc.gcOnce();
+
+            assertFalse(store.contains(NS, first), "zero budgets disable delete caps");
+            assertFalse(store.contains(NS, second), "zero budgets disable delete caps");
+            assertFalse(store.contains(NS, third), "zero budgets disable delete caps");
+        }
+    }
+
+    private static int present(ChunkStore store, StrataNamespace ns, ChunkId... ids) {
+        int count = 0;
+        for (ChunkId id : ids) {
+            if (store.contains(ns, id)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     private static ScpServer notLeaderServer() throws Exception {
         return new ScpServer(0, 0, 0, 0, req -> {
             if (req.opcode() != Opcode.LOOKUP_FILE.code) {
@@ -161,8 +303,30 @@ class OrphanGcTest {
     private static OrphanGc orphanGc(ChunkStore store, List<String> controllerEndpoints,
                                      long graceMs, long scanIntervalMs,
                                      long startupGraceMs, int confirmTimeoutMs) {
+        return orphanGc(store, controllerEndpoints, graceMs, scanIntervalMs, startupGraceMs,
+                confirmTimeoutMs, OrphanGc.DEFAULT_MAX_CONFIRMED_DELETES_PER_NAMESPACE_PER_PASS);
+    }
+
+    private static OrphanGc orphanGc(ChunkStore store, List<String> controllerEndpoints,
+                                     long graceMs, long scanIntervalMs,
+                                     long startupGraceMs, int confirmTimeoutMs,
+                                     int maxConfirmedDeletesPerNamespacePerPass) {
+        return orphanGc(store, controllerEndpoints, graceMs, scanIntervalMs, startupGraceMs,
+                confirmTimeoutMs, maxConfirmedDeletesPerNamespacePerPass,
+                OrphanGc.DEFAULT_MAX_CONFIRMED_DELETE_PERCENT_PER_NAMESPACE_PER_PASS,
+                OrphanGc.DEFAULT_MAX_CONFIRMED_DELETES_PER_NODE_PASS);
+    }
+
+    private static OrphanGc orphanGc(ChunkStore store, List<String> controllerEndpoints,
+                                     long graceMs, long scanIntervalMs,
+                                     long startupGraceMs, int confirmTimeoutMs,
+                                     int maxConfirmedDeletesPerNamespacePerPass,
+                                     int maxConfirmedDeletePercentPerNamespacePerPass,
+                                     int maxConfirmedDeletesPerNodePass) {
         ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
         return new OrphanGc(store, deletes, NODE_ID, controllerEndpoints,
-                graceMs, scanIntervalMs, startupGraceMs, confirmTimeoutMs);
+                graceMs, scanIntervalMs, startupGraceMs, confirmTimeoutMs,
+                maxConfirmedDeletesPerNamespacePerPass, maxConfirmedDeletePercentPerNamespacePerPass,
+                maxConfirmedDeletesPerNodePass);
     }
 }

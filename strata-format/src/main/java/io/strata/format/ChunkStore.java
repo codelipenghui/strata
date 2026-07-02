@@ -310,6 +310,22 @@ public final class ChunkStore implements AutoCloseable {
         return countByState(ChunkState.SEALED);
     }
 
+    /** Sealed chunks by namespace — best-effort snapshot for orphan-GC delete budgets. */
+    public Map<StrataNamespace, Integer> sealedChunksByNamespace() {
+        Map<StrataNamespace, Integer> out = new HashMap<>();
+        for (Handle h : chunks.values()) {
+            h.lock.lock();
+            try {
+                if (h.state == ChunkState.SEALED) {
+                    out.merge(h.ns, 1, Integer::sum);
+                }
+            } finally {
+                h.lock.unlock();
+            }
+        }
+        return out;
+    }
+
     /** Sealed-chunk channel-cache hits (served an already-open FD) — observability. */
     public long channelCacheHits() { return channelCache.hits(); }
 
