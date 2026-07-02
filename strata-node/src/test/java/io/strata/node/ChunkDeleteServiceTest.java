@@ -3,12 +3,12 @@ package io.strata.node;
 import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.NsChunkId;
 import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
@@ -123,11 +123,7 @@ class ChunkDeleteServiceTest {
     }
 
     private static Object newNsChunkId(ChunkId id) throws Exception {
-        Class<?> type = Class.forName("io.strata.common.NsChunkId");
-        Constructor<?> ctor =
-                type.getDeclaredConstructor(StrataNamespace.class, ChunkId.class);
-        ctor.setAccessible(true);
-        return ctor.newInstance(NS, id);
+        return new NsChunkId(NS, id);
     }
 
     private static void waitFor(BooleanSupplier condition) throws Exception {

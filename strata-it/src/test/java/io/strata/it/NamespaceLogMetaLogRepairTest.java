@@ -33,22 +33,13 @@ class NamespaceLogMetaLogRepairTest {
 
     @BeforeAll
     void setup() throws Exception {
-        System.setProperty("strata.controller.backend", "namespace-log");
-        System.setProperty("strata.controller.log.rf", "3");
-        System.setProperty("strata.controller.log.ack", "2");
-        cluster = new MiniCluster(4);
+        cluster = MiniCluster.namespaceLog(4);
     }
 
     @AfterAll
     void teardown() throws Exception {
-        try {
-            if (cluster != null) {
-                cluster.close();
-            }
-        } finally {
-            System.clearProperty("strata.controller.backend");
-            System.clearProperty("strata.controller.log.rf");
-            System.clearProperty("strata.controller.log.ack");
+        if (cluster != null) {
+            cluster.close();
         }
     }
 

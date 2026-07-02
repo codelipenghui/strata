@@ -26,7 +26,6 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -100,7 +99,7 @@ public final class ChunkStore implements AutoCloseable {
     // keeps seal-time fsync small; with the default Kafka-like seal fsync disabled, it still prevents
     // unbounded dirty-page buildup from later stalling ordinary append writes.
     //
-    // Both knobs are tunable (system property, then env, else default) so a deployment can trade fsync
+    // Both knobs are tunable through ChunkStoreConfig so a deployment can trade fsync
     // syscall rate against seal-time fsync size: a shorter interval / smaller threshold keeps less dirty
     // data per open chunk, so a synchronized roll does not stampede the disk's fsync queue with many
     // large concurrent forces. Background writeback keeps the original 500ms / 4 MiB default.
@@ -109,73 +108,12 @@ public final class ChunkStore implements AutoCloseable {
     // ack durability (the group committer always forces data+ledger before acking on fsyncOnAck files),
     // and even with it off a sealed chunk's ledger is retained until reclaimSealedLedgersOnce() forces
     // the SEALED state durable, so recovery never discards acknowledged data.
-    private static final boolean SEAL_FSYNC_DEFAULT =
-            booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false);
-    private static final long BG_FLUSH_INTERVAL_MS =
-            longConf("strata.bgFlush.intervalMs", "STRATA_BG_FLUSH_INTERVAL_MS", 500);
-    private static final long BG_FLUSH_THRESHOLD_BYTES =
-            longConf("strata.bgFlush.thresholdBytes", "STRATA_BG_FLUSH_THRESHOLD_BYTES", 4L << 20); // 4 MiB
-    private static final long SLOW_APPEND_LOG_NANOS = TimeUnit.MILLISECONDS.toNanos(
-            longConf("strata.slowAppendLogMs", "STRATA_SLOW_APPEND_LOG_MS", 1_000));
-    private static final long SLOW_MUTATION_LOG_NANOS = TimeUnit.MILLISECONDS.toNanos(
-            longConf("strata.slowMutationLogMs", "STRATA_SLOW_MUTATION_LOG_MS", 500));
-    private static final long CHANNEL_CACHE_MAX_SIZE =
-            longConf("strata.fileChannelCache.maxSize", "STRATA_FILE_CHANNEL_CACHE_MAX_SIZE",
-                    defaultChannelCacheCapacity());
     /** Whether seal/open/delete force their metadata + data to disk synchronously. Defaults from
      *  STRATA_SEAL_FSYNC; overridable per instance so tests can exercise both durability paths. */
     private final boolean sealFsync;
     private final ChunkStoreConfig csConfig;
     private final ScheduledExecutorService flusher;
     private final ExecutorService cleanupExecutor;
-
-    /** System property (preferred, for tests) → environment variable → default; malformed values fall
-     *  back to the default rather than failing node startup. */
-    static long longConf(String property, String env, long def) {
-        String raw = System.getProperty(property);
-        if (raw == null) raw = System.getenv(env);
-        if (raw == null || raw.isBlank()) return def;
-        try {
-            long v = Long.parseLong(raw.trim());
-            return v > 0 ? v : def;
-        } catch (NumberFormatException e) {
-            log.warn("ignoring non-numeric {}/{}='{}', using default {}", property, env, raw, def);
-            return def;
-        }
-    }
-
-    static boolean booleanConf(String property, String env, boolean def) {
-        String raw = System.getProperty(property);
-        if (raw == null) raw = System.getenv(env);
-        if (raw == null || raw.isBlank()) return def;
-        return switch (raw.trim().toLowerCase(Locale.ROOT)) {
-            case "true", "1", "yes", "y", "on" -> true;
-            case "false", "0", "no", "n", "off" -> false;
-            default -> {
-                log.warn("ignoring non-boolean {}/{}='{}', using default {}", property, env, raw, def);
-                yield def;
-            }
-        };
-    }
-
-    /**
-     * Default sealed-chunk channel-cache capacity: derived from the soft RLIMIT_NOFILE minus headroom
-     * for pinned OPEN channels, ledgers, sockets, and in-flight transient FDs. Falls back to a fixed
-     * default on non-Unix / non-HotSpot JVMs where the FD limit is not introspectable.
-     */
-    static int defaultChannelCacheCapacity() {
-        long max = -1;
-        OperatingSystemMXBean os = ManagementFactory.getOperatingSystemMXBean();
-        if (os instanceof UnixOperatingSystemMXBean unix) {
-            max = unix.getMaxFileDescriptorCount();
-        }
-        if (max <= 0) {
-            return 1024; // non-Unix fallback
-        }
-        long headroom = Math.max(256, max / 4);
-        long cap = max - headroom;
-        return (int) Math.max(128, Math.min(cap, Integer.MAX_VALUE));
-    }
 
     /** Live process open file-descriptor count for observability; {@code -1} when unavailable. */
     public long openFds() {
@@ -187,16 +125,16 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     public ChunkStore(Path dir) throws IOException {
-        this(dir, SEAL_FSYNC_DEFAULT);
+        this(dir, ChunkStoreConfig.DEFAULT);
     }
 
     public ChunkStore(Path dir, ChunkStoreConfig csConfig) throws IOException {
-        this(dir, SEAL_FSYNC_DEFAULT, (int) CHANNEL_CACHE_MAX_SIZE, csConfig);
+        this(dir, csConfig.sealFsync(), csConfig.channelCacheMaxSize(), csConfig);
     }
 
     /** Package-private: lets tests exercise both the seal-fsync-on and -off durability paths. */
     ChunkStore(Path dir, boolean sealFsync) throws IOException {
-        this(dir, sealFsync, (int) CHANNEL_CACHE_MAX_SIZE, ChunkStoreConfig.DEFAULT);
+        this(dir, ChunkStoreConfig.DEFAULT.withSealFsync(sealFsync));
     }
 
     /**
@@ -204,7 +142,8 @@ public final class ChunkStore implements AutoCloseable {
      * without creating thousands of files (avoids static-final class-load timing coupling).
      */
     ChunkStore(Path dir, boolean sealFsync, int channelCacheCapacity) throws IOException {
-        this(dir, sealFsync, channelCacheCapacity, ChunkStoreConfig.DEFAULT);
+        this(dir, ChunkStoreConfig.DEFAULT.withSealFsync(sealFsync)
+                .withChannelCacheMaxSize(channelCacheCapacity));
     }
 
     ChunkStore(Path dir, boolean sealFsync, int channelCacheCapacity, ChunkStoreConfig csConfig) throws IOException {
@@ -225,9 +164,10 @@ public final class ChunkStore implements AutoCloseable {
             return t;
         });
         log.info("chunk store writeback configured: intervalMs={} thresholdBytes={} sealFsync={}",
-                BG_FLUSH_INTERVAL_MS, BG_FLUSH_THRESHOLD_BYTES, sealFsync);
+                csConfig.backgroundFlushIntervalMs(), csConfig.backgroundFlushThresholdBytes(), sealFsync);
         flusher.scheduleWithFixedDelay(this::backgroundFlushSafely,
-                BG_FLUSH_INTERVAL_MS, BG_FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS);
+                csConfig.backgroundFlushIntervalMs(), csConfig.backgroundFlushIntervalMs(),
+                TimeUnit.MILLISECONDS);
     }
 
     /** Number of group-commit force() calls — observability + coalescing tests. */
@@ -238,6 +178,14 @@ public final class ChunkStore implements AutoCloseable {
     /** Number of background-writeback fsyncs of open chunks — observability; should keep seals cheap. */
     public long backgroundFlushes() {
         return backgroundFlushes.get();
+    }
+
+    private long slowAppendLogNanos() {
+        return TimeUnit.MILLISECONDS.toNanos(csConfig.slowAppendLogMs());
+    }
+
+    private long slowMutationLogNanos() {
+        return TimeUnit.MILLISECONDS.toNanos(csConfig.slowMutationLogMs());
     }
 
     /** Number of sealed chunks whose integrity ledger was reclaimed after the SEALED state was forced
@@ -411,7 +359,7 @@ public final class ChunkStore implements AutoCloseable {
 
     /**
      * Best-effort writeback: fsync each OPEN, non-ack-on-fsync chunk that has accumulated at least
-     * {@link #BG_FLUSH_THRESHOLD_BYTES} since its last background flush, bounding the dirty backlog a
+     * the configured threshold since its last background flush, bounding the dirty backlog a
      * later seal must flush. The force runs OUTSIDE the chunk lock (it is slow and safe to run
      * concurrently with positional appends); the lock is held only to read state and record
      * progress. Package-private so tests can drive a round deterministically.
@@ -427,7 +375,7 @@ public final class ChunkStore implements AutoCloseable {
                 if (h.state != ChunkState.OPEN || h.committer != null) {
                     continue;
                 }
-                if (h.end - h.bgFlushedOffset < BG_FLUSH_THRESHOLD_BYTES) {
+                if (h.end - h.bgFlushedOffset < csConfig.backgroundFlushThresholdBytes()) {
                     continue;
                 }
                 flushTo = h.end;
@@ -635,6 +583,10 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
+    Object handleForTests(ChunkId id, ChunkFormats.Header header, StrataNamespace ns) {
+        return new Handle(id, header, ns);
+    }
+
     private Handle lookup(StrataNamespace ns, ChunkId id) {
         Handle h = chunks.get(new NsChunkId(ns, id));
         if (h == null) throw new ScpException(ErrorCode.CHUNK_NOT_FOUND, id.toString());
@@ -740,7 +692,7 @@ public final class ChunkStore implements AutoCloseable {
             h.startCommitterIfFsync(forceCount);
             chunks.put(new NsChunkId(ns, id), h);
             tInstall = System.nanoTime();
-            if (tInstall - t0 > SLOW_MUTATION_LOG_NANOS) {
+            if (tInstall - t0 > slowMutationLogNanos()) {
                 log.info("slow open {} ns={} fsyncOnAck={} phases(ms): dataOpen={} headerWrite={} dataFsync={} "
                                 + "dataDirFsync={} ledgerCreate={} ledgerDirFsync={} sidecarPersist={} total={}",
                         id, ns, fsyncOnAck, msBetween(t0, tChannelOpen), msBetween(tChannelOpen, tHeaderWrite),
@@ -822,7 +774,7 @@ public final class ChunkStore implements AutoCloseable {
                 try {
                     Files.deleteIfExists(ledgerPath);
                     long tDone = System.nanoTime();
-                    if (tDone - t0 > SLOW_MUTATION_LOG_NANOS) {
+                    if (tDone - t0 > slowMutationLogNanos()) {
                         log.info("slow async ledger delete {} phases(ms): delete={} total={}",
                                 id, msBetween(t0, tDone), msBetween(t0, tDone));
                     }
@@ -900,7 +852,7 @@ public final class ChunkStore implements AutoCloseable {
             h.lock.unlock();
         }
         tUnlock = System.nanoTime();
-        if (tUnlock - t0 > SLOW_APPEND_LOG_NANOS) {
+        if (tUnlock - t0 > slowAppendLogNanos()) {
             log.info("slow append {} len={} base={} phases(ms): lockWait={} dataWrite={} "
                             + "ledgerAppend={} runningCrc={} lockHeld={} total={}",
                     id, len, baseOffset, msBetween(tBeforeLock, tLock),
@@ -1324,7 +1276,7 @@ public final class ChunkStore implements AutoCloseable {
             h.sealedLedgerPending = true;
         }
         long tLedgerDeleteEnqueue = System.nanoTime();
-        if (tLedgerDeleteEnqueue - t0 > SLOW_MUTATION_LOG_NANOS) {
+        if (tLedgerDeleteEnqueue - t0 > slowMutationLogNanos()) {
             log.info("slow seal {} len={}MiB phases(ms): stopCommitter={} "
                             + "truncate={} footerBuild={} footerWrite={} dataFsync={} "
                             + "ledgerClose={} ledgerDeleteEnqueue={} total={}",
@@ -1675,7 +1627,7 @@ public final class ChunkStore implements AutoCloseable {
             return ErrorCode.INTERNAL;
         }
         channelCache.invalidate(key);
-        if (System.nanoTime() - t0 > SLOW_MUTATION_LOG_NANOS) {
+        if (System.nanoTime() - t0 > slowMutationLogNanos()) {
             log.info("slow delete {} took {}ms", id, msBetween(t0, System.nanoTime()));
         }
         return ErrorCode.OK;

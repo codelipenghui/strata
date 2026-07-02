@@ -49,6 +49,11 @@ final class MiniCluster implements AutoCloseable {
         this(nodeCount, zkConnectOverride, metaCount, (zk, idx) -> ControllerConfig.forTests(zk));
     }
 
+    static MiniCluster namespaceLog(int nodeCount) throws Exception {
+        return new MiniCluster(nodeCount, null, 1,
+                (zk, idx) -> ControllerConfig.forTests(zk).withNamespaceLogBackend());
+    }
+
     /**
      * A namespace-SHARDED cluster: {@code controllerCount} controllers on fixed ports, each configured with
      * the full eligible-endpoint set and replica-count 1, so each namespace is owned by exactly one
@@ -65,7 +70,8 @@ final class MiniCluster implements AutoCloseable {
         List<String> eligible = List.copyOf(endpoints);
         return new MiniCluster(dataNodeCount, null, controllerCount, (zk, idx) ->
                 new ControllerConfig(zk, ports[idx], 200, 1_000, 1_500, 300, 3_000, 60_000, 5_000, 20_000,
-                        "127.0.0.1", 90_000, eligible, 1, 2_000, 256, 30_000, 600_000L, 16, 100, 5));
+                        "127.0.0.1", 90_000, eligible, 1, 2_000, 256, 30_000, 600_000L, 16, 100, 5)
+                        .withNamespaceLogBackend());
     }
 
     private static int freePort() throws IOException {

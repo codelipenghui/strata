@@ -38,10 +38,7 @@ class NamespaceLogMetadataBackendTest {
     @BeforeAll
     void setup() throws Exception {
         // Select the namespace-log backend for this class; the meta-log itself is replicated RF=3.
-        System.setProperty("strata.controller.backend", "namespace-log");
-        System.setProperty("strata.controller.log.rf", "3");
-        System.setProperty("strata.controller.log.ack", "2");
-        cluster = new MiniCluster(3);
+        cluster = MiniCluster.namespaceLog(3);
         client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint()));
     }
 
@@ -54,14 +51,8 @@ class NamespaceLogMetadataBackendTest {
         } catch (Exception ignore) {
             // best-effort
         }
-        try {
-            if (cluster != null) {
-                cluster.close();
-            }
-        } finally {
-            System.clearProperty("strata.controller.backend");
-            System.clearProperty("strata.controller.log.rf");
-            System.clearProperty("strata.controller.log.ack");
+        if (cluster != null) {
+            cluster.close();
         }
     }
 

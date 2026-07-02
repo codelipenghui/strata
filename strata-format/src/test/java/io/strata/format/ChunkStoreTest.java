@@ -13,7 +13,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -231,7 +230,7 @@ class ChunkStoreTest {
 
     @Test
     void defaultChannelCacheCapacityIsPositive() {
-        assertTrue(ChunkStore.defaultChannelCacheCapacity() >= 128,
+        assertTrue(ChunkStoreConfig.defaultChannelCacheCapacity() >= 128,
                 "auto-sized cache capacity must be a sane floor");
     }
 
@@ -326,11 +325,9 @@ class ChunkStoreTest {
     }
 
     private static Object newHandle(ChunkStore store, ChunkId chunkId) throws Exception {
-        Class<?> type = Class.forName("io.strata.format.ChunkStore$Handle");
         // Handle(ChunkId id, ChunkFormats.Header header, StrataNamespace ns)
-        Constructor<?> ctor = type.getDeclaredConstructor(ChunkStore.class, ChunkId.class, ChunkFormats.Header.class, StrataNamespace.class);
-        ctor.setAccessible(true);
-        return ctor.newInstance(store, chunkId, new ChunkFormats.Header(chunkId, false, 1, 1718000000000L, 0, 0, 0), TEST_NS);
+        return store.handleForTests(chunkId,
+                new ChunkFormats.Header(chunkId, false, 1, 1718000000000L, 0, 0, 0), TEST_NS);
     }
 
     private static int checkedFooterLength(ChunkFormats.Trailer trailer, long fileLen) throws Exception {
@@ -1492,9 +1489,6 @@ class ChunkStoreTest {
         // on-disk sidecar still reads OPEN and recovery takes the OPEN branch, which rebuilds the chunk
         // by REPLAYING THE INTEGRITY LEDGER. So seal() must not remove the ledger until the SEALED state
         // is durable — otherwise recovery finds no ledger and truncates acknowledged data to zero.
-        assumeTrue(!ChunkStore.booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false),
-                "guarantee under test is specific to the no-seal-fsync durability path");
-
         ChunkId chunkId = new ChunkId(FileId.of(7), 0);
         Path metaPath = dir.resolve(rel(chunkId) + ".meta");
         byte[] payload = "important-acknowledged-data".getBytes(StandardCharsets.UTF_8);
@@ -1519,8 +1513,6 @@ class ChunkStoreTest {
 
     @Test
     void sealRetainsLedgerUntilReclaimedWhenSealFsyncDisabled() throws Exception {
-        assumeTrue(!ChunkStore.booleanConf("strata.seal.fsync", "STRATA_SEAL_FSYNC", false),
-                "ledger retention is specific to the no-seal-fsync durability path");
         ChunkId chunkId = new ChunkId(FileId.of(8), 0);
         Path ledgerPath = dir.resolve(rel(chunkId) + ".j");
         byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
@@ -2178,9 +2170,7 @@ class ChunkStoreTest {
     @Test
     void cachedChannelsStayBoundedAsSealedCountExceedsCapacity() throws Exception {
         // Use a tiny explicit capacity so the bound is observable without thousands of files.
-        // CHANNEL_CACHE_MAX_SIZE is static-final (read once at class load), so setting a system
-        // property inside a test is unreliable once the class is already loaded by earlier tests.
-        // The package-private ChunkStore(dir, sealFsync, capacity) constructor sidesteps that.
+        // Use a constructor-injected capacity so the test does not depend on the host FD limit.
         int tinyCapacity = 4;
         int n = 32; // >> tinyCapacity, guarantees eviction
         try (ChunkStore store = new ChunkStore(dir, true, tinyCapacity)) {

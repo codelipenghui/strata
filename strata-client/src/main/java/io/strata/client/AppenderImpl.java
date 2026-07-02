@@ -10,7 +10,6 @@ import io.strata.proto.ManagedScpConnection;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.Resp;
-import io.strata.proto.ScpClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,16 +48,7 @@ final class AppenderImpl implements StrataFile.Appender {
     /** Replica responses are dispatched off transport event-loop threads. */
     private static final Executor CALLBACKS =
             Executors.newVirtualThreadPerTaskExecutor();
-    private static final int APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK =
-            intConf("strata.append.replicaInflightHighWatermark",
-                    "STRATA_APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK", 64);
     private static final long APPEND_BACKPRESSURE_WARN_NANOS = TimeUnit.SECONDS.toNanos(10);
-    private static final int DEFAULT_APPEND_CONNECTION_PENDING_HIGH_WATERMARK =
-            Math.max(1, (ScpClient.maxPendingRequests() * 3) / 4);
-    private static final int APPEND_CONNECTION_PENDING_HIGH_WATERMARK =
-            intConf("strata.append.connectionPendingHighWatermark",
-                    "STRATA_APPEND_CONNECTION_PENDING_HIGH_WATERMARK",
-                    DEFAULT_APPEND_CONNECTION_PENDING_HIGH_WATERMARK);
 
     private final ControllerClient controller;
     private final NodePool pool;
@@ -119,6 +109,15 @@ final class AppenderImpl implements StrataFile.Appender {
     }
 
     private record Pending(long chunkEnd, CompletableFuture<Long> future) {}
+
+    static Object chunkSessionForTests(ChunkId chunkId, List<Messages.Replica> replicas,
+                                       long createOpMsb, long createOpLsb) {
+        return new ChunkSession(chunkId, replicas, createOpMsb, createOpLsb);
+    }
+
+    static Object pendingForTests(long chunkEnd, CompletableFuture<Long> future) {
+        return new Pending(chunkEnd, future);
+    }
 
     AppenderImpl(ControllerClient controller, NodePool pool, ClientConfig config, FileId fileId,
                  StrataNamespace namespace, int epoch, Messages.WritePolicy writePolicy,
@@ -279,19 +278,6 @@ final class AppenderImpl implements StrataFile.Appender {
         return ScpException.rootCause(err) instanceof ScpException e ? e : null;
     }
 
-    private static int intConf(String property, String env, int def) {
-        String raw = System.getProperty(property);
-        if (raw == null) raw = System.getenv(env);
-        if (raw == null || raw.isBlank()) return def;
-        try {
-            int value = Integer.parseInt(raw.trim());
-            return value > 0 ? value : def;
-        } catch (NumberFormatException e) {
-            log.warn("ignoring non-numeric {}/{}='{}', using default {}", property, env, raw, def);
-            return def;
-        }
-    }
-
     private void awaitAppendConnectionCapacityLocked(ChunkSession s) {
         long waitStart = System.nanoTime();
         long nextWarn = waitStart + APPEND_BACKPRESSURE_WARN_NANOS;
@@ -335,10 +321,10 @@ final class AppenderImpl implements StrataFile.Appender {
 
     private boolean replicaHasAppendCapacity(ChunkSession s, int replicaIndex) {
         if (s.failed[replicaIndex]) return false;
-        if (s.inFlight[replicaIndex] >= APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK) return false;
+        if (s.inFlight[replicaIndex] >= config.appendReplicaInflightHighWatermark()) return false;
         ManagedScpConnection connection = s.connections[replicaIndex];
         return connection == null
-                || connection.pendingCount() < APPEND_CONNECTION_PENDING_HIGH_WATERMARK;
+                || connection.pendingCount() < config.appendConnectionPendingHighWatermark();
     }
 
     private void beginReplicaRequestLocked(ChunkSession s, int replicaIndex) {

@@ -73,7 +73,8 @@ public final class StrataServer {
                 .withDeletedTombstoneTtlMs(longEnv("STRATA_CONTROLLER_DELETED_TOMBSTONE_TTL_MS", 600_000))
                 .withMaxCommandsPerHeartbeat(intEnv("STRATA_CONTROLLER_MAX_COMMANDS_PER_HEARTBEAT", 16))
                 .withZkRetryBaseMs(intEnv("STRATA_CONTROLLER_ZK_RETRY_BASE_MS", 100))
-                .withZkRetryMaxRetries(intEnv("STRATA_CONTROLLER_ZK_RETRY_MAX", 5));
+                .withZkRetryMaxRetries(intEnv("STRATA_CONTROLLER_ZK_RETRY_MAX", 5))
+                .withMetadataBackend(metadataBackendConfig());
         // Namespace sharding is OPT-IN (default off = single global leader). When enabled, namespaces are
         // rendezvous-assigned across STRATA_CONTROLLER_ENDPOINTS so each controller node owns a shard. The
         // client (ControllerClient) is sharding-aware: it keeps one connection per owner and routes each op
@@ -122,6 +123,8 @@ public final class StrataServer {
                 .withOrphanStartupGraceMs(longEnv("STRATA_ORPHAN_STARTUP_GRACE_MS", 6_000))
                 .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
                 .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
+                .withControlCommandLimits(intEnv("STRATA_NODE_COMMAND_PARALLELISM", 8),
+                        intEnv("STRATA_NODE_MAX_QUEUED_COMMANDS", 1024))
                 .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
                 .withDeleteMaxConcurrent(intEnv("STRATA_DELETE_MAX_CONCURRENT", 1))
                 .withDeleteMinIntervalMs(longEnv("STRATA_DELETE_MIN_INTERVAL_MS", 50))
@@ -129,7 +132,14 @@ public final class StrataServer {
                         intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
                         longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
                         longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
-                        longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000)));
+                        longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000),
+                        Boolean.parseBoolean(env("STRATA_SEAL_FSYNC", "false")),
+                        longEnv("STRATA_BG_FLUSH_INTERVAL_MS", 500),
+                        longEnv("STRATA_BG_FLUSH_THRESHOLD_BYTES", 4L << 20),
+                        longEnv("STRATA_SLOW_APPEND_LOG_MS", 1_000),
+                        longEnv("STRATA_SLOW_MUTATION_LOG_MS", 500),
+                        intEnv("STRATA_FILE_CHANNEL_CACHE_MAX_SIZE",
+                                ChunkStoreConfig.DEFAULT.channelCacheMaxSize())));
         DataNode node = new DataNode(config);
         log.info("data node started: endpoint={} dataDir={} controller={}",
                 node.endpoint(), config.dataDir(), config.controllerEndpoints());
@@ -178,7 +188,8 @@ public final class StrataServer {
                 .withDeletedTombstoneTtlMs(longEnv("STRATA_CONTROLLER_DELETED_TOMBSTONE_TTL_MS", 600_000))
                 .withMaxCommandsPerHeartbeat(intEnv("STRATA_CONTROLLER_MAX_COMMANDS_PER_HEARTBEAT", 16))
                 .withZkRetryBaseMs(intEnv("STRATA_CONTROLLER_ZK_RETRY_BASE_MS", 100))
-                .withZkRetryMaxRetries(intEnv("STRATA_CONTROLLER_ZK_RETRY_MAX", 5));
+                .withZkRetryMaxRetries(intEnv("STRATA_CONTROLLER_ZK_RETRY_MAX", 5))
+                .withMetadataBackend(metadataBackendConfig());
         // Namespace sharding is OPT-IN (default off = single global leader). The sharding-aware client
         // (ControllerClient) keeps one connection per owner and routes each op to its namespace's owner,
         // so it does not thrash a single connection. Off by default to gate rollout. See runController /
@@ -204,6 +215,8 @@ public final class StrataServer {
                 .withOrphanStartupGraceMs(longEnv("STRATA_ORPHAN_STARTUP_GRACE_MS", 6_000))
                 .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
                 .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
+                .withControlCommandLimits(intEnv("STRATA_NODE_COMMAND_PARALLELISM", 8),
+                        intEnv("STRATA_NODE_MAX_QUEUED_COMMANDS", 1024))
                 .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
                 .withDeleteMaxConcurrent(intEnv("STRATA_DELETE_MAX_CONCURRENT", 1))
                 .withDeleteMinIntervalMs(longEnv("STRATA_DELETE_MIN_INTERVAL_MS", 50))
@@ -211,7 +224,14 @@ public final class StrataServer {
                         intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
                         longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
                         longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
-                        longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000)));
+                        longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000),
+                        Boolean.parseBoolean(env("STRATA_SEAL_FSYNC", "false")),
+                        longEnv("STRATA_BG_FLUSH_INTERVAL_MS", 500),
+                        longEnv("STRATA_BG_FLUSH_THRESHOLD_BYTES", 4L << 20),
+                        longEnv("STRATA_SLOW_APPEND_LOG_MS", 1_000),
+                        longEnv("STRATA_SLOW_MUTATION_LOG_MS", 500),
+                        intEnv("STRATA_FILE_CHANNEL_CACHE_MAX_SIZE",
+                                ChunkStoreConfig.DEFAULT.channelCacheMaxSize())));
         Combined combined = startCombined(controllerConfig, nodeConfig);
         log.info("combined node started: scp={} zk={}", combined.node().endpoint(), controllerConfig.zkConnect());
         awaitShutdown("combined node", combined);
@@ -354,6 +374,23 @@ public final class StrataServer {
     static String env(String key, String def) {
         String v = System.getenv(key);
         return (v == null || v.isBlank()) ? def : v.trim();
+    }
+
+    private static ControllerConfig.MetadataBackendConfig metadataBackendConfig() {
+        String backend = env("STRATA_CONTROLLER_BACKEND", "zk");
+        if (!"namespace-log".equalsIgnoreCase(backend)) {
+            return new ControllerConfig.MetadataBackendConfig(backend, 3, 2, false,
+                    4 * 1024 * 1024, 30_000, true, 0, 4 * 1024 * 1024);
+        }
+        return new ControllerConfig.MetadataBackendConfig("namespace-log",
+                intEnv("STRATA_CONTROLLER_LOG_RF", 3),
+                intEnv("STRATA_CONTROLLER_LOG_ACK", 2),
+                Boolean.parseBoolean(env("STRATA_CONTROLLER_LOG_FSYNC", "false")),
+                intEnv("STRATA_CONTROLLER_LOG_COMPACT_BYTES", 4 * 1024 * 1024),
+                intEnv("STRATA_CONTROLLER_LOG_COMPACT_INTERVAL_MS", 30_000),
+                Boolean.parseBoolean(env("STRATA_CONTROLLER_LOG_ORPHAN_GC", "true")),
+                intEnv("STRATA_CONTROLLER_LOG_RETENTION_MS", 0),
+                intEnv("STRATA_CONTROLLER_LOG_READ_CHUNK_BYTES", 4 * 1024 * 1024));
     }
 
     private static String required(String key) {

@@ -13,7 +13,6 @@ import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
@@ -1417,10 +1416,7 @@ class RecoveryTest {
 
     private static Object replicaState(Messages.Replica replica, long localEnd, long durable, ChunkState state)
             throws Exception {
-        Class<?> type = Class.forName("io.strata.client.Recovery$ReplicaState");
-        Constructor<?> ctor = type.getDeclaredConstructor(Messages.Replica.class, Messages.FenceResp.class);
-        ctor.setAccessible(true);
-        return ctor.newInstance(replica, new Messages.FenceResp(2, localEnd, durable, state));
+        return Recovery.replicaStateForTests(replica, localEnd, durable, state);
     }
 
     private static byte[] invokeReadRange(Recovery recovery, ChunkId chunkId, Object source, long from, long to)

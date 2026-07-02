@@ -79,6 +79,10 @@ final class Recovery {
         }
     }
 
+    static Object replicaStateForTests(Messages.Replica replica, long localEnd, long durable, ChunkState state) {
+        return new ReplicaState(replica, new Messages.FenceResp(2, localEnd, durable, state));
+    }
+
     StrataFile.SealInfo recoverAndSeal(FileId fileId) {
         Messages.LookupFileResp file = controller.lookupFile(namespace, fileId);
         boolean needsRecovery = file.chunks().stream().anyMatch(c -> c.state() != ChunkState.SEALED);

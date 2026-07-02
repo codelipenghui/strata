@@ -72,6 +72,11 @@ class RepairCoordinator implements AutoCloseable {
         }
     }
 
+    static Object replicateActionForTests(StrataNamespace namespace, FileId fileId, ChunkId chunkId,
+                                          int deadNode, int targetNode, long issuedAtMs) {
+        return new ReplicateAction(namespace, fileId, chunkId, deadNode, targetNode, issuedAtMs);
+    }
+
     private record DeleteAction(StrataNamespace namespace, FileId fileId, ChunkId chunkId,
                                 int nodeId, long issuedAtMs) implements Action {
         @Override

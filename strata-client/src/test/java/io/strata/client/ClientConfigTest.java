@@ -35,6 +35,10 @@ class ClientConfigTest {
                 () -> new ClientConfig(List.of("host:123"), 1, 1, ConnectionPolicy.DEFAULT, 0, 0L, 0, 0));
         assertThrows(IllegalArgumentException.class,
                 () -> new ClientConfig(List.of("host:123"), 1, 1, ConnectionPolicy.DEFAULT, -1, 0L, 0, 0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ClientConfig(List.of("host:123"), 1, 1, ConnectionPolicy.DEFAULT, 1, 1L, 1, 1, 0, 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ClientConfig(List.of("host:123"), 1, 1, ConnectionPolicy.DEFAULT, 1, 1L, 1, 1, 1, 0));
         assertThrows(NullPointerException.class,
                 () -> new ClientConfig(List.of("host:123"), 1, 1, null));
     }
@@ -52,16 +56,22 @@ class ClientConfigTest {
         assertEquals(15_000L, c.controllerRetryDeadlineMs());
         assertEquals(200, c.controllerRetryBackoffMs());
         assertEquals(4 * 1024 * 1024, c.recoveryCopyChunkBytes());
+        assertEquals(64, c.appendReplicaInflightHighWatermark());
+        assertEquals(Math.max(1, (io.strata.proto.ScpClient.maxPendingRequests() * 3) / 4),
+                c.appendConnectionPendingHighWatermark());
     }
 
     @Test
     void withSettersOverrideClientTuning() {
         ClientConfig c = ClientConfig.of("host:123")
                 .withControllerRetryDeadlineMs(30_000L).withControllerRetryBackoffMs(50)
-                .withRecoveryCopyChunkBytes(1 << 20);
+                .withRecoveryCopyChunkBytes(1 << 20)
+                .withAppendWatermarks(32, 128);
         assertEquals(30_000L, c.controllerRetryDeadlineMs());
         assertEquals(50, c.controllerRetryBackoffMs());
         assertEquals(1 << 20, c.recoveryCopyChunkBytes());
+        assertEquals(32, c.appendReplicaInflightHighWatermark());
+        assertEquals(128, c.appendConnectionPendingHighWatermark());
     }
 
     @Test

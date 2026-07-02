@@ -14,7 +14,6 @@ import io.strata.proto.ScpClient;
 import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -1055,11 +1054,8 @@ class RepairCoordinatorTest {
 
     private static Object replicateAction(FileId fileId, ChunkId chunkId, int deadNode, int targetNode)
             throws Exception {
-        Class<?> type = Class.forName("io.strata.meta.RepairCoordinator$ReplicateAction");
-        Constructor<?> ctor = type.getDeclaredConstructor(StrataNamespace.class, FileId.class, ChunkId.class,
-                int.class, int.class, long.class);
-        ctor.setAccessible(true);
-        return ctor.newInstance(TEST_NS, fileId, chunkId, deadNode, targetNode, System.currentTimeMillis());
+        return RepairCoordinator.replicateActionForTests(TEST_NS, fileId, chunkId, deadNode, targetNode,
+                System.currentTimeMillis());
     }
 
     private static void applyReplicaSwap(RepairCoordinator coordinator, Object action) throws Exception {

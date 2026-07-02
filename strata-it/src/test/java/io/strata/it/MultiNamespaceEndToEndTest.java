@@ -57,10 +57,7 @@ class MultiNamespaceEndToEndTest {
     @BeforeAll
     void setup() throws Exception {
         // Select the namespace-log backend: per-namespace owner-assigned fileIds starting at 0.
-        System.setProperty("strata.controller.backend", "namespace-log");
-        System.setProperty("strata.controller.log.rf", "3");
-        System.setProperty("strata.controller.log.ack", "2");
-        cluster = new MiniCluster(3);
+        cluster = MiniCluster.namespaceLog(3);
         client = StrataClient.connect(ClientConfig.of(cluster.metaEndpoint())
                 .withChunkRollBytes(4096)
                 .withDataNodeConnectionsPerEndpoint(3));
@@ -72,12 +69,8 @@ class MultiNamespaceEndToEndTest {
             if (client != null) client.close();
         } catch (Exception ignore) {
         }
-        try {
-            if (cluster != null) cluster.close();
-        } finally {
-            System.clearProperty("strata.controller.backend");
-            System.clearProperty("strata.controller.log.rf");
-            System.clearProperty("strata.controller.log.ack");
+        if (cluster != null) {
+            cluster.close();
         }
     }
 
