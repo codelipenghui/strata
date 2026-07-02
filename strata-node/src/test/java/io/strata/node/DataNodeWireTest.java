@@ -400,6 +400,57 @@ class DataNodeWireTest {
     }
 
     @Test
+    void recoveredOpenReplicaCanBeResealedOverWireAfterTrailerLoss() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(8), 0);
+        byte[] payload = "crash-recovered-prefix".getBytes();
+        int payloadCrc = Crc.of(ByteBuffer.wrap(payload));
+        Path chunksDir = dir.resolve("chunks");
+        Path dataPath = chunksDir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, chunk) + ".chunk");
+        Path metaPath = chunksDir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, chunk) + ".meta");
+        Path ledgerPath = chunksDir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, chunk) + ".j");
+
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
+             ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(chunk, 1, false,
+                    1 << 20, 1L, TEST_NS).encode(), null, 5000);
+            client.call(Opcode.APPEND, new Messages.Append(chunk, 1, 0, 0, TEST_NS).encode(),
+                    ByteBuffer.wrap(payload), 5000);
+            ByteBuffer seal = client.call(Opcode.SEAL_CHUNK,
+                    new Messages.SealChunk(chunk, 1, payload.length, TEST_NS).encode(), null, 5000);
+            assertEquals(payload.length, Messages.SealResp.decode(seal).finalLength());
+        }
+
+        assertTrue(Files.exists(ledgerPath), "non-fsync seal must retain the ledger until reclaim");
+        try (FileChannel channel = FileChannel.open(dataPath, StandardOpenOption.WRITE)) {
+            channel.truncate(ChunkFormats.DATA_START + payload.length);
+        }
+        Files.write(metaPath, new ChunkFormats.Sidecar(1, -1, payload.length, ChunkState.OPEN).encode());
+
+        try (DataNode recovered = new DataNode(DataNodeConfig.standalone(dir));
+             ScpClient client = new ScpClient("127.0.0.1", recovered.port(), ScpClient.KIND_BROKER, "test")) {
+            ByteBuffer statOpen = client.call(Opcode.STAT_CHUNK,
+                    new Messages.StatChunk(chunk, TEST_NS).encode(), null, 5000);
+            var open = Messages.StatResp.decode(statOpen);
+            assertEquals(ChunkState.OPEN, open.state());
+            assertEquals(payload.length, open.localEndOffset());
+            assertEquals(payload.length, open.lastKnownDO());
+
+            ByteBuffer reseal = client.call(Opcode.SEAL_CHUNK,
+                    new Messages.SealChunk(chunk, 1, payload.length, TEST_NS).encode(), null, 5000);
+            var resealed = Messages.SealResp.decode(reseal);
+            assertEquals(payload.length, resealed.finalLength());
+            assertEquals(payloadCrc, resealed.chunkCrc());
+
+            ByteBuffer statSealed = client.call(Opcode.STAT_CHUNK,
+                    new Messages.StatChunk(chunk, TEST_NS).encode(), null, 5000);
+            var sealed = Messages.StatResp.decode(statSealed);
+            assertEquals(ChunkState.SEALED, sealed.state());
+            assertEquals(payload.length, sealed.sealedLength());
+            assertEquals(payloadCrc, sealed.sealedCrc());
+        }
+    }
+
+    @Test
     void nodeRestartRecoversChunksOverTheWire() throws Exception {
         UUID incarnation;
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));

@@ -950,6 +950,8 @@ class RepairCoordinator implements AutoCloseable {
                     new Messages.SealChunk(chunkId, exp.writeEpoch(), exp.length(), ns).encode(), null, timeoutMs);
             Messages.SealResp r = Messages.SealResp.decode(resp);
             if (r.finalLength() != exp.length() || r.chunkCrc() != exp.crc()) {
+                // A successful seal with a bad CRC leaves a sealed-corrupt replica for the next verify
+                // pass to classify and grace-drop through the normal corrupt-sealed path.
                 log.warn("owner-reseal of {} on node {} returned len/crc {}/{} expected {}/{}",
                         chunkId, node.nodeId(), r.finalLength(), r.chunkCrc(), exp.length(), exp.crc());
                 return false;
