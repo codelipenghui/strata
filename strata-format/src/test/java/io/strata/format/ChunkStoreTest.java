@@ -109,6 +109,62 @@ class ChunkStoreTest {
     }
 
     @Test
+    void fsyncOnAckOpenForcesCreatedShardAncestorDirentsWhenSealFsyncDisabled() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102), 0);
+        List<Path> forced = new ArrayList<>();
+
+        try (ChunkStore store = new ChunkStore(dir, false, 1024, ChunkStoreConfig.DEFAULT, forced::add)) {
+            store.open(TEST_NS, chunkId, true, 1, 1718000000000L);
+        }
+
+        Path nsDir = dir.resolve(TEST_NS.value());
+        Path l1Dir = nsDir.resolve("02");
+        Path shardDir = l1Dir.resolve("01");
+        assertTrue(forced.contains(dir), "new namespace dirent must be forced in the store root");
+        assertTrue(forced.contains(nsDir), "new L1 dirent must be forced in the namespace directory");
+        assertTrue(forced.contains(l1Dir), "new shard dirent must be forced in the L1 directory");
+        assertTrue(forced.contains(shardDir), "chunk file dirents must be forced in the shard directory");
+    }
+
+    @Test
+    void replicateOpenDoesNotForceCreatedShardDirentsWhenSealFsyncDisabled() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102), 0);
+        List<Path> forced = new ArrayList<>();
+
+        try (ChunkStore store = new ChunkStore(dir, false, 1024, ChunkStoreConfig.DEFAULT, forced::add)) {
+            store.open(TEST_NS, chunkId, false, 1, 1718000000000L);
+        }
+
+        assertTrue(forced.isEmpty(), "ack-on-replicate open must stay off the fsync path when seal fsync is disabled");
+    }
+
+    @Test
+    void importSealedForcesCreatedShardAncestorDirents() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102), 0);
+        byte[] payload = "sealed".getBytes(StandardCharsets.UTF_8);
+        byte[] fileBytes;
+        Path sourceDir = Files.createTempDirectory(dir.getParent(), "strata-source-");
+        try (ChunkStore source = new ChunkStore(sourceDir)) {
+            fileBytes = sealedBytes(source, chunkId, "sealed");
+        }
+        Path sourceFile = dir.resolve("sealed.import");
+        Files.write(sourceFile, fileBytes);
+        List<Path> forced = new ArrayList<>();
+
+        try (ChunkStore target = new ChunkStore(dir, false, 1024, ChunkStoreConfig.DEFAULT, forced::add)) {
+            target.importSealed(TEST_NS, chunkId, sourceFile, payload.length, Crc.of(payload));
+        }
+
+        Path nsDir = dir.resolve(TEST_NS.value());
+        Path l1Dir = nsDir.resolve("02");
+        Path shardDir = l1Dir.resolve("01");
+        assertTrue(forced.contains(dir), "new namespace dirent must be forced in the store root");
+        assertTrue(forced.contains(nsDir), "new L1 dirent must be forced in the namespace directory");
+        assertTrue(forced.contains(l1Dir), "new shard dirent must be forced in the L1 directory");
+        assertTrue(forced.contains(shardDir), "imported chunk dirent must be forced in the shard directory");
+    }
+
+    @Test
     void verifyReportsPresentSealedFactsAndMissingAbsent() throws Exception {
         try (ChunkStore store = newStore()) {
             ChunkId present = new ChunkId(FileId.of(1), 0);

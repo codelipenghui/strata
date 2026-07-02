@@ -279,6 +279,27 @@ class CrashRecoveryTest {
     }
 
     @Test
+    void ackedFsyncChunkSurvivesTornSidecarAfterCrash() throws Exception {
+        byte[] payload = "acked-fsync".getBytes();
+        ChunkStore store = new ChunkStore(dir);
+        store.open(TEST_NS, id, true, 1, 1718000000000L);
+        store.appendAsync(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(payload)).get(5, TimeUnit.SECONDS);
+        store.close();
+
+        Files.write(metaPath(), new byte[ChunkFormats.SIDECAR_SIZE]);
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            assertEquals(ChunkState.OPEN, recovered.stat(TEST_NS, id).state());
+            assertArrayEquals(payload, recovered.read(TEST_NS, id, 0, 100).bytes());
+
+            ScpException stale = assertThrows(ScpException.class,
+                    () -> recovered.append(TEST_NS, id, 1, payload.length, payload.length,
+                            ByteBuffer.wrap("stale".getBytes())));
+            assertEquals(ErrorCode.FENCED_EPOCH, stale.code());
+        }
+    }
+
+    @Test
     void missingSidecarOpenChunkWithFooterShapedPayloadRecoversFromLedger() throws Exception {
         byte[] payload = footerShapedPayload("live".getBytes());
         ChunkStore store = new ChunkStore(dir);
