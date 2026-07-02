@@ -1759,6 +1759,7 @@ class AppenderImplTest {
                 assertEquals(2, createCalls.get(), "third record must roll to a successor chunk");
                 assertEquals(2L, sealedChunkLength.get());
                 assertEquals(6, oldChunkAppends.get());
+                waitFor(() -> newChunkAppends.get() == 3);
                 assertEquals(3, newChunkAppends.get());
             }
         }
