@@ -341,11 +341,8 @@ class DataNodeWireTest {
             assertEquals(ErrorCode.CRC_MISMATCH,
                     assertThrows(ScpException.class, () -> node.store().read(TEST_NS, id, 0, payload.length)).code());
 
-            ScpException regionError = assertThrows(ScpException.class, () -> {
-                try (var ignored = node.store().readRegion(TEST_NS, id, 0, payload.length)) {
-                    // Should fail before returning a readable region.
-                }
-            });
+            ScpException regionError = assertThrows(ScpException.class,
+                    () -> node.store().readRegion(TEST_NS, id, 0, payload.length));
             assertEquals(ErrorCode.CRC_MISMATCH, regionError.code());
 
             ScpException wireError = assertThrows(ScpException.class, () -> client.call(Opcode.READ,

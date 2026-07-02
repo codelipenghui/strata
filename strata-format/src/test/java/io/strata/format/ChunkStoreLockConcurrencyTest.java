@@ -443,13 +443,12 @@ class ChunkStoreLockConcurrencyTest {
                     try {
                         go.await();
                         while (!writerDone.get()) {
-                            try (ChunkStore.ReadRegionResult region = store.readRegion(TEST_NS, id, 0, 1 << 20)) {
-                                int len = region.length();
-                                byte[] got = region.bytes();
-                                if (len == 0 || got == null) continue;
-                                for (int b = 0; b < len; b++) {
-                                    if (got[b] != 'X') throw new AssertionError("torn region byte at " + b + " = " + got[b]);
-                                }
+                            ChunkStore.ReadRegionResult region = store.readRegion(TEST_NS, id, 0, 1 << 20);
+                            int len = region.length();
+                            byte[] got = region.bytes();
+                            if (len == 0) continue;
+                            for (int b = 0; b < len; b++) {
+                                if (got[b] != 'X') throw new AssertionError("torn region byte at " + b + " = " + got[b]);
                             }
                         }
                     } catch (Throwable t) {

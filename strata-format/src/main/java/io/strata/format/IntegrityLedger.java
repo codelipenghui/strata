@@ -85,6 +85,40 @@ public final class IntegrityLedger implements AutoCloseable {
         return List.copyOf(entries);
     }
 
+    public record EntrySpan(long firstStart, List<ChunkFormats.LedgerEntry> entries) {}
+
+    /**
+     * Returns the minimal ledger-entry span that covers [offset, readEnd). Entries are monotonic by
+     * endOffset, so the first covering entry is found by binary search instead of scanning every append.
+     */
+    public EntrySpan entriesCovering(long offset, long readEnd) {
+        int first = firstEntryEndingAfter(offset);
+        long firstStart = first == 0 ? 0 : entries.get(first - 1).endOffset();
+        List<ChunkFormats.LedgerEntry> out = new ArrayList<>();
+        for (int i = first; i < entries.size(); i++) {
+            ChunkFormats.LedgerEntry e = entries.get(i);
+            out.add(e);
+            if (e.endOffset() >= readEnd) {
+                break;
+            }
+        }
+        return new EntrySpan(firstStart, List.copyOf(out));
+    }
+
+    private int firstEntryEndingAfter(long offset) {
+        int lo = 0;
+        int hi = entries.size();
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (entries.get(mid).endOffset() > offset) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        return lo;
+    }
+
     /** Entries with endOffset > fromOffset, in order. */
     public List<ChunkFormats.LedgerEntry> entriesAfter(long fromOffset) {
         List<ChunkFormats.LedgerEntry> out = new ArrayList<>();

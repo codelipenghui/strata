@@ -178,15 +178,10 @@ final class DataNodeHandlers implements ScpServer.Handler {
         };
     }
 
-    /** Wire-encodes a {@link ChunkStore.ReadRegionResult}: usually materialized bytes, with file-region
-     * support retained for callers that explicitly return a channel-backed result. */
+    /** Wire-encodes a verified, materialized {@link ChunkStore.ReadRegionResult}. */
     private static Frame readRegionResponse(Frame req, ChunkStore.ReadRegionResult r) {
         byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
-        if (r.channel() != null) {
-            return ScpServer.okFileRegion(req, header, r.channel(), r.filePosition(), r.length(),
-                    r.releaser());
-        }
         byte[] bytes = r.bytes();
-        return ScpServer.ok(req, header, bytes != null && bytes.length > 0 ? ByteBuffer.wrap(bytes) : null);
+        return ScpServer.ok(req, header, bytes.length > 0 ? ByteBuffer.wrap(bytes) : null);
     }
 }

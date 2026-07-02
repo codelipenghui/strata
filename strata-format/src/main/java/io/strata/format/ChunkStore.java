@@ -939,58 +939,19 @@ public final class ChunkStore implements AutoCloseable {
 
     public record ReadResult(byte[] bytes, long localEndOffset, long lastKnownDO) {}
 
-    /**
-     * A read response that is either a channel-backed file region or a heap snapshot of the bytes.
-     * Client reads of open chunks are bounded by the replica-known durable high watermark and are
-     * materialized with per-read CRC verification before being returned. Open recovery reads can include
-     * the undurable tail, so they are snapshotted before any concurrent seal-truncate can alter the
-     * transferred payload.
-     * Exactly one of {@code channel} / {@code bytes} is set for a non-empty result.
-     */
-    public record ReadRegionResult(FileChannel channel, long filePosition, int length, byte[] bytes,
-                                   long localEndOffset, long lastKnownDO, Runnable releaser)
-            implements AutoCloseable {
-        /** Releases the underlying read resource: a cache lease (sealed) or the transient FD (open). */
-        @Override
-        public void close() {
-            if (releaser != null) {
-                releaser.run();
-            }
+    /** A verified read response whose bytes are materialized before the caller writes them to the client. */
+    public record ReadRegionResult(byte[] bytes, long localEndOffset, long lastKnownDO) {
+        public int length() {
+            return bytes.length;
         }
     }
 
+    private record OpenReadPlan(Path dataPath, NsChunkId nsKey, long firstEntryStart,
+                                List<ChunkFormats.LedgerEntry> entries) {}
+
     public ReadResult read(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
-        requireNonNegative(offset, "read offset");
-        requireNonNegative(maxBytes, "read maxBytes");
-        Handle h = lookup(ns, id);
-        long sealedLength;
-        List<Integer> rangeCrcs;
-        long lastKnownDO;
-        Path dataPath;
-        h.lock.lock();
-        try {
-            if (h.state != ChunkState.SEALED) {
-                long end = h.currentEnd();
-                if (offset >= end) return new ReadResult(new byte[0], end, h.lastKnownDO);
-                int n = (int) Math.min(Math.min(maxBytes, csConfig.maxRequestBytes()), end - offset);
-                byte[] out = new byte[n];
-                readOpenVerified(h, offset, out);
-                return new ReadResult(out, end, h.lastKnownDO);
-            }
-            sealedLength = h.sealedLength;
-            rangeCrcs = h.sealedRangeCrcs;
-            lastKnownDO = h.lastKnownDO;
-            dataPath = h.dataPath;
-        } finally {
-            h.lock.unlock();
-        }
-        if (offset >= sealedLength) return new ReadResult(new byte[0], sealedLength, lastKnownDO);
-        int n = (int) Math.min(Math.min(maxBytes, csConfig.maxRequestBytes()), sealedLength - offset);
-        byte[] out = new byte[n];
-        try (ChannelCache.Lease lease = channelCache.acquire(h.nsKey, dataPath)) {
-            readSealedVerified(lease.channel(), sealedLength, rangeCrcs, id, offset, out);
-        }
-        return new ReadResult(out, sealedLength, lastKnownDO);
+        ReadRegionResult r = readRegion(ns, id, offset, maxBytes, true);
+        return new ReadResult(r.bytes(), r.localEndOffset(), r.lastKnownDO());
     }
 
     public ReadRegionResult readRegion(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
@@ -1019,6 +980,7 @@ public final class ChunkStore implements AutoCloseable {
         int n;
         Path dataPath;
         NsChunkId nsKey;
+        OpenReadPlan openReadPlan = null;
         long sealedLength = -1;
         List<Integer> sealedRangeCrcs = null;
         h.lock.lock();
@@ -1028,43 +990,47 @@ public final class ChunkStore implements AutoCloseable {
             long readableEnd = (h.state == ChunkState.SEALED || includeUndurableTail)
                     ? localEnd : Math.min(localEnd, lastKnownDO);
             if (offset >= readableEnd) {
-                return new ReadRegionResult(null, 0, 0, null, localEnd, lastKnownDO, null);
+                return new ReadRegionResult(new byte[0], localEnd, lastKnownDO);
             }
             n = (int) Math.min(Math.min(maxBytes, csConfig.maxRequestBytes()), readableEnd - offset);
             if (n == 0) {
-                return new ReadRegionResult(null, 0, 0, null, localEnd, lastKnownDO, null);
-            }
-            if (!includeUndurableTail) {
-                // observability: count client READ bytes served (mirrors append counters; drives read
-                // throughput). Recovery reads are internal control-plane traffic, not client reads.
-                readOps.incrementAndGet();
-                readBytes.addAndGet(n);
-                var nsCounters = nsIoFor(ns);
-                nsCounters[2].increment();
-                nsCounters[3].add(n);
+                return new ReadRegionResult(new byte[0], localEnd, lastKnownDO);
             }
             if (h.state != ChunkState.SEALED) {
-                // READs over open chunks must be materialized + ledger-verified under the chunk lock. The
-                // recovery path may inspect bytes above lastKnownDO, and even the client durable prefix uses
-                // the same ledger CRCs to avoid silently serving local disk rot.
-                byte[] out = new byte[n];
-                readOpenVerified(h, offset, out);
-                return new ReadRegionResult(null, 0, n, out, localEnd, lastKnownDO, null);
+                if (!includeUndurableTail) {
+                    openReadPlan = openReadPlan(h, offset, checkedAdd(offset, n, "open read end"));
+                    dataPath = openReadPlan.dataPath();
+                    nsKey = openReadPlan.nsKey();
+                } else {
+                    // Recovery may inspect bytes above lastKnownDO; that tail can be seal-truncated, so keep
+                    // the read and CRC under the chunk lock.
+                    byte[] out = new byte[n];
+                    readOpenVerified(h, offset, out);
+                    return new ReadRegionResult(out, localEnd, lastKnownDO);
+                }
+            } else {
+                sealedLength = h.sealedLength;
+                sealedRangeCrcs = h.sealedRangeCrcs;
+                dataPath = h.dataPath;
+                nsKey = h.nsKey;
             }
-            sealedLength = h.sealedLength;
-            sealedRangeCrcs = h.sealedRangeCrcs;
-            // Snapshot what the off-lock open needs. The bytes we will expose are stable once the lock is
-            // released: a SEALED chunk's data region is immutable. So the blocking acquire below need not
-            // hold the chunk lock — keeping it off-lock stops a blocking open from serializing every other
-            // op on this chunk.
-            dataPath = h.dataPath;
-            nsKey = h.nsKey;
         } finally {
             h.lock.unlock();
         }
         // Test seam: lets a test delete + re-import this id in the window between the lock release and the
         // off-lock open/acquire below, to exercise the post-open handle revalidation.
         FailureInjector.point("format.readRegion.beforeOpen");
+        if (openReadPlan != null) {
+            // Client open reads are clamped to lastKnownDO. Seal may not truncate below that floor, so the
+            // verified disk I/O can run off-lock against an independent FD after handle revalidation.
+            byte[] out = new byte[n];
+            try (FileChannel readChannel = FileChannel.open(dataPath, StandardOpenOption.READ)) {
+                requireCurrentHandle(h, nsKey, id);
+                readOpenVerified(readChannel, openReadPlan.firstEntryStart(), openReadPlan.entries(), id, offset, out);
+            }
+            countClientRead(ns, n);
+            return new ReadRegionResult(out, localEnd, lastKnownDO);
+        }
         // SEALED READs are immutable, so we can verify off-lock against the footer CRC ranges. Both client
         // reads and recovery reads use this path: a corrupt local block fails before the node writes a READ
         // response, instead of waiting for background scrub.
@@ -1073,7 +1039,28 @@ public final class ChunkStore implements AutoCloseable {
             requireCurrentHandle(h, nsKey, id);
             readSealedVerified(lease.channel(), sealedLength, sealedRangeCrcs, id, offset, out);
         }
-        return new ReadRegionResult(null, 0, n, out, localEnd, lastKnownDO, null);
+        if (!includeUndurableTail) {
+            countClientRead(ns, n);
+        }
+        return new ReadRegionResult(out, localEnd, lastKnownDO);
+    }
+
+    private OpenReadPlan openReadPlan(Handle h, long offset, long readEnd) throws IOException {
+        if (h.ledger == null) {
+            throw new ScpException(ErrorCode.CORRUPT_CHUNK, "open chunk missing integrity ledger: " + h.id);
+        }
+        IntegrityLedger.EntrySpan span = h.ledger.entriesCovering(offset, readEnd);
+        return new OpenReadPlan(h.dataPath, h.nsKey, span.firstStart(), span.entries());
+    }
+
+    private void countClientRead(StrataNamespace ns, int n) {
+        // observability: count client READ bytes served after verification (mirrors append counters; drives
+        // read throughput). Recovery reads are internal control-plane traffic, not client reads.
+        readOps.incrementAndGet();
+        readBytes.addAndGet(n);
+        var nsCounters = nsIoFor(ns);
+        nsCounters[2].increment();
+        nsCounters[3].add(n);
     }
 
     /**
@@ -1082,8 +1069,8 @@ public final class ChunkStore implements AutoCloseable {
      * window between the metadata snapshot and the open would otherwise bind the stale snapshot
      * (length/state) to the freshly-replaced physical file. A {@code Handle} is in the map iff it has not
      * been deleted, so an identity mismatch means the snapshot is stale: fail with CHUNK_NOT_FOUND and let
-     * the client retry — the same contract as opening an already-unlinked file. The verified read() path
-     * needs no equivalent: open reads stay under the chunk lock until bytes are CRC-verified.
+     * the client retry — the same contract as opening an already-unlinked file. Both open client reads and
+     * sealed reads revalidate after their off-lock open/acquire before trusting the snapshot.
      */
     private void requireCurrentHandle(Handle h, NsChunkId nsKey, ChunkId id) {
         if (chunks.get(nsKey) != h) {
@@ -2242,13 +2229,25 @@ public final class ChunkStore implements AutoCloseable {
             throw new ScpException(ErrorCode.CORRUPT_CHUNK, "open chunk missing integrity ledger: " + h.id);
         }
         long readEnd = checkedAdd(offset, out.length, "open read end");
-        long entryStart = 0;
+        IntegrityLedger.EntrySpan span = h.ledger.entriesCovering(offset, readEnd);
+        // This overload uses the handle's shared FileChannel for recovery/local reads. Server request
+        // threads must not be interrupted with cancel(true): FileChannel is interruptible and may close.
+        readOpenVerified(h.data, span.firstStart(), span.entries(), h.id, offset, out);
+    }
+
+    private void readOpenVerified(FileChannel data, long firstEntryStart, List<ChunkFormats.LedgerEntry> entries,
+                                  ChunkId id, long offset, byte[] out) throws IOException {
+        if (out.length == 0) {
+            return;
+        }
+        long readEnd = checkedAdd(offset, out.length, "open read end");
+        long entryStart = firstEntryStart;
         int copied = 0;
-        for (ChunkFormats.LedgerEntry e : h.ledger.entries()) {
+        for (ChunkFormats.LedgerEntry e : entries) {
             long entryEnd = e.endOffset();
             if (entryEnd <= entryStart) {
                 throw new ScpException(ErrorCode.CORRUPT_CHUNK,
-                        "non-increasing ledger entry for " + h.id + ": " + entryEnd);
+                        "non-increasing ledger entry for " + id + ": " + entryEnd);
             }
             if (entryEnd <= offset) {
                 entryStart = entryEnd;
@@ -2260,16 +2259,16 @@ public final class ChunkStore implements AutoCloseable {
             long entryLenLong = entryEnd - entryStart;
             if (entryLenLong > Integer.MAX_VALUE) {
                 throw new ScpException(ErrorCode.CORRUPT_CHUNK,
-                        "oversized ledger entry for " + h.id + ": " + entryLenLong);
+                        "oversized ledger entry for " + id + ": " + entryLenLong);
             }
             int entryLen = (int) entryLenLong;
             byte[] entryBytes = new byte[entryLen];
-            readFully(h.data, ByteBuffer.wrap(entryBytes),
+            readFully(data, ByteBuffer.wrap(entryBytes),
                     checkedAdd(DATA_START, entryStart, "chunk file offset"));
             int actual = Crc.of(entryBytes, 0, entryLen);
             if (actual != e.payloadCrc()) {
                 throw new ScpException(ErrorCode.CRC_MISMATCH,
-                        "open ledger crc mismatch on " + h.id + " range [" + entryStart + ".." + entryEnd + ")");
+                        "open ledger crc mismatch on " + id + " range [" + entryStart + ".." + entryEnd + ")");
             }
             long copyStart = Math.max(offset, entryStart);
             long copyEnd = Math.min(readEnd, entryEnd);
@@ -2284,7 +2283,7 @@ public final class ChunkStore implements AutoCloseable {
         }
         if (copied != out.length) {
             throw new ScpException(ErrorCode.CORRUPT_CHUNK,
-                    "open read is not covered by ledger for " + h.id);
+                    "open read is not covered by ledger for " + id);
         }
     }
 
