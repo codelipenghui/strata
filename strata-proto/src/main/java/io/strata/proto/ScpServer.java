@@ -211,7 +211,7 @@ public final class ScpServer implements AutoCloseable {
             try {
                 requestExecutor.execute(task);
             } catch (RuntimeException | Error e) {
-                task.closeIfPending();
+                task.closeRejected();
                 throw e;
             }
         }
@@ -256,7 +256,6 @@ public final class ScpServer implements AutoCloseable {
         private final class FrameTask implements Runnable {
             private final ChannelHandlerContext ctx;
             private final Frame frame;
-            private final AtomicBoolean started = new AtomicBoolean(false);
 
             private FrameTask(ChannelHandlerContext ctx, Frame frame) {
                 this.ctx = ctx;
@@ -265,7 +264,6 @@ public final class ScpServer implements AutoCloseable {
 
             @Override
             public void run() {
-                started.set(true);
                 try {
                     processFrame(ctx, frame);
                 } catch (RuntimeException | Error e) {
@@ -275,11 +273,9 @@ public final class ScpServer implements AutoCloseable {
                 }
             }
 
-            private void closeIfPending() {
-                if (started.compareAndSet(false, true)) {
-                    releaseInbound(frame);
-                    frame.close();
-                }
+            private void closeRejected() {
+                releaseInbound(frame);
+                frame.close();
             }
         }
 
