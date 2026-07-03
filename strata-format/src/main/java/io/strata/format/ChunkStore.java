@@ -612,14 +612,17 @@ public final class ChunkStore implements AutoCloseable {
          * lock; {@code payload}'s position/limit are left untouched.
          */
         void crcAccumulate(ByteBuffer payload) {
-            ByteBuffer src = payload.duplicate();
-            while (src.hasRemaining()) {
-                int n = (int) Math.min(src.remaining(), rangeRemaining);
-                ByteBuffer slice = src.duplicate();
-                slice.limit(slice.position() + n);
-                runningWhole.update(slice.duplicate());
+            int cursor = payload.position();
+            int limit = payload.limit();
+            while (cursor < limit) {
+                int n = (int) Math.min(limit - cursor, rangeRemaining);
+                ByteBuffer slice = payload.duplicate();
+                slice.position(cursor);
+                slice.limit(cursor + n);
+                runningWhole.update(slice);
+                slice.position(cursor);
                 runningRange.update(slice);
-                src.position(src.position() + n);
+                cursor += n;
                 rangeRemaining -= n;
                 if (rangeRemaining == 0) {
                     completedRangeCrcs.add((int) runningRange.getValue());
@@ -904,6 +907,15 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
+    private static void writeFullyPreservingPosition(FileChannel ch, ByteBuffer buf, long position) throws IOException {
+        int originalPosition = buf.position();
+        try {
+            writeFully(ch, buf, position);
+        } finally {
+            buf.position(originalPosition);
+        }
+    }
+
     /** Closes and nulls a sealed Handle's writable data channel under its lock. Caller holds the lock. */
     private void closeAndNullData(Handle h) {
         if (h.data != null) {
@@ -984,7 +996,7 @@ public final class ChunkStore implements AutoCloseable {
             }
             newEnd = checkedAdd(baseOffset, len, "chunk offset");
             long writePos = checkedAdd(DATA_START, baseOffset, "chunk file offset");
-            writeFully(h.data, payload.duplicate(), writePos);
+            writeFullyPreservingPosition(h.data, payload, writePos);
             tWrite = System.nanoTime();
             h.ledger.append(new ChunkFormats.LedgerEntry(newEnd, payloadCrc, epoch));
             tLedger = System.nanoTime();

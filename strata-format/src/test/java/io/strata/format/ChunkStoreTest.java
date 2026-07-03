@@ -117,6 +117,23 @@ class ChunkStoreTest {
     }
 
     @Test
+    void appendDoesNotAdvanceCallerPayloadPosition() throws Exception {
+        try (ChunkStore store = newStore()) {
+            store.open(TEST_NS, id, false, 1, 1718000000000L);
+            ByteBuffer payload = ByteBuffer.wrap("xxpayloadyy".getBytes(StandardCharsets.UTF_8));
+            payload.position(2);
+            payload.limit(9);
+
+            store.appendAsync(TEST_NS, id, 1, 0, 0, payload).join();
+
+            assertEquals(2, payload.position());
+            assertEquals(9, payload.limit());
+            assertArrayEquals("payload".getBytes(StandardCharsets.UTF_8),
+                    store.read(TEST_NS, id, 0, 1024).bytes());
+        }
+    }
+
+    @Test
     void fsyncOnAckOpenForcesCreatedShardAncestorDirentsWhenSealFsyncDisabled() throws Exception {
         ChunkId chunkId = new ChunkId(FileId.of(0x0102), 0);
         List<Path> forced = new ArrayList<>();
