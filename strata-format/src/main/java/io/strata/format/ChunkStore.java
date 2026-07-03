@@ -612,23 +612,27 @@ public final class ChunkStore implements AutoCloseable {
          * lock; {@code payload}'s position/limit are left untouched.
          */
         void crcAccumulate(ByteBuffer payload) {
-            int cursor = payload.position();
-            int limit = payload.limit();
-            while (cursor < limit) {
-                int n = (int) Math.min(limit - cursor, rangeRemaining);
-                ByteBuffer slice = payload.duplicate();
-                slice.position(cursor);
-                slice.limit(cursor + n);
-                runningWhole.update(slice);
-                slice.position(cursor);
-                runningRange.update(slice);
-                cursor += n;
-                rangeRemaining -= n;
-                if (rangeRemaining == 0) {
-                    completedRangeCrcs.add((int) runningRange.getValue());
-                    runningRange.reset();
-                    rangeRemaining = ChunkFormats.CRC_RANGE_SIZE;
+            int originalPosition = payload.position();
+            int originalLimit = payload.limit();
+            int cursor = originalPosition;
+            try {
+                while (cursor < originalLimit) {
+                    int n = (int) Math.min(originalLimit - cursor, rangeRemaining);
+                    int next = cursor + n;
+                    payload.position(cursor).limit(next);
+                    runningWhole.update(payload);
+                    payload.position(cursor).limit(next);
+                    runningRange.update(payload);
+                    cursor = next;
+                    rangeRemaining -= n;
+                    if (rangeRemaining == 0) {
+                        completedRangeCrcs.add((int) runningRange.getValue());
+                        runningRange.reset();
+                        rangeRemaining = ChunkFormats.CRC_RANGE_SIZE;
+                    }
                 }
+            } finally {
+                payload.limit(originalLimit).position(originalPosition);
             }
         }
 
