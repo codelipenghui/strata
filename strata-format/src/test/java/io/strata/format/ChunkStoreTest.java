@@ -177,6 +177,24 @@ class ChunkStoreTest {
         }
     }
 
+    @Test
+    void fencePersistsExistingSidecarWithDirentFsync() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102), 0);
+        Path shardDir = dir.resolve(TEST_NS.value()).resolve("02").resolve("01")
+                .toAbsolutePath().normalize();
+        List<Path> forced = new ArrayList<>();
+
+        try (ChunkStore store = new ChunkStore(dir, false, 1024, ChunkStoreConfig.DEFAULT, forced::add)) {
+            store.open(TEST_NS, chunkId, true, 1, 1718000000000L);
+            forced.clear();
+
+            store.fence(TEST_NS, chunkId, 2);
+        }
+
+        assertTrue(forced.stream().map(p -> p.toAbsolutePath().normalize()).anyMatch(shardDir::equals),
+                "sidecar replacement must fsync the containing directory even when .meta already existed");
+    }
+
     private void openFsync(ChunkStore store, ChunkId chunkId) {
         try {
             store.open(TEST_NS, chunkId, true, 1, 1718000000000L);

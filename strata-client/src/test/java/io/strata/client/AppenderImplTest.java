@@ -1755,6 +1755,8 @@ class AppenderImplTest {
                 waitFor(() -> oldChunkAppends.get() == 6 && appendsQuiesced(appender));
 
                 assertEquals(3L, appender.append(ByteBuffer.wrap(new byte[] {3})).get(1, TimeUnit.SECONDS));
+                // append(...) completes at ack quorum; wait for the full successor fan-out before counting it.
+                waitFor(() -> newChunkAppends.get() == 3 && appendsQuiesced(appender));
 
                 assertEquals(2, createCalls.get(), "third record must roll to a successor chunk");
                 assertEquals(2L, sealedChunkLength.get());
