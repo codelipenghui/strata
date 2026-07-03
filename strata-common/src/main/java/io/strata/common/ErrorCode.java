@@ -22,7 +22,8 @@ public enum ErrorCode {
     NO_CAPACITY(16, true),
     FILE_NOT_FOUND(17, false),
     FILE_SEALED(18, false),
-    PRECONDITION_FAILED(19, false);
+    PRECONDITION_FAILED(19, false),
+    METADATA_RECOVERING(20, true);
 
     public final short code;
     public final boolean retriable;

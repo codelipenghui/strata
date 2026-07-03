@@ -59,8 +59,9 @@ final class ControllerClient implements AutoCloseable {
 
     /**
      * Routes {@code op} to the owner of {@code routingKey} (cached, else a seed) and caches whoever serves
-     * it. On a NOT_LEADER redirect, retargets to the owner hint and updates the cache; other retriable
-     * errors back off and retry. {@code routingKey} null = un-routed (no owner concept).
+     * it. On a NOT_LEADER redirect, retargets to the owner hint and updates the cache. On
+     * METADATA_RECOVERING, keeps the current owner and retries after backoff. Other retriable errors rotate
+     * to a seed so a dead cached owner cannot pin the client. {@code routingKey} null = un-routed.
      */
     private ByteBuffer call(Opcode op, byte[] header, Object routingKey) {
         long deadline = System.currentTimeMillis() + Math.max(config.controllerRetryDeadlineMs(), config.callTimeoutMs());
@@ -83,6 +84,10 @@ final class ControllerClient implements AutoCloseable {
                 }
                 if (e.code() == ErrorCode.NOT_LEADER && e.leaderHint() != null && !e.leaderHint().isBlank()) {
                     target = e.leaderHint();                  // redirect straight to the namespace owner
+                    if (routingKey != null) {
+                        ownerByKey.put(routingKey, target);
+                    }
+                } else if (e.code() == ErrorCode.METADATA_RECOVERING) {
                     if (routingKey != null) {
                         ownerByKey.put(routingKey, target);
                     }

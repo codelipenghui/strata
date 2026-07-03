@@ -143,6 +143,31 @@ class ControllerClientTest {
     }
 
     @Test
+    void metadataRecoveringRetriesSameOwnerWithoutResolvingAnotherSeed() throws Exception {
+        AtomicInteger ownerCalls = new AtomicInteger();
+        AtomicInteger otherCalls = new AtomicInteger();
+        FileId id = FileId.of(5);
+        try (ScpServer owner = new ScpServer(0, 1, 0, 0, req -> {
+                if (ownerCalls.getAndIncrement() == 0) {
+                    throw new ScpException(ErrorCode.METADATA_RECOVERING, "recovering");
+                }
+                return ScpServer.ok(req, new Messages.CreateFileResp(id).encode(), null);
+             });
+             ScpServer other = new ScpServer(0, 1, 0, 0, req -> {
+                 otherCalls.incrementAndGet();
+                 return ScpServer.ok(req, new Messages.CreateFileResp(FileId.of(99)).encode(), null);
+             });
+             ControllerClient meta = new ControllerClient(new ClientConfig(
+                     List.of(endpoint(owner), endpoint(other)), 1024, 100))) {
+
+            assertEquals(id, meta.createFile(StrataClient.FileSpec.log("test", "/test-file")));
+
+            assertEquals(2, ownerCalls.get());
+            assertEquals(0, otherCalls.get(), "METADATA_RECOVERING retries the same owner");
+        }
+    }
+
+    @Test
     void clientFailsOverToAnotherControllerWhenOneDies() throws Exception {
         // Owner-aware client: the first call goes to the first seed; once that controller dies, a retriable
         // transport failure advances to the next controller, so the second call still succeeds.
