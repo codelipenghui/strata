@@ -200,6 +200,35 @@ class ProtocolCoverageTest {
     }
 
     @Test
+    void readDecodeReadsOwnedDirectHeader() {
+        StrataNamespace namespace = StrataNamespace.of("test");
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);
+        BufWriter header = new BufWriter();
+        header.chunkId(chunkId).u64(11).u32(65536).namespace(namespace);
+        TaggedFields.of(Map.of(99, new byte[] {8, 9})).writeTo(header);
+        byte[] encoded = header.toBytes();
+
+        ByteBuf owner = Unpooled.directBuffer(encoded.length + 5);
+        owner.writeZero(3);
+        int headerIndex = owner.writerIndex();
+        owner.writeBytes(encoded);
+        owner.writeZero(2);
+        Frame frame = Frame.fromOwnedBuffer(Opcode.READ.code, (short) 1, (short) 0, 17L,
+                owner, headerIndex, encoded.length, headerIndex + encoded.length, 0, 0);
+        try {
+            Messages.Read.ReadFields fields = Messages.Read.decodeFields(frame);
+            assertEquals(chunkId.fileId().id(), fields.fileId());
+            assertEquals(chunkId.index(), fields.chunkIndex());
+            assertEquals(11, fields.offset());
+            assertEquals(65536, fields.maxBytes());
+            assertEquals(namespace, fields.namespace());
+            assertEquals(chunkId, fields.chunkId());
+        } finally {
+            frame.close();
+        }
+    }
+
+    @Test
     void responseHelpersCoverOkAndErrorVariants() {
         ByteBuffer ok = ByteBuffer.wrap(Messages.okHeader());
         Resp.check(ok);
