@@ -32,6 +32,10 @@ public final class Frame implements AutoCloseable {
     private final ByteBuffer payload;
     private final FilePayload filePayload;
     private final ByteBuf owner;
+    private final int ownerHeaderIndex;
+    private final int ownerHeaderLen;
+    private final int ownerPayloadIndex;
+    private final int ownerPayloadLen;
     private final Runnable payloadReleaser;
     private final int payloadCrc;
     private final AtomicBoolean closed = new AtomicBoolean(false);
@@ -45,6 +49,14 @@ public final class Frame implements AutoCloseable {
     private Frame(short opcode, short apiVersion, short flags, long correlationId,
                   ByteBuffer header, ByteBuffer payload, FilePayload filePayload, ByteBuf owner,
                   Runnable payloadReleaser, int payloadCrc) {
+        this(opcode, apiVersion, flags, correlationId, header, payload, filePayload, owner,
+                -1, -1, -1, -1, payloadReleaser, payloadCrc);
+    }
+
+    private Frame(short opcode, short apiVersion, short flags, long correlationId,
+                  ByteBuffer header, ByteBuffer payload, FilePayload filePayload, ByteBuf owner,
+                  int ownerHeaderIndex, int ownerHeaderLen, int ownerPayloadIndex, int ownerPayloadLen,
+                  Runnable payloadReleaser, int payloadCrc) {
         this.opcode = opcode;
         this.apiVersion = apiVersion;
         this.flags = flags;
@@ -53,6 +65,10 @@ public final class Frame implements AutoCloseable {
         this.payload = payload;
         this.filePayload = filePayload;
         this.owner = owner;
+        this.ownerHeaderIndex = ownerHeaderIndex;
+        this.ownerHeaderLen = ownerHeaderLen;
+        this.ownerPayloadIndex = ownerPayloadIndex;
+        this.ownerPayloadLen = ownerPayloadLen;
         this.payloadReleaser = payloadReleaser;
         this.payloadCrc = payloadCrc;
     }
@@ -60,9 +76,8 @@ public final class Frame implements AutoCloseable {
     static Frame fromOwnedBuffer(short opcode, short apiVersion, short flags, long correlationId,
                                  ByteBuf owner, int headerIndex, int headerLen, int payloadIndex, int payloadLen,
                                  int payloadCrc) {
-        ByteBuffer header = owner.nioBuffer(headerIndex, headerLen).asReadOnlyBuffer();
-        ByteBuffer payload = owner.nioBuffer(payloadIndex, payloadLen).asReadOnlyBuffer();
-        return new Frame(opcode, apiVersion, flags, correlationId, header, payload, null, owner, null,
+        return new Frame(opcode, apiVersion, flags, correlationId, null, null, null, owner,
+                headerIndex, headerLen, payloadIndex, payloadLen, null,
                 retainedPayloadCrc(flags, payloadLen, payloadCrc));
     }
 
@@ -129,33 +144,38 @@ public final class Frame implements AutoCloseable {
     }
 
     public ByteBuffer headerSlice() {
-        return header.asReadOnlyBuffer();
+        return owner != null ? ownerBuffer(ownerHeaderIndex, ownerHeaderLen).asReadOnlyBuffer()
+                : header.asReadOnlyBuffer();
     }
 
     int headerLength() {
-        return header.remaining();
+        return owner != null ? ownerHeaderLen : header.remaining();
     }
 
     ByteBuffer headerView() {
-        return header;
+        return owner != null ? ownerBuffer(ownerHeaderIndex, ownerHeaderLen) : header;
     }
 
     public ByteBuffer payloadSlice() {
         if (filePayload != null) {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
-        return payload.asReadOnlyBuffer();
+        return owner != null ? ownerBuffer(ownerPayloadIndex, ownerPayloadLen).asReadOnlyBuffer()
+                : payload.asReadOnlyBuffer();
     }
 
     ByteBuffer payloadView() {
         if (filePayload != null) {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
-        return payload;
+        return owner != null ? ownerBuffer(ownerPayloadIndex, ownerPayloadLen) : payload;
     }
 
     public int payloadLength() {
-        return filePayload != null ? filePayload.length() : payload.remaining();
+        if (filePayload != null) {
+            return filePayload.length();
+        }
+        return owner != null ? ownerPayloadLen : payload.remaining();
     }
 
     /** CRC32C of the payload as computed by the sender and verified at decode; 0 when no payload CRC. */
@@ -179,7 +199,7 @@ public final class Frame implements AutoCloseable {
             throw new IllegalStateException("file payload cannot be copied to heap");
         }
         return new Frame(opcode, apiVersion, flags, correlationId,
-                readOnlySlice(copy(header)), readOnlySlice(copy(payload)), null, null, null, payloadCrc);
+                readOnlySlice(copy(headerView())), readOnlySlice(copy(payloadView())), null, null, null, payloadCrc);
     }
 
     public boolean ownsBuffer() {
@@ -213,6 +233,10 @@ public final class Frame implements AutoCloseable {
 
     private static ByteBuffer slice(ByteBuffer buffer) {
         return buffer == null ? EMPTY.duplicate() : buffer.slice();
+    }
+
+    private ByteBuffer ownerBuffer(int index, int length) {
+        return length == 0 ? EMPTY.duplicate() : owner.nioBuffer(index, length);
     }
 
     private static ByteBuffer copy(ByteBuffer source) {

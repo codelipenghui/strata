@@ -219,7 +219,7 @@ public final class ScpServer implements AutoCloseable {
 
         private long frameWireBytes(Frame frame) {
             long payloadBytes = frame.hasFilePayload() ? frame.filePayload().length() : frame.payloadLength();
-            return Frame.PREAMBLE_AFTER_LEN + frame.headerSlice().remaining() + payloadBytes;
+            return Frame.PREAMBLE_AFTER_LEN + frame.headerLength() + payloadBytes;
         }
 
         private void releaseInbound(Frame frame) {

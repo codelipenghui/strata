@@ -1,6 +1,9 @@
 package io.strata.proto;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.strata.common.ChunkId;
+import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
@@ -253,6 +256,31 @@ class ProtocolCoverageTest {
         ExecutionException wrapped = new ExecutionException(new TimeoutException());
         // This future shape is what CompletableFuture#get produces for timed pipelined calls.
         assertEquals(TimeoutException.class, wrapped.getCause().getClass());
+    }
+
+    @Test
+    void ownedFramesReadFromOwnerBufferAndReleaseIt() {
+        byte[] bytes = {9, 1, 2, 3, 4, 5, 9};
+        ByteBuf owner = Unpooled.wrappedBuffer(bytes);
+        Frame frame = Frame.fromOwnedBuffer(Opcode.PING.code, (short) 1, Frame.FLAG_PAYLOAD_CRC, 99,
+                owner, 1, 2, 3, 3, Crc.of(bytes, 3, 3));
+
+        assertTrue(frame.ownsBuffer());
+        assertEquals(1, frame.ownerRefCnt());
+        assertEquals(2, frame.headerLength());
+        assertEquals(3, frame.payloadLength());
+        assertEquals(Crc.of(bytes, 3, 3), frame.payloadCrc());
+
+        byte[] header = new byte[2];
+        frame.headerSlice().get(header);
+        assertArrayEquals(new byte[]{1, 2}, header);
+        byte[] payload = new byte[3];
+        frame.payloadSlice().get(payload);
+        assertArrayEquals(new byte[]{3, 4, 5}, payload);
+        assertThrows(ReadOnlyBufferException.class, () -> frame.payloadSlice().put((byte) 0));
+
+        frame.close();
+        assertEquals(0, frame.ownerRefCnt());
     }
 
     private static void assertFrameReadFails(byte[] wire, String messageFragment) {
