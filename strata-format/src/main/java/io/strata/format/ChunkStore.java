@@ -29,6 +29,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -1287,6 +1288,8 @@ public final class ChunkStore implements AutoCloseable {
         // existed for ack-on-replicate), so no flusher can race the truncate/footer writes below.
         long tCommitter = t0;
         if (dataLength < h.end) {
+            // From this point until SEALED is published, the safe recovery path for an I/O failure is
+            // a seal retry: retry re-truncates and re-appends the synthetic boundary before publishing.
             h.data.truncate(checkedAdd(DATA_START, dataLength, "chunk file offset"));
             h.ledger.truncateTo(dataLength);
             appendSealBoundaryLedgerEntryIfNeeded(h, dataLength);
@@ -1400,6 +1403,8 @@ public final class ChunkStore implements AutoCloseable {
         }
         int crc = crcDataRange(h.data, ledgerEnd, dataLength);
         h.ledger.append(new ChunkFormats.LedgerEntry(dataLength, crc, h.writeEpoch));
+        // Keep this force even for sealFsync=true: until deleteLedgerDurably completes, recovery can
+        // still see the retained ledger beside a durable trailer and needs the boundary to classify it.
         h.ledger.force();
     }
 
@@ -1966,6 +1971,36 @@ public final class ChunkStore implements AutoCloseable {
                 quarantineRecoveredFiles(p);
             }
         }
+        removeSidecarTempFiles(nsDir);
+    }
+
+    private void removeSidecarTempFiles(Path nsDir) throws IOException {
+        List<Path> tempFiles;
+        try (Stream<Path> files = Files.walk(nsDir)) {
+            tempFiles = files.filter(ChunkStore::isSidecarTempFile).toList();
+        }
+        Set<Path> dirtiedDirs = new HashSet<>();
+        for (Path p : tempFiles) {
+            try {
+                if (Files.deleteIfExists(p)) {
+                    dirtiedDirs.add(p.getParent());
+                }
+            } catch (IOException e) {
+                log.warn("failed to remove sidecar temp file {}", p, e);
+            }
+        }
+        for (Path shardDir : dirtiedDirs) {
+            try {
+                forceDirectory(shardDir);
+            } catch (IOException e) {
+                log.warn("failed to fsync sidecar temp cleanup directory {}", shardDir, e);
+            }
+        }
+    }
+
+    private static boolean isSidecarTempFile(Path p) {
+        Path name = p.getFileName();
+        return name != null && name.toString().contains(".meta.tmp-");
     }
 
     private void quarantineRecoveredFiles(Path dataPath) {
@@ -2545,7 +2580,10 @@ public final class ChunkStore implements AutoCloseable {
                 }
                 if (h.state != ChunkState.SEALED) {
                     try {
-                        h.persistSidecar(sealFsync || h.header.fsyncOnAck()); // persist advisory DO/epochs on clean shutdown
+                        // Non-fsync ack-on-replicate chunks keep clean-close sidecars advisory: the
+                        // temp+rename write is old-or-new, but we skip the directory fsync to preserve
+                        // that tier's shutdown cost and power-loss durability contract.
+                        h.persistSidecar(sealFsync || h.header.fsyncOnAck());
                     } catch (IOException | RuntimeException e) {
                         log.warn("close {} failed", h.id, e);
                         failure = Closeables.suppress(failure, e);

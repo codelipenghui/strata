@@ -81,6 +81,23 @@ class CrashRecoveryTest {
     }
 
     @Test
+    void startupRecoveryRemovesSidecarTempFiles() throws Exception {
+        try (ChunkStore store = new ChunkStore(dir)) {
+            open(store);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("payload".getBytes()));
+        }
+        Path tmp = metaPath().resolveSibling(metaPath().getFileName() + ".tmp-stale");
+        Files.write(tmp, new byte[] {1});
+        assertTrue(Files.exists(tmp));
+
+        try (ChunkStore recovered = new ChunkStore(dir)) {
+            assertFalse(Files.exists(tmp), "startup recovery must remove abandoned sidecar temp files");
+            assertEquals(ChunkState.OPEN, recovered.stat(TEST_NS, id).state());
+            assertArrayEquals("payload".getBytes(), recovered.read(TEST_NS, id, 0, 100).bytes());
+        }
+    }
+
+    @Test
     void tornDataTailTruncatedToLastVerifiedBoundary() throws Exception {
         ChunkStore store = new ChunkStore(dir);
         open(store);
