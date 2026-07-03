@@ -623,6 +623,29 @@ class ClientServerTest {
     }
 
     @Test
+    void serverContinuesDrainingAfterUncaughtRequestFailure() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        ScpServer.Handler handler = req -> {
+            if (calls.incrementAndGet() == 1) {
+                throw new AssertionError("uncaught request failure");
+            }
+            return ScpServer.ok(req, Messages.okHeader(), null);
+        };
+
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
+            CompletableFuture<Frame> first = client.send(Opcode.PING, emptyHeader(), null);
+            CompletableFuture<Frame> second = client.send(Opcode.READ, emptyHeader(), null);
+
+            Resp.check(second.get(30, TimeUnit.SECONDS).headerSlice());
+            assertEquals(2, calls.get());
+
+            client.close();
+            assertThrows(ExecutionException.class, () -> first.get(30, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
     void serverCloseSkipsDeferredAsyncResponses() throws Exception {
         CompletableFuture<Frame> delayed = new CompletableFuture<>();
         CompletableFuture<Frame> seenRequest = new CompletableFuture<>();

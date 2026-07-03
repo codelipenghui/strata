@@ -32,8 +32,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -41,7 +40,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * SCP server over Netty. Handler invocation is serialized per connection on a virtual-thread
- * executor so blocking storage/metadata code never runs on a Netty event-loop thread.
+ * drain so blocking storage/metadata code never runs on a Netty event-loop thread.
  */
 public final class ScpServer implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ScpServer.class);
@@ -306,7 +305,7 @@ public final class ScpServer implements AutoCloseable {
     }
 
     private final class ConnectionHandler extends SimpleChannelInboundHandler<Frame> {
-        private final ExecutorService requestExecutor;
+        private final SerialRequestExecutor requestExecutor;
         private final Set<Frame> inFlightAsyncRequests = ConcurrentHashMap.newKeySet();
         private final ArrayDeque<FrameTask> frameTasks = new ArrayDeque<>();
         private final ArrayDeque<ResponseWriteListener> responseWriteListeners = new ArrayDeque<>();
@@ -318,8 +317,7 @@ public final class ScpServer implements AutoCloseable {
         private boolean helloComplete;
 
         ConnectionHandler(Channel channel) {
-            this.requestExecutor = Executors.newSingleThreadExecutor(
-                    Thread.ofVirtual().name("scp-conn-" + channel.remoteAddress() + "-", 0).factory());
+            this.requestExecutor = new SerialRequestExecutor(channel);
         }
 
         @Override
@@ -403,6 +401,59 @@ public final class ScpServer implements AutoCloseable {
             if (bytes != 0) {
                 inflightRequests.decrementAndGet();
                 inflightBytes.addAndGet(-bytes);
+            }
+        }
+
+        private final class SerialRequestExecutor {
+            private final ArrayDeque<FrameTask> queue = new ArrayDeque<>();
+            private final Thread worker;
+            private boolean shutdown;
+
+            private SerialRequestExecutor(Channel channel) {
+                this.worker = Thread.ofVirtual()
+                        .name("scp-conn-" + channel.remoteAddress() + "-", 0)
+                        .start(this::drain);
+            }
+
+            private void execute(FrameTask task) {
+                synchronized (queue) {
+                    if (shutdown) {
+                        throw new RejectedExecutionException("connection request executor is shut down");
+                    }
+                    queue.addLast(task);
+                    queue.notify();
+                }
+            }
+
+            private void drain() {
+                while (true) {
+                    FrameTask task;
+                    synchronized (queue) {
+                        while ((task = queue.pollFirst()) == null) {
+                            if (shutdown) {
+                                return;
+                            }
+                            try {
+                                queue.wait();
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                return;
+                            }
+                        }
+                    }
+                    try {
+                        task.run();
+                    } catch (RuntimeException | Error e) {
+                        log.warn("scp request task failed", e);
+                    }
+                }
+            }
+
+            private void shutdown() {
+                synchronized (queue) {
+                    shutdown = true;
+                    queue.notify();
+                }
             }
         }
 
