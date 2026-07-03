@@ -757,15 +757,16 @@ public final class ScpServer implements AutoCloseable {
                 ctx.close();
                 return;
             }
-            ChannelFuture write;
             try {
-                write = ctx.writeAndFlush(out);
+                ctx.writeAndFlush(out, ctx.voidPromise());
             } catch (RuntimeException e) {
                 out.release();
                 closeFrames(null, req);
                 throw e;
             }
-            finishWrite(ctx, write, false, null, req);
+            // OK_U64 responses own only the encoded ByteBuf now queued in Netty; the request payload
+            // was consumed before this point, so no write listener is needed just to release it.
+            closeFrames(null, req);
         }
 
         private void writeUnreservedResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
