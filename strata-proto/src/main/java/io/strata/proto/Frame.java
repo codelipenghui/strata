@@ -25,6 +25,7 @@ public final class Frame implements AutoCloseable {
 
     private static final ByteBuffer EMPTY = ByteBuffer.allocate(0).asReadOnlyBuffer();
     static final int OK_U64_HEADER_LENGTH = Short.BYTES + Long.BYTES + 1;
+    static final int OK_TWO_U64_HEADER_LENGTH = Short.BYTES + Long.BYTES + Long.BYTES + 1;
     private static final byte HEADER_KIND_BUFFER = 0;
     private static final byte HEADER_KIND_OK_U64 = 1;
     private static final AtomicIntegerFieldUpdater<Frame> CLOSED =

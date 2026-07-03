@@ -130,6 +130,40 @@ final class NettyFrameCodec {
         }
     }
 
+    static ByteBuf encodeTwoU64BytesResponse(ByteBufAllocator allocator, Frame req, long first, long second,
+                                             byte[] payload, int payloadLen) throws IOException {
+        if (payloadLen < 0) {
+            throw new IllegalArgumentException("negative payload length: " + payloadLen);
+        }
+        if (payloadLen > 0 && (payload == null || payloadLen > payload.length)) {
+            throw new IllegalArgumentException("invalid payload length " + payloadLen);
+        }
+        int capacity = Integer.BYTES + FrameIO.checkedFrameLength(Frame.OK_TWO_U64_HEADER_LENGTH, payloadLen);
+        ByteBuf out = allocator.ioBuffer(capacity, capacity);
+        boolean success = false;
+        try {
+            int payloadCrc = payloadLen > 0 ? Crc.of(payload, 0, payloadLen) : 0;
+            short flags = payloadLen > 0
+                    ? (short) (Frame.FLAG_RESPONSE | Frame.FLAG_PAYLOAD_CRC)
+                    : Frame.FLAG_RESPONSE;
+            writePrefix(out, req.opcode(), req.apiVersion(), flags, req.correlationId(),
+                    Frame.OK_TWO_U64_HEADER_LENGTH, payloadLen, payloadCrc);
+            out.writeShort(0);
+            out.writeLong(first);
+            out.writeLong(second);
+            out.writeByte(0);
+            if (payloadLen > 0) {
+                out.writeBytes(payload, 0, payloadLen);
+            }
+            success = true;
+            return out;
+        } finally {
+            if (!success) {
+                out.release();
+            }
+        }
+    }
+
     private static void writePrefix(ByteBuf out, Frame f, int headerLen, int payloadLen,
                                     int payloadCrc, short flags) throws IOException {
         writePrefix(out, f.opcode(), f.apiVersion(), flags, f.correlationId(), headerLen, payloadLen, payloadCrc);

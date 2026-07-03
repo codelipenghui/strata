@@ -252,8 +252,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
     private static void readRegionResponse(Frame req, ChunkStore.ReadRegionResult r, ScpServer.ResponseSink sink) {
         boolean success = false;
         try {
-            byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
-            sink.bytes(header, r.payloadBytes(), r.length(), r::close);
+            sink.twoU64Bytes(r.localEndOffset(), r.lastKnownDO(), r.payloadBytes(), r.length(), r);
             success = true;
         } finally {
             if (!success) {

@@ -379,6 +379,23 @@ class ProtocolCoverageTest {
             directBytes.release();
         }
 
+        ByteBuf directReadBytes = NettyFrameCodec.encodeTwoU64BytesResponse(
+                UnpooledByteBufAllocator.DEFAULT, request, 9, 7, borrowedBytes, 3);
+        try {
+            byte[] directWire = new byte[directReadBytes.readableBytes()];
+            directReadBytes.readBytes(directWire);
+            Frame decodedReadBytes = FrameIO.read(new DataInputStream(new ByteArrayInputStream(directWire)));
+            ByteBuffer readHeader = decodedReadBytes.headerSlice();
+            Resp.check(readHeader);
+            assertEquals(new Messages.ReadResp(9, 7), Messages.ReadResp.decode(readHeader));
+            assertEquals(Crc.of(borrowedBytes, 0, 3), decodedReadBytes.payloadCrc());
+            byte[] directPayload = new byte[decodedReadBytes.payloadLength()];
+            decodedReadBytes.payloadSlice().get(directPayload);
+            assertArrayEquals(new byte[]{1, 2, 3}, directPayload);
+        } finally {
+            directReadBytes.release();
+        }
+
         Frame nullHeader = Frame.request(Opcode.PING, null, null, 12);
         assertEquals(0, nullHeader.headerSlice().remaining());
         assertEquals(0, Frame.response(nullHeader, null, null).headerSlice().remaining());

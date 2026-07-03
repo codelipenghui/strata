@@ -156,15 +156,19 @@ public final class ScpServer implements AutoCloseable {
         private static final int OK_U64 = 3;
         private static final int DEFERRED_OK_U64 = 4;
         private static final int BYTES = 5;
+        private static final int TWO_U64_BYTES = 6;
 
         private int kind;
         private Object response;
         private CompletableFuture<?> future;
         private long okU64Value;
+        private long headerU64A;
+        private long headerU64B;
         private byte[] header;
         private byte[] payload;
         private int payloadLen;
         private Runnable payloadReleaser;
+        private AutoCloseable payloadCloseable;
 
         private ResponseSink() {}
 
@@ -233,15 +237,39 @@ public final class ScpServer implements AutoCloseable {
             this.payloadReleaser = payloadReleaser;
         }
 
+        public void twoU64Bytes(long first, long second, byte[] payload, int payloadLen,
+                                AutoCloseable payloadCloseable) {
+            if (payloadLen < 0) {
+                throw new IllegalArgumentException("negative payload length: " + payloadLen);
+            }
+            if (payloadLen > 0 && (payload == null || payloadLen > payload.length)) {
+                throw new IllegalArgumentException("invalid payload length " + payloadLen);
+            }
+            kind = TWO_U64_BYTES;
+            response = null;
+            future = null;
+            okU64Value = 0;
+            headerU64A = first;
+            headerU64B = second;
+            header = null;
+            this.payload = payload;
+            this.payloadLen = payloadLen;
+            this.payloadReleaser = null;
+            this.payloadCloseable = payloadCloseable;
+        }
+
         private void reset() {
             kind = EMPTY;
             response = null;
             future = null;
             okU64Value = 0;
+            headerU64A = 0;
+            headerU64B = 0;
             header = null;
             payload = null;
             payloadLen = 0;
             payloadReleaser = null;
+            payloadCloseable = null;
         }
     }
 
@@ -572,6 +600,10 @@ public final class ScpServer implements AutoCloseable {
             byte[] immediatePayload = null;
             int immediatePayloadLen = 0;
             Runnable immediatePayloadReleaser = null;
+            boolean immediateTwoU64Bytes = false;
+            long immediateHeaderU64A = 0;
+            long immediateHeaderU64B = 0;
+            AutoCloseable immediatePayloadCloseable = null;
             try {
                 if (handler.requiresAsyncHandling(req)) {
                     responseSink.reset();
@@ -614,6 +646,15 @@ public final class ScpServer implements AutoCloseable {
                                 immediatePayloadLen = responseSink.payloadLen;
                                 immediatePayloadReleaser = responseSink.payloadReleaser;
                             }
+                            case ResponseSink.TWO_U64_BYTES -> {
+                                respF = null;
+                                immediateTwoU64Bytes = true;
+                                immediateHeaderU64A = responseSink.headerU64A;
+                                immediateHeaderU64B = responseSink.headerU64B;
+                                immediatePayload = responseSink.payload;
+                                immediatePayloadLen = responseSink.payloadLen;
+                                immediatePayloadCloseable = responseSink.payloadCloseable;
+                            }
                             default -> {
                                 respF = null;
                                 immediateResp = internalError(req, "handler returned null future");
@@ -654,6 +695,11 @@ public final class ScpServer implements AutoCloseable {
                 if (immediateBytes) {
                     writeBytesResponse(ctx, req, immediateHeader, immediatePayload, immediatePayloadLen,
                             immediatePayloadReleaser);
+                    return;
+                }
+                if (immediateTwoU64Bytes) {
+                    writeTwoU64BytesResponse(ctx, req, immediateHeaderU64A, immediateHeaderU64B,
+                            immediatePayload, immediatePayloadLen, immediatePayloadCloseable);
                     return;
                 }
                 writeResponseObject(ctx, req, requireResponse(req, immediateResp));
@@ -909,6 +955,52 @@ public final class ScpServer implements AutoCloseable {
             releasePayload(payloadReleaser);
         }
 
+        private void writeTwoU64BytesResponse(ChannelHandlerContext ctx, Frame req, long first, long second,
+                                              byte[] payload, int payloadLen, AutoCloseable payloadCloseable) {
+            long frameBytes;
+            try {
+                frameBytes = twoU64BytesResponseWireBytes(payload, payloadLen);
+            } catch (RuntimeException e) {
+                closePayload(payloadCloseable);
+                closeFrames(null, req);
+                throw e;
+            }
+            if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
+                closePayload(payloadCloseable);
+                closeFrames(null, req);
+                return;
+            }
+            if (!reserveOutboundBytes(frameBytes, req)) {
+                closePayload(payloadCloseable);
+                writeUnreservedResponse(ctx, Frame.response(req,
+                        Resp.error(ErrorCode.THROTTLED, "too many in-flight response bytes", maxInflightBytes),
+                        null), true, req);
+                return;
+            }
+
+            ByteBuf out;
+            try {
+                out = NettyFrameCodec.encodeTwoU64BytesResponse(ctx.alloc(), req, first, second,
+                        payload, payloadLen);
+            } catch (IOException | RuntimeException e) {
+                closePayload(payloadCloseable);
+                closeFrames(null, req);
+                ctx.close();
+                return;
+            }
+            ChannelFuture write;
+            try {
+                write = ctx.writeAndFlush(out);
+            } catch (RuntimeException e) {
+                out.release();
+                closePayload(payloadCloseable);
+                closeFrames(null, req);
+                throw e;
+            }
+            finishWrite(ctx, write, false, null, req);
+            closePayload(payloadCloseable);
+        }
+
         private long bytesResponseWireBytes(byte[] header, byte[] payload, int payloadLen) {
             int headerLen = header == null ? 0 : header.length;
             if (payloadLen < 0) {
@@ -925,6 +1017,21 @@ public final class ScpServer implements AutoCloseable {
             return Frame.PREAMBLE_AFTER_LEN + headerLen + (long) payloadLen;
         }
 
+        private long twoU64BytesResponseWireBytes(byte[] payload, int payloadLen) {
+            if (payloadLen < 0) {
+                throw new IllegalArgumentException("negative payload length: " + payloadLen);
+            }
+            if (payloadLen > 0 && (payload == null || payloadLen > payload.length)) {
+                throw new IllegalArgumentException("invalid payload length " + payloadLen);
+            }
+            try {
+                FrameIO.checkedFrameLength(Frame.OK_TWO_U64_HEADER_LENGTH, payloadLen);
+            } catch (IOException e) {
+                throw new IllegalArgumentException(e);
+            }
+            return Frame.PREAMBLE_AFTER_LEN + Frame.OK_TWO_U64_HEADER_LENGTH + (long) payloadLen;
+        }
+
         private void releasePayload(Runnable payloadReleaser) {
             if (payloadReleaser == null) {
                 return;
@@ -933,6 +1040,17 @@ public final class ScpServer implements AutoCloseable {
                 payloadReleaser.run();
             } catch (RuntimeException e) {
                 log.warn("response payload release failed", e);
+            }
+        }
+
+        private void closePayload(AutoCloseable payloadCloseable) {
+            if (payloadCloseable == null) {
+                return;
+            }
+            try {
+                payloadCloseable.close();
+            } catch (Exception e) {
+                log.warn("response payload close failed", e);
             }
         }
 
