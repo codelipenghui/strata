@@ -302,6 +302,7 @@ final class NamespaceLogBackend implements AutoCloseable {
     }
 
     private NamespaceMetadataLogRepository repo(StrataNamespace namespace) throws Exception {
+        requireOwnedNamespace(namespace);
         NamespaceMetadataLogRepository r = repos.get(namespace);   // fast path, lock-free
         if (r != null) {
             return r;
@@ -325,6 +326,7 @@ final class NamespaceLogBackend implements AutoCloseable {
      */
     private NamespaceMetadataLogRepository openLocked(StrataNamespace namespace, boolean countAsAcquisition)
             throws Exception {
+        requireOwnedNamespace(namespace);
         NamespaceMetadataLogRepository r = repos.get(namespace);
         if (r != null) {
             return r;
@@ -378,6 +380,13 @@ final class NamespaceLogBackend implements AutoCloseable {
             return runLockedMutation(reacquire(namespace, repo), txn);
         } catch (PoisonedMetadataLogRepositoryException e) {
             throw poisonFailure(e);
+        }
+    }
+
+    private void requireOwnedNamespace(StrataNamespace namespace) {
+        if (!ownsNamespace.test(namespace)) {
+            throw new ScpException(ErrorCode.NOT_LEADER,
+                    "namespace " + namespace + " is not owned by this controller");
         }
     }
 

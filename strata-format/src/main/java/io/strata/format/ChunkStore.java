@@ -188,6 +188,24 @@ public final class ChunkStore implements AutoCloseable {
         directorySyncer.force(directory);
     }
 
+    private void forceParentDirectory(Path path) throws IOException {
+        Path parent = path.getParent();
+        if (parent != null) {
+            forceDirectory(parent);
+        }
+    }
+
+    private void forceSourceDirectoryAfterMove(Path sourceParent, Path targetDir) throws IOException {
+        if (sourceParent == null) {
+            return;
+        }
+        Path source = sourceParent.toAbsolutePath().normalize();
+        Path target = targetDir.toAbsolutePath().normalize();
+        if (!source.equals(target)) {
+            forceDirectory(source);
+        }
+    }
+
     private void createDirectories(Path targetDir, boolean syncCreatedDirents) throws IOException {
         if (!syncCreatedDirents) {
             Files.createDirectories(targetDir);
@@ -1608,8 +1626,10 @@ public final class ChunkStore implements AutoCloseable {
                 try (FileChannel ch = FileChannel.open(sourceFile, StandardOpenOption.WRITE)) {
                     ch.force(true);
                 }
+                Path sourceParent = sourceFile.getParent();
                 Files.move(sourceFile, h.dataPath, StandardCopyOption.ATOMIC_MOVE);
                 forceDirectory(h.shardDir);
+                forceSourceDirectoryAfterMove(sourceParent, h.shardDir);
                 movedData = true;
                 h.data = null; // sealed + durable on import: reads go through the channel cache
                 h.state = ChunkState.SEALED;
@@ -1668,7 +1688,7 @@ public final class ChunkStore implements AutoCloseable {
         }
         try {
             Files.deleteIfExists(tmp);
-            forceDirectory(dir); // temp file lives in store root
+            forceParentDirectory(tmp);
         } catch (IOException e) {
             log.warn("failed to delete incomplete import temp file {}", tmp, e);
         }
@@ -1901,18 +1921,23 @@ public final class ChunkStore implements AutoCloseable {
     private void recoverAll() throws IOException {
         if (!Files.isDirectory(dir)) return;
 
-        // Single pass: partition store-root entries into namespace dirs and stray .chunk files.
+        // Single pass: partition store-root entries into namespace dirs and stray flat files.
         List<Path> nsDirs = new ArrayList<>();
         List<Path> rootChunks = new ArrayList<>();
+        List<Path> rootImports = new ArrayList<>();
         try (Stream<Path> stream = Files.list(dir)) {
             stream.forEach(p -> {
+                String name = p.getFileName().toString();
                 if (Files.isDirectory(p)) {
                     nsDirs.add(p);
-                } else if (p.getFileName().toString().endsWith(".chunk")) {
+                } else if (name.endsWith(".chunk")) {
                     rootChunks.add(p);
+                } else if (name.endsWith(".import")) {
+                    rootImports.add(p);
                 }
             });
         }
+        deleteStaleRootImportTemps(rootImports);
         // Quarantine any unexpected flat .chunk files placed directly in the store root
         // (they cannot belong to any namespace directory and indicate corruption or misplaced files).
         for (Path p : rootChunks) {
@@ -1956,10 +1981,25 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     private void recoverNamespace(StrataNamespace ns, Path nsDir) throws IOException {
-        // Collect all .chunk files first (crash-safety: avoid delete-during-walk)
+        // Collect files first (crash-safety: avoid delete-during-walk)
         List<Path> chunkFiles;
+        List<Path> sidecarFiles;
         try (Stream<Path> files = Files.walk(nsDir)) {
-            chunkFiles = files.filter(p -> p.getFileName().toString().endsWith(".chunk")).toList();
+            List<Path> recoveredFiles = files
+                    .filter(p -> {
+                        String name = p.getFileName().toString();
+                        return name.endsWith(".chunk") || name.endsWith(".meta") || name.endsWith(".j");
+                    })
+                    .toList();
+            chunkFiles = recoveredFiles.stream()
+                    .filter(p -> p.getFileName().toString().endsWith(".chunk"))
+                    .toList();
+            sidecarFiles = recoveredFiles.stream()
+                    .filter(p -> {
+                        String name = p.getFileName().toString();
+                        return name.endsWith(".meta") || name.endsWith(".j");
+                    })
+                    .toList();
         }
         for (Path p : chunkFiles) {
             String name = p.getFileName().toString();
@@ -1971,7 +2011,71 @@ public final class ChunkStore implements AutoCloseable {
                 quarantineRecoveredFiles(p);
             }
         }
+        quarantineOrphanSidecarFiles(sidecarFiles);
         removeSidecarTempFiles(nsDir);
+    }
+
+    private void deleteStaleRootImportTemps(List<Path> rootImports) {
+        if (rootImports.isEmpty()) {
+            return;
+        }
+        boolean deleted = false;
+        for (Path p : rootImports) {
+            try {
+                if (Files.deleteIfExists(p)) {
+                    deleted = true;
+                    log.warn("deleted stale import temp file left in store root: {}", p);
+                }
+            } catch (IOException e) {
+                log.warn("failed to delete stale import temp file {}", p, e);
+            }
+        }
+        if (deleted) {
+            try {
+                forceDirectory(dir);
+            } catch (IOException e) {
+                log.warn("failed to fsync store root after import-temp cleanup {}", dir, e);
+            }
+        }
+    }
+
+    private void quarantineOrphanSidecarFiles(List<Path> sidecarFiles) {
+        if (sidecarFiles.isEmpty()) {
+            return;
+        }
+        String suffix = ".quarantine-" + System.currentTimeMillis();
+        Set<Path> touchedDirs = new HashSet<>();
+        for (Path p : sidecarFiles) {
+            if (!Files.exists(p)) {
+                continue;
+            }
+            Path dataPath = sidecarDataPath(p);
+            if (Files.exists(dataPath)) {
+                continue;
+            }
+            try {
+                Files.move(p, quarantineTarget(p, suffix), StandardCopyOption.ATOMIC_MOVE);
+                touchedDirs.add(p.getParent());
+                log.warn("quarantined orphan chunk sidecar without data file: {}", p);
+            } catch (IOException e) {
+                log.warn("failed to quarantine orphan chunk sidecar {}", p, e);
+            }
+        }
+        for (Path touchedDir : touchedDirs) {
+            try {
+                forceDirectory(touchedDir);
+            } catch (IOException e) {
+                log.warn("failed to fsync sidecar quarantine directory {}", touchedDir, e);
+            }
+        }
+    }
+
+    private static Path sidecarDataPath(Path sidecarPath) {
+        String name = sidecarPath.getFileName().toString();
+        if (name.endsWith(".meta")) {
+            return sidecarPath.resolveSibling(name.substring(0, name.length() - ".meta".length()) + ".chunk");
+        }
+        return sidecarPath.resolveSibling(name.substring(0, name.length() - ".j".length()) + ".chunk");
     }
 
     private void removeSidecarTempFiles(Path nsDir) throws IOException {

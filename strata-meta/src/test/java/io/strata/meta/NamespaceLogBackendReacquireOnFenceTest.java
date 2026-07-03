@@ -249,6 +249,20 @@ class NamespaceLogBackendReacquireOnFenceTest {
         }
     }
 
+    @Test
+    void nonOwnedNamespaceCannotBeOpenedThroughBackend() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            NamespaceLogBackend backend = new NamespaceLogBackend(root, new TestNamespaceMetadataFileStore(), false);
+            backend.setOwnership(ns -> false);
+
+            ScpException rejected = assertThrows(ScpException.class,
+                    () -> backend.createFileOwnerAssigned(template("/not-owned", 9)));
+
+            assertEquals(ErrorCode.NOT_LEADER, rejected.code());
+        }
+    }
+
     private interface ThrowingSupplier<T> {
         T get() throws Exception;
     }
