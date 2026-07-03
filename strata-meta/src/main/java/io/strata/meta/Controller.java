@@ -52,6 +52,7 @@ public final class Controller implements AutoCloseable {
     private final LeaderLatch leaderLatch;
     private final String advertisedEndpoint;  // this node's reachable host:port — the leader hint clients redirect to
     private final NamespaceOwnership ownership; // resolves the controller owner of each namespace (design §6)
+    private final NamespaceLeadership namespaceLeadership; // optional: namespace-log ACTIVE/RECOVERING barrier
 
     public Controller(ControllerConfig config) throws Exception {
         this(config, null);
@@ -108,19 +109,19 @@ public final class Controller implements AutoCloseable {
             // empty/single-endpoint membership this node owns every namespace (no behavior change).
             NamespaceOwnership openedOwnership = new NamespaceOwnership(this.advertisedEndpoint,
                     config.controllerEndpoints(), 0, config.controllerReplicaCount());
-            NamespaceLeadership namespaceLeadership = null;
+            NamespaceLeadership openedNamespaceLeadership = null;
             // Eager namespace recovery on the namespace-log backend is scoped to the namespaces this
             // node owns, so it never republishes (and fences) another owner's namespace.
             if (backendStore instanceof NamespaceLogMetadataStore namespaceLog) {
                 namespaceLog.setOwnership(openedOwnership::isOwner);
-                namespaceLeadership = namespaceLog;
+                openedNamespaceLeadership = namespaceLog;
             }
             // Repair's orphan-deletion is gated on owning every namespace (a sharded controller never
             // deletes an inventory chunk owned by another controller node), and a non-controller owner heals
             // only the namespaces it owns via the direct EXEC_REPLICATE pass.
             openedRepair = new RepairCoordinator(backendStore, openedRegistry, config,
                     openedLatch::hasLeadership, openedOwnership::ownsAll, openedOwnership::isOwner,
-                    namespaceLeadership);
+                    openedNamespaceLeadership);
 
             this.store = backendStore;
             this.rootZk = openedStore;
@@ -129,6 +130,7 @@ public final class Controller implements AutoCloseable {
             this.leaderLatch = openedLatch;
             this.repair = openedRepair;
             this.ownership = openedOwnership;
+            this.namespaceLeadership = openedNamespaceLeadership;
             // The owner-pull verifier identifies itself by its advertised endpoint (design §20.4) so a
             // node can record which owner attested each chunk; it is also this node's rendezvous identity.
             openedRepair.advertisedEndpoint(this.advertisedEndpoint);
@@ -426,9 +428,10 @@ public final class Controller implements AutoCloseable {
     }
 
     /**
-     * Gate a namespace-scoped op (design §6): the controller owner serves; a non-owner is redirected with a
-     * NOT_LEADER hint pointing at the owner endpoint. A non-sharded (single-endpoint) deployment falls
-     * back to the global leader latch, so single-leader behavior is unchanged.
+     * Gate a namespace-scoped op (design §6): the controller owner serves once its namespace is ACTIVE; a
+     * non-owner is redirected with a NOT_LEADER hint pointing at the owner endpoint. A non-sharded
+     * (single-endpoint) deployment falls back to the global leader latch, then applies the same namespace-log
+     * recovery barrier when that backend is enabled.
      */
     private void requireNamespaceOwner(StrataNamespace namespace) {
         // Tag this request's metrics with its namespace (read back by ScpServer's request observer).
@@ -440,14 +443,27 @@ public final class Controller implements AutoCloseable {
         }
         if (ownership.ownsAll()) {
             requireLeader();
-            return;
-        }
-        if (!ownership.isOwner(namespace)) {
+        } else if (!ownership.isOwner(namespace)) {
             // Redirect to the namespace's owner; the owner-aware client caches namespace->owner and
             // routes directly, re-resolving only on this exception (an ownership change) (design §6).
             throw new ScpException(ErrorCode.NOT_LEADER,
                     "namespace " + namespace + " is owned by another controller", 0,
                     ownership.ownerOf(namespace));
+        }
+        requireNamespaceActive(namespace);
+    }
+
+    private void requireNamespaceActive(StrataNamespace namespace) {
+        NamespaceLeadership leadership = namespaceLeadership;
+        if (leadership == null) {
+            return;
+        }
+        NamespaceLeaderState state = leadership.leaderState(namespace);
+        // STANDBY means no local repo has been opened yet (or a failed open is retryable by opening again).
+        // RECOVERING/FENCED are in-flight barriers; clients should retry this same owner after backoff.
+        if (state == NamespaceLeaderState.RECOVERING || state == NamespaceLeaderState.FENCED) {
+            throw new ScpException(ErrorCode.METADATA_RECOVERING,
+                    "namespace " + namespace + " is " + state + "; retry the same owner");
         }
     }
 

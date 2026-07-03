@@ -90,7 +90,8 @@ class MessageGoldenCorpusTest {
                 "NO_CAPACITY=16:true",
                 "FILE_NOT_FOUND=17:false",
                 "FILE_SEALED=18:false",
-                "PRECONDITION_FAILED=19:false"),
+                "PRECONDITION_FAILED=19:false",
+                "METADATA_RECOVERING=20:true"),
                 Arrays.stream(ErrorCode.values())
                         .map(code -> code.name() + "=" + code.code + ":" + code.retriable)
                         .toList());

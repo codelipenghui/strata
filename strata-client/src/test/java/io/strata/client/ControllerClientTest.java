@@ -143,11 +143,36 @@ class ControllerClientTest {
     }
 
     @Test
+    void metadataRecoveringRetriesSameOwnerWithoutResolvingAnotherSeed() throws Exception {
+        AtomicInteger ownerCalls = new AtomicInteger();
+        AtomicInteger otherCalls = new AtomicInteger();
+        FileId id = FileId.of(5);
+        try (ScpServer owner = new ScpServer(0, 1, 0, 0, req -> {
+                if (ownerCalls.getAndIncrement() == 0) {
+                    throw new ScpException(ErrorCode.METADATA_RECOVERING, "recovering");
+                }
+                return ScpServer.ok(req, new Messages.CreateFileResp(id).encode(), null);
+             });
+             ScpServer other = new ScpServer(0, 1, 0, 0, req -> {
+                 otherCalls.incrementAndGet();
+                 return ScpServer.ok(req, new Messages.CreateFileResp(FileId.of(99)).encode(), null);
+             });
+             ControllerClient meta = new ControllerClient(new ClientConfig(
+                     List.of(endpoint(owner), endpoint(other)), 1024, 100))) {
+
+            assertEquals(id, meta.createFile(StrataClient.FileSpec.log("test", "/test-file")));
+
+            assertEquals(2, ownerCalls.get());
+            assertEquals(0, otherCalls.get(), "METADATA_RECOVERING retries the same owner");
+        }
+    }
+
+    @Test
     void clientFailsOverToAnotherControllerWhenOneDies() throws Exception {
         // Owner-aware client: the first call goes to the first seed; once that controller dies, a retriable
         // transport failure advances to the next controller, so the second call still succeeds.
-        FileId firstId = FileId.of(5);
-        FileId secondId = FileId.of(6);
+        FileId firstId = FileId.of(6);
+        FileId secondId = FileId.of(7);
         try (ScpServer first = new ScpServer(0, 1, 0, 0, req -> {
                 Opcode op = Opcode.fromCode(req.opcode());
                 if (op == Opcode.CREATE_FILE) {
@@ -189,7 +214,7 @@ class ControllerClientTest {
              ControllerClient meta = new ControllerClient(new ClientConfig(List.of(endpoint(server)), 1024, 100))) {
 
             ScpException e = assertThrows(ScpException.class,
-                    () -> meta.lookupFile(StrataNamespace.of("test"), FileId.of(7)));
+                    () -> meta.lookupFile(StrataNamespace.of("test"), FileId.of(8)));
 
             assertEquals(ErrorCode.FILE_NOT_FOUND, e.code());
             assertEquals(1, calls.get());
@@ -202,7 +227,7 @@ class ControllerClientTest {
         // in the LOOKUP_FILE request that arrives at the controller — the server uses it to route
         // to the correct namespace owner.
         StrataNamespace ns = StrataNamespace.of("tenant-x");
-        FileId fileId = FileId.of(8);
+        FileId fileId = FileId.of(9);
         Messages.LookupFileResp stubResp = new Messages.LookupFileResp(
                 ns.toString(), "/some/path", Messages.WritePolicy.DEFAULT, (byte) 0, List.of());
 
@@ -233,7 +258,7 @@ class ControllerClientTest {
     @Test
     void fileScopedOpRoutesByNamespaceAndFollowsRedirect() throws Exception {
         StrataNamespace ns = StrataNamespace.of("tenant-x");
-        FileId id = FileId.of(9);
+        FileId id = FileId.of(10);
         AtomicInteger standbyCalls = new AtomicInteger();
         try (ScpServer standby = new ScpServer(0, 1, 0, 0, req -> {
                 standbyCalls.incrementAndGet();
