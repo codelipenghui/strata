@@ -230,8 +230,8 @@ class RepairCoordinator implements AutoCloseable {
     // threaded, but tests drive verifyPass() directly, so this stays a field.
     private long lastSystemVerifyMs;
 
-    // Global controller-leader settle time for cluster-scope node liveness work. Namespace repair/verify uses
-    // per-namespace activeSince from NamespaceLeadership when the namespace-log backend is active.
+    // Global controller-leader settle time for cluster-scope node liveness work. Namespace activation only gates
+    // access to a recovered local metadata view; verify verdicts add a namespace-level settle delay separately.
     private volatile long clusterLeaderSince;
 
     private void scanLoop() {
@@ -322,27 +322,20 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     private boolean namespaceActive(StrataNamespace namespace) {
-        if (NamespaceLogBackend.isSystem(namespace) && namespaceLeadership != null) {
-            return isLeader.getAsBoolean();
+        if (NamespaceLogBackend.isSystem(namespace)) {
+            return true;
         }
         return namespaceLeadership == null || namespaceLeadership.isNamespaceActive(namespace);
     }
 
-    private long namespaceActiveSinceMs(StrataNamespace namespace, long now) {
-        if (NamespaceLogBackend.isSystem(namespace) && namespaceLeadership != null) {
-            return clusterLeaderSince;
-        }
-        if (namespaceLeadership == null) {
-            return now - settleMs() - 1;
-        }
-        return namespaceLeadership.namespaceActiveSinceMs(namespace);
-    }
-
-    private boolean namespaceSettled(StrataNamespace namespace, long now) {
+    private boolean namespaceSettledForVerify(StrataNamespace namespace, long now) {
         if (!namespaceActive(namespace)) {
             return false;
         }
-        long activeSince = namespaceActiveSinceMs(namespace, now);
+        if (NamespaceLogBackend.isSystem(namespace) || namespaceLeadership == null) {
+            return true;
+        }
+        long activeSince = namespaceLeadership.namespaceActiveSinceMs(namespace);
         return activeSince != 0 && now - activeSince >= settleMs();
     }
 
@@ -385,7 +378,7 @@ class RepairCoordinator implements AutoCloseable {
             if (!ownsAll.getAsBoolean() && !ownsNamespace.test(ns) && !NamespaceLogBackend.isSystem(ns)) {
                 continue;
             }
-            if (!namespaceSettled(ns, now)) {
+            if (!namespaceActive(ns)) {
                 continue;
             }
             for (FileId fileId : store.listFileIds(ns)) {
@@ -478,7 +471,7 @@ class RepairCoordinator implements AutoCloseable {
 
         long now = System.currentTimeMillis();
         for (StrataNamespace ns : store.listNamespaces()) {
-            if (!namespaceSettled(ns, now)) {
+            if (!namespaceActive(ns)) {
                 continue;
             }
             ReentrantLock lock = namespaceReconcileLock(ns);
@@ -518,7 +511,8 @@ class RepairCoordinator implements AutoCloseable {
                         }
                     });
                 }
-                // exposure priority within this namespace: fewest live replicas first (tech design §7.2).
+                // Exposure priority is intentionally namespace-local: the per-namespace reconcile lock avoids
+                // cross-namespace head-of-line blocking, so we order fewest-live-first within this namespace.
                 repairs.sort(Comparator.comparingInt(Repair::liveReplicas));
                 for (Repair r : repairs) {
                     issueReplicate(r.ns(), r.fileId(), r.file(), r.chunk(), RepairTrigger.RECONCILE);
@@ -644,7 +638,7 @@ class RepairCoordinator implements AutoCloseable {
         }
         long now = System.currentTimeMillis();
         for (StrataNamespace ns : store.listNamespaces()) {
-            if (!ownsNamespace.test(ns) || !namespaceSettled(ns, now)) {
+            if (!ownsNamespace.test(ns) || !namespaceActive(ns)) {
                 continue;
             }
             ReentrantLock lock = namespaceReconcileLock(ns);
@@ -715,7 +709,7 @@ class RepairCoordinator implements AutoCloseable {
             if (!ownsNamespace.test(ns)) {
                 continue;
             }
-            if (!namespaceSettled(ns, now)) {
+            if (!namespaceSettledForVerify(ns, now)) {
                 continue;
             }
             if (NamespaceLogBackend.isSystem(ns)) {
@@ -1061,10 +1055,13 @@ class RepairCoordinator implements AutoCloseable {
      * disk stays bounded under sustained delete load. Synchronized with the scan so they don't race.
      */
     void driveDeletionNow(StrataNamespace namespace, FileId fileId) {
+        if (!namespaceActive(namespace)) {
+            return;
+        }
         ReentrantLock lock = namespaceReconcileLock(namespace);
         lock.lock();
         try {
-            if (!namespaceSettled(namespace, System.currentTimeMillis())) {
+            if (!namespaceActive(namespace)) {
                 return;
             }
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(namespace, fileId);

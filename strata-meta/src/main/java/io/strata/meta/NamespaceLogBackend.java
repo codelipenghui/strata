@@ -52,6 +52,7 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
 
     /** Reserved namespace holding the metadata-log/snapshot system files; routed to the ZK root. */
     static final StrataNamespace SYSTEM_NAMESPACE = StrataNamespace.of("strata-meta");
+    private static final long SYSTEM_NAMESPACE_ACTIVE_SINCE_MS = 1L;
 
     static boolean isSystem(StrataNamespace namespace) {
         return SYSTEM_NAMESPACE.equals(namespace);
@@ -859,7 +860,7 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
     @Override
     public long namespaceActiveSinceMs(StrataNamespace namespace) {
         if (isSystem(namespace)) {
-            return System.currentTimeMillis();
+            return SYSTEM_NAMESPACE_ACTIVE_SINCE_MS;
         }
         NamespaceLeadershipHandle handle = namespaces.get(namespace);
         return handle == null ? 0 : handle.activeSinceMs;
@@ -867,7 +868,11 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
 
     @Override
     public ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
-        return namespaceHandle(namespace).reconcileLock;
+        NamespaceLeadershipHandle handle = namespaces.get(namespace);
+        if (handle == null) {
+            throw new IllegalStateException("namespace has no local leadership handle: " + namespace);
+        }
+        return handle.reconcileLock;
     }
 
     @Override

@@ -27,6 +27,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -971,6 +972,25 @@ class RepairCoordinatorTest {
         }
     }
 
+    @Test
+    void promptDeleteDoesNotWaitForFreshNamespaceSettle() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        StrataNamespace namespace = StrataNamespace.of("fresh-delete");
+        FileId deletingFile = fileId(9103);
+        store.createFile(new Records.FileRecord(deletingFile, namespace, StrataPath.of("/delete"),
+                3, 2, false, FileState.DELETING, 1234, List.of()));
+
+        RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                () -> false, () -> false, ns -> namespace.equals(ns),
+                activeLeadership(System.currentTimeMillis()));
+
+        owner.driveDeletionNow(namespace, deletingFile);
+
+        assertFalse(store.files.containsKey(deletingFile),
+                "prompt delete needs only an active recovered namespace, not the verify settle delay");
+    }
+
     /**
      * Regression test for the cross-namespace DeleteAction in-flight dedup collision.
      *
@@ -1060,6 +1080,27 @@ class RepairCoordinatorTest {
                 "DELETING file must be reclaimed even when a preceding file's getFile throws");
     }
 
+    @Test
+    void scanOnceCountsActiveNamespaceBeforeVerifySettle() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Registered source = register(registry, 9300, "fresh-source");
+        StrataNamespace namespace = StrataNamespace.of("fresh-census");
+        FileId fileId = fileId(9301);
+        store.createFile(new Records.FileRecord(fileId, namespace, StrataPath.of("/under"),
+                3, 2, false, FileState.SEALED, 1234,
+                List.of(sealed(0, 128, 9301, List.of(source.nodeId())))));
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(),
+                () -> true, () -> true, ns -> true, activeLeadership(System.currentTimeMillis()));
+
+        coordinator.scanOnce();
+
+        assertEquals(1, coordinator.underReplicatedChunks(),
+                "active namespaces must remain visible in durability gauges before verify settle");
+        assertEquals(1, coordinator.chunksAtMinRedundancy(),
+                "the active-but-fresh namespace still contributes at-min-redundancy census");
+    }
+
     private static Registered registerAt(NodeRegistry registry, long incMsb, String host, String endpoint)
             throws Exception {
         long incLsb = incMsb + 1;
@@ -1147,38 +1188,32 @@ class RepairCoordinatorTest {
         FileId sysFile = fileId(703);
         store.createFile(new Records.FileRecord(sysFile, "strata-meta", "/metadata-log/seg-703",
                 3, 2, false, FileState.DELETING, 1234, List.of()));
-        NamespaceLeadership leadership = new NamespaceLeadership() {
-            private final java.util.concurrent.locks.ReentrantLock lock =
-                    new java.util.concurrent.locks.ReentrantLock();
-
-            @Override
-            public NamespaceLeaderState leaderState(StrataNamespace namespace) {
-                return NamespaceLeaderState.ACTIVE;
-            }
-
-            @Override
-            public boolean isNamespaceActive(StrataNamespace namespace) {
-                return true;
-            }
-
-            @Override
-            public long namespaceActiveSinceMs(StrataNamespace namespace) {
-                return System.currentTimeMillis();
-            }
-
-            @Override
-            public java.util.concurrent.locks.ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
-                return lock;
-            }
-        };
         RepairCoordinator coordinator =
-                new RepairCoordinator(store, registry, config(), () -> true, () -> true, ns -> true, leadership);
+                new RepairCoordinator(store, registry, config(), () -> true, () -> true, ns -> true,
+                        activeLeadership(System.currentTimeMillis()));
         coordinator.becomeLeaderForTest();
 
         coordinator.scanOnce();
 
         assertFalse(store.files.containsKey(sysFile),
                 "system namespace must use the settled cluster leader gate, not per-namespace activeSince");
+    }
+
+    @Test
+    void verifyPassSystemNamespaceDoesNotRequireClusterLeadershipWithNamespaceLeadership() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        FileId sysFile = fileId(704);
+        store.createFile(new Records.FileRecord(sysFile, "strata-meta", "/metadata-log/seg-704",
+                3, 2, false, FileState.OPEN, 1234, List.of()));
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(),
+                () -> false, () -> false, NamespaceLogBackend::isSystem,
+                activeLeadership(System.currentTimeMillis()));
+
+        coordinator.verifyPass();
+
+        assertEquals(1, store.getFileCalls(sysFile),
+                "the system namespace has no recovery barrier and is verified by its namespace owner");
     }
 
     @Test
@@ -1234,6 +1269,32 @@ class RepairCoordinatorTest {
         // grace 0: these tests assert prompt missing-replica drops
         return new ControllerConfig("unused", 0, 1, 60_000, 0, 1,
                 repairCommandTimeoutMs).withReplicaMissingGraceMs(0);
+    }
+
+    private static NamespaceLeadership activeLeadership(long activeSinceMs) {
+        return new NamespaceLeadership() {
+            private final ReentrantLock lock = new ReentrantLock();
+
+            @Override
+            public NamespaceLeaderState leaderState(StrataNamespace namespace) {
+                return NamespaceLeaderState.ACTIVE;
+            }
+
+            @Override
+            public boolean isNamespaceActive(StrataNamespace namespace) {
+                return true;
+            }
+
+            @Override
+            public long namespaceActiveSinceMs(StrataNamespace namespace) {
+                return activeSinceMs;
+            }
+
+            @Override
+            public ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
+                return lock;
+            }
+        };
     }
 
     private static Registered register(NodeRegistry registry, long incMsb, String host) throws Exception {
