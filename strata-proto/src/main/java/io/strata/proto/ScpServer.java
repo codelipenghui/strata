@@ -27,6 +27,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.util.ArrayDeque;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -48,6 +49,8 @@ public final class ScpServer implements AutoCloseable {
             EnvConfig.intEnv("STRATA_SCP_MAX_INFLIGHT_REQUESTS", 1024);
     private static final long DEFAULT_MAX_INFLIGHT_BYTES =
             EnvConfig.longEnv("STRATA_SCP_MAX_INFLIGHT_BYTES", 1L << 30);
+    private static final int MAX_POOLED_RESPONSE_WRITE_LISTENERS =
+            EnvConfig.intEnv("STRATA_SCP_RESPONSE_WRITE_LISTENER_POOL_SIZE", 256);
 
     /**
      * Handles one request frame; returns the response frame. Throw ScpException for protocol errors.
@@ -196,6 +199,7 @@ public final class ScpServer implements AutoCloseable {
     private final class ConnectionHandler extends SimpleChannelInboundHandler<Frame> {
         private final ExecutorService requestExecutor;
         private final Set<Frame> inFlightAsyncRequests = ConcurrentHashMap.newKeySet();
+        private final ArrayDeque<ResponseWriteListener> responseWriteListeners = new ArrayDeque<>();
         private final AtomicInteger inflightRequests = new AtomicInteger();
         private final AtomicLong inflightBytes = new AtomicLong();
         private final AtomicBoolean connectionOpen = new AtomicBoolean(true);
@@ -494,17 +498,41 @@ public final class ScpServer implements AutoCloseable {
 
         private void finishWrite(ChannelHandlerContext ctx, ChannelFuture write, boolean closeAfterWrite,
                                  Frame frame, Frame releaseAfterWrite) {
-            write.addListener(new ResponseWriteListener(ctx, frame, releaseAfterWrite, closeAfterWrite));
+            write.addListener(responseWriteListener(ctx, frame, releaseAfterWrite, closeAfterWrite));
+        }
+
+        private ResponseWriteListener responseWriteListener(ChannelHandlerContext ctx, Frame frame,
+                                                            Frame releaseAfterWrite, boolean closeAfterWrite) {
+            ResponseWriteListener listener;
+            synchronized (responseWriteListeners) {
+                listener = responseWriteListeners.pollFirst();
+            }
+            if (listener == null) {
+                listener = new ResponseWriteListener();
+            }
+            listener.reset(ctx, frame, releaseAfterWrite, closeAfterWrite);
+            return listener;
+        }
+
+        private void recycleResponseWriteListener(ResponseWriteListener listener) {
+            if (MAX_POOLED_RESPONSE_WRITE_LISTENERS <= 0) {
+                return;
+            }
+            synchronized (responseWriteListeners) {
+                if (responseWriteListeners.size() < MAX_POOLED_RESPONSE_WRITE_LISTENERS) {
+                    responseWriteListeners.addFirst(listener);
+                }
+            }
         }
 
         private final class ResponseWriteListener implements ChannelFutureListener {
-            private final ChannelHandlerContext ctx;
-            private final Frame frame;
-            private final Frame releaseAfterWrite;
-            private final boolean closeAfterWrite;
+            private ChannelHandlerContext ctx;
+            private Frame frame;
+            private Frame releaseAfterWrite;
+            private boolean closeAfterWrite;
 
-            private ResponseWriteListener(ChannelHandlerContext ctx, Frame frame, Frame releaseAfterWrite,
-                                          boolean closeAfterWrite) {
+            private void reset(ChannelHandlerContext ctx, Frame frame, Frame releaseAfterWrite,
+                               boolean closeAfterWrite) {
                 this.ctx = ctx;
                 this.frame = frame;
                 this.releaseAfterWrite = releaseAfterWrite;
@@ -513,12 +541,24 @@ public final class ScpServer implements AutoCloseable {
 
             @Override
             public void operationComplete(ChannelFuture future) {
+                ChannelHandlerContext localCtx = ctx;
+                Frame localFrame = frame;
+                Frame localReleaseAfterWrite = releaseAfterWrite;
+                boolean localCloseAfterWrite = closeAfterWrite;
+                ctx = null;
+                frame = null;
+                releaseAfterWrite = null;
+                closeAfterWrite = false;
                 try {
-                    closeFrames(frame, releaseAfterWrite);
-                } finally {
-                    if (closeAfterWrite || !future.isSuccess()) {
-                        ctx.close();
+                    try {
+                        closeFrames(localFrame, localReleaseAfterWrite);
+                    } finally {
+                        if (localCloseAfterWrite || !future.isSuccess()) {
+                            localCtx.close();
+                        }
                     }
+                } finally {
+                    recycleResponseWriteListener(this);
                 }
             }
         }
