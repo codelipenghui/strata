@@ -496,6 +496,11 @@ public final class ScpServer implements AutoCloseable {
         return Frame.response(req, header, payload);
     }
 
+    /** Convenience for handlers: success response that owns the materialized payload until write close. */
+    public static Frame ok(Frame req, byte[] header, ByteBuffer payload, Runnable payloadReleaser) {
+        return Frame.response(req, header, payload, payloadReleaser);
+    }
+
     /** Convenience for handlers: success response whose payload is streamed from a file region. */
     public static Frame okFileRegion(Frame req, byte[] header, FileChannel channel, long position,
                                      int length, Runnable releaser) {

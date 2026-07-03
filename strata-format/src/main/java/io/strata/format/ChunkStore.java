@@ -5,6 +5,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.Closeables;
 import io.strata.common.Crc;
+import io.strata.common.EnvConfig;
 import io.strata.common.ErrorCode;
 import io.strata.common.FailureInjector;
 import io.strata.common.Fsync;
@@ -26,7 +27,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -43,6 +46,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
@@ -78,10 +83,17 @@ public final class ChunkStore implements AutoCloseable {
     private static final long MAX_IMPORT_FOOTER_BYTES = 64L * 1024 * 1024;
 
     private static final int RECOVERY_FENCE_REQUIRED = Integer.MAX_VALUE;
+    private static final byte[] EMPTY_READ_BYTES = new byte[0];
+    private static final int READ_BUFFER_POOL_MAX_BYTES =
+            EnvConfig.intEnv("STRATA_READ_BUFFER_POOL_MAX_BYTES", 1 << 20);
+    private static final int READ_BUFFER_POOL_MAX_BUFFERS =
+            EnvConfig.intEnv("STRATA_READ_BUFFER_POOL_MAX_BUFFERS", 64);
 
     private final Path dir;
     private final Map<NsChunkId, Handle> chunks = new ConcurrentHashMap<>();
     private final ChannelCache channelCache;
+    private final ReadBufferPool readBufferPool =
+            new ReadBufferPool(READ_BUFFER_POOL_MAX_BYTES, READ_BUFFER_POOL_MAX_BUFFERS);
     private final Set<NsChunkId> creating = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<Path, Object> directoryDurabilityLocks = new ConcurrentHashMap<>();
     private final Set<Path> durableDirectories = ConcurrentHashMap.newKeySet();
@@ -1022,10 +1034,146 @@ public final class ChunkStore implements AutoCloseable {
 
     public record ReadResult(byte[] bytes, long localEndOffset, long lastKnownDO) {}
 
-    /** A verified read response whose bytes are materialized before the caller writes them to the client. */
-    public record ReadRegionResult(byte[] bytes, long localEndOffset, long lastKnownDO) {
+    /** A verified read response whose payload buffer remains owned until {@link #close()}. */
+    public static final class ReadRegionResult implements AutoCloseable {
+        private final ReadBuffer buffer;
+        private final int length;
+        private final long localEndOffset;
+        private final long lastKnownDO;
+
+        private ReadRegionResult(ReadBuffer buffer, int length, long localEndOffset, long lastKnownDO) {
+            this.buffer = Objects.requireNonNull(buffer, "buffer");
+            if (length < 0 || length > buffer.bytes().length) {
+                throw new IllegalArgumentException("invalid read length " + length
+                        + " for buffer length " + buffer.bytes().length);
+            }
+            this.length = length;
+            this.localEndOffset = localEndOffset;
+            this.lastKnownDO = lastKnownDO;
+        }
+
+        static ReadRegionResult empty(long localEndOffset, long lastKnownDO) {
+            return new ReadRegionResult(ReadBuffer.unpooled(EMPTY_READ_BYTES), 0, localEndOffset, lastKnownDO);
+        }
+
+        static ReadRegionResult of(ReadBuffer buffer, int length, long localEndOffset, long lastKnownDO) {
+            return new ReadRegionResult(buffer, length, localEndOffset, lastKnownDO);
+        }
+
+        public byte[] bytes() {
+            return length == 0 ? EMPTY_READ_BYTES : Arrays.copyOf(buffer.bytes(), length);
+        }
+
+        public ByteBuffer payloadBuffer() {
+            return length == 0 ? null : ByteBuffer.wrap(buffer.bytes(), 0, length);
+        }
+
         public int length() {
-            return bytes.length;
+            return length;
+        }
+
+        public long localEndOffset() {
+            return localEndOffset;
+        }
+
+        public long lastKnownDO() {
+            return lastKnownDO;
+        }
+
+        @Override
+        public void close() {
+            buffer.close();
+        }
+    }
+
+    private static final class ReadBuffer implements AutoCloseable {
+        private final byte[] bytes;
+        private final Runnable releaser;
+        private final AtomicBoolean closed = new AtomicBoolean(false);
+
+        private ReadBuffer(byte[] bytes, Runnable releaser) {
+            this.bytes = Objects.requireNonNull(bytes, "bytes");
+            this.releaser = releaser;
+        }
+
+        static ReadBuffer unpooled(byte[] bytes) {
+            return new ReadBuffer(bytes, null);
+        }
+
+        byte[] bytes() {
+            return bytes;
+        }
+
+        @Override
+        public void close() {
+            if (releaser != null && closed.compareAndSet(false, true)) {
+                releaser.run();
+            }
+        }
+    }
+
+    private static final class ReadBufferPool {
+        private final int maxBufferBytes;
+        private final int maxBuffers;
+        private final ConcurrentHashMap<Integer, ArrayDeque<byte[]>> buffers = new ConcurrentHashMap<>();
+        private final AtomicInteger pooled = new AtomicInteger();
+
+        private ReadBufferPool(int maxBufferBytes, int maxBuffers) {
+            this.maxBufferBytes = Math.max(0, maxBufferBytes);
+            this.maxBuffers = Math.max(0, maxBuffers);
+        }
+
+        ReadBuffer acquire(int length) {
+            if (length == 0) {
+                return ReadBuffer.unpooled(EMPTY_READ_BYTES);
+            }
+            if (!poolable(length)) {
+                return ReadBuffer.unpooled(new byte[length]);
+            }
+
+            byte[] pooledBytes = poll(length);
+            if (pooledBytes != null) {
+                return new ReadBuffer(pooledBytes, () -> release(pooledBytes));
+            }
+            byte[] allocated = new byte[length];
+            return new ReadBuffer(allocated, () -> release(allocated));
+        }
+
+        private byte[] poll(int length) {
+            ArrayDeque<byte[]> queue = buffers.get(length);
+            if (queue == null) {
+                return null;
+            }
+            synchronized (queue) {
+                byte[] bytes = queue.pollFirst();
+                if (bytes != null) {
+                    pooled.decrementAndGet();
+                }
+                return bytes;
+            }
+        }
+
+        private void release(byte[] bytes) {
+            if (!poolable(bytes.length)) {
+                return;
+            }
+            while (true) {
+                int current = pooled.get();
+                if (current >= maxBuffers) {
+                    return;
+                }
+                if (pooled.compareAndSet(current, current + 1)) {
+                    break;
+                }
+            }
+            ArrayDeque<byte[]> queue = buffers.computeIfAbsent(bytes.length, ignored -> new ArrayDeque<>());
+            synchronized (queue) {
+                queue.addFirst(bytes);
+            }
+        }
+
+        private boolean poolable(int length) {
+            return length > 0 && length <= maxBufferBytes && maxBuffers > 0;
         }
     }
 
@@ -1033,8 +1181,9 @@ public final class ChunkStore implements AutoCloseable {
                                 List<ChunkFormats.LedgerEntry> entries) {}
 
     public ReadResult read(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
-        ReadRegionResult r = readRegion(ns, id, offset, maxBytes, true);
-        return new ReadResult(r.bytes(), r.localEndOffset(), r.lastKnownDO());
+        try (ReadRegionResult r = readRegion(ns, id, offset, maxBytes, true)) {
+            return new ReadResult(r.bytes(), r.localEndOffset(), r.lastKnownDO());
+        }
     }
 
     public ReadRegionResult readRegion(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
@@ -1073,11 +1222,11 @@ public final class ChunkStore implements AutoCloseable {
             long readableEnd = (h.state == ChunkState.SEALED || includeUndurableTail)
                     ? localEnd : Math.min(localEnd, lastKnownDO);
             if (offset >= readableEnd) {
-                return new ReadRegionResult(new byte[0], localEnd, lastKnownDO);
+                return ReadRegionResult.empty(localEnd, lastKnownDO);
             }
             n = (int) Math.min(Math.min(maxBytes, csConfig.maxRequestBytes()), readableEnd - offset);
             if (n == 0) {
-                return new ReadRegionResult(new byte[0], localEnd, lastKnownDO);
+                return ReadRegionResult.empty(localEnd, lastKnownDO);
             }
             if (h.state != ChunkState.SEALED) {
                 if (!includeUndurableTail) {
@@ -1087,9 +1236,17 @@ public final class ChunkStore implements AutoCloseable {
                 } else {
                     // Recovery may inspect bytes above lastKnownDO; that tail can be seal-truncated, so keep
                     // the read and CRC under the chunk lock.
-                    byte[] out = new byte[n];
-                    readOpenVerified(h, offset, out);
-                    return new ReadRegionResult(out, localEnd, lastKnownDO);
+                    ReadBuffer out = readBufferPool.acquire(n);
+                    boolean success = false;
+                    try {
+                        readOpenVerified(h, offset, out.bytes());
+                        success = true;
+                        return ReadRegionResult.of(out, n, localEnd, lastKnownDO);
+                    } finally {
+                        if (!success) {
+                            out.close();
+                        }
+                    }
                 }
             } else {
                 sealedLength = h.sealedLength;
@@ -1106,26 +1263,39 @@ public final class ChunkStore implements AutoCloseable {
         if (openReadPlan != null) {
             // Client open reads are clamped to lastKnownDO. Seal may not truncate below that floor, so the
             // verified disk I/O can run off-lock against an independent FD after handle revalidation.
-            byte[] out = new byte[n];
+            ReadBuffer out = readBufferPool.acquire(n);
+            boolean success = false;
             try (FileChannel readChannel = FileChannel.open(dataPath, StandardOpenOption.READ)) {
                 requireCurrentHandle(h, nsKey, id);
-                readOpenVerified(readChannel, openReadPlan.firstEntryStart(), openReadPlan.entries(), id, offset, out);
+                readOpenVerified(readChannel, openReadPlan.firstEntryStart(), openReadPlan.entries(), id, offset, out.bytes());
+                countClientRead(ns, n);
+                success = true;
+                return ReadRegionResult.of(out, n, localEnd, lastKnownDO);
+            } finally {
+                if (!success) {
+                    out.close();
+                }
             }
-            countClientRead(ns, n);
-            return new ReadRegionResult(out, localEnd, lastKnownDO);
         }
         // SEALED READs are immutable, so we can verify off-lock against the footer CRC ranges. Both client
         // reads and recovery reads use this path: a corrupt local block fails before the node writes a READ
         // response, instead of waiting for background scrub.
-        byte[] out = new byte[n];
+        ReadBuffer out = readBufferPool.acquire(n);
+        boolean success = false;
         try (ChannelCache.Lease lease = channelCache.acquire(nsKey, dataPath)) {
             requireCurrentHandle(h, nsKey, id);
-            readSealedVerified(lease.channel(), h, sealedLength, sealedRangeCrcs, !includeUndurableTail, id, offset, out);
+            readSealedVerified(lease.channel(), h, sealedLength, sealedRangeCrcs, !includeUndurableTail, id, offset,
+                    out.bytes());
+            if (!includeUndurableTail) {
+                countClientRead(ns, n);
+            }
+            success = true;
+            return ReadRegionResult.of(out, n, localEnd, lastKnownDO);
+        } finally {
+            if (!success) {
+                out.close();
+            }
         }
-        if (!includeUndurableTail) {
-            countClientRead(ns, n);
-        }
-        return new ReadRegionResult(out, localEnd, lastKnownDO);
     }
 
     private OpenReadPlan openReadPlan(Handle h, long offset, long readEnd) throws IOException {

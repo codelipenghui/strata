@@ -10,9 +10,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * One SCP frame (tech design §10.2). Header and payload are exposed as read-only
  * {@link ByteBuffer} slices.
  *
- * <p>Frames constructed from ordinary {@link ByteBuffer}s do not own memory and
- * {@link #close()} is a no-op. Netty-decoded frames may own a retained {@link ByteBuf};
- * transport code must close those frames after the handler no longer needs the slices.</p>
+ * <p>Frames constructed from ordinary {@link ByteBuffer}s do not own memory unless a payload
+ * releaser is supplied. Netty-decoded frames may own a retained {@link ByteBuf}; transport code
+ * must close owned frames after the handler no longer needs the slices.</p>
  */
 public final class Frame implements AutoCloseable {
     public static final byte MAGIC = 0x5C;
@@ -32,16 +32,19 @@ public final class Frame implements AutoCloseable {
     private final ByteBuffer payload;
     private final FilePayload filePayload;
     private final ByteBuf owner;
+    private final Runnable payloadReleaser;
     private final int payloadCrc;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     public Frame(short opcode, short apiVersion, short flags, long correlationId,
                  ByteBuffer header, ByteBuffer payload) {
-        this(opcode, apiVersion, flags, correlationId, readOnlySlice(header), readOnlySlice(payload), null, null, 0);
+        this(opcode, apiVersion, flags, correlationId, readOnlySlice(header), readOnlySlice(payload),
+                null, null, null, 0);
     }
 
     private Frame(short opcode, short apiVersion, short flags, long correlationId,
-                  ByteBuffer header, ByteBuffer payload, FilePayload filePayload, ByteBuf owner, int payloadCrc) {
+                  ByteBuffer header, ByteBuffer payload, FilePayload filePayload, ByteBuf owner,
+                  Runnable payloadReleaser, int payloadCrc) {
         this.opcode = opcode;
         this.apiVersion = apiVersion;
         this.flags = flags;
@@ -50,6 +53,7 @@ public final class Frame implements AutoCloseable {
         this.payload = payload;
         this.filePayload = filePayload;
         this.owner = owner;
+        this.payloadReleaser = payloadReleaser;
         this.payloadCrc = payloadCrc;
     }
 
@@ -58,7 +62,7 @@ public final class Frame implements AutoCloseable {
                                  int payloadCrc) {
         ByteBuffer header = owner.nioBuffer(headerIndex, headerLen).asReadOnlyBuffer();
         ByteBuffer payload = owner.nioBuffer(payloadIndex, payloadLen).asReadOnlyBuffer();
-        return new Frame(opcode, apiVersion, flags, correlationId, header, payload, null, owner,
+        return new Frame(opcode, apiVersion, flags, correlationId, header, payload, null, owner, null,
                 retainedPayloadCrc(flags, payloadLen, payloadCrc));
     }
 
@@ -66,7 +70,7 @@ public final class Frame implements AutoCloseable {
                          ByteBuffer header, ByteBuffer payload, int payloadCrc) {
         ByteBuffer payloadSlice = readOnlySlice(payload);
         return new Frame(opcode, apiVersion, flags, correlationId,
-                readOnlySlice(header), payloadSlice, null, null,
+                readOnlySlice(header), payloadSlice, null, null, null,
                 retainedPayloadCrc(flags, payloadSlice.remaining(), payloadCrc));
     }
 
@@ -175,7 +179,7 @@ public final class Frame implements AutoCloseable {
             throw new IllegalStateException("file payload cannot be copied to heap");
         }
         return new Frame(opcode, apiVersion, flags, correlationId,
-                readOnlySlice(copy(header)), readOnlySlice(copy(payload)), null, null, payloadCrc);
+                readOnlySlice(copy(header)), readOnlySlice(copy(payload)), null, null, null, payloadCrc);
     }
 
     public boolean ownsBuffer() {
@@ -188,13 +192,17 @@ public final class Frame implements AutoCloseable {
 
     @Override
     public void close() {
-        // a frame owns at most one of {retained buffer, file payload} by construction
+        // a frame owns at most one inbound buffer or file payload; materialized responses may also
+        // carry a payload releaser for buffers borrowed from the storage layer.
         if (closed.compareAndSet(false, true)) {
             if (owner != null) {
                 owner.release();
             }
             if (filePayload != null) {
                 filePayload.close();
+            }
+            if (payloadReleaser != null) {
+                payloadReleaser.run();
             }
         }
     }
@@ -229,8 +237,14 @@ public final class Frame implements AutoCloseable {
                 headerBuffer(header), payload != null ? payload : EMPTY.duplicate());
     }
 
+    public static Frame response(Frame req, byte[] header, ByteBuffer payload, Runnable payloadReleaser) {
+        return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
+                readOnlySlice(headerBuffer(header)), readOnlySlice(payload != null ? payload : EMPTY.duplicate()),
+                null, null, payloadReleaser, 0);
+    }
+
     public static Frame fileResponse(Frame req, byte[] header, FilePayload filePayload) {
         return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
-                readOnlySlice(headerBuffer(header)), readOnlySlice(EMPTY.duplicate()), filePayload, null, 0);
+                readOnlySlice(headerBuffer(header)), readOnlySlice(EMPTY.duplicate()), filePayload, null, null, 0);
     }
 }

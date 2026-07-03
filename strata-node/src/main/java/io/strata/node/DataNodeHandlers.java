@@ -180,8 +180,16 @@ final class DataNodeHandlers implements ScpServer.Handler {
 
     /** Wire-encodes a verified, materialized {@link ChunkStore.ReadRegionResult}. */
     private static Frame readRegionResponse(Frame req, ChunkStore.ReadRegionResult r) {
-        byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
-        byte[] bytes = r.bytes();
-        return ScpServer.ok(req, header, bytes.length > 0 ? ByteBuffer.wrap(bytes) : null);
+        boolean success = false;
+        try {
+            byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
+            Frame frame = ScpServer.ok(req, header, r.payloadBuffer(), r::close);
+            success = true;
+            return frame;
+        } finally {
+            if (!success) {
+                r.close();
+            }
+        }
     }
 }
