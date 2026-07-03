@@ -14,6 +14,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -36,6 +37,41 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class NamespaceLogBackendReacquireOnFenceTest {
 
     private static final StrataNamespace NS = StrataNamespace.of("tenant-a");
+
+    @Test
+    void namespaceIsRecoveringUntilOpenBarrierPublishesActive() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            TestNamespaceMetadataFileStore delegate = new TestNamespaceMetadataFileStore();
+            NamespaceLogCowCompactionTest.BlockingSnapshotFileStore blocking =
+                    new NamespaceLogCowCompactionTest.BlockingSnapshotFileStore(delegate);
+            blocking.armed = true;
+
+            try (NamespaceLogBackend owner = new NamespaceLogBackend(root, blocking, false)) {
+                CompletableFuture<FileId> create = CompletableFuture.supplyAsync(() ->
+                        sup(() -> owner.createFileOwnerAssigned(template("/recovering", 10))));
+
+                assertTrue(blocking.entered.await(2, TimeUnit.SECONDS),
+                        "open recovery must park before the manifest publish");
+                assertEquals(NamespaceLeaderState.RECOVERING, owner.leaderState(NS),
+                        "the namespace is not active while the open recovery barrier is still running");
+                assertFalse(owner.isNamespaceActive(NS),
+                        "non-ACTIVE namespaces must not be treated as serviceable");
+                assertEquals(0, owner.namespaceActiveSinceMs(NS),
+                        "activeSince is published only after the recovery barrier completes");
+                assertEquals(0, owner.loadedNamespaceCount(),
+                        "a recovering repo must not be published as a loaded active namespace");
+
+                blocking.block.countDown();
+                assertEquals(FileId.of(0), create.get(5, TimeUnit.SECONDS));
+                assertEquals(NamespaceLeaderState.ACTIVE, owner.leaderState(NS));
+                assertTrue(owner.isNamespaceActive(NS));
+                assertTrue(owner.namespaceActiveSinceMs(NS) > 0,
+                        "activeSince is stamped when the namespace becomes ACTIVE");
+                assertEquals(1, owner.loadedNamespaceCount());
+            }
+        }
+    }
 
     @Test
     void fencedOwnerReAcquiresAndCompletesInsteadOfStayingWedged() throws Exception {

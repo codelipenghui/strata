@@ -90,6 +90,9 @@ class RepairCoordinator implements AutoCloseable {
     private final BooleanSupplier ownsAll;
     // Whether this node is the controller owner of a namespace — scopes the non-controller owner repair pass.
     private final Predicate<StrataNamespace> ownsNamespace;
+    // Real per-namespace leadership state when the namespace-log backend is active; null for root/test stores.
+    private final NamespaceLeadership namespaceLeadership;
+    private final ConcurrentHashMap<StrataNamespace, ReentrantLock> fallbackReconcileLocks = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicLong commandIds = new AtomicLong(System.currentTimeMillis());
     private final Map<Long, Action> inflight = new ConcurrentHashMap<>();
@@ -187,12 +190,21 @@ class RepairCoordinator implements AutoCloseable {
                       BooleanSupplier isLeader,
                       BooleanSupplier ownsAllNamespaces,
                       Predicate<StrataNamespace> ownsNamespace) {
+        this(store, registry, config, isLeader, ownsAllNamespaces, ownsNamespace, null);
+    }
+
+    RepairCoordinator(MetadataStore store, NodeRegistry registry, ControllerConfig config,
+                      BooleanSupplier isLeader,
+                      BooleanSupplier ownsAllNamespaces,
+                      Predicate<StrataNamespace> ownsNamespace,
+                      NamespaceLeadership namespaceLeadership) {
         this.store = store;
         this.registry = registry;
         this.config = config;
         this.isLeader = isLeader;
         this.ownsAll = ownsAllNamespaces;
         this.ownsNamespace = ownsNamespace;
+        this.namespaceLeadership = namespaceLeadership;
         this.systemVerifyIntervalMs = config.systemVerifyIntervalMs();
     }
 
@@ -218,17 +230,9 @@ class RepairCoordinator implements AutoCloseable {
     // threaded, but tests drive verifyPass() directly, so this stays a field.
     private long lastSystemVerifyMs;
 
-    // leaderSince is written by the scan thread (tick/reconcile) and read by the verify thread's settle
-    // gate, so it must publish safely across threads.
-    private volatile long leaderSince;
-    /**
-     * Serializes the descriptor-mutating reconcile passes — scanOnce() (leader), ownerRepairPass()
-     * (non-leader owner), and driveDeletionNow() (prompt delete) — against each other (replaces a
-     * {@code synchronized(this)} monitor). A ReentrantLock does not pin the virtual-thread carrier across
-     * the blocking store/ZK and node-RPC I/O these methods perform, unlike {@code synchronized} on Java 21.
-     */
-    private final ReentrantLock reconcileLock =
-            new ReentrantLock();
+    // Global controller-leader settle time for cluster-scope node liveness work. Namespace activation only gates
+    // access to a recovered local metadata view; verify verdicts add a namespace-level settle delay separately.
+    private volatile long clusterLeaderSince;
 
     private void scanLoop() {
         long lastTombstoneSweep = 0;
@@ -276,16 +280,16 @@ class RepairCoordinator implements AutoCloseable {
      */
     void tick() {
         if (!isLeader.getAsBoolean()) {
-            leaderSince = 0;
+            clusterLeaderSince = 0;
             return;
         }
-        if (leaderSince == 0) {
-            leaderSince = System.currentTimeMillis();
+        if (clusterLeaderSince == 0) {
+            clusterLeaderSince = System.currentTimeMillis();
         }
         registry.publishClusterLiveNodes();
         // settle period after acquiring leadership: nodes registered with the previous leader need a
         // lease cycle to re-register here, or expireScan() would mark them DEAD spuriously.
-        if (System.currentTimeMillis() - leaderSince < config.leaseMs() + config.deadGraceMs()) {
+        if (!clusterLeaderSettled(System.currentTimeMillis())) {
             return;
         }
         // Lane B: feed each newly-dead node to a targeted repair so a death starts repair immediately
@@ -303,9 +307,43 @@ class RepairCoordinator implements AutoCloseable {
         this.systemVerifyIntervalMs = ms;
     }
 
-    /** Test seam: stamps {@code leaderSince} far enough in the past that the settle gate is open. */
+    /** Test seam: stamps {@code clusterLeaderSince} far enough in the past that the settle gate is open. */
     void becomeLeaderForTest() {
-        leaderSince = System.currentTimeMillis() - (config.leaseMs() + config.deadGraceMs()) - 1;
+        clusterLeaderSince = System.currentTimeMillis() - settleMs() - 1;
+    }
+
+    private long settleMs() {
+        return (long) config.leaseMs() + config.deadGraceMs();
+    }
+
+    private boolean clusterLeaderSettled(long now) {
+        long since = clusterLeaderSince;
+        return since != 0 && now - since >= settleMs();
+    }
+
+    private boolean namespaceActive(StrataNamespace namespace) {
+        if (NamespaceLogBackend.isSystem(namespace)) {
+            return true;
+        }
+        return namespaceLeadership == null || namespaceLeadership.isNamespaceActive(namespace);
+    }
+
+    private boolean namespaceSettledForVerify(StrataNamespace namespace, long now) {
+        if (!namespaceActive(namespace)) {
+            return false;
+        }
+        if (NamespaceLogBackend.isSystem(namespace) || namespaceLeadership == null) {
+            return true;
+        }
+        long activeSince = namespaceLeadership.namespaceActiveSinceMs(namespace);
+        return activeSince != 0 && now - activeSince >= settleMs();
+    }
+
+    private ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
+        if (namespaceLeadership != null && !NamespaceLogBackend.isSystem(namespace)) {
+            return namespaceLeadership.namespaceReconcileLock(namespace);
+        }
+        return fallbackReconcileLocks.computeIfAbsent(namespace, ignored -> new ReentrantLock());
     }
 
     /**
@@ -332,11 +370,15 @@ class RepairCoordinator implements AutoCloseable {
         if (!isLeader.getAsBoolean()) {
             return;
         }
-        if (System.currentTimeMillis() - leaderSince < config.leaseMs() + config.deadGraceMs()) {
+        long now = System.currentTimeMillis();
+        if (!clusterLeaderSettled(now)) {
             return;
         }
         for (StrataNamespace ns : store.listNamespaces()) {
             if (!ownsAll.getAsBoolean() && !ownsNamespace.test(ns) && !NamespaceLogBackend.isSystem(ns)) {
+                continue;
+            }
+            if (!namespaceActive(ns)) {
                 continue;
             }
             for (FileId fileId : store.listFileIds(ns)) {
@@ -389,10 +431,10 @@ class RepairCoordinator implements AutoCloseable {
             ownerRepairPass();
             return;
         }
-        if (leaderSince == 0) {
-            leaderSince = System.currentTimeMillis();
+        if (clusterLeaderSince == 0) {
+            clusterLeaderSince = System.currentTimeMillis();
         }
-        if (System.currentTimeMillis() - leaderSince < config.leaseMs() + config.deadGraceMs()) {
+        if (!clusterLeaderSettled(System.currentTimeMillis())) {
             return;
         }
         scanOnce();
@@ -414,26 +456,8 @@ class RepairCoordinator implements AutoCloseable {
         }
     }
 
-    /**
-     * Live (namespace, fileId) pairs across every namespace. Repair reconciles the whole cluster,
-     * not one tenant, so it composes per-namespace listings — there is no global flat file enumeration.
-     * Returns a list (not a map) so that colliding numeric FileIds in different namespaces are never
-     * collapsed — each (namespace, fileId) pair is a distinct entry (design §Task-9 final review fix).
-     */
-    private List<NsFileKey> allFilesByNamespace() throws Exception {
-        List<NsFileKey> out = new ArrayList<>();
-        for (var ns : store.listNamespaces()) {
-            for (FileId id : store.listFileIds(ns)) {
-                out.add(new NsFileKey(ns, id));
-            }
-        }
-        return out;
-    }
-
     /** One reconciliation pass over all files. Idempotent; safe to call while serving. */
     void scanOnce() throws Exception {
-        reconcileLock.lock();
-        try {
         // The controller refreshes the shared live-node snapshot each pass so non-controller namespace
         // owners have a current placement view (design §11). Leader-gated: a standby must not publish.
         if (isLeader.getAsBoolean()) {
@@ -442,57 +466,64 @@ class RepairCoordinator implements AutoCloseable {
         sweepStuckCommands();
         record Repair(StrataNamespace ns, FileId fileId, Records.FileRecord file,
                       Records.ChunkRecord chunk, int liveReplicas) {}
-        List<Repair> repairs = new ArrayList<>();
         // durability census, published to gauges at the end; int[] lets lambdas increment them
         int[] under = {0}, unavailable = {0}, atMin = {0};
 
-        for (NsFileKey entry : allFilesByNamespace()) {
-            FileId fileId = entry.fileId();
-            StrataNamespace ns = entry.namespace();
-            perFileIsolated(ns, fileId, "scanOnce", () -> {
-                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
-                if (opt.isEmpty()) return;
-                Records.FileRecord file = opt.get().value();
+        long now = System.currentTimeMillis();
+        for (StrataNamespace ns : store.listNamespaces()) {
+            if (!namespaceActive(ns)) {
+                continue;
+            }
+            ReentrantLock lock = namespaceReconcileLock(ns);
+            lock.lock();
+            try {
+                List<Repair> repairs = new ArrayList<>();
+                for (FileId fileId : store.listFileIds(ns)) {
+                    perFileIsolated(ns, fileId, "scanOnce", () -> {
+                        Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
+                        if (opt.isEmpty()) return;
+                        Records.FileRecord file = opt.get().value();
 
-                if (file.state() == FileState.DELETING) {
-                    driveDeletion(file, opt.get().version());
-                    return;
+                        if (file.state() == FileState.DELETING) {
+                            driveDeletion(file, opt.get().version());
+                            return;
+                        }
+                        for (Records.ChunkRecord chunk : file.chunks()) {
+                            if (chunk.state() != ChunkState.SEALED) continue; // open chunks belong to their writer
+                            ChunkId chunkId = file.chunkId(chunk.index());
+                            int live = 0;
+                            for (int nodeId : chunk.replicas()) {
+                                if (!registry.isDead(nodeId)) live++;
+                            }
+                            // durability census — counted for every sealed chunk regardless of in-flight repair
+                            if (live == 0) {
+                                unavailable[0]++;
+                            } else if (live < file.replicationFactor()) {
+                                under[0]++;
+                                if (live == 1) atMin[0]++;
+                            }
+                            if (chunksBeingRepaired.contains(new NsChunkId(ns, chunkId))) continue;
+                            if (live < file.replicationFactor() && live > 0) {
+                                repairs.add(new Repair(ns, fileId, file, chunk, live));
+                            } else if (live == 0) {
+                                log.error("chunk {} has NO live replicas — data loss exposure, cannot repair", chunkId);
+                            }
+                        }
+                    });
                 }
-                for (Records.ChunkRecord chunk : file.chunks()) {
-                    if (chunk.state() != ChunkState.SEALED) continue; // open chunks belong to their writer
-                    ChunkId chunkId = file.chunkId(chunk.index());
-                    int live = 0;
-                    for (int nodeId : chunk.replicas()) {
-                        if (!registry.isDead(nodeId)) live++;
-                    }
-                    // durability census — counted for every sealed chunk regardless of in-flight repair
-                    if (live == 0) {
-                        unavailable[0]++;
-                    } else if (live < file.replicationFactor()) {
-                        under[0]++;
-                        if (live == 1) atMin[0]++;
-                    }
-                    if (chunksBeingRepaired.contains(new NsChunkId(ns, chunkId))) continue;
-                    if (live < file.replicationFactor() && live > 0) {
-                        repairs.add(new Repair(ns, fileId, file, chunk, live));
-                    } else if (live == 0) {
-                        log.error("chunk {} has NO live replicas — data loss exposure, cannot repair", chunkId);
-                    }
+                // Exposure priority is intentionally namespace-local: the per-namespace reconcile lock avoids
+                // cross-namespace head-of-line blocking, so we order fewest-live-first within this namespace.
+                repairs.sort(Comparator.comparingInt(Repair::liveReplicas));
+                for (Repair r : repairs) {
+                    issueReplicate(r.ns(), r.fileId(), r.file(), r.chunk(), RepairTrigger.RECONCILE);
                 }
-            });
+            } finally {
+                lock.unlock();
+            }
         }
         underReplicatedChunks = under[0];
         unavailableChunks = unavailable[0];
         chunksAtMinRedundancy = atMin[0];
-
-        // exposure priority: fewest live replicas first (tech design §7.2)
-        repairs.sort(Comparator.comparingInt(Repair::liveReplicas));
-        for (Repair r : repairs) {
-            issueReplicate(r.ns(), r.fileId(), r.file(), r.chunk(), RepairTrigger.RECONCILE);
-        }
-        } finally {
-            reconcileLock.unlock();
-        }
     }
 
     @FunctionalInterface
@@ -598,19 +629,21 @@ class RepairCoordinator implements AutoCloseable {
         if (ownsAll.getAsBoolean()) {
             return;
         }
-        reconcileLock.lock();
-        try {
-            Map<Integer, Records.NodeRecord> nodes = nodesById();
-            Set<Integer> dead = new HashSet<>();
-            for (Records.NodeRecord n : nodes.values()) {
-                if (n.state() == Records.NodeState.DEAD) {
-                    dead.add(n.nodeId());
-                }
+        Map<Integer, Records.NodeRecord> nodes = nodesById();
+        Set<Integer> dead = new HashSet<>();
+        for (Records.NodeRecord n : nodes.values()) {
+            if (n.state() == Records.NodeState.DEAD) {
+                dead.add(n.nodeId());
             }
-            for (StrataNamespace ns : store.listNamespaces()) {
-                if (!ownsNamespace.test(ns)) {
-                    continue;
-                }
+        }
+        long now = System.currentTimeMillis();
+        for (StrataNamespace ns : store.listNamespaces()) {
+            if (!ownsNamespace.test(ns) || !namespaceActive(ns)) {
+                continue;
+            }
+            ReentrantLock lock = namespaceReconcileLock(ns);
+            lock.lock();
+            try {
                 for (FileId fileId : store.listFileIds(ns)) {
                     perFileIsolated(ns, fileId, "ownerRepairPass", () -> {
                         Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
@@ -631,9 +664,9 @@ class RepairCoordinator implements AutoCloseable {
                         }
                     });
                 }
+            } finally {
+                lock.unlock();
             }
-        } finally {
-            reconcileLock.unlock();
         }
     }
 
@@ -666,9 +699,7 @@ class RepairCoordinator implements AutoCloseable {
         if (isLeader.getAsBoolean()) {
             // A just-elected leader's node-liveness view is stale until nodes re-register; a missing
             // verdict in that window could falsely drop a healthy replica, so wait out the settle period.
-            long since = leaderSince;
-            if (since == 0
-                    || System.currentTimeMillis() - since < (long) config.leaseMs() + config.deadGraceMs()) {
+            if (!clusterLeaderSettled(System.currentTimeMillis())) {
                 return;
             }
         }
@@ -676,6 +707,9 @@ class RepairCoordinator implements AutoCloseable {
         Map<Integer, Records.NodeRecord> nodes = nodesById();
         for (StrataNamespace ns : store.listNamespaces()) {
             if (!ownsNamespace.test(ns)) {
+                continue;
+            }
+            if (!namespaceSettledForVerify(ns, now)) {
                 continue;
             }
             if (NamespaceLogBackend.isSystem(ns)) {
@@ -1021,8 +1055,15 @@ class RepairCoordinator implements AutoCloseable {
      * disk stays bounded under sustained delete load. Synchronized with the scan so they don't race.
      */
     void driveDeletionNow(StrataNamespace namespace, FileId fileId) {
-        reconcileLock.lock();
+        if (!namespaceActive(namespace)) {
+            return;
+        }
+        ReentrantLock lock = namespaceReconcileLock(namespace);
+        lock.lock();
         try {
+            if (!namespaceActive(namespace)) {
+                return;
+            }
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(namespace, fileId);
             if (opt.isEmpty() || opt.get().value().state() != FileState.DELETING) {
                 return;
@@ -1038,7 +1079,7 @@ class RepairCoordinator implements AutoCloseable {
         } catch (Exception e) {
             log.warn("prompt delete dispatch for {} failed — background scan will retry", fileId, e);
         } finally {
-            reconcileLock.unlock();
+            lock.unlock();
         }
     }
 
@@ -1345,8 +1386,6 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     // Cache key that pairs namespace + fileId for unambiguous per-namespace lookup.
-    private record NsFileKey(StrataNamespace namespace, FileId fileId) {}
-
     @Override
     public void close() {
         closed.set(true);

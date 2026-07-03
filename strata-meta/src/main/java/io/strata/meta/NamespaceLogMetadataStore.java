@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Predicate;
 
 /**
@@ -17,7 +18,7 @@ import java.util.function.Predicate;
  * facade over the shared {@link NamespaceLogBackend}, so the existing SCP surface and Controller
  * run unchanged — only where metadata lives changes (design §1, §4).
  */
-public final class NamespaceLogMetadataStore implements MetadataStore {
+public final class NamespaceLogMetadataStore implements MetadataStore, NamespaceLeadership {
     private final NamespaceLogBackend backend;
 
     NamespaceLogMetadataStore(NamespaceLogBackend backend) {
@@ -37,6 +38,26 @@ public final class NamespaceLogMetadataStore implements MetadataStore {
     /** Namespaces with a live owner repository on this instance — the sharding load this node carries. */
     int loadedNamespaceCount() {
         return backend.loadedNamespaceCount();
+    }
+
+    @Override
+    public NamespaceLeaderState leaderState(StrataNamespace namespace) {
+        return backend.leaderState(namespace);
+    }
+
+    @Override
+    public boolean isNamespaceActive(StrataNamespace namespace) {
+        return backend.isNamespaceActive(namespace);
+    }
+
+    @Override
+    public long namespaceActiveSinceMs(StrataNamespace namespace) {
+        return backend.namespaceActiveSinceMs(namespace);
+    }
+
+    @Override
+    public ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
+        return backend.namespaceReconcileLock(namespace);
     }
 
     /** Per-namespace stats {@code namespace -> [liveFiles, openLogBytes]} for owned namespaces. */

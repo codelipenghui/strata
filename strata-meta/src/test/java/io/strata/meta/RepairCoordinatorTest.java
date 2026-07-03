@@ -24,7 +24,10 @@ import java.util.Optional;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -483,9 +486,9 @@ class RepairCoordinatorTest {
                 List.of(sealed(0, 64, 8013, List.of(source.nodeId())))));
         store.throwOnListFiles = true;
         RepairCoordinator coordinator = new RepairCoordinator(store, registry, fast, () -> true);
-        Field leaderSince = RepairCoordinator.class.getDeclaredField("leaderSince");
-        leaderSince.setAccessible(true);
-        leaderSince.setLong(coordinator, System.currentTimeMillis() - 20_000);
+        Field clusterLeaderSince = RepairCoordinator.class.getDeclaredField("clusterLeaderSince");
+        clusterLeaderSince.setAccessible(true);
+        clusterLeaderSince.setLong(coordinator, System.currentTimeMillis() - 20_000);
         coordinator.start();
         try {
             Thread.sleep(20);
@@ -937,6 +940,57 @@ class RepairCoordinatorTest {
                 "DELETING file must be reclaimed even when a preceding file's getFile throws");
     }
 
+    @Test
+    void promptDeleteInAnotherNamespaceDoesNotWaitForSlowOwnerRepairNamespace() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        StrataNamespace slowNs = StrataNamespace.of("aaa-slow");
+        StrataNamespace deletingNs = StrataNamespace.of("zzz-delete");
+        FileId slowFile = fileId(9101);
+        FileId deletingFile = fileId(9102);
+        store.createFile(new Records.FileRecord(slowFile, slowNs, StrataPath.of("/slow"),
+                3, 2, false, FileState.SEALED, 1234, List.of()));
+        store.createFile(new Records.FileRecord(deletingFile, deletingNs, StrataPath.of("/delete"),
+                3, 2, false, FileState.DELETING, 1234, List.of()));
+        store.blockGetFileNamespace = slowNs;
+
+        RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                () -> false, () -> false, ns -> true);
+        CompletableFuture<Void> slowRepair = CompletableFuture.runAsync(() -> run(owner::ownerRepairPass));
+        assertTrue(store.getFileBlocked.await(2, TimeUnit.SECONDS),
+                "ownerRepairPass should be parked inside the slow namespace");
+
+        try {
+            CompletableFuture<Void> promptDelete = CompletableFuture.runAsync(() ->
+                    owner.driveDeletionNow(deletingNs, deletingFile));
+            promptDelete.get(1, TimeUnit.SECONDS);
+            assertFalse(store.files.containsKey(deletingFile),
+                    "prompt delete in another namespace must not wait for the slow namespace lock");
+        } finally {
+            store.releaseGetFile.countDown();
+            slowRepair.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void promptDeleteDoesNotWaitForFreshNamespaceSettle() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        StrataNamespace namespace = StrataNamespace.of("fresh-delete");
+        FileId deletingFile = fileId(9103);
+        store.createFile(new Records.FileRecord(deletingFile, namespace, StrataPath.of("/delete"),
+                3, 2, false, FileState.DELETING, 1234, List.of()));
+
+        RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                () -> false, () -> false, ns -> namespace.equals(ns),
+                activeLeadership(System.currentTimeMillis()));
+
+        owner.driveDeletionNow(namespace, deletingFile);
+
+        assertFalse(store.files.containsKey(deletingFile),
+                "prompt delete needs only an active recovered namespace, not the verify settle delay");
+    }
+
     /**
      * Regression test for the cross-namespace DeleteAction in-flight dedup collision.
      *
@@ -1026,6 +1080,27 @@ class RepairCoordinatorTest {
                 "DELETING file must be reclaimed even when a preceding file's getFile throws");
     }
 
+    @Test
+    void scanOnceCountsActiveNamespaceBeforeVerifySettle() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Registered source = register(registry, 9300, "fresh-source");
+        StrataNamespace namespace = StrataNamespace.of("fresh-census");
+        FileId fileId = fileId(9301);
+        store.createFile(new Records.FileRecord(fileId, namespace, StrataPath.of("/under"),
+                3, 2, false, FileState.SEALED, 1234,
+                List.of(sealed(0, 128, 9301, List.of(source.nodeId())))));
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(),
+                () -> true, () -> true, ns -> true, activeLeadership(System.currentTimeMillis()));
+
+        coordinator.scanOnce();
+
+        assertEquals(1, coordinator.underReplicatedChunks(),
+                "active namespaces must remain visible in durability gauges before verify settle");
+        assertEquals(1, coordinator.chunksAtMinRedundancy(),
+                "the active-but-fresh namespace still contributes at-min-redundancy census");
+    }
+
     private static Registered registerAt(NodeRegistry registry, long incMsb, String host, String endpoint)
             throws Exception {
         long incLsb = incMsb + 1;
@@ -1107,6 +1182,41 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void scanOnceUsesClusterLeaderGateForSystemNamespaceWithNamespaceLeadership() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        FileId sysFile = fileId(703);
+        store.createFile(new Records.FileRecord(sysFile, "strata-meta", "/metadata-log/seg-703",
+                3, 2, false, FileState.DELETING, 1234, List.of()));
+        RepairCoordinator coordinator =
+                new RepairCoordinator(store, registry, config(), () -> true, () -> true, ns -> true,
+                        activeLeadership(System.currentTimeMillis()));
+        coordinator.becomeLeaderForTest();
+
+        coordinator.scanOnce();
+
+        assertFalse(store.files.containsKey(sysFile),
+                "system namespace must use the settled cluster leader gate, not per-namespace activeSince");
+    }
+
+    @Test
+    void verifyPassSystemNamespaceDoesNotRequireClusterLeadershipWithNamespaceLeadership() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        FileId sysFile = fileId(704);
+        store.createFile(new Records.FileRecord(sysFile, "strata-meta", "/metadata-log/seg-704",
+                3, 2, false, FileState.OPEN, 1234, List.of()));
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(),
+                () -> false, () -> false, NamespaceLogBackend::isSystem,
+                activeLeadership(System.currentTimeMillis()));
+
+        coordinator.verifyPass();
+
+        assertEquals(1, store.getFileCalls(sysFile),
+                "the system namespace has no recovery barrier and is verified by its namespace owner");
+    }
+
+    @Test
     void verifyPassRunsSystemNamespaceEveryPassWhenIntervalElapsed() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
@@ -1161,6 +1271,32 @@ class RepairCoordinatorTest {
                 repairCommandTimeoutMs).withReplicaMissingGraceMs(0);
     }
 
+    private static NamespaceLeadership activeLeadership(long activeSinceMs) {
+        return new NamespaceLeadership() {
+            private final ReentrantLock lock = new ReentrantLock();
+
+            @Override
+            public NamespaceLeaderState leaderState(StrataNamespace namespace) {
+                return NamespaceLeaderState.ACTIVE;
+            }
+
+            @Override
+            public boolean isNamespaceActive(StrataNamespace namespace) {
+                return true;
+            }
+
+            @Override
+            public long namespaceActiveSinceMs(StrataNamespace namespace) {
+                return activeSinceMs;
+            }
+
+            @Override
+            public ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
+                return lock;
+            }
+        };
+    }
+
     private static Registered register(NodeRegistry registry, long incMsb, String host) throws Exception {
         long incLsb = incMsb + 1;
         Messages.RegisterResp resp = registry.register(new Messages.RegisterNode(
@@ -1184,6 +1320,19 @@ class RepairCoordinatorTest {
     private static Messages.Command onlyCommand(Messages.HeartbeatResp heartbeat) {
         assertEquals(1, heartbeat.commands().size());
         return heartbeat.commands().get(0);
+    }
+
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
+    }
+
+    private static void run(ThrowingRunnable r) {
+        try {
+            r.run();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private static void issueReplicate(RepairCoordinator coordinator, FileId fileId,
@@ -1268,6 +1417,9 @@ class RepairCoordinatorTest {
         private boolean throwOnListFiles;
         /** If non-null, getFile throws for this specific fileId (poison-file injection). */
         private FileId throwOnGetFileId;
+        private StrataNamespace blockGetFileNamespace;
+        private final CountDownLatch getFileBlocked = new CountDownLatch(1);
+        private final CountDownLatch releaseGetFile = new CountDownLatch(1);
 
         @Override
         public void createFile(Records.FileRecord record) {
@@ -1289,6 +1441,15 @@ class RepairCoordinatorTest {
         @Override
         public Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) {
             getFileCalls.merge(id, 1, Integer::sum);
+            if (namespace.equals(blockGetFileNamespace)) {
+                getFileBlocked.countDown();
+                try {
+                    releaseGetFile.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                }
+            }
             if (throwOnGetFile) {
                 throw new IllegalStateException("getFile failure");
             }

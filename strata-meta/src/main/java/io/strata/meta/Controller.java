@@ -108,11 +108,19 @@ public final class Controller implements AutoCloseable {
             // empty/single-endpoint membership this node owns every namespace (no behavior change).
             NamespaceOwnership openedOwnership = new NamespaceOwnership(this.advertisedEndpoint,
                     config.controllerEndpoints(), 0, config.controllerReplicaCount());
+            NamespaceLeadership namespaceLeadership = null;
+            // Eager namespace recovery on the namespace-log backend is scoped to the namespaces this
+            // node owns, so it never republishes (and fences) another owner's namespace.
+            if (backendStore instanceof NamespaceLogMetadataStore namespaceLog) {
+                namespaceLog.setOwnership(openedOwnership::isOwner);
+                namespaceLeadership = namespaceLog;
+            }
             // Repair's orphan-deletion is gated on owning every namespace (a sharded controller never
             // deletes an inventory chunk owned by another controller node), and a non-controller owner heals
             // only the namespaces it owns via the direct EXEC_REPLICATE pass.
             openedRepair = new RepairCoordinator(backendStore, openedRegistry, config,
-                    openedLatch::hasLeadership, openedOwnership::ownsAll, openedOwnership::isOwner);
+                    openedLatch::hasLeadership, openedOwnership::ownsAll, openedOwnership::isOwner,
+                    namespaceLeadership);
 
             this.store = backendStore;
             this.rootZk = openedStore;
@@ -121,12 +129,6 @@ public final class Controller implements AutoCloseable {
             this.leaderLatch = openedLatch;
             this.repair = openedRepair;
             this.ownership = openedOwnership;
-            // Eager namespace recovery on the namespace-log backend is scoped to the namespaces this
-            // node owns, so it never republishes (and fences) another owner's namespace.
-            if (backendStore instanceof NamespaceLogMetadataStore namespaceLog) {
-                namespaceLog.setOwnership(openedOwnership::isOwner);
-            }
-
             // The owner-pull verifier identifies itself by its advertised endpoint (design §20.4) so a
             // node can record which owner attested each chunk; it is also this node's rendezvous identity.
             openedRepair.advertisedEndpoint(this.advertisedEndpoint);
