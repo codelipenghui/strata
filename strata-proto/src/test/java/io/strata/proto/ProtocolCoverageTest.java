@@ -363,6 +363,39 @@ class ProtocolCoverageTest {
         assertEquals(0, frame.ownerRefCnt());
     }
 
+    @Test
+    void ownedInternalReadBuffersExposeCorrectRangesWithoutChangingPublicSlices() {
+        byte[] bytes = {9, 1, 2, 3, 4, 5, 9};
+        ByteBuf owner = Unpooled.directBuffer(bytes.length);
+        owner.writeBytes(bytes);
+        Frame frame = Frame.fromOwnedBuffer(Opcode.PING.code, (short) 1, Frame.FLAG_PAYLOAD_CRC, 99,
+                owner, 1, 2, 3, 3, Crc.of(bytes, 3, 3));
+        try {
+            ByteBuffer headerRead = frame.headerReadBuffer();
+            assertEquals(2, headerRead.remaining());
+            int headerPosition = headerRead.position();
+            int headerLimit = headerRead.limit();
+            assertEquals(1, headerRead.get(headerPosition));
+
+            ByteBuffer payloadRead = frame.payloadReadBuffer();
+            assertEquals(3, payloadRead.remaining());
+            assertEquals(headerPosition, headerRead.position());
+            assertEquals(headerLimit, headerRead.limit());
+            assertEquals(1, headerRead.get(headerPosition));
+            byte[] payload = new byte[3];
+            payloadRead.get(payload);
+            assertArrayEquals(new byte[] {3, 4, 5}, payload);
+
+            byte[] header = new byte[2];
+            frame.headerSlice().get(header);
+            assertArrayEquals(new byte[] {1, 2}, header);
+            assertThrows(ReadOnlyBufferException.class, () -> frame.payloadSlice().put((byte) 0));
+        } finally {
+            frame.close();
+        }
+        assertEquals(0, frame.ownerRefCnt());
+    }
+
     private static void assertFrameReadFails(byte[] wire, String messageFragment) {
         IOException e = assertThrows(IOException.class,
                 () -> FrameIO.read(new DataInputStream(new ByteArrayInputStream(wire))));
