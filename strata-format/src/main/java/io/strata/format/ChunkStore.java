@@ -981,6 +981,34 @@ public final class ChunkStore implements AutoCloseable {
     public record AppendResult(long endOffset) {}
 
     /**
+     * Caller-owned append result for hot paths that only need the primitive end offset and an optional
+     * durability future. Reuse from one thread at a time; the store resets it before publishing a new
+     * outcome.
+     */
+    public static final class AppendOutcome {
+        private long endOffset;
+        private CompletableFuture<Void> waitForFlush;
+
+        public long endOffset() {
+            return endOffset;
+        }
+
+        public CompletableFuture<Void> waitForFlush() {
+            return waitForFlush;
+        }
+
+        private void reset() {
+            endOffset = 0;
+            waitForFlush = null;
+        }
+
+        private void complete(long endOffset, CompletableFuture<Void> waitForFlush) {
+            this.endOffset = endOffset;
+            this.waitForFlush = waitForFlush;
+        }
+    }
+
+    /**
      * Validates and writes synchronously (per-chunk ordering and contiguity preserved); the
      * returned future completes when the append is durable per the chunk's ack policy —
      * immediately for ack-on-replicate, after a covering group-commit force for ack-on-fsync.
@@ -994,6 +1022,20 @@ public final class ChunkStore implements AutoCloseable {
     public CompletableFuture<AppendResult> appendAsync(
             StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset,
             ByteBuffer payload, int payloadCrc, boolean recoveryAppend) throws IOException {
+        AppendOutcome outcome = new AppendOutcome();
+        appendAsync(ns, id, epoch, baseOffset, durableOffset, payload, payloadCrc, recoveryAppend, outcome);
+        long end = outcome.endOffset();
+        CompletableFuture<Void> waitForFlush = outcome.waitForFlush();
+        if (waitForFlush == null) {
+            return CompletableFuture.completedFuture(new AppendResult(end));
+        }
+        return waitForFlush.thenApply(v -> new AppendResult(end));
+    }
+
+    public void appendAsync(
+            StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset,
+            ByteBuffer payload, int payloadCrc, boolean recoveryAppend, AppendOutcome outcome) throws IOException {
+        Objects.requireNonNull(outcome, "outcome").reset();
         Handle h = lookup(ns, id);
         // payloadCrc is the writer's CRC32C over this payload, already verified by the frame decoder;
         // the node stores it as the per-record digest and never originates its own (no node-side CRC
@@ -1024,7 +1066,8 @@ public final class ChunkStore implements AutoCloseable {
             h.lastKnownDO = Math.max(h.lastKnownDO, Math.min(durableOffset, h.end));
             len = payload.remaining();
             if (len == 0) {
-                return CompletableFuture.completedFuture(new AppendResult(h.end)); // DO beacon
+                outcome.complete(h.end, null); // DO beacon
+                return;
             }
             if (!recoveryAppend && h.ledger.size() >= csConfig.maxOpenChunkLedgerEntries()) {
                 throw new ScpException(ErrorCode.CHUNK_SEALED,
@@ -1063,10 +1106,10 @@ public final class ChunkStore implements AutoCloseable {
                     msBetween(tLock, tRunningCrc), msBetween(t0, tUnlock));
         }
         if (committer == null) {
-            return CompletableFuture.completedFuture(new AppendResult(newEnd));
+            outcome.complete(newEnd, null);
+            return;
         }
-        long end = newEnd;
-        return committer.awaitFlush(end).thenApply(v -> new AppendResult(end));
+        outcome.complete(newEnd, committer.awaitFlush(newEnd));
     }
 
     /** Convenience for tests/simple callers without a precomputed digest: computes it then delegates. */

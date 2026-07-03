@@ -18,6 +18,9 @@ import java.util.concurrent.CompletableFuture;
 
 /** Maps SCP data-plane opcodes onto the ChunkStore engine (tech design §10.3). */
 final class DataNodeHandlers implements ScpServer.Handler {
+    private static final ThreadLocal<ChunkStore.AppendOutcome> APPEND_OUTCOME =
+            ThreadLocal.withInitial(ChunkStore.AppendOutcome::new);
+
     private final ChunkStore store;
     private final DataNode node;
     private final ChunkDeleteService deletes;
@@ -62,13 +65,15 @@ final class DataNodeHandlers implements ScpServer.Handler {
             // covering group-commit force, while this connection keeps processing frames
             var m = Messages.Append.decodeFields(req);
             RequestContext.setNamespace(m.namespace().value());
-            CompletableFuture<ChunkStore.AppendResult> append =
-                    store.appendAsync(m.namespace(), m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
-                            req.payloadReadBuffer(), req.payloadCrc(), m.recovery());
-            if (append.isDone() && !append.isCompletedExceptionally()) {
-                return ScpServer.okU64(req, append.join().endOffset());
+            ChunkStore.AppendOutcome outcome = APPEND_OUTCOME.get();
+            store.appendAsync(m.namespace(), m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
+                    req.payloadReadBuffer(), req.payloadCrc(), m.recovery(), outcome);
+            long endOffset = outcome.endOffset();
+            CompletableFuture<Void> waitForFlush = outcome.waitForFlush();
+            if (waitForFlush == null) {
+                return ScpServer.okU64(req, endOffset);
             }
-            return append.thenApply(r -> ScpServer.okU64(req, r.endOffset()));
+            return waitForFlush.thenApply(ignored -> ScpServer.okU64(req, endOffset));
         }
         return CompletableFuture.completedFuture(handle(req));
     }
