@@ -76,17 +76,42 @@ final class NettyFrameCodec {
         }
     }
 
+    static ByteBuf encodeOkU64Response(ByteBufAllocator allocator, Frame req, long value) throws IOException {
+        int headerLen = Frame.OK_U64_HEADER_LENGTH;
+        int capacity = Integer.BYTES + FrameIO.checkedFrameLength(headerLen, 0);
+        ByteBuf out = allocator.ioBuffer(capacity, capacity);
+        boolean success = false;
+        try {
+            writePrefix(out, req.opcode(), req.apiVersion(), Frame.FLAG_RESPONSE, req.correlationId(),
+                    headerLen, 0, 0);
+            out.writeShort(0);
+            out.writeLong(value);
+            out.writeByte(0);
+            success = true;
+            return out;
+        } finally {
+            if (!success) {
+                out.release();
+            }
+        }
+    }
+
     private static void writePrefix(ByteBuf out, Frame f, int headerLen, int payloadLen,
                                     int payloadCrc, short flags) throws IOException {
+        writePrefix(out, f.opcode(), f.apiVersion(), flags, f.correlationId(), headerLen, payloadLen, payloadCrc);
+    }
+
+    private static void writePrefix(ByteBuf out, short opcode, short apiVersion, short flags, long correlationId,
+                                    int headerLen, int payloadLen, int payloadCrc) throws IOException {
         int frameLen = FrameIO.checkedFrameLength(headerLen, payloadLen);
 
         out.writeInt(frameLen);
         out.writeByte(Frame.MAGIC);
         out.writeByte(Frame.FRAME_VERSION);
-        out.writeShort(f.opcode());
-        out.writeShort(f.apiVersion());
+        out.writeShort(opcode);
+        out.writeShort(apiVersion);
         out.writeShort(flags);
-        out.writeLong(f.correlationId());
+        out.writeLong(correlationId);
         out.writeInt(payloadLen);
         out.writeInt(payloadCrc);
         out.writeShort(headerLen);

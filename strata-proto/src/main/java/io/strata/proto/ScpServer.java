@@ -53,6 +53,8 @@ public final class ScpServer implements AutoCloseable {
             EnvConfig.intEnv("STRATA_SCP_FRAME_TASK_POOL_SIZE", 256);
     private static final int MAX_POOLED_RESPONSE_WRITE_LISTENERS =
             EnvConfig.intEnv("STRATA_SCP_RESPONSE_WRITE_LISTENER_POOL_SIZE", 256);
+    private static final int MAX_POOLED_OK_U64_WRITE_TASKS =
+            EnvConfig.intEnv("STRATA_SCP_OK_U64_WRITE_TASK_POOL_SIZE", 256);
 
     /**
      * Handles one request frame; returns the response frame. Throw ScpException for protocol errors.
@@ -79,8 +81,8 @@ public final class ScpServer implements AutoCloseable {
 
         /**
          * Async dispatch result for handlers that can often complete synchronously. Return either a
-         * {@link Frame} for an immediate response or a {@code CompletableFuture<Frame>} when the ack
-         * must complete later.
+         * {@link Frame}, an {@link OkU64Response}, or a {@code CompletableFuture} that completes with
+         * one of those when the response must complete later.
          */
         default Object handleAsyncResult(Frame request) throws Exception {
             return handleAsync(request);
@@ -132,6 +134,28 @@ public final class ScpServer implements AutoCloseable {
                     return (request.opcode() & 0xFFFF) >= 0x0100 ? controlPlane : dataPlane;
                 }
             };
+        }
+    }
+
+    /**
+     * Lightweight success response for hot u64-ack paths. The server writes it directly as a small
+     * ByteBuf, avoiding a full {@link Frame} allocation for APPEND acknowledgements.
+     */
+    public static final class OkU64Response {
+        private final long value;
+        private final CompletableFuture<Void> waitFor;
+
+        private OkU64Response(long value, CompletableFuture<Void> waitFor) {
+            this.value = value;
+            this.waitFor = waitFor;
+        }
+
+        private long value() {
+            return value;
+        }
+
+        private CompletableFuture<Void> waitFor() {
+            return waitFor;
         }
     }
 
@@ -203,6 +227,7 @@ public final class ScpServer implements AutoCloseable {
         private final Set<Frame> inFlightAsyncRequests = ConcurrentHashMap.newKeySet();
         private final ArrayDeque<FrameTask> frameTasks = new ArrayDeque<>();
         private final ArrayDeque<ResponseWriteListener> responseWriteListeners = new ArrayDeque<>();
+        private final ArrayDeque<OkU64WriteTask> okU64WriteTasks = new ArrayDeque<>();
         private final AtomicInteger inflightRequests = new AtomicInteger();
         private final AtomicLong inflightBytes = new AtomicLong();
         private final AtomicBoolean connectionOpen = new AtomicBoolean(true);
@@ -374,8 +399,9 @@ public final class ScpServer implements AutoCloseable {
 
         private void handleRequest(ChannelHandlerContext ctx, Frame req) {
             long startNanos = System.nanoTime();
-            CompletableFuture<Frame> respF;
-            Frame immediateResp = null;
+            CompletableFuture<?> respF;
+            Object immediateResp = null;
+            OkU64Response deferredOkU64 = null;
             boolean handlerFailed = false;
             try {
                 if (handler.requiresAsyncHandling(req)) {
@@ -383,13 +409,23 @@ public final class ScpServer implements AutoCloseable {
                     if (result instanceof Frame frame) {
                         respF = null;
                         immediateResp = frame;
+                    } else if (result instanceof OkU64Response okU64) {
+                        if (okU64.waitFor() == null) {
+                            respF = null;
+                            immediateResp = okU64;
+                        } else {
+                            respF = okU64.waitFor();
+                            deferredOkU64 = okU64;
+                        }
                     } else if (result instanceof CompletableFuture<?> future) {
-                        @SuppressWarnings("unchecked")
-                        CompletableFuture<Frame> typed = (CompletableFuture<Frame>) future;
-                        respF = typed;
+                        respF = future;
+                    } else if (result == null) {
+                        respF = null;
+                        immediateResp = internalError(req, "handler returned null future");
+                        handlerFailed = true;
                     } else {
-                        respF = CompletableFuture.completedFuture(
-                                internalError(req, "handler returned null future"));
+                        respF = null;
+                        immediateResp = internalError(req, "handler returned unsupported async response");
                         handlerFailed = true;
                     }
                 } else {
@@ -416,12 +452,14 @@ public final class ScpServer implements AutoCloseable {
             String ns = RequestContext.takeNamespace();
             if (respF == null) {
                 observeRequest(req, startNanos, !handlerFailed, ns);
-                writeResponse(ctx, requireResponse(req, immediateResp), false, req);
+                writeResponseObject(ctx, req, requireResponse(req, immediateResp));
                 return;
             }
+            OkU64Response asyncOkU64 = deferredOkU64;
             if (respF.isDone() && !respF.isCompletedExceptionally()) {
                 observeRequest(req, startNanos, !handlerFailed, ns);
-                writeResponse(ctx, requireResponse(req, respF.join()), false, req); // fast path, no extra hop
+                writeResponseObject(ctx, req,
+                        requireResponse(req, asyncOkU64 != null ? asyncOkU64 : respF.join())); // fast path
             } else {
                 // Test seam: lets a test pause the request thread here to drive the close-vs-register
                 // race deterministically (connection closes after handleAsync returns but before the add).
@@ -434,15 +472,17 @@ public final class ScpServer implements AutoCloseable {
                         return;
                     }
                     observeRequest(req, startNanos, err == null, ns);
-                    Frame frame = resp;
                     if (err != null) {
                         Throwable cause = err instanceof CompletionException
                                 ? err.getCause() : err;
-                        frame = cause instanceof ScpException se
+                        Frame frame = cause instanceof ScpException se
                                 ? Frame.response(req, Resp.error(se.code(), se.getMessage(), se.detail(), se.leaderHint()), null)
                                 : Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(cause), 0), null);
+                        writeResponse(ctx, frame, false, req);
+                        return;
                     }
-                    writeResponse(ctx, requireResponse(req, frame), false, req);
+                    writeResponseObject(ctx, req,
+                            requireResponse(req, asyncOkU64 != null ? asyncOkU64 : resp));
                 });
                 // The connection can close between handleAsync returning and the add above; channelInactive
                 // would then drain inFlightAsyncRequests before req was in it, orphaning the request buffer.
@@ -478,6 +518,138 @@ public final class ScpServer implements AutoCloseable {
                 return;
             }
             writeUnreservedResponse(ctx, frame, closeAfterWrite, releaseAfterWrite);
+        }
+
+        private boolean reserveOutboundBytes(long frameBytes, Frame request) {
+            long bytes = inflightBytes.addAndGet(frameBytes);
+            if (bytes <= maxInflightBytes) {
+                request.reserveWireBytes(frameBytes);
+                return true;
+            }
+            inflightBytes.addAndGet(-frameBytes);
+            return false;
+        }
+
+        private void writeResponseObject(ChannelHandlerContext ctx, Frame req, Object response) {
+            if (response instanceof Frame frame) {
+                writeResponse(ctx, frame, false, req);
+                return;
+            }
+            if (response instanceof OkU64Response okU64) {
+                writeOkU64Response(ctx, req, okU64.value());
+                return;
+            }
+            writeResponse(ctx, internalError(req, "handler returned unsupported response"), false, req);
+        }
+
+        private void writeOkU64Response(ChannelHandlerContext ctx, Frame req, long value) {
+            if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
+                closeFrames(null, req);
+                return;
+            }
+            if (!reserveOutboundBytes(Frame.PREAMBLE_AFTER_LEN + Frame.OK_U64_HEADER_LENGTH, req)) {
+                writeUnreservedResponse(ctx, Frame.response(req,
+                        Resp.error(ErrorCode.THROTTLED, "too many in-flight response bytes", maxInflightBytes),
+                        null), true, req);
+                return;
+            }
+            if (ctx.channel().eventLoop().inEventLoop()) {
+                writeOkU64ResponseOnEventLoop(ctx, req, value);
+                return;
+            }
+            OkU64WriteTask task = okU64WriteTask(ctx, req, value);
+            try {
+                ctx.channel().eventLoop().execute(task);
+            } catch (RuntimeException e) {
+                task.closeRejected();
+                throw e;
+            }
+        }
+
+        private OkU64WriteTask okU64WriteTask(ChannelHandlerContext ctx, Frame req, long value) {
+            OkU64WriteTask task;
+            synchronized (okU64WriteTasks) {
+                task = okU64WriteTasks.pollFirst();
+            }
+            if (task == null) {
+                task = new OkU64WriteTask();
+            }
+            task.reset(ctx, req, value);
+            return task;
+        }
+
+        private void recycleOkU64WriteTask(OkU64WriteTask task) {
+            if (MAX_POOLED_OK_U64_WRITE_TASKS <= 0) {
+                return;
+            }
+            synchronized (okU64WriteTasks) {
+                if (okU64WriteTasks.size() < MAX_POOLED_OK_U64_WRITE_TASKS) {
+                    okU64WriteTasks.addFirst(task);
+                }
+            }
+        }
+
+        private final class OkU64WriteTask implements Runnable {
+            private ChannelHandlerContext ctx;
+            private Frame req;
+            private long value;
+
+            private void reset(ChannelHandlerContext ctx, Frame req, long value) {
+                this.ctx = ctx;
+                this.req = req;
+                this.value = value;
+            }
+
+            @Override
+            public void run() {
+                ChannelHandlerContext localCtx = ctx;
+                Frame localReq = req;
+                long localValue = value;
+                ctx = null;
+                req = null;
+                value = 0;
+                try {
+                    writeOkU64ResponseOnEventLoop(localCtx, localReq, localValue);
+                } finally {
+                    recycleOkU64WriteTask(this);
+                }
+            }
+
+            private void closeRejected() {
+                Frame localReq = req;
+                ctx = null;
+                req = null;
+                value = 0;
+                try {
+                    closeFrames(null, localReq);
+                } finally {
+                    recycleOkU64WriteTask(this);
+                }
+            }
+        }
+
+        private void writeOkU64ResponseOnEventLoop(ChannelHandlerContext ctx, Frame req, long value) {
+            if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
+                closeFrames(null, req);
+                return;
+            }
+            ByteBuf out;
+            try {
+                out = NettyFrameCodec.encodeOkU64Response(ctx.alloc(), req, value);
+            } catch (IOException | RuntimeException e) {
+                closeFrames(null, req);
+                ctx.close();
+                return;
+            }
+            ChannelFuture write;
+            try {
+                write = ctx.writeAndFlush(out);
+            } catch (RuntimeException e) {
+                out.release();
+                closeFrames(null, req);
+                throw e;
+            }
+            finishWrite(ctx, write, false, null, req);
         }
 
         private void writeUnreservedResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
@@ -603,7 +775,12 @@ public final class ScpServer implements AutoCloseable {
         }
 
         private void closeFrames(Frame frame, Frame releaseAfterWrite) {
-            frame.close();
+            if (frame != null) {
+                frame.close();
+            }
+            if (releaseAfterWrite == null) {
+                return;
+            }
             if (releaseAfterWrite != frame) {
                 releaseInbound(releaseAfterWrite);
                 releaseAfterWrite.close();
@@ -636,8 +813,8 @@ public final class ScpServer implements AutoCloseable {
         }
     }
 
-    private static Frame requireResponse(Frame req, Frame frame) {
-        return frame != null ? frame : internalError(req, "handler returned null response");
+    private static Object requireResponse(Frame req, Object response) {
+        return response != null ? response : internalError(req, "handler returned null response");
     }
 
     private static Frame internalError(Frame req, String message) {
@@ -652,6 +829,16 @@ public final class ScpServer implements AutoCloseable {
     /** Convenience for handlers: success response with one u64 field and no tagged fields. */
     public static Frame okU64(Frame req, long value) {
         return Frame.okU64Response(req, value);
+    }
+
+    /** Hot-path handler result: success response with one u64 field and no tagged fields. */
+    public static OkU64Response okU64Result(long value) {
+        return new OkU64Response(value, null);
+    }
+
+    /** Hot-path handler result: write the u64 success response after the supplied future completes. */
+    public static OkU64Response okU64Result(long value, CompletableFuture<Void> waitFor) {
+        return new OkU64Response(value, waitFor);
     }
 
     /** Convenience for handlers: success response that owns the materialized payload until write close. */

@@ -141,6 +141,59 @@ class ClientServerTest {
     }
 
     @Test
+    void directOkU64ResultWritesAppendCompatibleHeader() throws Exception {
+        AtomicReference<Frame> seenRequest = new AtomicReference<>();
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("async result path expected");
+            }
+
+            @Override
+            public Object handleAsyncResult(Frame request) {
+                seenRequest.set(request);
+                return ScpServer.okU64Result(42);
+            }
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "direct-u64")) {
+            ByteBuffer header = client.call(Opcode.APPEND, emptyHeader(), null, 2_000);
+            assertEquals(42, Messages.AppendResp.decode(header).endOffset());
+            waitFor(() -> seenRequest.get() != null && seenRequest.get().ownerRefCnt() == 0);
+        }
+    }
+
+    @Test
+    void deferredOkU64ResultWritesAfterFutureCompletes() throws Exception {
+        CompletableFuture<Void> flush = new CompletableFuture<>();
+        AtomicReference<Frame> seenRequest = new AtomicReference<>();
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("async result path expected");
+            }
+
+            @Override
+            public Object handleAsyncResult(Frame request) {
+                seenRequest.set(request);
+                return ScpServer.okU64Result(99, flush);
+            }
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "deferred-u64")) {
+            CompletableFuture<Frame> response = client.send(Opcode.APPEND, emptyHeader(), null);
+            assertFalse(response.isDone());
+
+            flush.complete(null);
+            Frame frame = response.get(2, TimeUnit.SECONDS);
+            ByteBuffer header = frame.headerSlice();
+            Resp.check(header);
+            assertEquals(99, Messages.AppendResp.decode(header).endOffset());
+            waitFor(() -> seenRequest.get() != null && seenRequest.get().ownerRefCnt() == 0);
+        }
+    }
+
+    @Test
     void managedConnectionHeartbeatsIdleHealthyConnection() throws Exception {
         AtomicInteger pings = new AtomicInteger();
         try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {

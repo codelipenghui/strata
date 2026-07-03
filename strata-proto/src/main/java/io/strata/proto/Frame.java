@@ -24,6 +24,7 @@ public final class Frame implements AutoCloseable {
     public static final int PREAMBLE_AFTER_LEN = 26;
 
     private static final ByteBuffer EMPTY = ByteBuffer.allocate(0).asReadOnlyBuffer();
+    static final int OK_U64_HEADER_LENGTH = Short.BYTES + Long.BYTES + 1;
     private static final byte HEADER_KIND_BUFFER = 0;
     private static final byte HEADER_KIND_OK_U64 = 1;
     private static final AtomicIntegerFieldUpdater<Frame> CLOSED =
@@ -232,7 +233,7 @@ public final class Frame implements AutoCloseable {
     }
 
     int headerLength() {
-        return hasOkU64Header() ? Short.BYTES + Long.BYTES + 1
+        return hasOkU64Header() ? OK_U64_HEADER_LENGTH
                 : owner != null ? ownerHeaderLen : headerBytes != null ? headerBytes.length : header.remaining();
     }
 

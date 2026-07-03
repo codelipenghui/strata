@@ -72,9 +72,9 @@ final class DataNodeHandlers implements ScpServer.Handler {
             long endOffset = outcome.endOffset();
             CompletableFuture<Void> waitForFlush = outcome.waitForFlush();
             if (waitForFlush == null) {
-                return ScpServer.okU64(req, endOffset);
+                return ScpServer.okU64Result(endOffset);
             }
-            return waitForFlush.thenApply(ignored -> ScpServer.okU64(req, endOffset));
+            return ScpServer.okU64Result(endOffset, waitForFlush);
         }
         return CompletableFuture.completedFuture(handle(req));
     }
