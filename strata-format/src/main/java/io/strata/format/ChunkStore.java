@@ -1287,8 +1287,7 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    private record OpenReadPlan(Path dataPath, NsChunkId nsKey, long firstEntryStart,
-                                ChunkFormats.LedgerEntry[] entries) {}
+    private record OpenReadPlan(Path dataPath, NsChunkId nsKey, IntegrityLedger.EntrySpan span) {}
 
     public ReadResult read(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
         try (ReadRegionResult r = readRegion(ns, id, offset, maxBytes, true)) {
@@ -1377,11 +1376,13 @@ public final class ChunkStore implements AutoCloseable {
             boolean success = false;
             try (FileChannel readChannel = FileChannel.open(dataPath, StandardOpenOption.READ)) {
                 requireCurrentHandle(h, nsKey, id);
-                readOpenVerified(readChannel, openReadPlan.firstEntryStart(), openReadPlan.entries(), id, offset, out.bytes());
+                IntegrityLedger.EntrySpan span = openReadPlan.span();
+                readOpenVerified(readChannel, span.firstStart(), span.rawEntries(), span.length(), id, offset, out.bytes());
                 countClientRead(ns, n);
                 success = true;
                 return ReadRegionResult.of(out, n, localEnd, lastKnownDO);
             } finally {
+                openReadPlan.span().clear();
                 if (!success) {
                     out.close();
                 }
@@ -1412,8 +1413,8 @@ public final class ChunkStore implements AutoCloseable {
         if (h.ledger == null) {
             throw new ScpException(ErrorCode.CORRUPT_CHUNK, "open chunk missing integrity ledger: " + h.id);
         }
-        IntegrityLedger.EntrySpan span = h.ledger.entriesCovering(offset, readEnd);
-        return new OpenReadPlan(h.dataPath, h.nsKey, span.firstStart(), span.entries());
+        IntegrityLedger.EntrySpan span = h.ledger.reusableEntriesCovering(offset, readEnd);
+        return new OpenReadPlan(h.dataPath, h.nsKey, span);
     }
 
     private void countClientRead(StrataNamespace ns, int n) {
@@ -2797,14 +2798,18 @@ public final class ChunkStore implements AutoCloseable {
             throw new ScpException(ErrorCode.CORRUPT_CHUNK, "open chunk missing integrity ledger: " + h.id);
         }
         long readEnd = checkedAdd(offset, out.length, "open read end");
-        IntegrityLedger.EntrySpan span = h.ledger.entriesCovering(offset, readEnd);
+        IntegrityLedger.EntrySpan span = h.ledger.reusableEntriesCovering(offset, readEnd);
         // This overload uses the handle's shared FileChannel for recovery/local reads. Server request
         // threads must not be interrupted with cancel(true): FileChannel is interruptible and may close.
-        readOpenVerified(h.data, span.firstStart(), span.entries(), h.id, offset, out);
+        try {
+            readOpenVerified(h.data, span.firstStart(), span.rawEntries(), span.length(), h.id, offset, out);
+        } finally {
+            span.clear();
+        }
     }
 
     private void readOpenVerified(FileChannel data, long firstEntryStart, ChunkFormats.LedgerEntry[] entries,
-                                  ChunkId id, long offset, byte[] out) throws IOException {
+                                  int entryCount, ChunkId id, long offset, byte[] out) throws IOException {
         if (out.length == 0) {
             return;
         }
@@ -2812,7 +2817,8 @@ public final class ChunkStore implements AutoCloseable {
         long entryStart = firstEntryStart;
         int copied = 0;
         ByteBuffer outView = ByteBuffer.wrap(out);
-        for (ChunkFormats.LedgerEntry e : entries) {
+        for (int i = 0; i < entryCount; i++) {
+            ChunkFormats.LedgerEntry e = entries[i];
             long entryEnd = e.endOffset();
             if (entryEnd <= entryStart) {
                 throw new ScpException(ErrorCode.CORRUPT_CHUNK,

@@ -7,6 +7,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static io.strata.format.ChunkFormats.LEDGER_ENTRY_SIZE;
@@ -17,6 +18,10 @@ import static io.strata.format.ChunkFormats.LEDGER_ENTRY_SIZE;
  * never parses payload bytes, even to recover. Deleted at seal.
  */
 public final class IntegrityLedger implements AutoCloseable {
+    private static final int INITIAL_REUSABLE_SPAN_ENTRIES = 64;
+    private static final ThreadLocal<ChunkFormats.LedgerEntry[]> REUSABLE_ENTRY_SPAN =
+            ThreadLocal.withInitial(() -> new ChunkFormats.LedgerEntry[INITIAL_REUSABLE_SPAN_ENTRIES]);
+
     private final FileChannel channel;
     private final List<ChunkFormats.LedgerEntry> entries; // in-memory mirror, ordered by endOffset
     // appends are single-threaded under the owning chunk's monitor, so one scratch buffer can be
@@ -85,13 +90,55 @@ public final class IntegrityLedger implements AutoCloseable {
         return List.copyOf(entries);
     }
 
-    public record EntrySpan(long firstStart, ChunkFormats.LedgerEntry[] entries) {}
+    public static final class EntrySpan {
+        private final long firstStart;
+        private final ChunkFormats.LedgerEntry[] entries;
+        private final int length;
+        private final boolean reusable;
+
+        private EntrySpan(long firstStart, ChunkFormats.LedgerEntry[] entries, int length, boolean reusable) {
+            this.firstStart = firstStart;
+            this.entries = entries;
+            this.length = length;
+            this.reusable = reusable;
+        }
+
+        public long firstStart() {
+            return firstStart;
+        }
+
+        public ChunkFormats.LedgerEntry[] entries() {
+            return entries.length == length ? entries : Arrays.copyOf(entries, length);
+        }
+
+        ChunkFormats.LedgerEntry[] rawEntries() {
+            return entries;
+        }
+
+        int length() {
+            return length;
+        }
+
+        void clear() {
+            if (reusable) {
+                Arrays.fill(entries, 0, length, null);
+            }
+        }
+    }
 
     /**
      * Returns the minimal ledger-entry span that covers [offset, readEnd). Entries are monotonic by
      * endOffset, so the first covering entry is found by binary search instead of scanning every append.
      */
     public EntrySpan entriesCovering(long offset, long readEnd) {
+        return entriesCovering(offset, readEnd, false);
+    }
+
+    EntrySpan reusableEntriesCovering(long offset, long readEnd) {
+        return entriesCovering(offset, readEnd, true);
+    }
+
+    private EntrySpan entriesCovering(long offset, long readEnd, boolean reusable) {
         int first = firstEntryEndingAfter(offset);
         long firstStart = first == 0 ? 0 : entries.get(first - 1).endOffset();
         int end = first;
@@ -102,12 +149,26 @@ public final class IntegrityLedger implements AutoCloseable {
                 break;
             }
         }
-        ChunkFormats.LedgerEntry[] out = new ChunkFormats.LedgerEntry[end - first];
+        int length = end - first;
+        ChunkFormats.LedgerEntry[] out = reusable ? reusableSpanArray(length) : new ChunkFormats.LedgerEntry[length];
         for (int i = first; i < end; i++) {
             ChunkFormats.LedgerEntry e = entries.get(i);
             out[i - first] = e;
         }
-        return new EntrySpan(firstStart, out);
+        return new EntrySpan(firstStart, out, length, reusable);
+    }
+
+    private static ChunkFormats.LedgerEntry[] reusableSpanArray(int length) {
+        ChunkFormats.LedgerEntry[] out = REUSABLE_ENTRY_SPAN.get();
+        if (out.length < length) {
+            int capacity = out.length;
+            while (capacity < length) {
+                capacity <<= 1;
+            }
+            out = new ChunkFormats.LedgerEntry[capacity];
+            REUSABLE_ENTRY_SPAN.set(out);
+        }
+        return out;
     }
 
     private int firstEntryEndingAfter(long offset) {
