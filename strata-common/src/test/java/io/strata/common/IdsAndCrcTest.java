@@ -4,6 +4,8 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
+import java.util.HashMap;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -53,6 +55,18 @@ class IdsAndCrcTest {
         assertTrue(firstChunk.compareTo(secondChunk) < 0);
         assertTrue(laterParentChunk.compareTo(secondChunk) > 0);
         assertEquals(0, firstChunk.compareTo(new ChunkId(first, 1)));
+    }
+
+    @Test
+    void namespaceChunkIdHashMatchesMapLookupContract() {
+        StrataNamespace namespace = StrataNamespace.of("tenant-a");
+        ChunkId chunkId = new ChunkId(FileId.of(42), 3);
+        NsChunkId key = new NsChunkId(namespace, chunkId);
+
+        assertEquals(key.hashCode(), NsChunkId.hash(namespace, chunkId));
+        Map<NsChunkId, String> map = new HashMap<>();
+        map.put(key, "present");
+        assertEquals("present", map.get(new NsChunkId(namespace, chunkId)));
     }
 
     @Test

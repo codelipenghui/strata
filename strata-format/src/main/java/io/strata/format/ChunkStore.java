@@ -85,6 +85,7 @@ public final class ChunkStore implements AutoCloseable {
 
     private static final int RECOVERY_FENCE_REQUIRED = Integer.MAX_VALUE;
     private static final byte[] EMPTY_READ_BYTES = new byte[0];
+    private static final ThreadLocal<LookupKey> LOOKUP_KEY = ThreadLocal.withInitial(LookupKey::new);
     private static final int READ_BUFFER_POOL_MAX_BYTES =
             EnvConfig.intEnv("STRATA_READ_BUFFER_POOL_MAX_BYTES", 1 << 20);
     private static final int READ_BUFFER_POOL_MAX_BUFFERS =
@@ -743,9 +744,41 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     private Handle lookup(StrataNamespace ns, ChunkId id) {
-        Handle h = chunks.get(new NsChunkId(ns, id));
+        Handle h = chunks.get(LOOKUP_KEY.get().set(ns, id));
         if (h == null) throw new ScpException(ErrorCode.CHUNK_NOT_FOUND, id.toString());
         return h;
+    }
+
+    private static final class LookupKey {
+        private StrataNamespace namespace;
+        private ChunkId chunkId;
+
+        private LookupKey set(StrataNamespace namespace, ChunkId chunkId) {
+            this.namespace = namespace;
+            this.chunkId = chunkId;
+            return this;
+        }
+
+        @Override
+        public int hashCode() {
+            return NsChunkId.hash(namespace, chunkId);
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (obj instanceof NsChunkId key) {
+                return Objects.equals(namespace, key.namespace())
+                        && Objects.equals(chunkId, key.chunkId());
+            }
+            if (obj instanceof LookupKey key) {
+                return Objects.equals(namespace, key.namespace)
+                        && Objects.equals(chunkId, key.chunkId);
+            }
+            return false;
+        }
     }
 
     private void reserveNewChunk(StrataNamespace ns, ChunkId id) {
