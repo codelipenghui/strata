@@ -50,6 +50,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
@@ -1268,9 +1269,11 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     private static final class ReadBufferPool {
+        private static final int MAX_BUCKETS = 32;
+
         private final int maxBufferBytes;
         private final int maxBuffers;
-        private final ConcurrentHashMap<Integer, ArrayDeque<byte[]>> buffers = new ConcurrentHashMap<>();
+        private final AtomicReferenceArray<Bucket> buckets = new AtomicReferenceArray<>(MAX_BUCKETS);
         private final AtomicInteger pooled = new AtomicInteger();
 
         private ReadBufferPool(int maxBufferBytes, int maxBuffers) {
@@ -1299,12 +1302,12 @@ public final class ChunkStore implements AutoCloseable {
         }
 
         private byte[] poll(int length) {
-            ArrayDeque<byte[]> queue = buffers.get(length);
-            if (queue == null) {
+            Bucket bucket = findBucket(length);
+            if (bucket == null) {
                 return null;
             }
-            synchronized (queue) {
-                byte[] bytes = queue.pollFirst();
+            synchronized (bucket.buffers) {
+                byte[] bytes = bucket.buffers.pollFirst();
                 if (bytes != null) {
                     pooled.decrementAndGet();
                 }
@@ -1325,14 +1328,58 @@ public final class ChunkStore implements AutoCloseable {
                     break;
                 }
             }
-            ArrayDeque<byte[]> queue = buffers.computeIfAbsent(bytes.length, ignored -> new ArrayDeque<>());
-            synchronized (queue) {
-                queue.addFirst(bytes);
+            Bucket bucket = bucketFor(bytes.length);
+            if (bucket == null) {
+                pooled.decrementAndGet();
+                return;
+            }
+            synchronized (bucket.buffers) {
+                bucket.buffers.addFirst(bytes);
             }
         }
 
         private boolean poolable(int length) {
             return length > 0 && length <= maxBufferBytes && maxBuffers > 0;
+        }
+
+        private Bucket findBucket(int length) {
+            for (int i = 0; i < buckets.length(); i++) {
+                Bucket bucket = buckets.get(i);
+                if (bucket != null && bucket.length == length) {
+                    return bucket;
+                }
+            }
+            return null;
+        }
+
+        private Bucket bucketFor(int length) {
+            Bucket existing = findBucket(length);
+            if (existing != null) {
+                return existing;
+            }
+            Bucket created = new Bucket(length);
+            for (int i = 0; i < buckets.length(); i++) {
+                Bucket bucket = buckets.get(i);
+                if (bucket != null) {
+                    if (bucket.length == length) {
+                        return bucket;
+                    }
+                    continue;
+                }
+                if (buckets.compareAndSet(i, null, created)) {
+                    return created;
+                }
+            }
+            return null;
+        }
+
+        private static final class Bucket {
+            private final int length;
+            private final ArrayDeque<byte[]> buffers = new ArrayDeque<>();
+
+            private Bucket(int length) {
+                this.length = length;
+            }
         }
     }
 
