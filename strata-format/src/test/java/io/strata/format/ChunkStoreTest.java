@@ -133,6 +133,22 @@ class ChunkStoreTest {
     }
 
     @Test
+    void primitiveReadPathFindsTheOpenChunk() throws Exception {
+        try (ChunkStore store = newStore()) {
+            store.open(TEST_NS, id, false, 1, 1718000000000L);
+            byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.append(TEST_NS, id, 1, payload.length, payload.length, ByteBuffer.allocate(0));
+
+            try (ChunkStore.ReadRegionResult result =
+                         store.readRegion(TEST_NS, id.fileId().id(), id.index(), 0, 1024)) {
+                assertEquals(payload.length, result.length());
+                assertArrayEquals(payload, result.bytes());
+            }
+        }
+    }
+
+    @Test
     void appendDoesNotAdvanceCallerPayloadPosition() throws Exception {
         try (ChunkStore store = newStore()) {
             store.open(TEST_NS, id, false, 1, 1718000000000L);

@@ -479,8 +479,57 @@ public final class Messages {
     }
 
     public record Read(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace) {
+        private static final ThreadLocal<ReadFields> FIELDS = ThreadLocal.withInitial(ReadFields::new);
+
         public Read {
             namespace = Objects.requireNonNull(namespace, "namespace");
+        }
+
+        public static final class ReadFields {
+            private ChunkId chunkId;
+            private long fileId;
+            private int chunkIndex;
+            private long offset;
+            private int maxBytes;
+            private StrataNamespace namespace;
+
+            private ReadFields set(long fileId, int chunkIndex, long offset, int maxBytes,
+                                   StrataNamespace namespace) {
+                this.chunkId = null;
+                this.fileId = fileId;
+                this.chunkIndex = chunkIndex;
+                this.offset = offset;
+                this.maxBytes = maxBytes;
+                this.namespace = namespace;
+                return this;
+            }
+
+            public ChunkId chunkId() {
+                if (chunkId == null) {
+                    chunkId = new ChunkId(new FileId(fileId), chunkIndex);
+                }
+                return chunkId;
+            }
+
+            public long fileId() {
+                return fileId;
+            }
+
+            public int chunkIndex() {
+                return chunkIndex;
+            }
+
+            public long offset() {
+                return offset;
+            }
+
+            public int maxBytes() {
+                return maxBytes;
+            }
+
+            public StrataNamespace namespace() {
+                return namespace;
+            }
         }
 
         public byte[] encode() {
@@ -490,10 +539,19 @@ public final class Messages {
         }
 
         public static Read decode(ByteBuffer b) {
-            Read m = new Read(ChunkId.readFrom(b), b.getLong(), b.getInt(),
-                    StrataNamespace.readFrom(b));
+            ReadFields fields = decodeFields(b);
+            return new Read(fields.chunkId(), fields.offset(), fields.maxBytes(), fields.namespace());
+        }
+
+        public static ReadFields decodeFields(ByteBuffer b) {
+            ReadFields fields = FIELDS.get();
+            long fileId = b.getLong();
+            int chunkIndex = b.getInt();
+            long offset = b.getLong();
+            int maxBytes = b.getInt();
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             TaggedFields.readFrom(b);
-            return m;
+            return fields.set(fileId, chunkIndex, offset, maxBytes, namespace);
         }
     }
 

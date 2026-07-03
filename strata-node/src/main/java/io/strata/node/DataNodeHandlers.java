@@ -106,17 +106,19 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case READ -> {
                 // Client read: open reads are bounded to the replica-known durable high watermark, and
                 // both open durable-prefix reads and sealed reads are CRC-verified before the response.
-                var m = Messages.Read.decode(req.headerReadBuffer());
+                var m = Messages.Read.decodeFields(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
-                yield readRegionResponse(req, store.readRegion(m.namespace(), m.chunkId(), m.offset(), m.maxBytes()));
+                yield readRegionResponse(req, store.readRegion(
+                        m.namespace(), m.fileId(), m.chunkIndex(), m.offset(), m.maxBytes()));
             }
 
             case READ_RECOVERY -> {
                 // Seal recovery reads the never-acked tail above the durable watermark (clamped away
                 // from client READs) to re-prove and re-replicate bytes a quorum still holds.
-                var m = Messages.Read.decode(req.headerReadBuffer());
+                var m = Messages.Read.decodeFields(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
-                yield readRegionResponse(req, store.readRegionForRecovery(m.namespace(), m.chunkId(), m.offset(), m.maxBytes()));
+                yield readRegionResponse(req, store.readRegionForRecovery(
+                        m.namespace(), m.fileId(), m.chunkIndex(), m.offset(), m.maxBytes()));
             }
 
             case FENCE -> {

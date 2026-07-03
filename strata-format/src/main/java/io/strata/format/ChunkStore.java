@@ -1339,13 +1339,18 @@ public final class ChunkStore implements AutoCloseable {
     private record OpenReadPlan(Path dataPath, NsChunkId nsKey, IntegrityLedger.EntrySpan span) {}
 
     public ReadResult read(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
-        try (ReadRegionResult r = readRegion(ns, id, offset, maxBytes, true)) {
+        try (ReadRegionResult r = readRegion0(ns, id, id.fileId().id(), id.index(), offset, maxBytes, true)) {
             return new ReadResult(r.bytes(), r.localEndOffset(), r.lastKnownDO());
         }
     }
 
     public ReadRegionResult readRegion(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
-        return readRegion(ns, id, offset, maxBytes, false);
+        return readRegion0(ns, id, id.fileId().id(), id.index(), offset, maxBytes, false);
+    }
+
+    public ReadRegionResult readRegion(StrataNamespace ns, long fileId, int chunkIndex, long offset, int maxBytes)
+            throws IOException {
+        return readRegion0(ns, null, fileId, chunkIndex, offset, maxBytes, false);
     }
 
     /**
@@ -1356,15 +1361,23 @@ public final class ChunkStore implements AutoCloseable {
      * still integrity-verified (open chunks against the ledger, sealed chunks against footer CRC
      * ranges), and the recovery path does not count toward client read throughput metrics.
      */
-    public ReadRegionResult readRegionForRecovery(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
-        return readRegion(ns, id, offset, maxBytes, true);
+    public ReadRegionResult readRegionForRecovery(StrataNamespace ns, ChunkId id, long offset, int maxBytes)
+            throws IOException {
+        return readRegion0(ns, id, id.fileId().id(), id.index(), offset, maxBytes, true);
     }
 
-    private ReadRegionResult readRegion(StrataNamespace ns, ChunkId id, long offset, int maxBytes,
-                                        boolean includeUndurableTail) throws IOException {
+    public ReadRegionResult readRegionForRecovery(StrataNamespace ns, long fileId, int chunkIndex,
+                                                  long offset, int maxBytes) throws IOException {
+        return readRegion0(ns, null, fileId, chunkIndex, offset, maxBytes, true);
+    }
+
+    private ReadRegionResult readRegion0(StrataNamespace ns, ChunkId requestedId, long fileId, int chunkIndex,
+                                         long offset, int maxBytes, boolean includeUndurableTail)
+            throws IOException {
         requireNonNegative(offset, "read offset");
         requireNonNegative(maxBytes, "read maxBytes");
-        Handle h = lookup(ns, id);
+        Handle h = requestedId != null ? lookup(ns, requestedId) : lookup(ns, fileId, chunkIndex);
+        ChunkId id = h.id;
         long localEnd;
         long lastKnownDO;
         int n;
