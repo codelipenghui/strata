@@ -72,6 +72,15 @@ public final class ScpServer implements AutoCloseable {
             return CompletableFuture.completedFuture(handle(request));
         }
 
+        /**
+         * Async dispatch result for handlers that can often complete synchronously. Return either a
+         * {@link Frame} for an immediate response or a {@code CompletableFuture<Frame>} when the ack
+         * must complete later.
+         */
+        default Object handleAsyncResult(Frame request) throws Exception {
+            return handleAsync(request);
+        }
+
         static Handler sync(Handler handler) {
             return new Handler() {
                 @Override
@@ -102,6 +111,11 @@ public final class ScpServer implements AutoCloseable {
                 @Override
                 public CompletableFuture<Frame> handleAsync(Frame request) throws Exception {
                     return pick(request).handleAsync(request);
+                }
+
+                @Override
+                public Object handleAsyncResult(Frame request) throws Exception {
+                    return pick(request).handleAsyncResult(request);
                 }
 
                 @Override
@@ -322,9 +336,17 @@ public final class ScpServer implements AutoCloseable {
             boolean handlerFailed = false;
             try {
                 if (handler.requiresAsyncHandling(req)) {
-                    respF = handler.handleAsync(req);
-                    if (respF == null) {
-                        respF = CompletableFuture.completedFuture(internalError(req, "handler returned null future"));
+                    Object result = handler.handleAsyncResult(req);
+                    if (result instanceof Frame frame) {
+                        respF = null;
+                        immediateResp = frame;
+                    } else if (result instanceof CompletableFuture<?> future) {
+                        @SuppressWarnings("unchecked")
+                        CompletableFuture<Frame> typed = (CompletableFuture<Frame>) future;
+                        respF = typed;
+                    } else {
+                        respF = CompletableFuture.completedFuture(
+                                internalError(req, "handler returned null future"));
                         handlerFailed = true;
                     }
                 } else {

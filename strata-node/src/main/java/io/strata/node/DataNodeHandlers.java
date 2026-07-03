@@ -36,6 +36,17 @@ final class DataNodeHandlers implements ScpServer.Handler {
 
     @Override
     public CompletableFuture<Frame> handleAsync(Frame req) throws Exception {
+        Object result = handleAsyncResult(req);
+        if (result instanceof Frame frame) {
+            return CompletableFuture.completedFuture(frame);
+        }
+        @SuppressWarnings("unchecked")
+        CompletableFuture<Frame> future = (CompletableFuture<Frame>) result;
+        return future;
+    }
+
+    @Override
+    public Object handleAsyncResult(Frame req) throws Exception {
         if (req.opcode() == Opcode.APPEND.code) {
             // The per-record digest is writer-origin: a non-empty append MUST carry the client's payload
             // CRC (FLAG_PAYLOAD_CRC), which the node stores verbatim as the ledger digest. Reject a
@@ -51,9 +62,13 @@ final class DataNodeHandlers implements ScpServer.Handler {
             // covering group-commit force, while this connection keeps processing frames
             var m = Messages.Append.decodeFields(req);
             RequestContext.setNamespace(m.namespace().value());
-            return store.appendAsync(m.namespace(), m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
-                            req.payloadReadBuffer(), req.payloadCrc(), m.recovery())
-                    .thenApply(r -> ScpServer.okU64(req, r.endOffset()));
+            CompletableFuture<ChunkStore.AppendResult> append =
+                    store.appendAsync(m.namespace(), m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
+                            req.payloadReadBuffer(), req.payloadCrc(), m.recovery());
+            if (append.isDone() && !append.isCompletedExceptionally()) {
+                return ScpServer.okU64(req, append.join().endOffset());
+            }
+            return append.thenApply(r -> ScpServer.okU64(req, r.endOffset()));
         }
         return CompletableFuture.completedFuture(handle(req));
     }
