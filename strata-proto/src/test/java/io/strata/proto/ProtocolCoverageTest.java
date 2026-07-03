@@ -2,6 +2,7 @@ package io.strata.proto;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.buffer.UnpooledByteBufAllocator;
 import io.strata.common.ChunkId;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
@@ -363,6 +364,20 @@ class ProtocolCoverageTest {
         assertEquals(Crc.of(borrowedBytes, 0, 3), decodedBytesResponse.payloadCrc());
         bytesResponse.close();
         assertTrue(bytesReleased.get());
+
+        ByteBuf directBytes = NettyFrameCodec.encodeBytesResponse(
+                UnpooledByteBufAllocator.DEFAULT, request, Messages.okHeader(), borrowedBytes, 3);
+        try {
+            byte[] directWire = new byte[directBytes.readableBytes()];
+            directBytes.readBytes(directWire);
+            Frame decodedDirectBytes = FrameIO.read(new DataInputStream(new ByteArrayInputStream(directWire)));
+            assertEquals(Crc.of(borrowedBytes, 0, 3), decodedDirectBytes.payloadCrc());
+            byte[] directPayload = new byte[decodedDirectBytes.payloadLength()];
+            decodedDirectBytes.payloadSlice().get(directPayload);
+            assertArrayEquals(new byte[]{1, 2, 3}, directPayload);
+        } finally {
+            directBytes.release();
+        }
 
         Frame nullHeader = Frame.request(Opcode.PING, null, null, 12);
         assertEquals(0, nullHeader.headerSlice().remaining());

@@ -70,12 +70,22 @@ final class DataNodeHandlers implements ScpServer.Handler {
             sink.okU64(outcome.endOffset(), outcome.waitForFlush());
             return;
         }
-        sink.future(CompletableFuture.completedFuture(handle(req)));
+        if (req.opcode() == Opcode.READ.code) {
+            readRegionResponse(req, readRegion(req, false), sink);
+            return;
+        }
+        if (req.opcode() == Opcode.READ_RECOVERY.code) {
+            readRegionResponse(req, readRegion(req, true), sink);
+            return;
+        }
+        sink.result(handle(req));
     }
 
     @Override
     public boolean requiresAsyncHandling(Frame req) {
-        return req.opcode() == Opcode.APPEND.code;
+        return req.opcode() == Opcode.APPEND.code
+                || req.opcode() == Opcode.READ.code
+                || req.opcode() == Opcode.READ_RECOVERY.code;
     }
 
     @Override
@@ -100,19 +110,13 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case READ -> {
                 // Client read: open reads are bounded to the replica-known durable high watermark, and
                 // both open durable-prefix reads and sealed reads are CRC-verified before the response.
-                var m = Messages.Read.decodeFields(req);
-                RequestContext.setNamespace(m.namespace().value());
-                yield readRegionResponse(req, store.readRegion(
-                        m.namespace(), m.fileId(), m.chunkIndex(), m.offset(), m.maxBytes()));
+                yield readRegionResponse(req, readRegion(req, false));
             }
 
             case READ_RECOVERY -> {
                 // Seal recovery reads the never-acked tail above the durable watermark (clamped away
                 // from client READs) to re-prove and re-replicate bytes a quorum still holds.
-                var m = Messages.Read.decodeFields(req);
-                RequestContext.setNamespace(m.namespace().value());
-                yield readRegionResponse(req, store.readRegionForRecovery(
-                        m.namespace(), m.fileId(), m.chunkIndex(), m.offset(), m.maxBytes()));
+                yield readRegionResponse(req, readRegion(req, true));
             }
 
             case FENCE -> {
@@ -221,6 +225,14 @@ final class DataNodeHandlers implements ScpServer.Handler {
         return outcome;
     }
 
+    private ChunkStore.ReadRegionResult readRegion(Frame req, boolean recovery) throws IOException {
+        var m = Messages.Read.decodeFields(req);
+        RequestContext.setNamespace(m.namespace().value());
+        return recovery
+                ? store.readRegionForRecovery(m.namespace(), m.fileId(), m.chunkIndex(), m.offset(), m.maxBytes())
+                : store.readRegion(m.namespace(), m.fileId(), m.chunkIndex(), m.offset(), m.maxBytes());
+    }
+
     /** Wire-encodes a verified, materialized {@link ChunkStore.ReadRegionResult}. */
     private static Frame readRegionResponse(Frame req, ChunkStore.ReadRegionResult r) {
         boolean success = false;
@@ -229,6 +241,20 @@ final class DataNodeHandlers implements ScpServer.Handler {
             Frame frame = ScpServer.okBytes(req, header, r.payloadBytes(), r.length(), r::close);
             success = true;
             return frame;
+        } finally {
+            if (!success) {
+                r.close();
+            }
+        }
+    }
+
+    /** Hands a verified, materialized read payload to the server's direct bytes response path. */
+    private static void readRegionResponse(Frame req, ChunkStore.ReadRegionResult r, ScpServer.ResponseSink sink) {
+        boolean success = false;
+        try {
+            byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
+            sink.bytes(header, r.payloadBytes(), r.length(), r::close);
+            success = true;
         } finally {
             if (!success) {
                 r.close();

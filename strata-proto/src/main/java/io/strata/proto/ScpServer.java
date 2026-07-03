@@ -155,11 +155,16 @@ public final class ScpServer implements AutoCloseable {
         private static final int FUTURE = 2;
         private static final int OK_U64 = 3;
         private static final int DEFERRED_OK_U64 = 4;
+        private static final int BYTES = 5;
 
         private int kind;
         private Object response;
         private CompletableFuture<?> future;
         private long okU64Value;
+        private byte[] header;
+        private byte[] payload;
+        private int payloadLen;
+        private Runnable payloadReleaser;
 
         private ResponseSink() {}
 
@@ -211,11 +216,32 @@ public final class ScpServer implements AutoCloseable {
             okU64Value = value;
         }
 
+        public void bytes(byte[] header, byte[] payload, int payloadLen, Runnable payloadReleaser) {
+            if (payloadLen < 0) {
+                throw new IllegalArgumentException("negative payload length: " + payloadLen);
+            }
+            if (payloadLen > 0 && (payload == null || payloadLen > payload.length)) {
+                throw new IllegalArgumentException("invalid payload length " + payloadLen);
+            }
+            kind = BYTES;
+            response = null;
+            future = null;
+            okU64Value = 0;
+            this.header = header;
+            this.payload = payload;
+            this.payloadLen = payloadLen;
+            this.payloadReleaser = payloadReleaser;
+        }
+
         private void reset() {
             kind = EMPTY;
             response = null;
             future = null;
             okU64Value = 0;
+            header = null;
+            payload = null;
+            payloadLen = 0;
+            payloadReleaser = null;
         }
     }
 
@@ -541,6 +567,11 @@ public final class ScpServer implements AutoCloseable {
             boolean deferredOkU64 = false;
             long deferredOkU64Value = 0;
             boolean handlerFailed = false;
+            boolean immediateBytes = false;
+            byte[] immediateHeader = null;
+            byte[] immediatePayload = null;
+            int immediatePayloadLen = 0;
+            Runnable immediatePayloadReleaser = null;
             try {
                 if (handler.requiresAsyncHandling(req)) {
                     responseSink.reset();
@@ -574,6 +605,14 @@ public final class ScpServer implements AutoCloseable {
                                 respF = responseSink.future;
                                 deferredOkU64 = true;
                                 deferredOkU64Value = responseSink.okU64Value;
+                            }
+                            case ResponseSink.BYTES -> {
+                                respF = null;
+                                immediateBytes = true;
+                                immediateHeader = responseSink.header;
+                                immediatePayload = responseSink.payload;
+                                immediatePayloadLen = responseSink.payloadLen;
+                                immediatePayloadReleaser = responseSink.payloadReleaser;
                             }
                             default -> {
                                 respF = null;
@@ -610,6 +649,11 @@ public final class ScpServer implements AutoCloseable {
                 observeRequest(req, startNanos, !handlerFailed, ns);
                 if (immediateOkU64) {
                     writeOkU64Response(ctx, req, immediateOkU64Value);
+                    return;
+                }
+                if (immediateBytes) {
+                    writeBytesResponse(ctx, req, immediateHeader, immediatePayload, immediatePayloadLen,
+                            immediatePayloadReleaser);
                     return;
                 }
                 writeResponseObject(ctx, req, requireResponse(req, immediateResp));
@@ -818,6 +862,78 @@ public final class ScpServer implements AutoCloseable {
             // OK_U64 responses own only the encoded ByteBuf now queued in Netty; the request payload
             // was consumed before this point, so no write listener is needed just to release it.
             closeFrames(null, req);
+        }
+
+        private void writeBytesResponse(ChannelHandlerContext ctx, Frame req, byte[] header, byte[] payload,
+                                        int payloadLen, Runnable payloadReleaser) {
+            long frameBytes;
+            try {
+                frameBytes = bytesResponseWireBytes(header, payload, payloadLen);
+            } catch (RuntimeException e) {
+                releasePayload(payloadReleaser);
+                closeFrames(null, req);
+                throw e;
+            }
+            if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
+                releasePayload(payloadReleaser);
+                closeFrames(null, req);
+                return;
+            }
+            if (!reserveOutboundBytes(frameBytes, req)) {
+                releasePayload(payloadReleaser);
+                writeUnreservedResponse(ctx, Frame.response(req,
+                        Resp.error(ErrorCode.THROTTLED, "too many in-flight response bytes", maxInflightBytes),
+                        null), true, req);
+                return;
+            }
+
+            ByteBuf out;
+            try {
+                out = NettyFrameCodec.encodeBytesResponse(ctx.alloc(), req, header, payload, payloadLen);
+            } catch (IOException | RuntimeException e) {
+                releasePayload(payloadReleaser);
+                closeFrames(null, req);
+                ctx.close();
+                return;
+            }
+            ChannelFuture write;
+            try {
+                write = ctx.writeAndFlush(out);
+            } catch (RuntimeException e) {
+                out.release();
+                releasePayload(payloadReleaser);
+                closeFrames(null, req);
+                throw e;
+            }
+            finishWrite(ctx, write, false, null, req);
+            releasePayload(payloadReleaser);
+        }
+
+        private long bytesResponseWireBytes(byte[] header, byte[] payload, int payloadLen) {
+            int headerLen = header == null ? 0 : header.length;
+            if (payloadLen < 0) {
+                throw new IllegalArgumentException("negative payload length: " + payloadLen);
+            }
+            if (payloadLen > 0 && (payload == null || payloadLen > payload.length)) {
+                throw new IllegalArgumentException("invalid payload length " + payloadLen);
+            }
+            try {
+                FrameIO.checkedFrameLength(headerLen, payloadLen);
+            } catch (IOException e) {
+                throw new IllegalArgumentException(e);
+            }
+            return Frame.PREAMBLE_AFTER_LEN + headerLen + (long) payloadLen;
+        }
+
+        private void releasePayload(Runnable payloadReleaser) {
+            if (payloadReleaser == null) {
+                return;
+            }
+            try {
+                payloadReleaser.run();
+            } catch (RuntimeException e) {
+                log.warn("response payload release failed", e);
+            }
         }
 
         private void writeUnreservedResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
