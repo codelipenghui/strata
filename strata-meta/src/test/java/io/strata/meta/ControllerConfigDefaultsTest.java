@@ -38,6 +38,8 @@ class ControllerConfigDefaultsTest {
         assertEquals("zk", c.metadataBackendConfig().backend());
         assertEquals(ControllerConfig.DEFAULT_NAMESPACE_LOG_RETENTION_MS,
                 c.metadataBackendConfig().namespaceLogRetentionMs());
+        assertEquals(ControllerConfig.DEFAULT_NAMESPACE_LOG_CHUNK_ROLL_BYTES,
+                c.metadataBackendConfig().namespaceLogChunkRollBytes());
     }
 
     @Test
@@ -58,6 +60,8 @@ class ControllerConfigDefaultsTest {
         assertEquals(2, c.metadataBackendConfig().namespaceLogAckQuorum());
         assertEquals(ControllerConfig.DEFAULT_NAMESPACE_LOG_RETENTION_MS,
                 c.metadataBackendConfig().namespaceLogRetentionMs());
+        assertEquals(ControllerConfig.DEFAULT_NAMESPACE_LOG_CHUNK_ROLL_BYTES,
+                c.metadataBackendConfig().namespaceLogChunkRollBytes());
     }
 
     @Test
@@ -69,7 +73,11 @@ class ControllerConfigDefaultsTest {
         assertThrows(IllegalArgumentException.class, () -> base.withZkRetryMaxRetries(-1));
         assertThrows(IllegalArgumentException.class, () -> base.withMetadataBackend(
                 new ControllerConfig.MetadataBackendConfig("namespace-log", 2, 3, false,
-                        4 * 1024 * 1024, 30_000, true, 0, 4 * 1024 * 1024)));
+                        4 * 1024 * 1024, 30_000, true, 0, 4 * 1024 * 1024,
+                        ControllerConfig.DEFAULT_NAMESPACE_LOG_CHUNK_ROLL_BYTES)));
+        assertThrows(IllegalArgumentException.class,
+                () -> base.withMetadataBackend(ControllerConfig.MetadataBackendConfig.namespaceLog()
+                        .withNamespaceLogChunkRollBytes(0)));
         // 0 retries is valid (means no retry)
         assertDoesNotThrow(() -> base.withZkRetryMaxRetries(0));
         assertEquals(0, base.withZkRetryMaxRetries(0).zkRetryMaxRetries());

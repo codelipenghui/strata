@@ -478,8 +478,10 @@ class ChaosTest {
                         "recovery sealed " + recovered.sealedLength()
                                 + " below acked " + workload.ackedBytes());
                 workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
-                ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
+                Messages.LookupFileResp sealed = ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                         recovered.sealedLength());
+                ConsistencyVerifier.assertAckedPrefixReadsAtChunkOffsets(
+                        client, fileId, sealed, workload.expectedBytes());
             }
         }
     }
@@ -518,8 +520,10 @@ class ChaosTest {
                         "recovery sealed " + recovered.sealedLength()
                                 + " below acked " + workload.ackedBytes());
                 workload.verifyAckedPrefix(client, StrataNamespace.of("test"), fileId);
-                ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
+                Messages.LookupFileResp sealed = ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                         recovered.sealedLength());
+                ConsistencyVerifier.assertAckedPrefixReadsAtChunkOffsets(
+                        client, fileId, sealed, workload.expectedBytes());
             }
         }
     }

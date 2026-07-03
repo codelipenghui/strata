@@ -209,10 +209,11 @@ public final class Controller implements AutoCloseable {
         // generation. 0 disables the window: superseded generations are reclaimed on the next sweep.
         int retentionMs = backend.namespaceLogRetentionMs();
         int readChunkBytes = backend.namespaceLogReadChunkBytes();
+        long chunkRollBytes = backend.namespaceLogChunkRollBytes();
         return (root, endpoint) -> {
             NamespaceLogBackend logBackend = new NamespaceLogBackend(root,
                     new StrataSystemMetadataFileStore(() -> endpoint, replicationFactor, ackQuorum, logFsync,
-                            readChunkBytes), true);
+                            readChunkBytes, chunkRollBytes), true);
             logBackend.setLogRetentionMs(retentionMs);
             logBackend.startBackgroundCompaction(compactBytes, compactIntervalMs, orphanGc);
             return new NamespaceLogMetadataStore(logBackend);
