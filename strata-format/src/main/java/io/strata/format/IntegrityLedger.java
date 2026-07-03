@@ -1,5 +1,7 @@
 package io.strata.format;
 
+import io.strata.common.Crc;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -18,25 +20,39 @@ import static io.strata.format.ChunkFormats.LEDGER_ENTRY_SIZE;
  * never parses payload bytes, even to recover. Deleted at seal.
  */
 public final class IntegrityLedger implements AutoCloseable {
+    private static final int INITIAL_ENTRIES = 1024;
     private static final int INITIAL_REUSABLE_SPAN_ENTRIES = 64;
-    private static final ThreadLocal<ChunkFormats.LedgerEntry[]> REUSABLE_ENTRY_SPAN =
-            ThreadLocal.withInitial(() -> new ChunkFormats.LedgerEntry[INITIAL_REUSABLE_SPAN_ENTRIES]);
+    private static final ThreadLocal<EntryScratch> REUSABLE_ENTRY_SPAN =
+            ThreadLocal.withInitial(() -> new EntryScratch(INITIAL_REUSABLE_SPAN_ENTRIES));
 
     private final FileChannel channel;
-    private final List<ChunkFormats.LedgerEntry> entries; // in-memory mirror, ordered by endOffset
+    // In-memory mirror, ordered by endOffset. Kept as primitives so the append hot path does not
+    // allocate one LedgerEntry record per write; public APIs materialize objects only at boundaries.
+    private long[] endOffsets;
+    private int[] payloadCrcs;
+    private int[] writeEpochs;
+    private int size;
     // appends are single-threaded under the owning chunk's monitor, so one scratch buffer can be
     // reused for every entry encode instead of allocating a byte[] + two wrappers per record
     private final ByteBuffer scratch = ByteBuffer.allocate(LEDGER_ENTRY_SIZE);
 
-    private IntegrityLedger(FileChannel channel, List<ChunkFormats.LedgerEntry> entries) {
+    private IntegrityLedger(FileChannel channel) {
+        this(channel, new long[INITIAL_ENTRIES], new int[INITIAL_ENTRIES], new int[INITIAL_ENTRIES], 0);
+    }
+
+    private IntegrityLedger(FileChannel channel, long[] endOffsets, int[] payloadCrcs, int[] writeEpochs,
+                            int size) {
         this.channel = channel;
-        this.entries = entries;
+        this.endOffsets = endOffsets;
+        this.payloadCrcs = payloadCrcs;
+        this.writeEpochs = writeEpochs;
+        this.size = size;
     }
 
     public static IntegrityLedger create(Path path) throws IOException {
         FileChannel ch = FileChannel.open(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE,
                 StandardOpenOption.READ);
-        return new IntegrityLedger(ch, new ArrayList<>());
+        return new IntegrityLedger(ch);
     }
 
     /**
@@ -45,7 +61,7 @@ public final class IntegrityLedger implements AutoCloseable {
      * for a chunk that must recover its integrity ledger after a crash.
      */
     public static IntegrityLedger memory() {
-        return new IntegrityLedger(null, new ArrayList<>());
+        return new IntegrityLedger(null);
     }
 
     /**
@@ -56,28 +72,43 @@ public final class IntegrityLedger implements AutoCloseable {
         FileChannel ch = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
                 StandardOpenOption.READ);
         byte[] all = Files.readAllBytes(path);
-        List<ChunkFormats.LedgerEntry> valid = new ArrayList<>();
         int fullEntries = all.length / LEDGER_ENTRY_SIZE;
+        int capacity = Math.max(INITIAL_ENTRIES, fullEntries);
+        long[] endOffsets = new long[capacity];
+        int[] payloadCrcs = new int[capacity];
+        int[] writeEpochs = new int[capacity];
+        int size = 0;
         long prevEnd = 0;
         for (int i = 0; i < fullEntries; i++) {
             ChunkFormats.LedgerEntry e = ChunkFormats.LedgerEntry.decodeOrNull(all, i * LEDGER_ENTRY_SIZE);
             if (e == null || e.endOffset() <= prevEnd) break;
-            valid.add(e);
+            endOffsets[size] = e.endOffset();
+            payloadCrcs[size] = e.payloadCrc();
+            writeEpochs[size] = e.writeEpoch();
+            size++;
             prevEnd = e.endOffset();
         }
-        ch.truncate((long) valid.size() * LEDGER_ENTRY_SIZE);
+        ch.truncate((long) size * LEDGER_ENTRY_SIZE);
         ch.position(ch.size());
-        return new IntegrityLedger(ch, valid);
+        return new IntegrityLedger(ch, endOffsets, payloadCrcs, writeEpochs, size);
     }
 
     public void append(ChunkFormats.LedgerEntry entry) throws IOException {
+        append(entry.endOffset(), entry.payloadCrc(), entry.writeEpoch());
+    }
+
+    public void append(long endOffset, int payloadCrc, int writeEpoch) throws IOException {
+        ensureCapacity(size + 1);
         if (channel != null) {
             scratch.clear();
-            entry.encodeInto(scratch);
+            encodeInto(scratch, endOffset, payloadCrc, writeEpoch);
             scratch.flip();
-            ChunkFormats.writeFully(channel, scratch, (long) entries.size() * LEDGER_ENTRY_SIZE);
+            ChunkFormats.writeFully(channel, scratch, (long) size * LEDGER_ENTRY_SIZE);
         }
-        entries.add(entry);
+        endOffsets[size] = endOffset;
+        payloadCrcs[size] = payloadCrc;
+        writeEpochs[size] = writeEpoch;
+        size++;
     }
 
     public void force() throws IOException {
@@ -87,20 +118,33 @@ public final class IntegrityLedger implements AutoCloseable {
     }
 
     public List<ChunkFormats.LedgerEntry> entries() {
-        return List.copyOf(entries);
+        List<ChunkFormats.LedgerEntry> out = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            out.add(entryAt(i));
+        }
+        return List.copyOf(out);
     }
 
     public static final class EntrySpan {
-        private final long firstStart;
-        private final ChunkFormats.LedgerEntry[] entries;
-        private final int length;
-        private final boolean reusable;
+        private long firstStart;
+        private long[] endOffsets;
+        private int[] payloadCrcs;
+        private int[] writeEpochs;
+        private int length;
+        private boolean reusable;
 
-        private EntrySpan(long firstStart, ChunkFormats.LedgerEntry[] entries, int length, boolean reusable) {
+        private EntrySpan() {
+        }
+
+        private EntrySpan reset(long firstStart, long[] endOffsets, int[] payloadCrcs, int[] writeEpochs,
+                                int length, boolean reusable) {
             this.firstStart = firstStart;
-            this.entries = entries;
+            this.endOffsets = endOffsets;
+            this.payloadCrcs = payloadCrcs;
+            this.writeEpochs = writeEpochs;
             this.length = length;
             this.reusable = reusable;
+            return this;
         }
 
         public long firstStart() {
@@ -108,11 +152,19 @@ public final class IntegrityLedger implements AutoCloseable {
         }
 
         public ChunkFormats.LedgerEntry[] entries() {
-            return entries.length == length ? entries : Arrays.copyOf(entries, length);
+            ChunkFormats.LedgerEntry[] out = new ChunkFormats.LedgerEntry[length];
+            for (int i = 0; i < length; i++) {
+                out[i] = new ChunkFormats.LedgerEntry(endOffsets[i], payloadCrcs[i], writeEpochs[i]);
+            }
+            return out;
         }
 
-        ChunkFormats.LedgerEntry[] rawEntries() {
-            return entries;
+        long endOffset(int index) {
+            return endOffsets[index];
+        }
+
+        int payloadCrc(int index) {
+            return payloadCrcs[index];
         }
 
         int length() {
@@ -121,7 +173,9 @@ public final class IntegrityLedger implements AutoCloseable {
 
         void clear() {
             if (reusable) {
-                Arrays.fill(entries, 0, length, null);
+                Arrays.fill(endOffsets, 0, length, 0);
+                Arrays.fill(payloadCrcs, 0, length, 0);
+                Arrays.fill(writeEpochs, 0, length, 0);
             }
         }
     }
@@ -140,43 +194,45 @@ public final class IntegrityLedger implements AutoCloseable {
 
     private EntrySpan entriesCovering(long offset, long readEnd, boolean reusable) {
         int first = firstEntryEndingAfter(offset);
-        long firstStart = first == 0 ? 0 : entries.get(first - 1).endOffset();
+        long firstStart = first == 0 ? 0 : endOffsets[first - 1];
         int end = first;
-        for (; end < entries.size(); end++) {
-            ChunkFormats.LedgerEntry e = entries.get(end);
-            if (e.endOffset() >= readEnd) {
+        for (; end < size; end++) {
+            if (endOffsets[end] >= readEnd) {
                 end++;
                 break;
             }
         }
         int length = end - first;
-        ChunkFormats.LedgerEntry[] out = reusable ? reusableSpanArray(length) : new ChunkFormats.LedgerEntry[length];
-        for (int i = first; i < end; i++) {
-            ChunkFormats.LedgerEntry e = entries.get(i);
-            out[i - first] = e;
+        if (reusable) {
+            EntryScratch scratch = reusableSpanScratch(length);
+            copyEntries(first, length, scratch.endOffsets, scratch.payloadCrcs, scratch.writeEpochs);
+            return scratch.span.reset(firstStart, scratch.endOffsets, scratch.payloadCrcs, scratch.writeEpochs,
+                    length, true);
         }
-        return new EntrySpan(firstStart, out, length, reusable);
+        long[] ends = Arrays.copyOfRange(endOffsets, first, end);
+        int[] crcs = Arrays.copyOfRange(payloadCrcs, first, end);
+        int[] epochs = Arrays.copyOfRange(writeEpochs, first, end);
+        return new EntrySpan().reset(firstStart, ends, crcs, epochs, length, false);
     }
 
-    private static ChunkFormats.LedgerEntry[] reusableSpanArray(int length) {
-        ChunkFormats.LedgerEntry[] out = REUSABLE_ENTRY_SPAN.get();
-        if (out.length < length) {
-            int capacity = out.length;
-            while (capacity < length) {
-                capacity <<= 1;
-            }
-            out = new ChunkFormats.LedgerEntry[capacity];
-            REUSABLE_ENTRY_SPAN.set(out);
-        }
-        return out;
+    private void copyEntries(int first, int length, long[] ends, int[] crcs, int[] epochs) {
+        System.arraycopy(endOffsets, first, ends, 0, length);
+        System.arraycopy(payloadCrcs, first, crcs, 0, length);
+        System.arraycopy(writeEpochs, first, epochs, 0, length);
+    }
+
+    private static EntryScratch reusableSpanScratch(int length) {
+        EntryScratch scratch = REUSABLE_ENTRY_SPAN.get();
+        scratch.ensureCapacity(length);
+        return scratch;
     }
 
     private int firstEntryEndingAfter(long offset) {
         int lo = 0;
-        int hi = entries.size();
+        int hi = size;
         while (lo < hi) {
             int mid = (lo + hi) >>> 1;
-            if (entries.get(mid).endOffset() > offset) {
+            if (endOffsets[mid] > offset) {
                 hi = mid;
             } else {
                 lo = mid + 1;
@@ -186,30 +242,45 @@ public final class IntegrityLedger implements AutoCloseable {
     }
 
     public int size() {
-        return entries.size();
+        return size;
     }
 
     public long lastEndOffset() {
-        return entries.isEmpty() ? 0 : entries.get(entries.size() - 1).endOffset();
+        return size == 0 ? 0 : endOffsets[size - 1];
     }
 
     /** Entries with endOffset > fromOffset, in order. */
     public List<ChunkFormats.LedgerEntry> entriesAfter(long fromOffset) {
         List<ChunkFormats.LedgerEntry> out = new ArrayList<>();
-        for (ChunkFormats.LedgerEntry e : entries) {
-            if (e.endOffset() > fromOffset) out.add(e);
+        for (int i = 0; i < size; i++) {
+            if (endOffsets[i] > fromOffset) out.add(entryAt(i));
         }
         return out;
+    }
+
+    int entriesThrough(long endOffset) {
+        int count = 0;
+        while (count < size && endOffsets[count] <= endOffset) {
+            count++;
+        }
+        return count;
+    }
+
+    long endOffsetAt(int index) {
+        return endOffsets[index];
     }
 
     /** Truncates the ledger so the last entry's endOffset is <= newEnd. */
     public void truncateTo(long newEnd) throws IOException {
         int keep = 0;
-        for (ChunkFormats.LedgerEntry e : entries) {
-            if (e.endOffset() <= newEnd) keep++;
+        for (int i = 0; i < size; i++) {
+            if (endOffsets[i] <= newEnd) keep++;
             else break;
         }
-        while (entries.size() > keep) entries.remove(entries.size() - 1);
+        Arrays.fill(endOffsets, keep, size, 0);
+        Arrays.fill(payloadCrcs, keep, size, 0);
+        Arrays.fill(writeEpochs, keep, size, 0);
+        size = keep;
         if (channel != null) {
             channel.truncate((long) keep * LEDGER_ENTRY_SIZE);
         }
@@ -219,6 +290,55 @@ public final class IntegrityLedger implements AutoCloseable {
     public void close() throws IOException {
         if (channel != null) {
             channel.close();
+        }
+    }
+
+    private ChunkFormats.LedgerEntry entryAt(int index) {
+        return new ChunkFormats.LedgerEntry(endOffsets[index], payloadCrcs[index], writeEpochs[index]);
+    }
+
+    private void ensureCapacity(int minCapacity) {
+        if (endOffsets.length >= minCapacity) {
+            return;
+        }
+        int capacity = endOffsets.length;
+        while (capacity < minCapacity) {
+            capacity <<= 1;
+        }
+        endOffsets = Arrays.copyOf(endOffsets, capacity);
+        payloadCrcs = Arrays.copyOf(payloadCrcs, capacity);
+        writeEpochs = Arrays.copyOf(writeEpochs, capacity);
+    }
+
+    private static void encodeInto(ByteBuffer b, long endOffset, int payloadCrc, int writeEpoch) {
+        int start = b.position();
+        b.putLong(endOffset).putInt(payloadCrc).putInt(writeEpoch).putInt(0);
+        b.putInt(Crc.of(b.array(), b.arrayOffset() + start, LEDGER_ENTRY_SIZE - 4));
+    }
+
+    private static final class EntryScratch {
+        private long[] endOffsets;
+        private int[] payloadCrcs;
+        private int[] writeEpochs;
+        private final EntrySpan span = new EntrySpan();
+
+        private EntryScratch(int capacity) {
+            this.endOffsets = new long[capacity];
+            this.payloadCrcs = new int[capacity];
+            this.writeEpochs = new int[capacity];
+        }
+
+        private void ensureCapacity(int minCapacity) {
+            if (endOffsets.length >= minCapacity) {
+                return;
+            }
+            int capacity = endOffsets.length;
+            while (capacity < minCapacity) {
+                capacity <<= 1;
+            }
+            endOffsets = new long[capacity];
+            payloadCrcs = new int[capacity];
+            writeEpochs = new int[capacity];
         }
     }
 }

@@ -2,9 +2,9 @@ package io.strata.format;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class IntegrityLedgerTest {
@@ -20,16 +20,28 @@ class IntegrityLedgerTest {
 
             IntegrityLedger.EntrySpan span = ledger.reusableEntriesCovering(0, 3);
             assertEquals(3, span.length());
-            assertEquals(3, span.entries().length);
-            assertTrue(span.rawEntries().length >= 3);
-            assertSame(first, span.rawEntries()[0]);
-            assertSame(second, span.rawEntries()[1]);
-            assertSame(third, span.rawEntries()[2]);
+            ChunkFormats.LedgerEntry[] entries = span.entries();
+            assertEquals(3, entries.length);
+            assertEquals(first, entries[0]);
+            assertEquals(second, entries[1]);
+            assertEquals(third, entries[2]);
+            assertEquals(1, span.endOffset(0));
+            assertEquals(22, span.payloadCrc(1));
 
             span.clear();
-            assertNull(span.rawEntries()[0]);
-            assertNull(span.rawEntries()[1]);
-            assertNull(span.rawEntries()[2]);
+            assertEquals(0, span.endOffset(0));
+            assertEquals(0, span.payloadCrc(1));
+        }
+    }
+
+    @Test
+    void primitiveAppendPreservesPublicEntries() throws Exception {
+        try (IntegrityLedger ledger = IntegrityLedger.memory()) {
+            ledger.append(10, 123, 2);
+
+            assertEquals(1, ledger.size());
+            assertEquals(10, ledger.lastEndOffset());
+            assertEquals(List.of(new ChunkFormats.LedgerEntry(10, 123, 2)), ledger.entries());
         }
     }
 }

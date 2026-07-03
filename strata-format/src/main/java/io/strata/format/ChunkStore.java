@@ -1079,7 +1079,7 @@ public final class ChunkStore implements AutoCloseable {
             long writePos = checkedAdd(DATA_START, baseOffset, "chunk file offset");
             writeFullyPreservingPosition(h.data, payload, writePos);
             tWrite = System.nanoTime();
-            h.ledger.append(new ChunkFormats.LedgerEntry(newEnd, payloadCrc, epoch));
+            h.ledger.append(newEnd, payloadCrc, epoch);
             tLedger = System.nanoTime();
             // Fold into the running whole + range CRCs ONLY after the data + ledger writes commit: a
             // throwing ledger.append must leave the accumulators (and h.end) untouched, or a same-offset
@@ -1377,7 +1377,7 @@ public final class ChunkStore implements AutoCloseable {
             try (FileChannel readChannel = FileChannel.open(dataPath, StandardOpenOption.READ)) {
                 requireCurrentHandle(h, nsKey, id);
                 IntegrityLedger.EntrySpan span = openReadPlan.span();
-                readOpenVerified(readChannel, span.firstStart(), span.rawEntries(), span.length(), id, offset, out.bytes());
+                readOpenVerified(readChannel, span, id, offset, out.bytes());
                 countClientRead(ns, n);
                 success = true;
                 return ReadRegionResult.of(out, n, localEnd, lastKnownDO);
@@ -1678,13 +1678,8 @@ public final class ChunkStore implements AutoCloseable {
     private record CallerSections(int count, byte[] bytes) {}
 
     private static int ledgerEntriesThroughSeal(IntegrityLedger ledger, long endOffset) {
-        int count = 0;
-        long lastEnd = 0;
-        for (ChunkFormats.LedgerEntry e : ledger.entries()) {
-            if (e.endOffset() > endOffset) break;
-            count++;
-            lastEnd = e.endOffset();
-        }
+        int count = ledger.entriesThrough(endOffset);
+        long lastEnd = count == 0 ? 0 : ledger.endOffsetAt(count - 1);
         if (endOffset > lastEnd) {
             count++;
         }
@@ -1701,7 +1696,7 @@ public final class ChunkStore implements AutoCloseable {
                     "seal ledger boundary beyond data length: " + ledgerEnd + " > " + dataLength);
         }
         int crc = crcDataRange(h.data, ledgerEnd, dataLength);
-        h.ledger.append(new ChunkFormats.LedgerEntry(dataLength, crc, h.writeEpoch));
+        h.ledger.append(dataLength, crc, h.writeEpoch);
         // Keep this force even for sealFsync=true: until deleteLedgerDurably completes, recovery can
         // still see the retained ledger beside a durable trailer and needs the boundary to classify it.
         h.ledger.force();
@@ -2802,24 +2797,23 @@ public final class ChunkStore implements AutoCloseable {
         // This overload uses the handle's shared FileChannel for recovery/local reads. Server request
         // threads must not be interrupted with cancel(true): FileChannel is interruptible and may close.
         try {
-            readOpenVerified(h.data, span.firstStart(), span.rawEntries(), span.length(), h.id, offset, out);
+            readOpenVerified(h.data, span, h.id, offset, out);
         } finally {
             span.clear();
         }
     }
 
-    private void readOpenVerified(FileChannel data, long firstEntryStart, ChunkFormats.LedgerEntry[] entries,
-                                  int entryCount, ChunkId id, long offset, byte[] out) throws IOException {
+    private void readOpenVerified(FileChannel data, IntegrityLedger.EntrySpan span, ChunkId id, long offset,
+                                  byte[] out) throws IOException {
         if (out.length == 0) {
             return;
         }
         long readEnd = checkedAdd(offset, out.length, "open read end");
-        long entryStart = firstEntryStart;
+        long entryStart = span.firstStart();
         int copied = 0;
         ByteBuffer outView = ByteBuffer.wrap(out);
-        for (int i = 0; i < entryCount; i++) {
-            ChunkFormats.LedgerEntry e = entries[i];
-            long entryEnd = e.endOffset();
+        for (int i = 0; i < span.length(); i++) {
+            long entryEnd = span.endOffset(i);
             if (entryEnd <= entryStart) {
                 throw new ScpException(ErrorCode.CORRUPT_CHUNK,
                         "non-increasing ledger entry for " + id + ": " + entryEnd);
@@ -2845,7 +2839,7 @@ public final class ChunkStore implements AutoCloseable {
                 readFully(data, slice(outView, dst, entryLen),
                         checkedAdd(DATA_START, entryStart, "chunk file offset"));
                 int actual = Crc.of(out, dst, entryLen);
-                if (actual != e.payloadCrc()) {
+                if (actual != span.payloadCrc(i)) {
                     throw new ScpException(ErrorCode.CRC_MISMATCH,
                             "open ledger crc mismatch on " + id + " range [" + entryStart + ".." + entryEnd + ")");
                 }
@@ -2857,7 +2851,7 @@ public final class ChunkStore implements AutoCloseable {
             readFully(data, ByteBuffer.wrap(entryBytes),
                     checkedAdd(DATA_START, entryStart, "chunk file offset"));
             int actual = Crc.of(entryBytes, 0, entryLen);
-            if (actual != e.payloadCrc()) {
+            if (actual != span.payloadCrc(i)) {
                 throw new ScpException(ErrorCode.CRC_MISMATCH,
                         "open ledger crc mismatch on " + id + " range [" + entryStart + ".." + entryEnd + ")");
             }
