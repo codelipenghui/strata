@@ -88,12 +88,18 @@ public final class ChunkStore implements AutoCloseable {
             EnvConfig.intEnv("STRATA_READ_BUFFER_POOL_MAX_BYTES", 1 << 20);
     private static final int READ_BUFFER_POOL_MAX_BUFFERS =
             EnvConfig.intEnv("STRATA_READ_BUFFER_POOL_MAX_BUFFERS", 64);
+    private static final int SEALED_VERIFY_BUFFER_POOL_MAX_BYTES =
+            EnvConfig.intEnv("STRATA_SEALED_VERIFY_BUFFER_POOL_MAX_BYTES", ChunkFormats.CRC_RANGE_SIZE);
+    private static final int SEALED_VERIFY_BUFFER_POOL_MAX_BUFFERS =
+            EnvConfig.intEnv("STRATA_SEALED_VERIFY_BUFFER_POOL_MAX_BUFFERS", 8);
 
     private final Path dir;
     private final Map<NsChunkId, Handle> chunks = new ConcurrentHashMap<>();
     private final ChannelCache channelCache;
     private final ReadBufferPool readBufferPool =
             new ReadBufferPool(READ_BUFFER_POOL_MAX_BYTES, READ_BUFFER_POOL_MAX_BUFFERS);
+    private final ReadBufferPool sealedVerifyBufferPool =
+            new ReadBufferPool(SEALED_VERIFY_BUFFER_POOL_MAX_BYTES, SEALED_VERIFY_BUFFER_POOL_MAX_BUFFERS);
     private final Set<NsChunkId> creating = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<Path, Object> directoryDurabilityLocks = new ConcurrentHashMap<>();
     private final Set<Path> durableDirectories = ConcurrentHashMap.newKeySet();
@@ -1124,19 +1130,23 @@ public final class ChunkStore implements AutoCloseable {
         }
 
         ReadBuffer acquire(int length) {
+            byte[] bytes = acquireBytes(length);
+            return new ReadBuffer(bytes, () -> releaseBytes(bytes));
+        }
+
+        byte[] acquireBytes(int length) {
             if (length == 0) {
-                return ReadBuffer.unpooled(EMPTY_READ_BYTES);
+                return EMPTY_READ_BYTES;
             }
             if (!poolable(length)) {
-                return ReadBuffer.unpooled(new byte[length]);
+                return new byte[length];
             }
 
             byte[] pooledBytes = poll(length);
             if (pooledBytes != null) {
-                return new ReadBuffer(pooledBytes, () -> release(pooledBytes));
+                return pooledBytes;
             }
-            byte[] allocated = new byte[length];
-            return new ReadBuffer(allocated, () -> release(allocated));
+            return new byte[length];
         }
 
         private byte[] poll(int length) {
@@ -1153,7 +1163,7 @@ public final class ChunkStore implements AutoCloseable {
             }
         }
 
-        private void release(byte[] bytes) {
+        void releaseBytes(byte[] bytes) {
             if (!poolable(bytes.length)) {
                 return;
             }
@@ -2646,11 +2656,15 @@ public final class ChunkStore implements AutoCloseable {
                         checkedAdd(DATA_START, rangeStart, "chunk file offset"));
                 actual = Crc.of(out, dst, rangeLen);
             } else {
-                byte[] rangeBuf = new byte[rangeLen];
-                readFully(data, ByteBuffer.wrap(rangeBuf), checkedAdd(DATA_START, rangeStart, "chunk file offset"));
-                actual = Crc.of(rangeBuf, 0, rangeLen);
-                System.arraycopy(rangeBuf, (int) (copyStart - rangeStart), out,
-                        (int) (copyStart - offset), copyLen);
+                byte[] rangeBuf = sealedVerifyBufferPool.acquireBytes(rangeLen);
+                try {
+                    readFully(data, ByteBuffer.wrap(rangeBuf), checkedAdd(DATA_START, rangeStart, "chunk file offset"));
+                    actual = Crc.of(rangeBuf, 0, rangeLen);
+                    System.arraycopy(rangeBuf, (int) (copyStart - rangeStart), out,
+                            (int) (copyStart - offset), copyLen);
+                } finally {
+                    sealedVerifyBufferPool.releaseBytes(rangeBuf);
+                }
             }
             int expected = rangeCrcs.get(rangeIndex);
             if (actual != expected) {
