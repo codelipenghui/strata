@@ -48,6 +48,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
@@ -1113,9 +1114,12 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     private static final class ReadBuffer implements AutoCloseable {
+        private static final AtomicIntegerFieldUpdater<ReadBuffer> CLOSED =
+                AtomicIntegerFieldUpdater.newUpdater(ReadBuffer.class, "closed");
         private final byte[] bytes;
         private final Runnable releaser;
-        private final AtomicBoolean closed = new AtomicBoolean(false);
+        @SuppressWarnings("unused") // updated through CLOSED
+        private volatile int closed;
 
         private ReadBuffer(byte[] bytes, Runnable releaser) {
             this.bytes = Objects.requireNonNull(bytes, "bytes");
@@ -1132,7 +1136,7 @@ public final class ChunkStore implements AutoCloseable {
 
         @Override
         public void close() {
-            if (releaser != null && closed.compareAndSet(false, true)) {
+            if (releaser != null && CLOSED.compareAndSet(this, 0, 1)) {
                 releaser.run();
             }
         }
