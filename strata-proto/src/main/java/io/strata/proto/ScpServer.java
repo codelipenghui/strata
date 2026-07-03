@@ -88,6 +88,14 @@ public final class ScpServer implements AutoCloseable {
             return handleAsync(request);
         }
 
+        /**
+         * Allocation-free dispatch result hook for hot handlers. Implementations must not retain
+         * {@code sink}; fill it during the call and return.
+         */
+        default void handleAsyncResult(Frame request, ResponseSink sink) throws Exception {
+            sink.result(handleAsyncResult(request));
+        }
+
         static Handler sync(Handler handler) {
             return new Handler() {
                 @Override
@@ -126,6 +134,11 @@ public final class ScpServer implements AutoCloseable {
                 }
 
                 @Override
+                public void handleAsyncResult(Frame request, ResponseSink sink) throws Exception {
+                    pick(request).handleAsyncResult(request, sink);
+                }
+
+                @Override
                 public boolean requiresAsyncHandling(Frame request) {
                     return pick(request).requiresAsyncHandling(request);
                 }
@@ -134,6 +147,76 @@ public final class ScpServer implements AutoCloseable {
                     return (request.opcode() & 0xFFFF) >= 0x0100 ? controlPlane : dataPlane;
                 }
             };
+        }
+    }
+
+    public static final class ResponseSink {
+        private static final int EMPTY = 0;
+        private static final int OBJECT = 1;
+        private static final int FUTURE = 2;
+        private static final int OK_U64 = 3;
+        private static final int DEFERRED_OK_U64 = 4;
+
+        private int kind;
+        private Object response;
+        private CompletableFuture<?> future;
+        private long okU64Value;
+
+        private ResponseSink() {}
+
+        public void frame(Frame frame) {
+            result(frame);
+        }
+
+        public void result(Object result) {
+            if (result instanceof OkU64Response okU64) {
+                okU64(okU64.value(), okU64.waitFor());
+                return;
+            }
+            if (result instanceof CompletableFuture<?> responseFuture) {
+                future(responseFuture);
+                return;
+            }
+            kind = OBJECT;
+            response = result;
+            future = null;
+            okU64Value = 0;
+        }
+
+        public void future(CompletableFuture<?> responseFuture) {
+            if (responseFuture == null) {
+                result(null);
+                return;
+            }
+            kind = FUTURE;
+            response = null;
+            future = responseFuture;
+            okU64Value = 0;
+        }
+
+        public void okU64(long value) {
+            kind = OK_U64;
+            response = null;
+            future = null;
+            okU64Value = value;
+        }
+
+        public void okU64(long value, CompletableFuture<Void> waitFor) {
+            if (waitFor == null) {
+                okU64(value);
+                return;
+            }
+            kind = DEFERRED_OK_U64;
+            response = null;
+            future = waitFor;
+            okU64Value = value;
+        }
+
+        private void reset() {
+            kind = EMPTY;
+            response = null;
+            future = null;
+            okU64Value = 0;
         }
     }
 
@@ -228,6 +311,7 @@ public final class ScpServer implements AutoCloseable {
         private final ArrayDeque<FrameTask> frameTasks = new ArrayDeque<>();
         private final ArrayDeque<ResponseWriteListener> responseWriteListeners = new ArrayDeque<>();
         private final ArrayDeque<OkU64WriteTask> okU64WriteTasks = new ArrayDeque<>();
+        private final ResponseSink responseSink = new ResponseSink();
         private final AtomicInteger inflightRequests = new AtomicInteger();
         private final AtomicLong inflightBytes = new AtomicLong();
         private final AtomicBoolean connectionOpen = new AtomicBoolean(true);
@@ -401,32 +485,53 @@ public final class ScpServer implements AutoCloseable {
             long startNanos = System.nanoTime();
             CompletableFuture<?> respF;
             Object immediateResp = null;
-            OkU64Response deferredOkU64 = null;
+            boolean immediateOkU64 = false;
+            long immediateOkU64Value = 0;
+            boolean deferredOkU64 = false;
+            long deferredOkU64Value = 0;
             boolean handlerFailed = false;
             try {
                 if (handler.requiresAsyncHandling(req)) {
-                    Object result = handler.handleAsyncResult(req);
-                    if (result instanceof Frame frame) {
-                        respF = null;
-                        immediateResp = frame;
-                    } else if (result instanceof OkU64Response okU64) {
-                        if (okU64.waitFor() == null) {
-                            respF = null;
-                            immediateResp = okU64;
-                        } else {
-                            respF = okU64.waitFor();
-                            deferredOkU64 = okU64;
+                    responseSink.reset();
+                    try {
+                        handler.handleAsyncResult(req, responseSink);
+                        switch (responseSink.kind) {
+                            case ResponseSink.OBJECT -> {
+                                Object result = responseSink.response;
+                                if (result instanceof Frame frame) {
+                                    respF = null;
+                                    immediateResp = frame;
+                                } else if (result == null) {
+                                    respF = null;
+                                    immediateResp = internalError(req, "handler returned null future");
+                                    handlerFailed = true;
+                                } else {
+                                    respF = null;
+                                    immediateResp = internalError(req, "handler returned unsupported async response");
+                                    handlerFailed = true;
+                                }
+                            }
+                            case ResponseSink.FUTURE -> {
+                                respF = responseSink.future;
+                            }
+                            case ResponseSink.OK_U64 -> {
+                                respF = null;
+                                immediateOkU64 = true;
+                                immediateOkU64Value = responseSink.okU64Value;
+                            }
+                            case ResponseSink.DEFERRED_OK_U64 -> {
+                                respF = responseSink.future;
+                                deferredOkU64 = true;
+                                deferredOkU64Value = responseSink.okU64Value;
+                            }
+                            default -> {
+                                respF = null;
+                                immediateResp = internalError(req, "handler returned null future");
+                                handlerFailed = true;
+                            }
                         }
-                    } else if (result instanceof CompletableFuture<?> future) {
-                        respF = future;
-                    } else if (result == null) {
-                        respF = null;
-                        immediateResp = internalError(req, "handler returned null future");
-                        handlerFailed = true;
-                    } else {
-                        respF = null;
-                        immediateResp = internalError(req, "handler returned unsupported async response");
-                        handlerFailed = true;
+                    } finally {
+                        responseSink.reset();
                     }
                 } else {
                     respF = null;
@@ -452,14 +557,22 @@ public final class ScpServer implements AutoCloseable {
             String ns = RequestContext.takeNamespace();
             if (respF == null) {
                 observeRequest(req, startNanos, !handlerFailed, ns);
+                if (immediateOkU64) {
+                    writeOkU64Response(ctx, req, immediateOkU64Value);
+                    return;
+                }
                 writeResponseObject(ctx, req, requireResponse(req, immediateResp));
                 return;
             }
-            OkU64Response asyncOkU64 = deferredOkU64;
+            boolean asyncOkU64 = deferredOkU64;
+            long asyncOkU64Value = deferredOkU64Value;
             if (respF.isDone() && !respF.isCompletedExceptionally()) {
                 observeRequest(req, startNanos, !handlerFailed, ns);
-                writeResponseObject(ctx, req,
-                        requireResponse(req, asyncOkU64 != null ? asyncOkU64 : respF.join())); // fast path
+                if (asyncOkU64) {
+                    writeOkU64Response(ctx, req, asyncOkU64Value);
+                } else {
+                    writeResponseObject(ctx, req, requireResponse(req, respF.join())); // fast path
+                }
             } else {
                 // Test seam: lets a test pause the request thread here to drive the close-vs-register
                 // race deterministically (connection closes after handleAsync returns but before the add).
@@ -481,8 +594,11 @@ public final class ScpServer implements AutoCloseable {
                         writeResponse(ctx, frame, false, req);
                         return;
                     }
-                    writeResponseObject(ctx, req,
-                            requireResponse(req, asyncOkU64 != null ? asyncOkU64 : resp));
+                    if (asyncOkU64) {
+                        writeOkU64Response(ctx, req, asyncOkU64Value);
+                    } else {
+                        writeResponseObject(ctx, req, requireResponse(req, resp));
+                    }
                 });
                 // The connection can close between handleAsync returning and the add above; channelInactive
                 // would then drain inFlightAsyncRequests before req was in it, orphaning the request buffer.

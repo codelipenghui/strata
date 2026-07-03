@@ -10,6 +10,7 @@ import io.strata.proto.Opcode;
 import io.strata.proto.RequestContext;
 import io.strata.proto.ScpServer;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -51,24 +52,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
     @Override
     public Object handleAsyncResult(Frame req) throws Exception {
         if (req.opcode() == Opcode.APPEND.code) {
-            // The per-record digest is writer-origin: a non-empty append MUST carry the client's payload
-            // CRC (FLAG_PAYLOAD_CRC), which the node stores verbatim as the ledger digest. Reject a
-            // non-empty append that lacks it rather than silently store a 0 digest that would defeat
-            // torn-tail recovery. (The wire encoder always sets the flag for a non-empty payload, so this
-            // only fires for a malformed/non-conforming client.)
-            if (req.payloadLength() > 0 && (req.flags() & Frame.FLAG_PAYLOAD_CRC) == 0) {
-                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
-                        "non-empty APPEND must carry FLAG_PAYLOAD_CRC (writer-origin per-record digest)");
-            }
-            // validation + write run synchronously here (per-chunk ordering preserved); the ack
-            // defers until durability per the chunk's policy — for ack-on-fsync that means a
-            // covering group-commit force, while this connection keeps processing frames
-            var m = Messages.Append.decodeFields(req);
-            RequestContext.setNamespace(m.namespace().value());
-            ChunkStore.AppendOutcome outcome = APPEND_OUTCOME.get();
-            store.appendAsync(m.namespace(), m.fileId(), m.chunkIndex(), m.writeEpoch(),
-                    m.baseOffset(), m.durableOffset(), req.payloadReadBuffer(), req.payloadCrc(),
-                    m.recovery(), outcome);
+            ChunkStore.AppendOutcome outcome = append(req);
             long endOffset = outcome.endOffset();
             CompletableFuture<Void> waitForFlush = outcome.waitForFlush();
             if (waitForFlush == null) {
@@ -77,6 +61,16 @@ final class DataNodeHandlers implements ScpServer.Handler {
             return ScpServer.okU64Result(endOffset, waitForFlush);
         }
         return CompletableFuture.completedFuture(handle(req));
+    }
+
+    @Override
+    public void handleAsyncResult(Frame req, ScpServer.ResponseSink sink) throws Exception {
+        if (req.opcode() == Opcode.APPEND.code) {
+            ChunkStore.AppendOutcome outcome = append(req);
+            sink.okU64(outcome.endOffset(), outcome.waitForFlush());
+            return;
+        }
+        sink.future(CompletableFuture.completedFuture(handle(req)));
     }
 
     @Override
@@ -203,6 +197,28 @@ final class DataNodeHandlers implements ScpServer.Handler {
 
             default -> throw new ScpException(ErrorCode.UNKNOWN_OPCODE, op + " not served by data node");
         };
+    }
+
+    private ChunkStore.AppendOutcome append(Frame req) throws IOException {
+        // The per-record digest is writer-origin: a non-empty append MUST carry the client's payload
+        // CRC (FLAG_PAYLOAD_CRC), which the node stores verbatim as the ledger digest. Reject a
+        // non-empty append that lacks it rather than silently store a 0 digest that would defeat
+        // torn-tail recovery. (The wire encoder always sets the flag for a non-empty payload, so this
+        // only fires for a malformed/non-conforming client.)
+        if (req.payloadLength() > 0 && (req.flags() & Frame.FLAG_PAYLOAD_CRC) == 0) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                    "non-empty APPEND must carry FLAG_PAYLOAD_CRC (writer-origin per-record digest)");
+        }
+        // validation + write run synchronously here (per-chunk ordering preserved); the ack
+        // defers until durability per the chunk's policy — for ack-on-fsync that means a
+        // covering group-commit force, while this connection keeps processing frames
+        var m = Messages.Append.decodeFields(req);
+        RequestContext.setNamespace(m.namespace().value());
+        ChunkStore.AppendOutcome outcome = APPEND_OUTCOME.get();
+        store.appendAsync(m.namespace(), m.fileId(), m.chunkIndex(), m.writeEpoch(),
+                m.baseOffset(), m.durableOffset(), req.payloadReadBuffer(), req.payloadCrc(),
+                m.recovery(), outcome);
+        return outcome;
     }
 
     /** Wire-encodes a verified, materialized {@link ChunkStore.ReadRegionResult}. */
