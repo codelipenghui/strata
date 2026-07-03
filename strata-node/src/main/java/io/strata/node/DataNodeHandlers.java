@@ -49,7 +49,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             // validation + write run synchronously here (per-chunk ordering preserved); the ack
             // defers until durability per the chunk's policy — for ack-on-fsync that means a
             // covering group-commit force, while this connection keeps processing frames
-            var m = Messages.Append.decode(req.headerReadBuffer());
+            var m = Messages.Append.decode(req);
             RequestContext.setNamespace(m.namespace().value());
             return store.appendAsync(m.namespace(), m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
                             req.payloadReadBuffer(), req.payloadCrc(), m.recovery())

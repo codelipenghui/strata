@@ -13,6 +13,11 @@ public record StrataNamespace(String value) implements Comparable<StrataNamespac
     private static final int DECODE_CACHE_SLOTS = 16;
     private static final ThreadLocal<DecodeCache> DECODE_CACHE = ThreadLocal.withInitial(DecodeCache::new);
 
+    @FunctionalInterface
+    public interface AsciiBytes {
+        byte byteAt(int index);
+    }
+
     public StrataNamespace {
         value = validate(value);
     }
@@ -44,6 +49,27 @@ public record StrataNamespace(String value) implements Comparable<StrataNamespac
         }
         byte[] bytes = new byte[len];
         buf.get(bytes);
+        StrataNamespace namespace = of(new String(bytes, StandardCharsets.US_ASCII));
+        cache.put(bytes, namespace);
+        return namespace;
+    }
+
+    public static StrataNamespace readFrom(int len, AsciiBytes source) {
+        if (len < 0) {
+            throw new IllegalArgumentException("bad namespace length on wire: " + len);
+        }
+        if (len > MAX_BYTES) {
+            throw new IllegalArgumentException("namespace too long: " + len);
+        }
+        DecodeCache cache = DECODE_CACHE.get();
+        StrataNamespace cached = cache.get(source, len);
+        if (cached != null) {
+            return cached;
+        }
+        byte[] bytes = new byte[len];
+        for (int i = 0; i < len; i++) {
+            bytes[i] = source.byteAt(i);
+        }
         StrataNamespace namespace = of(new String(bytes, StandardCharsets.US_ASCII));
         cache.put(bytes, namespace);
         return namespace;
@@ -98,6 +124,16 @@ public record StrataNamespace(String value) implements Comparable<StrataNamespac
             return null;
         }
 
+        StrataNamespace get(AsciiBytes source, int len) {
+            for (int slot = 0; slot < keys.length; slot++) {
+                byte[] key = keys[slot];
+                if (key != null && key.length == len && matches(key, source)) {
+                    return values[slot];
+                }
+            }
+            return null;
+        }
+
         void put(byte[] key, StrataNamespace value) {
             int slot = next++ & (DECODE_CACHE_SLOTS - 1);
             keys[slot] = key;
@@ -107,6 +143,15 @@ public record StrataNamespace(String value) implements Comparable<StrataNamespac
         private static boolean matches(byte[] key, ByteBuffer buf, int pos) {
             for (int i = 0; i < key.length; i++) {
                 if (buf.get(pos + i) != key[i]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static boolean matches(byte[] key, AsciiBytes source) {
+            for (int i = 0; i < key.length; i++) {
+                if (source.byteAt(i) != key[i]) {
                     return false;
                 }
             }

@@ -8,6 +8,7 @@ import io.strata.common.StrataPath;
 import io.strata.common.Varint;
 
 import java.nio.ByteBuffer;
+import java.nio.BufferUnderflowException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -155,6 +156,8 @@ public final class Messages {
     public record Append(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset,
                          StrataNamespace namespace, boolean recovery) {
         private static final int TAG_RECOVERY_APPEND = 0;
+        private static final ThreadLocal<OwnedAppendDecoder> OWNED_DECODER =
+                ThreadLocal.withInitial(OwnedAppendDecoder::new);
 
         public Append(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset,
                       StrataNamespace namespace) {
@@ -189,13 +192,187 @@ public final class Messages {
             long baseOffset = b.getLong();
             long durableOffset = b.getLong();
             StrataNamespace namespace = StrataNamespace.readFrom(b);
-            TaggedFields tags = TaggedFields.readFrom(b);
-            byte[] recovery = tags.get(TAG_RECOVERY_APPEND);
-            if (recovery != null && recovery.length != 1) {
-                throw new IllegalArgumentException("bad append recovery tag size: " + recovery.length);
-            }
             return new Append(chunkId, writeEpoch, baseOffset, durableOffset, namespace,
-                    recovery != null && recovery[0] != 0);
+                    readRecoveryTag(b));
+        }
+
+        public static Append decode(Frame frame) {
+            if (!frame.hasOwnedHeader()) {
+                return decode(frame.headerReadBuffer());
+            }
+            return OWNED_DECODER.get().decode(frame);
+        }
+
+        private static boolean readRecoveryTag(ByteBuffer b) {
+            long n = Varint.readUnsigned(b);
+            if (n == 0) {
+                requireEndOfTaggedFields(b.remaining());
+                return false;
+            }
+            if (n < 0 || n > 1024) {
+                throw new IllegalArgumentException("bad tagged-field count: " + n);
+            }
+            boolean hasRecovery = false;
+            boolean recovery = false;
+            long recoverySize = -1;
+            for (int i = 0; i < n; i++) {
+                long tagValue = Varint.readUnsigned(b);
+                validateTaggedFieldTag(tagValue);
+                long size = Varint.readUnsigned(b);
+                if (size < 0 || size > b.remaining()) {
+                    throw new IllegalArgumentException("bad tagged-field size: " + size);
+                }
+                if ((int) tagValue == TAG_RECOVERY_APPEND) {
+                    hasRecovery = true;
+                    recoverySize = size;
+                    if (size == 1) {
+                        recovery = b.get() != 0;
+                    } else {
+                        b.position(b.position() + (int) size);
+                    }
+                } else {
+                    b.position(b.position() + (int) size);
+                }
+            }
+            requireEndOfTaggedFields(b.remaining());
+            if (hasRecovery && recoverySize != 1) {
+                throw new IllegalArgumentException("bad append recovery tag size: " + recoverySize);
+            }
+            return hasRecovery && recovery;
+        }
+
+        private static void validateTaggedFieldTag(long tag) {
+            if (tag < 0 || tag > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("bad tagged-field tag: " + tag);
+            }
+        }
+
+        private static void requireEndOfTaggedFields(int remaining) {
+            if (remaining != 0) {
+                throw new IllegalArgumentException("trailing bytes after tagged fields: " + remaining);
+            }
+        }
+
+        private static final class OwnedAppendDecoder implements StrataNamespace.AsciiBytes {
+            private Frame frame;
+            private int pos;
+            private int namespaceOffset;
+
+            Append decode(Frame frame) {
+                this.frame = frame;
+                pos = 0;
+                namespaceOffset = 0;
+                try {
+                    ChunkId chunkId = new ChunkId(new FileId(readLong()), readInt());
+                    int writeEpoch = readInt();
+                    long baseOffset = readLong();
+                    long durableOffset = readLong();
+                    StrataNamespace namespace = readNamespace();
+                    boolean recovery = readRecoveryTag();
+                    return new Append(chunkId, writeEpoch, baseOffset, durableOffset, namespace, recovery);
+                } finally {
+                    this.frame = null;
+                }
+            }
+
+            @Override
+            public byte byteAt(int index) {
+                return frame.ownedHeaderByte(namespaceOffset + index);
+            }
+
+            private long readLong() {
+                require(8);
+                long value = frame.ownedHeaderLong(pos);
+                pos += 8;
+                return value;
+            }
+
+            private int readInt() {
+                require(4);
+                int value = frame.ownedHeaderInt(pos);
+                pos += 4;
+                return value;
+            }
+
+            private StrataNamespace readNamespace() {
+                long lenLong = readUnsigned();
+                if (lenLong > remaining()) {
+                    throw new IllegalArgumentException(
+                            "bad namespace length on wire: " + lenLong + " (remaining " + remaining() + ")");
+                }
+                namespaceOffset = pos;
+                StrataNamespace namespace = StrataNamespace.readFrom((int) lenLong, this);
+                pos += (int) lenLong;
+                return namespace;
+            }
+
+            private boolean readRecoveryTag() {
+                long n = readUnsigned();
+                if (n == 0) {
+                    requireEndOfTaggedFields(remaining());
+                    return false;
+                }
+                if (n < 0 || n > 1024) {
+                    throw new IllegalArgumentException("bad tagged-field count: " + n);
+                }
+                boolean hasRecovery = false;
+                boolean recovery = false;
+                long recoverySize = -1;
+                for (int i = 0; i < n; i++) {
+                    long tagValue = readUnsigned();
+                    validateTaggedFieldTag(tagValue);
+                    long size = readUnsigned();
+                    if (size < 0 || size > remaining()) {
+                        throw new IllegalArgumentException("bad tagged-field size: " + size);
+                    }
+                    if ((int) tagValue == TAG_RECOVERY_APPEND) {
+                        hasRecovery = true;
+                        recoverySize = size;
+                        if (size == 1) {
+                            recovery = readByte() != 0;
+                        } else {
+                            pos += (int) size;
+                        }
+                    } else {
+                        pos += (int) size;
+                    }
+                }
+                requireEndOfTaggedFields(remaining());
+                if (hasRecovery && recoverySize != 1) {
+                    throw new IllegalArgumentException("bad append recovery tag size: " + recoverySize);
+                }
+                return hasRecovery && recovery;
+            }
+
+            private long readUnsigned() {
+                long value = 0;
+                int shift = 0;
+                while (true) {
+                    if (shift > 63) throw new IllegalArgumentException("varint too long");
+                    byte b = readByte();
+                    if (shift == 63 && (b & 0xFE) != 0) {
+                        throw new IllegalArgumentException("varint too long");
+                    }
+                    value |= (long) (b & 0x7F) << shift;
+                    if ((b & 0x80) == 0) return value;
+                    shift += 7;
+                }
+            }
+
+            private byte readByte() {
+                require(1);
+                return frame.ownedHeaderByte(pos++);
+            }
+
+            private int remaining() {
+                return frame.headerLength() - pos;
+            }
+
+            private void require(int bytes) {
+                if (bytes > remaining()) {
+                    throw new BufferUnderflowException();
+                }
+            }
         }
     }
 

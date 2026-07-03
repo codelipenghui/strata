@@ -163,6 +163,22 @@ public final class Frame implements AutoCloseable {
         return owner != null ? ownerHeaderLen : header.remaining();
     }
 
+    boolean hasOwnedHeader() {
+        return owner != null;
+    }
+
+    byte ownedHeaderByte(int offset) {
+        return owner.getByte(ownerHeaderIndex + offset);
+    }
+
+    int ownedHeaderInt(int offset) {
+        return owner.getInt(ownerHeaderIndex + offset);
+    }
+
+    long ownedHeaderLong(int offset) {
+        return owner.getLong(ownerHeaderIndex + offset);
+    }
+
     ByteBuffer headerView() {
         return owner != null ? ownerBuffer(ownerHeaderIndex, ownerHeaderLen) : header;
     }
