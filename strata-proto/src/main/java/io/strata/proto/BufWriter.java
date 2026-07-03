@@ -2,6 +2,7 @@ package io.strata.proto;
 
 import io.strata.common.ChunkId;
 import io.strata.common.FileId;
+import io.strata.common.StrataNamespace;
 import io.strata.common.Varint;
 
 import java.nio.ByteBuffer;
@@ -73,6 +74,17 @@ public final class BufWriter {
         byte[] b = s.getBytes(StandardCharsets.UTF_8);
         varint(b.length);
         raw(b);
+        return this;
+    }
+
+    public BufWriter namespace(StrataNamespace namespace) {
+        String s = namespace.value();
+        int len = s.length(); // namespace validation allows ASCII only
+        varint(len);
+        ensure(len);
+        for (int i = 0; i < len; i++) {
+            bytes[pos++] = (byte) s.charAt(i);
+        }
         return this;
     }
 

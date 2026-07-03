@@ -9,12 +9,36 @@ import org.junit.jupiter.api.Test;
 import java.nio.ByteBuffer;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 
 class MessagesNamespaceRoundTripTest {
     private static final StrataNamespace NS = StrataNamespace.of("tenant-a");
     private static final FileId FID = FileId.of(1);
     private static final ChunkId CID = new ChunkId(FID, 3);
+
+    @Test
+    void namespaceWriterKeepsStringWireFormat() {
+        BufWriter stringWriter = new BufWriter();
+        stringWriter.string(NS.value());
+        BufWriter namespaceWriter = new BufWriter();
+        namespaceWriter.namespace(NS);
+
+        assertArrayEquals(stringWriter.toBytes(), namespaceWriter.toBytes());
+    }
+
+    @Test
+    void repeatedNamespaceDecodeReusesCachedInstance() {
+        StrataNamespace cacheNs = StrataNamespace.of("tenant-cache");
+
+        var append = Messages.Append.decode(ByteBuffer.wrap(
+                new Messages.Append(CID, 7, 0, 0, cacheNs).encode()));
+        var read = Messages.Read.decode(ByteBuffer.wrap(
+                new Messages.Read(CID, 0, 1024, cacheNs).encode()));
+
+        assertSame(append.namespace(), read.namespace());
+    }
 
     @Test
     void createChunkCarriesNamespace() {

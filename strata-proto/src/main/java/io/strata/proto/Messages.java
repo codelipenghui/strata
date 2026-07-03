@@ -115,7 +115,7 @@ public final class Messages {
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.chunkId(chunkId).i32(writeEpoch).u8(fsyncOnAck ? 1 : 0)
-                    .u64(expectedMaxBytes).u64(createdAtMs).string(namespace.toString()).noTags();
+                    .u64(expectedMaxBytes).u64(createdAtMs).namespace(namespace).noTags();
             return w.toBytes();
         }
 
@@ -125,7 +125,7 @@ public final class Messages {
             boolean fsyncOnAck = Varint.readBoolean(b);
             long expectedMaxBytes = b.getLong();
             long createdAtMs = b.getLong();
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             TaggedFields.readFrom(b);
             return new OpenChunk(chunkId, writeEpoch, fsyncOnAck, expectedMaxBytes, createdAtMs, namespace);
         }
@@ -153,7 +153,7 @@ public final class Messages {
             int len = namespace.value().length(); // ASCII namespace: UTF-8 length == char length
             BufWriter w = new BufWriter(33 + (len < 128 ? 1 : 2) + len);
             w.chunkId(chunkId).i32(writeEpoch).u64(baseOffset).u64(durableOffset)
-                    .string(namespace.toString());
+                    .namespace(namespace);
             if (recovery) {
                 TaggedFields.of(Map.of(TAG_RECOVERY_APPEND, new byte[] {1})).writeTo(w);
             } else {
@@ -167,7 +167,7 @@ public final class Messages {
             int writeEpoch = b.getInt();
             long baseOffset = b.getLong();
             long durableOffset = b.getLong();
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             TaggedFields tags = TaggedFields.readFrom(b);
             byte[] recovery = tags.get(TAG_RECOVERY_APPEND);
             if (recovery != null && recovery.length != 1) {
@@ -200,13 +200,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(offset).u32(maxBytes).string(namespace.toString()).noTags();
+            w.chunkId(chunkId).u64(offset).u32(maxBytes).namespace(namespace).noTags();
             return w.toBytes();
         }
 
         public static Read decode(ByteBuffer b) {
             Read m = new Read(ChunkId.readFrom(b), b.getLong(), b.getInt(),
-                    StrataNamespace.of(Varint.readString(b)));
+                    StrataNamespace.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -234,13 +234,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(fenceEpoch).string(namespace.toString()).noTags();
+            w.chunkId(chunkId).i32(fenceEpoch).namespace(namespace).noTags();
             return w.toBytes();
         }
 
         public static Fence decode(ByteBuffer b) {
             Fence m = new Fence(ChunkId.readFrom(b), b.getInt(),
-                    StrataNamespace.of(Varint.readString(b)));
+                    StrataNamespace.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -268,13 +268,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).string(namespace.toString()).noTags();
+            w.chunkId(chunkId).namespace(namespace).noTags();
             return w.toBytes();
         }
 
         public static StatChunk decode(ByteBuffer b) {
             StatChunk m = new StatChunk(ChunkId.readFrom(b),
-                    StrataNamespace.of(Varint.readString(b)));
+                    StrataNamespace.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -305,13 +305,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(writeEpoch).u64(dataLength).string(namespace.toString()).noTags();
+            w.chunkId(chunkId).i32(writeEpoch).u64(dataLength).namespace(namespace).noTags();
             return w.toBytes();
         }
 
         public static SealChunk decode(ByteBuffer b) {
             SealChunk m = new SealChunk(ChunkId.readFrom(b), b.getInt(), b.getLong(),
-                    StrataNamespace.of(Varint.readString(b)));
+                    StrataNamespace.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -342,7 +342,7 @@ public final class Messages {
             BufWriter w = new BufWriter();
             w.varint(chunkIds.size());
             for (ChunkId c : chunkIds) w.chunkId(c);
-            w.string(namespace.toString()).noTags();
+            w.namespace(namespace).noTags();
             return w.toBytes();
         }
 
@@ -350,7 +350,7 @@ public final class Messages {
             int n = count(b);
             List<ChunkId> ids = new ArrayList<>(n);
             for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             TaggedFields.readFrom(b);
             return new DeleteChunks(ids, namespace);
         }
@@ -396,13 +396,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(offset).u32(maxBytes).string(namespace.toString()).noTags();
+            w.chunkId(chunkId).u64(offset).u32(maxBytes).namespace(namespace).noTags();
             return w.toBytes();
         }
 
         public static FetchChunk decode(ByteBuffer b) {
             FetchChunk m = new FetchChunk(ChunkId.readFrom(b), b.getLong(), b.getInt(),
-                    StrataNamespace.of(Varint.readString(b)));
+                    StrataNamespace.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -430,13 +430,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(fromOffset).string(namespace.toString()).noTags();
+            w.chunkId(chunkId).u64(fromOffset).namespace(namespace).noTags();
             return w.toBytes();
         }
 
         public static ReadLedger decode(ByteBuffer b) {
             ReadLedger m = new ReadLedger(ChunkId.readFrom(b), b.getLong(),
-                    StrataNamespace.of(Varint.readString(b)));
+                    StrataNamespace.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -588,12 +588,12 @@ public final class Messages {
                     w.u8(1).chunkId(r.chunkId());
                     writeReplicas(w, r.sources());
                     w.u8(r.priority()).u32(r.expectedCrc()).u64(r.expectedLength())
-                     .string(r.namespace().toString());
+                     .namespace(r.namespace());
                 }
                 case DeleteCmd d -> {
                     w.u8(2).varint(d.chunkIds().size());
                     for (ChunkId id : d.chunkIds()) w.chunkId(id);
-                    w.string(d.namespace().toString());
+                    w.namespace(d.namespace());
                 }
                 case DrainCmd dr -> w.u8(3);
             }
@@ -609,14 +609,14 @@ public final class Messages {
                     byte priority = b.get();
                     int expectedCrc = b.getInt();
                     long expectedLength = b.getLong();
-                    StrataNamespace ns = StrataNamespace.of(Varint.readString(b));
+                    StrataNamespace ns = StrataNamespace.readFrom(b);
                     yield new ReplicateCmd(id, chunkId, sources, priority, expectedCrc, expectedLength, ns);
                 }
                 case 2 -> {
                     int n = count(b);
                     List<ChunkId> ids = new ArrayList<>(n);
                     for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
-                    StrataNamespace delNs = StrataNamespace.of(Varint.readString(b));
+                    StrataNamespace delNs = StrataNamespace.readFrom(b);
                     yield new DeleteCmd(id, ids, delNs);
                 }
                 case 3 -> new DrainCmd(id);
@@ -685,14 +685,14 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).string(verifierEndpoint).varint(chunkIds.size());
+            w.namespace(namespace).string(verifierEndpoint).varint(chunkIds.size());
             for (ChunkId c : chunkIds) w.chunkId(c);
             w.noTags();
             return w.toBytes();
         }
 
         public static VerifyChunks decode(ByteBuffer b) {
-            StrataNamespace ns = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace ns = StrataNamespace.readFrom(b);
             String verifier = Varint.readString(b);
             int n = count(b);
             List<ChunkId> ids = new ArrayList<>(n);
@@ -804,14 +804,14 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).string(path.toString());
+            w.namespace(namespace).string(path.toString());
             writePolicy.writeTo(w);
             w.u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
         public static CreateFile decode(ByteBuffer b) {
-            CreateFile m = new CreateFile(StrataNamespace.of(Varint.readString(b)),
+            CreateFile m = new CreateFile(StrataNamespace.readFrom(b),
                     StrataPath.of(Varint.readString(b)), WritePolicy.readFrom(b),
                     b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
@@ -857,7 +857,7 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).fileId(fileId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb);
+            w.namespace(namespace).fileId(fileId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb);
             if (excludedNodeIds.isEmpty()) {
                 w.noTags();
             } else {
@@ -870,7 +870,7 @@ public final class Messages {
         }
 
         public static CreateChunk decode(ByteBuffer b) {
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             FileId fileId = FileId.readFrom(b);
             int writeEpoch = b.getInt();
             long opIdMsb = b.getLong();
@@ -936,13 +936,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).fileId(fileId).u8(purpose).noTags();
+            w.namespace(namespace).fileId(fileId).u8(purpose).noTags();
             return w.toBytes();
         }
 
         public static AllocateWriterEpoch decode(ByteBuffer b) {
             AllocateWriterEpoch m = new AllocateWriterEpoch(
-                    StrataNamespace.of(Varint.readString(b)), FileId.readFrom(b), b.get());
+                    StrataNamespace.readFrom(b), FileId.readFrom(b), b.get());
             TaggedFields.readFrom(b);
             return m;
         }
@@ -988,7 +988,7 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).chunkId(chunkId).i32(writeEpoch).u64(length).u32(crc);
+            w.namespace(namespace).chunkId(chunkId).i32(writeEpoch).u64(length).u32(crc);
             w.varint(sealedReplicas.size());
             for (int id : sealedReplicas) w.u32(id);
             w.u64(opIdMsb).u64(opIdLsb).noTags();
@@ -996,7 +996,7 @@ public final class Messages {
         }
 
         public static SealChunkMeta decode(ByteBuffer b) {
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             ChunkId id = ChunkId.readFrom(b);
             int epoch = b.getInt();
             long length = b.getLong();
@@ -1018,13 +1018,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).chunkId(chunkId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb).noTags();
+            w.namespace(namespace).chunkId(chunkId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
         public static AbortChunkMeta decode(ByteBuffer b) {
             AbortChunkMeta m = new AbortChunkMeta(
-                    StrataNamespace.of(Varint.readString(b)), ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong());
+                    StrataNamespace.readFrom(b), ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }
@@ -1037,12 +1037,12 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).fileId(fileId).noTags();
+            w.namespace(namespace).fileId(fileId).noTags();
             return w.toBytes();
         }
 
         public static LookupFile decode(ByteBuffer b) {
-            LookupFile m = new LookupFile(StrataNamespace.of(Varint.readString(b)), FileId.readFrom(b));
+            LookupFile m = new LookupFile(StrataNamespace.readFrom(b), FileId.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -1060,12 +1060,12 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).string(path.toString()).noTags();
+            w.namespace(namespace).string(path.toString()).noTags();
             return w.toBytes();
         }
 
         public static LookupPath decode(ByteBuffer b) {
-            LookupPath m = new LookupPath(StrataNamespace.of(Varint.readString(b)),
+            LookupPath m = new LookupPath(StrataNamespace.readFrom(b),
                     StrataPath.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
@@ -1122,7 +1122,7 @@ public final class Messages {
         public byte[] encode() {
             BufWriter w = new BufWriter();
             Resp.writeOk(w);
-            w.string(namespace.toString()).string(path.toString());
+            w.namespace(namespace).string(path.toString());
             writePolicy.writeTo(w);
             w.u8(fileState).varint(chunks.size());
             for (ChunkInfo c : chunks) ChunkInfo.write(w, c);
@@ -1131,7 +1131,7 @@ public final class Messages {
         }
 
         public static LookupFileResp decode(ByteBuffer b) {
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             StrataPath path = StrataPath.of(Varint.readString(b));
             WritePolicy writePolicy = WritePolicy.readFrom(b);
             byte state = b.get();
@@ -1151,7 +1151,7 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString());
+            w.namespace(namespace);
             w.varint(fileIds.size());
             for (FileId f : fileIds) w.fileId(f);
             w.noTags();
@@ -1159,7 +1159,7 @@ public final class Messages {
         }
 
         public static DeleteFiles decode(ByteBuffer b) {
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             int n = count(b);
             List<FileId> ids = new ArrayList<>(n);
             for (int i = 0; i < n; i++) ids.add(FileId.readFrom(b));
@@ -1208,12 +1208,12 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).fileId(fileId).u64(totalLength).noTags();
+            w.namespace(namespace).fileId(fileId).u64(totalLength).noTags();
             return w.toBytes();
         }
 
         public static SealFile decode(ByteBuffer b) {
-            SealFile m = new SealFile(StrataNamespace.of(Varint.readString(b)), FileId.readFrom(b), b.getLong());
+            SealFile m = new SealFile(StrataNamespace.readFrom(b), FileId.readFrom(b), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }

@@ -415,7 +415,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (opcode)(rate(strata_scp_request_duration_seconds_count{instance=~\"$instance\",opcode=~\"CREATE_FILE|CREATE_CHUNK|ALLOCATE_WRITER_EPOCH|SEAL_CHUNK_META|ABORT_CHUNK_META|SEAL_FILE|LOOKUP_FILE|LOOKUP_PATH|DELETE_FILES|REGISTER_NODE|NODE_HEARTBEAT\"}[$__rate_interval]))",
+          "expr": "sum by (opcode)(rate(strata_scp_requests_total{instance=~\"$instance\",opcode=~\"CREATE_FILE|CREATE_CHUNK|ALLOCATE_WRITER_EPOCH|SEAL_CHUNK_META|ABORT_CHUNK_META|SEAL_FILE|LOOKUP_FILE|LOOKUP_PATH|DELETE_FILES|REGISTER_NODE|NODE_HEARTBEAT\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "{{opcode}}"
         }

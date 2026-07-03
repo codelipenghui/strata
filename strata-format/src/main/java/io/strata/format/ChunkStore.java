@@ -2453,6 +2453,7 @@ public final class ChunkStore implements AutoCloseable {
         }
         long firstRange = offset / ChunkFormats.CRC_RANGE_SIZE;
         long lastRange = (offset + out.length - 1) / ChunkFormats.CRC_RANGE_SIZE;
+        ByteBuffer outView = ByteBuffer.wrap(out);
         for (long range = firstRange; range <= lastRange; range++) {
             if (range >= rangeCrcs.size()) {
                 throw new ScpException(ErrorCode.CORRUPT_CHUNK, "CRC range missing for " + id);
@@ -2468,9 +2469,19 @@ public final class ChunkStore implements AutoCloseable {
                         checkedAdd(DATA_START, copyStart, "chunk file offset"));
                 continue;
             }
-            byte[] rangeBuf = new byte[rangeLen];
-            readFully(data, ByteBuffer.wrap(rangeBuf), checkedAdd(DATA_START, rangeStart, "chunk file offset"));
-            int actual = Crc.of(rangeBuf, 0, rangeLen);
+            int actual;
+            if (copyStart == rangeStart && copyLen == rangeLen) {
+                int dst = (int) (copyStart - offset);
+                readFully(data, slice(outView, dst, rangeLen),
+                        checkedAdd(DATA_START, rangeStart, "chunk file offset"));
+                actual = Crc.of(out, dst, rangeLen);
+            } else {
+                byte[] rangeBuf = new byte[rangeLen];
+                readFully(data, ByteBuffer.wrap(rangeBuf), checkedAdd(DATA_START, rangeStart, "chunk file offset"));
+                actual = Crc.of(rangeBuf, 0, rangeLen);
+                System.arraycopy(rangeBuf, (int) (copyStart - rangeStart), out,
+                        (int) (copyStart - offset), copyLen);
+            }
             int expected = rangeCrcs.get(rangeIndex);
             if (actual != expected) {
                 throw new ScpException(ErrorCode.CRC_MISMATCH,
@@ -2479,8 +2490,6 @@ public final class ChunkStore implements AutoCloseable {
             if (useVerifiedRangeCache) {
                 markSealedRangeVerified(h, rangeIndex);
             }
-            System.arraycopy(rangeBuf, (int) (copyStart - rangeStart), out,
-                    (int) (copyStart - offset), copyLen);
         }
     }
 
@@ -2518,6 +2527,7 @@ public final class ChunkStore implements AutoCloseable {
         long readEnd = checkedAdd(offset, out.length, "open read end");
         long entryStart = firstEntryStart;
         int copied = 0;
+        ByteBuffer outView = ByteBuffer.wrap(out);
         for (ChunkFormats.LedgerEntry e : entries) {
             long entryEnd = e.endOffset();
             if (entryEnd <= entryStart) {
@@ -2537,6 +2547,22 @@ public final class ChunkStore implements AutoCloseable {
                         "oversized ledger entry for " + id + ": " + entryLenLong);
             }
             int entryLen = (int) entryLenLong;
+            long copyStart = Math.max(offset, entryStart);
+            long copyEnd = Math.min(readEnd, entryEnd);
+            boolean fullEntryCovered = copyStart == entryStart && copyEnd == entryEnd;
+            if (fullEntryCovered) {
+                int dst = (int) (copyStart - offset);
+                readFully(data, slice(outView, dst, entryLen),
+                        checkedAdd(DATA_START, entryStart, "chunk file offset"));
+                int actual = Crc.of(out, dst, entryLen);
+                if (actual != e.payloadCrc()) {
+                    throw new ScpException(ErrorCode.CRC_MISMATCH,
+                            "open ledger crc mismatch on " + id + " range [" + entryStart + ".." + entryEnd + ")");
+                }
+                copied += entryLen;
+                entryStart = entryEnd;
+                continue;
+            }
             byte[] entryBytes = new byte[entryLen];
             readFully(data, ByteBuffer.wrap(entryBytes),
                     checkedAdd(DATA_START, entryStart, "chunk file offset"));
@@ -2545,8 +2571,6 @@ public final class ChunkStore implements AutoCloseable {
                 throw new ScpException(ErrorCode.CRC_MISMATCH,
                         "open ledger crc mismatch on " + id + " range [" + entryStart + ".." + entryEnd + ")");
             }
-            long copyStart = Math.max(offset, entryStart);
-            long copyEnd = Math.min(readEnd, entryEnd);
             if (copyEnd > copyStart) {
                 int src = (int) (copyStart - entryStart);
                 int dst = (int) (copyStart - offset);
@@ -2560,6 +2584,13 @@ public final class ChunkStore implements AutoCloseable {
             throw new ScpException(ErrorCode.CORRUPT_CHUNK,
                     "open read is not covered by ledger for " + id);
         }
+    }
+
+    private static ByteBuffer slice(ByteBuffer view, int offset, int length) {
+        view.clear();
+        view.position(offset);
+        view.limit(offset + length);
+        return view;
     }
 
     private static int checkedFooterLength(ChunkFormats.Trailer trailer, long fileLen) {

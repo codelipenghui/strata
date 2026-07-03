@@ -17,6 +17,17 @@ final class NettyFrameCodec {
 
     static final class Encoder extends MessageToByteEncoder<Frame> {
         @Override
+        protected ByteBuf allocateBuffer(ChannelHandlerContext ctx, Frame f, boolean preferDirect) throws Exception {
+            if (f.hasFilePayload()) {
+                return super.allocateBuffer(ctx, f, preferDirect);
+            }
+            int headerLen = f.headerSlice().remaining();
+            int payloadLen = f.payloadLength();
+            int capacity = Integer.BYTES + FrameIO.checkedFrameLength(headerLen, payloadLen);
+            return preferDirect ? ctx.alloc().ioBuffer(capacity, capacity) : ctx.alloc().heapBuffer(capacity, capacity);
+        }
+
+        @Override
         protected void encode(ChannelHandlerContext ctx, Frame f, ByteBuf out) throws Exception {
             if (f.hasFilePayload()) {
                 throw new IOException("file payload frames must be written as a frame prefix plus FileRegion");

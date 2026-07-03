@@ -15,17 +15,21 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
 
 /**
  * Registers Strata's domain metrics on the meter registry by wiring Micrometer gauges/counters to
  * the read-only accessors on {@link Controller} / {@link DataNode}. All of these are either
- * periodic gauges over existing in-memory state (zero data-path cost) or monotonic function-counters
- * over plain atomic counters — no timers on the hot path. The {@code role} common tag is set by
+ * periodic gauges over existing in-memory state (zero data-path cost), monotonic function-counters
+ * over plain atomic counters, or sampled request timers. The {@code role} common tag is set by
  * {@code StrataMetrics}, so a single Prometheus job can scrape both process kinds.
  */
 final class ServerMetrics {
+    static final int DEFAULT_REQUEST_LATENCY_SAMPLE_RATE = 16;
+
     private ServerMetrics() {
     }
 
@@ -277,32 +281,60 @@ final class ServerMetrics {
     }
 
     /**
-     * A per-request latency observer recording into a {@code strata_scp_request_duration} timer
-     * tagged by opcode + status. Emits a Prometheus HISTOGRAM (cumulative {@code _bucket{le}}
-     * series) rather than client-side quantiles, so percentiles can be aggregated correctly across
-     * the node fleet at query time (histogram_quantile over summed buckets) and re-quantiled at any
-     * window — pre-computed per-instance quantiles cannot be averaged across instances. Explicit SLO
-     * buckets (1ms..5s) bound the cardinality and pick boundaries meaningful for SCP request latency.
-     * Timers are cached per opcode+status, so the per-request cost is a map lookup + a histogram
-     * record. For an async APPEND in fsync mode this latency includes the group-commit/fsync wait.
+     * A per-request observer that keeps exact request counts in {@code strata_scp_requests} and samples
+     * successful latency observations into {@code strata_scp_request_duration}; error latency is always
+     * recorded. The duration timer emits a Prometheus HISTOGRAM (cumulative {@code _bucket{le}} series)
+     * rather than client-side quantiles, so percentiles can be aggregated across the node fleet at query
+     * time. Explicit SLO buckets (1ms..5s) bound cardinality and pick boundaries meaningful for SCP
+     * request latency. For an async APPEND in fsync mode this latency includes the group-commit/fsync wait.
      */
     static RequestObserver requestObserver(MeterRegistry reg, long[] bucketsMs) {
+        return requestObserver(reg, bucketsMs, DEFAULT_REQUEST_LATENCY_SAMPLE_RATE);
+    }
+
+    static RequestObserver requestObserver(MeterRegistry reg, long[] bucketsMs, int successLatencySampleRate) {
+        if (successLatencySampleRate <= 0) {
+            throw new IllegalArgumentException("successLatencySampleRate must be positive: "
+                    + successLatencySampleRate);
+        }
         Duration[] slos = new Duration[bucketsMs.length];
         for (int i = 0; i < bucketsMs.length; i++) {
             slos[i] = Duration.ofMillis(bucketsMs[i]);
         }
-        Map<String, Timer> timers = new ConcurrentHashMap<>();
+        Map<String, RequestMetric> metrics = new ConcurrentHashMap<>();
         return (opcode, namespace, durationNanos, success) -> {
             String status = success ? "ok" : "error";
-            timers.computeIfAbsent(opcode + ':' + status + ':' + namespace, k -> {
+            RequestMetric metric = metrics.computeIfAbsent(opcode + ':' + status + ':' + namespace, k -> {
                 Timer.Builder b = Timer.builder("strata_scp_request_duration")
-                        .description("request handler latency by opcode + namespace (incl. async durability wait)")
+                        .description("sampled request handler latency by opcode + namespace "
+                                + "(errors always recorded; includes async durability wait)")
                         .tag("opcode", opcode)
                         .tag("status", status)
                         .tag("namespace", namespace);
                 b.serviceLevelObjectives(slos);
-                return b.register(reg);
-            }).record(durationNanos, TimeUnit.NANOSECONDS);
+                RequestMetric created = new RequestMetric(b.register(reg));
+                FunctionCounter.builder("strata_scp_requests", created.requests, LongAdder::sum)
+                        .description("exact SCP request count by opcode + namespace + status")
+                        .tag("opcode", opcode)
+                        .tag("status", status)
+                        .tag("namespace", namespace)
+                        .register(reg);
+                return created;
+            });
+            metric.requests.increment();
+            if (!success || successLatencySampleRate == 1
+                    || ThreadLocalRandom.current().nextInt(successLatencySampleRate) == 0) {
+                metric.latency.record(durationNanos, TimeUnit.NANOSECONDS);
+            }
         };
+    }
+
+    private static final class RequestMetric {
+        final LongAdder requests = new LongAdder();
+        final Timer latency;
+
+        RequestMetric(Timer latency) {
+            this.latency = latency;
+        }
     }
 }

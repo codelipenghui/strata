@@ -17,6 +17,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -91,10 +92,47 @@ class ServerMetricsTest {
     void requestObserverTagsNamespace() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         RequestObserver obs = ServerMetrics.requestObserver(registry,
-                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
+                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000}, 1);
         obs.observe("READ", "orders", 1_000_000L, true);
         assertNotNull(registry.find("strata_scp_request_duration")
                         .tag("namespace", "orders").tag("opcode", "READ").tag("status", "ok").timer(),
                 "request timer must carry a namespace tag");
+        assertNotNull(registry.find("strata_scp_requests")
+                        .tag("namespace", "orders").tag("opcode", "READ").tag("status", "ok").functionCounter(),
+                "exact request counter must carry the same tags");
+    }
+
+    @Test
+    void requestObserverKeepsExactCountWhenLatencyIsSampled() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        RequestObserver obs = ServerMetrics.requestObserver(registry,
+                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000}, 16);
+
+        for (int i = 0; i < 10; i++) {
+            obs.observe("APPEND", "orders", 1_000_000L, true);
+        }
+
+        var requests = registry.find("strata_scp_requests")
+                .tag("namespace", "orders").tag("opcode", "APPEND").tag("status", "ok").functionCounter();
+        assertNotNull(requests);
+        assertEquals(10.0, requests.count());
+    }
+
+    @Test
+    void requestObserverAlwaysRecordsErrorLatency() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        RequestObserver obs = ServerMetrics.requestObserver(registry,
+                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000}, 16);
+
+        obs.observe("APPEND", "orders", 2_000_000L, false);
+
+        var requests = registry.find("strata_scp_requests")
+                .tag("namespace", "orders").tag("opcode", "APPEND").tag("status", "error").functionCounter();
+        var latency = registry.find("strata_scp_request_duration")
+                .tag("namespace", "orders").tag("opcode", "APPEND").tag("status", "error").timer();
+        assertNotNull(requests);
+        assertNotNull(latency);
+        assertEquals(1.0, requests.count());
+        assertEquals(1L, latency.count());
     }
 }
