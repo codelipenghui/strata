@@ -237,13 +237,20 @@ final class NettyFrameCodec {
 
                 int headerIndex = Frame.PREAMBLE_AFTER_LEN;
                 int payloadIndex = headerIndex + headerLen;
+                ByteBuffer internalPayloadReadBuffer = null;
                 if ((flags & Frame.FLAG_PAYLOAD_CRC) != 0 && payloadLen > 0) {
-                    FrameIO.checkPayloadCrc(payloadCrc, payloadCrc(in, sourceBase + payloadIndex, payloadLen));
+                    if (shouldCacheInternalPayloadReadBuffer(opcode, flags, in)) {
+                        internalPayloadReadBuffer = in.internalNioBuffer(sourceBase + payloadIndex,
+                                payloadLen).duplicate();
+                        FrameIO.checkPayloadCrc(payloadCrc, Crc.of(internalPayloadReadBuffer));
+                    } else {
+                        FrameIO.checkPayloadCrc(payloadCrc, payloadCrc(in, sourceBase + payloadIndex, payloadLen));
+                    }
                 }
                 // Frame normalizes payloadCrc to 0 on an unflagged/empty frame (the accessor contract)
                 out.add(Frame.fromOwnedBuffer(opcode, apiVersion, flags, correlationId,
                         frame, frameBase + headerIndex, headerLen,
-                        frameBase + payloadIndex, payloadLen, payloadCrc));
+                        frameBase + payloadIndex, payloadLen, payloadCrc, internalPayloadReadBuffer));
                 emitted = true;
             } finally {
                 if (!emitted) {
@@ -252,8 +259,13 @@ final class NettyFrameCodec {
             }
         }
 
+        private static boolean shouldCacheInternalPayloadReadBuffer(short opcode, short flags, ByteBuf in) {
+            return opcode == Opcode.APPEND.code
+                    && (flags & Frame.FLAG_RESPONSE) == 0
+                    && in.nioBufferCount() == 1;
+        }
+
         private static int payloadCrc(ByteBuf buf, int index, int length) {
-            // The retained frame is a sliced ByteBuf whose nioBuffer() path allocates a NIO view per APPEND.
             if (buf.nioBufferCount() == 1) {
                 return Crc.of(buf.internalNioBuffer(index, length));
             }

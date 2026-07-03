@@ -3,6 +3,7 @@ package io.strata.proto;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.buffer.UnpooledByteBufAllocator;
+import io.netty.channel.embedded.EmbeddedChannel;
 import io.strata.common.ChunkId;
 import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
@@ -31,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -197,6 +199,39 @@ class ProtocolCoverageTest {
             assertEquals(new Messages.Append(chunkId, 7, 11, 9, namespace, true), decoded);
         } finally {
             frame.close();
+        }
+    }
+
+    @Test
+    void decoderCachesAppendPayloadInternalReadBuffer() {
+        StrataNamespace namespace = StrataNamespace.of("test");
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);
+        byte[] header = new Messages.Append(chunkId, 7, 11, 9, namespace).encode();
+        byte[] payload = new byte[] {1, 2, 3, 4};
+        Frame request = Frame.request(Opcode.APPEND, header, ByteBuffer.wrap(payload), 17L);
+        EmbeddedChannel channel = new EmbeddedChannel(new NettyFrameCodec.Encoder(), new NettyFrameCodec.Decoder());
+        try {
+            assertTrue(channel.writeOutbound(request));
+            ByteBuf wire = channel.readOutbound();
+            assertTrue(channel.writeInbound(wire));
+            Frame decoded = channel.readInbound();
+            try {
+                assertTrue(decoded.ownsBuffer());
+                ByteBuffer internal = decoded.payloadInternalReadBuffer();
+                assertSame(internal, decoded.payloadInternalReadBuffer());
+                assertEquals(payload.length, internal.remaining());
+                byte[] got = new byte[payload.length];
+                internal.duplicate().get(got);
+                assertArrayEquals(payload, got);
+
+                byte[] publicRead = new byte[payload.length];
+                decoded.payloadReadBuffer().get(publicRead);
+                assertArrayEquals(payload, publicRead);
+            } finally {
+                decoded.close();
+            }
+        } finally {
+            channel.finishAndReleaseAll();
         }
     }
 

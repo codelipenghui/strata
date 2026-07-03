@@ -148,7 +148,14 @@ public final class Frame implements AutoCloseable {
     static Frame fromOwnedBuffer(short opcode, short apiVersion, short flags, long correlationId,
                                  ByteBuf owner, int headerIndex, int headerLen, int payloadIndex, int payloadLen,
                                  int payloadCrc) {
-        return new Frame(opcode, apiVersion, flags, correlationId, null, null, null, null, owner,
+        return fromOwnedBuffer(opcode, apiVersion, flags, correlationId, owner, headerIndex, headerLen,
+                payloadIndex, payloadLen, payloadCrc, null);
+    }
+
+    static Frame fromOwnedBuffer(short opcode, short apiVersion, short flags, long correlationId,
+                                 ByteBuf owner, int headerIndex, int headerLen, int payloadIndex, int payloadLen,
+                                 int payloadCrc, ByteBuffer internalPayloadReadBuffer) {
+        return new Frame(opcode, apiVersion, flags, correlationId, null, null, internalPayloadReadBuffer, null, owner,
                 headerIndex, headerLen, payloadIndex, payloadLen, null,
                 retainedPayloadCrc(flags, payloadLen, payloadCrc));
     }
@@ -313,6 +320,17 @@ public final class Frame implements AutoCloseable {
         return owner != null ? ownerBuffer(ownerPayloadIndex, ownerPayloadLen)
                 : payloadBytes != null ? ByteBuffer.wrap(payloadBytes, payloadBytesOffset, payloadBytesLen)
                 : payload.duplicate();
+    }
+
+    /**
+     * Single-use internal payload view for synchronous hot paths. Unlike {@link #payloadReadBuffer()},
+     * this may return a transport-cached cursor, so callers must not retain it or call it concurrently.
+     */
+    public ByteBuffer payloadInternalReadBuffer() {
+        if (filePayload != null) {
+            throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
+        }
+        return owner != null && payload != null ? payload : payloadReadBuffer();
     }
 
     ByteBuffer payloadView() {

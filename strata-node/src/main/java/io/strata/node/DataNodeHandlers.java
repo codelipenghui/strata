@@ -220,7 +220,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
         RequestContext.setNamespace(m.namespace().value());
         ChunkStore.AppendOutcome outcome = APPEND_OUTCOME.get();
         store.appendAsync(m.namespace(), m.fileId(), m.chunkIndex(), m.writeEpoch(),
-                m.baseOffset(), m.durableOffset(), req.payloadReadBuffer(), req.payloadCrc(),
+                m.baseOffset(), m.durableOffset(), req.payloadInternalReadBuffer(), req.payloadCrc(),
                 m.recovery(), outcome);
         return outcome;
     }
