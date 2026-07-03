@@ -130,6 +130,9 @@ public final class Messages {
 
     public record OpenChunk(ChunkId chunkId, int writeEpoch, boolean fsyncOnAck,
                             long expectedMaxBytes, long createdAtMs, StrataNamespace namespace) {
+        private static final ThreadLocal<OwnedOpenChunkDecoder> OWNED_DECODER =
+                ThreadLocal.withInitial(OwnedOpenChunkDecoder::new);
+
         public OpenChunk {
             namespace = Objects.requireNonNull(namespace, "namespace");
         }
@@ -150,6 +153,144 @@ public final class Messages {
             StrataNamespace namespace = StrataNamespace.readFrom(b);
             TaggedFields.readFrom(b);
             return new OpenChunk(chunkId, writeEpoch, fsyncOnAck, expectedMaxBytes, createdAtMs, namespace);
+        }
+
+        public static OpenChunk decode(Frame frame) {
+            if (!frame.hasOwnedHeader()) {
+                return decode(frame.headerReadBuffer());
+            }
+            return OWNED_DECODER.get().decode(frame);
+        }
+
+        private static void validateTaggedFieldTag(long tag) {
+            if (tag < 0 || tag > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("bad tagged-field tag: " + tag);
+            }
+        }
+
+        private static void requireEndOfTaggedFields(int remaining) {
+            if (remaining != 0) {
+                throw new IllegalArgumentException("trailing bytes after tagged fields: " + remaining);
+            }
+        }
+
+        private static final class OwnedOpenChunkDecoder implements StrataNamespace.AsciiBytes {
+            private Frame frame;
+            private int pos;
+            private int namespaceOffset;
+
+            OpenChunk decode(Frame frame) {
+                this.frame = frame;
+                pos = 0;
+                namespaceOffset = 0;
+                try {
+                    long fileId = readLong();
+                    int chunkIndex = readInt();
+                    int writeEpoch = readInt();
+                    boolean fsyncOnAck = readBoolean();
+                    long expectedMaxBytes = readLong();
+                    long createdAtMs = readLong();
+                    StrataNamespace namespace = readNamespace();
+                    readTaggedFields();
+                    return new OpenChunk(new ChunkId(FileId.of(fileId), chunkIndex), writeEpoch,
+                            fsyncOnAck, expectedMaxBytes, createdAtMs, namespace);
+                } finally {
+                    this.frame = null;
+                }
+            }
+
+            @Override
+            public byte byteAt(int index) {
+                return frame.ownedHeaderByte(namespaceOffset + index);
+            }
+
+            private long readLong() {
+                require(Long.BYTES);
+                long value = frame.ownedHeaderLong(pos);
+                pos += Long.BYTES;
+                return value;
+            }
+
+            private int readInt() {
+                require(Integer.BYTES);
+                int value = frame.ownedHeaderInt(pos);
+                pos += Integer.BYTES;
+                return value;
+            }
+
+            private boolean readBoolean() {
+                byte value = readByte();
+                if (value == 0) {
+                    return false;
+                }
+                if (value == 1) {
+                    return true;
+                }
+                throw new IllegalArgumentException("bad boolean value on wire: " + (value & 0xFF));
+            }
+
+            private StrataNamespace readNamespace() {
+                long lenLong = readUnsigned();
+                if (lenLong > remaining()) {
+                    throw new IllegalArgumentException(
+                            "bad namespace length on wire: " + lenLong + " (remaining " + remaining() + ")");
+                }
+                namespaceOffset = pos;
+                StrataNamespace namespace = StrataNamespace.readFrom((int) lenLong, this);
+                pos += (int) lenLong;
+                return namespace;
+            }
+
+            private void readTaggedFields() {
+                long n = readUnsigned();
+                if (n == 0) {
+                    requireEndOfTaggedFields(remaining());
+                    return;
+                }
+                if (n < 0 || n > 1024) {
+                    throw new IllegalArgumentException("bad tagged-field count: " + n);
+                }
+                for (int i = 0; i < n; i++) {
+                    long tagValue = readUnsigned();
+                    validateTaggedFieldTag(tagValue);
+                    long size = readUnsigned();
+                    if (size < 0 || size > remaining()) {
+                        throw new IllegalArgumentException("bad tagged-field size: " + size);
+                    }
+                    pos += (int) size;
+                }
+                requireEndOfTaggedFields(remaining());
+            }
+
+            private long readUnsigned() {
+                long value = 0;
+                int shift = 0;
+                while (true) {
+                    if (shift > 63) throw new IllegalArgumentException("varint too long");
+                    byte b = readByte();
+                    if (shift == 63 && (b & 0xFE) != 0) {
+                        throw new IllegalArgumentException("varint too long");
+                    }
+                    value |= (long) (b & 0x7F) << shift;
+                    if ((b & 0x80) == 0) return value;
+                    shift += 7;
+                }
+            }
+
+            private byte readByte() {
+                require(1);
+                return frame.ownedHeaderByte(pos++);
+            }
+
+            private int remaining() {
+                return frame.headerLength() - pos;
+            }
+
+            private void require(int bytes) {
+                if (bytes > remaining()) {
+                    throw new BufferUnderflowException();
+                }
+            }
         }
     }
 

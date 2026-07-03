@@ -200,6 +200,53 @@ class ProtocolCoverageTest {
     }
 
     @Test
+    void openChunkDecodeReadsOwnedDirectHeader() {
+        StrataNamespace namespace = StrataNamespace.of("test");
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);
+        Messages.OpenChunk expected = new Messages.OpenChunk(
+                chunkId, 7, true, 1L << 30, 1_718_000_000_000L, namespace);
+        BufWriter header = new BufWriter();
+        header.chunkId(chunkId).i32(7).u8(1).u64(1L << 30).u64(1_718_000_000_000L)
+                .namespace(namespace);
+        TaggedFields.of(Map.of(99, new byte[] {8, 9})).writeTo(header);
+        byte[] encoded = header.toBytes();
+
+        ByteBuf owner = Unpooled.directBuffer(encoded.length + 5);
+        owner.writeZero(3);
+        int headerIndex = owner.writerIndex();
+        owner.writeBytes(encoded);
+        owner.writeZero(2);
+        Frame frame = Frame.fromOwnedBuffer(Opcode.OPEN_CHUNK.code, (short) 1, (short) 0, 17L,
+                owner, headerIndex, encoded.length, headerIndex + encoded.length, 0, 0);
+        try {
+            assertEquals(expected, Messages.OpenChunk.decode(frame));
+        } finally {
+            frame.close();
+        }
+    }
+
+    @Test
+    void openChunkOwnedDecodeRejectsBadBoolean() {
+        StrataNamespace namespace = StrataNamespace.of("test");
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);
+        BufWriter header = new BufWriter();
+        header.chunkId(chunkId).i32(7).u8(2).u64(1L << 30).u64(1_718_000_000_000L)
+                .namespace(namespace).noTags();
+        byte[] encoded = header.toBytes();
+
+        ByteBuf owner = Unpooled.directBuffer(encoded.length);
+        owner.writeBytes(encoded);
+        Frame frame = Frame.fromOwnedBuffer(Opcode.OPEN_CHUNK.code, (short) 1, (short) 0, 17L,
+                owner, 0, encoded.length, encoded.length, 0, 0);
+        try {
+            var error = assertThrows(IllegalArgumentException.class, () -> Messages.OpenChunk.decode(frame));
+            assertTrue(error.getMessage().contains("boolean"));
+        } finally {
+            frame.close();
+        }
+    }
+
+    @Test
     void readDecodeReadsOwnedDirectHeader() {
         StrataNamespace namespace = StrataNamespace.of("test");
         ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);

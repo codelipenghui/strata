@@ -86,7 +86,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case PING -> ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
 
             case OPEN_CHUNK -> {
-                var m = Messages.OpenChunk.decode(req.headerReadBuffer());
+                var m = Messages.OpenChunk.decode(req);
                 RequestContext.setNamespace(m.namespace().value());
                 if (node.isDraining()) {
                     throw new ScpException(ErrorCode.NO_CAPACITY, "node draining");
