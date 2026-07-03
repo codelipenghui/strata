@@ -33,21 +33,27 @@ final class NettyFrameCodec {
                 throw new IOException("file payload frames must be written as a frame prefix plus FileRegion");
             }
             FailureInjector.point("scp.encoder.beforeHeader");
-            ByteBuffer payload = f.payloadView();
             int headerLen = f.headerLength();
-            int payloadLen = payload.remaining();
+            ByteBuffer payload = f.hasPayloadBytes() ? null : f.payloadView();
+            int payloadLen = f.hasPayloadBytes() ? f.payloadBytesLength() : payload.remaining();
 
             short flags = f.flags();
             int payloadCrc = 0;
             if (payloadLen > 0) {
-                payloadCrc = Crc.of(payload);
+                payloadCrc = f.hasPayloadBytes()
+                        ? Crc.of(f.payloadBytes(), f.payloadBytesOffset(), payloadLen)
+                        : Crc.of(payload);
                 flags |= Frame.FLAG_PAYLOAD_CRC;
             }
 
             writePrefix(out, f, headerLen, payloadLen, payloadCrc, flags);
             writeHeader(out, f);
             FailureInjector.point("scp.encoder.beforePayload");
-            writeBytes(out, payload);
+            if (f.hasPayloadBytes()) {
+                out.writeBytes(f.payloadBytes(), f.payloadBytesOffset(), payloadLen);
+            } else {
+                writeBytes(out, payload);
+            }
         }
     }
 

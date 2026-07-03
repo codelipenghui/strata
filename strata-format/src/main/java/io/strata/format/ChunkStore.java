@@ -1090,6 +1090,10 @@ public final class ChunkStore implements AutoCloseable {
             return length == 0 ? null : ByteBuffer.wrap(buffer.bytes(), 0, length);
         }
 
+        public byte[] payloadBytes() {
+            return buffer.bytes();
+        }
+
         public int length() {
             return length;
         }

@@ -263,6 +263,23 @@ class ProtocolCoverageTest {
         assertThrows(ReadOnlyBufferException.class, () -> borrowedResponse.payloadSlice().put((byte) 0));
         borrowedResponse.close();
         assertTrue(released.get());
+
+        byte[] borrowedBytes = {1, 2, 3, 4};
+        AtomicBoolean bytesReleased = new AtomicBoolean(false);
+        Frame bytesResponse = Frame.responseBytes(request, Messages.okHeader(), borrowedBytes, 3,
+                () -> bytesReleased.set(true));
+        assertEquals(3, bytesResponse.payloadLength());
+        byte[] bytesPayload = new byte[3];
+        bytesResponse.payloadSlice().get(bytesPayload);
+        assertArrayEquals(new byte[]{1, 2, 3}, bytesPayload);
+        ByteArrayOutputStream encodedBytesResponse = new ByteArrayOutputStream();
+        FrameIO.write(new DataOutputStream(encodedBytesResponse), bytesResponse);
+        Frame decodedBytesResponse = FrameIO.read(new DataInputStream(
+                new ByteArrayInputStream(encodedBytesResponse.toByteArray())));
+        assertEquals(Crc.of(borrowedBytes, 0, 3), decodedBytesResponse.payloadCrc());
+        bytesResponse.close();
+        assertTrue(bytesReleased.get());
+
         Frame nullHeader = Frame.request(Opcode.PING, null, null, 12);
         assertEquals(0, nullHeader.headerSlice().remaining());
         assertEquals(0, Frame.response(nullHeader, null, null).headerSlice().remaining());

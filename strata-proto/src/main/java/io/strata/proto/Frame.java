@@ -40,6 +40,9 @@ public final class Frame implements AutoCloseable {
     private final byte headerKind;
     private final long headerU64;
     private final ByteBuffer payload;
+    private final byte[] payloadBytes;
+    private final int payloadBytesOffset;
+    private final int payloadBytesLen;
     private final FilePayload filePayload;
     private final ByteBuf owner;
     private final int ownerHeaderIndex;
@@ -79,6 +82,9 @@ public final class Frame implements AutoCloseable {
         this.headerKind = HEADER_KIND_BUFFER;
         this.headerU64 = 0;
         this.payload = payload;
+        this.payloadBytes = null;
+        this.payloadBytesOffset = 0;
+        this.payloadBytesLen = 0;
         this.filePayload = filePayload;
         this.owner = owner;
         this.ownerHeaderIndex = ownerHeaderIndex;
@@ -100,7 +106,34 @@ public final class Frame implements AutoCloseable {
         this.headerKind = HEADER_KIND_OK_U64;
         this.headerU64 = okU64Header;
         this.payload = payload;
+        this.payloadBytes = null;
+        this.payloadBytesOffset = 0;
+        this.payloadBytesLen = 0;
         this.filePayload = filePayload;
+        this.owner = null;
+        this.ownerHeaderIndex = -1;
+        this.ownerHeaderLen = -1;
+        this.ownerPayloadIndex = -1;
+        this.ownerPayloadLen = -1;
+        this.payloadReleaser = payloadReleaser;
+        this.payloadCrc = 0;
+    }
+
+    private Frame(short opcode, short apiVersion, short flags, long correlationId, byte[] headerBytes,
+                  byte[] payloadBytes, int payloadBytesOffset, int payloadBytesLen, Runnable payloadReleaser) {
+        this.opcode = opcode;
+        this.apiVersion = apiVersion;
+        this.flags = flags;
+        this.correlationId = correlationId;
+        this.header = EMPTY;
+        this.headerBytes = headerBytes;
+        this.headerKind = HEADER_KIND_BUFFER;
+        this.headerU64 = 0;
+        this.payload = EMPTY;
+        this.payloadBytes = payloadBytes;
+        this.payloadBytesOffset = payloadBytesOffset;
+        this.payloadBytesLen = payloadBytesLen;
+        this.filePayload = null;
         this.owner = null;
         this.ownerHeaderIndex = -1;
         this.ownerHeaderLen = -1;
@@ -223,6 +256,22 @@ public final class Frame implements AutoCloseable {
         return headerBytes;
     }
 
+    boolean hasPayloadBytes() {
+        return payloadBytes != null;
+    }
+
+    byte[] payloadBytes() {
+        return payloadBytes;
+    }
+
+    int payloadBytesOffset() {
+        return payloadBytesOffset;
+    }
+
+    int payloadBytesLength() {
+        return payloadBytesLen;
+    }
+
     byte ownedHeaderByte(int offset) {
         return owner.getByte(ownerHeaderIndex + offset);
     }
@@ -247,6 +296,7 @@ public final class Frame implements AutoCloseable {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
         return owner != null ? ownerBuffer(ownerPayloadIndex, ownerPayloadLen).asReadOnlyBuffer()
+                : payloadBytes != null ? ByteBuffer.wrap(payloadBytes, payloadBytesOffset, payloadBytesLen).asReadOnlyBuffer()
                 : payload.asReadOnlyBuffer();
     }
 
@@ -258,21 +308,25 @@ public final class Frame implements AutoCloseable {
         if (filePayload != null) {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
-        return owner != null ? ownerBuffer(ownerPayloadIndex, ownerPayloadLen) : payload.duplicate();
+        return owner != null ? ownerBuffer(ownerPayloadIndex, ownerPayloadLen)
+                : payloadBytes != null ? ByteBuffer.wrap(payloadBytes, payloadBytesOffset, payloadBytesLen)
+                : payload.duplicate();
     }
 
     ByteBuffer payloadView() {
         if (filePayload != null) {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
-        return owner != null ? ownerBuffer(ownerPayloadIndex, ownerPayloadLen) : payload;
+        return owner != null ? ownerBuffer(ownerPayloadIndex, ownerPayloadLen)
+                : payloadBytes != null ? ByteBuffer.wrap(payloadBytes, payloadBytesOffset, payloadBytesLen)
+                : payload;
     }
 
     public int payloadLength() {
         if (filePayload != null) {
             return filePayload.length();
         }
-        return owner != null ? ownerPayloadLen : payload.remaining();
+        return owner != null ? ownerPayloadLen : payloadBytes != null ? payloadBytesLen : payload.remaining();
     }
 
     /** CRC32C of the payload as computed by the sender and verified at decode; 0 when no payload CRC. */
@@ -379,6 +433,22 @@ public final class Frame implements AutoCloseable {
         return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
                 EMPTY, headerBytes(header), slice(payload),
                 null, null, payloadReleaser, 0);
+    }
+
+    public static Frame responseBytes(Frame req, byte[] header, byte[] payload, int payloadLen,
+                                      Runnable payloadReleaser) {
+        if (payloadLen < 0) {
+            throw new IllegalArgumentException("negative payload length: " + payloadLen);
+        }
+        if (payloadLen == 0) {
+            return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
+                    EMPTY, headerBytes(header), EMPTY, null, null, payloadReleaser, 0);
+        }
+        if (payload == null || payloadLen > payload.length) {
+            throw new IllegalArgumentException("invalid payload length " + payloadLen);
+        }
+        return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
+                headerBytes(header), payload, 0, payloadLen, payloadReleaser);
     }
 
     public static Frame fileResponse(Frame req, byte[] header, FilePayload filePayload) {

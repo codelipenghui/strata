@@ -187,7 +187,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
         boolean success = false;
         try {
             byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
-            Frame frame = ScpServer.ok(req, header, r.payloadBuffer(), r::close);
+            Frame frame = ScpServer.okBytes(req, header, r.payloadBytes(), r.length(), r::close);
             success = true;
             return frame;
         } finally {
