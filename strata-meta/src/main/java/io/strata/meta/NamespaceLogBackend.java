@@ -42,11 +42,11 @@ import java.util.function.Predicate;
  * routing (M2). Each {@link NamespaceMetadataLogRepository} owns a per-namespace {@link ReentrantLock}
  * (not {@code synchronized}) held across that namespace's durable append, so the blocking root/file-store
  * I/O inside a critical section never pins a virtual-thread carrier — and a slow append in one namespace
- * never head-of-line-blocks a mutation in another. Repo creation/warm/close is guarded by
- * {@code repoCreateLock}; best-effort metric reads ({@code loadedNamespaceCount}/{@code namespaceStats}/
- * {@code listNamespaces}) run lock-free over the {@link ConcurrentHashMap} of repos.
+     * never head-of-line-blocks a mutation in another. Repo creation/recovery is guarded by that namespace's
+     * leadership handle; best-effort metric reads ({@code loadedNamespaceCount}/{@code namespaceStats}/
+     * {@code listNamespaces}) run lock-free over the {@link ConcurrentHashMap} of namespace handles.
  */
-final class NamespaceLogBackend implements AutoCloseable {
+final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
 
     private static final Logger log = LoggerFactory.getLogger(NamespaceLogBackend.class);
 
@@ -61,14 +61,66 @@ final class NamespaceLogBackend implements AutoCloseable {
     private final NamespaceMetadataFileStore fileStore;
     private final boolean ownsRoot;
     private final NamespaceLogMetrics metrics = new NamespaceLogMetrics();
-    private final ConcurrentHashMap<StrataNamespace, NamespaceMetadataLogRepository> repos =
+    private final ConcurrentHashMap<StrataNamespace, NamespaceLeadershipHandle> namespaces =
             new ConcurrentHashMap<>();
-    private final ReentrantLock repoCreateLock = new ReentrantLock();
     // Only namespaces this node OWNS may be opened here — opening another owner's namespace would
     // republish its manifest and fence the real owner. Default ns->true for single-node / tests.
     private volatile Predicate<StrataNamespace> ownsNamespace = ns -> true;
     private volatile boolean closed;
     private volatile Thread compactionThread;
+
+    private static final class NamespaceLeadershipHandle {
+        private final StrataNamespace namespace;
+        private final ReentrantLock openLock = new ReentrantLock();
+        private final ReentrantLock reconcileLock = new ReentrantLock();
+        private volatile NamespaceLeaderState state = NamespaceLeaderState.STANDBY;
+        private volatile NamespaceMetadataLogRepository repo;
+        private volatile long metadataEpoch;
+        private volatile long activeSinceMs;
+
+        private NamespaceLeadershipHandle(StrataNamespace namespace) {
+            this.namespace = namespace;
+        }
+
+        private NamespaceMetadataLogRepository activeRepo() {
+            NamespaceMetadataLogRepository r = repo;
+            return state == NamespaceLeaderState.ACTIVE && r != null ? r : null;
+        }
+
+        private void recovering(long epoch) {
+            metadataEpoch = epoch;
+            activeSinceMs = 0;
+            state = NamespaceLeaderState.RECOVERING;
+        }
+
+        private void activate(NamespaceMetadataLogRepository opened) {
+            repo = opened;
+            metadataEpoch = opened.metadataEpoch();
+            activeSinceMs = System.currentTimeMillis();
+            state = NamespaceLeaderState.ACTIVE;
+        }
+
+        private void fenceIfCurrent(NamespaceMetadataLogRepository stale) {
+            if (repo == stale) {
+                repo = null;
+                activeSinceMs = 0;
+                state = NamespaceLeaderState.FENCED;
+            }
+        }
+
+        private void restore(NamespaceMetadataLogRepository stale) {
+            repo = stale;
+            if (stale != null) {
+                metadataEpoch = stale.metadataEpoch();
+                activeSinceMs = System.currentTimeMillis();
+                state = NamespaceLeaderState.ACTIVE;
+            } else {
+                metadataEpoch = 0;
+                activeSinceMs = 0;
+                state = NamespaceLeaderState.STANDBY;
+            }
+        }
+    }
 
     NamespaceLogBackend(MetadataStore root, NamespaceMetadataFileStore fileStore, boolean ownsRoot) {
         this.root = root;
@@ -87,7 +139,13 @@ final class NamespaceLogBackend implements AutoCloseable {
 
     /** Namespaces with a live owner repository on this instance — the sharding load this node carries. */
     int loadedNamespaceCount() {
-        return repos.size(); // best-effort gauge over the ConcurrentHashMap (lock-free)
+        int count = 0;
+        for (NamespaceLeadershipHandle handle : namespaces.values()) {
+            if (handle.activeRepo() != null) {
+                count++;
+            }
+        }
+        return count; // best-effort gauge over the ConcurrentHashMap (lock-free)
     }
 
     /** Per-namespace stats for the namespaces this node owns: {@code namespace -> [liveFiles, openLogBytes]}. */
@@ -95,9 +153,12 @@ final class NamespaceLogBackend implements AutoCloseable {
         // Best-effort gauges over the ConcurrentHashMap; each per-namespace read is taken under that repo's
         // lock — liveFileCount() iterates a plain HashMap that append() mutates under the same lock, so a
         // lock-free read would race into a ConcurrentModificationException.
-        Map<StrataNamespace, long[]> out = new HashMap<>(repos.size());
-        for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
-            NamespaceMetadataLogRepository repo = e.getValue();
+        Map<StrataNamespace, long[]> out = new HashMap<>(namespaces.size());
+        for (Map.Entry<StrataNamespace, NamespaceLeadershipHandle> e : namespaces.entrySet()) {
+            NamespaceMetadataLogRepository repo = e.getValue().activeRepo();
+            if (repo == null) {
+                continue;
+            }
             repo.lock();
             try {
                 out.put(e.getKey(), new long[]{repo.liveFileCount(), repo.openLogBytes()});
@@ -277,8 +338,11 @@ final class NamespaceLogBackend implements AutoCloseable {
      */
     int compactOversizedRepos(long thresholdBytes) {
         int compacted = 0;
-        for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
-            NamespaceMetadataLogRepository repo = e.getValue();
+        for (Map.Entry<StrataNamespace, NamespaceLeadershipHandle> e : namespaces.entrySet()) {
+            NamespaceMetadataLogRepository repo = e.getValue().activeRepo();
+            if (repo == null) {
+                continue;
+            }
             try {
                 if (repo.compact(thresholdBytes)) {
                     compacted++;
@@ -286,7 +350,7 @@ final class NamespaceLogBackend implements AutoCloseable {
             } catch (IllegalStateException fenced) {
                 // The only IllegalStateException compact() raises in steady state is a lost manifest CAS —
                 // another node owns this namespace now; drop the stale repo so the next op re-acquires.
-                repos.remove(e.getKey(), repo);
+                e.getValue().fenceIfCurrent(repo);
                 if (!closed) {
                     log.warn("namespace {} open-log compaction fenced — evicting stale repo", e.getKey(), fenced);
                 }
@@ -301,43 +365,72 @@ final class NamespaceLogBackend implements AutoCloseable {
         return compacted;
     }
 
+    private NamespaceLeadershipHandle namespaceHandle(StrataNamespace namespace) {
+        return namespaces.computeIfAbsent(namespace, NamespaceLeadershipHandle::new);
+    }
+
     private NamespaceMetadataLogRepository repo(StrataNamespace namespace) throws Exception {
         requireOwnedNamespace(namespace);
-        NamespaceMetadataLogRepository r = repos.get(namespace);   // fast path, lock-free
+        NamespaceLeadershipHandle handle = namespaceHandle(namespace);
+        NamespaceMetadataLogRepository r = handle.activeRepo();   // fast path, lock-free
         if (r != null) {
             return r;
         }
-        repoCreateLock.lock();
+        handle.openLock.lock();
         try {
             // Cold acquisition = this node started owning a namespace it had no repository for: an
             // ownership handoff to this node, counted as an owner-change.
-            return openLocked(namespace, true);
+            return openLocked(handle, true);
         } finally {
-            repoCreateLock.unlock();
+            handle.openLock.unlock();
         }
     }
 
     /**
      * Opens (and recovers) this node's repository for {@code namespace} if not already cached; caller holds
-     * {@code repoCreateLock}. {@code countAsAcquisition} distinguishes a genuine cold ownership handoff
+     * the namespace handle's open lock. {@code countAsAcquisition} distinguishes a genuine cold ownership handoff
      * (counted in {@code ownerChanges}) from the fence-driven in-place {@link #reacquire} — an epoch bump on
      * a namespace this node already owns, which must NOT register as an owner change. If another thread won
      * the open race the existing repo is returned and nothing is counted.
      */
-    private NamespaceMetadataLogRepository openLocked(StrataNamespace namespace, boolean countAsAcquisition)
+    private NamespaceMetadataLogRepository openLocked(NamespaceLeadershipHandle handle, boolean countAsAcquisition)
             throws Exception {
+        StrataNamespace namespace = handle.namespace;
         requireOwnedNamespace(namespace);
-        NamespaceMetadataLogRepository r = repos.get(namespace);
+        NamespaceMetadataLogRepository r = handle.activeRepo();
         if (r != null) {
             return r;
         }
         long epoch = root.allocateMetadataEpoch();
-        r = NamespaceMetadataLogRepository.open(namespace, fileStore, root, epoch, metrics);
-        repos.put(namespace, r);   // publish only after recovery
-        if (countAsAcquisition) {
-            metrics.recordOwnerAcquired(namespace);
+        handle.recovering(epoch);
+        try {
+            r = NamespaceMetadataLogRepository.open(namespace, fileStore, root, epoch, metrics);
+            assertRecoveredBeforeActive(handle, r);
+            handle.activate(r);   // publish only after recovery + manifest CAS
+            if (countAsAcquisition) {
+                metrics.recordOwnerAcquired(namespace);
+            }
+            return r;
+        } catch (Exception e) {
+            if (handle.repo == null) {
+                handle.restore(null);
+            }
+            throw e;
         }
-        return r;
+    }
+
+    private static void assertRecoveredBeforeActive(NamespaceLeadershipHandle handle,
+                                                    NamespaceMetadataLogRepository repo) {
+        if (repo.metadataEpoch() != handle.metadataEpoch) {
+            throw new IllegalStateException("namespace " + handle.namespace
+                    + " recovered epoch " + repo.metadataEpoch() + " but handle expected " + handle.metadataEpoch);
+        }
+        if (repo.state() == null) {
+            throw new IllegalStateException("namespace " + handle.namespace + " recovered without metadata state");
+        }
+        if (repo.openLogBytes() < 0) {
+            throw new IllegalStateException("namespace " + handle.namespace + " recovered with a negative open log");
+        }
     }
 
     @FunctionalInterface
@@ -434,21 +527,24 @@ final class NamespaceLogBackend implements AutoCloseable {
      */
     private NamespaceMetadataLogRepository reacquire(StrataNamespace namespace,
             NamespaceMetadataLogRepository stale) throws Exception {
-        repoCreateLock.lock();
+        NamespaceLeadershipHandle handle = namespaceHandle(namespace);
+        handle.openLock.lock();
         try {
-            boolean removed = repos.remove(namespace, stale); // no-op if another thread already re-acquired
+            NamespaceMetadataLogRepository current = handle.activeRepo();
+            if (current != null && current != stale) {
+                return current; // another thread already re-acquired
+            }
+            handle.fenceIfCurrent(stale);
             try {
                 // In-place epoch bump on a namespace this node already owns — NOT an ownership handoff, so it
                 // must not increment ownerChanges (recordReacquire already counts this churn separately).
-                return openLocked(namespace, false);
+                return openLocked(handle, false);
             } catch (Exception e) {
-                if (removed) {
-                    repos.putIfAbsent(namespace, stale);
-                }
+                handle.restore(stale);
                 throw e;
             }
         } finally {
-            repoCreateLock.unlock();
+            handle.openLock.unlock();
         }
     }
 
@@ -694,12 +790,13 @@ final class NamespaceLogBackend implements AutoCloseable {
     }
 
     List<StrataNamespace> listNamespaces() throws Exception {
-        // System (metadata-log) namespaces come from the root; user namespaces from the loaded repos.
+        // System (metadata-log) namespaces come from the root; user namespaces from active namespace handles.
         // The per-repo live check is taken under that repo's lock: state().hasLiveFiles() iterates a plain
         // HashMap that append() mutates under the same lock, so a lock-free read would race into a CME.
         Set<StrataNamespace> out = new LinkedHashSet<>(root.listNamespaces());
-        for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
-            if (runLocked(e.getValue(), repo -> repo.state().hasLiveFiles())) {
+        for (Map.Entry<StrataNamespace, NamespaceLeadershipHandle> e : namespaces.entrySet()) {
+            NamespaceMetadataLogRepository repo = e.getValue().activeRepo();
+            if (repo != null && runLocked(repo, active -> active.state().hasLiveFiles())) {
                 out.add(e.getKey());
             }
         }
@@ -712,7 +809,7 @@ final class NamespaceLogBackend implements AutoCloseable {
     }
 
     /**
-     * Reaps tombstones only in the loaded (owned) namespace repos — the system-file tombstones in the
+     * Reaps tombstones only in the active owned namespace handles — the system-file tombstones in the
      * shared root are NOT touched here (the leader sweeps those globally via {@link #sweepDeletedFiles}).
      * Each namespace owner calls this so its own namespaces' tombstones are reaped even when it does not
      * hold the global leader latch.
@@ -720,10 +817,13 @@ final class NamespaceLogBackend implements AutoCloseable {
     int sweepOwnedNamespaceTombstones(long olderThanMs) throws Exception {
         long cutoff = System.currentTimeMillis() - olderThanMs;
         int reaped = 0;
-        // Iterate the repos lock-free, but lock EACH repo around its own sweep so the tombstone append
+        // Iterate namespace handles lock-free, but lock EACH repo around its own sweep so the tombstone append
         // stays under that namespace's mutation lock (no cross-namespace head-of-line blocking).
-        for (Map.Entry<StrataNamespace, NamespaceMetadataLogRepository> e : repos.entrySet()) {
+        for (Map.Entry<StrataNamespace, NamespaceLeadershipHandle> e : namespaces.entrySet()) {
             StrataNamespace namespace = e.getKey();
+            if (e.getValue().activeRepo() == null) {
+                continue;
+            }
             try {
                 reaped += withRepoReacquiringOnFence(namespace, repo -> {
                     int swept = 0;
@@ -743,27 +843,50 @@ final class NamespaceLogBackend implements AutoCloseable {
     }
 
     @Override
+    public NamespaceLeaderState leaderState(StrataNamespace namespace) {
+        if (isSystem(namespace)) {
+            return NamespaceLeaderState.ACTIVE;
+        }
+        NamespaceLeadershipHandle handle = namespaces.get(namespace);
+        return handle == null ? NamespaceLeaderState.STANDBY : handle.state;
+    }
+
+    @Override
+    public boolean isNamespaceActive(StrataNamespace namespace) {
+        return leaderState(namespace) == NamespaceLeaderState.ACTIVE;
+    }
+
+    @Override
+    public long namespaceActiveSinceMs(StrataNamespace namespace) {
+        if (isSystem(namespace)) {
+            return System.currentTimeMillis();
+        }
+        NamespaceLeadershipHandle handle = namespaces.get(namespace);
+        return handle == null ? 0 : handle.activeSinceMs;
+    }
+
+    @Override
+    public ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
+        return namespaceHandle(namespace).reconcileLock;
+    }
+
+    @Override
     public void close() {
-        repoCreateLock.lock();
+        if (closed) {
+            return;
+        }
+        closed = true;
+        Thread sweeper = compactionThread;
+        if (sweeper != null) {
+            sweeper.interrupt(); // best-effort; the loop also self-exits on the closed flag
+        }
         try {
-            if (closed) {
-                return;
-            }
-            closed = true;
-            Thread sweeper = compactionThread;
-            if (sweeper != null) {
-                sweeper.interrupt(); // best-effort; the loop also self-exits on the closed flag
-            }
-            try {
-                fileStore.close();
-            } catch (RuntimeException ignore) {
-                // best-effort — file-store close releases an embedded client; never block shutdown
-            }
-            if (ownsRoot) {
-                root.close();
-            }
-        } finally {
-            repoCreateLock.unlock();
+            fileStore.close();
+        } catch (RuntimeException ignore) {
+            // best-effort — file-store close releases an embedded client; never block shutdown
+        }
+        if (ownsRoot) {
+            root.close();
         }
     }
 }
