@@ -33,9 +33,8 @@ final class NettyFrameCodec {
                 throw new IOException("file payload frames must be written as a frame prefix plus FileRegion");
             }
             FailureInjector.point("scp.encoder.beforeHeader");
-            ByteBuffer header = f.headerView();
             ByteBuffer payload = f.payloadView();
-            int headerLen = header.remaining();
+            int headerLen = f.headerLength();
             int payloadLen = payload.remaining();
 
             short flags = f.flags();
@@ -45,7 +44,8 @@ final class NettyFrameCodec {
                 flags |= Frame.FLAG_PAYLOAD_CRC;
             }
 
-            writePrefix(out, f, header, payloadLen, payloadCrc, flags);
+            writePrefix(out, f, headerLen, payloadLen, payloadCrc, flags);
+            writeHeader(out, f);
             FailureInjector.point("scp.encoder.beforePayload");
             writeBytes(out, payload);
         }
@@ -55,12 +55,12 @@ final class NettyFrameCodec {
         if (!f.hasFilePayload()) {
             throw new IOException("frame has no file payload");
         }
-        ByteBuffer header = f.headerView();
         int headerLen = f.headerLength();
         ByteBuf out = allocator.buffer(Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + headerLen);
         boolean success = false;
         try {
-            writePrefix(out, f, header, f.payloadLength(), 0, f.flags());
+            writePrefix(out, f, headerLen, f.payloadLength(), 0, f.flags());
+            writeHeader(out, f);
             success = true;
             return out;
         } finally {
@@ -70,9 +70,8 @@ final class NettyFrameCodec {
         }
     }
 
-    private static void writePrefix(ByteBuf out, Frame f, ByteBuffer header, int payloadLen,
+    private static void writePrefix(ByteBuf out, Frame f, int headerLen, int payloadLen,
                                     int payloadCrc, short flags) throws IOException {
-        int headerLen = header.remaining();
         int frameLen = FrameIO.checkedFrameLength(headerLen, payloadLen);
 
         out.writeInt(frameLen);
@@ -85,7 +84,14 @@ final class NettyFrameCodec {
         out.writeInt(payloadLen);
         out.writeInt(payloadCrc);
         out.writeShort(headerLen);
-        writeBytes(out, header);
+    }
+
+    private static void writeHeader(ByteBuf out, Frame f) {
+        if (f.hasHeaderBytes()) {
+            out.writeBytes(f.headerBytes());
+        } else {
+            writeBytes(out, f.headerView());
+        }
     }
 
     private static void writeBytes(ByteBuf out, ByteBuffer source) {

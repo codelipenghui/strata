@@ -31,6 +31,7 @@ public final class Frame implements AutoCloseable {
     private final short flags;
     private final long correlationId;
     private final ByteBuffer header;
+    private final byte[] headerBytes;
     private final ByteBuffer payload;
     private final FilePayload filePayload;
     private final ByteBuf owner;
@@ -45,19 +46,19 @@ public final class Frame implements AutoCloseable {
 
     public Frame(short opcode, short apiVersion, short flags, long correlationId,
                  ByteBuffer header, ByteBuffer payload) {
-        this(opcode, apiVersion, flags, correlationId, readOnlySlice(header), readOnlySlice(payload),
+        this(opcode, apiVersion, flags, correlationId, readOnlySlice(header), null, readOnlySlice(payload),
                 null, null, null, 0);
     }
 
     private Frame(short opcode, short apiVersion, short flags, long correlationId,
-                  ByteBuffer header, ByteBuffer payload, FilePayload filePayload, ByteBuf owner,
+                  ByteBuffer header, byte[] headerBytes, ByteBuffer payload, FilePayload filePayload, ByteBuf owner,
                   Runnable payloadReleaser, int payloadCrc) {
-        this(opcode, apiVersion, flags, correlationId, header, payload, filePayload, owner,
+        this(opcode, apiVersion, flags, correlationId, header, headerBytes, payload, filePayload, owner,
                 -1, -1, -1, -1, payloadReleaser, payloadCrc);
     }
 
     private Frame(short opcode, short apiVersion, short flags, long correlationId,
-                  ByteBuffer header, ByteBuffer payload, FilePayload filePayload, ByteBuf owner,
+                  ByteBuffer header, byte[] headerBytes, ByteBuffer payload, FilePayload filePayload, ByteBuf owner,
                   int ownerHeaderIndex, int ownerHeaderLen, int ownerPayloadIndex, int ownerPayloadLen,
                   Runnable payloadReleaser, int payloadCrc) {
         this.opcode = opcode;
@@ -65,6 +66,7 @@ public final class Frame implements AutoCloseable {
         this.flags = flags;
         this.correlationId = correlationId;
         this.header = header;
+        this.headerBytes = headerBytes;
         this.payload = payload;
         this.filePayload = filePayload;
         this.owner = owner;
@@ -79,7 +81,7 @@ public final class Frame implements AutoCloseable {
     static Frame fromOwnedBuffer(short opcode, short apiVersion, short flags, long correlationId,
                                  ByteBuf owner, int headerIndex, int headerLen, int payloadIndex, int payloadLen,
                                  int payloadCrc) {
-        return new Frame(opcode, apiVersion, flags, correlationId, null, null, null, owner,
+        return new Frame(opcode, apiVersion, flags, correlationId, null, null, null, null, owner,
                 headerIndex, headerLen, payloadIndex, payloadLen, null,
                 retainedPayloadCrc(flags, payloadLen, payloadCrc));
     }
@@ -88,7 +90,7 @@ public final class Frame implements AutoCloseable {
                          ByteBuffer header, ByteBuffer payload, int payloadCrc) {
         ByteBuffer payloadSlice = readOnlySlice(payload);
         return new Frame(opcode, apiVersion, flags, correlationId,
-                readOnlySlice(header), payloadSlice, null, null, null,
+                readOnlySlice(header), null, payloadSlice, null, null, null,
                 retainedPayloadCrc(flags, payloadSlice.remaining(), payloadCrc));
     }
 
@@ -148,6 +150,7 @@ public final class Frame implements AutoCloseable {
 
     public ByteBuffer headerSlice() {
         return owner != null ? ownerBuffer(ownerHeaderIndex, ownerHeaderLen).asReadOnlyBuffer()
+                : headerBytes != null ? ByteBuffer.wrap(headerBytes).asReadOnlyBuffer()
                 : header.asReadOnlyBuffer();
     }
 
@@ -156,15 +159,25 @@ public final class Frame implements AutoCloseable {
      * {@link #headerSlice()} when exposing a buffer outside the transport/storage stack.
      */
     public ByteBuffer headerReadBuffer() {
-        return owner != null ? ownerBuffer(ownerHeaderIndex, ownerHeaderLen) : header.duplicate();
+        return owner != null ? ownerBuffer(ownerHeaderIndex, ownerHeaderLen)
+                : headerBytes != null ? ByteBuffer.wrap(headerBytes)
+                : header.duplicate();
     }
 
     int headerLength() {
-        return owner != null ? ownerHeaderLen : header.remaining();
+        return owner != null ? ownerHeaderLen : headerBytes != null ? headerBytes.length : header.remaining();
     }
 
     boolean hasOwnedHeader() {
         return owner != null;
+    }
+
+    boolean hasHeaderBytes() {
+        return headerBytes != null;
+    }
+
+    byte[] headerBytes() {
+        return headerBytes;
     }
 
     byte ownedHeaderByte(int offset) {
@@ -180,7 +193,9 @@ public final class Frame implements AutoCloseable {
     }
 
     ByteBuffer headerView() {
-        return owner != null ? ownerBuffer(ownerHeaderIndex, ownerHeaderLen) : header;
+        return owner != null ? ownerBuffer(ownerHeaderIndex, ownerHeaderLen)
+                : headerBytes != null ? ByteBuffer.wrap(headerBytes)
+                : header;
     }
 
     public ByteBuffer payloadSlice() {
@@ -237,7 +252,7 @@ public final class Frame implements AutoCloseable {
             throw new IllegalStateException("file payload cannot be copied to heap");
         }
         return new Frame(opcode, apiVersion, flags, correlationId,
-                copy(headerView()), copy(payloadView()), null, null, null, payloadCrc);
+                copy(headerView()), null, copy(payloadView()), null, null, null, payloadCrc);
     }
 
     public boolean ownsBuffer() {
@@ -289,28 +304,28 @@ public final class Frame implements AutoCloseable {
         return ByteBuffer.wrap(bytes);
     }
 
-    private static ByteBuffer headerBuffer(byte[] header) {
-        return header == null || header.length == 0 ? EMPTY : ByteBuffer.wrap(header);
+    private static byte[] headerBytes(byte[] header) {
+        return header == null || header.length == 0 ? null : header;
     }
 
     public static Frame request(Opcode op, byte[] header, ByteBuffer payload, long correlationId) {
         return new Frame(op.code, (short) 1, (short) 0, correlationId,
-                headerBuffer(header), slice(payload), null, null, null, 0);
+                EMPTY, headerBytes(header), slice(payload), null, null, null, 0);
     }
 
     public static Frame response(Frame req, byte[] header, ByteBuffer payload) {
         return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
-                headerBuffer(header), slice(payload), null, null, null, 0);
+                EMPTY, headerBytes(header), slice(payload), null, null, null, 0);
     }
 
     public static Frame response(Frame req, byte[] header, ByteBuffer payload, Runnable payloadReleaser) {
         return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
-                headerBuffer(header), slice(payload),
+                EMPTY, headerBytes(header), slice(payload),
                 null, null, payloadReleaser, 0);
     }
 
     public static Frame fileResponse(Frame req, byte[] header, FilePayload filePayload) {
         return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
-                headerBuffer(header), EMPTY, filePayload, null, null, 0);
+                EMPTY, headerBytes(header), EMPTY, filePayload, null, null, 0);
     }
 }
