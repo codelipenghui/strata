@@ -129,7 +129,7 @@ public final class Frame implements AutoCloseable {
     }
 
     public ByteBuffer headerSlice() {
-        return header.duplicate();
+        return header.asReadOnlyBuffer();
     }
 
     int headerLength() {
@@ -144,7 +144,7 @@ public final class Frame implements AutoCloseable {
         if (filePayload != null) {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
-        return payload.duplicate();
+        return payload.asReadOnlyBuffer();
     }
 
     ByteBuffer payloadView() {
@@ -211,6 +211,10 @@ public final class Frame implements AutoCloseable {
         return buffer == null ? EMPTY.duplicate() : buffer.slice().asReadOnlyBuffer();
     }
 
+    private static ByteBuffer slice(ByteBuffer buffer) {
+        return buffer == null ? EMPTY.duplicate() : buffer.slice();
+    }
+
     private static ByteBuffer copy(ByteBuffer source) {
         if (source == null || !source.hasRemaining()) {
             // header-only responses (e.g. the APPEND ack) carry an empty payload; reuse the shared
@@ -239,7 +243,7 @@ public final class Frame implements AutoCloseable {
 
     public static Frame response(Frame req, byte[] header, ByteBuffer payload, Runnable payloadReleaser) {
         return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
-                readOnlySlice(headerBuffer(header)), readOnlySlice(payload != null ? payload : EMPTY.duplicate()),
+                slice(headerBuffer(header)), slice(payload != null ? payload : EMPTY.duplicate()),
                 null, null, payloadReleaser, 0);
     }
 

@@ -12,7 +12,16 @@ public final class Crc {
     public static int of(ByteBuffer buf) {
         CRC32C crc = CRC.get();
         crc.reset();
-        crc.update(buf.duplicate());
+        if (buf.hasArray()) {
+            crc.update(buf.array(), buf.arrayOffset() + buf.position(), buf.remaining());
+        } else {
+            int position = buf.position();
+            try {
+                crc.update(buf);
+            } finally {
+                buf.position(position);
+            }
+        }
         return (int) crc.getValue();
     }
 

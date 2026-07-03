@@ -17,6 +17,7 @@ import java.nio.ReadOnlyBufferException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
@@ -225,6 +226,14 @@ class ProtocolCoverageTest {
         assertThrows(ReadOnlyBufferException.class, () -> request.headerSlice().put((byte) 0));
         Frame response = Frame.response(request, Messages.okHeader(), null);
         assertTrue(response.isResponse());
+        byte[] borrowed = "borrowed".getBytes();
+        AtomicBoolean released = new AtomicBoolean(false);
+        Frame borrowedResponse = Frame.response(request, Messages.okHeader(), ByteBuffer.wrap(borrowed),
+                () -> released.set(true));
+        assertTrue(borrowedResponse.payloadView().hasArray());
+        assertThrows(ReadOnlyBufferException.class, () -> borrowedResponse.payloadSlice().put((byte) 0));
+        borrowedResponse.close();
+        assertTrue(released.get());
         Frame nullHeader = Frame.request(Opcode.PING, null, null, 12);
         assertEquals(0, nullHeader.headerSlice().remaining());
         assertEquals(0, Frame.response(nullHeader, null, null).headerSlice().remaining());

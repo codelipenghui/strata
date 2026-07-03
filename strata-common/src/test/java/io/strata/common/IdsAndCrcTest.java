@@ -74,6 +74,30 @@ class IdsAndCrcTest {
     }
 
     @Test
+    void crcOfByteBufferPreservesPosition() {
+        byte[] bytes = "xxpayloadyy".getBytes();
+        int expected = Crc.of("payload".getBytes());
+
+        ByteBuffer heap = ByteBuffer.wrap(bytes);
+        heap.position(2).limit(9);
+        assertEquals(expected, Crc.of(heap));
+        assertEquals(2, heap.position());
+        assertEquals(9, heap.limit());
+
+        ByteBuffer direct = ByteBuffer.allocateDirect(bytes.length);
+        direct.put(bytes).flip().position(2).limit(9);
+        assertEquals(expected, Crc.of(direct));
+        assertEquals(2, direct.position());
+        assertEquals(9, direct.limit());
+
+        ByteBuffer readOnlyDirect = direct.asReadOnlyBuffer();
+        readOnlyDirect.position(2).limit(9);
+        assertEquals(expected, Crc.of(readOnlyDirect));
+        assertEquals(2, readOnlyDirect.position());
+        assertEquals(9, readOnlyDirect.limit());
+    }
+
+    @Test
     void errorCodeMapping() throws Exception {
         assertEquals(ErrorCode.FENCED_EPOCH, ErrorCode.fromCode((short) 3));
         assertEquals(ErrorCode.INTERNAL, ErrorCode.fromCode((short) 999)); // unknown future code

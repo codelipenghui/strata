@@ -47,7 +47,7 @@ final class NettyFrameCodec {
 
             writePrefix(out, f, header, payloadLen, payloadCrc, flags);
             FailureInjector.point("scp.encoder.beforePayload");
-            out.writeBytes(payload.duplicate());
+            writeBytes(out, payload);
         }
     }
 
@@ -85,7 +85,16 @@ final class NettyFrameCodec {
         out.writeInt(payloadLen);
         out.writeInt(payloadCrc);
         out.writeShort(headerLen);
-        out.writeBytes(header.duplicate());
+        writeBytes(out, header);
+    }
+
+    private static void writeBytes(ByteBuf out, ByteBuffer source) {
+        int position = source.position();
+        try {
+            out.writeBytes(source);
+        } finally {
+            source.position(position);
+        }
     }
 
     static final class Decoder extends ByteToMessageDecoder {
