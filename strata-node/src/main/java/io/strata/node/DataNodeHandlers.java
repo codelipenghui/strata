@@ -53,7 +53,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             RequestContext.setNamespace(m.namespace().value());
             return store.appendAsync(m.namespace(), m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
                             req.payloadReadBuffer(), req.payloadCrc(), m.recovery())
-                    .thenApply(r -> ScpServer.ok(req, new Messages.AppendResp(r.endOffset()).encode(), null));
+                    .thenApply(r -> ScpServer.okU64(req, r.endOffset()));
         }
         return CompletableFuture.completedFuture(handle(req));
     }

@@ -87,7 +87,11 @@ final class NettyFrameCodec {
     }
 
     private static void writeHeader(ByteBuf out, Frame f) {
-        if (f.hasHeaderBytes()) {
+        if (f.hasOkU64Header()) {
+            out.writeShort(0);
+            out.writeLong(f.okU64HeaderValue());
+            out.writeByte(0);
+        } else if (f.hasHeaderBytes()) {
             out.writeBytes(f.headerBytes());
         } else {
             writeBytes(out, f.headerView());

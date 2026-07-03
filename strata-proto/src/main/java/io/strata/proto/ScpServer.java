@@ -552,6 +552,11 @@ public final class ScpServer implements AutoCloseable {
         return Frame.response(req, header, payload);
     }
 
+    /** Convenience for handlers: success response with one u64 field and no tagged fields. */
+    public static Frame okU64(Frame req, long value) {
+        return Frame.okU64Response(req, value);
+    }
+
     /** Convenience for handlers: success response that owns the materialized payload until write close. */
     public static Frame ok(Frame req, byte[] header, ByteBuffer payload, Runnable payloadReleaser) {
         return Frame.response(req, header, payload, payloadReleaser);
