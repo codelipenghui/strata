@@ -4,7 +4,7 @@ import io.netty.buffer.ByteBuf;
 
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 /**
  * One SCP frame (tech design §10.2). Header and payload are exposed as read-only
@@ -23,6 +23,8 @@ public final class Frame implements AutoCloseable {
     public static final int PREAMBLE_AFTER_LEN = 26;
 
     private static final ByteBuffer EMPTY = ByteBuffer.allocate(0).asReadOnlyBuffer();
+    private static final AtomicIntegerFieldUpdater<Frame> CLOSED =
+            AtomicIntegerFieldUpdater.newUpdater(Frame.class, "closed");
 
     private final short opcode;
     private final short apiVersion;
@@ -38,7 +40,8 @@ public final class Frame implements AutoCloseable {
     private final int ownerPayloadLen;
     private final Runnable payloadReleaser;
     private final int payloadCrc;
-    private final AtomicBoolean closed = new AtomicBoolean(false);
+    @SuppressWarnings("unused") // updated through CLOSED
+    private volatile int closed;
 
     public Frame(short opcode, short apiVersion, short flags, long correlationId,
                  ByteBuffer header, ByteBuffer payload) {
@@ -214,7 +217,7 @@ public final class Frame implements AutoCloseable {
     public void close() {
         // a frame owns at most one inbound buffer or file payload; materialized responses may also
         // carry a payload releaser for buffers borrowed from the storage layer.
-        if (closed.compareAndSet(false, true)) {
+        if (CLOSED.compareAndSet(this, 0, 1)) {
             if (owner != null) {
                 owner.release();
             }
