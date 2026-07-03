@@ -59,6 +59,12 @@ class ChunkStoreTest {
     @TempDir
     Path dir;
 
+    @TempDir
+    Path sourceRoot;
+
+    @TempDir
+    Path importRoot;
+
     private final ChunkId id = new ChunkId(FileId.of(1), 0);
 
     private static ByteBuffer bytes(String s) {
@@ -190,11 +196,12 @@ class ChunkStoreTest {
         ChunkId chunkId = new ChunkId(FileId.of(0x0102), 0);
         byte[] payload = "sealed".getBytes(StandardCharsets.UTF_8);
         byte[] fileBytes;
-        Path sourceDir = Files.createTempDirectory(dir.getParent(), "strata-source-");
+        Path sourceDir = sourceRoot.resolve("strata-source");
         try (ChunkStore source = new ChunkStore(sourceDir)) {
             fileBytes = sealedBytes(source, chunkId, "sealed");
         }
-        Path importSourceDir = Files.createTempDirectory(dir.getParent(), "strata-import-source-");
+        Path importSourceDir = importRoot.resolve("strata-import-source");
+        Files.createDirectories(importSourceDir);
         Path sourceFile = importSourceDir.resolve("sealed.import");
         Files.write(sourceFile, fileBytes);
         List<Path> forced = new ArrayList<>();
@@ -217,11 +224,12 @@ class ChunkStoreTest {
         ChunkId chunkId = new ChunkId(FileId.of(0x0103), 0);
         byte[] payload = "source-dir-durable".getBytes(StandardCharsets.UTF_8);
         byte[] fileBytes;
-        Path generatorDir = Files.createTempDirectory(dir.getParent(), "strata-generator-");
+        Path generatorDir = sourceRoot.resolve("strata-generator");
         try (ChunkStore source = new ChunkStore(generatorDir)) {
             fileBytes = sealedBytes(source, chunkId, "source-dir-durable");
         }
-        Path sourceDir = Files.createTempDirectory(dir.getParent(), "strata-import-source-");
+        Path sourceDir = importRoot.resolve("strata-import-source");
+        Files.createDirectories(sourceDir);
         Path sourceFile = sourceDir.resolve("sealed.import");
         Files.write(sourceFile, fileBytes);
         List<Path> forced = new ArrayList<>();
@@ -244,7 +252,7 @@ class ChunkStoreTest {
     }
 
     @Test
-    void startupRecoveryDeletesOrphanSidecarsWithoutDataFile() throws Exception {
+    void startupRecoveryQuarantinesOrphanSidecarsWithoutDataFile() throws Exception {
         ChunkId orphan = new ChunkId(FileId.of(0x0203), 0);
         String base = relMkdirs(orphan);
         Path meta = dir.resolve(base + ".meta");
@@ -253,8 +261,13 @@ class ChunkStoreTest {
         Files.writeString(ledger, "orphan ledger");
 
         try (ChunkStore ignored = newStore()) {
-            assertFalse(Files.exists(meta), "orphan sidecar left after a partial delete must be removed");
-            assertFalse(Files.exists(ledger), "orphan ledger left after a partial delete must be removed");
+            assertFalse(Files.exists(meta), "orphan sidecar left after a partial delete must be moved");
+            assertFalse(Files.exists(ledger), "orphan ledger left after a partial delete must be moved");
+            Path shardDir = meta.getParent();
+            try (Stream<Path> shardFiles = Files.list(shardDir)) {
+                assertEquals(2, shardFiles.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
+                        "orphan sidecars must be quarantined for later inspection");
+            }
         }
     }
 

@@ -65,7 +65,7 @@ final class NodeRegistry {
     // owner re-reads at most once per publish interval.
     private volatile Records.ClusterLiveNodes cachedSnapshot;
     private volatile long cachedSnapshotAtMs;
-    private final AtomicLong clusterLiveNodesDecodeFailures = new AtomicLong();
+    private final AtomicLong clusterLiveNodesReadFailures = new AtomicLong();
 
     @FunctionalInterface
     interface CompletionSink {
@@ -502,15 +502,16 @@ final class NodeRegistry {
                 cachedSnapshot = snap;
                 cachedSnapshotAtMs = now;
             } catch (Exception e) {
-                clusterLiveNodesDecodeFailures.incrementAndGet();
+                cachedSnapshotAtMs = now;
+                clusterLiveNodesReadFailures.incrementAndGet();
                 log.warn("reading cluster live-nodes snapshot failed; using cached view", e);
             }
         }
         return snap;
     }
 
-    long clusterLiveNodesDecodeFailures() {
-        return clusterLiveNodesDecodeFailures.get();
+    long clusterLiveNodesReadFailures() {
+        return clusterLiveNodesReadFailures.get();
     }
 
     private static LiveNode snapshotLiveNode(Records.ClusterLiveNodes.LiveEntry e, long now) {

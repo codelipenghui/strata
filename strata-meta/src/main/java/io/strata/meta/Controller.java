@@ -311,8 +311,8 @@ public final class Controller implements AutoCloseable {
     }
 
     /** Corrupt/unreadable shared live-node snapshots seen by placement readers. */
-    public long clusterLiveNodesDecodeFailures() {
-        return registry.clusterLiveNodesDecodeFailures();
+    public long clusterLiveNodesReadFailures() {
+        return registry.clusterLiveNodesReadFailures();
     }
 
     /** This controller's rendezvous endpoint identity — the {@code owner} label for the namespace-owner

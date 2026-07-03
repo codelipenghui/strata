@@ -744,7 +744,7 @@ class NodeRegistryTest {
     }
 
     @Test
-    void corruptPlacementSnapshotIncrementsDecodeFailureAndUsesCachedView() throws Exception {
+    void corruptPlacementSnapshotIncrementsReadFailureAndUsesCachedView() throws Exception {
         FakeStore store = new FakeStore();
         long t0 = 1_000_000L;
         store.liveNodesSnapshot = new Records.ClusterLiveNodes(t0,
@@ -761,7 +761,14 @@ class NodeRegistryTest {
         assertEquals(List.of(5), registry.candidatesFor(StrataNamespace.of("ns"), t0 + 5_001).stream()
                 .map(n -> n.record.nodeId())
                 .toList(), "a corrupt refresh should keep the prior cached placement view");
-        assertEquals(1, registry.clusterLiveNodesDecodeFailures());
+        assertEquals(2, store.liveNodeReads);
+        assertEquals(1, registry.clusterLiveNodesReadFailures());
+
+        assertEquals(List.of(5), registry.candidatesFor(StrataNamespace.of("ns"), t0 + 5_002).stream()
+                .map(n -> n.record.nodeId())
+                .toList(), "failed refreshes should be rate-limited to the publish interval");
+        assertEquals(2, store.liveNodeReads, "a failed refresh must not retry on every placement call");
+        assertEquals(1, registry.clusterLiveNodesReadFailures());
     }
 
     private static ControllerConfig config() {

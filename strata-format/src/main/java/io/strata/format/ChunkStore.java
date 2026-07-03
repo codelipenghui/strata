@@ -1946,7 +1946,7 @@ public final class ChunkStore implements AutoCloseable {
                 quarantineRecoveredFiles(p);
             }
         }
-        deleteOrphanSidecarFiles(sidecarFiles);
+        quarantineOrphanSidecarFiles(sidecarFiles);
     }
 
     private void deleteStaleRootImportTemps(List<Path> rootImports) {
@@ -1973,10 +1973,11 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    private void deleteOrphanSidecarFiles(List<Path> sidecarFiles) {
+    private void quarantineOrphanSidecarFiles(List<Path> sidecarFiles) {
         if (sidecarFiles.isEmpty()) {
             return;
         }
+        String suffix = ".quarantine-" + System.currentTimeMillis();
         Set<Path> touchedDirs = new HashSet<>();
         for (Path p : sidecarFiles) {
             Path dataPath = sidecarDataPath(p);
@@ -1984,19 +1985,18 @@ public final class ChunkStore implements AutoCloseable {
                 continue;
             }
             try {
-                if (Files.deleteIfExists(p)) {
-                    touchedDirs.add(p.getParent());
-                    log.warn("deleted orphan chunk sidecar without data file: {}", p);
-                }
+                Files.move(p, quarantineTarget(p, suffix), StandardCopyOption.ATOMIC_MOVE);
+                touchedDirs.add(p.getParent());
+                log.warn("quarantined orphan chunk sidecar without data file: {}", p);
             } catch (IOException e) {
-                log.warn("failed to delete orphan chunk sidecar {}", p, e);
+                log.warn("failed to quarantine orphan chunk sidecar {}", p, e);
             }
         }
         for (Path touchedDir : touchedDirs) {
             try {
                 forceDirectory(touchedDir);
             } catch (IOException e) {
-                log.warn("failed to fsync sidecar cleanup directory {}", touchedDir, e);
+                log.warn("failed to fsync sidecar quarantine directory {}", touchedDir, e);
             }
         }
     }
