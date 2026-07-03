@@ -95,7 +95,8 @@ public final class Controller implements AutoCloseable {
                 // Build the SCP server first so the latch advertises this node's real bound endpoint
                 // (the listen port may be ephemeral) — what a standby returns as the redirect hint.
                 openedServer = new ScpServer(config.listenPort(), 0,
-                        serviceId.getMostSignificantBits(), serviceId.getLeastSignificantBits(), this::handle);
+                        serviceId.getMostSignificantBits(), serviceId.getLeastSignificantBits(),
+                        ScpServer.Handler.sync(this::handle));
                 this.advertisedEndpoint = config.advertisedHost() + ":" + openedServer.port();
             }
             // Build the backend once the endpoint is known: the namespace-log backend's system-file store
@@ -231,7 +232,7 @@ public final class Controller implements AutoCloseable {
     /** SCP handler for the metadata (control-plane) opcodes. In embedded mode the caller serves this
      *  on its own listener; standalone, it is already wired to this service's own server. */
     public ScpServer.Handler handler() {
-        return this::handle;
+        return ScpServer.Handler.sync(this::handle);
     }
 
     public boolean isLeader() {

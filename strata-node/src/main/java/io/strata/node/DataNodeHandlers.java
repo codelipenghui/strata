@@ -59,6 +59,11 @@ final class DataNodeHandlers implements ScpServer.Handler {
     }
 
     @Override
+    public boolean requiresAsyncHandling(Frame req) {
+        return req.opcode() == Opcode.APPEND.code;
+    }
+
+    @Override
     public Frame handle(Frame req) throws Exception {
         Opcode op = Opcode.fromCode(req.opcode());
         if (op == null) throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "0x" + Integer.toHexString(req.opcode()));

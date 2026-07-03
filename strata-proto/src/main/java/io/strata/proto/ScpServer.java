@@ -5,6 +5,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
@@ -63,8 +64,26 @@ public final class ScpServer implements AutoCloseable {
     public interface Handler {
         Frame handle(Frame request) throws Exception;
 
+        default boolean requiresAsyncHandling(Frame request) {
+            return true;
+        }
+
         default CompletableFuture<Frame> handleAsync(Frame request) throws Exception {
             return CompletableFuture.completedFuture(handle(request));
+        }
+
+        static Handler sync(Handler handler) {
+            return new Handler() {
+                @Override
+                public Frame handle(Frame request) throws Exception {
+                    return handler.handle(request);
+                }
+
+                @Override
+                public boolean requiresAsyncHandling(Frame request) {
+                    return false;
+                }
+            };
         }
 
         /**
@@ -83,6 +102,11 @@ public final class ScpServer implements AutoCloseable {
                 @Override
                 public CompletableFuture<Frame> handleAsync(Frame request) throws Exception {
                     return pick(request).handleAsync(request);
+                }
+
+                @Override
+                public boolean requiresAsyncHandling(Frame request) {
+                    return pick(request).requiresAsyncHandling(request);
                 }
 
                 private Handler pick(Frame request) {
@@ -298,12 +322,22 @@ public final class ScpServer implements AutoCloseable {
         private void handleRequest(ChannelHandlerContext ctx, Frame req) {
             long startNanos = System.nanoTime();
             CompletableFuture<Frame> respF;
+            Frame immediateResp = null;
             boolean handlerFailed = false;
             try {
-                respF = handler.handleAsync(req);
-                if (respF == null) {
-                    respF = CompletableFuture.completedFuture(internalError(req, "handler returned null future"));
-                    handlerFailed = true;
+                if (handler.requiresAsyncHandling(req)) {
+                    respF = handler.handleAsync(req);
+                    if (respF == null) {
+                        respF = CompletableFuture.completedFuture(internalError(req, "handler returned null future"));
+                        handlerFailed = true;
+                    }
+                } else {
+                    respF = null;
+                    immediateResp = handler.handle(req);
+                    if (immediateResp == null) {
+                        immediateResp = internalError(req, "handler returned null response");
+                        handlerFailed = true;
+                    }
                 }
             } catch (ScpException e) {
                 respF = CompletableFuture.completedFuture(
@@ -319,6 +353,11 @@ public final class ScpServer implements AutoCloseable {
             // decode, on this same connection-handler thread — read it now, before any async completion,
             // and carry it into both the sync and async observe paths.
             String ns = RequestContext.takeNamespace();
+            if (respF == null) {
+                observeRequest(req, startNanos, !handlerFailed, ns);
+                writeResponse(ctx, requireResponse(req, immediateResp), false, req);
+                return;
+            }
             if (respF.isDone() && !respF.isCompletedExceptionally()) {
                 observeRequest(req, startNanos, !handlerFailed, ns);
                 writeResponse(ctx, requireResponse(req, respF.join()), false, req); // fast path, no extra hop
@@ -437,15 +476,33 @@ public final class ScpServer implements AutoCloseable {
 
         private void finishWrite(ChannelHandlerContext ctx, ChannelFuture write, boolean closeAfterWrite,
                                  Frame frame, Frame releaseAfterWrite) {
-            write.addListener(f -> closeFrames(frame, releaseAfterWrite));
-            if (closeAfterWrite) {
-                write.addListener(f -> ctx.close());
+            write.addListener(new ResponseWriteListener(ctx, frame, releaseAfterWrite, closeAfterWrite));
+        }
+
+        private final class ResponseWriteListener implements ChannelFutureListener {
+            private final ChannelHandlerContext ctx;
+            private final Frame frame;
+            private final Frame releaseAfterWrite;
+            private final boolean closeAfterWrite;
+
+            private ResponseWriteListener(ChannelHandlerContext ctx, Frame frame, Frame releaseAfterWrite,
+                                          boolean closeAfterWrite) {
+                this.ctx = ctx;
+                this.frame = frame;
+                this.releaseAfterWrite = releaseAfterWrite;
+                this.closeAfterWrite = closeAfterWrite;
             }
-            write.addListener(f -> {
-                if (!f.isSuccess()) {
-                    ctx.close();
+
+            @Override
+            public void operationComplete(ChannelFuture future) {
+                try {
+                    closeFrames(frame, releaseAfterWrite);
+                } finally {
+                    if (closeAfterWrite || !future.isSuccess()) {
+                        ctx.close();
+                    }
                 }
-            });
+            }
         }
 
         private void closeFrames(Frame frame, Frame releaseAfterWrite) {
