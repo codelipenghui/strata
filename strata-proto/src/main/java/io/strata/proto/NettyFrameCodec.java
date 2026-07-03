@@ -21,7 +21,7 @@ final class NettyFrameCodec {
             if (f.hasFilePayload()) {
                 return super.allocateBuffer(ctx, f, preferDirect);
             }
-            int headerLen = f.headerSlice().remaining();
+            int headerLen = f.headerLength();
             int payloadLen = f.payloadLength();
             int capacity = Integer.BYTES + FrameIO.checkedFrameLength(headerLen, payloadLen);
             return preferDirect ? ctx.alloc().ioBuffer(capacity, capacity) : ctx.alloc().heapBuffer(capacity, capacity);
@@ -33,15 +33,15 @@ final class NettyFrameCodec {
                 throw new IOException("file payload frames must be written as a frame prefix plus FileRegion");
             }
             FailureInjector.point("scp.encoder.beforeHeader");
-            ByteBuffer header = f.headerSlice();
-            ByteBuffer payload = f.payloadSlice();
+            ByteBuffer header = f.headerView();
+            ByteBuffer payload = f.payloadView();
             int headerLen = header.remaining();
             int payloadLen = payload.remaining();
 
             short flags = f.flags();
             int payloadCrc = 0;
             if (payloadLen > 0) {
-                payloadCrc = Crc.of(payload.duplicate());
+                payloadCrc = Crc.of(payload);
                 flags |= Frame.FLAG_PAYLOAD_CRC;
             }
 
@@ -55,8 +55,8 @@ final class NettyFrameCodec {
         if (!f.hasFilePayload()) {
             throw new IOException("frame has no file payload");
         }
-        ByteBuffer header = f.headerSlice();
-        int headerLen = header.remaining();
+        ByteBuffer header = f.headerView();
+        int headerLen = f.headerLength();
         ByteBuf out = allocator.buffer(Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + headerLen);
         boolean success = false;
         try {

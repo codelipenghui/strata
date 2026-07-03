@@ -128,11 +128,26 @@ public final class Frame implements AutoCloseable {
         return header.duplicate();
     }
 
+    int headerLength() {
+        return header.remaining();
+    }
+
+    ByteBuffer headerView() {
+        return header;
+    }
+
     public ByteBuffer payloadSlice() {
         if (filePayload != null) {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
         return payload.duplicate();
+    }
+
+    ByteBuffer payloadView() {
+        if (filePayload != null) {
+            throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
+        }
+        return payload;
     }
 
     public int payloadLength() {

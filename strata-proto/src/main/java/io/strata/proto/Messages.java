@@ -51,6 +51,27 @@ public final class Messages {
         return rs;
     }
 
+    private static byte[] okWithU64(long value) {
+        byte[] out = new byte[Short.BYTES + Long.BYTES + 1];
+        putU64(out, Short.BYTES, value);
+        out[out.length - 1] = 0;
+        return out;
+    }
+
+    private static byte[] okWithTwoU64(long first, long second) {
+        byte[] out = new byte[Short.BYTES + Long.BYTES + Long.BYTES + 1];
+        putU64(out, Short.BYTES, first);
+        putU64(out, Short.BYTES + Long.BYTES, second);
+        out[out.length - 1] = 0;
+        return out;
+    }
+
+    private static void putU64(byte[] out, int offset, long value) {
+        for (int i = 7; i >= 0; i--) {
+            out[offset++] = (byte) (value >>> (8 * i));
+        }
+    }
+
     /* ---------- HELLO ---------- */
 
     public record Hello(byte clientKind, long featureBits, String clientId) {
@@ -180,10 +201,7 @@ public final class Messages {
 
     public record AppendResp(long endOffset) {
         public byte[] encode() {
-            BufWriter w = new BufWriter();
-            Resp.writeOk(w);
-            w.u64(endOffset).noTags();
-            return w.toBytes();
+            return okWithU64(endOffset);
         }
 
         public static AppendResp decode(ByteBuffer b) {
@@ -214,10 +232,7 @@ public final class Messages {
 
     public record ReadResp(long localEndOffset, long durableOffset) {
         public byte[] encode() {
-            BufWriter w = new BufWriter();
-            Resp.writeOk(w);
-            w.u64(localEndOffset).u64(durableOffset).noTags();
-            return w.toBytes();
+            return okWithTwoU64(localEndOffset, durableOffset);
         }
 
         public static ReadResp decode(ByteBuffer b) {
