@@ -351,6 +351,11 @@ public final class Frame implements AutoCloseable {
         if (filePayload != null) {
             throw new IllegalStateException("file payload cannot be copied to heap");
         }
+        if (owner != null) {
+            return new Frame(opcode, apiVersion, flags, correlationId,
+                    copyOwnerRange(ownerHeaderIndex, ownerHeaderLen), null,
+                    copyOwnerRange(ownerPayloadIndex, ownerPayloadLen), null, null, null, payloadCrc);
+        }
         return new Frame(opcode, apiVersion, flags, correlationId,
                 copy(headerView()), null, copy(payloadView()), null, null, null, payloadCrc);
     }
@@ -398,6 +403,15 @@ public final class Frame implements AutoCloseable {
 
     private ByteBuffer ownerBuffer(int index, int length) {
         return length == 0 ? EMPTY : owner.nioBuffer(index, length);
+    }
+
+    private ByteBuffer copyOwnerRange(int index, int length) {
+        if (length == 0) {
+            return EMPTY;
+        }
+        byte[] bytes = new byte[length];
+        owner.getBytes(index, bytes);
+        return ByteBuffer.wrap(bytes);
     }
 
     private static ByteBuffer copy(ByteBuffer source) {

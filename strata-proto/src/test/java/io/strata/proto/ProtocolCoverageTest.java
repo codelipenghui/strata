@@ -469,6 +469,18 @@ class ProtocolCoverageTest {
             frame.headerSlice().get(header);
             assertArrayEquals(new byte[] {1, 2}, header);
             assertThrows(ReadOnlyBufferException.class, () -> frame.payloadSlice().put((byte) 0));
+
+            Frame heapCopy = frame.copyToHeap();
+            frame.close();
+            assertFalse(heapCopy.ownsBuffer());
+            assertEquals(Crc.of(bytes, 3, 3), heapCopy.payloadCrc());
+            byte[] copiedHeader = new byte[2];
+            heapCopy.headerSlice().get(copiedHeader);
+            assertArrayEquals(new byte[] {1, 2}, copiedHeader);
+            byte[] copiedPayload = new byte[3];
+            heapCopy.payloadSlice().get(copiedPayload);
+            assertArrayEquals(new byte[] {3, 4, 5}, copiedPayload);
+            heapCopy.close();
         } finally {
             frame.close();
         }
