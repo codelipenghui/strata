@@ -111,34 +111,44 @@ final class NettyFrameCodec {
                 return;
             }
 
+            int sourceBase = in.readerIndex();
             ByteBuf frame = in.readRetainedSlice(frameLen);
             boolean emitted = false;
             try {
-                int base = frame.readerIndex();
-                FrameIO.checkMagicAndVersion(frame.getByte(base), frame.getByte(base + 1));
-                short opcode = frame.getShort(base + 2);
-                short apiVersion = frame.getShort(base + 4);
-                short flags = frame.getShort(base + 6);
-                long correlationId = frame.getLong(base + 8);
-                int payloadLen = frame.getInt(base + 16);
-                int payloadCrc = frame.getInt(base + 20);
-                int headerLen = frame.getUnsignedShort(base + 24);
+                int frameBase = frame.readerIndex();
+                FrameIO.checkMagicAndVersion(frame.getByte(frameBase), frame.getByte(frameBase + 1));
+                short opcode = frame.getShort(frameBase + 2);
+                short apiVersion = frame.getShort(frameBase + 4);
+                short flags = frame.getShort(frameBase + 6);
+                long correlationId = frame.getLong(frameBase + 8);
+                int payloadLen = frame.getInt(frameBase + 16);
+                int payloadCrc = frame.getInt(frameBase + 20);
+                int headerLen = frame.getUnsignedShort(frameBase + 24);
                 FrameIO.checkBodyGeometry(frameLen, headerLen, payloadLen);
 
-                int headerIndex = base + Frame.PREAMBLE_AFTER_LEN;
+                int headerIndex = Frame.PREAMBLE_AFTER_LEN;
                 int payloadIndex = headerIndex + headerLen;
                 if ((flags & Frame.FLAG_PAYLOAD_CRC) != 0 && payloadLen > 0) {
-                    FrameIO.checkPayloadCrc(payloadCrc, Crc.of(frame.nioBuffer(payloadIndex, payloadLen)));
+                    FrameIO.checkPayloadCrc(payloadCrc, payloadCrc(in, sourceBase + payloadIndex, payloadLen));
                 }
                 // Frame normalizes payloadCrc to 0 on an unflagged/empty frame (the accessor contract)
                 out.add(Frame.fromOwnedBuffer(opcode, apiVersion, flags, correlationId,
-                        frame, headerIndex, headerLen, payloadIndex, payloadLen, payloadCrc));
+                        frame, frameBase + headerIndex, headerLen,
+                        frameBase + payloadIndex, payloadLen, payloadCrc));
                 emitted = true;
             } finally {
                 if (!emitted) {
                     frame.release();
                 }
             }
+        }
+
+        private static int payloadCrc(ByteBuf buf, int index, int length) {
+            // The retained frame is a sliced ByteBuf whose nioBuffer() path allocates a NIO view per APPEND.
+            if (buf.nioBufferCount() == 1) {
+                return Crc.of(buf.internalNioBuffer(index, length));
+            }
+            return Crc.of(buf.nioBuffer(index, length));
         }
     }
 }
