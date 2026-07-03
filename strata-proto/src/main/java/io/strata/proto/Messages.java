@@ -197,10 +197,21 @@ public final class Messages {
         }
 
         public static Append decode(Frame frame) {
+            AppendFields fields = decodeFields(frame);
+            return new Append(fields.chunkId(), fields.writeEpoch(), fields.baseOffset(), fields.durableOffset(),
+                    fields.namespace(), fields.recovery());
+        }
+
+        /**
+         * Thread-local decode view for hot server paths. The returned object is overwritten by the next
+         * {@code decodeFields} call on the same thread; callers must copy any fields they keep asynchronously.
+         */
+        public static AppendFields decodeFields(Frame frame) {
+            OwnedAppendDecoder decoder = OWNED_DECODER.get();
             if (!frame.hasOwnedHeader()) {
-                return decode(frame.headerReadBuffer());
+                return decoder.decode(decode(frame.headerReadBuffer()));
             }
-            return OWNED_DECODER.get().decode(frame);
+            return decoder.decode(frame);
         }
 
         private static boolean readRecoveryTag(ByteBuffer b) {
@@ -253,12 +264,62 @@ public final class Messages {
             }
         }
 
+        public static final class AppendFields {
+            private ChunkId chunkId;
+            private int writeEpoch;
+            private long baseOffset;
+            private long durableOffset;
+            private StrataNamespace namespace;
+            private boolean recovery;
+
+            private AppendFields set(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset,
+                                     StrataNamespace namespace, boolean recovery) {
+                this.chunkId = chunkId;
+                this.writeEpoch = writeEpoch;
+                this.baseOffset = baseOffset;
+                this.durableOffset = durableOffset;
+                this.namespace = namespace;
+                this.recovery = recovery;
+                return this;
+            }
+
+            public ChunkId chunkId() {
+                return chunkId;
+            }
+
+            public int writeEpoch() {
+                return writeEpoch;
+            }
+
+            public long baseOffset() {
+                return baseOffset;
+            }
+
+            public long durableOffset() {
+                return durableOffset;
+            }
+
+            public StrataNamespace namespace() {
+                return namespace;
+            }
+
+            public boolean recovery() {
+                return recovery;
+            }
+        }
+
         private static final class OwnedAppendDecoder implements StrataNamespace.AsciiBytes {
+            private final AppendFields fields = new AppendFields();
             private Frame frame;
             private int pos;
             private int namespaceOffset;
 
-            Append decode(Frame frame) {
+            AppendFields decode(Append append) {
+                return fields.set(append.chunkId(), append.writeEpoch(), append.baseOffset(),
+                        append.durableOffset(), append.namespace(), append.recovery());
+            }
+
+            AppendFields decode(Frame frame) {
                 this.frame = frame;
                 pos = 0;
                 namespaceOffset = 0;
@@ -269,7 +330,7 @@ public final class Messages {
                     long durableOffset = readLong();
                     StrataNamespace namespace = readNamespace();
                     boolean recovery = readRecoveryTag();
-                    return new Append(chunkId, writeEpoch, baseOffset, durableOffset, namespace, recovery);
+                    return fields.set(chunkId, writeEpoch, baseOffset, durableOffset, namespace, recovery);
                 } finally {
                     this.frame = null;
                 }

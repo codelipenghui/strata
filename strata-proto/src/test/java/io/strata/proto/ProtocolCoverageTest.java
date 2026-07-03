@@ -183,6 +183,14 @@ class ProtocolCoverageTest {
         Frame frame = Frame.fromOwnedBuffer(Opcode.APPEND.code, (short) 1, (short) 0, 17L,
                 owner, headerIndex, encoded.length, headerIndex + encoded.length, 0, 0);
         try {
+            Messages.Append.AppendFields fields = Messages.Append.decodeFields(frame);
+            assertEquals(chunkId, fields.chunkId());
+            assertEquals(7, fields.writeEpoch());
+            assertEquals(11, fields.baseOffset());
+            assertEquals(9, fields.durableOffset());
+            assertEquals(namespace, fields.namespace());
+            assertTrue(fields.recovery());
+
             Messages.Append decoded = Messages.Append.decode(frame);
 
             assertEquals(new Messages.Append(chunkId, 7, 11, 9, namespace, true), decoded);
