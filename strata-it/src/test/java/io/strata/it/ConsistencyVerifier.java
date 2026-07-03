@@ -358,6 +358,7 @@ final class ConsistencyVerifier {
             for (Messages.ChunkInfo chunk : sealed.chunks()) {
                 long chunkStart = chunkBase;
                 long chunkEnd = chunkBase + chunk.length();
+                // Prefix-mode recovery may keep unacked tail bytes; only acked-prefix offsets are verifiable.
                 if (chunkStart < expectedBytes.length) {
                     int headLength = (int) Math.min(32,
                             Math.min(chunk.length(), expectedBytes.length - chunkStart));

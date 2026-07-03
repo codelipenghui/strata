@@ -72,6 +72,7 @@ final class Workload {
         return ackedPayloads.size();
     }
 
+    // Intentionally releases the monitor while waiting on append futures; use only from single-threaded tests.
     long appendAckedAndVerifyOffsets(StrataFile.Appender appender, int from, int n) {
         long expectedEnd = ackedBytes();
         long lastEnd = -1;

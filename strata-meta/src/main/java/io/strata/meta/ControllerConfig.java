@@ -32,6 +32,7 @@ public record ControllerConfig(
         MetadataBackendConfig metadataBackendConfig
 ) {
     public static final int DEFAULT_NAMESPACE_LOG_RETENTION_MS = 5 * 60_000;
+    // Mirrors ClientConfig.of() so namespace metadata logs roll at the same default size as client files.
     public static final long DEFAULT_NAMESPACE_LOG_CHUNK_ROLL_BYTES = 2L << 30;
 
     public record MetadataBackendConfig(
