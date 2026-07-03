@@ -5,6 +5,7 @@ import io.netty.buffer.ByteBuf;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
  * One SCP frame (tech design §10.2). Header and payload are exposed as read-only
@@ -25,6 +26,8 @@ public final class Frame implements AutoCloseable {
     private static final ByteBuffer EMPTY = ByteBuffer.allocate(0).asReadOnlyBuffer();
     private static final AtomicIntegerFieldUpdater<Frame> CLOSED =
             AtomicIntegerFieldUpdater.newUpdater(Frame.class, "closed");
+    private static final AtomicLongFieldUpdater<Frame> RESERVED_WIRE_BYTES =
+            AtomicLongFieldUpdater.newUpdater(Frame.class, "reservedWireBytes");
 
     private final short opcode;
     private final short apiVersion;
@@ -43,6 +46,8 @@ public final class Frame implements AutoCloseable {
     private final int payloadCrc;
     @SuppressWarnings("unused") // updated through CLOSED
     private volatile int closed;
+    @SuppressWarnings("unused") // updated through RESERVED_WIRE_BYTES by ScpServer
+    private volatile long reservedWireBytes;
 
     public Frame(short opcode, short apiVersion, short flags, long correlationId,
                  ByteBuffer header, ByteBuffer payload) {
@@ -261,6 +266,14 @@ public final class Frame implements AutoCloseable {
 
     public int ownerRefCnt() {
         return owner == null ? -1 : owner.refCnt();
+    }
+
+    void reserveWireBytes(long bytes) {
+        RESERVED_WIRE_BYTES.addAndGet(this, bytes);
+    }
+
+    long drainReservedWireBytes() {
+        return RESERVED_WIRE_BYTES.getAndSet(this, 0);
     }
 
     @Override

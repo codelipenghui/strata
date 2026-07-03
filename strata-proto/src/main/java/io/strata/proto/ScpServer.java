@@ -158,7 +158,6 @@ public final class ScpServer implements AutoCloseable {
     private final class ConnectionHandler extends SimpleChannelInboundHandler<Frame> {
         private final ExecutorService requestExecutor;
         private final Set<Frame> inFlightAsyncRequests = ConcurrentHashMap.newKeySet();
-        private final ConcurrentHashMap<Frame, Long> reservedBytesByFrame = new ConcurrentHashMap<>();
         private final AtomicInteger inflightRequests = new AtomicInteger();
         private final AtomicLong inflightBytes = new AtomicLong();
         private final AtomicBoolean connectionOpen = new AtomicBoolean(true);
@@ -198,7 +197,7 @@ public final class ScpServer implements AutoCloseable {
             int requests = inflightRequests.incrementAndGet();
             long bytes = inflightBytes.addAndGet(frameBytes);
             if (requests <= maxInflightRequests && bytes <= maxInflightBytes) {
-                reservedBytesByFrame.put(frame, frameBytes);
+                frame.reserveWireBytes(frameBytes);
                 return true;
             }
             inflightRequests.decrementAndGet();
@@ -210,7 +209,7 @@ public final class ScpServer implements AutoCloseable {
             long frameBytes = frameWireBytes(response);
             long bytes = inflightBytes.addAndGet(frameBytes);
             if (bytes <= maxInflightBytes) {
-                reservedBytesByFrame.merge(request, frameBytes, Long::sum);
+                request.reserveWireBytes(frameBytes);
                 return true;
             }
             inflightBytes.addAndGet(-frameBytes);
@@ -223,8 +222,8 @@ public final class ScpServer implements AutoCloseable {
         }
 
         private void releaseInbound(Frame frame) {
-            Long bytes = reservedBytesByFrame.remove(frame);
-            if (bytes != null) {
+            long bytes = frame.drainReservedWireBytes();
+            if (bytes != 0) {
                 inflightRequests.decrementAndGet();
                 inflightBytes.addAndGet(-bytes);
             }
