@@ -66,8 +66,9 @@ final class DataNodeHandlers implements ScpServer.Handler {
             var m = Messages.Append.decodeFields(req);
             RequestContext.setNamespace(m.namespace().value());
             ChunkStore.AppendOutcome outcome = APPEND_OUTCOME.get();
-            store.appendAsync(m.namespace(), m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
-                    req.payloadReadBuffer(), req.payloadCrc(), m.recovery(), outcome);
+            store.appendAsync(m.namespace(), m.fileId(), m.chunkIndex(), m.writeEpoch(),
+                    m.baseOffset(), m.durableOffset(), req.payloadReadBuffer(), req.payloadCrc(),
+                    m.recovery(), outcome);
             long endOffset = outcome.endOffset();
             CompletableFuture<Void> waitForFlush = outcome.waitForFlush();
             if (waitForFlush == null) {

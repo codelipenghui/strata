@@ -749,19 +749,40 @@ public final class ChunkStore implements AutoCloseable {
         return h;
     }
 
+    private Handle lookup(StrataNamespace ns, long fileId, int chunkIndex) {
+        Handle h = chunks.get(LOOKUP_KEY.get().set(ns, fileId, chunkIndex));
+        if (h == null) {
+            throw new ScpException(ErrorCode.CHUNK_NOT_FOUND, chunkString(fileId, chunkIndex));
+        }
+        return h;
+    }
+
+    private static String chunkString(long fileId, int chunkIndex) {
+        return String.format("%016x.%d", fileId, chunkIndex);
+    }
+
     private static final class LookupKey {
         private StrataNamespace namespace;
-        private ChunkId chunkId;
+        private long fileId;
+        private int chunkIndex;
 
         private LookupKey set(StrataNamespace namespace, ChunkId chunkId) {
+            return set(namespace, chunkId.fileId().id(), chunkId.index());
+        }
+
+        private LookupKey set(StrataNamespace namespace, long fileId, int chunkIndex) {
             this.namespace = namespace;
-            this.chunkId = chunkId;
+            this.fileId = fileId;
+            this.chunkIndex = chunkIndex;
             return this;
         }
 
         @Override
         public int hashCode() {
-            return NsChunkId.hash(namespace, chunkId);
+            int result = 1;
+            result = 31 * result + Objects.hashCode(namespace);
+            result = 31 * result + chunkHash();
+            return result;
         }
 
         @Override
@@ -771,13 +792,25 @@ public final class ChunkStore implements AutoCloseable {
             }
             if (obj instanceof NsChunkId key) {
                 return Objects.equals(namespace, key.namespace())
-                        && Objects.equals(chunkId, key.chunkId());
+                        && chunkEquals(key.chunkId());
             }
             if (obj instanceof LookupKey key) {
                 return Objects.equals(namespace, key.namespace)
-                        && Objects.equals(chunkId, key.chunkId);
+                        && fileId == key.fileId
+                        && chunkIndex == key.chunkIndex;
             }
             return false;
+        }
+
+        private int chunkHash() {
+            int result = 0;
+            result = 31 * result + Long.hashCode(fileId);
+            result = 31 * result + Integer.hashCode(chunkIndex);
+            return result;
+        }
+
+        private boolean chunkEquals(ChunkId other) {
+            return other != null && fileId == other.fileId().id() && chunkIndex == other.index();
         }
     }
 
@@ -1035,8 +1068,24 @@ public final class ChunkStore implements AutoCloseable {
     public void appendAsync(
             StrataNamespace ns, ChunkId id, int epoch, long baseOffset, long durableOffset,
             ByteBuffer payload, int payloadCrc, boolean recoveryAppend, AppendOutcome outcome) throws IOException {
+        appendAsync0(ns, id, id.fileId().id(), id.index(), epoch, baseOffset, durableOffset,
+                payload, payloadCrc, recoveryAppend, outcome);
+    }
+
+    public void appendAsync(
+            StrataNamespace ns, long fileId, int chunkIndex, int epoch, long baseOffset, long durableOffset,
+            ByteBuffer payload, int payloadCrc, boolean recoveryAppend, AppendOutcome outcome) throws IOException {
+        appendAsync0(ns, null, fileId, chunkIndex, epoch, baseOffset, durableOffset,
+                payload, payloadCrc, recoveryAppend, outcome);
+    }
+
+    private void appendAsync0(
+            StrataNamespace ns, ChunkId requestedId, long fileId, int chunkIndex, int epoch,
+            long baseOffset, long durableOffset, ByteBuffer payload, int payloadCrc,
+            boolean recoveryAppend, AppendOutcome outcome) throws IOException {
         Objects.requireNonNull(outcome, "outcome").reset();
-        Handle h = lookup(ns, id);
+        Handle h = requestedId != null ? lookup(ns, requestedId) : lookup(ns, fileId, chunkIndex);
+        ChunkId id = h.id;
         // payloadCrc is the writer's CRC32C over this payload, already verified by the frame decoder;
         // the node stores it as the per-record digest and never originates its own (no node-side CRC
         // pass on this path; the convenience overload below computes one for callers that lack a digest).

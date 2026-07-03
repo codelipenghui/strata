@@ -266,6 +266,8 @@ public final class Messages {
 
         public static final class AppendFields {
             private ChunkId chunkId;
+            private long fileId;
+            private int chunkIndex;
             private int writeEpoch;
             private long baseOffset;
             private long durableOffset;
@@ -275,6 +277,21 @@ public final class Messages {
             private AppendFields set(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset,
                                      StrataNamespace namespace, boolean recovery) {
                 this.chunkId = chunkId;
+                this.fileId = chunkId.fileId().id();
+                this.chunkIndex = chunkId.index();
+                this.writeEpoch = writeEpoch;
+                this.baseOffset = baseOffset;
+                this.durableOffset = durableOffset;
+                this.namespace = namespace;
+                this.recovery = recovery;
+                return this;
+            }
+
+            private AppendFields set(long fileId, int chunkIndex, int writeEpoch, long baseOffset,
+                                     long durableOffset, StrataNamespace namespace, boolean recovery) {
+                this.chunkId = null;
+                this.fileId = fileId;
+                this.chunkIndex = chunkIndex;
                 this.writeEpoch = writeEpoch;
                 this.baseOffset = baseOffset;
                 this.durableOffset = durableOffset;
@@ -284,7 +301,18 @@ public final class Messages {
             }
 
             public ChunkId chunkId() {
+                if (chunkId == null) {
+                    chunkId = new ChunkId(new FileId(fileId), chunkIndex);
+                }
                 return chunkId;
+            }
+
+            public long fileId() {
+                return fileId;
+            }
+
+            public int chunkIndex() {
+                return chunkIndex;
             }
 
             public int writeEpoch() {
@@ -324,13 +352,14 @@ public final class Messages {
                 pos = 0;
                 namespaceOffset = 0;
                 try {
-                    ChunkId chunkId = new ChunkId(new FileId(readLong()), readInt());
+                    long fileId = readLong();
+                    int chunkIndex = readInt();
                     int writeEpoch = readInt();
                     long baseOffset = readLong();
                     long durableOffset = readLong();
                     StrataNamespace namespace = readNamespace();
                     boolean recovery = readRecoveryTag();
-                    return fields.set(chunkId, writeEpoch, baseOffset, durableOffset, namespace, recovery);
+                    return fields.set(fileId, chunkIndex, writeEpoch, baseOffset, durableOffset, namespace, recovery);
                 } finally {
                     this.frame = null;
                 }

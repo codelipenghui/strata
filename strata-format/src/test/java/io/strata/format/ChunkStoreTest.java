@@ -117,6 +117,22 @@ class ChunkStoreTest {
     }
 
     @Test
+    void primitiveAppendPathFindsTheOpenChunk() throws Exception {
+        try (ChunkStore store = newStore()) {
+            store.open(TEST_NS, id, false, 1, 1718000000000L);
+            byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
+            ChunkStore.AppendOutcome outcome = new ChunkStore.AppendOutcome();
+
+            store.appendAsync(TEST_NS, id.fileId().id(), id.index(), 1, 0, 0,
+                    ByteBuffer.wrap(payload), Crc.of(ByteBuffer.wrap(payload)), false, outcome);
+
+            assertEquals(payload.length, outcome.endOffset());
+            assertNull(outcome.waitForFlush());
+            assertArrayEquals(payload, store.read(TEST_NS, id, 0, 1024).bytes());
+        }
+    }
+
+    @Test
     void appendDoesNotAdvanceCallerPayloadPosition() throws Exception {
         try (ChunkStore store = newStore()) {
             store.open(TEST_NS, id, false, 1, 1718000000000L);
