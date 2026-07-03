@@ -29,6 +29,8 @@ import java.util.stream.Collectors;
  */
 final class ServerMetrics {
     static final int DEFAULT_REQUEST_LATENCY_SAMPLE_RATE = 16;
+    private static final String STATUS_OK = "ok";
+    private static final String STATUS_ERROR = "error";
 
     private ServerMetrics() {
     }
@@ -301,32 +303,62 @@ final class ServerMetrics {
         for (int i = 0; i < bucketsMs.length; i++) {
             slos[i] = Duration.ofMillis(bucketsMs[i]);
         }
-        Map<String, RequestMetric> metrics = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, RequestMetricFamily> metrics = new ConcurrentHashMap<>();
         return (opcode, namespace, durationNanos, success) -> {
-            String status = success ? "ok" : "error";
-            RequestMetric metric = metrics.computeIfAbsent(opcode + ':' + status + ':' + namespace, k -> {
-                Timer.Builder b = Timer.builder("strata_scp_request_duration")
-                        .description("sampled request handler latency by opcode + namespace "
-                                + "(errors always recorded; includes async durability wait)")
-                        .tag("opcode", opcode)
-                        .tag("status", status)
-                        .tag("namespace", namespace);
-                b.serviceLevelObjectives(slos);
-                RequestMetric created = new RequestMetric(b.register(reg));
-                FunctionCounter.builder("strata_scp_requests", created.requests, LongAdder::sum)
-                        .description("exact SCP request count by opcode + namespace + status")
-                        .tag("opcode", opcode)
-                        .tag("status", status)
-                        .tag("namespace", namespace)
-                        .register(reg);
-                return created;
-            });
+            RequestMetricFamily family = metrics.get(opcode);
+            if (family == null) {
+                RequestMetricFamily created = new RequestMetricFamily();
+                RequestMetricFamily existing = metrics.putIfAbsent(opcode, created);
+                family = existing == null ? created : existing;
+            }
+            RequestMetric metric = family.metric(reg, slos, opcode, namespace, success);
             metric.requests.increment();
             if (!success || successLatencySampleRate == 1
                     || ThreadLocalRandom.current().nextInt(successLatencySampleRate) == 0) {
                 metric.latency.record(durationNanos, TimeUnit.NANOSECONDS);
             }
         };
+    }
+
+    private static final class RequestMetricFamily {
+        private final ConcurrentHashMap<String, RequestMetric> ok = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<String, RequestMetric> error = new ConcurrentHashMap<>();
+
+        RequestMetric metric(MeterRegistry reg, Duration[] slos, String opcode, String namespace, boolean success) {
+            ConcurrentHashMap<String, RequestMetric> byNamespace = success ? ok : error;
+            String namespaceTag = String.valueOf(namespace);
+            RequestMetric metric = byNamespace.get(namespaceTag);
+            if (metric != null) {
+                return metric;
+            }
+            synchronized (byNamespace) {
+                metric = byNamespace.get(namespaceTag);
+                if (metric == null) {
+                    metric = registerMetric(reg, slos, opcode, namespaceTag, success ? STATUS_OK : STATUS_ERROR);
+                    byNamespace.put(namespaceTag, metric);
+                }
+                return metric;
+            }
+        }
+
+        private static RequestMetric registerMetric(MeterRegistry reg, Duration[] slos, String opcode,
+                                                    String namespace, String status) {
+            Timer.Builder b = Timer.builder("strata_scp_request_duration")
+                    .description("sampled request handler latency by opcode + namespace "
+                            + "(errors always recorded; includes async durability wait)")
+                    .tag("opcode", opcode)
+                    .tag("status", status)
+                    .tag("namespace", namespace);
+            b.serviceLevelObjectives(slos);
+            RequestMetric created = new RequestMetric(b.register(reg));
+            FunctionCounter.builder("strata_scp_requests", created.requests, LongAdder::sum)
+                    .description("exact SCP request count by opcode + namespace + status")
+                    .tag("opcode", opcode)
+                    .tag("status", status)
+                    .tag("namespace", namespace)
+                    .register(reg);
+            return created;
+        }
     }
 
     private static final class RequestMetric {
