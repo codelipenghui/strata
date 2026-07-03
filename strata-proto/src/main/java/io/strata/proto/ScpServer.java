@@ -280,7 +280,7 @@ public final class ScpServer implements AutoCloseable {
                 return;
             }
             try {
-                Messages.Hello.decode(hello.headerSlice()); // validates frame-version overlap
+                Messages.Hello.decode(hello.headerReadBuffer()); // validates frame-version overlap
             } catch (RuntimeException e) {
                 // incompatible version range or malformed HELLO header: answer with a typed
                 // error instead of silently dropping the connection

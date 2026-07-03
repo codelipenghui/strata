@@ -49,10 +49,10 @@ final class DataNodeHandlers implements ScpServer.Handler {
             // validation + write run synchronously here (per-chunk ordering preserved); the ack
             // defers until durability per the chunk's policy — for ack-on-fsync that means a
             // covering group-commit force, while this connection keeps processing frames
-            var m = Messages.Append.decode(req.headerSlice());
+            var m = Messages.Append.decode(req.headerReadBuffer());
             RequestContext.setNamespace(m.namespace().value());
             return store.appendAsync(m.namespace(), m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
-                            req.payloadSlice(), req.payloadCrc(), m.recovery())
+                            req.payloadReadBuffer(), req.payloadCrc(), m.recovery())
                     .thenApply(r -> ScpServer.ok(req, new Messages.AppendResp(r.endOffset()).encode(), null));
         }
         return CompletableFuture.completedFuture(handle(req));
@@ -62,12 +62,11 @@ final class DataNodeHandlers implements ScpServer.Handler {
     public Frame handle(Frame req) throws Exception {
         Opcode op = Opcode.fromCode(req.opcode());
         if (op == null) throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "0x" + Integer.toHexString(req.opcode()));
-        ByteBuffer h = req.headerSlice();
         return switch (op) {
             case PING -> ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
 
             case OPEN_CHUNK -> {
-                var m = Messages.OpenChunk.decode(h);
+                var m = Messages.OpenChunk.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 if (node.isDraining()) {
                     throw new ScpException(ErrorCode.NO_CAPACITY, "node draining");
@@ -81,7 +80,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case READ -> {
                 // Client read: open reads are bounded to the replica-known durable high watermark, and
                 // both open durable-prefix reads and sealed reads are CRC-verified before the response.
-                var m = Messages.Read.decode(h);
+                var m = Messages.Read.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 yield readRegionResponse(req, store.readRegion(m.namespace(), m.chunkId(), m.offset(), m.maxBytes()));
             }
@@ -89,13 +88,13 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case READ_RECOVERY -> {
                 // Seal recovery reads the never-acked tail above the durable watermark (clamped away
                 // from client READs) to re-prove and re-replicate bytes a quorum still holds.
-                var m = Messages.Read.decode(h);
+                var m = Messages.Read.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 yield readRegionResponse(req, store.readRegionForRecovery(m.namespace(), m.chunkId(), m.offset(), m.maxBytes()));
             }
 
             case FENCE -> {
-                var m = Messages.Fence.decode(h);
+                var m = Messages.Fence.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 var r = store.fence(m.namespace(), m.chunkId(), m.fenceEpoch());
                 yield ScpServer.ok(req, new Messages.FenceResp(r.persistedFenceEpoch(), r.localEndOffset(),
@@ -103,7 +102,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             }
 
             case STAT_CHUNK -> {
-                var m = Messages.StatChunk.decode(h);
+                var m = Messages.StatChunk.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 var r = store.stat(m.namespace(), m.chunkId());
                 yield ScpServer.ok(req, new Messages.StatResp(r.state(), r.localEndOffset(), r.lastKnownDO(),
@@ -111,15 +110,15 @@ final class DataNodeHandlers implements ScpServer.Handler {
             }
 
             case SEAL_CHUNK -> {
-                var m = Messages.SealChunk.decode(h);
+                var m = Messages.SealChunk.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 var r = store.seal(m.namespace(), m.chunkId(), m.writeEpoch(), m.dataLength(),
-                        req.payloadLength() > 0 ? req.payloadSlice() : null);
+                        req.payloadLength() > 0 ? req.payloadReadBuffer() : null);
                 yield ScpServer.ok(req, new Messages.SealResp(r.finalLength(), r.dataCrc()).encode(), null);
             }
 
             case DELETE_CHUNKS -> {
-                var m = Messages.DeleteChunks.decode(h);
+                var m = Messages.DeleteChunks.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 List<Short> codes = new ArrayList<>(m.chunkIds().size());
                 for (var id : m.chunkIds()) codes.add(deletes.delete(m.namespace(), id).code);
@@ -127,7 +126,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             }
 
             case FETCH_CHUNK -> {
-                var m = Messages.FetchChunk.decode(h);
+                var m = Messages.FetchChunk.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 var r = store.fetch(m.namespace(), m.chunkId(), m.offset(), m.maxBytes());
                 yield ScpServer.ok(req, new Messages.FetchResp(r.fileLength(), r.state()).encode(),
@@ -135,7 +134,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             }
 
             case READ_LEDGER -> {
-                var m = Messages.ReadLedger.decode(h);
+                var m = Messages.ReadLedger.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 List<ChunkFormats.LedgerEntry> entries = store.readLedger(m.namespace(), m.chunkId(), m.fromOffset());
                 List<Messages.LedgerEntry> wire = new ArrayList<>(entries.size());
@@ -151,7 +150,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 if (loop == null) {
                     throw new ScpException(ErrorCode.INTERNAL, "control loop unavailable for EXEC_REPLICATE");
                 }
-                if (!(Messages.Command.read(h) instanceof Messages.ReplicateCmd cmd)) {
+                if (!(Messages.Command.read(req.headerReadBuffer()) instanceof Messages.ReplicateCmd cmd)) {
                     throw new ScpException(ErrorCode.PRECONDITION_FAILED, "EXEC_REPLICATE requires a ReplicateCmd");
                 }
                 RequestContext.setNamespace(cmd.namespace().value());
@@ -163,7 +162,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 // Owner-pull durability verification (design §20.3): report the local state of each
                 // requested chunk (present/state/length/crc) and stamp the present ones as freshly
                 // verified, feeding node-local orphan GC (§20.4). The owner judges missing/corrupt.
-                var m = Messages.VerifyChunks.decode(h);
+                var m = Messages.VerifyChunks.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 node.noteVerifiedBy(m.verifierEndpoint());
                 List<Messages.VerifyChunkResult> results = new ArrayList<>(m.chunkIds().size());

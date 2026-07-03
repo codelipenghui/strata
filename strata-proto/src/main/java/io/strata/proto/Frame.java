@@ -151,6 +151,14 @@ public final class Frame implements AutoCloseable {
                 : header.asReadOnlyBuffer();
     }
 
+    /**
+     * Independent read cursor for trusted internal decoders. Callers must not mutate the bytes; use
+     * {@link #headerSlice()} when exposing a buffer outside the transport/storage stack.
+     */
+    public ByteBuffer headerReadBuffer() {
+        return owner != null ? ownerBuffer(ownerHeaderIndex, ownerHeaderLen) : header.duplicate();
+    }
+
     int headerLength() {
         return owner != null ? ownerHeaderLen : header.remaining();
     }
@@ -165,6 +173,17 @@ public final class Frame implements AutoCloseable {
         }
         return owner != null ? ownerBuffer(ownerPayloadIndex, ownerPayloadLen).asReadOnlyBuffer()
                 : payload.asReadOnlyBuffer();
+    }
+
+    /**
+     * Independent read cursor for trusted internal storage paths. Callers must not mutate the bytes;
+     * use {@link #payloadSlice()} when exposing a buffer outside the transport/storage stack.
+     */
+    public ByteBuffer payloadReadBuffer() {
+        if (filePayload != null) {
+            throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
+        }
+        return owner != null ? ownerBuffer(ownerPayloadIndex, ownerPayloadLen) : payload.duplicate();
     }
 
     ByteBuffer payloadView() {
