@@ -49,6 +49,8 @@ public final class ScpServer implements AutoCloseable {
             EnvConfig.intEnv("STRATA_SCP_MAX_INFLIGHT_REQUESTS", 1024);
     private static final long DEFAULT_MAX_INFLIGHT_BYTES =
             EnvConfig.longEnv("STRATA_SCP_MAX_INFLIGHT_BYTES", 1L << 30);
+    private static final int MAX_POOLED_FRAME_TASKS =
+            EnvConfig.intEnv("STRATA_SCP_FRAME_TASK_POOL_SIZE", 256);
     private static final int MAX_POOLED_RESPONSE_WRITE_LISTENERS =
             EnvConfig.intEnv("STRATA_SCP_RESPONSE_WRITE_LISTENER_POOL_SIZE", 256);
 
@@ -199,6 +201,7 @@ public final class ScpServer implements AutoCloseable {
     private final class ConnectionHandler extends SimpleChannelInboundHandler<Frame> {
         private final ExecutorService requestExecutor;
         private final Set<Frame> inFlightAsyncRequests = ConcurrentHashMap.newKeySet();
+        private final ArrayDeque<FrameTask> frameTasks = new ArrayDeque<>();
         private final ArrayDeque<ResponseWriteListener> responseWriteListeners = new ArrayDeque<>();
         private final AtomicInteger inflightRequests = new AtomicInteger();
         private final AtomicLong inflightBytes = new AtomicLong();
@@ -225,12 +228,35 @@ public final class ScpServer implements AutoCloseable {
                         null), true, frame);
                 return;
             }
-            FrameTask task = new FrameTask(ctx, frame);
+            FrameTask task = frameTask(ctx, frame);
             try {
                 requestExecutor.execute(task);
             } catch (RuntimeException | Error e) {
                 task.closeRejected();
                 throw e;
+            }
+        }
+
+        private FrameTask frameTask(ChannelHandlerContext ctx, Frame frame) {
+            FrameTask task;
+            synchronized (frameTasks) {
+                task = frameTasks.pollFirst();
+            }
+            if (task == null) {
+                task = new FrameTask();
+            }
+            task.reset(ctx, frame);
+            return task;
+        }
+
+        private void recycleFrameTask(FrameTask task) {
+            if (MAX_POOLED_FRAME_TASKS <= 0) {
+                return;
+            }
+            synchronized (frameTasks) {
+                if (frameTasks.size() < MAX_POOLED_FRAME_TASKS) {
+                    frameTasks.addFirst(task);
+                }
             }
         }
 
@@ -272,28 +298,41 @@ public final class ScpServer implements AutoCloseable {
         }
 
         private final class FrameTask implements Runnable {
-            private final ChannelHandlerContext ctx;
-            private final Frame frame;
+            private ChannelHandlerContext ctx;
+            private Frame frame;
 
-            private FrameTask(ChannelHandlerContext ctx, Frame frame) {
+            private void reset(ChannelHandlerContext ctx, Frame frame) {
                 this.ctx = ctx;
                 this.frame = frame;
             }
 
             @Override
             public void run() {
+                ChannelHandlerContext localCtx = ctx;
+                Frame localFrame = frame;
+                ctx = null;
+                frame = null;
                 try {
-                    processFrame(ctx, frame);
+                    processFrame(localCtx, localFrame);
                 } catch (RuntimeException | Error e) {
-                    releaseInbound(frame);
-                    frame.close();
+                    releaseInbound(localFrame);
+                    localFrame.close();
                     throw e;
+                } finally {
+                    recycleFrameTask(this);
                 }
             }
 
             private void closeRejected() {
-                releaseInbound(frame);
-                frame.close();
+                Frame localFrame = frame;
+                ctx = null;
+                frame = null;
+                try {
+                    releaseInbound(localFrame);
+                    localFrame.close();
+                } finally {
+                    recycleFrameTask(this);
+                }
             }
         }
 
