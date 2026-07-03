@@ -24,6 +24,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -95,6 +96,7 @@ public final class ChunkStore implements AutoCloseable {
             EnvConfig.intEnv("STRATA_SEALED_VERIFY_BUFFER_POOL_MAX_BYTES", ChunkFormats.CRC_RANGE_SIZE);
     private static final int SEALED_VERIFY_BUFFER_POOL_MAX_BUFFERS =
             EnvConfig.intEnv("STRATA_SEALED_VERIFY_BUFFER_POOL_MAX_BUFFERS", 8);
+    private static final Set<OpenOption> READ_OPEN_OPTIONS = Set.of(StandardOpenOption.READ);
 
     private final Path dir;
     private final Map<NsChunkId, Handle> chunks = new ConcurrentHashMap<>();
@@ -1242,29 +1244,58 @@ public final class ChunkStore implements AutoCloseable {
     private static final class ReadBuffer implements AutoCloseable {
         private static final AtomicIntegerFieldUpdater<ReadBuffer> CLOSED =
                 AtomicIntegerFieldUpdater.newUpdater(ReadBuffer.class, "closed");
-        private final byte[] bytes;
-        private final Runnable releaser;
+        private final BufferSlot slot;
+        private final ReadBufferPool owner;
         @SuppressWarnings("unused") // updated through CLOSED
         private volatile int closed;
 
-        private ReadBuffer(byte[] bytes, Runnable releaser) {
-            this.bytes = Objects.requireNonNull(bytes, "bytes");
-            this.releaser = releaser;
+        private ReadBuffer(BufferSlot slot, ReadBufferPool owner) {
+            this.slot = Objects.requireNonNull(slot, "slot");
+            this.owner = owner;
         }
 
         static ReadBuffer unpooled(byte[] bytes) {
-            return new ReadBuffer(bytes, null);
+            return new ReadBuffer(new BufferSlot(bytes), null);
         }
 
         byte[] bytes() {
-            return bytes;
+            return slot.bytes();
+        }
+
+        ByteBuffer slice(int offset, int length) {
+            return slot.slice(offset, length);
         }
 
         @Override
         public void close() {
-            if (releaser != null && CLOSED.compareAndSet(this, 0, 1)) {
-                releaser.run();
+            if (owner != null && CLOSED.compareAndSet(this, 0, 1)) {
+                owner.release(slot);
             }
+        }
+    }
+
+    private static final class BufferSlot {
+        private final byte[] bytes;
+        private final ByteBuffer view;
+
+        private BufferSlot(byte[] bytes) {
+            this.bytes = Objects.requireNonNull(bytes, "bytes");
+            this.view = ByteBuffer.wrap(bytes);
+        }
+
+        private byte[] bytes() {
+            return bytes;
+        }
+
+        private ByteBuffer slice(int offset, int length) {
+            view.clear();
+            view.position(offset);
+            view.limit(offset + length);
+            return view;
+        }
+
+        private void resetForAcquire() {
+            view.clear();
         }
     }
 
@@ -1282,41 +1313,37 @@ public final class ChunkStore implements AutoCloseable {
         }
 
         ReadBuffer acquire(int length) {
-            byte[] bytes = acquireBytes(length);
-            return new ReadBuffer(bytes, () -> releaseBytes(bytes));
-        }
-
-        byte[] acquireBytes(int length) {
             if (length == 0) {
-                return EMPTY_READ_BYTES;
+                return ReadBuffer.unpooled(EMPTY_READ_BYTES);
             }
             if (!poolable(length)) {
-                return new byte[length];
+                return ReadBuffer.unpooled(new byte[length]);
             }
 
-            byte[] pooledBytes = poll(length);
-            if (pooledBytes != null) {
-                return pooledBytes;
+            BufferSlot pooledSlot = poll(length);
+            if (pooledSlot != null) {
+                return new ReadBuffer(pooledSlot, this);
             }
-            return new byte[length];
+            return new ReadBuffer(new BufferSlot(new byte[length]), this);
         }
 
-        private byte[] poll(int length) {
+        private BufferSlot poll(int length) {
             Bucket bucket = findBucket(length);
             if (bucket == null) {
                 return null;
             }
             synchronized (bucket.buffers) {
-                byte[] bytes = bucket.buffers.pollFirst();
-                if (bytes != null) {
+                BufferSlot slot = bucket.buffers.pollFirst();
+                if (slot != null) {
                     pooled.decrementAndGet();
+                    slot.resetForAcquire();
                 }
-                return bytes;
+                return slot;
             }
         }
 
-        void releaseBytes(byte[] bytes) {
-            if (!poolable(bytes.length)) {
+        void release(BufferSlot slot) {
+            if (!poolable(slot.bytes().length)) {
                 return;
             }
             while (true) {
@@ -1328,13 +1355,13 @@ public final class ChunkStore implements AutoCloseable {
                     break;
                 }
             }
-            Bucket bucket = bucketFor(bytes.length);
+            Bucket bucket = bucketFor(slot.bytes().length);
             if (bucket == null) {
                 pooled.decrementAndGet();
                 return;
             }
             synchronized (bucket.buffers) {
-                bucket.buffers.addFirst(bytes);
+                bucket.buffers.addFirst(slot);
             }
         }
 
@@ -1375,7 +1402,7 @@ public final class ChunkStore implements AutoCloseable {
 
         private static final class Bucket {
             private final int length;
-            private final ArrayDeque<byte[]> buffers = new ArrayDeque<>();
+            private final ArrayDeque<BufferSlot> buffers = new ArrayDeque<>();
 
             private Bucket(int length) {
                 this.length = length;
@@ -1457,7 +1484,7 @@ public final class ChunkStore implements AutoCloseable {
                     ReadBuffer out = readBufferPool.acquire(n);
                     boolean success = false;
                     try {
-                        readOpenVerified(h, offset, out.bytes());
+                        readOpenVerified(h, offset, out);
                         success = true;
                         return ReadRegionResult.of(out, n, localEnd, lastKnownDO);
                     } finally {
@@ -1483,10 +1510,10 @@ public final class ChunkStore implements AutoCloseable {
             // verified disk I/O can run off-lock against an independent FD after handle revalidation.
             ReadBuffer out = readBufferPool.acquire(n);
             boolean success = false;
-            try (FileChannel readChannel = FileChannel.open(dataPath, StandardOpenOption.READ)) {
+            try (FileChannel readChannel = FileChannel.open(dataPath, READ_OPEN_OPTIONS)) {
                 requireCurrentHandle(h, nsKey, id);
                 IntegrityLedger.EntrySpan span = openReadPlan.span();
-                readOpenVerified(readChannel, span, id, offset, out.bytes());
+                readOpenVerified(readChannel, span, id, offset, out);
                 countClientRead(ns, n);
                 success = true;
                 return ReadRegionResult.of(out, n, localEnd, lastKnownDO);
@@ -1505,7 +1532,7 @@ public final class ChunkStore implements AutoCloseable {
         try (ChannelCache.Lease lease = channelCache.acquire(nsKey, dataPath)) {
             requireCurrentHandle(h, nsKey, id);
             readSealedVerified(lease.channel(), h, sealedLength, sealedRangeCrcs, !includeUndurableTail, id, offset,
-                    out.bytes());
+                    out);
             if (!includeUndurableTail) {
                 countClientRead(ns, n);
             }
@@ -1973,7 +2000,7 @@ public final class ChunkStore implements AutoCloseable {
             ChunkFormats.Header header;
             ChunkFormats.Trailer trailer;
             List<Integer> rangeCrcs;
-            try (FileChannel input = FileChannel.open(sourceFile, StandardOpenOption.READ)) {
+            try (FileChannel input = FileChannel.open(sourceFile, READ_OPEN_OPTIONS)) {
                 header = ChunkFormats.Header.decode(readBytes(input, HEADER_SIZE, 0));
                 if (!header.chunkId().equals(id)) {
                     throw new ScpException(ErrorCode.CORRUPT_CHUNK, "chunk id mismatch: " + header.chunkId());
@@ -2539,7 +2566,7 @@ public final class ChunkStore implements AutoCloseable {
         byte[] headerBytes = new byte[HEADER_SIZE];
         ChunkFormats.Header header;
         try {
-            try (FileChannel ch = FileChannel.open(probe.dataPath, StandardOpenOption.READ)) {
+            try (FileChannel ch = FileChannel.open(probe.dataPath, READ_OPEN_OPTIONS)) {
                 readFully(ch, ByteBuffer.wrap(headerBytes), 0);
             }
             header = ChunkFormats.Header.decode(headerBytes);
@@ -2762,7 +2789,7 @@ public final class ChunkStore implements AutoCloseable {
 
     /** The validated sealed trailer/footer of {@code dataPath}, or null if it is not a valid sealed chunk. */
     private SealedProbe trySealedProbe(Path dataPath, ChunkId id) {
-        try (FileChannel ch = FileChannel.open(dataPath, StandardOpenOption.READ)) {
+        try (FileChannel ch = FileChannel.open(dataPath, READ_OPEN_OPTIONS)) {
             long fileLen = ch.size();
             if (fileLen < DATA_START + TRAILER_SIZE) {
                 return null;
@@ -2778,7 +2805,7 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     private static SealedProbe readSealedFooterFromPath(Path dataPath, ChunkId id) throws IOException {
-        try (FileChannel data = FileChannel.open(dataPath, StandardOpenOption.READ)) {
+        try (FileChannel data = FileChannel.open(dataPath, READ_OPEN_OPTIONS)) {
             return readSealedFooter(data, data.size(), id);
         }
     }
@@ -2819,7 +2846,7 @@ public final class ChunkStore implements AutoCloseable {
                 return false;
             }
             byte[] buf = new byte[ChunkFormats.LEDGER_ENTRY_SIZE];
-            try (FileChannel ch = FileChannel.open(ledgerPath, StandardOpenOption.READ)) {
+            try (FileChannel ch = FileChannel.open(ledgerPath, READ_OPEN_OPTIONS)) {
                 readFully(ch, ByteBuffer.wrap(buf), size - ChunkFormats.LEDGER_ENTRY_SIZE);
             }
             ChunkFormats.LedgerEntry last = ChunkFormats.LedgerEntry.decodeOrNull(buf, 0);
@@ -2830,15 +2857,15 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     private void readSealedVerified(FileChannel data, Handle h, long sealedLength, List<Integer> rangeCrcs,
-                                    boolean useVerifiedRangeCache, ChunkId id, long offset, byte[] out)
+                                    boolean useVerifiedRangeCache, ChunkId id, long offset, ReadBuffer out)
             throws IOException {
-        if (out.length == 0) return;
+        byte[] outBytes = out.bytes();
+        if (outBytes.length == 0) return;
         if (rangeCrcs.isEmpty()) {
             throw new ScpException(ErrorCode.CORRUPT_CHUNK, "sealed chunk missing CRC ranges: " + id);
         }
         long firstRange = offset / ChunkFormats.CRC_RANGE_SIZE;
-        long lastRange = (offset + out.length - 1) / ChunkFormats.CRC_RANGE_SIZE;
-        ByteBuffer outView = ByteBuffer.wrap(out);
+        long lastRange = (offset + outBytes.length - 1) / ChunkFormats.CRC_RANGE_SIZE;
         for (long range = firstRange; range <= lastRange; range++) {
             if (range >= rangeCrcs.size()) {
                 throw new ScpException(ErrorCode.CORRUPT_CHUNK, "CRC range missing for " + id);
@@ -2847,28 +2874,30 @@ public final class ChunkStore implements AutoCloseable {
             long rangeStart = range * (long) ChunkFormats.CRC_RANGE_SIZE;
             int rangeLen = (int) Math.min(ChunkFormats.CRC_RANGE_SIZE, sealedLength - rangeStart);
             long copyStart = Math.max(offset, rangeStart);
-            long copyEnd = Math.min(offset + out.length, rangeStart + rangeLen);
+            long copyEnd = Math.min(offset + outBytes.length, rangeStart + rangeLen);
             int copyLen = (int) (copyEnd - copyStart);
             if (useVerifiedRangeCache && isSealedRangeVerified(h, rangeIndex)) {
-                readFully(data, ByteBuffer.wrap(out, (int) (copyStart - offset), copyLen),
+                readFully(data, out.slice((int) (copyStart - offset), copyLen),
                         checkedAdd(DATA_START, copyStart, "chunk file offset"));
                 continue;
             }
             int actual;
             if (copyStart == rangeStart && copyLen == rangeLen) {
                 int dst = (int) (copyStart - offset);
-                readFully(data, slice(outView, dst, rangeLen),
+                readFully(data, out.slice(dst, rangeLen),
                         checkedAdd(DATA_START, rangeStart, "chunk file offset"));
-                actual = Crc.of(out, dst, rangeLen);
+                actual = Crc.of(outBytes, dst, rangeLen);
             } else {
-                byte[] rangeBuf = sealedVerifyBufferPool.acquireBytes(rangeLen);
+                ReadBuffer rangeBuf = sealedVerifyBufferPool.acquire(rangeLen);
+                byte[] rangeBytes = rangeBuf.bytes();
                 try {
-                    readFully(data, ByteBuffer.wrap(rangeBuf), checkedAdd(DATA_START, rangeStart, "chunk file offset"));
-                    actual = Crc.of(rangeBuf, 0, rangeLen);
-                    System.arraycopy(rangeBuf, (int) (copyStart - rangeStart), out,
+                    readFully(data, rangeBuf.slice(0, rangeLen),
+                            checkedAdd(DATA_START, rangeStart, "chunk file offset"));
+                    actual = Crc.of(rangeBytes, 0, rangeLen);
+                    System.arraycopy(rangeBytes, (int) (copyStart - rangeStart), outBytes,
                             (int) (copyStart - offset), copyLen);
                 } finally {
-                    sealedVerifyBufferPool.releaseBytes(rangeBuf);
+                    rangeBuf.close();
                 }
             }
             int expected = rangeCrcs.get(rangeIndex);
@@ -2894,14 +2923,15 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    private void readOpenVerified(Handle h, long offset, byte[] out) throws IOException {
-        if (out.length == 0) {
+    private void readOpenVerified(Handle h, long offset, ReadBuffer out) throws IOException {
+        byte[] outBytes = out.bytes();
+        if (outBytes.length == 0) {
             return;
         }
         if (h.ledger == null) {
             throw new ScpException(ErrorCode.CORRUPT_CHUNK, "open chunk missing integrity ledger: " + h.id);
         }
-        long readEnd = checkedAdd(offset, out.length, "open read end");
+        long readEnd = checkedAdd(offset, outBytes.length, "open read end");
         IntegrityLedger.EntrySpan span = h.ledger.reusableEntriesCovering(offset, readEnd);
         // This overload uses the handle's shared FileChannel for recovery/local reads. Server request
         // threads must not be interrupted with cancel(true): FileChannel is interruptible and may close.
@@ -2913,14 +2943,14 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     private void readOpenVerified(FileChannel data, IntegrityLedger.EntrySpan span, ChunkId id, long offset,
-                                  byte[] out) throws IOException {
-        if (out.length == 0) {
+                                  ReadBuffer out) throws IOException {
+        byte[] outBytes = out.bytes();
+        if (outBytes.length == 0) {
             return;
         }
-        long readEnd = checkedAdd(offset, out.length, "open read end");
+        long readEnd = checkedAdd(offset, outBytes.length, "open read end");
         long entryStart = span.firstStart();
         int copied = 0;
-        ByteBuffer outView = ByteBuffer.wrap(out);
         for (int i = 0; i < span.length(); i++) {
             long entryEnd = span.endOffset(i);
             if (entryEnd <= entryStart) {
@@ -2945,9 +2975,9 @@ public final class ChunkStore implements AutoCloseable {
             boolean fullEntryCovered = copyStart == entryStart && copyEnd == entryEnd;
             if (fullEntryCovered) {
                 int dst = (int) (copyStart - offset);
-                readFully(data, slice(outView, dst, entryLen),
+                readFully(data, out.slice(dst, entryLen),
                         checkedAdd(DATA_START, entryStart, "chunk file offset"));
-                int actual = Crc.of(out, dst, entryLen);
+                int actual = Crc.of(outBytes, dst, entryLen);
                 if (actual != span.payloadCrc(i)) {
                     throw new ScpException(ErrorCode.CRC_MISMATCH,
                             "open ledger crc mismatch on " + id + " range [" + entryStart + ".." + entryEnd + ")");
@@ -2968,22 +2998,15 @@ public final class ChunkStore implements AutoCloseable {
                 int src = (int) (copyStart - entryStart);
                 int dst = (int) (copyStart - offset);
                 int len = (int) (copyEnd - copyStart);
-                System.arraycopy(entryBytes, src, out, dst, len);
+                System.arraycopy(entryBytes, src, outBytes, dst, len);
                 copied += len;
             }
             entryStart = entryEnd;
         }
-        if (copied != out.length) {
+        if (copied != outBytes.length) {
             throw new ScpException(ErrorCode.CORRUPT_CHUNK,
                     "open read is not covered by ledger for " + id);
         }
-    }
-
-    private static ByteBuffer slice(ByteBuffer view, int offset, int length) {
-        view.clear();
-        view.position(offset);
-        view.limit(offset + length);
-        return view;
     }
 
     private static int checkedFooterLength(ChunkFormats.Trailer trailer, long fileLen) {
