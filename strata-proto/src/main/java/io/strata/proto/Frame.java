@@ -202,7 +202,7 @@ public final class Frame implements AutoCloseable {
             throw new IllegalStateException("file payload cannot be copied to heap");
         }
         return new Frame(opcode, apiVersion, flags, correlationId,
-                readOnlySlice(copy(headerView())), readOnlySlice(copy(payloadView())), null, null, null, payloadCrc);
+                copy(headerView()), copy(payloadView()), null, null, null, payloadCrc);
     }
 
     public boolean ownsBuffer() {
@@ -231,22 +231,22 @@ public final class Frame implements AutoCloseable {
     }
 
     private static ByteBuffer readOnlySlice(ByteBuffer buffer) {
-        return buffer == null ? EMPTY.duplicate() : buffer.slice().asReadOnlyBuffer();
+        return buffer == null || !buffer.hasRemaining() ? EMPTY : buffer.slice().asReadOnlyBuffer();
     }
 
     private static ByteBuffer slice(ByteBuffer buffer) {
-        return buffer == null ? EMPTY.duplicate() : buffer.slice();
+        return buffer == null || !buffer.hasRemaining() ? EMPTY : buffer.slice();
     }
 
     private ByteBuffer ownerBuffer(int index, int length) {
-        return length == 0 ? EMPTY.duplicate() : owner.nioBuffer(index, length);
+        return length == 0 ? EMPTY : owner.nioBuffer(index, length);
     }
 
     private static ByteBuffer copy(ByteBuffer source) {
         if (source == null || !source.hasRemaining()) {
             // header-only responses (e.g. the APPEND ack) carry an empty payload; reuse the shared
             // empty buffer instead of allocating a zero-length array + wrapper per response
-            return EMPTY.duplicate();
+            return EMPTY;
         }
         ByteBuffer duplicate = source.duplicate();
         byte[] bytes = new byte[duplicate.remaining()];
@@ -255,27 +255,27 @@ public final class Frame implements AutoCloseable {
     }
 
     private static ByteBuffer headerBuffer(byte[] header) {
-        return header != null ? ByteBuffer.wrap(header) : EMPTY.duplicate();
+        return header == null || header.length == 0 ? EMPTY : ByteBuffer.wrap(header);
     }
 
     public static Frame request(Opcode op, byte[] header, ByteBuffer payload, long correlationId) {
         return new Frame(op.code, (short) 1, (short) 0, correlationId,
-                headerBuffer(header), payload != null ? payload : EMPTY.duplicate());
+                headerBuffer(header), slice(payload), null, null, null, 0);
     }
 
     public static Frame response(Frame req, byte[] header, ByteBuffer payload) {
         return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
-                headerBuffer(header), payload != null ? payload : EMPTY.duplicate());
+                headerBuffer(header), slice(payload), null, null, null, 0);
     }
 
     public static Frame response(Frame req, byte[] header, ByteBuffer payload, Runnable payloadReleaser) {
         return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
-                slice(headerBuffer(header)), slice(payload != null ? payload : EMPTY.duplicate()),
+                headerBuffer(header), slice(payload),
                 null, null, payloadReleaser, 0);
     }
 
     public static Frame fileResponse(Frame req, byte[] header, FilePayload filePayload) {
         return new Frame(req.opcode(), req.apiVersion(), FLAG_RESPONSE, req.correlationId(),
-                readOnlySlice(headerBuffer(header)), readOnlySlice(EMPTY.duplicate()), filePayload, null, null, 0);
+                headerBuffer(header), EMPTY, filePayload, null, null, 0);
     }
 }
