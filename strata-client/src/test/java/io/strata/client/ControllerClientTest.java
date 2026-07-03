@@ -171,8 +171,8 @@ class ControllerClientTest {
     void clientFailsOverToAnotherControllerWhenOneDies() throws Exception {
         // Owner-aware client: the first call goes to the first seed; once that controller dies, a retriable
         // transport failure advances to the next controller, so the second call still succeeds.
-        FileId firstId = FileId.of(6);
-        FileId secondId = FileId.of(7);
+        FileId firstId = FileId.of(5);
+        FileId secondId = FileId.of(6);
         try (ScpServer first = new ScpServer(0, 1, 0, 0, req -> {
                 Opcode op = Opcode.fromCode(req.opcode());
                 if (op == Opcode.CREATE_FILE) {
@@ -214,7 +214,7 @@ class ControllerClientTest {
              ControllerClient meta = new ControllerClient(new ClientConfig(List.of(endpoint(server)), 1024, 100))) {
 
             ScpException e = assertThrows(ScpException.class,
-                    () -> meta.lookupFile(StrataNamespace.of("test"), FileId.of(8)));
+                    () -> meta.lookupFile(StrataNamespace.of("test"), FileId.of(7)));
 
             assertEquals(ErrorCode.FILE_NOT_FOUND, e.code());
             assertEquals(1, calls.get());
@@ -227,7 +227,7 @@ class ControllerClientTest {
         // in the LOOKUP_FILE request that arrives at the controller — the server uses it to route
         // to the correct namespace owner.
         StrataNamespace ns = StrataNamespace.of("tenant-x");
-        FileId fileId = FileId.of(9);
+        FileId fileId = FileId.of(8);
         Messages.LookupFileResp stubResp = new Messages.LookupFileResp(
                 ns.toString(), "/some/path", Messages.WritePolicy.DEFAULT, (byte) 0, List.of());
 
@@ -258,7 +258,7 @@ class ControllerClientTest {
     @Test
     void fileScopedOpRoutesByNamespaceAndFollowsRedirect() throws Exception {
         StrataNamespace ns = StrataNamespace.of("tenant-x");
-        FileId id = FileId.of(10);
+        FileId id = FileId.of(9);
         AtomicInteger standbyCalls = new AtomicInteger();
         try (ScpServer standby = new ScpServer(0, 1, 0, 0, req -> {
                 standbyCalls.incrementAndGet();

@@ -10,9 +10,14 @@ import io.strata.proto.ScpClient;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.util.List;
+import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -122,12 +127,68 @@ class ControllerNamespaceLogBackendTest {
         }
     }
 
+    @Test
+    void fencedNamespaceFallsThroughToLazyReopenOnNextOperation() throws Exception {
+        try (TestingServer zk = new TestingServer(true)) {
+            TestNamespaceMetadataFileStore fileStore = new TestNamespaceMetadataFileStore();
+            AtomicBoolean loseNextManifestCas = new AtomicBoolean(false);
+            AtomicReference<NamespaceLogBackend> backendRef = new AtomicReference<>();
+            StrataNamespace namespace = StrataNamespace.of("tenant-a");
+            BiFunction<ZkMetadataStore, String, MetadataStore> backend = (root, endpoint) -> {
+                NamespaceLogBackend logBackend = new NamespaceLogBackend(
+                        failManifestCasOnce(root, loseNextManifestCas), fileStore, true);
+                backendRef.set(logBackend);
+                return new NamespaceLogMetadataStore(logBackend);
+            };
+
+            try (Controller service =
+                         new Controller(ControllerConfig.forTests(zk.getConnectString()), null, backend);
+                 ScpClient client = new ScpClient("127.0.0.1", service.port(), ScpClient.KIND_TOOL,
+                         "nslog-fenced")) {
+                awaitLeader(service);
+                var created = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                        new Messages.CreateFile(namespace.value(), "/logs/seg-fenced",
+                                new Messages.WritePolicy(3, 2, true)).encode(), null, 5_000));
+                NamespaceLogBackend logBackend = backendRef.get();
+                assertEquals(NamespaceLeaderState.ACTIVE, logBackend.leaderState(namespace));
+
+                loseNextManifestCas.set(true);
+                assertEquals(0, logBackend.compactOversizedRepos(1),
+                        "lost manifest CAS fences and evicts without publishing a compaction");
+                assertEquals(NamespaceLeaderState.FENCED, logBackend.leaderState(namespace));
+
+                var byPath = Messages.LookupPathResp.decode(client.call(Opcode.LOOKUP_PATH,
+                        new Messages.LookupPath(namespace.value(), "/logs/seg-fenced").encode(), null, 5_000));
+
+                assertEquals(created.fileId(), byPath.fileId());
+                assertEquals(NamespaceLeaderState.ACTIVE, logBackend.leaderState(namespace),
+                        "the next client op lazily re-opens a FENCED namespace");
+            }
+        }
+    }
+
     private static void awaitLeader(Controller service) throws InterruptedException {
         long deadline = System.currentTimeMillis() + 10_000;
         while (!service.isLeader() && System.currentTimeMillis() < deadline) {
             Thread.sleep(20);
         }
         assertTrue(service.isLeader(), "service must acquire leadership");
+    }
+
+    private static MetadataStore failManifestCasOnce(MetadataStore delegate, AtomicBoolean armed) {
+        return (MetadataStore) Proxy.newProxyInstance(
+                MetadataStore.class.getClassLoader(),
+                new Class<?>[]{MetadataStore.class},
+                (proxy, method, methodArgs) -> {
+                    if (method.getName().equals("putNamespaceManifest") && armed.compareAndSet(true, false)) {
+                        return OptionalInt.empty();
+                    }
+                    try {
+                        return method.invoke(delegate, methodArgs);
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
     }
 
     private interface ThrowingSupplier<T> {

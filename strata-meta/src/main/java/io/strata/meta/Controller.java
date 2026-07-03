@@ -460,8 +460,9 @@ public final class Controller implements AutoCloseable {
         }
         NamespaceLeaderState state = leadership.leaderState(namespace);
         // STANDBY means no local repo has been opened yet (or a failed open is retryable by opening again).
-        // RECOVERING/FENCED are in-flight barriers; clients should retry this same owner after backoff.
-        if (state == NamespaceLeaderState.RECOVERING || state == NamespaceLeaderState.FENCED) {
+        // RECOVERING is an in-flight barrier; clients should retry this same owner after backoff.
+        // FENCED falls through so the next op can lazily re-open the namespace at a fresh epoch.
+        if (state == NamespaceLeaderState.RECOVERING) {
             throw new ScpException(ErrorCode.METADATA_RECOVERING,
                     "namespace " + namespace + " is " + state + "; retry the same owner");
         }
