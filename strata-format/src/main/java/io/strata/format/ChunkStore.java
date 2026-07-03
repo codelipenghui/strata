@@ -1208,7 +1208,7 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     private record OpenReadPlan(Path dataPath, NsChunkId nsKey, long firstEntryStart,
-                                List<ChunkFormats.LedgerEntry> entries) {}
+                                ChunkFormats.LedgerEntry[] entries) {}
 
     public ReadResult read(StrataNamespace ns, ChunkId id, long offset, int maxBytes) throws IOException {
         try (ReadRegionResult r = readRegion(ns, id, offset, maxBytes, true)) {
@@ -2723,7 +2723,7 @@ public final class ChunkStore implements AutoCloseable {
         readOpenVerified(h.data, span.firstStart(), span.entries(), h.id, offset, out);
     }
 
-    private void readOpenVerified(FileChannel data, long firstEntryStart, List<ChunkFormats.LedgerEntry> entries,
+    private void readOpenVerified(FileChannel data, long firstEntryStart, ChunkFormats.LedgerEntry[] entries,
                                   ChunkId id, long offset, byte[] out) throws IOException {
         if (out.length == 0) {
             return;

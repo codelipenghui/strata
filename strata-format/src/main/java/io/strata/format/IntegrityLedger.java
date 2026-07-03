@@ -85,7 +85,7 @@ public final class IntegrityLedger implements AutoCloseable {
         return List.copyOf(entries);
     }
 
-    public record EntrySpan(long firstStart, List<ChunkFormats.LedgerEntry> entries) {}
+    public record EntrySpan(long firstStart, ChunkFormats.LedgerEntry[] entries) {}
 
     /**
      * Returns the minimal ledger-entry span that covers [offset, readEnd). Entries are monotonic by
@@ -94,15 +94,20 @@ public final class IntegrityLedger implements AutoCloseable {
     public EntrySpan entriesCovering(long offset, long readEnd) {
         int first = firstEntryEndingAfter(offset);
         long firstStart = first == 0 ? 0 : entries.get(first - 1).endOffset();
-        List<ChunkFormats.LedgerEntry> out = new ArrayList<>();
-        for (int i = first; i < entries.size(); i++) {
-            ChunkFormats.LedgerEntry e = entries.get(i);
-            out.add(e);
+        int end = first;
+        for (; end < entries.size(); end++) {
+            ChunkFormats.LedgerEntry e = entries.get(end);
             if (e.endOffset() >= readEnd) {
+                end++;
                 break;
             }
         }
-        return new EntrySpan(firstStart, List.copyOf(out));
+        ChunkFormats.LedgerEntry[] out = new ChunkFormats.LedgerEntry[end - first];
+        for (int i = first; i < end; i++) {
+            ChunkFormats.LedgerEntry e = entries.get(i);
+            out[i - first] = e;
+        }
+        return new EntrySpan(firstStart, out);
     }
 
     private int firstEntryEndingAfter(long offset) {
