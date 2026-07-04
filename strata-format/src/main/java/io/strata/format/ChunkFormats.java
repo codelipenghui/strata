@@ -18,6 +18,7 @@ import java.nio.channels.FileChannel;
  */
 public final class ChunkFormats {
     private ChunkFormats() {}
+    private static final char[] HEX = "0123456789abcdef".toCharArray();
 
     public static final int FORMAT_VERSION = 2;
     public static final int HEADER_SIZE = 4096;
@@ -242,7 +243,22 @@ public final class ChunkFormats {
         long fid = id.fileId().id();
         int l1 = (int) (fid & 0xFF);
         int l2 = (int) ((fid >> 8) & 0xFF);
-        return String.format("%s/%02x/%02x/%s", ns, l1, l2, baseName(id));
+        String nsString = ns.toString();
+        String index = Integer.toString(id.index());
+        StringBuilder out = new StringBuilder(nsString.length() + 1 + 2 + 1 + 2 + 1 + 16 + 1 + index.length());
+        out.append(nsString).append('/');
+        appendHexByte(out, l1);
+        out.append('/');
+        appendHexByte(out, l2);
+        out.append('/');
+        id.fileId().appendHex16(out);
+        out.append('.').append(index);
+        return out.toString();
+    }
+
+    private static void appendHexByte(StringBuilder out, int value) {
+        out.append(HEX[(value >>> 4) & 0xF]);
+        out.append(HEX[value & 0xF]);
     }
 
     public static ChunkId parseBaseName(String base) {

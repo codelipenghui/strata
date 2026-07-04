@@ -125,7 +125,7 @@ public record ChunkStoreConfig(
     }
 
     /**
-     * Default sealed-chunk channel-cache capacity: derived from the soft RLIMIT_NOFILE minus headroom
+     * Default read channel-cache capacity: derived from the soft RLIMIT_NOFILE minus headroom
      * for pinned OPEN channels, ledgers, sockets, and in-flight transient FDs. Falls back to a fixed
      * default on non-Unix / non-HotSpot JVMs where the FD limit is not introspectable.
      */

@@ -220,11 +220,14 @@ final class NettyFrameCodec {
                 return;
             }
 
-            int sourceBase = in.readerIndex();
-            ByteBuf frame = in.readRetainedSlice(frameLen);
+            int frameBase = in.readerIndex();
+            // Retain the cumulation itself and keep absolute indexes into it. ByteToMessageDecoder
+            // skips discard while refCnt > 1, so the request bytes stay stable until Frame.close()
+            // releases this retain. This avoids allocating a PooledSlicedByteBuf per inbound frame.
+            ByteBuf frame = in.retain();
+            in.skipBytes(frameLen);
             boolean emitted = false;
             try {
-                int frameBase = frame.readerIndex();
                 FrameIO.checkMagicAndVersion(frame.getByte(frameBase), frame.getByte(frameBase + 1));
                 short opcode = frame.getShort(frameBase + 2);
                 short apiVersion = frame.getShort(frameBase + 4);
@@ -237,20 +240,18 @@ final class NettyFrameCodec {
 
                 int headerIndex = Frame.PREAMBLE_AFTER_LEN;
                 int payloadIndex = headerIndex + headerLen;
-                ByteBuffer internalPayloadReadBuffer = null;
                 if ((flags & Frame.FLAG_PAYLOAD_CRC) != 0 && payloadLen > 0) {
-                    if (shouldCacheInternalPayloadReadBuffer(opcode, flags, in)) {
-                        internalPayloadReadBuffer = in.internalNioBuffer(sourceBase + payloadIndex,
-                                payloadLen).duplicate();
-                        FrameIO.checkPayloadCrc(payloadCrc, Crc.of(internalPayloadReadBuffer));
+                    if (shouldUseInternalPayloadCrcBuffer(opcode, flags, in)) {
+                        FrameIO.checkPayloadCrc(payloadCrc,
+                                Crc.of(in.internalNioBuffer(frameBase + payloadIndex, payloadLen)));
                     } else {
-                        FrameIO.checkPayloadCrc(payloadCrc, payloadCrc(in, sourceBase + payloadIndex, payloadLen));
+                        FrameIO.checkPayloadCrc(payloadCrc, payloadCrc(in, frameBase + payloadIndex, payloadLen));
                     }
                 }
                 // Frame normalizes payloadCrc to 0 on an unflagged/empty frame (the accessor contract)
                 out.add(Frame.fromOwnedBuffer(opcode, apiVersion, flags, correlationId,
                         frame, frameBase + headerIndex, headerLen,
-                        frameBase + payloadIndex, payloadLen, payloadCrc, internalPayloadReadBuffer));
+                        frameBase + payloadIndex, payloadLen, payloadCrc));
                 emitted = true;
             } finally {
                 if (!emitted) {
@@ -259,7 +260,7 @@ final class NettyFrameCodec {
             }
         }
 
-        private static boolean shouldCacheInternalPayloadReadBuffer(short opcode, short flags, ByteBuf in) {
+        private static boolean shouldUseInternalPayloadCrcBuffer(short opcode, short flags, ByteBuf in) {
             return opcode == Opcode.APPEND.code
                     && (flags & Frame.FLAG_RESPONSE) == 0
                     && in.nioBufferCount() == 1;

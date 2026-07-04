@@ -79,12 +79,18 @@ class ServerMetricsTest {
             SimpleMeterRegistry registry = new SimpleMeterRegistry();
             ServerMetrics.registerDataNode(registry, node, 10_000);
             ServerMetrics.registerNewDataNodeNamespaces(registry, node); // force the lazy registration now
+            ServerMetrics.registerNewDataNodeNamespaces(registry, node);
 
             var appendBytes = registry.find("strata_data_node_append_bytes")
                     .tag("namespace", "ns1").functionCounter();
             assertNotNull(appendBytes, "per-namespace append_bytes counter must register after node I/O");
             assertTrue(appendBytes.count() >= payload.length,
                     "append_bytes for ns1 must reflect the written payload");
+            long appendBytesMeters = registry.getMeters().stream()
+                    .filter(m -> "strata_data_node_append_bytes".equals(m.getId().getName()))
+                    .filter(m -> "ns1".equals(m.getId().getTag("namespace")))
+                    .count();
+            assertEquals(1, appendBytesMeters, "lazy registration must not duplicate namespace meters");
         }
     }
 

@@ -13,6 +13,7 @@ import io.strata.proto.RequestObserver;
 
 import java.time.Duration;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
@@ -138,6 +139,7 @@ final class ServerMetrics {
         // endpoint. A state-timeline over this series shows the owner and visibly flips on handoff (design §3.5).
         MultiGauge owner = MultiGauge.builder("strata_controller_namespace_owner")
                 .description("=1 from the controller that currently owns the namespace (owner = its endpoint)").register(reg);
+        NsCounterRegistrationState nsCounters = new NsCounterRegistrationState();
         var refresh = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "controller-ns-metrics");
             t.setDaemon(true);
@@ -155,7 +157,7 @@ final class ServerMetrics {
             owner.register(stats.keySet().stream()
                     .map(ns -> MultiGauge.Row.of(Tags.of("namespace", ns, "owner", self), 1))
                     .collect(Collectors.toList()), true);
-            registerNewControllerNamespaceCounters(reg, s);
+            registerNewControllerNamespaceCounters(reg, s, nsCounters);
         }, 0, refreshIntervalMs, TimeUnit.MILLISECONDS);
     }
 
@@ -165,9 +167,14 @@ final class ServerMetrics {
      * callable directly (tests) to register without waiting for a tick.
      */
     static void registerNewControllerNamespaceCounters(MeterRegistry reg, Controller s) {
+        registerNewControllerNamespaceCounters(reg, s, new NsCounterRegistrationState());
+    }
+
+    private static void registerNewControllerNamespaceCounters(MeterRegistry reg, Controller s,
+            NsCounterRegistrationState registrations) {
         registerLazyNsCounters(reg, s, s.namespaceLogNamespaces(), CONTROLLER_NS_COUNTERS,
                 "per-namespace metadata-log activity / ownership handoffs (rate() = ops/s or bytes/s)",
-                Controller::namespaceLogValue);
+                Controller::namespaceLogValue, registrations);
     }
 
     /** Data plane: capacity, chunk state, write throughput, fsync force rate, registration. */
@@ -240,7 +247,9 @@ final class ServerMetrics {
             t.setDaemon(true);
             return t;
         });
-        refresh.scheduleAtFixedRate(() -> registerNewDataNodeNamespaces(reg, n), 0, refreshIntervalMs, TimeUnit.MILLISECONDS);
+        NsCounterRegistrationState nsCounters = new NsCounterRegistrationState();
+        refresh.scheduleAtFixedRate(() -> registerNewDataNodeNamespaces(reg, n, nsCounters),
+                0, refreshIntervalMs, TimeUnit.MILLISECONDS);
     }
 
     private static final String[] DATA_NODE_NS_COUNTERS = {
@@ -260,17 +269,44 @@ final class ServerMetrics {
      * ever seen and counter semantics stay monotonic.
      */
     private static <T> void registerLazyNsCounters(MeterRegistry reg, T source, Iterable<String> namespaces,
-            String[] names, String description, NsCounterReader<T> reader) {
+            String[] names, String description, NsCounterReader<T> reader,
+            NsCounterRegistrationState registrations) {
         for (String ns : namespaces) {
             for (int i = 0; i < names.length; i++) {
-                if (reg.find(names[i]).tag("namespace", ns).functionCounter() == null) {
-                    final int idx = i;
-                    final String namespace = ns;
-                    FunctionCounter.builder(names[i], source, src -> reader.valueOf(src, namespace, idx))
-                            .tag("namespace", namespace).description(description).register(reg);
+                final int idx = i;
+                final String namespace = ns;
+                String name = names[i];
+                if (registrations.mark(name, namespace)) {
+                    boolean registered = false;
+                    try {
+                        if (reg.find(name).tag("namespace", namespace).functionCounter() == null) {
+                            FunctionCounter.builder(name, source, src -> reader.valueOf(src, namespace, idx))
+                                    .tag("namespace", namespace).description(description).register(reg);
+                        }
+                        registered = true;
+                    } finally {
+                        if (!registered) {
+                            registrations.unmark(name, namespace);
+                        }
+                    }
                 }
             }
         }
+    }
+
+    private static final class NsCounterRegistrationState {
+        private final Set<NsCounterKey> registered = ConcurrentHashMap.newKeySet();
+
+        boolean mark(String name, String namespace) {
+            return registered.add(new NsCounterKey(name, namespace));
+        }
+
+        void unmark(String name, String namespace) {
+            registered.remove(new NsCounterKey(name, namespace));
+        }
+    }
+
+    private record NsCounterKey(String name, String namespace) {
     }
 
     /**
@@ -278,8 +314,13 @@ final class ServerMetrics {
      * seen I/O. Called by the refresh timer; also callable directly (tests) to register without a tick.
      */
     static void registerNewDataNodeNamespaces(MeterRegistry reg, DataNode n) {
+        registerNewDataNodeNamespaces(reg, n, new NsCounterRegistrationState());
+    }
+
+    private static void registerNewDataNodeNamespaces(MeterRegistry reg, DataNode n,
+            NsCounterRegistrationState registrations) {
         registerLazyNsCounters(reg, n, n.ioNamespaces(), DATA_NODE_NS_COUNTERS,
-                "per-namespace data throughput (rate() = ops/s or bytes/s)", DataNode::ioValue);
+                "per-namespace data throughput (rate() = ops/s or bytes/s)", DataNode::ioValue, registrations);
     }
 
     /**

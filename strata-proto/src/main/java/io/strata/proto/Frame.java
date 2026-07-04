@@ -1,9 +1,13 @@
 package io.strata.proto;
 
 import io.netty.buffer.ByteBuf;
+import io.strata.common.EnvConfig;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.GatheringByteChannel;
+import java.util.ArrayDeque;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
@@ -32,27 +36,34 @@ public final class Frame implements AutoCloseable {
             AtomicIntegerFieldUpdater.newUpdater(Frame.class, "closed");
     private static final AtomicLongFieldUpdater<Frame> RESERVED_WIRE_BYTES =
             AtomicLongFieldUpdater.newUpdater(Frame.class, "reservedWireBytes");
+    private static final int MAX_POOLED_OWNED_REQUEST_FRAMES =
+            EnvConfig.intEnv("STRATA_SCP_OWNED_REQUEST_FRAME_POOL_SIZE",
+                    EnvConfig.intEnv("STRATA_SCP_OWNED_APPEND_FRAME_POOL_SIZE", 64));
+    private static final ThreadLocal<ArrayDeque<Frame>> OWNED_REQUEST_FRAMES =
+            ThreadLocal.withInitial(ArrayDeque::new);
 
-    private final short opcode;
-    private final short apiVersion;
-    private final short flags;
-    private final long correlationId;
-    private final ByteBuffer header;
-    private final byte[] headerBytes;
-    private final byte headerKind;
-    private final long headerU64;
-    private final ByteBuffer payload;
-    private final byte[] payloadBytes;
-    private final int payloadBytesOffset;
-    private final int payloadBytesLen;
-    private final FilePayload filePayload;
-    private final ByteBuf owner;
-    private final int ownerHeaderIndex;
-    private final int ownerHeaderLen;
-    private final int ownerPayloadIndex;
-    private final int ownerPayloadLen;
-    private final Runnable payloadReleaser;
-    private final int payloadCrc;
+    private short opcode;
+    private short apiVersion;
+    private short flags;
+    private long correlationId;
+    private ByteBuffer header = EMPTY;
+    private byte[] headerBytes;
+    private byte headerKind = HEADER_KIND_BUFFER;
+    private long headerU64;
+    private ByteBuffer payload = EMPTY;
+    private byte[] payloadBytes;
+    private int payloadBytesOffset;
+    private int payloadBytesLen;
+    private FilePayload filePayload;
+    private ByteBuf owner;
+    private int ownerHeaderIndex = -1;
+    private int ownerHeaderLen = -1;
+    private int ownerPayloadIndex = -1;
+    private int ownerPayloadLen = -1;
+    private Runnable payloadReleaser;
+    private int payloadCrc;
+    private boolean recyclableOwned;
+    private int closedOwnerRefCnt = -1;
     @SuppressWarnings("unused") // updated through CLOSED
     private volatile int closed;
     @SuppressWarnings("unused") // updated through RESERVED_WIRE_BYTES by ScpServer
@@ -62,6 +73,10 @@ public final class Frame implements AutoCloseable {
                  ByteBuffer header, ByteBuffer payload) {
         this(opcode, apiVersion, flags, correlationId, readOnlySlice(header), null, readOnlySlice(payload),
                 null, null, null, 0);
+    }
+
+    private Frame() {
+        closed = 1;
     }
 
     private Frame(short opcode, short apiVersion, short flags, long correlationId,
@@ -155,9 +170,66 @@ public final class Frame implements AutoCloseable {
     static Frame fromOwnedBuffer(short opcode, short apiVersion, short flags, long correlationId,
                                  ByteBuf owner, int headerIndex, int headerLen, int payloadIndex, int payloadLen,
                                  int payloadCrc, ByteBuffer internalPayloadReadBuffer) {
-        return new Frame(opcode, apiVersion, flags, correlationId, null, null, internalPayloadReadBuffer, null, owner,
-                headerIndex, headerLen, payloadIndex, payloadLen, null,
-                retainedPayloadCrc(flags, payloadLen, payloadCrc));
+        boolean recyclable = shouldRecycleOwnedFrame(opcode, flags);
+        Frame frame = recyclable ? acquireOwnedRequestFrame() : new Frame();
+        return frame.initOwnedBuffer(opcode, apiVersion, flags, correlationId, owner, headerIndex, headerLen,
+                payloadIndex, payloadLen, payloadCrc, internalPayloadReadBuffer, recyclable);
+    }
+
+    private Frame initOwnedBuffer(short opcode, short apiVersion, short flags, long correlationId,
+                                  ByteBuf owner, int headerIndex, int headerLen, int payloadIndex, int payloadLen,
+                                  int payloadCrc, ByteBuffer internalPayloadReadBuffer, boolean recyclableOwned) {
+        this.opcode = opcode;
+        this.apiVersion = apiVersion;
+        this.flags = flags;
+        this.correlationId = correlationId;
+        this.header = null;
+        this.headerBytes = null;
+        this.headerKind = HEADER_KIND_BUFFER;
+        this.headerU64 = 0;
+        this.payload = internalPayloadReadBuffer;
+        this.payloadBytes = null;
+        this.payloadBytesOffset = 0;
+        this.payloadBytesLen = 0;
+        this.filePayload = null;
+        this.owner = owner;
+        this.ownerHeaderIndex = headerIndex;
+        this.ownerHeaderLen = headerLen;
+        this.ownerPayloadIndex = payloadIndex;
+        this.ownerPayloadLen = payloadLen;
+        this.payloadReleaser = null;
+        this.payloadCrc = retainedPayloadCrc(flags, payloadLen, payloadCrc);
+        this.recyclableOwned = recyclableOwned;
+        this.closedOwnerRefCnt = -1;
+        this.reservedWireBytes = 0;
+        this.closed = 0;
+        return this;
+    }
+
+    private static boolean shouldRecycleOwnedFrame(short opcode, short flags) {
+        return MAX_POOLED_OWNED_REQUEST_FRAMES > 0
+                && (opcode == Opcode.APPEND.code
+                        || opcode == Opcode.READ.code
+                        || opcode == Opcode.READ_RECOVERY.code)
+                && (flags & FLAG_RESPONSE) == 0;
+    }
+
+    private static Frame acquireOwnedRequestFrame() {
+        Frame frame = OWNED_REQUEST_FRAMES.get().pollFirst();
+        if (frame != null) {
+            return frame;
+        }
+        return new Frame();
+    }
+
+    private static void recycleOwnedRequestFrame(Frame frame) {
+        if (MAX_POOLED_OWNED_REQUEST_FRAMES <= 0) {
+            return;
+        }
+        ArrayDeque<Frame> frames = OWNED_REQUEST_FRAMES.get();
+        if (frames.size() < MAX_POOLED_OWNED_REQUEST_FRAMES) {
+            frames.addFirst(frame);
+        }
     }
 
     static Frame decoded(short opcode, short apiVersion, short flags, long correlationId,
@@ -349,6 +421,70 @@ public final class Frame implements AutoCloseable {
         return owner != null ? ownerPayloadLen : payloadBytes != null ? payloadBytesLen : payload.remaining();
     }
 
+    public void writePayloadTo(FileChannel channel, long position) throws IOException {
+        if (filePayload != null) {
+            throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
+        }
+        int length = payloadLength();
+        if (length == 0) {
+            return;
+        }
+        if (owner != null) {
+            writeOwnedPayloadTo(channel, position, length);
+            return;
+        }
+        writeFully(channel, payloadReadBuffer(), position);
+    }
+
+    public void copyPayloadTo(int payloadOffset, byte[] dst, int dstOffset, int length) {
+        if (filePayload != null) {
+            throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
+        }
+        checkRange(payloadOffset, length, payloadLength());
+        if (dstOffset < 0 || length < 0 || dstOffset > dst.length - length) {
+            throw new IndexOutOfBoundsException(
+                    "dstOffset=" + dstOffset + " length=" + length + " capacity=" + dst.length);
+        }
+        if (length == 0) {
+            return;
+        }
+        if (owner != null) {
+            owner.getBytes(ownerPayloadIndex + payloadOffset, dst, dstOffset, length);
+            return;
+        }
+        ByteBuffer source = payloadReadBuffer();
+        source.position(source.position() + payloadOffset);
+        source.get(dst, dstOffset, length);
+    }
+
+    public void copyPayloadTo(int payloadOffset, ByteBuffer dst, int length) {
+        if (filePayload != null) {
+            throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
+        }
+        checkRange(payloadOffset, length, payloadLength());
+        if (length < 0 || length > dst.remaining()) {
+            throw new IndexOutOfBoundsException(
+                    "length=" + length + " remaining=" + dst.remaining());
+        }
+        if (length == 0) {
+            return;
+        }
+        int originalLimit = dst.limit();
+        try {
+            dst.limit(dst.position() + length);
+            if (owner != null) {
+                owner.getBytes(ownerPayloadIndex + payloadOffset, dst);
+                return;
+            }
+            ByteBuffer source = payloadReadBuffer();
+            int sourceStart = source.position() + payloadOffset;
+            source.position(sourceStart).limit(sourceStart + length);
+            dst.put(source);
+        } finally {
+            dst.limit(originalLimit);
+        }
+    }
+
     /** CRC32C of the payload as computed by the sender and verified at decode; 0 when no payload CRC. */
     public int payloadCrc() {
         return payloadCrc;
@@ -383,7 +519,7 @@ public final class Frame implements AutoCloseable {
     }
 
     public int ownerRefCnt() {
-        return owner == null ? -1 : owner.refCnt();
+        return owner == null ? closedOwnerRefCnt : owner.refCnt();
     }
 
     void reserveWireBytes(long bytes) {
@@ -399,16 +535,50 @@ public final class Frame implements AutoCloseable {
         // a frame owns at most one inbound buffer or file payload; materialized responses may also
         // carry a payload releaser for buffers borrowed from the storage layer.
         if (CLOSED.compareAndSet(this, 0, 1)) {
-            if (owner != null) {
-                owner.release();
+            ByteBuf localOwner = owner;
+            FilePayload localFilePayload = filePayload;
+            Runnable localPayloadReleaser = payloadReleaser;
+            boolean recycle = recyclableOwned;
+            if (localOwner != null) {
+                localOwner.release();
+                closedOwnerRefCnt = localOwner.refCnt();
             }
-            if (filePayload != null) {
-                filePayload.close();
+            if (localFilePayload != null) {
+                localFilePayload.close();
             }
-            if (payloadReleaser != null) {
-                payloadReleaser.run();
+            if (localPayloadReleaser != null) {
+                localPayloadReleaser.run();
+            }
+            if (recycle) {
+                clearRecyclableState();
+                recycleOwnedRequestFrame(this);
             }
         }
+    }
+
+    private void clearRecyclableState() {
+        opcode = 0;
+        apiVersion = 0;
+        flags = 0;
+        correlationId = 0;
+        header = EMPTY;
+        headerBytes = null;
+        headerKind = HEADER_KIND_BUFFER;
+        headerU64 = 0;
+        payload = EMPTY;
+        payloadBytes = null;
+        payloadBytesOffset = 0;
+        payloadBytesLen = 0;
+        filePayload = null;
+        owner = null;
+        ownerHeaderIndex = -1;
+        ownerHeaderLen = -1;
+        ownerPayloadIndex = -1;
+        ownerPayloadLen = -1;
+        payloadReleaser = null;
+        payloadCrc = 0;
+        recyclableOwned = false;
+        reservedWireBytes = 0;
     }
 
     private static ByteBuffer readOnlySlice(ByteBuffer buffer) {
@@ -417,6 +587,36 @@ public final class Frame implements AutoCloseable {
 
     private static ByteBuffer slice(ByteBuffer buffer) {
         return buffer == null || !buffer.hasRemaining() ? EMPTY : buffer.slice();
+    }
+
+    private void writeOwnedPayloadTo(FileChannel channel, long position, int length) throws IOException {
+        int written = 0;
+        while (written < length) {
+            channel.position(position + written);
+            int n = owner.getBytes(ownerPayloadIndex + written, (GatheringByteChannel) channel, length - written);
+            if (n <= 0) {
+                throw new IOException("failed to write payload bytes");
+            }
+            written += n;
+        }
+    }
+
+    private static void writeFully(FileChannel channel, ByteBuffer source, long position) throws IOException {
+        long writePosition = position;
+        while (source.hasRemaining()) {
+            int n = channel.write(source, writePosition);
+            if (n <= 0) {
+                throw new IOException("failed to write payload bytes");
+            }
+            writePosition += n;
+        }
+    }
+
+    private static void checkRange(int offset, int length, int capacity) {
+        if (offset < 0 || length < 0 || offset > capacity - length) {
+            throw new IndexOutOfBoundsException(
+                    "offset=" + offset + " length=" + length + " capacity=" + capacity);
+        }
     }
 
     private ByteBuffer ownerBuffer(int index, int length) {

@@ -12,6 +12,7 @@ import io.strata.proto.ScpServer;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -21,6 +22,9 @@ import java.util.concurrent.CompletableFuture;
 final class DataNodeHandlers implements ScpServer.Handler {
     private static final ThreadLocal<ChunkStore.AppendOutcome> APPEND_OUTCOME =
             ThreadLocal.withInitial(ChunkStore.AppendOutcome::new);
+    private static final int APPEND_PAYLOAD_SCRATCH_BYTES = 64 * 1024;
+    private static final ThreadLocal<FrameAppendPayload> APPEND_PAYLOAD =
+            ThreadLocal.withInitial(FrameAppendPayload::new);
 
     private final ChunkStore store;
     private final DataNode node;
@@ -219,10 +223,93 @@ final class DataNodeHandlers implements ScpServer.Handler {
         var m = Messages.Append.decodeFields(req);
         RequestContext.setNamespace(m.namespace().value());
         ChunkStore.AppendOutcome outcome = APPEND_OUTCOME.get();
-        store.appendAsync(m.namespace(), m.fileId(), m.chunkIndex(), m.writeEpoch(),
-                m.baseOffset(), m.durableOffset(), req.payloadInternalReadBuffer(), req.payloadCrc(),
-                m.recovery(), outcome);
+        FrameAppendPayload payload = APPEND_PAYLOAD.get().reset(req);
+        try {
+            store.appendAsync(m.namespace(), m.fileId(), m.chunkIndex(), m.writeEpoch(),
+                    m.baseOffset(), m.durableOffset(), payload, req.payloadCrc(), m.recovery(), outcome);
+        } finally {
+            payload.clear();
+        }
         return outcome;
+    }
+
+    private static final class FrameAppendPayload implements ChunkStore.AppendPayload {
+        private final ByteBuffer scratchBuffer = ByteBuffer.allocateDirect(APPEND_PAYLOAD_SCRATCH_BYTES);
+        private byte[] crcScratch;
+        private Frame frame;
+        private boolean scratchContainsPayload;
+        private int scratchPayloadLength;
+
+        private FrameAppendPayload reset(Frame frame) {
+            this.frame = Objects.requireNonNull(frame, "frame");
+            scratchContainsPayload = false;
+            scratchPayloadLength = 0;
+            return this;
+        }
+
+        private void clear() {
+            frame = null;
+            scratchContainsPayload = false;
+            scratchPayloadLength = 0;
+            scratchBuffer.clear();
+        }
+
+        @Override
+        public int remaining() {
+            return frame.payloadLength();
+        }
+
+        @Override
+        public void writeFully(FileChannel channel, long position) throws IOException {
+            int length = frame.payloadLength();
+            if (length <= scratchBuffer.capacity()) {
+                scratchBuffer.clear();
+                frame.copyPayloadTo(0, scratchBuffer, length);
+                scratchBuffer.flip();
+                scratchContainsPayload = true;
+                scratchPayloadLength = length;
+                DataNodeHandlers.writeFully(channel, scratchBuffer, position);
+                return;
+            }
+            frame.writePayloadTo(channel, position);
+        }
+
+        @Override
+        public void accumulateCrc(ChunkStore.PayloadCrcAccumulator accumulator) {
+            if (scratchContainsPayload) {
+                scratchBuffer.limit(scratchPayloadLength).position(0);
+                accumulator.update(scratchBuffer);
+                return;
+            }
+            byte[] scratch = crcScratch();
+            int offset = 0;
+            int remaining = frame.payloadLength();
+            while (remaining > 0) {
+                int n = Math.min(scratch.length, remaining);
+                frame.copyPayloadTo(offset, scratch, 0, n);
+                accumulator.update(scratch, 0, n);
+                offset += n;
+                remaining -= n;
+            }
+        }
+
+        private byte[] crcScratch() {
+            if (crcScratch == null) {
+                crcScratch = new byte[APPEND_PAYLOAD_SCRATCH_BYTES];
+            }
+            return crcScratch;
+        }
+    }
+
+    private static void writeFully(FileChannel channel, ByteBuffer source, long position) throws IOException {
+        long writePosition = position;
+        while (source.hasRemaining()) {
+            int n = channel.write(source, writePosition);
+            if (n <= 0) {
+                throw new IOException("failed to write payload bytes");
+            }
+            writePosition += n;
+        }
     }
 
     private ChunkStore.ReadRegionResult readRegion(Frame req, boolean recovery) throws IOException {

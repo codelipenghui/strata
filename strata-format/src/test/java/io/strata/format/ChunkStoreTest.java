@@ -50,6 +50,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -162,6 +163,46 @@ class ChunkStoreTest {
             assertEquals(9, payload.limit());
             assertArrayEquals("payload".getBytes(StandardCharsets.UTF_8),
                     store.read(TEST_NS, id, 0, 1024).bytes());
+        }
+    }
+
+    @Test
+    void appendPayloadSourceWritesAndAccumulatesCrcs() throws Exception {
+        try (ChunkStore store = newStore()) {
+            store.open(TEST_NS, id, false, 1, 1718000000000L);
+            byte[] payload = "payload-source".getBytes(StandardCharsets.UTF_8);
+            ChunkStore.AppendOutcome outcome = new ChunkStore.AppendOutcome();
+            ChunkStore.AppendPayload source = new ChunkStore.AppendPayload() {
+                @Override
+                public int remaining() {
+                    return payload.length;
+                }
+
+                @Override
+                public void writeFully(FileChannel channel, long position) throws IOException {
+                    ByteBuffer view = ByteBuffer.wrap(payload);
+                    long writePosition = position;
+                    while (view.hasRemaining()) {
+                        int n = channel.write(view, writePosition);
+                        assertTrue(n > 0);
+                        writePosition += n;
+                    }
+                }
+
+                @Override
+                public void accumulateCrc(ChunkStore.PayloadCrcAccumulator accumulator) {
+                    accumulator.update(payload, 0, 4);
+                    accumulator.update(payload, 4, payload.length - 4);
+                }
+            };
+
+            store.appendAsync(TEST_NS, id.fileId().id(), id.index(), 1, 0, 0,
+                    source, Crc.of(payload), false, outcome);
+
+            assertEquals(payload.length, outcome.endOffset());
+            assertNull(outcome.waitForFlush());
+            assertArrayEquals(payload, store.read(TEST_NS, id, 0, 1024).bytes());
+            assertEquals(Crc.of(payload), store.seal(TEST_NS, id, 1, payload.length, null).dataCrc());
         }
     }
 
@@ -597,13 +638,12 @@ class ChunkStoreTest {
         }
     }
 
-    @SuppressWarnings("unchecked")
-    private static List<Integer> decodeCrcRanges(byte[] footerBytes, long dataLength, int expectedSections)
+    private static int[] decodeCrcRanges(byte[] footerBytes, long dataLength, int expectedSections)
             throws Exception {
         Method method = ChunkStore.class.getDeclaredMethod("decodeCrcRanges", byte[].class, long.class, int.class);
         method.setAccessible(true);
         try {
-            return (List<Integer>) method.invoke(null, footerBytes, dataLength, expectedSections);
+            return (int[]) method.invoke(null, footerBytes, dataLength, expectedSections);
         } catch (InvocationTargetException e) {
             throw rethrowCause(e);
         }
@@ -1636,7 +1676,7 @@ class ChunkStoreTest {
             store.append(TEST_NS, id, 1, 0, 0, bytes("payload"));
             store.seal(TEST_NS, id, 1, 7, null);
 
-            setHandleObject(store, id, "sealedRangeCrcs", List.of());
+            setHandleObject(store, id, "sealedRangeCrcs", new int[0]);
             assertEquals(ErrorCode.CORRUPT_CHUNK,
                     assertThrows(ScpException.class, () -> store.read(TEST_NS, id, 0, 1)).code());
         }
@@ -1650,7 +1690,7 @@ class ChunkStoreTest {
             store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(payload));
             store.seal(TEST_NS, id, 1, payload.length, null);
 
-            setHandleObject(store, id, "sealedRangeCrcs", List.of(Crc.of(payload, 0, ChunkFormats.CRC_RANGE_SIZE)));
+            setHandleObject(store, id, "sealedRangeCrcs", new int[] {Crc.of(payload, 0, ChunkFormats.CRC_RANGE_SIZE)});
             assertEquals(ErrorCode.CORRUPT_CHUNK,
                     assertThrows(ScpException.class,
                             () -> store.read(TEST_NS, id, ChunkFormats.CRC_RANGE_SIZE, 1)).code());
@@ -2340,6 +2380,28 @@ class ChunkStoreTest {
     }
 
     @Test
+    void openClientReadGoesThroughChannelCache() throws Exception {
+        try (ChunkStore store = newStore()) {
+            open(store, id, 1);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("open-cache"));
+            store.append(TEST_NS, id, 1, 10, 10, ByteBuffer.allocate(0));
+
+            ChunkStore.ReadRegionResult first = store.readRegion(TEST_NS, id, 0, 4);
+            assertArrayEquals("open".getBytes(StandardCharsets.UTF_8), first.bytes());
+            first.close();
+            assertEquals(1, store.channelCacheMisses());
+            assertEquals(0, store.channelCacheHits());
+            assertTrue(store.cachedChannels() >= 1, "open read returns the borrowed FD to the channel cache");
+
+            ChunkStore.ReadRegionResult second = store.readRegion(TEST_NS, id, 5, 5);
+            assertArrayEquals("cache".getBytes(StandardCharsets.UTF_8), second.bytes());
+            second.close();
+            assertEquals(1, store.channelCacheMisses());
+            assertEquals(1, store.channelCacheHits());
+        }
+    }
+
+    @Test
     void sealedFetchGoesThroughChannelCache() throws Exception {
         try (ChunkStore store = newStore()) {
             byte[] full = sealedBytes(store, id, "fetch-via-cache");
@@ -2381,6 +2443,27 @@ class ChunkStoreTest {
             assertArrayEquals("lease".getBytes(), r.bytes());
             assertTrue(store.cachedChannels() >= 1,
                     "sealed read verification returns the borrowed FD to the channel cache");
+        }
+    }
+
+    @Test
+    void readRegionResultWrapperIsReusedAfterClose() throws Exception {
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, id, "reuse-wrapper");
+
+            ChunkStore.ReadRegionResult first = store.readRegion(TEST_NS, id, 0, 5);
+            assertArrayEquals("reuse".getBytes(StandardCharsets.UTF_8), first.bytes());
+            assertEquals("reuse-wrapper".length(), first.localEndOffset());
+            assertEquals("reuse-wrapper".length(), first.lastKnownDO());
+            first.close();
+            first.close();
+
+            ChunkStore.ReadRegionResult second = store.readRegion(TEST_NS, id, 6, 7);
+            assertSame(first, second);
+            assertArrayEquals("wrapper".getBytes(StandardCharsets.UTF_8), second.bytes());
+            assertEquals("reuse-wrapper".length(), second.localEndOffset());
+            assertEquals("reuse-wrapper".length(), second.lastKnownDO());
+            second.close();
         }
     }
 
