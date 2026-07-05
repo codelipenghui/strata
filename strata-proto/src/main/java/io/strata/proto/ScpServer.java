@@ -359,18 +359,22 @@ public final class ScpServer implements AutoCloseable {
     }
 
     private final class ConnectionHandler extends SimpleChannelInboundHandler<Frame> {
+        private final Channel channel;
         private final SerialRequestExecutor requestExecutor;
         private final Set<Frame> inFlightAsyncRequests = ConcurrentHashMap.newKeySet();
         private final ArrayDeque<FrameTask> frameTasks = new ArrayDeque<>();
         private final ArrayDeque<ResponseWriteListener> responseWriteListeners = new ArrayDeque<>();
         private final ArrayDeque<OkU64WriteTask> okU64WriteTasks = new ArrayDeque<>();
+        private final Runnable okU64FlushTask = this::flushPendingOkU64Responses;
         private final ResponseSink responseSink = new ResponseSink();
         private final AtomicInteger inflightRequests = new AtomicInteger();
         private final AtomicLong inflightBytes = new AtomicLong();
         private final AtomicBoolean connectionOpen = new AtomicBoolean(true);
+        private boolean okU64FlushPending;
         private boolean helloComplete;
 
         ConnectionHandler(Channel channel) {
+            this.channel = channel;
             this.requestExecutor = new SerialRequestExecutor(channel);
         }
 
@@ -898,16 +902,43 @@ public final class ScpServer implements AutoCloseable {
                 ctx.close();
                 return;
             }
+            boolean queued = false;
             try {
-                ctx.writeAndFlush(out, ctx.voidPromise());
+                ctx.write(out, ctx.voidPromise());
+                queued = true;
+                scheduleOkU64Flush(ctx);
             } catch (RuntimeException e) {
-                out.release();
+                if (!queued) {
+                    out.release();
+                } else {
+                    ctx.flush();
+                }
                 closeFrames(null, req);
                 throw e;
             }
             // OK_U64 responses own only the encoded ByteBuf now queued in Netty; the request payload
             // was consumed before this point, so no write listener is needed just to release it.
             closeFrames(null, req);
+        }
+
+        private void scheduleOkU64Flush(ChannelHandlerContext ctx) {
+            if (okU64FlushPending) {
+                return;
+            }
+            okU64FlushPending = true;
+            try {
+                channel.eventLoop().execute(okU64FlushTask);
+            } catch (RuntimeException e) {
+                okU64FlushPending = false;
+                throw e;
+            }
+        }
+
+        private void flushPendingOkU64Responses() {
+            okU64FlushPending = false;
+            if (!closed.get() && connectionOpen.get() && channel.isActive()) {
+                channel.flush();
+            }
         }
 
         private void writeBytesResponse(ChannelHandlerContext ctx, Frame req, byte[] header, byte[] payload,
@@ -935,7 +966,7 @@ public final class ScpServer implements AutoCloseable {
 
             ByteBuf out;
             try {
-                out = NettyFrameCodec.encodeBytesResponse(ctx.alloc(), req, header, payload, payloadLen);
+                out = NettyFrameCodec.encodeBytesResponseComposite(ctx.alloc(), req, header, payload, payloadLen);
             } catch (IOException | RuntimeException e) {
                 releasePayload(payloadReleaser);
                 closeFrames(null, req);
@@ -951,8 +982,7 @@ public final class ScpServer implements AutoCloseable {
                 closeFrames(null, req);
                 throw e;
             }
-            finishWrite(ctx, write, false, null, req);
-            releasePayload(payloadReleaser);
+            finishWrite(ctx, write, false, null, req, payloadReleaser, null);
         }
 
         private void writeTwoU64BytesResponse(ChannelHandlerContext ctx, Frame req, long first, long second,
@@ -980,7 +1010,7 @@ public final class ScpServer implements AutoCloseable {
 
             ByteBuf out;
             try {
-                out = NettyFrameCodec.encodeTwoU64BytesResponse(ctx.alloc(), req, first, second,
+                out = NettyFrameCodec.encodeTwoU64BytesResponseComposite(ctx.alloc(), req, first, second,
                         payload, payloadLen);
             } catch (IOException | RuntimeException e) {
                 closePayload(payloadCloseable);
@@ -997,8 +1027,7 @@ public final class ScpServer implements AutoCloseable {
                 closeFrames(null, req);
                 throw e;
             }
-            finishWrite(ctx, write, false, null, req);
-            closePayload(payloadCloseable);
+            finishWrite(ctx, write, false, null, req, null, payloadCloseable);
         }
 
         private long bytesResponseWireBytes(byte[] header, byte[] payload, int payloadLen) {
@@ -1111,11 +1140,20 @@ public final class ScpServer implements AutoCloseable {
 
         private void finishWrite(ChannelHandlerContext ctx, ChannelFuture write, boolean closeAfterWrite,
                                  Frame frame, Frame releaseAfterWrite) {
-            write.addListener(responseWriteListener(ctx, frame, releaseAfterWrite, closeAfterWrite));
+            finishWrite(ctx, write, closeAfterWrite, frame, releaseAfterWrite, null, null);
+        }
+
+        private void finishWrite(ChannelHandlerContext ctx, ChannelFuture write, boolean closeAfterWrite,
+                                 Frame frame, Frame releaseAfterWrite, Runnable payloadReleaser,
+                                 AutoCloseable payloadCloseable) {
+            write.addListener(responseWriteListener(ctx, frame, releaseAfterWrite, closeAfterWrite,
+                    payloadReleaser, payloadCloseable));
         }
 
         private ResponseWriteListener responseWriteListener(ChannelHandlerContext ctx, Frame frame,
-                                                            Frame releaseAfterWrite, boolean closeAfterWrite) {
+                                                            Frame releaseAfterWrite, boolean closeAfterWrite,
+                                                            Runnable payloadReleaser,
+                                                            AutoCloseable payloadCloseable) {
             ResponseWriteListener listener;
             synchronized (responseWriteListeners) {
                 listener = responseWriteListeners.pollFirst();
@@ -1123,7 +1161,7 @@ public final class ScpServer implements AutoCloseable {
             if (listener == null) {
                 listener = new ResponseWriteListener();
             }
-            listener.reset(ctx, frame, releaseAfterWrite, closeAfterWrite);
+            listener.reset(ctx, frame, releaseAfterWrite, closeAfterWrite, payloadReleaser, payloadCloseable);
             return listener;
         }
 
@@ -1142,13 +1180,18 @@ public final class ScpServer implements AutoCloseable {
             private ChannelHandlerContext ctx;
             private Frame frame;
             private Frame releaseAfterWrite;
+            private Runnable payloadReleaser;
+            private AutoCloseable payloadCloseable;
             private boolean closeAfterWrite;
 
             private void reset(ChannelHandlerContext ctx, Frame frame, Frame releaseAfterWrite,
-                               boolean closeAfterWrite) {
+                               boolean closeAfterWrite, Runnable payloadReleaser,
+                               AutoCloseable payloadCloseable) {
                 this.ctx = ctx;
                 this.frame = frame;
                 this.releaseAfterWrite = releaseAfterWrite;
+                this.payloadReleaser = payloadReleaser;
+                this.payloadCloseable = payloadCloseable;
                 this.closeAfterWrite = closeAfterWrite;
             }
 
@@ -1157,17 +1200,26 @@ public final class ScpServer implements AutoCloseable {
                 ChannelHandlerContext localCtx = ctx;
                 Frame localFrame = frame;
                 Frame localReleaseAfterWrite = releaseAfterWrite;
+                Runnable localPayloadReleaser = payloadReleaser;
+                AutoCloseable localPayloadCloseable = payloadCloseable;
                 boolean localCloseAfterWrite = closeAfterWrite;
                 ctx = null;
                 frame = null;
                 releaseAfterWrite = null;
+                payloadReleaser = null;
+                payloadCloseable = null;
                 closeAfterWrite = false;
                 try {
                     try {
                         closeFrames(localFrame, localReleaseAfterWrite);
                     } finally {
-                        if (localCloseAfterWrite || !future.isSuccess()) {
-                            localCtx.close();
+                        try {
+                            releasePayload(localPayloadReleaser);
+                            closePayload(localPayloadCloseable);
+                        } finally {
+                            if (localCloseAfterWrite || !future.isSuccess()) {
+                                localCtx.close();
+                            }
                         }
                     }
                 } finally {

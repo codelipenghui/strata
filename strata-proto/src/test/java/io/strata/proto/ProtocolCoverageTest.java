@@ -494,6 +494,37 @@ class ProtocolCoverageTest {
             directReadBytes.release();
         }
 
+        ByteBuf compositeBytes = NettyFrameCodec.encodeBytesResponseComposite(
+                UnpooledByteBufAllocator.DEFAULT, request, Messages.okHeader(), borrowedBytes, 3);
+        try {
+            byte[] directWire = new byte[compositeBytes.readableBytes()];
+            compositeBytes.readBytes(directWire);
+            Frame decodedCompositeBytes = FrameIO.read(new DataInputStream(new ByteArrayInputStream(directWire)));
+            assertEquals(Crc.of(borrowedBytes, 0, 3), decodedCompositeBytes.payloadCrc());
+            byte[] compositePayload = new byte[decodedCompositeBytes.payloadLength()];
+            decodedCompositeBytes.payloadSlice().get(compositePayload);
+            assertArrayEquals(new byte[]{1, 2, 3}, compositePayload);
+        } finally {
+            compositeBytes.release();
+        }
+
+        ByteBuf compositeReadBytes = NettyFrameCodec.encodeTwoU64BytesResponseComposite(
+                UnpooledByteBufAllocator.DEFAULT, request, 9, 7, borrowedBytes, 3);
+        try {
+            byte[] directWire = new byte[compositeReadBytes.readableBytes()];
+            compositeReadBytes.readBytes(directWire);
+            Frame decodedCompositeRead = FrameIO.read(new DataInputStream(new ByteArrayInputStream(directWire)));
+            ByteBuffer readHeader = decodedCompositeRead.headerSlice();
+            Resp.check(readHeader);
+            assertEquals(new Messages.ReadResp(9, 7), Messages.ReadResp.decode(readHeader));
+            assertEquals(Crc.of(borrowedBytes, 0, 3), decodedCompositeRead.payloadCrc());
+            byte[] compositePayload = new byte[decodedCompositeRead.payloadLength()];
+            decodedCompositeRead.payloadSlice().get(compositePayload);
+            assertArrayEquals(new byte[]{1, 2, 3}, compositePayload);
+        } finally {
+            compositeReadBytes.release();
+        }
+
         Frame nullHeader = Frame.request(Opcode.PING, null, null, 12);
         assertEquals(0, nullHeader.headerSlice().remaining());
         assertEquals(0, Frame.response(nullHeader, null, null).headerSlice().remaining());

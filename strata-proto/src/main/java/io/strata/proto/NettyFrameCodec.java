@@ -2,6 +2,8 @@ package io.strata.proto;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.CompositeByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.MessageToByteEncoder;
@@ -99,25 +101,12 @@ final class NettyFrameCodec {
     static ByteBuf encodeBytesResponse(ByteBufAllocator allocator, Frame req, byte[] header, byte[] payload,
                                        int payloadLen) throws IOException {
         int headerLen = header == null ? 0 : header.length;
-        if (payloadLen < 0) {
-            throw new IllegalArgumentException("negative payload length: " + payloadLen);
-        }
-        if (payloadLen > 0 && (payload == null || payloadLen > payload.length)) {
-            throw new IllegalArgumentException("invalid payload length " + payloadLen);
-        }
+        checkPayload(payload, payloadLen);
         int capacity = Integer.BYTES + FrameIO.checkedFrameLength(headerLen, payloadLen);
         ByteBuf out = allocator.ioBuffer(capacity, capacity);
         boolean success = false;
         try {
-            int payloadCrc = payloadLen > 0 ? Crc.of(payload, 0, payloadLen) : 0;
-            short flags = payloadLen > 0
-                    ? (short) (Frame.FLAG_RESPONSE | Frame.FLAG_PAYLOAD_CRC)
-                    : Frame.FLAG_RESPONSE;
-            writePrefix(out, req.opcode(), req.apiVersion(), flags, req.correlationId(),
-                    headerLen, payloadLen, payloadCrc);
-            if (headerLen > 0) {
-                out.writeBytes(header);
-            }
+            writeBytesResponsePrefix(out, req, header, headerLen, payload, payloadLen);
             if (payloadLen > 0) {
                 out.writeBytes(payload, 0, payloadLen);
             }
@@ -130,28 +119,33 @@ final class NettyFrameCodec {
         }
     }
 
+    static ByteBuf encodeBytesResponseComposite(ByteBufAllocator allocator, Frame req, byte[] header, byte[] payload,
+                                                int payloadLen) throws IOException {
+        int headerLen = header == null ? 0 : header.length;
+        checkPayload(payload, payloadLen);
+        ByteBuf prefix = allocator.ioBuffer(
+                Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + headerLen,
+                Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + headerLen);
+        boolean prefixWritten = false;
+        try {
+            writeBytesResponsePrefix(prefix, req, header, headerLen, payload, payloadLen);
+            prefixWritten = true;
+        } finally {
+            if (!prefixWritten) {
+                prefix.release();
+            }
+        }
+        return composePayload(allocator, prefix, payload, payloadLen);
+    }
+
     static ByteBuf encodeTwoU64BytesResponse(ByteBufAllocator allocator, Frame req, long first, long second,
                                              byte[] payload, int payloadLen) throws IOException {
-        if (payloadLen < 0) {
-            throw new IllegalArgumentException("negative payload length: " + payloadLen);
-        }
-        if (payloadLen > 0 && (payload == null || payloadLen > payload.length)) {
-            throw new IllegalArgumentException("invalid payload length " + payloadLen);
-        }
+        checkPayload(payload, payloadLen);
         int capacity = Integer.BYTES + FrameIO.checkedFrameLength(Frame.OK_TWO_U64_HEADER_LENGTH, payloadLen);
         ByteBuf out = allocator.ioBuffer(capacity, capacity);
         boolean success = false;
         try {
-            int payloadCrc = payloadLen > 0 ? Crc.of(payload, 0, payloadLen) : 0;
-            short flags = payloadLen > 0
-                    ? (short) (Frame.FLAG_RESPONSE | Frame.FLAG_PAYLOAD_CRC)
-                    : Frame.FLAG_RESPONSE;
-            writePrefix(out, req.opcode(), req.apiVersion(), flags, req.correlationId(),
-                    Frame.OK_TWO_U64_HEADER_LENGTH, payloadLen, payloadCrc);
-            out.writeShort(0);
-            out.writeLong(first);
-            out.writeLong(second);
-            out.writeByte(0);
+            writeTwoU64BytesResponsePrefix(out, req, first, second, payload, payloadLen);
             if (payloadLen > 0) {
                 out.writeBytes(payload, 0, payloadLen);
             }
@@ -161,6 +155,87 @@ final class NettyFrameCodec {
             if (!success) {
                 out.release();
             }
+        }
+    }
+
+    static ByteBuf encodeTwoU64BytesResponseComposite(ByteBufAllocator allocator, Frame req, long first, long second,
+                                                      byte[] payload, int payloadLen) throws IOException {
+        checkPayload(payload, payloadLen);
+        ByteBuf prefix = allocator.ioBuffer(
+                Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + Frame.OK_TWO_U64_HEADER_LENGTH,
+                Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + Frame.OK_TWO_U64_HEADER_LENGTH);
+        boolean prefixWritten = false;
+        try {
+            writeTwoU64BytesResponsePrefix(prefix, req, first, second, payload, payloadLen);
+            prefixWritten = true;
+        } finally {
+            if (!prefixWritten) {
+                prefix.release();
+            }
+        }
+        return composePayload(allocator, prefix, payload, payloadLen);
+    }
+
+    private static void writeBytesResponsePrefix(ByteBuf out, Frame req, byte[] header, int headerLen,
+                                                 byte[] payload, int payloadLen) throws IOException {
+        int payloadCrc = payloadLen > 0 ? Crc.of(payload, 0, payloadLen) : 0;
+        short flags = payloadLen > 0
+                ? (short) (Frame.FLAG_RESPONSE | Frame.FLAG_PAYLOAD_CRC)
+                : Frame.FLAG_RESPONSE;
+        writePrefix(out, req.opcode(), req.apiVersion(), flags, req.correlationId(),
+                headerLen, payloadLen, payloadCrc);
+        if (headerLen > 0) {
+            out.writeBytes(header);
+        }
+    }
+
+    private static void writeTwoU64BytesResponsePrefix(ByteBuf out, Frame req, long first, long second,
+                                                       byte[] payload, int payloadLen) throws IOException {
+        int payloadCrc = payloadLen > 0 ? Crc.of(payload, 0, payloadLen) : 0;
+        short flags = payloadLen > 0
+                ? (short) (Frame.FLAG_RESPONSE | Frame.FLAG_PAYLOAD_CRC)
+                : Frame.FLAG_RESPONSE;
+        writePrefix(out, req.opcode(), req.apiVersion(), flags, req.correlationId(),
+                Frame.OK_TWO_U64_HEADER_LENGTH, payloadLen, payloadCrc);
+        out.writeShort(0);
+        out.writeLong(first);
+        out.writeLong(second);
+        out.writeByte(0);
+    }
+
+    private static ByteBuf composePayload(ByteBufAllocator allocator, ByteBuf prefix, byte[] payload, int payloadLen) {
+        if (payloadLen == 0) {
+            return prefix;
+        }
+        ByteBuf payloadView = Unpooled.wrappedBuffer(payload, 0, payloadLen);
+        CompositeByteBuf composite = allocator.compositeBuffer(2);
+        boolean success = false;
+        try {
+            composite.addComponent(true, prefix);
+            prefix = null;
+            composite.addComponent(true, payloadView);
+            payloadView = null;
+            success = true;
+            return composite;
+        } finally {
+            if (!success) {
+                composite.release();
+                if (prefix != null) {
+                    prefix.release();
+                }
+                if (payloadView != null) {
+                    payloadView.release();
+                }
+            }
+        }
+    }
+
+    private static void checkPayload(byte[] payload, int payloadLen) {
+        if (payloadLen < 0) {
+            throw new IllegalArgumentException("negative payload length: " + payloadLen);
+        }
+        if (payloadLen > 0 && (payload == null || payloadLen > payload.length)) {
+            throw new IllegalArgumentException("invalid payload length " + payloadLen);
         }
     }
 
