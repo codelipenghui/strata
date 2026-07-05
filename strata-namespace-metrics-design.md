@@ -208,7 +208,7 @@ Skeleton cloned from `strata-controller.json` (closest template). Template var `
    (`histogram_quantile(0.99, sum by (le)(rate(strata_scp_request_duration_seconds_bucket{namespace=~"$namespace",opcode=~"APPEND|READ"}[…])))`)
    and controller request latency (opcode set CREATE_FILE|LOOKUP_*|SEAL_*|CREATE_CHUNK|…) p50/p95/p99.
 4. **Controller requests** — rate by opcode and error rate
-   (`status="error"`) for `$namespace`, from `strata_scp_request_duration_seconds_count`.
+   (`status="error"`) for `$namespace`, from `strata_scp_requests_total`.
 5. **Namespace log** — write-log records/bytes, read-log (replay) records/bytes, compactions,
    recoveries, reacquisitions per namespace; plus existing open-log bytes + live files filtered by
    `$namespace` (drill-down, not a copy of the fleet panels).

@@ -758,7 +758,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (opcode)(rate(strata_scp_request_duration_seconds_count{status=\"error\",instance=~\"$node\"}[$__rate_interval]))",
+          "expr": "sum by (opcode)(rate(strata_scp_requests_total{status=\"error\",instance=~\"$node\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "{{opcode}}"
         }

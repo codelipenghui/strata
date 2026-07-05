@@ -14,6 +14,16 @@ class RequestContextTest {
     }
 
     @Test
+    void repeatedSetTakeDoesNotLeakPriorNamespace() {
+        RequestContext.setNamespace("orders");
+        assertEquals("orders", RequestContext.takeNamespace());
+
+        RequestContext.setNamespace("payments");
+        assertEquals("payments", RequestContext.takeNamespace());
+        assertEquals("-", RequestContext.takeNamespace());
+    }
+
+    @Test
     void takeDefaultsToDashWhenUnset() {
         // Ensure no leakage from a prior test on this thread.
         RequestContext.takeNamespace();

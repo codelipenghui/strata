@@ -41,6 +41,12 @@ class MessageRoundtripTest {
 
         var read = new Messages.Read(c, 99, 65536, ns);
         assertEquals(read, Messages.Read.decode(buf(read.encode())));
+        var readFields = Messages.Read.decodeFields(buf(read.encode()));
+        assertEquals(f.id(), readFields.fileId());
+        assertEquals(c.index(), readFields.chunkIndex());
+        assertEquals(99, readFields.offset());
+        assertEquals(65536, readFields.maxBytes());
+        assertEquals(ns, readFields.namespace());
 
         var fence = new Messages.Fence(c, 6, ns);
         assertEquals(fence, Messages.Fence.decode(buf(fence.encode())));

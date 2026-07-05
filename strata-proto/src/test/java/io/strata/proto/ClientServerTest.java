@@ -141,6 +141,238 @@ class ClientServerTest {
     }
 
     @Test
+    void directOkU64ResultWritesAppendCompatibleHeader() throws Exception {
+        AtomicReference<Frame> seenRequest = new AtomicReference<>();
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("async result path expected");
+            }
+
+            @Override
+            public Object handleAsyncResult(Frame request) {
+                seenRequest.set(request);
+                return ScpServer.okU64Result(42);
+            }
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "direct-u64")) {
+            ByteBuffer header = client.call(Opcode.APPEND, emptyHeader(), null, 2_000);
+            assertEquals(42, Messages.AppendResp.decode(header).endOffset());
+            waitFor(() -> seenRequest.get() != null && seenRequest.get().ownerRefCnt() == 0);
+        }
+    }
+
+    @Test
+    void deferredOkU64ResultWritesAfterFutureCompletes() throws Exception {
+        CompletableFuture<Void> flush = new CompletableFuture<>();
+        AtomicReference<Frame> seenRequest = new AtomicReference<>();
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("async result path expected");
+            }
+
+            @Override
+            public Object handleAsyncResult(Frame request) {
+                seenRequest.set(request);
+                return ScpServer.okU64Result(99, flush);
+            }
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "deferred-u64")) {
+            CompletableFuture<Frame> response = client.send(Opcode.APPEND, emptyHeader(), null);
+            assertFalse(response.isDone());
+
+            flush.complete(null);
+            Frame frame = response.get(2, TimeUnit.SECONDS);
+            ByteBuffer header = frame.headerSlice();
+            Resp.check(header);
+            assertEquals(99, Messages.AppendResp.decode(header).endOffset());
+            waitFor(() -> seenRequest.get() != null && seenRequest.get().ownerRefCnt() == 0);
+        }
+    }
+
+    @Test
+    void sinkOkU64ResultWritesAppendCompatibleHeader() throws Exception {
+        AtomicReference<Frame> seenRequest = new AtomicReference<>();
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("async result path expected");
+            }
+
+            @Override
+            public Object handleAsyncResult(Frame request) {
+                throw new AssertionError("sink result path expected");
+            }
+
+            @Override
+            public void handleAsyncResult(Frame request, ScpServer.ResponseSink sink) {
+                seenRequest.set(request);
+                sink.okU64(123);
+            }
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "sink-u64")) {
+            ByteBuffer header = client.call(Opcode.APPEND, emptyHeader(), null, 2_000);
+            assertEquals(123, Messages.AppendResp.decode(header).endOffset());
+            waitFor(() -> seenRequest.get() != null && seenRequest.get().ownerRefCnt() == 0);
+        }
+    }
+
+    @Test
+    void deferredSinkOkU64ResultWritesAfterFutureCompletes() throws Exception {
+        CompletableFuture<Void> flush = new CompletableFuture<>();
+        AtomicReference<Frame> seenRequest = new AtomicReference<>();
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("async result path expected");
+            }
+
+            @Override
+            public Object handleAsyncResult(Frame request) {
+                throw new AssertionError("sink result path expected");
+            }
+
+            @Override
+            public void handleAsyncResult(Frame request, ScpServer.ResponseSink sink) {
+                seenRequest.set(request);
+                sink.okU64(456, flush);
+            }
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "deferred-sink-u64")) {
+            CompletableFuture<Frame> response = client.send(Opcode.APPEND, emptyHeader(), null);
+            assertFalse(response.isDone());
+
+            flush.complete(null);
+            Frame frame = response.get(2, TimeUnit.SECONDS);
+            ByteBuffer header = frame.headerSlice();
+            Resp.check(header);
+            assertEquals(456, Messages.AppendResp.decode(header).endOffset());
+            waitFor(() -> seenRequest.get() != null && seenRequest.get().ownerRefCnt() == 0);
+        }
+    }
+
+    @Test
+    void okU64LaneDrainsAdmissionBetweenSequentialRequests() throws Exception {
+        AtomicInteger count = new AtomicInteger();
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("async result path expected");
+            }
+
+            @Override
+            public void handleAsyncResult(Frame request, ScpServer.ResponseSink sink) {
+                sink.okU64(count.incrementAndGet());
+            }
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler, 1, 1 << 20);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "ok-u64-drain")) {
+            for (int i = 1; i <= 3; i++) {
+                ByteBuffer header = client.call(Opcode.APPEND, emptyHeader(), null, 2_000);
+                assertEquals(i, Messages.AppendResp.decode(header).endOffset());
+            }
+        }
+    }
+
+    @Test
+    void bytesLaneDrainsAdmissionBetweenSequentialRequests() throws Exception {
+        AtomicInteger count = new AtomicInteger();
+        byte[] payload = "payload".getBytes(StandardCharsets.UTF_8);
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("async result path expected");
+            }
+
+            @Override
+            public void handleAsyncResult(Frame request, ScpServer.ResponseSink sink) {
+                sink.bytes(Messages.okHeader(), payload, payload.length, null);
+            }
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler, 1, 1 << 20);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "bytes-drain")) {
+            for (int i = 0; i < 3; i++) {
+                Frame frame = client.callFrame(Opcode.PING, emptyHeader(), null, 2_000);
+                Resp.check(frame.headerSlice());
+                byte[] got = new byte[frame.payloadLength()];
+                frame.payloadSlice().get(got);
+                assertArrayEquals(payload, got);
+                count.incrementAndGet();
+            }
+            assertEquals(3, count.get());
+        }
+    }
+
+    @Test
+    void twoU64BytesLaneDrainsAdmissionBetweenSequentialRequests() throws Exception {
+        AtomicInteger count = new AtomicInteger();
+        AtomicInteger closed = new AtomicInteger();
+        byte[] payload = "read-payload".getBytes(StandardCharsets.UTF_8);
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("async result path expected");
+            }
+
+            @Override
+            public void handleAsyncResult(Frame request, ScpServer.ResponseSink sink) {
+                int next = count.incrementAndGet();
+                sink.twoU64Bytes(next, next - 1L, payload, payload.length, closed::incrementAndGet);
+            }
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler, 1, 1 << 20);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "two-u64-drain")) {
+            for (int i = 1; i <= 3; i++) {
+                Frame frame = client.callFrame(Opcode.READ, emptyHeader(), null, 2_000);
+                ByteBuffer header = frame.headerSlice();
+                Resp.check(header);
+                assertEquals(new Messages.ReadResp(i, i - 1L), Messages.ReadResp.decode(header));
+                byte[] got = new byte[frame.payloadLength()];
+                frame.payloadSlice().get(got);
+                assertArrayEquals(payload, got);
+            }
+            waitFor(() -> closed.get() == 3);
+        }
+    }
+
+    @Test
+    void requestObserverFailureDoesNotEatSinkResponse() throws Exception {
+        AtomicInteger closed = new AtomicInteger();
+        byte[] payload = "observed".getBytes(StandardCharsets.UTF_8);
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("async result path expected");
+            }
+
+            @Override
+            public void handleAsyncResult(Frame request, ScpServer.ResponseSink sink) {
+                sink.twoU64Bytes(7, 5, payload, payload.length, closed::incrementAndGet);
+            }
+        };
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "observer")) {
+            server.setRequestObserver((opcode, namespace, latencyNanos, success) -> {
+                throw new IllegalStateException("metrics failed");
+            });
+
+            Frame frame = client.callFrame(Opcode.READ, emptyHeader(), null, 2_000);
+            ByteBuffer header = frame.headerSlice();
+            Resp.check(header);
+            assertEquals(new Messages.ReadResp(7, 5), Messages.ReadResp.decode(header));
+            byte[] got = new byte[frame.payloadLength()];
+            frame.payloadSlice().get(got);
+            assertArrayEquals(payload, got);
+            waitFor(() -> closed.get() == 1);
+        }
+    }
+
+    @Test
     void managedConnectionHeartbeatsIdleHealthyConnection() throws Exception {
         AtomicInteger pings = new AtomicInteger();
         try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
@@ -503,6 +735,29 @@ class ClientServerTest {
             assertEquals(ErrorCode.INTERNAL, internal.code());
             assertTrue(internal.getMessage().contains("async boom"));
             waitFor(() -> serverRequests.stream().allMatch(req -> req.ownerRefCnt() == 0));
+        }
+    }
+
+    @Test
+    void serverContinuesDrainingAfterUncaughtRequestFailure() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        ScpServer.Handler handler = req -> {
+            if (calls.incrementAndGet() == 1) {
+                throw new AssertionError("uncaught request failure");
+            }
+            return ScpServer.ok(req, Messages.okHeader(), null);
+        };
+
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
+            CompletableFuture<Frame> first = client.send(Opcode.PING, emptyHeader(), null);
+            CompletableFuture<Frame> second = client.send(Opcode.READ, emptyHeader(), null);
+
+            Resp.check(second.get(30, TimeUnit.SECONDS).headerSlice());
+            assertEquals(2, calls.get());
+
+            client.close();
+            assertThrows(ExecutionException.class, () -> first.get(30, TimeUnit.SECONDS));
         }
     }
 

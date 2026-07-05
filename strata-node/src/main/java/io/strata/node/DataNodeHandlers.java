@@ -10,7 +10,9 @@ import io.strata.proto.Opcode;
 import io.strata.proto.RequestContext;
 import io.strata.proto.ScpServer;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -18,6 +20,12 @@ import java.util.concurrent.CompletableFuture;
 
 /** Maps SCP data-plane opcodes onto the ChunkStore engine (tech design §10.3). */
 final class DataNodeHandlers implements ScpServer.Handler {
+    private static final ThreadLocal<ChunkStore.AppendOutcome> APPEND_OUTCOME =
+            ThreadLocal.withInitial(ChunkStore.AppendOutcome::new);
+    private static final int APPEND_PAYLOAD_SCRATCH_BYTES = 64 * 1024;
+    private static final ThreadLocal<FrameAppendPayload> APPEND_PAYLOAD =
+            ThreadLocal.withInitial(FrameAppendPayload::new);
+
     private final ChunkStore store;
     private final DataNode node;
     private final ChunkDeleteService deletes;
@@ -36,38 +44,63 @@ final class DataNodeHandlers implements ScpServer.Handler {
 
     @Override
     public CompletableFuture<Frame> handleAsync(Frame req) throws Exception {
+        Object result = handleAsyncResult(req);
+        if (result instanceof Frame frame) {
+            return CompletableFuture.completedFuture(frame);
+        }
+        @SuppressWarnings("unchecked")
+        CompletableFuture<Frame> future = (CompletableFuture<Frame>) result;
+        return future;
+    }
+
+    @Override
+    public Object handleAsyncResult(Frame req) throws Exception {
         if (req.opcode() == Opcode.APPEND.code) {
-            // The per-record digest is writer-origin: a non-empty append MUST carry the client's payload
-            // CRC (FLAG_PAYLOAD_CRC), which the node stores verbatim as the ledger digest. Reject a
-            // non-empty append that lacks it rather than silently store a 0 digest that would defeat
-            // torn-tail recovery. (The wire encoder always sets the flag for a non-empty payload, so this
-            // only fires for a malformed/non-conforming client.)
-            if (req.payloadLength() > 0 && (req.flags() & Frame.FLAG_PAYLOAD_CRC) == 0) {
-                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
-                        "non-empty APPEND must carry FLAG_PAYLOAD_CRC (writer-origin per-record digest)");
+            ChunkStore.AppendOutcome outcome = append(req);
+            long endOffset = outcome.endOffset();
+            CompletableFuture<Void> waitForFlush = outcome.waitForFlush();
+            if (waitForFlush == null) {
+                return ScpServer.okU64Result(endOffset);
             }
-            // validation + write run synchronously here (per-chunk ordering preserved); the ack
-            // defers until durability per the chunk's policy — for ack-on-fsync that means a
-            // covering group-commit force, while this connection keeps processing frames
-            var m = Messages.Append.decode(req.headerSlice());
-            RequestContext.setNamespace(m.namespace().value());
-            return store.appendAsync(m.namespace(), m.chunkId(), m.writeEpoch(), m.baseOffset(), m.durableOffset(),
-                            req.payloadSlice(), req.payloadCrc(), m.recovery())
-                    .thenApply(r -> ScpServer.ok(req, new Messages.AppendResp(r.endOffset()).encode(), null));
+            return ScpServer.okU64Result(endOffset, waitForFlush);
         }
         return CompletableFuture.completedFuture(handle(req));
+    }
+
+    @Override
+    public void handleAsyncResult(Frame req, ScpServer.ResponseSink sink) throws Exception {
+        if (req.opcode() == Opcode.APPEND.code) {
+            ChunkStore.AppendOutcome outcome = append(req);
+            sink.okU64(outcome.endOffset(), outcome.waitForFlush());
+            return;
+        }
+        if (req.opcode() == Opcode.READ.code) {
+            readRegionResponse(req, readRegion(req, false), sink);
+            return;
+        }
+        if (req.opcode() == Opcode.READ_RECOVERY.code) {
+            readRegionResponse(req, readRegion(req, true), sink);
+            return;
+        }
+        sink.result(handle(req));
+    }
+
+    @Override
+    public boolean requiresAsyncHandling(Frame req) {
+        return req.opcode() == Opcode.APPEND.code
+                || req.opcode() == Opcode.READ.code
+                || req.opcode() == Opcode.READ_RECOVERY.code;
     }
 
     @Override
     public Frame handle(Frame req) throws Exception {
         Opcode op = Opcode.fromCode(req.opcode());
         if (op == null) throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "0x" + Integer.toHexString(req.opcode()));
-        ByteBuffer h = req.headerSlice();
         return switch (op) {
             case PING -> ScpServer.ok(req, Messages.okHeader(), req.payloadSlice());
 
             case OPEN_CHUNK -> {
-                var m = Messages.OpenChunk.decode(h);
+                var m = Messages.OpenChunk.decode(req);
                 RequestContext.setNamespace(m.namespace().value());
                 if (node.isDraining()) {
                     throw new ScpException(ErrorCode.NO_CAPACITY, "node draining");
@@ -81,21 +114,17 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case READ -> {
                 // Client read: open reads are bounded to the replica-known durable high watermark, and
                 // both open durable-prefix reads and sealed reads are CRC-verified before the response.
-                var m = Messages.Read.decode(h);
-                RequestContext.setNamespace(m.namespace().value());
-                yield readRegionResponse(req, store.readRegion(m.namespace(), m.chunkId(), m.offset(), m.maxBytes()));
+                yield readRegionResponse(req, readRegion(req, false));
             }
 
             case READ_RECOVERY -> {
                 // Seal recovery reads the never-acked tail above the durable watermark (clamped away
                 // from client READs) to re-prove and re-replicate bytes a quorum still holds.
-                var m = Messages.Read.decode(h);
-                RequestContext.setNamespace(m.namespace().value());
-                yield readRegionResponse(req, store.readRegionForRecovery(m.namespace(), m.chunkId(), m.offset(), m.maxBytes()));
+                yield readRegionResponse(req, readRegion(req, true));
             }
 
             case FENCE -> {
-                var m = Messages.Fence.decode(h);
+                var m = Messages.Fence.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 var r = store.fence(m.namespace(), m.chunkId(), m.fenceEpoch());
                 yield ScpServer.ok(req, new Messages.FenceResp(r.persistedFenceEpoch(), r.localEndOffset(),
@@ -103,7 +132,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             }
 
             case STAT_CHUNK -> {
-                var m = Messages.StatChunk.decode(h);
+                var m = Messages.StatChunk.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 var r = store.stat(m.namespace(), m.chunkId());
                 yield ScpServer.ok(req, new Messages.StatResp(r.state(), r.localEndOffset(), r.lastKnownDO(),
@@ -111,15 +140,15 @@ final class DataNodeHandlers implements ScpServer.Handler {
             }
 
             case SEAL_CHUNK -> {
-                var m = Messages.SealChunk.decode(h);
+                var m = Messages.SealChunk.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 var r = store.seal(m.namespace(), m.chunkId(), m.writeEpoch(), m.dataLength(),
-                        req.payloadLength() > 0 ? req.payloadSlice() : null);
+                        req.payloadLength() > 0 ? req.payloadReadBuffer() : null);
                 yield ScpServer.ok(req, new Messages.SealResp(r.finalLength(), r.dataCrc()).encode(), null);
             }
 
             case DELETE_CHUNKS -> {
-                var m = Messages.DeleteChunks.decode(h);
+                var m = Messages.DeleteChunks.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 List<Short> codes = new ArrayList<>(m.chunkIds().size());
                 for (var id : m.chunkIds()) codes.add(deletes.delete(m.namespace(), id).code);
@@ -127,7 +156,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             }
 
             case FETCH_CHUNK -> {
-                var m = Messages.FetchChunk.decode(h);
+                var m = Messages.FetchChunk.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 var r = store.fetch(m.namespace(), m.chunkId(), m.offset(), m.maxBytes());
                 yield ScpServer.ok(req, new Messages.FetchResp(r.fileLength(), r.state()).encode(),
@@ -135,7 +164,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             }
 
             case READ_LEDGER -> {
-                var m = Messages.ReadLedger.decode(h);
+                var m = Messages.ReadLedger.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 List<ChunkFormats.LedgerEntry> entries = store.readLedger(m.namespace(), m.chunkId(), m.fromOffset());
                 List<Messages.LedgerEntry> wire = new ArrayList<>(entries.size());
@@ -151,7 +180,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 if (loop == null) {
                     throw new ScpException(ErrorCode.INTERNAL, "control loop unavailable for EXEC_REPLICATE");
                 }
-                if (!(Messages.Command.read(h) instanceof Messages.ReplicateCmd cmd)) {
+                if (!(Messages.Command.read(req.headerReadBuffer()) instanceof Messages.ReplicateCmd cmd)) {
                     throw new ScpException(ErrorCode.PRECONDITION_FAILED, "EXEC_REPLICATE requires a ReplicateCmd");
                 }
                 RequestContext.setNamespace(cmd.namespace().value());
@@ -163,7 +192,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 // Owner-pull durability verification (design §20.3): report the local state of each
                 // requested chunk (present/state/length/crc) and stamp the present ones as freshly
                 // verified, feeding node-local orphan GC (§20.4). The owner judges missing/corrupt.
-                var m = Messages.VerifyChunks.decode(h);
+                var m = Messages.VerifyChunks.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 node.noteVerifiedBy(m.verifierEndpoint());
                 List<Messages.VerifyChunkResult> results = new ArrayList<>(m.chunkIds().size());
@@ -178,10 +207,144 @@ final class DataNodeHandlers implements ScpServer.Handler {
         };
     }
 
+    private ChunkStore.AppendOutcome append(Frame req) throws IOException {
+        // The per-record digest is writer-origin: a non-empty append MUST carry the client's payload
+        // CRC (FLAG_PAYLOAD_CRC), which the node stores verbatim as the ledger digest. Reject a
+        // non-empty append that lacks it rather than silently store a 0 digest that would defeat
+        // torn-tail recovery. (The wire encoder always sets the flag for a non-empty payload, so this
+        // only fires for a malformed/non-conforming client.)
+        if (req.payloadLength() > 0 && (req.flags() & Frame.FLAG_PAYLOAD_CRC) == 0) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                    "non-empty APPEND must carry FLAG_PAYLOAD_CRC (writer-origin per-record digest)");
+        }
+        // validation + write run synchronously here (per-chunk ordering preserved); the ack
+        // defers until durability per the chunk's policy — for ack-on-fsync that means a
+        // covering group-commit force, while this connection keeps processing frames
+        var m = Messages.Append.decodeFields(req);
+        RequestContext.setNamespace(m.namespace().value());
+        ChunkStore.AppendOutcome outcome = APPEND_OUTCOME.get();
+        FrameAppendPayload payload = APPEND_PAYLOAD.get().reset(req);
+        try {
+            store.appendAsync(m.namespace(), m.fileId(), m.chunkIndex(), m.writeEpoch(),
+                    m.baseOffset(), m.durableOffset(), payload, req.payloadCrc(), m.recovery(), outcome);
+        } finally {
+            payload.clear();
+        }
+        return outcome;
+    }
+
+    private static final class FrameAppendPayload implements ChunkStore.AppendPayload {
+        private final ByteBuffer scratchBuffer = ByteBuffer.allocateDirect(APPEND_PAYLOAD_SCRATCH_BYTES);
+        private byte[] crcScratch;
+        private Frame frame;
+        private boolean scratchContainsPayload;
+        private int scratchPayloadLength;
+
+        private FrameAppendPayload reset(Frame frame) {
+            this.frame = Objects.requireNonNull(frame, "frame");
+            scratchContainsPayload = false;
+            scratchPayloadLength = 0;
+            return this;
+        }
+
+        private void clear() {
+            frame = null;
+            scratchContainsPayload = false;
+            scratchPayloadLength = 0;
+            scratchBuffer.clear();
+        }
+
+        @Override
+        public int remaining() {
+            return frame.payloadLength();
+        }
+
+        @Override
+        public void writeFully(FileChannel channel, long position) throws IOException {
+            int length = frame.payloadLength();
+            if (length <= scratchBuffer.capacity()) {
+                scratchBuffer.clear();
+                frame.copyPayloadTo(0, scratchBuffer, length);
+                scratchBuffer.flip();
+                scratchContainsPayload = true;
+                scratchPayloadLength = length;
+                DataNodeHandlers.writeFully(channel, scratchBuffer, position);
+                return;
+            }
+            frame.writePayloadTo(channel, position);
+        }
+
+        @Override
+        public void accumulateCrc(ChunkStore.PayloadCrcAccumulator accumulator) {
+            if (scratchContainsPayload) {
+                scratchBuffer.limit(scratchPayloadLength).position(0);
+                accumulator.update(scratchBuffer);
+                return;
+            }
+            byte[] scratch = crcScratch();
+            int offset = 0;
+            int remaining = frame.payloadLength();
+            while (remaining > 0) {
+                int n = Math.min(scratch.length, remaining);
+                frame.copyPayloadTo(offset, scratch, 0, n);
+                accumulator.update(scratch, 0, n);
+                offset += n;
+                remaining -= n;
+            }
+        }
+
+        private byte[] crcScratch() {
+            if (crcScratch == null) {
+                crcScratch = new byte[APPEND_PAYLOAD_SCRATCH_BYTES];
+            }
+            return crcScratch;
+        }
+    }
+
+    private static void writeFully(FileChannel channel, ByteBuffer source, long position) throws IOException {
+        long writePosition = position;
+        while (source.hasRemaining()) {
+            int n = channel.write(source, writePosition);
+            if (n <= 0) {
+                throw new IOException("failed to write payload bytes");
+            }
+            writePosition += n;
+        }
+    }
+
+    private ChunkStore.ReadRegionResult readRegion(Frame req, boolean recovery) throws IOException {
+        var m = Messages.Read.decodeFields(req);
+        RequestContext.setNamespace(m.namespace().value());
+        return recovery
+                ? store.readRegionForRecovery(m.namespace(), m.fileId(), m.chunkIndex(), m.offset(), m.maxBytes())
+                : store.readRegion(m.namespace(), m.fileId(), m.chunkIndex(), m.offset(), m.maxBytes());
+    }
+
     /** Wire-encodes a verified, materialized {@link ChunkStore.ReadRegionResult}. */
     private static Frame readRegionResponse(Frame req, ChunkStore.ReadRegionResult r) {
-        byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
-        byte[] bytes = r.bytes();
-        return ScpServer.ok(req, header, bytes.length > 0 ? ByteBuffer.wrap(bytes) : null);
+        boolean success = false;
+        try {
+            byte[] header = new Messages.ReadResp(r.localEndOffset(), r.lastKnownDO()).encode();
+            Frame frame = ScpServer.okBytes(req, header, r.payloadBytes(), r.length(), r::close);
+            success = true;
+            return frame;
+        } finally {
+            if (!success) {
+                r.close();
+            }
+        }
+    }
+
+    /** Hands a verified, materialized read payload to the server's direct bytes response path. */
+    private static void readRegionResponse(Frame req, ChunkStore.ReadRegionResult r, ScpServer.ResponseSink sink) {
+        boolean success = false;
+        try {
+            sink.twoU64Bytes(r.localEndOffset(), r.lastKnownDO(), r.payloadBytes(), r.length(), r);
+            success = true;
+        } finally {
+            if (!success) {
+                r.close();
+            }
+        }
     }
 }

@@ -8,6 +8,7 @@ import io.strata.common.StrataPath;
 import io.strata.common.Varint;
 
 import java.nio.ByteBuffer;
+import java.nio.BufferUnderflowException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -49,6 +50,27 @@ public final class Messages {
         List<Replica> rs = new ArrayList<>(n);
         for (int i = 0; i < n; i++) rs.add(Replica.read(b));
         return rs;
+    }
+
+    private static byte[] okWithU64(long value) {
+        byte[] out = new byte[Short.BYTES + Long.BYTES + 1];
+        putU64(out, Short.BYTES, value);
+        out[out.length - 1] = 0;
+        return out;
+    }
+
+    private static byte[] okWithTwoU64(long first, long second) {
+        byte[] out = new byte[Short.BYTES + Long.BYTES + Long.BYTES + 1];
+        putU64(out, Short.BYTES, first);
+        putU64(out, Short.BYTES + Long.BYTES, second);
+        out[out.length - 1] = 0;
+        return out;
+    }
+
+    private static void putU64(byte[] out, int offset, long value) {
+        for (int i = 7; i >= 0; i--) {
+            out[offset++] = (byte) (value >>> (8 * i));
+        }
     }
 
     /* ---------- HELLO ---------- */
@@ -108,6 +130,9 @@ public final class Messages {
 
     public record OpenChunk(ChunkId chunkId, int writeEpoch, boolean fsyncOnAck,
                             long expectedMaxBytes, long createdAtMs, StrataNamespace namespace) {
+        private static final ThreadLocal<OwnedOpenChunkDecoder> OWNED_DECODER =
+                ThreadLocal.withInitial(OwnedOpenChunkDecoder::new);
+
         public OpenChunk {
             namespace = Objects.requireNonNull(namespace, "namespace");
         }
@@ -115,7 +140,7 @@ public final class Messages {
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.chunkId(chunkId).i32(writeEpoch).u8(fsyncOnAck ? 1 : 0)
-                    .u64(expectedMaxBytes).u64(createdAtMs).string(namespace.toString()).noTags();
+                    .u64(expectedMaxBytes).u64(createdAtMs).namespace(namespace).noTags();
             return w.toBytes();
         }
 
@@ -125,15 +150,155 @@ public final class Messages {
             boolean fsyncOnAck = Varint.readBoolean(b);
             long expectedMaxBytes = b.getLong();
             long createdAtMs = b.getLong();
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             TaggedFields.readFrom(b);
             return new OpenChunk(chunkId, writeEpoch, fsyncOnAck, expectedMaxBytes, createdAtMs, namespace);
+        }
+
+        public static OpenChunk decode(Frame frame) {
+            if (!frame.hasOwnedHeader()) {
+                return decode(frame.headerReadBuffer());
+            }
+            return OWNED_DECODER.get().decode(frame);
+        }
+
+        private static void validateTaggedFieldTag(long tag) {
+            if (tag < 0 || tag > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("bad tagged-field tag: " + tag);
+            }
+        }
+
+        private static void requireEndOfTaggedFields(int remaining) {
+            if (remaining != 0) {
+                throw new IllegalArgumentException("trailing bytes after tagged fields: " + remaining);
+            }
+        }
+
+        private static final class OwnedOpenChunkDecoder implements StrataNamespace.AsciiBytes {
+            private Frame frame;
+            private int pos;
+            private int namespaceOffset;
+
+            OpenChunk decode(Frame frame) {
+                this.frame = frame;
+                pos = 0;
+                namespaceOffset = 0;
+                try {
+                    long fileId = readLong();
+                    int chunkIndex = readInt();
+                    int writeEpoch = readInt();
+                    boolean fsyncOnAck = readBoolean();
+                    long expectedMaxBytes = readLong();
+                    long createdAtMs = readLong();
+                    StrataNamespace namespace = readNamespace();
+                    readTaggedFields();
+                    return new OpenChunk(new ChunkId(FileId.of(fileId), chunkIndex), writeEpoch,
+                            fsyncOnAck, expectedMaxBytes, createdAtMs, namespace);
+                } finally {
+                    this.frame = null;
+                }
+            }
+
+            @Override
+            public byte byteAt(int index) {
+                return frame.ownedHeaderByte(namespaceOffset + index);
+            }
+
+            private long readLong() {
+                require(Long.BYTES);
+                long value = frame.ownedHeaderLong(pos);
+                pos += Long.BYTES;
+                return value;
+            }
+
+            private int readInt() {
+                require(Integer.BYTES);
+                int value = frame.ownedHeaderInt(pos);
+                pos += Integer.BYTES;
+                return value;
+            }
+
+            private boolean readBoolean() {
+                byte value = readByte();
+                if (value == 0) {
+                    return false;
+                }
+                if (value == 1) {
+                    return true;
+                }
+                throw new IllegalArgumentException("bad boolean value on wire: " + (value & 0xFF));
+            }
+
+            private StrataNamespace readNamespace() {
+                long lenLong = readUnsigned();
+                if (lenLong > remaining()) {
+                    throw new IllegalArgumentException(
+                            "bad namespace length on wire: " + lenLong + " (remaining " + remaining() + ")");
+                }
+                namespaceOffset = pos;
+                StrataNamespace namespace = StrataNamespace.readFrom((int) lenLong, this);
+                pos += (int) lenLong;
+                return namespace;
+            }
+
+            private void readTaggedFields() {
+                long n = readUnsigned();
+                if (n == 0) {
+                    requireEndOfTaggedFields(remaining());
+                    return;
+                }
+                if (n < 0 || n > 1024) {
+                    throw new IllegalArgumentException("bad tagged-field count: " + n);
+                }
+                for (int i = 0; i < n; i++) {
+                    long tagValue = readUnsigned();
+                    validateTaggedFieldTag(tagValue);
+                    long size = readUnsigned();
+                    if (size < 0 || size > remaining()) {
+                        throw new IllegalArgumentException("bad tagged-field size: " + size);
+                    }
+                    pos += (int) size;
+                }
+                requireEndOfTaggedFields(remaining());
+            }
+
+            private long readUnsigned() {
+                long value = 0;
+                int shift = 0;
+                while (true) {
+                    if (shift > 63) throw new IllegalArgumentException("varint too long");
+                    byte b = readByte();
+                    if (shift == 63 && (b & 0xFE) != 0) {
+                        throw new IllegalArgumentException("varint too long");
+                    }
+                    value |= (long) (b & 0x7F) << shift;
+                    if ((b & 0x80) == 0) return value;
+                    shift += 7;
+                }
+            }
+
+            private byte readByte() {
+                require(1);
+                return frame.ownedHeaderByte(pos++);
+            }
+
+            private int remaining() {
+                return frame.headerLength() - pos;
+            }
+
+            private void require(int bytes) {
+                if (bytes > remaining()) {
+                    throw new BufferUnderflowException();
+                }
+            }
         }
     }
 
     public record Append(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset,
                          StrataNamespace namespace, boolean recovery) {
         private static final int TAG_RECOVERY_APPEND = 0;
+        private static final ThreadLocal<OwnedAppendDecoder> OWNED_DECODER =
+                ThreadLocal.withInitial(OwnedAppendDecoder::new);
 
         public Append(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset,
                       StrataNamespace namespace) {
@@ -153,7 +318,7 @@ public final class Messages {
             int len = namespace.value().length(); // ASCII namespace: UTF-8 length == char length
             BufWriter w = new BufWriter(33 + (len < 128 ? 1 : 2) + len);
             w.chunkId(chunkId).i32(writeEpoch).u64(baseOffset).u64(durableOffset)
-                    .string(namespace.toString());
+                    .namespace(namespace);
             if (recovery) {
                 TaggedFields.of(Map.of(TAG_RECOVERY_APPEND, new byte[] {1})).writeTo(w);
             } else {
@@ -167,23 +332,284 @@ public final class Messages {
             int writeEpoch = b.getInt();
             long baseOffset = b.getLong();
             long durableOffset = b.getLong();
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
-            TaggedFields tags = TaggedFields.readFrom(b);
-            byte[] recovery = tags.get(TAG_RECOVERY_APPEND);
-            if (recovery != null && recovery.length != 1) {
-                throw new IllegalArgumentException("bad append recovery tag size: " + recovery.length);
-            }
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             return new Append(chunkId, writeEpoch, baseOffset, durableOffset, namespace,
-                    recovery != null && recovery[0] != 0);
+                    readRecoveryTag(b));
+        }
+
+        public static Append decode(Frame frame) {
+            AppendFields fields = decodeFields(frame);
+            return new Append(fields.chunkId(), fields.writeEpoch(), fields.baseOffset(), fields.durableOffset(),
+                    fields.namespace(), fields.recovery());
+        }
+
+        /**
+         * Thread-local decode view for hot server paths. The returned object is overwritten by the next
+         * {@code decodeFields} call on the same thread; callers must copy any fields they keep asynchronously.
+         */
+        public static AppendFields decodeFields(Frame frame) {
+            OwnedAppendDecoder decoder = OWNED_DECODER.get();
+            if (!frame.hasOwnedHeader()) {
+                return decoder.decode(decode(frame.headerReadBuffer()));
+            }
+            return decoder.decode(frame);
+        }
+
+        private static boolean readRecoveryTag(ByteBuffer b) {
+            long n = Varint.readUnsigned(b);
+            if (n == 0) {
+                requireEndOfTaggedFields(b.remaining());
+                return false;
+            }
+            if (n < 0 || n > 1024) {
+                throw new IllegalArgumentException("bad tagged-field count: " + n);
+            }
+            boolean hasRecovery = false;
+            boolean recovery = false;
+            long recoverySize = -1;
+            for (int i = 0; i < n; i++) {
+                long tagValue = Varint.readUnsigned(b);
+                validateTaggedFieldTag(tagValue);
+                long size = Varint.readUnsigned(b);
+                if (size < 0 || size > b.remaining()) {
+                    throw new IllegalArgumentException("bad tagged-field size: " + size);
+                }
+                if ((int) tagValue == TAG_RECOVERY_APPEND) {
+                    hasRecovery = true;
+                    recoverySize = size;
+                    if (size == 1) {
+                        recovery = b.get() != 0;
+                    } else {
+                        b.position(b.position() + (int) size);
+                    }
+                } else {
+                    b.position(b.position() + (int) size);
+                }
+            }
+            requireEndOfTaggedFields(b.remaining());
+            if (hasRecovery && recoverySize != 1) {
+                throw new IllegalArgumentException("bad append recovery tag size: " + recoverySize);
+            }
+            return hasRecovery && recovery;
+        }
+
+        private static void validateTaggedFieldTag(long tag) {
+            if (tag < 0 || tag > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("bad tagged-field tag: " + tag);
+            }
+        }
+
+        private static void requireEndOfTaggedFields(int remaining) {
+            if (remaining != 0) {
+                throw new IllegalArgumentException("trailing bytes after tagged fields: " + remaining);
+            }
+        }
+
+        public static final class AppendFields {
+            private ChunkId chunkId;
+            private long fileId;
+            private int chunkIndex;
+            private int writeEpoch;
+            private long baseOffset;
+            private long durableOffset;
+            private StrataNamespace namespace;
+            private boolean recovery;
+
+            private AppendFields set(ChunkId chunkId, int writeEpoch, long baseOffset, long durableOffset,
+                                     StrataNamespace namespace, boolean recovery) {
+                this.chunkId = chunkId;
+                this.fileId = chunkId.fileId().id();
+                this.chunkIndex = chunkId.index();
+                this.writeEpoch = writeEpoch;
+                this.baseOffset = baseOffset;
+                this.durableOffset = durableOffset;
+                this.namespace = namespace;
+                this.recovery = recovery;
+                return this;
+            }
+
+            private AppendFields set(long fileId, int chunkIndex, int writeEpoch, long baseOffset,
+                                     long durableOffset, StrataNamespace namespace, boolean recovery) {
+                this.chunkId = null;
+                this.fileId = fileId;
+                this.chunkIndex = chunkIndex;
+                this.writeEpoch = writeEpoch;
+                this.baseOffset = baseOffset;
+                this.durableOffset = durableOffset;
+                this.namespace = namespace;
+                this.recovery = recovery;
+                return this;
+            }
+
+            public ChunkId chunkId() {
+                if (chunkId == null) {
+                    chunkId = new ChunkId(new FileId(fileId), chunkIndex);
+                }
+                return chunkId;
+            }
+
+            public long fileId() {
+                return fileId;
+            }
+
+            public int chunkIndex() {
+                return chunkIndex;
+            }
+
+            public int writeEpoch() {
+                return writeEpoch;
+            }
+
+            public long baseOffset() {
+                return baseOffset;
+            }
+
+            public long durableOffset() {
+                return durableOffset;
+            }
+
+            public StrataNamespace namespace() {
+                return namespace;
+            }
+
+            public boolean recovery() {
+                return recovery;
+            }
+        }
+
+        private static final class OwnedAppendDecoder implements StrataNamespace.AsciiBytes {
+            private final AppendFields fields = new AppendFields();
+            private Frame frame;
+            private int pos;
+            private int namespaceOffset;
+
+            AppendFields decode(Append append) {
+                return fields.set(append.chunkId(), append.writeEpoch(), append.baseOffset(),
+                        append.durableOffset(), append.namespace(), append.recovery());
+            }
+
+            AppendFields decode(Frame frame) {
+                this.frame = frame;
+                pos = 0;
+                namespaceOffset = 0;
+                try {
+                    long fileId = readLong();
+                    int chunkIndex = readInt();
+                    int writeEpoch = readInt();
+                    long baseOffset = readLong();
+                    long durableOffset = readLong();
+                    StrataNamespace namespace = readNamespace();
+                    boolean recovery = readRecoveryTag();
+                    return fields.set(fileId, chunkIndex, writeEpoch, baseOffset, durableOffset, namespace, recovery);
+                } finally {
+                    this.frame = null;
+                }
+            }
+
+            @Override
+            public byte byteAt(int index) {
+                return frame.ownedHeaderByte(namespaceOffset + index);
+            }
+
+            private long readLong() {
+                require(8);
+                long value = frame.ownedHeaderLong(pos);
+                pos += 8;
+                return value;
+            }
+
+            private int readInt() {
+                require(4);
+                int value = frame.ownedHeaderInt(pos);
+                pos += 4;
+                return value;
+            }
+
+            private StrataNamespace readNamespace() {
+                long lenLong = readUnsigned();
+                if (lenLong > remaining()) {
+                    throw new IllegalArgumentException(
+                            "bad namespace length on wire: " + lenLong + " (remaining " + remaining() + ")");
+                }
+                namespaceOffset = pos;
+                StrataNamespace namespace = StrataNamespace.readFrom((int) lenLong, this);
+                pos += (int) lenLong;
+                return namespace;
+            }
+
+            private boolean readRecoveryTag() {
+                long n = readUnsigned();
+                if (n == 0) {
+                    requireEndOfTaggedFields(remaining());
+                    return false;
+                }
+                if (n < 0 || n > 1024) {
+                    throw new IllegalArgumentException("bad tagged-field count: " + n);
+                }
+                boolean hasRecovery = false;
+                boolean recovery = false;
+                long recoverySize = -1;
+                for (int i = 0; i < n; i++) {
+                    long tagValue = readUnsigned();
+                    validateTaggedFieldTag(tagValue);
+                    long size = readUnsigned();
+                    if (size < 0 || size > remaining()) {
+                        throw new IllegalArgumentException("bad tagged-field size: " + size);
+                    }
+                    if ((int) tagValue == TAG_RECOVERY_APPEND) {
+                        hasRecovery = true;
+                        recoverySize = size;
+                        if (size == 1) {
+                            recovery = readByte() != 0;
+                        } else {
+                            pos += (int) size;
+                        }
+                    } else {
+                        pos += (int) size;
+                    }
+                }
+                requireEndOfTaggedFields(remaining());
+                if (hasRecovery && recoverySize != 1) {
+                    throw new IllegalArgumentException("bad append recovery tag size: " + recoverySize);
+                }
+                return hasRecovery && recovery;
+            }
+
+            private long readUnsigned() {
+                long value = 0;
+                int shift = 0;
+                while (true) {
+                    if (shift > 63) throw new IllegalArgumentException("varint too long");
+                    byte b = readByte();
+                    if (shift == 63 && (b & 0xFE) != 0) {
+                        throw new IllegalArgumentException("varint too long");
+                    }
+                    value |= (long) (b & 0x7F) << shift;
+                    if ((b & 0x80) == 0) return value;
+                    shift += 7;
+                }
+            }
+
+            private byte readByte() {
+                require(1);
+                return frame.ownedHeaderByte(pos++);
+            }
+
+            private int remaining() {
+                return frame.headerLength() - pos;
+            }
+
+            private void require(int bytes) {
+                if (bytes > remaining()) {
+                    throw new BufferUnderflowException();
+                }
+            }
         }
     }
 
     public record AppendResp(long endOffset) {
         public byte[] encode() {
-            BufWriter w = new BufWriter();
-            Resp.writeOk(w);
-            w.u64(endOffset).noTags();
-            return w.toBytes();
+            return okWithU64(endOffset);
         }
 
         public static AppendResp decode(ByteBuffer b) {
@@ -194,30 +620,212 @@ public final class Messages {
     }
 
     public record Read(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace) {
+        private static final ThreadLocal<ReadFields> FIELDS = ThreadLocal.withInitial(ReadFields::new);
+        private static final ThreadLocal<OwnedReadDecoder> OWNED_DECODER =
+                ThreadLocal.withInitial(OwnedReadDecoder::new);
+
         public Read {
             namespace = Objects.requireNonNull(namespace, "namespace");
         }
 
+        public static final class ReadFields {
+            private ChunkId chunkId;
+            private long fileId;
+            private int chunkIndex;
+            private long offset;
+            private int maxBytes;
+            private StrataNamespace namespace;
+
+            private ReadFields set(long fileId, int chunkIndex, long offset, int maxBytes,
+                                   StrataNamespace namespace) {
+                this.chunkId = null;
+                this.fileId = fileId;
+                this.chunkIndex = chunkIndex;
+                this.offset = offset;
+                this.maxBytes = maxBytes;
+                this.namespace = namespace;
+                return this;
+            }
+
+            public ChunkId chunkId() {
+                if (chunkId == null) {
+                    chunkId = new ChunkId(new FileId(fileId), chunkIndex);
+                }
+                return chunkId;
+            }
+
+            public long fileId() {
+                return fileId;
+            }
+
+            public int chunkIndex() {
+                return chunkIndex;
+            }
+
+            public long offset() {
+                return offset;
+            }
+
+            public int maxBytes() {
+                return maxBytes;
+            }
+
+            public StrataNamespace namespace() {
+                return namespace;
+            }
+        }
+
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(offset).u32(maxBytes).string(namespace.toString()).noTags();
+            w.chunkId(chunkId).u64(offset).u32(maxBytes).namespace(namespace).noTags();
             return w.toBytes();
         }
 
         public static Read decode(ByteBuffer b) {
-            Read m = new Read(ChunkId.readFrom(b), b.getLong(), b.getInt(),
-                    StrataNamespace.of(Varint.readString(b)));
+            ReadFields fields = decodeFields(b);
+            return new Read(fields.chunkId(), fields.offset(), fields.maxBytes(), fields.namespace());
+        }
+
+        public static ReadFields decodeFields(ByteBuffer b) {
+            ReadFields fields = FIELDS.get();
+            long fileId = b.getLong();
+            int chunkIndex = b.getInt();
+            long offset = b.getLong();
+            int maxBytes = b.getInt();
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             TaggedFields.readFrom(b);
-            return m;
+            return fields.set(fileId, chunkIndex, offset, maxBytes, namespace);
+        }
+
+        /**
+         * Thread-local decode view for hot server paths. The returned object is overwritten by the next
+         * {@code decodeFields} call on the same thread; callers must copy any fields they keep asynchronously.
+         */
+        public static ReadFields decodeFields(Frame frame) {
+            if (!frame.hasOwnedHeader()) {
+                return decodeFields(frame.headerReadBuffer());
+            }
+            return OWNED_DECODER.get().decode(frame);
+        }
+
+        private static void requireEndOfTaggedFields(int remaining) {
+            if (remaining != 0) {
+                throw new IllegalArgumentException("trailing bytes after tagged fields: " + remaining);
+            }
+        }
+
+        private static final class OwnedReadDecoder implements StrataNamespace.AsciiBytes {
+            private final ReadFields fields = new ReadFields();
+            private Frame frame;
+            private int pos;
+            private int namespaceOffset;
+
+            ReadFields decode(Frame frame) {
+                this.frame = frame;
+                pos = 0;
+                namespaceOffset = 0;
+                try {
+                    long fileId = readLong();
+                    int chunkIndex = readInt();
+                    long offset = readLong();
+                    int maxBytes = readInt();
+                    StrataNamespace namespace = readNamespace();
+                    readTaggedFields();
+                    return fields.set(fileId, chunkIndex, offset, maxBytes, namespace);
+                } finally {
+                    this.frame = null;
+                }
+            }
+
+            @Override
+            public byte byteAt(int index) {
+                return frame.ownedHeaderByte(namespaceOffset + index);
+            }
+
+            private long readLong() {
+                require(Long.BYTES);
+                long value = frame.ownedHeaderLong(pos);
+                pos += Long.BYTES;
+                return value;
+            }
+
+            private int readInt() {
+                require(Integer.BYTES);
+                int value = frame.ownedHeaderInt(pos);
+                pos += Integer.BYTES;
+                return value;
+            }
+
+            private StrataNamespace readNamespace() {
+                long lenLong = readUnsigned();
+                if (lenLong > remaining()) {
+                    throw new IllegalArgumentException(
+                            "bad namespace length on wire: " + lenLong + " (remaining " + remaining() + ")");
+                }
+                namespaceOffset = pos;
+                StrataNamespace namespace = StrataNamespace.readFrom((int) lenLong, this);
+                pos += (int) lenLong;
+                return namespace;
+            }
+
+            private void readTaggedFields() {
+                long n = readUnsigned();
+                if (n == 0) {
+                    requireEndOfTaggedFields(remaining());
+                    return;
+                }
+                if (n < 0 || n > 1024) {
+                    throw new IllegalArgumentException("bad tagged-field count: " + n);
+                }
+                for (int i = 0; i < n; i++) {
+                    long tagValue = readUnsigned();
+                    if (tagValue < 0 || tagValue > Integer.MAX_VALUE) {
+                        throw new IllegalArgumentException("bad tagged-field tag: " + tagValue);
+                    }
+                    long size = readUnsigned();
+                    if (size < 0 || size > remaining()) {
+                        throw new IllegalArgumentException("bad tagged-field size: " + size);
+                    }
+                    pos += (int) size;
+                }
+                requireEndOfTaggedFields(remaining());
+            }
+
+            private long readUnsigned() {
+                long value = 0;
+                int shift = 0;
+                while (true) {
+                    if (shift > 63) throw new IllegalArgumentException("varint too long");
+                    byte b = readByte();
+                    if (shift == 63 && (b & 0xFE) != 0) {
+                        throw new IllegalArgumentException("varint too long");
+                    }
+                    value |= (long) (b & 0x7F) << shift;
+                    if ((b & 0x80) == 0) return value;
+                    shift += 7;
+                }
+            }
+
+            private byte readByte() {
+                require(Byte.BYTES);
+                return frame.ownedHeaderByte(pos++);
+            }
+
+            private int remaining() {
+                return frame.headerLength() - pos;
+            }
+
+            private void require(int bytes) {
+                if (bytes > remaining()) {
+                    throw new BufferUnderflowException();
+                }
+            }
         }
     }
 
     public record ReadResp(long localEndOffset, long durableOffset) {
         public byte[] encode() {
-            BufWriter w = new BufWriter();
-            Resp.writeOk(w);
-            w.u64(localEndOffset).u64(durableOffset).noTags();
-            return w.toBytes();
+            return okWithTwoU64(localEndOffset, durableOffset);
         }
 
         public static ReadResp decode(ByteBuffer b) {
@@ -234,13 +842,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(fenceEpoch).string(namespace.toString()).noTags();
+            w.chunkId(chunkId).i32(fenceEpoch).namespace(namespace).noTags();
             return w.toBytes();
         }
 
         public static Fence decode(ByteBuffer b) {
             Fence m = new Fence(ChunkId.readFrom(b), b.getInt(),
-                    StrataNamespace.of(Varint.readString(b)));
+                    StrataNamespace.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -268,13 +876,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).string(namespace.toString()).noTags();
+            w.chunkId(chunkId).namespace(namespace).noTags();
             return w.toBytes();
         }
 
         public static StatChunk decode(ByteBuffer b) {
             StatChunk m = new StatChunk(ChunkId.readFrom(b),
-                    StrataNamespace.of(Varint.readString(b)));
+                    StrataNamespace.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -305,13 +913,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(writeEpoch).u64(dataLength).string(namespace.toString()).noTags();
+            w.chunkId(chunkId).i32(writeEpoch).u64(dataLength).namespace(namespace).noTags();
             return w.toBytes();
         }
 
         public static SealChunk decode(ByteBuffer b) {
             SealChunk m = new SealChunk(ChunkId.readFrom(b), b.getInt(), b.getLong(),
-                    StrataNamespace.of(Varint.readString(b)));
+                    StrataNamespace.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -342,7 +950,7 @@ public final class Messages {
             BufWriter w = new BufWriter();
             w.varint(chunkIds.size());
             for (ChunkId c : chunkIds) w.chunkId(c);
-            w.string(namespace.toString()).noTags();
+            w.namespace(namespace).noTags();
             return w.toBytes();
         }
 
@@ -350,7 +958,7 @@ public final class Messages {
             int n = count(b);
             List<ChunkId> ids = new ArrayList<>(n);
             for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             TaggedFields.readFrom(b);
             return new DeleteChunks(ids, namespace);
         }
@@ -396,13 +1004,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(offset).u32(maxBytes).string(namespace.toString()).noTags();
+            w.chunkId(chunkId).u64(offset).u32(maxBytes).namespace(namespace).noTags();
             return w.toBytes();
         }
 
         public static FetchChunk decode(ByteBuffer b) {
             FetchChunk m = new FetchChunk(ChunkId.readFrom(b), b.getLong(), b.getInt(),
-                    StrataNamespace.of(Varint.readString(b)));
+                    StrataNamespace.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -430,13 +1038,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(fromOffset).string(namespace.toString()).noTags();
+            w.chunkId(chunkId).u64(fromOffset).namespace(namespace).noTags();
             return w.toBytes();
         }
 
         public static ReadLedger decode(ByteBuffer b) {
             ReadLedger m = new ReadLedger(ChunkId.readFrom(b), b.getLong(),
-                    StrataNamespace.of(Varint.readString(b)));
+                    StrataNamespace.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -588,12 +1196,12 @@ public final class Messages {
                     w.u8(1).chunkId(r.chunkId());
                     writeReplicas(w, r.sources());
                     w.u8(r.priority()).u32(r.expectedCrc()).u64(r.expectedLength())
-                     .string(r.namespace().toString());
+                     .namespace(r.namespace());
                 }
                 case DeleteCmd d -> {
                     w.u8(2).varint(d.chunkIds().size());
                     for (ChunkId id : d.chunkIds()) w.chunkId(id);
-                    w.string(d.namespace().toString());
+                    w.namespace(d.namespace());
                 }
                 case DrainCmd dr -> w.u8(3);
             }
@@ -609,14 +1217,14 @@ public final class Messages {
                     byte priority = b.get();
                     int expectedCrc = b.getInt();
                     long expectedLength = b.getLong();
-                    StrataNamespace ns = StrataNamespace.of(Varint.readString(b));
+                    StrataNamespace ns = StrataNamespace.readFrom(b);
                     yield new ReplicateCmd(id, chunkId, sources, priority, expectedCrc, expectedLength, ns);
                 }
                 case 2 -> {
                     int n = count(b);
                     List<ChunkId> ids = new ArrayList<>(n);
                     for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
-                    StrataNamespace delNs = StrataNamespace.of(Varint.readString(b));
+                    StrataNamespace delNs = StrataNamespace.readFrom(b);
                     yield new DeleteCmd(id, ids, delNs);
                 }
                 case 3 -> new DrainCmd(id);
@@ -685,14 +1293,14 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).string(verifierEndpoint).varint(chunkIds.size());
+            w.namespace(namespace).string(verifierEndpoint).varint(chunkIds.size());
             for (ChunkId c : chunkIds) w.chunkId(c);
             w.noTags();
             return w.toBytes();
         }
 
         public static VerifyChunks decode(ByteBuffer b) {
-            StrataNamespace ns = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace ns = StrataNamespace.readFrom(b);
             String verifier = Varint.readString(b);
             int n = count(b);
             List<ChunkId> ids = new ArrayList<>(n);
@@ -804,14 +1412,14 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).string(path.toString());
+            w.namespace(namespace).string(path.toString());
             writePolicy.writeTo(w);
             w.u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
         public static CreateFile decode(ByteBuffer b) {
-            CreateFile m = new CreateFile(StrataNamespace.of(Varint.readString(b)),
+            CreateFile m = new CreateFile(StrataNamespace.readFrom(b),
                     StrataPath.of(Varint.readString(b)), WritePolicy.readFrom(b),
                     b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
@@ -857,7 +1465,7 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).fileId(fileId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb);
+            w.namespace(namespace).fileId(fileId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb);
             if (excludedNodeIds.isEmpty()) {
                 w.noTags();
             } else {
@@ -870,7 +1478,7 @@ public final class Messages {
         }
 
         public static CreateChunk decode(ByteBuffer b) {
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             FileId fileId = FileId.readFrom(b);
             int writeEpoch = b.getInt();
             long opIdMsb = b.getLong();
@@ -936,13 +1544,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).fileId(fileId).u8(purpose).noTags();
+            w.namespace(namespace).fileId(fileId).u8(purpose).noTags();
             return w.toBytes();
         }
 
         public static AllocateWriterEpoch decode(ByteBuffer b) {
             AllocateWriterEpoch m = new AllocateWriterEpoch(
-                    StrataNamespace.of(Varint.readString(b)), FileId.readFrom(b), b.get());
+                    StrataNamespace.readFrom(b), FileId.readFrom(b), b.get());
             TaggedFields.readFrom(b);
             return m;
         }
@@ -988,7 +1596,7 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).chunkId(chunkId).i32(writeEpoch).u64(length).u32(crc);
+            w.namespace(namespace).chunkId(chunkId).i32(writeEpoch).u64(length).u32(crc);
             w.varint(sealedReplicas.size());
             for (int id : sealedReplicas) w.u32(id);
             w.u64(opIdMsb).u64(opIdLsb).noTags();
@@ -996,7 +1604,7 @@ public final class Messages {
         }
 
         public static SealChunkMeta decode(ByteBuffer b) {
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             ChunkId id = ChunkId.readFrom(b);
             int epoch = b.getInt();
             long length = b.getLong();
@@ -1018,13 +1626,13 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).chunkId(chunkId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb).noTags();
+            w.namespace(namespace).chunkId(chunkId).i32(writeEpoch).u64(opIdMsb).u64(opIdLsb).noTags();
             return w.toBytes();
         }
 
         public static AbortChunkMeta decode(ByteBuffer b) {
             AbortChunkMeta m = new AbortChunkMeta(
-                    StrataNamespace.of(Varint.readString(b)), ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong());
+                    StrataNamespace.readFrom(b), ChunkId.readFrom(b), b.getInt(), b.getLong(), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }
@@ -1037,12 +1645,12 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).fileId(fileId).noTags();
+            w.namespace(namespace).fileId(fileId).noTags();
             return w.toBytes();
         }
 
         public static LookupFile decode(ByteBuffer b) {
-            LookupFile m = new LookupFile(StrataNamespace.of(Varint.readString(b)), FileId.readFrom(b));
+            LookupFile m = new LookupFile(StrataNamespace.readFrom(b), FileId.readFrom(b));
             TaggedFields.readFrom(b);
             return m;
         }
@@ -1060,12 +1668,12 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).string(path.toString()).noTags();
+            w.namespace(namespace).string(path.toString()).noTags();
             return w.toBytes();
         }
 
         public static LookupPath decode(ByteBuffer b) {
-            LookupPath m = new LookupPath(StrataNamespace.of(Varint.readString(b)),
+            LookupPath m = new LookupPath(StrataNamespace.readFrom(b),
                     StrataPath.of(Varint.readString(b)));
             TaggedFields.readFrom(b);
             return m;
@@ -1122,7 +1730,7 @@ public final class Messages {
         public byte[] encode() {
             BufWriter w = new BufWriter();
             Resp.writeOk(w);
-            w.string(namespace.toString()).string(path.toString());
+            w.namespace(namespace).string(path.toString());
             writePolicy.writeTo(w);
             w.u8(fileState).varint(chunks.size());
             for (ChunkInfo c : chunks) ChunkInfo.write(w, c);
@@ -1131,7 +1739,7 @@ public final class Messages {
         }
 
         public static LookupFileResp decode(ByteBuffer b) {
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             StrataPath path = StrataPath.of(Varint.readString(b));
             WritePolicy writePolicy = WritePolicy.readFrom(b);
             byte state = b.get();
@@ -1151,7 +1759,7 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString());
+            w.namespace(namespace);
             w.varint(fileIds.size());
             for (FileId f : fileIds) w.fileId(f);
             w.noTags();
@@ -1159,7 +1767,7 @@ public final class Messages {
         }
 
         public static DeleteFiles decode(ByteBuffer b) {
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
             int n = count(b);
             List<FileId> ids = new ArrayList<>(n);
             for (int i = 0; i < n; i++) ids.add(FileId.readFrom(b));
@@ -1208,12 +1816,12 @@ public final class Messages {
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.string(namespace.toString()).fileId(fileId).u64(totalLength).noTags();
+            w.namespace(namespace).fileId(fileId).u64(totalLength).noTags();
             return w.toBytes();
         }
 
         public static SealFile decode(ByteBuffer b) {
-            SealFile m = new SealFile(StrataNamespace.of(Varint.readString(b)), FileId.readFrom(b), b.getLong());
+            SealFile m = new SealFile(StrataNamespace.readFrom(b), FileId.readFrom(b), b.getLong());
             TaggedFields.readFrom(b);
             return m;
         }

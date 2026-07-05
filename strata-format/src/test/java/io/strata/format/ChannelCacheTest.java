@@ -199,6 +199,28 @@ class ChannelCacheTest {
     }
 
     @Test
+    void invalidatedLeaseDoesNotPoolStaleReplacedInode() throws Exception {
+        Path p = file(1, "old");
+        try (ChannelCache cache = new ChannelCache(8)) {
+            ChannelCache.Lease held = cache.acquire(id(1), p);
+            FileChannel oldChannel = held.channel();
+
+            cache.invalidate(id(1));
+            Files.delete(p);
+            Files.write(p, "new".getBytes(StandardCharsets.UTF_8));
+
+            assertEquals("old", new String(readAll(oldChannel, 3), StandardCharsets.UTF_8));
+            held.release();
+            assertEquals(0, cache.size(), "an invalidated lease must not re-enter the idle pool");
+
+            try (ChannelCache.Lease fresh = cache.acquire(id(1), p)) {
+                assertNotSame(oldChannel, fresh.channel(), "replacement must get a fresh channel");
+                assertEquals("new", new String(readAll(fresh.channel(), 3), StandardCharsets.UTF_8));
+            }
+        }
+    }
+
+    @Test
     void releaseIsIdempotent() throws Exception {
         Path p = file(1, "x");
         try (ChannelCache cache = new ChannelCache(8)) {
@@ -206,6 +228,23 @@ class ChannelCacheTest {
             l.release();
             assertEquals(1, cache.size());
             l.release(); // must not double-pool
+            assertEquals(1, cache.size());
+        }
+    }
+
+    @Test
+    void releasedLeaseWrapperIsNotReusedForNewHolder() throws Exception {
+        Path p = file(1, "x");
+        try (ChannelCache cache = new ChannelCache(8)) {
+            ChannelCache.Lease first = cache.acquire(id(1), p);
+            first.release();
+
+            ChannelCache.Lease second = cache.acquire(id(1), p);
+            assertNotSame(first, second, "stale release must not target a later holder's lease wrapper");
+            first.release();
+            assertTrue(second.channel().isOpen(), "stale release of the first wrapper must not close/repool second");
+            assertEquals(0, cache.size(), "second is still leased, not idle");
+            second.release();
             assertEquals(1, cache.size());
         }
     }

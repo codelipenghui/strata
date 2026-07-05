@@ -2,6 +2,7 @@ package io.strata.server;
 
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -31,5 +32,13 @@ class ServerMetricsConfigTest {
         assertTrue(StrataServer.parseBoolEnv("X", null, true));
         assertThrows(IllegalArgumentException.class, () -> StrataServer.parseBoolEnv("X", "1", false));
         assertThrows(IllegalArgumentException.class, () -> StrataServer.parseBoolEnv("X", "yes", false));
+    }
+
+    @Test
+    void positiveIntEnvRejectsZeroOrNegative() {
+        assertEquals(16, StrataServer.parsePositiveIntEnv("X", null, 16));
+        assertEquals(4, StrataServer.parsePositiveIntEnv("X", "4", 16));
+        assertThrows(IllegalArgumentException.class, () -> StrataServer.parsePositiveIntEnv("X", "0", 16));
+        assertThrows(IllegalArgumentException.class, () -> StrataServer.parsePositiveIntEnv("X", "-1", 16));
     }
 }

@@ -16,6 +16,7 @@ class FileIdTest {
     @Test void toStringIsZeroPaddedHexAndSortsNumerically() {
         assertEquals("0000000000000001", FileId.of(1).toString());
         assertEquals("00000000000000ff", FileId.of(255).toString());
+        assertEquals("ffffffffffffffff", FileId.of(-1L).toString());
         // lexical order == numeric order
         assertTrue(FileId.of(1).toString().compareTo(FileId.of(2).toString()) < 0);
         assertEquals(FileId.of(0x1234L), FileId.fromHex("0000000000001234"));

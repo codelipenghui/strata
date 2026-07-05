@@ -180,6 +180,31 @@ class AdversarialInputTest {
         }
     }
 
+    @Test
+    void nettyEncoderPreallocatesExactFrameCapacity() {
+        EmbeddedChannel encoder = new EmbeddedChannel(new NettyFrameCodec.Encoder());
+        ByteBuf encoded = null;
+        try {
+            byte[] header = new Messages.Append(new ChunkId(FileId.of(1), 0),
+                    1, 0, 0, StrataNamespace.of("test")).encode();
+            byte[] payload = new byte[32 * 1024];
+
+            assertTrue(encoder.writeOutbound(Frame.request(Opcode.APPEND,
+                    header, ByteBuffer.wrap(payload), 1)));
+
+            encoded = encoder.readOutbound();
+            int expected = Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + header.length + payload.length;
+            assertEquals(expected, encoded.readableBytes());
+            assertEquals(expected, encoded.capacity());
+            assertEquals(expected, encoded.maxCapacity());
+        } finally {
+            if (encoded != null) {
+                encoded.release();
+            }
+            encoder.finishAndReleaseAll();
+        }
+    }
+
     private static void assertDecoderRejects(ByteBuf frame, String expectedMessage) {
         EmbeddedChannel channel = new EmbeddedChannel(new NettyFrameCodec.Decoder());
         try {

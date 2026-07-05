@@ -23,7 +23,7 @@ public final class RequestContext {
     /** Returns the namespace set for the current request and clears it; {@code "-"} when unset. */
     public static String takeNamespace() {
         String ns = NAMESPACE.get();
-        NAMESPACE.remove();
+        NAMESPACE.set(null);
         return ns == null ? "-" : ns;
     }
 }

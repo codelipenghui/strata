@@ -90,11 +90,12 @@ public final class StrataServer {
         long nsRefreshMs = intEnv("STRATA_METRICS_NS_REFRESH_INTERVAL_MS", 10_000);
         long[] buckets = parseBucketsMs(env("STRATA_METRICS_REQUEST_DURATION_BUCKETS_MS", null),
                 new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
+        int latencySampleRate = requestLatencySampleRate();
         AutoCloseable metrics = null;
         try {
             metrics = startMetrics("controller", reg -> {
                 ServerMetrics.registerController(reg, service, nsRefreshMs);
-                service.setRequestObserver(ServerMetrics.requestObserver(reg, buckets));
+                service.setRequestObserver(ServerMetrics.requestObserver(reg, buckets, latencySampleRate));
             }, () -> service.isLeader() && service.zkConnected());
             awaitShutdown("controller", metrics, service);
         } catch (Exception e) {
@@ -144,11 +145,12 @@ public final class StrataServer {
         long nsRefreshMs = intEnv("STRATA_METRICS_NS_REFRESH_INTERVAL_MS", 10_000);
         long[] buckets = parseBucketsMs(env("STRATA_METRICS_REQUEST_DURATION_BUCKETS_MS", null),
                 new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
+        int latencySampleRate = requestLatencySampleRate();
         AutoCloseable metrics = null;
         try {
             metrics = startMetrics("data-node", reg -> {
                 ServerMetrics.registerDataNode(reg, node, nsRefreshMs);
-                node.setRequestObserver(ServerMetrics.requestObserver(reg, buckets));
+                node.setRequestObserver(ServerMetrics.requestObserver(reg, buckets, latencySampleRate));
             }, node::registered);
             awaitShutdown("data node", metrics, node);
         } catch (Exception e) {
@@ -260,12 +262,13 @@ public final class StrataServer {
             long nsRefreshMs = intEnv("STRATA_METRICS_NS_REFRESH_INTERVAL_MS", 10_000);
             long[] buckets = parseBucketsMs(env("STRATA_METRICS_REQUEST_DURATION_BUCKETS_MS", null),
                     new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
+            int latencySampleRate = requestLatencySampleRate();
             AutoCloseable metrics = startMetrics("combined", reg -> {
                 ServerMetrics.registerController(reg, startedController, nsRefreshMs);
                 ServerMetrics.registerDataNode(reg, startedNode, nsRefreshMs);
                 // The single (node) listener serves both planes, so observe there; the embedded controller
                 // has no server of its own.
-                startedNode.setRequestObserver(ServerMetrics.requestObserver(reg, buckets));
+                startedNode.setRequestObserver(ServerMetrics.requestObserver(reg, buckets, latencySampleRate));
             }, () -> startedController.isLeader() && startedController.zkConnected() && startedNode.registered());
             return new Combined(controller, node, metrics);
         } catch (Exception e) {
@@ -437,6 +440,12 @@ public final class StrataServer {
         return parseBoolEnv(key, env(key, null), def);
     }
 
+    private static int requestLatencySampleRate() {
+        return parsePositiveIntEnv("STRATA_METRICS_REQUEST_LATENCY_SAMPLE_RATE",
+                env("STRATA_METRICS_REQUEST_LATENCY_SAMPLE_RATE", null),
+                ServerMetrics.DEFAULT_REQUEST_LATENCY_SAMPLE_RATE);
+    }
+
     static boolean parseBoolEnv(String key, String value, boolean def) {
         String v = value == null || value.isBlank() ? null : value.trim();
         if (v == null) {
@@ -448,6 +457,18 @@ public final class StrataServer {
             default -> throw new IllegalArgumentException(
                     key + " must be 'true' or 'false' but was '" + v + "'");
         };
+    }
+
+    static int parsePositiveIntEnv(String key, String value, int def) {
+        String v = value == null || value.isBlank() ? null : value.trim();
+        if (v == null) {
+            return def;
+        }
+        int parsed = Integer.parseInt(v);
+        if (parsed <= 0) {
+            throw new IllegalArgumentException(key + " must be positive but was " + parsed);
+        }
+        return parsed;
     }
 
     /**

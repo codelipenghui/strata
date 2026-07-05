@@ -1,9 +1,15 @@
 package io.strata.proto;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.buffer.UnpooledByteBufAllocator;
+import io.netty.channel.embedded.EmbeddedChannel;
 import io.strata.common.ChunkId;
+import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -14,9 +20,14 @@ import java.io.IOException;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ReadOnlyBufferException;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
@@ -24,7 +35,9 @@ import java.util.concurrent.TimeoutException;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -162,6 +175,206 @@ class ProtocolCoverageTest {
     }
 
     @Test
+    void appendDecodeReadsOwnedDirectHeader() {
+        StrataNamespace namespace = StrataNamespace.of("test");
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);
+        BufWriter header = new BufWriter();
+        header.chunkId(chunkId).i32(7).u64(11).u64(9).namespace(namespace);
+        TaggedFields.of(Map.of(0, new byte[] {1}, 99, new byte[] {8, 9})).writeTo(header);
+        byte[] encoded = header.toBytes();
+
+        ByteBuf owner = Unpooled.directBuffer(encoded.length + 5);
+        owner.writeZero(3);
+        int headerIndex = owner.writerIndex();
+        owner.writeBytes(encoded);
+        owner.writeZero(2);
+        Frame frame = Frame.fromOwnedBuffer(Opcode.APPEND.code, (short) 1, (short) 0, 17L,
+                owner, headerIndex, encoded.length, headerIndex + encoded.length, 0, 0);
+        try {
+            Messages.Append.AppendFields fields = Messages.Append.decodeFields(frame);
+            assertEquals(chunkId, fields.chunkId());
+            assertEquals(7, fields.writeEpoch());
+            assertEquals(11, fields.baseOffset());
+            assertEquals(9, fields.durableOffset());
+            assertEquals(namespace, fields.namespace());
+            assertTrue(fields.recovery());
+
+            Messages.Append decoded = Messages.Append.decode(frame);
+
+            assertEquals(new Messages.Append(chunkId, 7, 11, 9, namespace, true), decoded);
+        } finally {
+            frame.close();
+        }
+    }
+
+    @Test
+    void decoderVerifiesAppendPayloadWithoutCachedInternalReadBuffer() {
+        StrataNamespace namespace = StrataNamespace.of("test");
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);
+        byte[] header = new Messages.Append(chunkId, 7, 11, 9, namespace).encode();
+        byte[] payload = new byte[] {1, 2, 3, 4};
+        Frame request = Frame.request(Opcode.APPEND, header, ByteBuffer.wrap(payload), 17L);
+        EmbeddedChannel channel = new EmbeddedChannel(new NettyFrameCodec.Encoder(), new NettyFrameCodec.Decoder());
+        try {
+            assertTrue(channel.writeOutbound(request));
+            ByteBuf wire = channel.readOutbound();
+            assertTrue(channel.writeInbound(wire));
+            Frame decoded = channel.readInbound();
+            try {
+                assertTrue(decoded.ownsBuffer());
+                ByteBuffer internal = decoded.payloadInternalReadBuffer();
+                assertNotSame(internal, decoded.payloadInternalReadBuffer());
+                assertEquals(payload.length, internal.remaining());
+                byte[] got = new byte[payload.length];
+                internal.duplicate().get(got);
+                assertArrayEquals(payload, got);
+
+                byte[] publicRead = new byte[payload.length];
+                decoded.payloadReadBuffer().get(publicRead);
+                assertArrayEquals(payload, publicRead);
+            } finally {
+                decoded.close();
+            }
+        } finally {
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void decoderRetainsParentCumulationForMultipleFrames() {
+        StrataNamespace namespace = StrataNamespace.of("test");
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);
+        byte[] header = new Messages.Append(chunkId, 7, 11, 9, namespace).encode();
+        byte[] firstPayload = new byte[] {1, 2, 3, 4};
+        byte[] secondPayload = new byte[] {5, 6, 7};
+        Frame firstRequest = Frame.request(Opcode.APPEND, header, ByteBuffer.wrap(firstPayload), 17L);
+        Frame secondRequest = Frame.request(Opcode.APPEND, header, ByteBuffer.wrap(secondPayload), 18L);
+        EmbeddedChannel channel = new EmbeddedChannel(new NettyFrameCodec.Encoder(), new NettyFrameCodec.Decoder());
+        ByteBuf firstWire = null;
+        ByteBuf secondWire = null;
+        ByteBuf combined = null;
+        Frame first = null;
+        Frame second = null;
+        try {
+            assertTrue(channel.writeOutbound(firstRequest));
+            assertTrue(channel.writeOutbound(secondRequest));
+            firstWire = channel.readOutbound();
+            secondWire = channel.readOutbound();
+            combined = Unpooled.directBuffer(firstWire.readableBytes() + secondWire.readableBytes());
+            combined.writeBytes(firstWire, firstWire.readerIndex(), firstWire.readableBytes());
+            combined.writeBytes(secondWire, secondWire.readerIndex(), secondWire.readableBytes());
+            firstWire.release();
+            firstWire = null;
+            secondWire.release();
+            secondWire = null;
+
+            assertTrue(channel.writeInbound(combined));
+            combined = null;
+            first = channel.readInbound();
+            second = channel.readInbound();
+            assertTrue(first != null);
+            assertTrue(second != null);
+            assertTrue(first.ownsBuffer());
+            assertTrue(second.ownsBuffer());
+            assertEquals(2, first.ownerRefCnt());
+            assertEquals(2, second.ownerRefCnt());
+
+            byte[] gotFirst = new byte[firstPayload.length];
+            first.payloadInternalReadBuffer().duplicate().get(gotFirst);
+            assertArrayEquals(firstPayload, gotFirst);
+            first.close();
+            assertEquals(1, second.ownerRefCnt());
+
+            byte[] gotSecond = new byte[secondPayload.length];
+            second.payloadInternalReadBuffer().duplicate().get(gotSecond);
+            assertArrayEquals(secondPayload, gotSecond);
+        } finally {
+            if (first != null) first.close();
+            if (second != null) second.close();
+            if (firstWire != null) firstWire.release();
+            if (secondWire != null) secondWire.release();
+            if (combined != null) combined.release();
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void openChunkDecodeReadsOwnedDirectHeader() {
+        StrataNamespace namespace = StrataNamespace.of("test");
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);
+        Messages.OpenChunk expected = new Messages.OpenChunk(
+                chunkId, 7, true, 1L << 30, 1_718_000_000_000L, namespace);
+        BufWriter header = new BufWriter();
+        header.chunkId(chunkId).i32(7).u8(1).u64(1L << 30).u64(1_718_000_000_000L)
+                .namespace(namespace);
+        TaggedFields.of(Map.of(99, new byte[] {8, 9})).writeTo(header);
+        byte[] encoded = header.toBytes();
+
+        ByteBuf owner = Unpooled.directBuffer(encoded.length + 5);
+        owner.writeZero(3);
+        int headerIndex = owner.writerIndex();
+        owner.writeBytes(encoded);
+        owner.writeZero(2);
+        Frame frame = Frame.fromOwnedBuffer(Opcode.OPEN_CHUNK.code, (short) 1, (short) 0, 17L,
+                owner, headerIndex, encoded.length, headerIndex + encoded.length, 0, 0);
+        try {
+            assertEquals(expected, Messages.OpenChunk.decode(frame));
+        } finally {
+            frame.close();
+        }
+    }
+
+    @Test
+    void openChunkOwnedDecodeRejectsBadBoolean() {
+        StrataNamespace namespace = StrataNamespace.of("test");
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);
+        BufWriter header = new BufWriter();
+        header.chunkId(chunkId).i32(7).u8(2).u64(1L << 30).u64(1_718_000_000_000L)
+                .namespace(namespace).noTags();
+        byte[] encoded = header.toBytes();
+
+        ByteBuf owner = Unpooled.directBuffer(encoded.length);
+        owner.writeBytes(encoded);
+        Frame frame = Frame.fromOwnedBuffer(Opcode.OPEN_CHUNK.code, (short) 1, (short) 0, 17L,
+                owner, 0, encoded.length, encoded.length, 0, 0);
+        try {
+            var error = assertThrows(IllegalArgumentException.class, () -> Messages.OpenChunk.decode(frame));
+            assertTrue(error.getMessage().contains("boolean"));
+        } finally {
+            frame.close();
+        }
+    }
+
+    @Test
+    void readDecodeReadsOwnedDirectHeader() {
+        StrataNamespace namespace = StrataNamespace.of("test");
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);
+        BufWriter header = new BufWriter();
+        header.chunkId(chunkId).u64(11).u32(65536).namespace(namespace);
+        TaggedFields.of(Map.of(99, new byte[] {8, 9})).writeTo(header);
+        byte[] encoded = header.toBytes();
+
+        ByteBuf owner = Unpooled.directBuffer(encoded.length + 5);
+        owner.writeZero(3);
+        int headerIndex = owner.writerIndex();
+        owner.writeBytes(encoded);
+        owner.writeZero(2);
+        Frame frame = Frame.fromOwnedBuffer(Opcode.READ.code, (short) 1, (short) 0, 17L,
+                owner, headerIndex, encoded.length, headerIndex + encoded.length, 0, 0);
+        try {
+            Messages.Read.ReadFields fields = Messages.Read.decodeFields(frame);
+            assertEquals(chunkId.fileId().id(), fields.fileId());
+            assertEquals(chunkId.index(), fields.chunkIndex());
+            assertEquals(11, fields.offset());
+            assertEquals(65536, fields.maxBytes());
+            assertEquals(namespace, fields.namespace());
+            assertEquals(chunkId, fields.chunkId());
+        } finally {
+            frame.close();
+        }
+    }
+
+    @Test
     void responseHelpersCoverOkAndErrorVariants() {
         ByteBuffer ok = ByteBuffer.wrap(Messages.okHeader());
         Resp.check(ok);
@@ -225,6 +438,93 @@ class ProtocolCoverageTest {
         assertThrows(ReadOnlyBufferException.class, () -> request.headerSlice().put((byte) 0));
         Frame response = Frame.response(request, Messages.okHeader(), null);
         assertTrue(response.isResponse());
+        byte[] borrowed = "borrowed".getBytes();
+        AtomicBoolean released = new AtomicBoolean(false);
+        Frame borrowedResponse = Frame.response(request, Messages.okHeader(), ByteBuffer.wrap(borrowed),
+                () -> released.set(true));
+        assertTrue(borrowedResponse.payloadView().hasArray());
+        assertThrows(ReadOnlyBufferException.class, () -> borrowedResponse.payloadSlice().put((byte) 0));
+        borrowedResponse.close();
+        assertTrue(released.get());
+
+        byte[] borrowedBytes = {1, 2, 3, 4};
+        AtomicBoolean bytesReleased = new AtomicBoolean(false);
+        Frame bytesResponse = Frame.responseBytes(request, Messages.okHeader(), borrowedBytes, 3,
+                () -> bytesReleased.set(true));
+        assertEquals(3, bytesResponse.payloadLength());
+        byte[] bytesPayload = new byte[3];
+        bytesResponse.payloadSlice().get(bytesPayload);
+        assertArrayEquals(new byte[]{1, 2, 3}, bytesPayload);
+        ByteArrayOutputStream encodedBytesResponse = new ByteArrayOutputStream();
+        FrameIO.write(new DataOutputStream(encodedBytesResponse), bytesResponse);
+        Frame decodedBytesResponse = FrameIO.read(new DataInputStream(
+                new ByteArrayInputStream(encodedBytesResponse.toByteArray())));
+        assertEquals(Crc.of(borrowedBytes, 0, 3), decodedBytesResponse.payloadCrc());
+        bytesResponse.close();
+        assertTrue(bytesReleased.get());
+
+        ByteBuf directBytes = NettyFrameCodec.encodeBytesResponse(
+                UnpooledByteBufAllocator.DEFAULT, request, Messages.okHeader(), borrowedBytes, 3);
+        try {
+            byte[] directWire = new byte[directBytes.readableBytes()];
+            directBytes.readBytes(directWire);
+            Frame decodedDirectBytes = FrameIO.read(new DataInputStream(new ByteArrayInputStream(directWire)));
+            assertEquals(Crc.of(borrowedBytes, 0, 3), decodedDirectBytes.payloadCrc());
+            byte[] directPayload = new byte[decodedDirectBytes.payloadLength()];
+            decodedDirectBytes.payloadSlice().get(directPayload);
+            assertArrayEquals(new byte[]{1, 2, 3}, directPayload);
+        } finally {
+            directBytes.release();
+        }
+
+        ByteBuf directReadBytes = NettyFrameCodec.encodeTwoU64BytesResponse(
+                UnpooledByteBufAllocator.DEFAULT, request, 9, 7, borrowedBytes, 3);
+        try {
+            byte[] directWire = new byte[directReadBytes.readableBytes()];
+            directReadBytes.readBytes(directWire);
+            Frame decodedReadBytes = FrameIO.read(new DataInputStream(new ByteArrayInputStream(directWire)));
+            ByteBuffer readHeader = decodedReadBytes.headerSlice();
+            Resp.check(readHeader);
+            assertEquals(new Messages.ReadResp(9, 7), Messages.ReadResp.decode(readHeader));
+            assertEquals(Crc.of(borrowedBytes, 0, 3), decodedReadBytes.payloadCrc());
+            byte[] directPayload = new byte[decodedReadBytes.payloadLength()];
+            decodedReadBytes.payloadSlice().get(directPayload);
+            assertArrayEquals(new byte[]{1, 2, 3}, directPayload);
+        } finally {
+            directReadBytes.release();
+        }
+
+        ByteBuf compositeBytes = NettyFrameCodec.encodeBytesResponseComposite(
+                UnpooledByteBufAllocator.DEFAULT, request, Messages.okHeader(), borrowedBytes, 3);
+        try {
+            byte[] directWire = new byte[compositeBytes.readableBytes()];
+            compositeBytes.readBytes(directWire);
+            Frame decodedCompositeBytes = FrameIO.read(new DataInputStream(new ByteArrayInputStream(directWire)));
+            assertEquals(Crc.of(borrowedBytes, 0, 3), decodedCompositeBytes.payloadCrc());
+            byte[] compositePayload = new byte[decodedCompositeBytes.payloadLength()];
+            decodedCompositeBytes.payloadSlice().get(compositePayload);
+            assertArrayEquals(new byte[]{1, 2, 3}, compositePayload);
+        } finally {
+            compositeBytes.release();
+        }
+
+        ByteBuf compositeReadBytes = NettyFrameCodec.encodeTwoU64BytesResponseComposite(
+                UnpooledByteBufAllocator.DEFAULT, request, 9, 7, borrowedBytes, 3);
+        try {
+            byte[] directWire = new byte[compositeReadBytes.readableBytes()];
+            compositeReadBytes.readBytes(directWire);
+            Frame decodedCompositeRead = FrameIO.read(new DataInputStream(new ByteArrayInputStream(directWire)));
+            ByteBuffer readHeader = decodedCompositeRead.headerSlice();
+            Resp.check(readHeader);
+            assertEquals(new Messages.ReadResp(9, 7), Messages.ReadResp.decode(readHeader));
+            assertEquals(Crc.of(borrowedBytes, 0, 3), decodedCompositeRead.payloadCrc());
+            byte[] compositePayload = new byte[decodedCompositeRead.payloadLength()];
+            decodedCompositeRead.payloadSlice().get(compositePayload);
+            assertArrayEquals(new byte[]{1, 2, 3}, compositePayload);
+        } finally {
+            compositeReadBytes.release();
+        }
+
         Frame nullHeader = Frame.request(Opcode.PING, null, null, 12);
         assertEquals(0, nullHeader.headerSlice().remaining());
         assertEquals(0, Frame.response(nullHeader, null, null).headerSlice().remaining());
@@ -244,6 +544,173 @@ class ProtocolCoverageTest {
         ExecutionException wrapped = new ExecutionException(new TimeoutException());
         // This future shape is what CompletableFuture#get produces for timed pipelined calls.
         assertEquals(TimeoutException.class, wrapped.getCause().getClass());
+    }
+
+    @Test
+    void ownedFramesReadFromOwnerBufferAndReleaseIt() throws Exception {
+        byte[] bytes = {9, 1, 2, 3, 4, 5, 9};
+        ByteBuf owner = Unpooled.wrappedBuffer(bytes);
+        Frame frame = Frame.fromOwnedBuffer(Opcode.PING.code, (short) 1, Frame.FLAG_PAYLOAD_CRC, 99,
+                owner, 1, 2, 3, 3, Crc.of(bytes, 3, 3));
+
+        assertTrue(frame.ownsBuffer());
+        assertEquals(1, frame.ownerRefCnt());
+        assertEquals(2, frame.headerLength());
+        assertEquals(3, frame.payloadLength());
+        assertEquals(Crc.of(bytes, 3, 3), frame.payloadCrc());
+
+        byte[] header = new byte[2];
+        frame.headerSlice().get(header);
+        assertArrayEquals(new byte[]{1, 2}, header);
+        byte[] payload = new byte[3];
+        frame.payloadSlice().get(payload);
+        assertArrayEquals(new byte[]{3, 4, 5}, payload);
+        assertThrows(ReadOnlyBufferException.class, () -> frame.payloadSlice().put((byte) 0));
+        byte[] copied = new byte[5];
+        frame.copyPayloadTo(1, copied, 2, 2);
+        assertArrayEquals(new byte[] {0, 0, 4, 5, 0}, copied);
+
+        Path tmp = Files.createTempFile("strata-frame-payload", ".bin");
+        try (FileChannel channel = FileChannel.open(tmp, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            frame.writePayloadTo(channel, 0);
+            ByteBuffer filePayload = ByteBuffer.allocate(3);
+            channel.read(filePayload, 0);
+            assertArrayEquals(new byte[] {3, 4, 5}, filePayload.array());
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+
+        frame.close();
+        assertEquals(0, frame.ownerRefCnt());
+    }
+
+    @Test
+    void ownedRequestFramesReuseWrapperAfterClose() {
+        assertOwnedRequestFrameReused(Opcode.APPEND);
+        assertOwnedRequestFrameReused(Opcode.READ);
+        assertOwnedRequestFrameReused(Opcode.READ_RECOVERY);
+    }
+
+    @Test
+    void ownedRequestFrameClosedOnDifferentThreadDoesNotEnterWrapperPool() throws Exception {
+        byte[] firstBytes = {9, 1, 2, 3, 4, 5, 9};
+        ByteBuf firstOwner = Unpooled.wrappedBuffer(firstBytes);
+        Frame first = Frame.fromOwnedBuffer(Opcode.APPEND.code, (short) 1, (short) 0, 99,
+                firstOwner, 1, 2, 3, 3, 0);
+        Thread closer = new Thread(first::close);
+        closer.start();
+        closer.join();
+        assertEquals(0, first.ownerRefCnt());
+
+        byte[] secondBytes = {8, 6, 7, 5, 3, 0, 9};
+        ByteBuf secondOwner = Unpooled.wrappedBuffer(secondBytes);
+        Frame second = Frame.fromOwnedBuffer(Opcode.APPEND.code, (short) 1, (short) 0, 100,
+                secondOwner, 1, 2, 3, 3, 0);
+        try {
+            assertNotSame(first, second);
+        } finally {
+            second.close();
+        }
+    }
+
+    private static void assertOwnedRequestFrameReused(Opcode opcode) {
+        byte[] firstBytes = {9, 1, 2, 3, 4, 5, 9};
+        ByteBuf firstOwner = Unpooled.wrappedBuffer(firstBytes);
+        Frame first = Frame.fromOwnedBuffer(opcode.code, (short) 1, (short) 0, 99,
+                firstOwner, 1, 2, 3, 3, 0);
+        assertTrue(first.ownsBuffer());
+        assertEquals(1, first.ownerRefCnt());
+        first.close();
+        assertEquals(0, first.ownerRefCnt());
+
+        byte[] secondBytes = {8, 6, 7, 5, 3, 0, 9};
+        ByteBuf secondOwner = Unpooled.wrappedBuffer(secondBytes);
+        Frame second = Frame.fromOwnedBuffer(opcode.code, (short) 1, (short) 0, 100,
+                secondOwner, 1, 2, 3, 3, 0);
+        try {
+            assertSame(first, second);
+            assertTrue(second.ownsBuffer());
+            assertEquals(1, second.ownerRefCnt());
+            byte[] payload = new byte[3];
+            second.payloadSlice().get(payload);
+            assertArrayEquals(new byte[] {5, 3, 0}, payload);
+        } finally {
+            second.close();
+        }
+        assertEquals(0, second.ownerRefCnt());
+    }
+
+    @Test
+    void ownedNonDataHotPathFramesDoNotEnterRequestWrapperPool() {
+        assertOwnedFrameNotReused(Opcode.PING, (short) 0);
+        assertOwnedFrameNotReused(Opcode.READ, Frame.FLAG_RESPONSE);
+    }
+
+    private static void assertOwnedFrameNotReused(Opcode opcode, short flags) {
+        byte[] firstBytes = {9, 1, 2, 3, 4, 5, 9};
+        ByteBuf firstOwner = Unpooled.wrappedBuffer(firstBytes);
+        Frame first = Frame.fromOwnedBuffer(opcode.code, (short) 1, flags, 99,
+                firstOwner, 1, 2, 3, 3, 0);
+        first.close();
+        assertEquals(0, first.ownerRefCnt());
+
+        byte[] secondBytes = {8, 6, 7, 5, 3, 0, 9};
+        ByteBuf secondOwner = Unpooled.wrappedBuffer(secondBytes);
+        Frame second = Frame.fromOwnedBuffer(opcode.code, (short) 1, flags, 100,
+                secondOwner, 1, 2, 3, 3, 0);
+        try {
+            assertNotSame(first, second);
+            assertTrue(second.ownsBuffer());
+            assertEquals(1, second.ownerRefCnt());
+        } finally {
+            second.close();
+        }
+        assertEquals(0, second.ownerRefCnt());
+    }
+
+    @Test
+    void ownedInternalReadBuffersExposeCorrectRangesWithoutChangingPublicSlices() {
+        byte[] bytes = {9, 1, 2, 3, 4, 5, 9};
+        ByteBuf owner = Unpooled.directBuffer(bytes.length);
+        owner.writeBytes(bytes);
+        Frame frame = Frame.fromOwnedBuffer(Opcode.PING.code, (short) 1, Frame.FLAG_PAYLOAD_CRC, 99,
+                owner, 1, 2, 3, 3, Crc.of(bytes, 3, 3));
+        try {
+            ByteBuffer headerRead = frame.headerReadBuffer();
+            assertEquals(2, headerRead.remaining());
+            int headerPosition = headerRead.position();
+            int headerLimit = headerRead.limit();
+            assertEquals(1, headerRead.get(headerPosition));
+
+            ByteBuffer payloadRead = frame.payloadReadBuffer();
+            assertEquals(3, payloadRead.remaining());
+            assertEquals(headerPosition, headerRead.position());
+            assertEquals(headerLimit, headerRead.limit());
+            assertEquals(1, headerRead.get(headerPosition));
+            byte[] payload = new byte[3];
+            payloadRead.get(payload);
+            assertArrayEquals(new byte[] {3, 4, 5}, payload);
+
+            byte[] header = new byte[2];
+            frame.headerSlice().get(header);
+            assertArrayEquals(new byte[] {1, 2}, header);
+            assertThrows(ReadOnlyBufferException.class, () -> frame.payloadSlice().put((byte) 0));
+
+            Frame heapCopy = frame.copyToHeap();
+            frame.close();
+            assertFalse(heapCopy.ownsBuffer());
+            assertEquals(Crc.of(bytes, 3, 3), heapCopy.payloadCrc());
+            byte[] copiedHeader = new byte[2];
+            heapCopy.headerSlice().get(copiedHeader);
+            assertArrayEquals(new byte[] {1, 2}, copiedHeader);
+            byte[] copiedPayload = new byte[3];
+            heapCopy.payloadSlice().get(copiedPayload);
+            assertArrayEquals(new byte[] {3, 4, 5}, copiedPayload);
+            heapCopy.close();
+        } finally {
+            frame.close();
+        }
+        assertEquals(0, frame.ownerRefCnt());
     }
 
     private static void assertFrameReadFails(byte[] wire, String messageFragment) {

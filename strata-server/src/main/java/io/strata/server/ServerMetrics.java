@@ -13,19 +13,26 @@ import io.strata.proto.RequestObserver;
 
 import java.time.Duration;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
 
 /**
  * Registers Strata's domain metrics on the meter registry by wiring Micrometer gauges/counters to
  * the read-only accessors on {@link Controller} / {@link DataNode}. All of these are either
- * periodic gauges over existing in-memory state (zero data-path cost) or monotonic function-counters
- * over plain atomic counters — no timers on the hot path. The {@code role} common tag is set by
+ * periodic gauges over existing in-memory state (zero data-path cost), monotonic function-counters
+ * over plain atomic counters, or sampled request timers. The {@code role} common tag is set by
  * {@code StrataMetrics}, so a single Prometheus job can scrape both process kinds.
  */
 final class ServerMetrics {
+    static final int DEFAULT_REQUEST_LATENCY_SAMPLE_RATE = 16;
+    private static final String STATUS_OK = "ok";
+    private static final String STATUS_ERROR = "error";
+
     private ServerMetrics() {
     }
 
@@ -132,6 +139,7 @@ final class ServerMetrics {
         // endpoint. A state-timeline over this series shows the owner and visibly flips on handoff (design §3.5).
         MultiGauge owner = MultiGauge.builder("strata_controller_namespace_owner")
                 .description("=1 from the controller that currently owns the namespace (owner = its endpoint)").register(reg);
+        NsCounterRegistrationState nsCounters = new NsCounterRegistrationState();
         var refresh = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "controller-ns-metrics");
             t.setDaemon(true);
@@ -149,7 +157,7 @@ final class ServerMetrics {
             owner.register(stats.keySet().stream()
                     .map(ns -> MultiGauge.Row.of(Tags.of("namespace", ns, "owner", self), 1))
                     .collect(Collectors.toList()), true);
-            registerNewControllerNamespaceCounters(reg, s);
+            registerNewControllerNamespaceCounters(reg, s, nsCounters);
         }, 0, refreshIntervalMs, TimeUnit.MILLISECONDS);
     }
 
@@ -159,9 +167,14 @@ final class ServerMetrics {
      * callable directly (tests) to register without waiting for a tick.
      */
     static void registerNewControllerNamespaceCounters(MeterRegistry reg, Controller s) {
+        registerNewControllerNamespaceCounters(reg, s, new NsCounterRegistrationState());
+    }
+
+    private static void registerNewControllerNamespaceCounters(MeterRegistry reg, Controller s,
+            NsCounterRegistrationState registrations) {
         registerLazyNsCounters(reg, s, s.namespaceLogNamespaces(), CONTROLLER_NS_COUNTERS,
                 "per-namespace metadata-log activity / ownership handoffs (rate() = ops/s or bytes/s)",
-                Controller::namespaceLogValue);
+                Controller::namespaceLogValue, registrations);
     }
 
     /** Data plane: capacity, chunk state, write throughput, fsync force rate, registration. */
@@ -234,7 +247,9 @@ final class ServerMetrics {
             t.setDaemon(true);
             return t;
         });
-        refresh.scheduleAtFixedRate(() -> registerNewDataNodeNamespaces(reg, n), 0, refreshIntervalMs, TimeUnit.MILLISECONDS);
+        NsCounterRegistrationState nsCounters = new NsCounterRegistrationState();
+        refresh.scheduleAtFixedRate(() -> registerNewDataNodeNamespaces(reg, n, nsCounters),
+                0, refreshIntervalMs, TimeUnit.MILLISECONDS);
     }
 
     private static final String[] DATA_NODE_NS_COUNTERS = {
@@ -254,17 +269,44 @@ final class ServerMetrics {
      * ever seen and counter semantics stay monotonic.
      */
     private static <T> void registerLazyNsCounters(MeterRegistry reg, T source, Iterable<String> namespaces,
-            String[] names, String description, NsCounterReader<T> reader) {
+            String[] names, String description, NsCounterReader<T> reader,
+            NsCounterRegistrationState registrations) {
         for (String ns : namespaces) {
             for (int i = 0; i < names.length; i++) {
-                if (reg.find(names[i]).tag("namespace", ns).functionCounter() == null) {
-                    final int idx = i;
-                    final String namespace = ns;
-                    FunctionCounter.builder(names[i], source, src -> reader.valueOf(src, namespace, idx))
-                            .tag("namespace", namespace).description(description).register(reg);
+                final int idx = i;
+                final String namespace = ns;
+                String name = names[i];
+                if (registrations.mark(name, namespace)) {
+                    boolean registered = false;
+                    try {
+                        if (reg.find(name).tag("namespace", namespace).functionCounter() == null) {
+                            FunctionCounter.builder(name, source, src -> reader.valueOf(src, namespace, idx))
+                                    .tag("namespace", namespace).description(description).register(reg);
+                        }
+                        registered = true;
+                    } finally {
+                        if (!registered) {
+                            registrations.unmark(name, namespace);
+                        }
+                    }
                 }
             }
         }
+    }
+
+    private static final class NsCounterRegistrationState {
+        private final Set<NsCounterKey> registered = ConcurrentHashMap.newKeySet();
+
+        boolean mark(String name, String namespace) {
+            return registered.add(new NsCounterKey(name, namespace));
+        }
+
+        void unmark(String name, String namespace) {
+            registered.remove(new NsCounterKey(name, namespace));
+        }
+    }
+
+    private record NsCounterKey(String name, String namespace) {
     }
 
     /**
@@ -272,37 +314,100 @@ final class ServerMetrics {
      * seen I/O. Called by the refresh timer; also callable directly (tests) to register without a tick.
      */
     static void registerNewDataNodeNamespaces(MeterRegistry reg, DataNode n) {
+        registerNewDataNodeNamespaces(reg, n, new NsCounterRegistrationState());
+    }
+
+    private static void registerNewDataNodeNamespaces(MeterRegistry reg, DataNode n,
+            NsCounterRegistrationState registrations) {
         registerLazyNsCounters(reg, n, n.ioNamespaces(), DATA_NODE_NS_COUNTERS,
-                "per-namespace data throughput (rate() = ops/s or bytes/s)", DataNode::ioValue);
+                "per-namespace data throughput (rate() = ops/s or bytes/s)", DataNode::ioValue, registrations);
     }
 
     /**
-     * A per-request latency observer recording into a {@code strata_scp_request_duration} timer
-     * tagged by opcode + status. Emits a Prometheus HISTOGRAM (cumulative {@code _bucket{le}}
-     * series) rather than client-side quantiles, so percentiles can be aggregated correctly across
-     * the node fleet at query time (histogram_quantile over summed buckets) and re-quantiled at any
-     * window — pre-computed per-instance quantiles cannot be averaged across instances. Explicit SLO
-     * buckets (1ms..5s) bound the cardinality and pick boundaries meaningful for SCP request latency.
-     * Timers are cached per opcode+status, so the per-request cost is a map lookup + a histogram
-     * record. For an async APPEND in fsync mode this latency includes the group-commit/fsync wait.
+     * A per-request observer that keeps exact request counts in {@code strata_scp_requests} and samples
+     * successful latency observations into {@code strata_scp_request_duration}; error latency is always
+     * recorded. The duration timer emits a Prometheus HISTOGRAM (cumulative {@code _bucket{le}} series)
+     * rather than client-side quantiles, so percentiles can be aggregated across the node fleet at query
+     * time. Explicit SLO buckets (1ms..5s) bound cardinality and pick boundaries meaningful for SCP
+     * request latency. For an async APPEND in fsync mode this latency includes the group-commit/fsync wait.
      */
     static RequestObserver requestObserver(MeterRegistry reg, long[] bucketsMs) {
+        return requestObserver(reg, bucketsMs, DEFAULT_REQUEST_LATENCY_SAMPLE_RATE);
+    }
+
+    static RequestObserver requestObserver(MeterRegistry reg, long[] bucketsMs, int successLatencySampleRate) {
+        if (successLatencySampleRate <= 0) {
+            throw new IllegalArgumentException("successLatencySampleRate must be positive: "
+                    + successLatencySampleRate);
+        }
         Duration[] slos = new Duration[bucketsMs.length];
         for (int i = 0; i < bucketsMs.length; i++) {
             slos[i] = Duration.ofMillis(bucketsMs[i]);
         }
-        Map<String, Timer> timers = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, RequestMetricFamily> metrics = new ConcurrentHashMap<>();
         return (opcode, namespace, durationNanos, success) -> {
-            String status = success ? "ok" : "error";
-            timers.computeIfAbsent(opcode + ':' + status + ':' + namespace, k -> {
-                Timer.Builder b = Timer.builder("strata_scp_request_duration")
-                        .description("request handler latency by opcode + namespace (incl. async durability wait)")
-                        .tag("opcode", opcode)
-                        .tag("status", status)
-                        .tag("namespace", namespace);
-                b.serviceLevelObjectives(slos);
-                return b.register(reg);
-            }).record(durationNanos, TimeUnit.NANOSECONDS);
+            RequestMetricFamily family = metrics.get(opcode);
+            if (family == null) {
+                RequestMetricFamily created = new RequestMetricFamily();
+                RequestMetricFamily existing = metrics.putIfAbsent(opcode, created);
+                family = existing == null ? created : existing;
+            }
+            RequestMetric metric = family.metric(reg, slos, opcode, namespace, success);
+            metric.requests.increment();
+            if (!success || successLatencySampleRate == 1
+                    || ThreadLocalRandom.current().nextInt(successLatencySampleRate) == 0) {
+                metric.latency.record(durationNanos, TimeUnit.NANOSECONDS);
+            }
         };
+    }
+
+    private static final class RequestMetricFamily {
+        private final ConcurrentHashMap<String, RequestMetric> ok = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<String, RequestMetric> error = new ConcurrentHashMap<>();
+
+        RequestMetric metric(MeterRegistry reg, Duration[] slos, String opcode, String namespace, boolean success) {
+            ConcurrentHashMap<String, RequestMetric> byNamespace = success ? ok : error;
+            String namespaceTag = String.valueOf(namespace);
+            RequestMetric metric = byNamespace.get(namespaceTag);
+            if (metric != null) {
+                return metric;
+            }
+            synchronized (byNamespace) {
+                metric = byNamespace.get(namespaceTag);
+                if (metric == null) {
+                    metric = registerMetric(reg, slos, opcode, namespaceTag, success ? STATUS_OK : STATUS_ERROR);
+                    byNamespace.put(namespaceTag, metric);
+                }
+                return metric;
+            }
+        }
+
+        private static RequestMetric registerMetric(MeterRegistry reg, Duration[] slos, String opcode,
+                                                    String namespace, String status) {
+            Timer.Builder b = Timer.builder("strata_scp_request_duration")
+                    .description("sampled request handler latency by opcode + namespace "
+                            + "(errors always recorded; includes async durability wait)")
+                    .tag("opcode", opcode)
+                    .tag("status", status)
+                    .tag("namespace", namespace);
+            b.serviceLevelObjectives(slos);
+            RequestMetric created = new RequestMetric(b.register(reg));
+            FunctionCounter.builder("strata_scp_requests", created.requests, LongAdder::sum)
+                    .description("exact SCP request count by opcode + namespace + status")
+                    .tag("opcode", opcode)
+                    .tag("status", status)
+                    .tag("namespace", namespace)
+                    .register(reg);
+            return created;
+        }
+    }
+
+    private static final class RequestMetric {
+        final LongAdder requests = new LongAdder();
+        final Timer latency;
+
+        RequestMetric(Timer latency) {
+            this.latency = latency;
+        }
     }
 }

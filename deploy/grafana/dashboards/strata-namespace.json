@@ -591,7 +591,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (opcode)(rate(strata_scp_request_duration_seconds_count{namespace=~\"$namespace\",opcode=~\"CREATE_FILE|CREATE_CHUNK|LOOKUP_FILE|LOOKUP_PATH|SEAL_FILE|SEAL_CHUNK_META|ABORT_CHUNK_META|ALLOCATE_WRITER_EPOCH|DELETE_FILES|DELETE_PATH\"}[$__rate_interval]))",
+          "expr": "sum by (opcode)(rate(strata_scp_requests_total{namespace=~\"$namespace\",opcode=~\"CREATE_FILE|CREATE_CHUNK|LOOKUP_FILE|LOOKUP_PATH|SEAL_FILE|SEAL_CHUNK_META|ABORT_CHUNK_META|ALLOCATE_WRITER_EPOCH|DELETE_FILES|DELETE_PATH\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "{{opcode}}"
         }
@@ -638,7 +638,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (opcode)(rate(strata_scp_request_duration_seconds_count{namespace=~\"$namespace\",opcode=~\"CREATE_FILE|CREATE_CHUNK|LOOKUP_FILE|LOOKUP_PATH|SEAL_FILE|SEAL_CHUNK_META|ABORT_CHUNK_META|ALLOCATE_WRITER_EPOCH|DELETE_FILES|DELETE_PATH\",status=\"error\"}[$__rate_interval]))",
+          "expr": "sum by (opcode)(rate(strata_scp_requests_total{namespace=~\"$namespace\",opcode=~\"CREATE_FILE|CREATE_CHUNK|LOOKUP_FILE|LOOKUP_PATH|SEAL_FILE|SEAL_CHUNK_META|ABORT_CHUNK_META|ALLOCATE_WRITER_EPOCH|DELETE_FILES|DELETE_PATH\",status=\"error\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "{{opcode}}"
         }

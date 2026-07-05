@@ -2,6 +2,8 @@ package io.strata.proto;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.CompositeByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.MessageToByteEncoder;
@@ -17,26 +19,43 @@ final class NettyFrameCodec {
 
     static final class Encoder extends MessageToByteEncoder<Frame> {
         @Override
+        protected ByteBuf allocateBuffer(ChannelHandlerContext ctx, Frame f, boolean preferDirect) throws Exception {
+            if (f.hasFilePayload()) {
+                return super.allocateBuffer(ctx, f, preferDirect);
+            }
+            int headerLen = f.headerLength();
+            int payloadLen = f.payloadLength();
+            int capacity = Integer.BYTES + FrameIO.checkedFrameLength(headerLen, payloadLen);
+            return preferDirect ? ctx.alloc().ioBuffer(capacity, capacity) : ctx.alloc().heapBuffer(capacity, capacity);
+        }
+
+        @Override
         protected void encode(ChannelHandlerContext ctx, Frame f, ByteBuf out) throws Exception {
             if (f.hasFilePayload()) {
                 throw new IOException("file payload frames must be written as a frame prefix plus FileRegion");
             }
             FailureInjector.point("scp.encoder.beforeHeader");
-            ByteBuffer header = f.headerSlice();
-            ByteBuffer payload = f.payloadSlice();
-            int headerLen = header.remaining();
-            int payloadLen = payload.remaining();
+            int headerLen = f.headerLength();
+            ByteBuffer payload = f.hasPayloadBytes() ? null : f.payloadView();
+            int payloadLen = f.hasPayloadBytes() ? f.payloadBytesLength() : payload.remaining();
 
             short flags = f.flags();
             int payloadCrc = 0;
             if (payloadLen > 0) {
-                payloadCrc = Crc.of(payload.duplicate());
+                payloadCrc = f.hasPayloadBytes()
+                        ? Crc.of(f.payloadBytes(), f.payloadBytesOffset(), payloadLen)
+                        : Crc.of(payload);
                 flags |= Frame.FLAG_PAYLOAD_CRC;
             }
 
-            writePrefix(out, f, header, payloadLen, payloadCrc, flags);
+            writePrefix(out, f, headerLen, payloadLen, payloadCrc, flags);
+            writeHeader(out, f);
             FailureInjector.point("scp.encoder.beforePayload");
-            out.writeBytes(payload.duplicate());
+            if (f.hasPayloadBytes()) {
+                out.writeBytes(f.payloadBytes(), f.payloadBytesOffset(), payloadLen);
+            } else {
+                writeBytes(out, payload);
+            }
         }
     }
 
@@ -44,12 +63,12 @@ final class NettyFrameCodec {
         if (!f.hasFilePayload()) {
             throw new IOException("frame has no file payload");
         }
-        ByteBuffer header = f.headerSlice();
-        int headerLen = header.remaining();
+        int headerLen = f.headerLength();
         ByteBuf out = allocator.buffer(Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + headerLen);
         boolean success = false;
         try {
-            writePrefix(out, f, header, f.payloadLength(), 0, f.flags());
+            writePrefix(out, f, headerLen, f.payloadLength(), 0, f.flags());
+            writeHeader(out, f);
             success = true;
             return out;
         } finally {
@@ -59,22 +78,209 @@ final class NettyFrameCodec {
         }
     }
 
-    private static void writePrefix(ByteBuf out, Frame f, ByteBuffer header, int payloadLen,
+    static ByteBuf encodeOkU64Response(ByteBufAllocator allocator, Frame req, long value) throws IOException {
+        int headerLen = Frame.OK_U64_HEADER_LENGTH;
+        int capacity = Integer.BYTES + FrameIO.checkedFrameLength(headerLen, 0);
+        ByteBuf out = allocator.ioBuffer(capacity, capacity);
+        boolean success = false;
+        try {
+            writePrefix(out, req.opcode(), req.apiVersion(), Frame.FLAG_RESPONSE, req.correlationId(),
+                    headerLen, 0, 0);
+            out.writeShort(0);
+            out.writeLong(value);
+            out.writeByte(0);
+            success = true;
+            return out;
+        } finally {
+            if (!success) {
+                out.release();
+            }
+        }
+    }
+
+    static ByteBuf encodeBytesResponse(ByteBufAllocator allocator, Frame req, byte[] header, byte[] payload,
+                                       int payloadLen) throws IOException {
+        int headerLen = header == null ? 0 : header.length;
+        checkPayload(payload, payloadLen);
+        int capacity = Integer.BYTES + FrameIO.checkedFrameLength(headerLen, payloadLen);
+        ByteBuf out = allocator.ioBuffer(capacity, capacity);
+        boolean success = false;
+        try {
+            writeBytesResponsePrefix(out, req, header, headerLen, payload, payloadLen);
+            if (payloadLen > 0) {
+                out.writeBytes(payload, 0, payloadLen);
+            }
+            success = true;
+            return out;
+        } finally {
+            if (!success) {
+                out.release();
+            }
+        }
+    }
+
+    static ByteBuf encodeBytesResponseComposite(ByteBufAllocator allocator, Frame req, byte[] header, byte[] payload,
+                                                int payloadLen) throws IOException {
+        int headerLen = header == null ? 0 : header.length;
+        checkPayload(payload, payloadLen);
+        ByteBuf prefix = allocator.ioBuffer(
+                Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + headerLen,
+                Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + headerLen);
+        boolean prefixWritten = false;
+        try {
+            writeBytesResponsePrefix(prefix, req, header, headerLen, payload, payloadLen);
+            prefixWritten = true;
+        } finally {
+            if (!prefixWritten) {
+                prefix.release();
+            }
+        }
+        return composePayload(allocator, prefix, payload, payloadLen);
+    }
+
+    static ByteBuf encodeTwoU64BytesResponse(ByteBufAllocator allocator, Frame req, long first, long second,
+                                             byte[] payload, int payloadLen) throws IOException {
+        checkPayload(payload, payloadLen);
+        int capacity = Integer.BYTES + FrameIO.checkedFrameLength(Frame.OK_TWO_U64_HEADER_LENGTH, payloadLen);
+        ByteBuf out = allocator.ioBuffer(capacity, capacity);
+        boolean success = false;
+        try {
+            writeTwoU64BytesResponsePrefix(out, req, first, second, payload, payloadLen);
+            if (payloadLen > 0) {
+                out.writeBytes(payload, 0, payloadLen);
+            }
+            success = true;
+            return out;
+        } finally {
+            if (!success) {
+                out.release();
+            }
+        }
+    }
+
+    static ByteBuf encodeTwoU64BytesResponseComposite(ByteBufAllocator allocator, Frame req, long first, long second,
+                                                      byte[] payload, int payloadLen) throws IOException {
+        checkPayload(payload, payloadLen);
+        ByteBuf prefix = allocator.ioBuffer(
+                Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + Frame.OK_TWO_U64_HEADER_LENGTH,
+                Integer.BYTES + Frame.PREAMBLE_AFTER_LEN + Frame.OK_TWO_U64_HEADER_LENGTH);
+        boolean prefixWritten = false;
+        try {
+            writeTwoU64BytesResponsePrefix(prefix, req, first, second, payload, payloadLen);
+            prefixWritten = true;
+        } finally {
+            if (!prefixWritten) {
+                prefix.release();
+            }
+        }
+        return composePayload(allocator, prefix, payload, payloadLen);
+    }
+
+    private static void writeBytesResponsePrefix(ByteBuf out, Frame req, byte[] header, int headerLen,
+                                                 byte[] payload, int payloadLen) throws IOException {
+        int payloadCrc = payloadLen > 0 ? Crc.of(payload, 0, payloadLen) : 0;
+        short flags = payloadLen > 0
+                ? (short) (Frame.FLAG_RESPONSE | Frame.FLAG_PAYLOAD_CRC)
+                : Frame.FLAG_RESPONSE;
+        writePrefix(out, req.opcode(), req.apiVersion(), flags, req.correlationId(),
+                headerLen, payloadLen, payloadCrc);
+        if (headerLen > 0) {
+            out.writeBytes(header);
+        }
+    }
+
+    private static void writeTwoU64BytesResponsePrefix(ByteBuf out, Frame req, long first, long second,
+                                                       byte[] payload, int payloadLen) throws IOException {
+        int payloadCrc = payloadLen > 0 ? Crc.of(payload, 0, payloadLen) : 0;
+        short flags = payloadLen > 0
+                ? (short) (Frame.FLAG_RESPONSE | Frame.FLAG_PAYLOAD_CRC)
+                : Frame.FLAG_RESPONSE;
+        writePrefix(out, req.opcode(), req.apiVersion(), flags, req.correlationId(),
+                Frame.OK_TWO_U64_HEADER_LENGTH, payloadLen, payloadCrc);
+        out.writeShort(0);
+        out.writeLong(first);
+        out.writeLong(second);
+        out.writeByte(0);
+    }
+
+    private static ByteBuf composePayload(ByteBufAllocator allocator, ByteBuf prefix, byte[] payload, int payloadLen) {
+        if (payloadLen == 0) {
+            return prefix;
+        }
+        ByteBuf payloadView = Unpooled.wrappedBuffer(payload, 0, payloadLen);
+        CompositeByteBuf composite = allocator.compositeBuffer(2);
+        boolean success = false;
+        try {
+            ByteBuf localPrefix = prefix;
+            prefix = null;
+            composite.addComponent(true, localPrefix);
+            ByteBuf localPayloadView = payloadView;
+            payloadView = null;
+            composite.addComponent(true, localPayloadView);
+            success = true;
+            return composite;
+        } finally {
+            if (!success) {
+                composite.release();
+                if (prefix != null) {
+                    prefix.release();
+                }
+                if (payloadView != null) {
+                    payloadView.release();
+                }
+            }
+        }
+    }
+
+    private static void checkPayload(byte[] payload, int payloadLen) {
+        if (payloadLen < 0) {
+            throw new IllegalArgumentException("negative payload length: " + payloadLen);
+        }
+        if (payloadLen > 0 && (payload == null || payloadLen > payload.length)) {
+            throw new IllegalArgumentException("invalid payload length " + payloadLen);
+        }
+    }
+
+    private static void writePrefix(ByteBuf out, Frame f, int headerLen, int payloadLen,
                                     int payloadCrc, short flags) throws IOException {
-        int headerLen = header.remaining();
+        writePrefix(out, f.opcode(), f.apiVersion(), flags, f.correlationId(), headerLen, payloadLen, payloadCrc);
+    }
+
+    private static void writePrefix(ByteBuf out, short opcode, short apiVersion, short flags, long correlationId,
+                                    int headerLen, int payloadLen, int payloadCrc) throws IOException {
         int frameLen = FrameIO.checkedFrameLength(headerLen, payloadLen);
 
         out.writeInt(frameLen);
         out.writeByte(Frame.MAGIC);
         out.writeByte(Frame.FRAME_VERSION);
-        out.writeShort(f.opcode());
-        out.writeShort(f.apiVersion());
+        out.writeShort(opcode);
+        out.writeShort(apiVersion);
         out.writeShort(flags);
-        out.writeLong(f.correlationId());
+        out.writeLong(correlationId);
         out.writeInt(payloadLen);
         out.writeInt(payloadCrc);
         out.writeShort(headerLen);
-        out.writeBytes(header.duplicate());
+    }
+
+    private static void writeHeader(ByteBuf out, Frame f) {
+        if (f.hasOkU64Header()) {
+            out.writeShort(0);
+            out.writeLong(f.okU64HeaderValue());
+            out.writeByte(0);
+        } else if (f.hasHeaderBytes()) {
+            out.writeBytes(f.headerBytes());
+        } else {
+            writeBytes(out, f.headerView());
+        }
+    }
+
+    private static void writeBytes(ByteBuf out, ByteBuffer source) {
+        int position = source.position();
+        try {
+            out.writeBytes(source);
+        } finally {
+            source.position(position);
+        }
     }
 
     static final class Decoder extends ByteToMessageDecoder {
@@ -91,34 +297,57 @@ final class NettyFrameCodec {
                 return;
             }
 
-            ByteBuf frame = in.readRetainedSlice(frameLen);
+            int frameBase = in.readerIndex();
+            // Retain the cumulation itself and keep absolute indexes into it. ByteToMessageDecoder
+            // skips discard while refCnt > 1, so the request bytes stay stable until Frame.close()
+            // releases this retain. This avoids allocating a PooledSlicedByteBuf per inbound frame.
+            ByteBuf frame = in.retain();
+            in.skipBytes(frameLen);
             boolean emitted = false;
             try {
-                int base = frame.readerIndex();
-                FrameIO.checkMagicAndVersion(frame.getByte(base), frame.getByte(base + 1));
-                short opcode = frame.getShort(base + 2);
-                short apiVersion = frame.getShort(base + 4);
-                short flags = frame.getShort(base + 6);
-                long correlationId = frame.getLong(base + 8);
-                int payloadLen = frame.getInt(base + 16);
-                int payloadCrc = frame.getInt(base + 20);
-                int headerLen = frame.getUnsignedShort(base + 24);
+                FrameIO.checkMagicAndVersion(frame.getByte(frameBase), frame.getByte(frameBase + 1));
+                short opcode = frame.getShort(frameBase + 2);
+                short apiVersion = frame.getShort(frameBase + 4);
+                short flags = frame.getShort(frameBase + 6);
+                long correlationId = frame.getLong(frameBase + 8);
+                int payloadLen = frame.getInt(frameBase + 16);
+                int payloadCrc = frame.getInt(frameBase + 20);
+                int headerLen = frame.getUnsignedShort(frameBase + 24);
                 FrameIO.checkBodyGeometry(frameLen, headerLen, payloadLen);
 
-                int headerIndex = base + Frame.PREAMBLE_AFTER_LEN;
+                int headerIndex = Frame.PREAMBLE_AFTER_LEN;
                 int payloadIndex = headerIndex + headerLen;
                 if ((flags & Frame.FLAG_PAYLOAD_CRC) != 0 && payloadLen > 0) {
-                    FrameIO.checkPayloadCrc(payloadCrc, Crc.of(frame.nioBuffer(payloadIndex, payloadLen)));
+                    if (shouldUseInternalPayloadCrcBuffer(opcode, flags, in)) {
+                        FrameIO.checkPayloadCrc(payloadCrc,
+                                Crc.of(in.internalNioBuffer(frameBase + payloadIndex, payloadLen)));
+                    } else {
+                        FrameIO.checkPayloadCrc(payloadCrc, payloadCrc(in, frameBase + payloadIndex, payloadLen));
+                    }
                 }
                 // Frame normalizes payloadCrc to 0 on an unflagged/empty frame (the accessor contract)
                 out.add(Frame.fromOwnedBuffer(opcode, apiVersion, flags, correlationId,
-                        frame, headerIndex, headerLen, payloadIndex, payloadLen, payloadCrc));
+                        frame, frameBase + headerIndex, headerLen,
+                        frameBase + payloadIndex, payloadLen, payloadCrc));
                 emitted = true;
             } finally {
                 if (!emitted) {
                     frame.release();
                 }
             }
+        }
+
+        private static boolean shouldUseInternalPayloadCrcBuffer(short opcode, short flags, ByteBuf in) {
+            return opcode == Opcode.APPEND.code
+                    && (flags & Frame.FLAG_RESPONSE) == 0
+                    && in.nioBufferCount() == 1;
+        }
+
+        private static int payloadCrc(ByteBuf buf, int index, int length) {
+            if (buf.nioBufferCount() == 1) {
+                return Crc.of(buf.internalNioBuffer(index, length));
+            }
+            return Crc.of(buf.nioBuffer(index, length));
         }
     }
 }

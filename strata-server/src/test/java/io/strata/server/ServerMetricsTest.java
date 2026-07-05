@@ -17,6 +17,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -78,12 +79,18 @@ class ServerMetricsTest {
             SimpleMeterRegistry registry = new SimpleMeterRegistry();
             ServerMetrics.registerDataNode(registry, node, 10_000);
             ServerMetrics.registerNewDataNodeNamespaces(registry, node); // force the lazy registration now
+            ServerMetrics.registerNewDataNodeNamespaces(registry, node);
 
             var appendBytes = registry.find("strata_data_node_append_bytes")
                     .tag("namespace", "ns1").functionCounter();
             assertNotNull(appendBytes, "per-namespace append_bytes counter must register after node I/O");
             assertTrue(appendBytes.count() >= payload.length,
                     "append_bytes for ns1 must reflect the written payload");
+            long appendBytesMeters = registry.getMeters().stream()
+                    .filter(m -> "strata_data_node_append_bytes".equals(m.getId().getName()))
+                    .filter(m -> "ns1".equals(m.getId().getTag("namespace")))
+                    .count();
+            assertEquals(1, appendBytesMeters, "lazy registration must not duplicate namespace meters");
         }
     }
 
@@ -91,10 +98,47 @@ class ServerMetricsTest {
     void requestObserverTagsNamespace() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         RequestObserver obs = ServerMetrics.requestObserver(registry,
-                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
+                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000}, 1);
         obs.observe("READ", "orders", 1_000_000L, true);
         assertNotNull(registry.find("strata_scp_request_duration")
                         .tag("namespace", "orders").tag("opcode", "READ").tag("status", "ok").timer(),
                 "request timer must carry a namespace tag");
+        assertNotNull(registry.find("strata_scp_requests")
+                        .tag("namespace", "orders").tag("opcode", "READ").tag("status", "ok").functionCounter(),
+                "exact request counter must carry the same tags");
+    }
+
+    @Test
+    void requestObserverKeepsExactCountWhenLatencyIsSampled() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        RequestObserver obs = ServerMetrics.requestObserver(registry,
+                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000}, 16);
+
+        for (int i = 0; i < 10; i++) {
+            obs.observe("APPEND", "orders", 1_000_000L, true);
+        }
+
+        var requests = registry.find("strata_scp_requests")
+                .tag("namespace", "orders").tag("opcode", "APPEND").tag("status", "ok").functionCounter();
+        assertNotNull(requests);
+        assertEquals(10.0, requests.count());
+    }
+
+    @Test
+    void requestObserverAlwaysRecordsErrorLatency() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        RequestObserver obs = ServerMetrics.requestObserver(registry,
+                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000}, 16);
+
+        obs.observe("APPEND", "orders", 2_000_000L, false);
+
+        var requests = registry.find("strata_scp_requests")
+                .tag("namespace", "orders").tag("opcode", "APPEND").tag("status", "error").functionCounter();
+        var latency = registry.find("strata_scp_request_duration")
+                .tag("namespace", "orders").tag("opcode", "APPEND").tag("status", "error").timer();
+        assertNotNull(requests);
+        assertNotNull(latency);
+        assertEquals(1.0, requests.count());
+        assertEquals(1L, latency.count());
     }
 }

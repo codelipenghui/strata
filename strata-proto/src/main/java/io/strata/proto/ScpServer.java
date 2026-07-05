@@ -5,6 +5,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
@@ -26,12 +27,12 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.util.ArrayDeque;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -39,7 +40,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * SCP server over Netty. Handler invocation is serialized per connection on a virtual-thread
- * executor so blocking storage/metadata code never runs on a Netty event-loop thread.
+ * drain so blocking storage/metadata code never runs on a Netty event-loop thread.
  */
 public final class ScpServer implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ScpServer.class);
@@ -47,6 +48,12 @@ public final class ScpServer implements AutoCloseable {
             EnvConfig.intEnv("STRATA_SCP_MAX_INFLIGHT_REQUESTS", 1024);
     private static final long DEFAULT_MAX_INFLIGHT_BYTES =
             EnvConfig.longEnv("STRATA_SCP_MAX_INFLIGHT_BYTES", 1L << 30);
+    private static final int MAX_POOLED_FRAME_TASKS =
+            EnvConfig.intEnv("STRATA_SCP_FRAME_TASK_POOL_SIZE", 256);
+    private static final int MAX_POOLED_RESPONSE_WRITE_LISTENERS =
+            EnvConfig.intEnv("STRATA_SCP_RESPONSE_WRITE_LISTENER_POOL_SIZE", 256);
+    private static final int MAX_POOLED_OK_U64_WRITE_TASKS =
+            EnvConfig.intEnv("STRATA_SCP_OK_U64_WRITE_TASK_POOL_SIZE", 256);
 
     /**
      * Handles one request frame; returns the response frame. Throw ScpException for protocol errors.
@@ -63,8 +70,43 @@ public final class ScpServer implements AutoCloseable {
     public interface Handler {
         Frame handle(Frame request) throws Exception;
 
+        default boolean requiresAsyncHandling(Frame request) {
+            return true;
+        }
+
         default CompletableFuture<Frame> handleAsync(Frame request) throws Exception {
             return CompletableFuture.completedFuture(handle(request));
+        }
+
+        /**
+         * Async dispatch result for handlers that can often complete synchronously. Return either a
+         * {@link Frame}, an {@link OkU64Response}, or a {@code CompletableFuture} that completes with
+         * one of those when the response must complete later.
+         */
+        default Object handleAsyncResult(Frame request) throws Exception {
+            return handleAsync(request);
+        }
+
+        /**
+         * Allocation-free dispatch result hook for hot handlers. Implementations must not retain
+         * {@code sink}; fill it during the call and return.
+         */
+        default void handleAsyncResult(Frame request, ResponseSink sink) throws Exception {
+            sink.result(handleAsyncResult(request));
+        }
+
+        static Handler sync(Handler handler) {
+            return new Handler() {
+                @Override
+                public Frame handle(Frame request) throws Exception {
+                    return handler.handle(request);
+                }
+
+                @Override
+                public boolean requiresAsyncHandling(Frame request) {
+                    return false;
+                }
+            };
         }
 
         /**
@@ -85,10 +127,192 @@ public final class ScpServer implements AutoCloseable {
                     return pick(request).handleAsync(request);
                 }
 
+                @Override
+                public Object handleAsyncResult(Frame request) throws Exception {
+                    return pick(request).handleAsyncResult(request);
+                }
+
+                @Override
+                public void handleAsyncResult(Frame request, ResponseSink sink) throws Exception {
+                    pick(request).handleAsyncResult(request, sink);
+                }
+
+                @Override
+                public boolean requiresAsyncHandling(Frame request) {
+                    return pick(request).requiresAsyncHandling(request);
+                }
+
                 private Handler pick(Frame request) {
                     return (request.opcode() & 0xFFFF) >= 0x0100 ? controlPlane : dataPlane;
                 }
             };
+        }
+    }
+
+    public static final class ResponseSink {
+        private static final int EMPTY = 0;
+        private static final int OBJECT = 1;
+        private static final int FUTURE = 2;
+        private static final int OK_U64 = 3;
+        private static final int DEFERRED_OK_U64 = 4;
+        private static final int BYTES = 5;
+        private static final int TWO_U64_BYTES = 6;
+
+        private int kind;
+        private Object response;
+        private CompletableFuture<?> future;
+        private long okU64Value;
+        private long headerU64A;
+        private long headerU64B;
+        private byte[] header;
+        private byte[] payload;
+        private int payloadLen;
+        private Runnable payloadReleaser;
+        private AutoCloseable payloadCloseable;
+
+        private ResponseSink() {}
+
+        public void frame(Frame frame) {
+            result(frame);
+        }
+
+        public void result(Object result) {
+            if (result instanceof OkU64Response okU64) {
+                okU64(okU64.value(), okU64.waitFor());
+                return;
+            }
+            if (result instanceof CompletableFuture<?> responseFuture) {
+                future(responseFuture);
+                return;
+            }
+            kind = OBJECT;
+            response = result;
+            future = null;
+            okU64Value = 0;
+        }
+
+        public void future(CompletableFuture<?> responseFuture) {
+            if (responseFuture == null) {
+                result(null);
+                return;
+            }
+            kind = FUTURE;
+            response = null;
+            future = responseFuture;
+            okU64Value = 0;
+        }
+
+        public void okU64(long value) {
+            kind = OK_U64;
+            response = null;
+            future = null;
+            okU64Value = value;
+        }
+
+        public void okU64(long value, CompletableFuture<Void> waitFor) {
+            if (waitFor == null) {
+                okU64(value);
+                return;
+            }
+            kind = DEFERRED_OK_U64;
+            response = null;
+            future = waitFor;
+            okU64Value = value;
+        }
+
+        public void bytes(byte[] header, byte[] payload, int payloadLen, Runnable payloadReleaser) {
+            if (payloadLen < 0) {
+                throw new IllegalArgumentException("negative payload length: " + payloadLen);
+            }
+            if (payloadLen > 0 && (payload == null || payloadLen > payload.length)) {
+                throw new IllegalArgumentException("invalid payload length " + payloadLen);
+            }
+            kind = BYTES;
+            response = null;
+            future = null;
+            okU64Value = 0;
+            this.header = header;
+            this.payload = payload;
+            this.payloadLen = payloadLen;
+            this.payloadReleaser = payloadReleaser;
+        }
+
+        public void twoU64Bytes(long first, long second, byte[] payload, int payloadLen,
+                                AutoCloseable payloadCloseable) {
+            if (payloadLen < 0) {
+                throw new IllegalArgumentException("negative payload length: " + payloadLen);
+            }
+            if (payloadLen > 0 && (payload == null || payloadLen > payload.length)) {
+                throw new IllegalArgumentException("invalid payload length " + payloadLen);
+            }
+            kind = TWO_U64_BYTES;
+            response = null;
+            future = null;
+            okU64Value = 0;
+            headerU64A = first;
+            headerU64B = second;
+            header = null;
+            this.payload = payload;
+            this.payloadLen = payloadLen;
+            this.payloadReleaser = null;
+            this.payloadCloseable = payloadCloseable;
+        }
+
+        private void clearBorrowedPayload() {
+            payloadReleaser = null;
+            payloadCloseable = null;
+        }
+
+        private void reset() {
+            Runnable releaser = payloadReleaser;
+            AutoCloseable closeable = payloadCloseable;
+            kind = EMPTY;
+            response = null;
+            future = null;
+            okU64Value = 0;
+            headerU64A = 0;
+            headerU64B = 0;
+            header = null;
+            payload = null;
+            payloadLen = 0;
+            payloadReleaser = null;
+            payloadCloseable = null;
+            if (releaser != null) {
+                try {
+                    releaser.run();
+                } catch (RuntimeException e) {
+                    log.warn("discarding unconsumed response payload failed", e);
+                }
+            }
+            if (closeable != null) {
+                try {
+                    closeable.close();
+                } catch (Exception e) {
+                    log.warn("closing unconsumed response payload failed", e);
+                }
+            }
+        }
+    }
+
+    /**
+     * Lightweight success response for hot u64-ack paths. The server writes it directly as a small
+     * ByteBuf, avoiding a full {@link Frame} allocation for APPEND acknowledgements.
+     */
+    public static final class OkU64Response {
+        private final long value;
+        private final CompletableFuture<Void> waitFor;
+
+        private OkU64Response(long value, CompletableFuture<Void> waitFor) {
+            this.value = value;
+            this.waitFor = waitFor;
+        }
+
+        private long value() {
+            return value;
+        }
+
+        private CompletableFuture<Void> waitFor() {
+            return waitFor;
         }
     }
 
@@ -156,17 +380,23 @@ public final class ScpServer implements AutoCloseable {
     }
 
     private final class ConnectionHandler extends SimpleChannelInboundHandler<Frame> {
-        private final ExecutorService requestExecutor;
+        private final Channel channel;
+        private final SerialRequestExecutor requestExecutor;
         private final Set<Frame> inFlightAsyncRequests = ConcurrentHashMap.newKeySet();
-        private final ConcurrentHashMap<Frame, Long> reservedBytesByFrame = new ConcurrentHashMap<>();
+        private final ArrayDeque<FrameTask> frameTasks = new ArrayDeque<>();
+        private final ArrayDeque<ResponseWriteListener> responseWriteListeners = new ArrayDeque<>();
+        private final ArrayDeque<OkU64WriteTask> okU64WriteTasks = new ArrayDeque<>();
+        private final Runnable okU64FlushTask = this::flushPendingOkU64Responses;
+        private final ResponseSink responseSink = new ResponseSink();
         private final AtomicInteger inflightRequests = new AtomicInteger();
         private final AtomicLong inflightBytes = new AtomicLong();
         private final AtomicBoolean connectionOpen = new AtomicBoolean(true);
+        private boolean okU64FlushPending;
         private boolean helloComplete;
 
         ConnectionHandler(Channel channel) {
-            this.requestExecutor = Executors.newSingleThreadExecutor(
-                    Thread.ofVirtual().name("scp-conn-" + channel.remoteAddress() + "-", 0).factory());
+            this.channel = channel;
+            this.requestExecutor = new SerialRequestExecutor(channel);
         }
 
         @Override
@@ -184,12 +414,35 @@ public final class ScpServer implements AutoCloseable {
                         null), true, frame);
                 return;
             }
-            FrameTask task = new FrameTask(ctx, frame);
+            FrameTask task = frameTask(ctx, frame);
             try {
                 requestExecutor.execute(task);
             } catch (RuntimeException | Error e) {
-                task.closeIfPending();
+                task.closeRejected();
                 throw e;
+            }
+        }
+
+        private FrameTask frameTask(ChannelHandlerContext ctx, Frame frame) {
+            FrameTask task;
+            synchronized (frameTasks) {
+                task = frameTasks.pollFirst();
+            }
+            if (task == null) {
+                task = new FrameTask();
+            }
+            task.reset(ctx, frame);
+            return task;
+        }
+
+        private void recycleFrameTask(FrameTask task) {
+            if (MAX_POOLED_FRAME_TASKS <= 0) {
+                return;
+            }
+            synchronized (frameTasks) {
+                if (frameTasks.size() < MAX_POOLED_FRAME_TASKS) {
+                    frameTasks.addFirst(task);
+                }
             }
         }
 
@@ -198,7 +451,7 @@ public final class ScpServer implements AutoCloseable {
             int requests = inflightRequests.incrementAndGet();
             long bytes = inflightBytes.addAndGet(frameBytes);
             if (requests <= maxInflightRequests && bytes <= maxInflightBytes) {
-                reservedBytesByFrame.put(frame, frameBytes);
+                frame.reserveWireBytes(frameBytes);
                 return true;
             }
             inflightRequests.decrementAndGet();
@@ -210,7 +463,7 @@ public final class ScpServer implements AutoCloseable {
             long frameBytes = frameWireBytes(response);
             long bytes = inflightBytes.addAndGet(frameBytes);
             if (bytes <= maxInflightBytes) {
-                reservedBytesByFrame.merge(request, frameBytes, Long::sum);
+                request.reserveWireBytes(frameBytes);
                 return true;
             }
             inflightBytes.addAndGet(-frameBytes);
@@ -219,43 +472,105 @@ public final class ScpServer implements AutoCloseable {
 
         private long frameWireBytes(Frame frame) {
             long payloadBytes = frame.hasFilePayload() ? frame.filePayload().length() : frame.payloadLength();
-            return Frame.PREAMBLE_AFTER_LEN + frame.headerSlice().remaining() + payloadBytes;
+            return Frame.PREAMBLE_AFTER_LEN + frame.headerLength() + payloadBytes;
         }
 
         private void releaseInbound(Frame frame) {
-            Long bytes = reservedBytesByFrame.remove(frame);
-            if (bytes != null) {
+            long bytes = frame.drainReservedWireBytes();
+            if (bytes != 0) {
                 inflightRequests.decrementAndGet();
                 inflightBytes.addAndGet(-bytes);
             }
         }
 
-        private final class FrameTask implements Runnable {
-            private final ChannelHandlerContext ctx;
-            private final Frame frame;
-            private final AtomicBoolean started = new AtomicBoolean(false);
+        private final class SerialRequestExecutor {
+            private final ArrayDeque<FrameTask> queue = new ArrayDeque<>();
+            private final Thread worker;
+            private boolean shutdown;
 
-            private FrameTask(ChannelHandlerContext ctx, Frame frame) {
+            private SerialRequestExecutor(Channel channel) {
+                this.worker = Thread.ofVirtual()
+                        .name("scp-conn-" + channel.remoteAddress() + "-", 0)
+                        .start(this::drain);
+            }
+
+            private void execute(FrameTask task) {
+                synchronized (queue) {
+                    if (shutdown) {
+                        throw new RejectedExecutionException("connection request executor is shut down");
+                    }
+                    queue.addLast(task);
+                    queue.notify();
+                }
+            }
+
+            private void drain() {
+                while (true) {
+                    FrameTask task;
+                    synchronized (queue) {
+                        while ((task = queue.pollFirst()) == null) {
+                            if (shutdown) {
+                                return;
+                            }
+                            try {
+                                queue.wait();
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                return;
+                            }
+                        }
+                    }
+                    try {
+                        task.run();
+                    } catch (RuntimeException | Error e) {
+                        log.warn("scp request task failed", e);
+                    }
+                }
+            }
+
+            private void shutdown() {
+                synchronized (queue) {
+                    shutdown = true;
+                    queue.notify();
+                }
+            }
+        }
+
+        private final class FrameTask implements Runnable {
+            private ChannelHandlerContext ctx;
+            private Frame frame;
+
+            private void reset(ChannelHandlerContext ctx, Frame frame) {
                 this.ctx = ctx;
                 this.frame = frame;
             }
 
             @Override
             public void run() {
-                started.set(true);
+                ChannelHandlerContext localCtx = ctx;
+                Frame localFrame = frame;
+                ctx = null;
+                frame = null;
                 try {
-                    processFrame(ctx, frame);
+                    processFrame(localCtx, localFrame);
                 } catch (RuntimeException | Error e) {
-                    releaseInbound(frame);
-                    frame.close();
+                    releaseInbound(localFrame);
+                    localFrame.close();
                     throw e;
+                } finally {
+                    recycleFrameTask(this);
                 }
             }
 
-            private void closeIfPending() {
-                if (started.compareAndSet(false, true)) {
-                    releaseInbound(frame);
-                    frame.close();
+            private void closeRejected() {
+                Frame localFrame = frame;
+                ctx = null;
+                frame = null;
+                try {
+                    releaseInbound(localFrame);
+                    localFrame.close();
+                } finally {
+                    recycleFrameTask(this);
                 }
             }
         }
@@ -280,7 +595,7 @@ public final class ScpServer implements AutoCloseable {
                 return;
             }
             try {
-                Messages.Hello.decode(hello.headerSlice()); // validates frame-version overlap
+                Messages.Hello.decode(hello.headerReadBuffer()); // validates frame-version overlap
             } catch (RuntimeException e) {
                 // incompatible version range or malformed HELLO header: answer with a typed
                 // error instead of silently dropping the connection
@@ -298,13 +613,91 @@ public final class ScpServer implements AutoCloseable {
 
         private void handleRequest(ChannelHandlerContext ctx, Frame req) {
             long startNanos = System.nanoTime();
-            CompletableFuture<Frame> respF;
+            CompletableFuture<?> respF;
+            Object immediateResp = null;
+            boolean immediateOkU64 = false;
+            long immediateOkU64Value = 0;
+            boolean deferredOkU64 = false;
+            long deferredOkU64Value = 0;
             boolean handlerFailed = false;
+            boolean immediateBytes = false;
+            byte[] immediateHeader = null;
+            byte[] immediatePayload = null;
+            int immediatePayloadLen = 0;
+            Runnable immediatePayloadReleaser = null;
+            boolean immediateTwoU64Bytes = false;
+            long immediateHeaderU64A = 0;
+            long immediateHeaderU64B = 0;
+            AutoCloseable immediatePayloadCloseable = null;
             try {
-                respF = handler.handleAsync(req);
-                if (respF == null) {
-                    respF = CompletableFuture.completedFuture(internalError(req, "handler returned null future"));
-                    handlerFailed = true;
+                if (handler.requiresAsyncHandling(req)) {
+                    responseSink.reset();
+                    try {
+                        handler.handleAsyncResult(req, responseSink);
+                        switch (responseSink.kind) {
+                            case ResponseSink.OBJECT -> {
+                                Object result = responseSink.response;
+                                if (result instanceof Frame frame) {
+                                    respF = null;
+                                    immediateResp = frame;
+                                } else if (result == null) {
+                                    respF = null;
+                                    immediateResp = internalError(req, "handler returned null future");
+                                    handlerFailed = true;
+                                } else {
+                                    respF = null;
+                                    immediateResp = internalError(req, "handler returned unsupported async response");
+                                    handlerFailed = true;
+                                }
+                            }
+                            case ResponseSink.FUTURE -> {
+                                respF = responseSink.future;
+                            }
+                            case ResponseSink.OK_U64 -> {
+                                respF = null;
+                                immediateOkU64 = true;
+                                immediateOkU64Value = responseSink.okU64Value;
+                            }
+                            case ResponseSink.DEFERRED_OK_U64 -> {
+                                respF = responseSink.future;
+                                deferredOkU64 = true;
+                                deferredOkU64Value = responseSink.okU64Value;
+                            }
+                            case ResponseSink.BYTES -> {
+                                respF = null;
+                                immediateBytes = true;
+                                immediateHeader = responseSink.header;
+                                immediatePayload = responseSink.payload;
+                                immediatePayloadLen = responseSink.payloadLen;
+                                immediatePayloadReleaser = responseSink.payloadReleaser;
+                                responseSink.clearBorrowedPayload();
+                            }
+                            case ResponseSink.TWO_U64_BYTES -> {
+                                respF = null;
+                                immediateTwoU64Bytes = true;
+                                immediateHeaderU64A = responseSink.headerU64A;
+                                immediateHeaderU64B = responseSink.headerU64B;
+                                immediatePayload = responseSink.payload;
+                                immediatePayloadLen = responseSink.payloadLen;
+                                immediatePayloadCloseable = responseSink.payloadCloseable;
+                                responseSink.clearBorrowedPayload();
+                            }
+                            default -> {
+                                respF = null;
+                                immediateResp = internalError(req, "handler returned null future");
+                                handlerFailed = true;
+                            }
+                        }
+                    } finally {
+                        responseSink.reset();
+                    }
+                } else {
+                    respF = null;
+                    immediateResp = handler.handle(req);
+                    if (immediateResp == null) {
+                        immediateResp = internalError(req, "handler returned null response");
+                        handlerFailed = true;
+                    }
                 }
             } catch (ScpException e) {
                 respF = CompletableFuture.completedFuture(
@@ -320,9 +713,34 @@ public final class ScpServer implements AutoCloseable {
             // decode, on this same connection-handler thread — read it now, before any async completion,
             // and carry it into both the sync and async observe paths.
             String ns = RequestContext.takeNamespace();
+            if (respF == null) {
+                observeRequest(req, startNanos, !handlerFailed, ns);
+                if (immediateOkU64) {
+                    writeOkU64Response(ctx, req, immediateOkU64Value);
+                    return;
+                }
+                if (immediateBytes) {
+                    writeBytesResponse(ctx, req, immediateHeader, immediatePayload, immediatePayloadLen,
+                            immediatePayloadReleaser);
+                    return;
+                }
+                if (immediateTwoU64Bytes) {
+                    writeTwoU64BytesResponse(ctx, req, immediateHeaderU64A, immediateHeaderU64B,
+                            immediatePayload, immediatePayloadLen, immediatePayloadCloseable);
+                    return;
+                }
+                writeResponseObject(ctx, req, requireResponse(req, immediateResp));
+                return;
+            }
+            boolean asyncOkU64 = deferredOkU64;
+            long asyncOkU64Value = deferredOkU64Value;
             if (respF.isDone() && !respF.isCompletedExceptionally()) {
                 observeRequest(req, startNanos, !handlerFailed, ns);
-                writeResponse(ctx, requireResponse(req, respF.join()), false, req); // fast path, no extra hop
+                if (asyncOkU64) {
+                    writeOkU64Response(ctx, req, asyncOkU64Value);
+                } else {
+                    writeResponseObject(ctx, req, requireResponse(req, respF.join())); // fast path
+                }
             } else {
                 // Test seam: lets a test pause the request thread here to drive the close-vs-register
                 // race deterministically (connection closes after handleAsync returns but before the add).
@@ -335,15 +753,20 @@ public final class ScpServer implements AutoCloseable {
                         return;
                     }
                     observeRequest(req, startNanos, err == null, ns);
-                    Frame frame = resp;
                     if (err != null) {
                         Throwable cause = err instanceof CompletionException
                                 ? err.getCause() : err;
-                        frame = cause instanceof ScpException se
+                        Frame frame = cause instanceof ScpException se
                                 ? Frame.response(req, Resp.error(se.code(), se.getMessage(), se.detail(), se.leaderHint()), null)
                                 : Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(cause), 0), null);
+                        writeResponse(ctx, frame, false, req);
+                        return;
                     }
-                    writeResponse(ctx, requireResponse(req, frame), false, req);
+                    if (asyncOkU64) {
+                        writeOkU64Response(ctx, req, asyncOkU64Value);
+                    } else {
+                        writeResponseObject(ctx, req, requireResponse(req, resp));
+                    }
                 });
                 // The connection can close between handleAsync returning and the add above; channelInactive
                 // would then drain inFlightAsyncRequests before req was in it, orphaning the request buffer.
@@ -361,8 +784,13 @@ public final class ScpServer implements AutoCloseable {
             if (obs == null) {
                 return;
             }
-            Opcode op = Opcode.fromCode(req.opcode());
-            obs.observe(op != null ? op.name() : "unknown", namespace, System.nanoTime() - startNanos, success);
+            try {
+                Opcode op = Opcode.fromCode(req.opcode());
+                obs.observe(op != null ? op.name() : "unknown", namespace, System.nanoTime() - startNanos, success);
+            } catch (RuntimeException e) {
+                log.warn("request observer failed opcode=0x{} corr={}",
+                        Integer.toHexString(req.opcode() & 0xFFFF), req.correlationId(), e);
+            }
         }
 
         private void writeResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
@@ -379,6 +807,310 @@ public final class ScpServer implements AutoCloseable {
                 return;
             }
             writeUnreservedResponse(ctx, frame, closeAfterWrite, releaseAfterWrite);
+        }
+
+        private boolean reserveOutboundBytes(long frameBytes, Frame request) {
+            long bytes = inflightBytes.addAndGet(frameBytes);
+            if (bytes <= maxInflightBytes) {
+                request.reserveWireBytes(frameBytes);
+                return true;
+            }
+            inflightBytes.addAndGet(-frameBytes);
+            return false;
+        }
+
+        private void writeResponseObject(ChannelHandlerContext ctx, Frame req, Object response) {
+            if (response instanceof Frame frame) {
+                writeResponse(ctx, frame, false, req);
+                return;
+            }
+            if (response instanceof OkU64Response okU64) {
+                writeOkU64Response(ctx, req, okU64.value());
+                return;
+            }
+            writeResponse(ctx, internalError(req, "handler returned unsupported response"), false, req);
+        }
+
+        private void writeOkU64Response(ChannelHandlerContext ctx, Frame req, long value) {
+            if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
+                closeFrames(null, req);
+                return;
+            }
+            if (!reserveOutboundBytes(Frame.PREAMBLE_AFTER_LEN + Frame.OK_U64_HEADER_LENGTH, req)) {
+                writeUnreservedResponse(ctx, Frame.response(req,
+                        Resp.error(ErrorCode.THROTTLED, "too many in-flight response bytes", maxInflightBytes),
+                        null), true, req);
+                return;
+            }
+            if (ctx.channel().eventLoop().inEventLoop()) {
+                writeOkU64ResponseOnEventLoop(ctx, req, value);
+                return;
+            }
+            OkU64WriteTask task = okU64WriteTask(ctx, req, value);
+            try {
+                ctx.channel().eventLoop().execute(task);
+            } catch (RuntimeException e) {
+                task.closeRejected();
+                throw e;
+            }
+        }
+
+        private OkU64WriteTask okU64WriteTask(ChannelHandlerContext ctx, Frame req, long value) {
+            OkU64WriteTask task;
+            synchronized (okU64WriteTasks) {
+                task = okU64WriteTasks.pollFirst();
+            }
+            if (task == null) {
+                task = new OkU64WriteTask();
+            }
+            task.reset(ctx, req, value);
+            return task;
+        }
+
+        private void recycleOkU64WriteTask(OkU64WriteTask task) {
+            if (MAX_POOLED_OK_U64_WRITE_TASKS <= 0) {
+                return;
+            }
+            synchronized (okU64WriteTasks) {
+                if (okU64WriteTasks.size() < MAX_POOLED_OK_U64_WRITE_TASKS) {
+                    okU64WriteTasks.addFirst(task);
+                }
+            }
+        }
+
+        private final class OkU64WriteTask implements Runnable {
+            private ChannelHandlerContext ctx;
+            private Frame req;
+            private long value;
+
+            private void reset(ChannelHandlerContext ctx, Frame req, long value) {
+                this.ctx = ctx;
+                this.req = req;
+                this.value = value;
+            }
+
+            @Override
+            public void run() {
+                ChannelHandlerContext localCtx = ctx;
+                Frame localReq = req;
+                long localValue = value;
+                ctx = null;
+                req = null;
+                value = 0;
+                try {
+                    writeOkU64ResponseOnEventLoop(localCtx, localReq, localValue);
+                } finally {
+                    recycleOkU64WriteTask(this);
+                }
+            }
+
+            private void closeRejected() {
+                Frame localReq = req;
+                ctx = null;
+                req = null;
+                value = 0;
+                try {
+                    closeFrames(null, localReq);
+                } finally {
+                    recycleOkU64WriteTask(this);
+                }
+            }
+        }
+
+        private void writeOkU64ResponseOnEventLoop(ChannelHandlerContext ctx, Frame req, long value) {
+            if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
+                closeFrames(null, req);
+                return;
+            }
+            ByteBuf out;
+            try {
+                out = NettyFrameCodec.encodeOkU64Response(ctx.alloc(), req, value);
+            } catch (IOException | RuntimeException e) {
+                logResponseEncodeFailure("OK_U64", req, e);
+                closeFrames(null, req);
+                ctx.close();
+                return;
+            }
+            ChannelFuture write;
+            boolean queued = false;
+            try {
+                write = ctx.write(out);
+                queued = true;
+                scheduleOkU64Flush(ctx);
+            } catch (RuntimeException e) {
+                if (!queued) {
+                    out.release();
+                } else {
+                    ctx.flush();
+                }
+                closeFrames(null, req);
+                throw e;
+            }
+            finishWrite(ctx, write, false, null, req);
+        }
+
+        private void scheduleOkU64Flush(ChannelHandlerContext ctx) {
+            if (okU64FlushPending) {
+                return;
+            }
+            okU64FlushPending = true;
+            try {
+                channel.eventLoop().execute(okU64FlushTask);
+            } catch (RuntimeException e) {
+                okU64FlushPending = false;
+                throw e;
+            }
+        }
+
+        private void flushPendingOkU64Responses() {
+            okU64FlushPending = false;
+            if (!closed.get() && connectionOpen.get() && channel.isActive()) {
+                channel.flush();
+            }
+        }
+
+        private void writeBytesResponse(ChannelHandlerContext ctx, Frame req, byte[] header, byte[] payload,
+                                        int payloadLen, Runnable payloadReleaser) {
+            long frameBytes;
+            try {
+                frameBytes = bytesResponseWireBytes(header, payload, payloadLen);
+            } catch (RuntimeException e) {
+                releasePayload(payloadReleaser);
+                closeFrames(null, req);
+                throw e;
+            }
+            if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
+                releasePayload(payloadReleaser);
+                closeFrames(null, req);
+                return;
+            }
+            if (!reserveOutboundBytes(frameBytes, req)) {
+                releasePayload(payloadReleaser);
+                writeUnreservedResponse(ctx, Frame.response(req,
+                        Resp.error(ErrorCode.THROTTLED, "too many in-flight response bytes", maxInflightBytes),
+                        null), true, req);
+                return;
+            }
+
+            ByteBuf out;
+            try {
+                out = NettyFrameCodec.encodeBytesResponseComposite(ctx.alloc(), req, header, payload, payloadLen);
+            } catch (IOException | RuntimeException e) {
+                logResponseEncodeFailure("BYTES", req, e);
+                releasePayload(payloadReleaser);
+                closeFrames(null, req);
+                ctx.close();
+                return;
+            }
+            ChannelFuture write;
+            try {
+                write = ctx.writeAndFlush(out);
+            } catch (RuntimeException e) {
+                out.release();
+                releasePayload(payloadReleaser);
+                closeFrames(null, req);
+                throw e;
+            }
+            finishWrite(ctx, write, false, null, req, payloadReleaser, null);
+        }
+
+        private void writeTwoU64BytesResponse(ChannelHandlerContext ctx, Frame req, long first, long second,
+                                              byte[] payload, int payloadLen, AutoCloseable payloadCloseable) {
+            long frameBytes;
+            try {
+                frameBytes = twoU64BytesResponseWireBytes(payload, payloadLen);
+            } catch (RuntimeException e) {
+                closePayload(payloadCloseable);
+                closeFrames(null, req);
+                throw e;
+            }
+            if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
+                closePayload(payloadCloseable);
+                closeFrames(null, req);
+                return;
+            }
+            if (!reserveOutboundBytes(frameBytes, req)) {
+                closePayload(payloadCloseable);
+                writeUnreservedResponse(ctx, Frame.response(req,
+                        Resp.error(ErrorCode.THROTTLED, "too many in-flight response bytes", maxInflightBytes),
+                        null), true, req);
+                return;
+            }
+
+            ByteBuf out;
+            try {
+                out = NettyFrameCodec.encodeTwoU64BytesResponseComposite(ctx.alloc(), req, first, second,
+                        payload, payloadLen);
+            } catch (IOException | RuntimeException e) {
+                logResponseEncodeFailure("TWO_U64_BYTES", req, e);
+                closePayload(payloadCloseable);
+                closeFrames(null, req);
+                ctx.close();
+                return;
+            }
+            ChannelFuture write;
+            try {
+                write = ctx.writeAndFlush(out);
+            } catch (RuntimeException e) {
+                out.release();
+                closePayload(payloadCloseable);
+                closeFrames(null, req);
+                throw e;
+            }
+            finishWrite(ctx, write, false, null, req, null, payloadCloseable);
+        }
+
+        private long bytesResponseWireBytes(byte[] header, byte[] payload, int payloadLen) {
+            int headerLen = header == null ? 0 : header.length;
+            if (payloadLen < 0) {
+                throw new IllegalArgumentException("negative payload length: " + payloadLen);
+            }
+            if (payloadLen > 0 && (payload == null || payloadLen > payload.length)) {
+                throw new IllegalArgumentException("invalid payload length " + payloadLen);
+            }
+            try {
+                FrameIO.checkedFrameLength(headerLen, payloadLen);
+            } catch (IOException e) {
+                throw new IllegalArgumentException(e);
+            }
+            return Frame.PREAMBLE_AFTER_LEN + headerLen + (long) payloadLen;
+        }
+
+        private long twoU64BytesResponseWireBytes(byte[] payload, int payloadLen) {
+            if (payloadLen < 0) {
+                throw new IllegalArgumentException("negative payload length: " + payloadLen);
+            }
+            if (payloadLen > 0 && (payload == null || payloadLen > payload.length)) {
+                throw new IllegalArgumentException("invalid payload length " + payloadLen);
+            }
+            try {
+                FrameIO.checkedFrameLength(Frame.OK_TWO_U64_HEADER_LENGTH, payloadLen);
+            } catch (IOException e) {
+                throw new IllegalArgumentException(e);
+            }
+            return Frame.PREAMBLE_AFTER_LEN + Frame.OK_TWO_U64_HEADER_LENGTH + (long) payloadLen;
+        }
+
+        private void releasePayload(Runnable payloadReleaser) {
+            if (payloadReleaser == null) {
+                return;
+            }
+            try {
+                payloadReleaser.run();
+            } catch (RuntimeException e) {
+                log.warn("response payload release failed", e);
+            }
+        }
+
+        private void closePayload(AutoCloseable payloadCloseable) {
+            if (payloadCloseable == null) {
+                return;
+            }
+            try {
+                payloadCloseable.close();
+            } catch (Exception e) {
+                log.warn("response payload close failed", e);
+            }
         }
 
         private void writeUnreservedResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
@@ -426,6 +1158,7 @@ public final class ScpServer implements AutoCloseable {
                 prefix = NettyFrameCodec.encodeFilePrefix(ctx.alloc(), frame);
                 region = new DefaultFileRegion(file.channel(), file.position(), file.length());
             } catch (IOException | RuntimeException e) {
+                logResponseEncodeFailure("FILE", releaseAfterWrite != null ? releaseAfterWrite : frame, e);
                 closeFrames(frame, releaseAfterWrite);
                 ctx.close();
                 return;
@@ -438,19 +1171,105 @@ public final class ScpServer implements AutoCloseable {
 
         private void finishWrite(ChannelHandlerContext ctx, ChannelFuture write, boolean closeAfterWrite,
                                  Frame frame, Frame releaseAfterWrite) {
-            write.addListener(f -> closeFrames(frame, releaseAfterWrite));
-            if (closeAfterWrite) {
-                write.addListener(f -> ctx.close());
+            finishWrite(ctx, write, closeAfterWrite, frame, releaseAfterWrite, null, null);
+        }
+
+        private void finishWrite(ChannelHandlerContext ctx, ChannelFuture write, boolean closeAfterWrite,
+                                 Frame frame, Frame releaseAfterWrite, Runnable payloadReleaser,
+                                 AutoCloseable payloadCloseable) {
+            write.addListener(responseWriteListener(ctx, frame, releaseAfterWrite, closeAfterWrite,
+                    payloadReleaser, payloadCloseable));
+        }
+
+        private ResponseWriteListener responseWriteListener(ChannelHandlerContext ctx, Frame frame,
+                                                            Frame releaseAfterWrite, boolean closeAfterWrite,
+                                                            Runnable payloadReleaser,
+                                                            AutoCloseable payloadCloseable) {
+            ResponseWriteListener listener;
+            synchronized (responseWriteListeners) {
+                listener = responseWriteListeners.pollFirst();
             }
-            write.addListener(f -> {
-                if (!f.isSuccess()) {
-                    ctx.close();
+            if (listener == null) {
+                listener = new ResponseWriteListener();
+            }
+            listener.reset(ctx, frame, releaseAfterWrite, closeAfterWrite, payloadReleaser, payloadCloseable);
+            return listener;
+        }
+
+        private void recycleResponseWriteListener(ResponseWriteListener listener) {
+            if (MAX_POOLED_RESPONSE_WRITE_LISTENERS <= 0) {
+                return;
+            }
+            synchronized (responseWriteListeners) {
+                if (responseWriteListeners.size() < MAX_POOLED_RESPONSE_WRITE_LISTENERS) {
+                    responseWriteListeners.addFirst(listener);
                 }
-            });
+            }
+        }
+
+        private final class ResponseWriteListener implements ChannelFutureListener {
+            private ChannelHandlerContext ctx;
+            private Frame frame;
+            private Frame releaseAfterWrite;
+            private Runnable payloadReleaser;
+            private AutoCloseable payloadCloseable;
+            private boolean closeAfterWrite;
+
+            private void reset(ChannelHandlerContext ctx, Frame frame, Frame releaseAfterWrite,
+                               boolean closeAfterWrite, Runnable payloadReleaser,
+                               AutoCloseable payloadCloseable) {
+                this.ctx = ctx;
+                this.frame = frame;
+                this.releaseAfterWrite = releaseAfterWrite;
+                this.payloadReleaser = payloadReleaser;
+                this.payloadCloseable = payloadCloseable;
+                this.closeAfterWrite = closeAfterWrite;
+            }
+
+            @Override
+            public void operationComplete(ChannelFuture future) {
+                ChannelHandlerContext localCtx = ctx;
+                Frame localFrame = frame;
+                Frame localReleaseAfterWrite = releaseAfterWrite;
+                Runnable localPayloadReleaser = payloadReleaser;
+                AutoCloseable localPayloadCloseable = payloadCloseable;
+                boolean localCloseAfterWrite = closeAfterWrite;
+                ctx = null;
+                frame = null;
+                releaseAfterWrite = null;
+                payloadReleaser = null;
+                payloadCloseable = null;
+                closeAfterWrite = false;
+                try {
+                    try {
+                        closeFrames(localFrame, localReleaseAfterWrite);
+                    } finally {
+                        try {
+                            releasePayload(localPayloadReleaser);
+                            closePayload(localPayloadCloseable);
+                        } finally {
+                            if (!future.isSuccess()) {
+                                log.warn("scp response write failed remote={}", localCtx.channel().remoteAddress(),
+                                        future.cause());
+                            }
+                            if (localCloseAfterWrite || !future.isSuccess()) {
+                                localCtx.close();
+                            }
+                        }
+                    }
+                } finally {
+                    recycleResponseWriteListener(this);
+                }
+            }
         }
 
         private void closeFrames(Frame frame, Frame releaseAfterWrite) {
-            frame.close();
+            if (frame != null) {
+                frame.close();
+            }
+            if (releaseAfterWrite == null) {
+                return;
+            }
             if (releaseAfterWrite != frame) {
                 releaseInbound(releaseAfterWrite);
                 releaseAfterWrite.close();
@@ -479,12 +1298,22 @@ public final class ScpServer implements AutoCloseable {
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            if (cause instanceof IOException) {
+                log.debug("scp connection I/O exception remote={}", ctx.channel().remoteAddress(), cause);
+            } else {
+                log.warn("scp connection exception remote={}", ctx.channel().remoteAddress(), cause);
+            }
             ctx.close();
+        }
+
+        private void logResponseEncodeFailure(String responseKind, Frame req, Throwable cause) {
+            log.warn("response encode failed kind={} opcode=0x{} corr={}", responseKind,
+                    Integer.toHexString(req.opcode() & 0xFFFF), req.correlationId(), cause);
         }
     }
 
-    private static Frame requireResponse(Frame req, Frame frame) {
-        return frame != null ? frame : internalError(req, "handler returned null response");
+    private static Object requireResponse(Frame req, Object response) {
+        return response != null ? response : internalError(req, "handler returned null response");
     }
 
     private static Frame internalError(Frame req, String message) {
@@ -494,6 +1323,31 @@ public final class ScpServer implements AutoCloseable {
     /** Convenience for handlers: success response with header bytes and optional payload. */
     public static Frame ok(Frame req, byte[] header, ByteBuffer payload) {
         return Frame.response(req, header, payload);
+    }
+
+    /** Convenience for handlers: success response with one u64 field and no tagged fields. */
+    public static Frame okU64(Frame req, long value) {
+        return Frame.okU64Response(req, value);
+    }
+
+    /** Hot-path handler result: success response with one u64 field and no tagged fields. */
+    public static OkU64Response okU64Result(long value) {
+        return new OkU64Response(value, null);
+    }
+
+    /** Hot-path handler result: write the u64 success response after the supplied future completes. */
+    public static OkU64Response okU64Result(long value, CompletableFuture<Void> waitFor) {
+        return new OkU64Response(value, waitFor);
+    }
+
+    /** Convenience for handlers: success response that owns the materialized payload until write close. */
+    public static Frame ok(Frame req, byte[] header, ByteBuffer payload, Runnable payloadReleaser) {
+        return Frame.response(req, header, payload, payloadReleaser);
+    }
+
+    /** Convenience for handlers: success response that borrows a heap payload until write close. */
+    public static Frame okBytes(Frame req, byte[] header, byte[] payload, int payloadLen, Runnable payloadReleaser) {
+        return Frame.responseBytes(req, header, payload, payloadLen, payloadReleaser);
     }
 
     /** Convenience for handlers: success response whose payload is streamed from a file region. */

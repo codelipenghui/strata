@@ -4,6 +4,8 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
+import java.util.HashMap;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -56,6 +58,18 @@ class IdsAndCrcTest {
     }
 
     @Test
+    void namespaceChunkIdHashMatchesMapLookupContract() {
+        StrataNamespace namespace = StrataNamespace.of("tenant-a");
+        ChunkId chunkId = new ChunkId(FileId.of(42), 3);
+        NsChunkId key = new NsChunkId(namespace, chunkId);
+
+        assertEquals(key.hashCode(), NsChunkId.hash(namespace, chunkId));
+        Map<NsChunkId, String> map = new HashMap<>();
+        map.put(key, "present");
+        assertEquals("present", map.get(new NsChunkId(namespace, chunkId)));
+    }
+
+    @Test
     void chunkStateMappingRejectsUnknownValues() {
         for (ChunkState state : ChunkState.values()) {
             assertEquals(state, ChunkState.fromValue(state.value));
@@ -71,6 +85,30 @@ class IdsAndCrcTest {
         byte[] zeros = new byte[32];
         assertEquals(0x8A9136AA, Crc.of(zeros));
         assertNotEquals(Crc.of(new byte[]{1}), Crc.of(new byte[]{2}));
+    }
+
+    @Test
+    void crcOfByteBufferPreservesPosition() {
+        byte[] bytes = "xxpayloadyy".getBytes();
+        int expected = Crc.of("payload".getBytes());
+
+        ByteBuffer heap = ByteBuffer.wrap(bytes);
+        heap.position(2).limit(9);
+        assertEquals(expected, Crc.of(heap));
+        assertEquals(2, heap.position());
+        assertEquals(9, heap.limit());
+
+        ByteBuffer direct = ByteBuffer.allocateDirect(bytes.length);
+        direct.put(bytes).flip().position(2).limit(9);
+        assertEquals(expected, Crc.of(direct));
+        assertEquals(2, direct.position());
+        assertEquals(9, direct.limit());
+
+        ByteBuffer readOnlyDirect = direct.asReadOnlyBuffer();
+        readOnlyDirect.position(2).limit(9);
+        assertEquals(expected, Crc.of(readOnlyDirect));
+        assertEquals(2, readOnlyDirect.position());
+        assertEquals(9, readOnlyDirect.limit());
     }
 
     @Test

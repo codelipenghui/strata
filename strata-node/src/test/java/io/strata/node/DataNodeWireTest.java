@@ -160,6 +160,50 @@ class DataNodeWireTest {
     }
 
     @Test
+    void largeWireAppendsRoundTripAndSealWithCorrectCrc() throws Exception {
+        byte[] first = patternBytes(64 * 1024 + 1, 17);
+        byte[] second = patternBytes(1024 * 1024, 91);
+        byte[] expected = ByteBuffer.allocate(first.length + second.length)
+                .put(first)
+                .put(second)
+                .array();
+
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
+             ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "large-append")) {
+            client.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
+                    2 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
+
+            ByteBuffer firstAck = client.call(Opcode.APPEND,
+                    new Messages.Append(id, 1, 0, 0, TEST_NS).encode(), ByteBuffer.wrap(first), 5000);
+            assertEquals(first.length, Messages.AppendResp.decode(firstAck).endOffset());
+            ByteBuffer secondAck = client.call(Opcode.APPEND,
+                    new Messages.Append(id, 1, first.length, first.length, TEST_NS).encode(),
+                    ByteBuffer.wrap(second), 5000);
+            assertEquals(expected.length, Messages.AppendResp.decode(secondAck).endOffset());
+            ByteBuffer durableAck = client.call(Opcode.APPEND,
+                    new Messages.Append(id, 1, expected.length, expected.length, TEST_NS).encode(),
+                    ByteBuffer.allocate(0), 5000);
+            assertEquals(expected.length, Messages.AppendResp.decode(durableAck).endOffset());
+
+            Frame read = client.callFrame(Opcode.READ,
+                    new Messages.Read(id, 0, expected.length, TEST_NS).encode(), null, 5000);
+            ByteBuffer readHeader = read.headerSlice();
+            Resp.check(readHeader);
+            assertEquals(new Messages.ReadResp(expected.length, expected.length),
+                    Messages.ReadResp.decode(readHeader));
+            byte[] got = new byte[read.payloadLength()];
+            read.payloadSlice().get(got);
+            assertArrayEquals(expected, got);
+
+            ByteBuffer seal = client.call(Opcode.SEAL_CHUNK,
+                    new Messages.SealChunk(id, 1, expected.length, TEST_NS).encode(), null, 5000);
+            var sealed = Messages.SealResp.decode(seal);
+            assertEquals(expected.length, sealed.finalLength());
+            assertEquals(Crc.of(expected), sealed.chunkCrc());
+        }
+    }
+
+    @Test
     void recoveryAppendCanBypassOpenChunkLedgerEntryCap() throws Exception {
         DataNodeConfig config = DataNodeConfig.standalone(dir)
                 .withChunkStoreConfig(ChunkStoreConfig.DEFAULT.withMaxOpenChunkLedgerEntries(1));
@@ -629,6 +673,14 @@ class DataNodeWireTest {
 
     private static ControlLoop controlLoop(DataNode node, DataNodeConfig config, ChunkStore store) {
         return new ControlLoop(node, config, store, new ChunkDeleteService(store, 1, 0));
+    }
+
+    private static byte[] patternBytes(int length, int seed) {
+        byte[] bytes = new byte[length];
+        for (int i = 0; i < bytes.length; i++) {
+            bytes[i] = (byte) (seed + i * 31);
+        }
+        return bytes;
     }
 
     private static void corruptChunkDataByte(Path dir, ChunkId chunkId, long dataOffset) throws IOException {
