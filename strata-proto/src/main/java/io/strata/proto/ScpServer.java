@@ -1298,7 +1298,11 @@ public final class ScpServer implements AutoCloseable {
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            log.warn("scp connection exception remote={}", ctx.channel().remoteAddress(), cause);
+            if (cause instanceof IOException) {
+                log.debug("scp connection I/O exception remote={}", ctx.channel().remoteAddress(), cause);
+            } else {
+                log.warn("scp connection exception remote={}", ctx.channel().remoteAddress(), cause);
+            }
             ctx.close();
         }
 
