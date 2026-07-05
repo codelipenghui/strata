@@ -233,15 +233,19 @@ class ChannelCacheTest {
     }
 
     @Test
-    void releasedLeaseWrapperIsReusedOnSameThread() throws Exception {
+    void releasedLeaseWrapperIsNotReusedForNewHolder() throws Exception {
         Path p = file(1, "x");
         try (ChannelCache cache = new ChannelCache(8)) {
             ChannelCache.Lease first = cache.acquire(id(1), p);
             first.release();
 
             ChannelCache.Lease second = cache.acquire(id(1), p);
-            assertSame(first, second, "released lease wrappers are reused on the same thread");
+            assertNotSame(first, second, "stale release must not target a later holder's lease wrapper");
+            first.release();
+            assertTrue(second.channel().isOpen(), "stale release of the first wrapper must not close/repool second");
+            assertEquals(0, cache.size(), "second is still leased, not idle");
             second.release();
+            assertEquals(1, cache.size());
         }
     }
 

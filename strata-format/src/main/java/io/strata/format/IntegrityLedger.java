@@ -167,12 +167,13 @@ public final class IntegrityLedger implements AutoCloseable {
         private int uniformWriteEpoch;
         private int length;
         private boolean reusable;
+        private EntryScratch scratch;
 
         private EntrySpan() {
         }
 
         private EntrySpan reset(long firstStart, long[] endOffsets, int[] payloadCrcs, int[] writeEpochs,
-                                int uniformWriteEpoch, int length, boolean reusable) {
+                                int uniformWriteEpoch, int length, boolean reusable, EntryScratch scratch) {
             this.firstStart = firstStart;
             this.endOffsets = endOffsets;
             this.payloadCrcs = payloadCrcs;
@@ -180,6 +181,7 @@ public final class IntegrityLedger implements AutoCloseable {
             this.uniformWriteEpoch = uniformWriteEpoch;
             this.length = length;
             this.reusable = reusable;
+            this.scratch = scratch;
             return this;
         }
 
@@ -216,6 +218,11 @@ public final class IntegrityLedger implements AutoCloseable {
                 firstStart = 0;
                 uniformWriteEpoch = 0;
                 length = 0;
+                EntryScratch localScratch = scratch;
+                scratch = null;
+                if (localScratch != null) {
+                    localScratch.inUse = false;
+                }
             }
         }
     }
@@ -228,6 +235,10 @@ public final class IntegrityLedger implements AutoCloseable {
         return entriesCovering(offset, readEnd, false);
     }
 
+    /**
+     * Returns a thread-local reusable span. The span is valid only until {@link EntrySpan#clear()} or
+     * the next reusable lookup on this thread; use {@link #entriesCovering(long, long)} for a copy.
+     */
     EntrySpan reusableEntriesCovering(long offset, long readEnd) {
         return entriesCovering(offset, readEnd, true);
     }
@@ -245,6 +256,8 @@ public final class IntegrityLedger implements AutoCloseable {
         int length = end - first;
         if (reusable) {
             EntryScratch scratch = reusableSpanScratch(length);
+            assert !scratch.inUse : "reusable EntrySpan is already live on this thread";
+            scratch.inUse = true;
             copyEntries(first, length, scratch.endOffsets, scratch.payloadCrcs);
             int[] epochs = null;
             if (writeEpochs != null) {
@@ -252,12 +265,12 @@ public final class IntegrityLedger implements AutoCloseable {
                 epochs = scratch.writeEpochs;
             }
             return scratch.span.reset(firstStart, scratch.endOffsets, scratch.payloadCrcs, epochs,
-                    uniformWriteEpoch, length, true);
+                    uniformWriteEpoch, length, true, scratch);
         }
         long[] ends = Arrays.copyOfRange(endOffsets, first, end);
         int[] crcs = Arrays.copyOfRange(payloadCrcs, first, end);
         int[] epochs = copyEpochRange(first, end);
-        return new EntrySpan().reset(firstStart, ends, crcs, epochs, uniformWriteEpoch, length, false);
+        return new EntrySpan().reset(firstStart, ends, crcs, epochs, uniformWriteEpoch, length, false, null);
     }
 
     private void copyEntries(int first, int length, long[] ends, int[] crcs) {
@@ -397,6 +410,7 @@ public final class IntegrityLedger implements AutoCloseable {
         private int[] payloadCrcs;
         private int[] writeEpochs;
         private final EntrySpan span = new EntrySpan();
+        private boolean inUse;
 
         private EntryScratch(int capacity) {
             this.endOffsets = new long[capacity];

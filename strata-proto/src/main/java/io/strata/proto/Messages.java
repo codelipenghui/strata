@@ -697,6 +697,10 @@ public final class Messages {
             return fields.set(fileId, chunkIndex, offset, maxBytes, namespace);
         }
 
+        /**
+         * Thread-local decode view for hot server paths. The returned object is overwritten by the next
+         * {@code decodeFields} call on the same thread; callers must copy any fields they keep asynchronously.
+         */
         public static ReadFields decodeFields(Frame frame) {
             if (!frame.hasOwnedHeader()) {
                 return decodeFields(frame.headerReadBuffer());

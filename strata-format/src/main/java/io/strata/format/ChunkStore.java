@@ -80,10 +80,20 @@ public final class ChunkStore implements AutoCloseable {
     static final long REPAIR_IMPORT_ORPHAN_PROTECTION_MS = 90_000;
 
     public interface AppendPayload {
+        /**
+         * Returns the exact byte count for this append. The value must stay stable across the
+         * matching {@link #writeFully(FileChannel, long)} and {@link #accumulateCrc(PayloadCrcAccumulator)}
+         * calls.
+         */
         int remaining();
 
+        /** Writes exactly {@link #remaining()} bytes at {@code position}, or throws before acking. */
         void writeFully(FileChannel channel, long position) throws IOException;
 
+        /**
+         * Folds the full payload exactly once. Implementations must not throw after partially updating
+         * {@code accumulator}; otherwise a same-offset retry can corrupt the seal-time CRC snapshot.
+         */
         void accumulateCrc(PayloadCrcAccumulator accumulator) throws IOException;
     }
 

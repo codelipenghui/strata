@@ -33,9 +33,6 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 final class ChannelCache implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(ChannelCache.class);
-    private static final int MAX_POOLED_LEASES_PER_THREAD = 64;
-    private static final ThreadLocal<ArrayDeque<LeaseImpl>> LEASES =
-            ThreadLocal.withInitial(ArrayDeque::new);
 
     interface Lease extends AutoCloseable {
         FileChannel channel();
@@ -210,11 +207,7 @@ final class ChannelCache implements AutoCloseable {
         private boolean released;
 
         private static LeaseImpl acquire(ChannelCache owner, Entry entry, FileChannel channel, long generation) {
-            ArrayDeque<LeaseImpl> leases = LEASES.get();
-            LeaseImpl lease = leases.pollFirst();
-            if (lease == null) {
-                lease = new LeaseImpl();
-            }
+            LeaseImpl lease = new LeaseImpl();
             lease.owner = owner;
             lease.entry = entry;
             lease.channel = channel;
@@ -262,14 +255,6 @@ final class ChannelCache implements AutoCloseable {
             closeQuietly(closeNow);
             if (evicted != null) {
                 closeAllQuietly(evicted);
-            }
-            recycle(this);
-        }
-
-        private static void recycle(LeaseImpl lease) {
-            ArrayDeque<LeaseImpl> leases = LEASES.get();
-            if (leases.size() < MAX_POOLED_LEASES_PER_THREAD) {
-                leases.addFirst(lease);
             }
         }
     }

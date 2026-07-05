@@ -7,6 +7,7 @@ import java.nio.file.Path;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class IntegrityLedgerTest {
@@ -38,10 +39,34 @@ class IntegrityLedgerTest {
             assertEquals(0, span.entries().length);
 
             IntegrityLedger.EntrySpan reused = ledger.reusableEntriesCovering(1, 2);
-            assertEquals(1, reused.length());
-            assertEquals(second, reused.entries()[0]);
-            assertEquals(2, reused.endOffset(0));
-            assertEquals(22, reused.payloadCrc(0));
+            try {
+                assertEquals(1, reused.length());
+                assertEquals(second, reused.entries()[0]);
+                assertEquals(2, reused.endOffset(0));
+                assertEquals(22, reused.payloadCrc(0));
+            } finally {
+                reused.clear();
+            }
+        }
+    }
+
+    @Test
+    void reusableEntrySpanAssertsWhenNestedOnSameThread() throws Exception {
+        boolean assertionsEnabled = false;
+        assert assertionsEnabled = true;
+        if (!assertionsEnabled) {
+            return;
+        }
+        try (IntegrityLedger ledger = IntegrityLedger.memory()) {
+            ledger.append(new ChunkFormats.LedgerEntry(1, 11, 1));
+            ledger.append(new ChunkFormats.LedgerEntry(2, 22, 1));
+
+            IntegrityLedger.EntrySpan span = ledger.reusableEntriesCovering(0, 1);
+            try {
+                assertThrows(AssertionError.class, () -> ledger.reusableEntriesCovering(1, 2));
+            } finally {
+                span.clear();
+            }
         }
     }
 

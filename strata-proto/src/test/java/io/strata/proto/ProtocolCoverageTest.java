@@ -591,6 +591,28 @@ class ProtocolCoverageTest {
         assertOwnedRequestFrameReused(Opcode.READ_RECOVERY);
     }
 
+    @Test
+    void ownedRequestFrameClosedOnDifferentThreadDoesNotEnterWrapperPool() throws Exception {
+        byte[] firstBytes = {9, 1, 2, 3, 4, 5, 9};
+        ByteBuf firstOwner = Unpooled.wrappedBuffer(firstBytes);
+        Frame first = Frame.fromOwnedBuffer(Opcode.APPEND.code, (short) 1, (short) 0, 99,
+                firstOwner, 1, 2, 3, 3, 0);
+        Thread closer = new Thread(first::close);
+        closer.start();
+        closer.join();
+        assertEquals(0, first.ownerRefCnt());
+
+        byte[] secondBytes = {8, 6, 7, 5, 3, 0, 9};
+        ByteBuf secondOwner = Unpooled.wrappedBuffer(secondBytes);
+        Frame second = Frame.fromOwnedBuffer(Opcode.APPEND.code, (short) 1, (short) 0, 100,
+                secondOwner, 1, 2, 3, 3, 0);
+        try {
+            assertNotSame(first, second);
+        } finally {
+            second.close();
+        }
+    }
+
     private static void assertOwnedRequestFrameReused(Opcode opcode) {
         byte[] firstBytes = {9, 1, 2, 3, 4, 5, 9};
         ByteBuf firstOwner = Unpooled.wrappedBuffer(firstBytes);

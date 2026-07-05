@@ -129,6 +129,9 @@
           <configuration>
             <excludedGroups>${excludedGroups}</excludedGroups>
             <trimStackTrace>false</trimStackTrace>
+            <systemPropertyVariables>
+              <io.netty.leakDetection.level>paranoid</io.netty.leakDetection.level>
+            </systemPropertyVariables>
           </configuration>
         </plugin>
       </plugins>

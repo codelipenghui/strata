@@ -258,7 +258,14 @@ public final class ScpServer implements AutoCloseable {
             this.payloadCloseable = payloadCloseable;
         }
 
+        private void clearBorrowedPayload() {
+            payloadReleaser = null;
+            payloadCloseable = null;
+        }
+
         private void reset() {
+            Runnable releaser = payloadReleaser;
+            AutoCloseable closeable = payloadCloseable;
             kind = EMPTY;
             response = null;
             future = null;
@@ -270,6 +277,20 @@ public final class ScpServer implements AutoCloseable {
             payloadLen = 0;
             payloadReleaser = null;
             payloadCloseable = null;
+            if (releaser != null) {
+                try {
+                    releaser.run();
+                } catch (RuntimeException e) {
+                    log.warn("discarding unconsumed response payload failed", e);
+                }
+            }
+            if (closeable != null) {
+                try {
+                    closeable.close();
+                } catch (Exception e) {
+                    log.warn("closing unconsumed response payload failed", e);
+                }
+            }
         }
     }
 
@@ -649,6 +670,7 @@ public final class ScpServer implements AutoCloseable {
                                 immediatePayload = responseSink.payload;
                                 immediatePayloadLen = responseSink.payloadLen;
                                 immediatePayloadReleaser = responseSink.payloadReleaser;
+                                responseSink.clearBorrowedPayload();
                             }
                             case ResponseSink.TWO_U64_BYTES -> {
                                 respF = null;
@@ -658,6 +680,7 @@ public final class ScpServer implements AutoCloseable {
                                 immediatePayload = responseSink.payload;
                                 immediatePayloadLen = responseSink.payloadLen;
                                 immediatePayloadCloseable = responseSink.payloadCloseable;
+                                responseSink.clearBorrowedPayload();
                             }
                             default -> {
                                 respF = null;
@@ -761,8 +784,13 @@ public final class ScpServer implements AutoCloseable {
             if (obs == null) {
                 return;
             }
-            Opcode op = Opcode.fromCode(req.opcode());
-            obs.observe(op != null ? op.name() : "unknown", namespace, System.nanoTime() - startNanos, success);
+            try {
+                Opcode op = Opcode.fromCode(req.opcode());
+                obs.observe(op != null ? op.name() : "unknown", namespace, System.nanoTime() - startNanos, success);
+            } catch (RuntimeException e) {
+                log.warn("request observer failed opcode=0x{} corr={}",
+                        Integer.toHexString(req.opcode() & 0xFFFF), req.correlationId(), e);
+            }
         }
 
         private void writeResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
@@ -898,13 +926,15 @@ public final class ScpServer implements AutoCloseable {
             try {
                 out = NettyFrameCodec.encodeOkU64Response(ctx.alloc(), req, value);
             } catch (IOException | RuntimeException e) {
+                logResponseEncodeFailure("OK_U64", req, e);
                 closeFrames(null, req);
                 ctx.close();
                 return;
             }
+            ChannelFuture write;
             boolean queued = false;
             try {
-                ctx.write(out, ctx.voidPromise());
+                write = ctx.write(out);
                 queued = true;
                 scheduleOkU64Flush(ctx);
             } catch (RuntimeException e) {
@@ -916,9 +946,7 @@ public final class ScpServer implements AutoCloseable {
                 closeFrames(null, req);
                 throw e;
             }
-            // OK_U64 responses own only the encoded ByteBuf now queued in Netty; the request payload
-            // was consumed before this point, so no write listener is needed just to release it.
-            closeFrames(null, req);
+            finishWrite(ctx, write, false, null, req);
         }
 
         private void scheduleOkU64Flush(ChannelHandlerContext ctx) {
@@ -968,6 +996,7 @@ public final class ScpServer implements AutoCloseable {
             try {
                 out = NettyFrameCodec.encodeBytesResponseComposite(ctx.alloc(), req, header, payload, payloadLen);
             } catch (IOException | RuntimeException e) {
+                logResponseEncodeFailure("BYTES", req, e);
                 releasePayload(payloadReleaser);
                 closeFrames(null, req);
                 ctx.close();
@@ -1013,6 +1042,7 @@ public final class ScpServer implements AutoCloseable {
                 out = NettyFrameCodec.encodeTwoU64BytesResponseComposite(ctx.alloc(), req, first, second,
                         payload, payloadLen);
             } catch (IOException | RuntimeException e) {
+                logResponseEncodeFailure("TWO_U64_BYTES", req, e);
                 closePayload(payloadCloseable);
                 closeFrames(null, req);
                 ctx.close();
@@ -1128,6 +1158,7 @@ public final class ScpServer implements AutoCloseable {
                 prefix = NettyFrameCodec.encodeFilePrefix(ctx.alloc(), frame);
                 region = new DefaultFileRegion(file.channel(), file.position(), file.length());
             } catch (IOException | RuntimeException e) {
+                logResponseEncodeFailure("FILE", releaseAfterWrite != null ? releaseAfterWrite : frame, e);
                 closeFrames(frame, releaseAfterWrite);
                 ctx.close();
                 return;
@@ -1217,6 +1248,10 @@ public final class ScpServer implements AutoCloseable {
                             releasePayload(localPayloadReleaser);
                             closePayload(localPayloadCloseable);
                         } finally {
+                            if (!future.isSuccess()) {
+                                log.warn("scp response write failed remote={}", localCtx.channel().remoteAddress(),
+                                        future.cause());
+                            }
                             if (localCloseAfterWrite || !future.isSuccess()) {
                                 localCtx.close();
                             }
@@ -1263,7 +1298,13 @@ public final class ScpServer implements AutoCloseable {
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            log.warn("scp connection exception remote={}", ctx.channel().remoteAddress(), cause);
             ctx.close();
+        }
+
+        private void logResponseEncodeFailure(String responseKind, Frame req, Throwable cause) {
+            log.warn("response encode failed kind={} opcode=0x{} corr={}", responseKind,
+                    Integer.toHexString(req.opcode() & 0xFFFF), req.correlationId(), cause);
         }
     }
 

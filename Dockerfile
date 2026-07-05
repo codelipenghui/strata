@@ -18,7 +18,7 @@ VOLUME ["/data"]
 #   9100 SCP (data + metadata, routed by opcode) · 9300 Prometheus /metrics
 EXPOSE 9100 9300
 # Default JVM flags; override with JAVA_OPTS. Container-aware heap sizing.
-ENV JAVA_OPTS="-XX:MaxRAMPercentage=70 -XX:+ExitOnOutOfMemoryError -Dio.netty.leakDetection.level=disabled"
+ENV JAVA_OPTS="-XX:MaxRAMPercentage=70 -XX:+ExitOnOutOfMemoryError -Dio.netty.leakDetection.level=simple"
 ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/strata-server.jar \"$@\"", "--"]
 # Role: override with `command: [controller]` / `[data-node]` / `[combined]` or STRATA_ROLE.
 CMD ["data-node"]

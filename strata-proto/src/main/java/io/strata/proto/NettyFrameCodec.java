@@ -211,10 +211,12 @@ final class NettyFrameCodec {
         CompositeByteBuf composite = allocator.compositeBuffer(2);
         boolean success = false;
         try {
-            composite.addComponent(true, prefix);
+            ByteBuf localPrefix = prefix;
             prefix = null;
-            composite.addComponent(true, payloadView);
+            composite.addComponent(true, localPrefix);
+            ByteBuf localPayloadView = payloadView;
             payloadView = null;
+            composite.addComponent(true, localPayloadView);
             success = true;
             return composite;
         } finally {

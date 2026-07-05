@@ -17,7 +17,9 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  *
  * <p>Frames constructed from ordinary {@link ByteBuffer}s do not own memory unless a payload
  * releaser is supplied. Netty-decoded frames may own a retained {@link ByteBuf}; transport code
- * must close owned frames after the handler no longer needs the slices.</p>
+ * must close owned frames after the handler no longer needs the slices. After {@link #close()}, an
+ * owned request frame may be reused for a later request; callers must not touch a frame after
+ * closing it. Set {@code STRATA_SCP_OWNED_REQUEST_FRAME_POOL_SIZE=0} to disable that wrapper pool.</p>
  */
 public final class Frame implements AutoCloseable {
     public static final byte MAGIC = 0x5C;
@@ -63,6 +65,7 @@ public final class Frame implements AutoCloseable {
     private Runnable payloadReleaser;
     private int payloadCrc;
     private boolean recyclableOwned;
+    private long recyclerThreadId;
     private int closedOwnerRefCnt = -1;
     @SuppressWarnings("unused") // updated through CLOSED
     private volatile int closed;
@@ -200,6 +203,7 @@ public final class Frame implements AutoCloseable {
         this.payloadReleaser = null;
         this.payloadCrc = retainedPayloadCrc(flags, payloadLen, payloadCrc);
         this.recyclableOwned = recyclableOwned;
+        this.recyclerThreadId = recyclableOwned ? Thread.currentThread().threadId() : 0;
         this.closedOwnerRefCnt = -1;
         this.reservedWireBytes = 0;
         this.closed = 0;
@@ -295,6 +299,7 @@ public final class Frame implements AutoCloseable {
     }
 
     public ByteBuffer headerSlice() {
+        assertOpen();
         return hasOkU64Header() ? okU64HeaderBuffer().asReadOnlyBuffer()
                 : owner != null ? ownerBuffer(ownerHeaderIndex, ownerHeaderLen).asReadOnlyBuffer()
                 : headerBytes != null ? ByteBuffer.wrap(headerBytes).asReadOnlyBuffer()
@@ -306,6 +311,7 @@ public final class Frame implements AutoCloseable {
      * {@link #headerSlice()} when exposing a buffer outside the transport/storage stack.
      */
     public ByteBuffer headerReadBuffer() {
+        assertOpen();
         return hasOkU64Header() ? okU64HeaderBuffer()
                 : owner != null ? ownerBuffer(ownerHeaderIndex, ownerHeaderLen)
                 : headerBytes != null ? ByteBuffer.wrap(headerBytes)
@@ -354,18 +360,22 @@ public final class Frame implements AutoCloseable {
     }
 
     byte ownedHeaderByte(int offset) {
+        assertOpen();
         return owner.getByte(ownerHeaderIndex + offset);
     }
 
     int ownedHeaderInt(int offset) {
+        assertOpen();
         return owner.getInt(ownerHeaderIndex + offset);
     }
 
     long ownedHeaderLong(int offset) {
+        assertOpen();
         return owner.getLong(ownerHeaderIndex + offset);
     }
 
     ByteBuffer headerView() {
+        assertOpen();
         return hasOkU64Header() ? okU64HeaderBuffer()
                 : owner != null ? ownerBuffer(ownerHeaderIndex, ownerHeaderLen)
                 : headerBytes != null ? ByteBuffer.wrap(headerBytes)
@@ -373,6 +383,7 @@ public final class Frame implements AutoCloseable {
     }
 
     public ByteBuffer payloadSlice() {
+        assertOpen();
         if (filePayload != null) {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
@@ -386,6 +397,7 @@ public final class Frame implements AutoCloseable {
      * use {@link #payloadSlice()} when exposing a buffer outside the transport/storage stack.
      */
     public ByteBuffer payloadReadBuffer() {
+        assertOpen();
         if (filePayload != null) {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
@@ -399,6 +411,7 @@ public final class Frame implements AutoCloseable {
      * this may return a transport-cached cursor, so callers must not retain it or call it concurrently.
      */
     public ByteBuffer payloadInternalReadBuffer() {
+        assertOpen();
         if (filePayload != null) {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
@@ -406,6 +419,7 @@ public final class Frame implements AutoCloseable {
     }
 
     ByteBuffer payloadView() {
+        assertOpen();
         if (filePayload != null) {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
@@ -415,6 +429,7 @@ public final class Frame implements AutoCloseable {
     }
 
     public int payloadLength() {
+        assertOpen();
         if (filePayload != null) {
             return filePayload.length();
         }
@@ -422,6 +437,7 @@ public final class Frame implements AutoCloseable {
     }
 
     public void writePayloadTo(FileChannel channel, long position) throws IOException {
+        assertOpen();
         if (filePayload != null) {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
@@ -437,6 +453,7 @@ public final class Frame implements AutoCloseable {
     }
 
     public void copyPayloadTo(int payloadOffset, byte[] dst, int dstOffset, int length) {
+        assertOpen();
         if (filePayload != null) {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
@@ -458,6 +475,7 @@ public final class Frame implements AutoCloseable {
     }
 
     public void copyPayloadTo(int payloadOffset, ByteBuffer dst, int length) {
+        assertOpen();
         if (filePayload != null) {
             throw new IllegalStateException("file payload is not materialized as a ByteBuffer");
         }
@@ -538,7 +556,7 @@ public final class Frame implements AutoCloseable {
             ByteBuf localOwner = owner;
             FilePayload localFilePayload = filePayload;
             Runnable localPayloadReleaser = payloadReleaser;
-            boolean recycle = recyclableOwned;
+            boolean recycle = recyclableOwned && recyclerThreadId == Thread.currentThread().threadId();
             if (localOwner != null) {
                 localOwner.release();
                 closedOwnerRefCnt = localOwner.refCnt();
@@ -578,7 +596,12 @@ public final class Frame implements AutoCloseable {
         payloadReleaser = null;
         payloadCrc = 0;
         recyclableOwned = false;
+        recyclerThreadId = 0;
         reservedWireBytes = 0;
+    }
+
+    private void assertOpen() {
+        assert closed == 0 : "frame is closed and may have been recycled";
     }
 
     private static ByteBuffer readOnlySlice(ByteBuffer buffer) {
