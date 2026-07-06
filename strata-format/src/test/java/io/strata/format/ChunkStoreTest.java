@@ -2468,7 +2468,7 @@ class ChunkStoreTest {
     }
 
     @Test
-    void sealedReadRegionReusesVerifiedRangeAfterFirstRead() throws Exception {
+    void sealedReadRegionRejectsRotAfterFirstRangeReadBeforeAndAfterScrub() throws Exception {
         try (ChunkStore store = newStore()) {
             byte[] payload = new byte[ChunkFormats.CRC_RANGE_SIZE];
             for (int i = 0; i < payload.length; i++) {
@@ -2479,15 +2479,25 @@ class ChunkStoreTest {
             store.seal(TEST_NS, id, 1, payload.length, null);
 
             byte[] expected = Arrays.copyOfRange(payload, 0, 4);
-            assertArrayEquals(expected, store.readRegion(TEST_NS, id, 0, expected.length).bytes());
-
-            Path dataPath = dir.resolve(rel(id) + ".chunk");
-            try (FileChannel ch = FileChannel.open(dataPath, StandardOpenOption.WRITE)) {
-                ch.write(ByteBuffer.wrap(new byte[] {(byte) (payload[1024] ^ 0x7F)}),
-                        ChunkFormats.DATA_START + 1024);
+            try (ChunkStore.ReadRegionResult first = store.readRegion(TEST_NS, id, 0, expected.length)) {
+                assertArrayEquals(expected, first.bytes());
             }
 
-            assertArrayEquals(expected, store.readRegion(TEST_NS, id, 0, expected.length).bytes());
+            Path dataPath = dir.resolve(rel(id) + ".chunk");
+            int corruptOffset = 1024;
+            try (FileChannel ch = FileChannel.open(dataPath, StandardOpenOption.WRITE)) {
+                ch.write(ByteBuffer.wrap(new byte[] {(byte) (payload[corruptOffset] ^ 0x7F)}),
+                        ChunkFormats.DATA_START + corruptOffset);
+            }
+
+            ScpException beforeScrub = assertThrows(ScpException.class,
+                    () -> store.readRegion(TEST_NS, id, corruptOffset, expected.length));
+            assertEquals(ErrorCode.CRC_MISMATCH, beforeScrub.code());
+
+            assertEquals(1, store.scrubOnce(), "scrub must detect rot even after the range was read before");
+            ScpException afterScrub = assertThrows(ScpException.class,
+                    () -> store.readRegion(TEST_NS, id, corruptOffset, expected.length));
+            assertEquals(ErrorCode.CRC_MISMATCH, afterScrub.code());
         }
     }
 

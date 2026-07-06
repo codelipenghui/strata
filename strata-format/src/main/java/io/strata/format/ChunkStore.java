@@ -32,7 +32,6 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.BitSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -622,9 +621,6 @@ public final class ChunkStore implements AutoCloseable {
         long sealedLength = -1;
         int dataCrc;
         int[] sealedRangeCrcs = EMPTY_INT_ARRAY;
-        // Sealed chunks are immutable. The first read of a CRC range attests it against the footer;
-        // later reads of that range can serve only the requested bytes instead of re-reading 4 MiB.
-        final BitSet sealedVerifiedRanges = new BitSet();
         // Last time an owner attested this replica via VERIFY_CHUNKS (design §20.3); seeded to when this
         // node first learned of the chunk so a freshly-created/recovered chunk gets the full orphan grace
         // (§20.4) before it can be considered a suspect. In-memory only: a restart re-earns verification.
@@ -1883,8 +1879,7 @@ public final class ChunkStore implements AutoCloseable {
         boolean success = false;
         try (ChannelCache.Lease lease = channelCache.acquire(nsKey, dataPath)) {
             requireCurrentHandle(h, id);
-            readSealedVerified(lease.channel(), h, sealedLength, sealedRangeCrcs, !includeUndurableTail, id, offset,
-                    out);
+            readSealedVerified(lease.channel(), sealedLength, sealedRangeCrcs, id, offset, out);
             if (!includeUndurableTail) {
                 countClientRead(ns, n);
             }
@@ -3227,8 +3222,8 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
-    private void readSealedVerified(FileChannel data, Handle h, long sealedLength, int[] rangeCrcs,
-                                    boolean useVerifiedRangeCache, ChunkId id, long offset, ReadRegionResult out)
+    private void readSealedVerified(FileChannel data, long sealedLength, int[] rangeCrcs,
+                                    ChunkId id, long offset, ReadRegionResult out)
             throws IOException {
         byte[] outBytes = out.array();
         int readLength = out.length();
@@ -3248,11 +3243,6 @@ public final class ChunkStore implements AutoCloseable {
             long copyStart = Math.max(offset, rangeStart);
             long copyEnd = Math.min(offset + readLength, rangeStart + rangeLen);
             int copyLen = (int) (copyEnd - copyStart);
-            if (useVerifiedRangeCache && isSealedRangeVerified(h, rangeIndex)) {
-                readFully(data, out.slice((int) (copyStart - offset), copyLen),
-                        checkedAdd(DATA_START, copyStart, "chunk file offset"));
-                continue;
-            }
             int actual;
             if (copyStart == rangeStart && copyLen == rangeLen) {
                 int dst = (int) (copyStart - offset);
@@ -3277,21 +3267,6 @@ public final class ChunkStore implements AutoCloseable {
                 throw new ScpException(ErrorCode.CRC_MISMATCH,
                         "sealed range crc mismatch on " + id + " range " + range);
             }
-            if (useVerifiedRangeCache) {
-                markSealedRangeVerified(h, rangeIndex);
-            }
-        }
-    }
-
-    private boolean isSealedRangeVerified(Handle h, int range) {
-        synchronized (h.sealedVerifiedRanges) {
-            return h.sealedVerifiedRanges.get(range);
-        }
-    }
-
-    private void markSealedRangeVerified(Handle h, int range) {
-        synchronized (h.sealedVerifiedRanges) {
-            h.sealedVerifiedRanges.set(range);
         }
     }
 
