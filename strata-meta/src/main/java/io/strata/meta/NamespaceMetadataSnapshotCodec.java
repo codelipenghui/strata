@@ -12,9 +12,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * CRC-protected envelope for a compacted namespace snapshot (design §9, §10). The body holds the
- * next log start offset, the file table (each FileRecord length-prefixed), and the tombstone deletion
- * timestamps; a trailing CRC32C over the body detects corruption of a sealed snapshot system file.
+ * CRC-protected envelope for a compacted namespace snapshot (design §4.2). The body holds the
+ * snapshot version, next file id high-water, next log start offset, file table, per-file CAS versions,
+ * and tombstone deletion timestamps; a trailing CRC32C detects corruption of a sealed snapshot system file.
  */
 final class NamespaceMetadataSnapshotCodec {
     private NamespaceMetadataSnapshotCodec() {}
@@ -49,7 +49,7 @@ final class NamespaceMetadataSnapshotCodec {
         }
         ByteBuffer b = ByteBuffer.wrap(bytes, 0, bodyLen);
         byte version = b.get();
-        if (version != 1 && version != 2) {
+        if (version != 2) {
             throw new IllegalArgumentException("snapshot version " + version);
         }
         long nextFid = b.getLong();
@@ -63,11 +63,9 @@ final class NamespaceMetadataSnapshotCodec {
             files.add(Records.FileRecord.decode(rec));
         }
         Map<FileId, Integer> versions = new HashMap<>();
-        if (version >= 2) {
-            int versionCount = Varint.readCount(b, "file version");
-            for (int i = 0; i < versionCount; i++) {
-                versions.put(FileId.readFrom(b), b.getInt());
-            }
+        int versionCount = Varint.readCount(b, "file version");
+        for (int i = 0; i < versionCount; i++) {
+            versions.put(FileId.readFrom(b), b.getInt());
         }
         int tombCount = Varint.readCount(b, "tombstone");
         Map<FileId, Long> tombstones = new HashMap<>();

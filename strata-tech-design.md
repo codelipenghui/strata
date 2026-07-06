@@ -91,6 +91,8 @@ Each namespace's file and chunk metadata — `FileRecord { fileId, namespace, pa
 
 The namespace's owner assigns each file's id from a monotonic `nextFileId` **high-water carried in the namespace snapshot** (not `max(live files)`, which a swept tombstone would forget and risk reusing). Assignment rides the existing single-writer manifest fence — no global allocator on the hot path. On failover the successor loads the snapshot's `nextFileId` and replays the tail; assign-then-append is safe because a crash after assigning N but before `FileCreated(N)` is durable leaves no file at N, so reissuing N is harmless — the "id reuse on failover" correctness anchor (§4.5, invariant §14.13).
 
+The snapshot also carries each file's CAS version so a version token read before failover cannot alias a freshly recovered in-memory counter. Restoring from a snapshot must preserve the file's mutation lineage; otherwise a stale retry could compare against a reset counter and replay an old file update over an intervening owner mutation.
+
 ### 4.3 RPC surface (SCP control)
 
 Brokers and data nodes both reach the metadata plane over **SCP control opcodes** (§10.4) served by an SCP listener on each controller — one protocol stack for every client. A request for a namespace this controller does not own is answered `NOT_LEADER` carrying the owner's endpoint; the owner-aware client caches `namespace → owner` and routes directly, re-resolving only on that redirect.

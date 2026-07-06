@@ -1,10 +1,12 @@
 package io.strata.meta;
 
+import io.strata.common.Crc;
 import io.strata.common.FileId;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 import org.junit.jupiter.api.Test;
 
+import java.nio.ByteBuffer;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -57,6 +59,22 @@ class NamespaceMetadataSnapshotCodecTest {
         assertTrue(decoded.files().isEmpty());
         assertTrue(decoded.versions().isEmpty());
         assertTrue(decoded.tombstones().isEmpty());
+    }
+
+    @Test
+    void rejectsSnapshotsWithoutFileCasVersions() {
+        NamespaceMetadataState state = new NamespaceMetadataState(NS);
+        state.apply(new MetadataLogRecord.FileCreated(FileId.of(1), NS, StrataPath.of("/a"),
+                3, 2, true, 1, 1, 1));
+        byte[] bytes = NamespaceMetadataSnapshotCodec.encode(state.exportSnapshot(0));
+        bytes[0] = 1; // old layout had no per-file CAS version table
+        int bodyLen = bytes.length - 4;
+        ByteBuffer.wrap(bytes, bodyLen, 4).putInt(Crc.of(bytes, 0, bodyLen));
+
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> NamespaceMetadataSnapshotCodec.decode(bytes));
+
+        assertEquals("snapshot version 1", thrown.getMessage());
     }
 
     @Test
