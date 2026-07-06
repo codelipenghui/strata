@@ -646,6 +646,60 @@ class RecoveryTest {
     }
 
     @Test
+    void aboveFloorLedgerReadFailureAbortsInsteadOfFloorSeal() throws Exception {
+        FileId fileId = FileId.of(41);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+
+        try (ScpServer holderA = aboveFloorLedgerFailingReplica(1, 8, 4);
+             ScpServer holderB = aboveFloorLedgerFailingReplica(2, 8, 4);
+             ScpServer lagging = openReplicaWithFenceAndSeal(3, 4, 4, 4, 777);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(holderA)),
+                             new Messages.Replica(2, endpoint(holderB)),
+                             new Messages.Replica(3, endpoint(lagging))))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
+
+                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertTrue(e.getMessage().contains("unverified above-floor holder"));
+                assertEquals(null, sealedFileLength.get());
+            }
+        }
+    }
+
+    @Test
+    void allAboveFloorRecoveryReadsFailAbortInsteadOfFloorSeal() throws Exception {
+        FileId fileId = FileId.of(42);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        byte[] tail = new byte[] {5, 6, 7, 8};
+        List<Messages.LedgerEntry> ledger = List.of(new Messages.LedgerEntry(8, Crc.of(tail), 1));
+
+        try (ScpServer holderA = aboveFloorReadFailingReplica(1, 8, 4, ledger);
+             ScpServer holderB = aboveFloorReadFailingReplica(2, 8, 4, ledger);
+             ScpServer lagging = openReplicaWithFenceAndSeal(3, 4, 4, 4, 777);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(holderA)),
+                             new Messages.Replica(2, endpoint(holderB)),
+                             new Messages.Replica(3, endpoint(lagging))))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
+
+                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertTrue(e.getMessage().contains("unverified above-floor holder"));
+                assertEquals(null, sealedFileLength.get());
+            }
+        }
+    }
+
+    @Test
     void conflictingSingleHolderContinuationsAboveFloorTruncateToFloor() throws Exception {
         // PR #34 review: with one replica unreachable, two reachable replicas can each hold a CRC-valid
         // but DIFFERENT continuation from the floor — R1 has A[0,4), R2 has B[0,8) with a different
@@ -974,7 +1028,7 @@ class RecoveryTest {
     }
 
     @Test
-    void oversizedLedgerBoundaryIsIgnoredAsInvalidReadRange() throws Exception {
+    void oversizedLedgerBoundaryAbortsAsUnverifiedAboveFloorHolder() throws Exception {
         FileId fileId = FileId.of(27);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicBoolean readCalled = new AtomicBoolean();
@@ -989,17 +1043,19 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(s2))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2);
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
 
-                assertEquals(0, sealedInfo.sealedLength());
-                assertEquals(0L, sealedFileLength.get());
+                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertTrue(e.getMessage().contains("unverified above-floor holder"));
+                assertEquals(null, sealedFileLength.get());
                 assertEquals(false, readCalled.get());
             }
         }
     }
 
     @Test
-    void malformedReadResponseIsIgnoredDuringLedgerContinuation() throws Exception {
+    void malformedReadResponseAbortsAsUnverifiedAboveFloorHolder() throws Exception {
         FileId fileId = FileId.of(28);
         ChunkId chunkId = new ChunkId(fileId, 0);
         AtomicReference<Long> sealedFileLength = new AtomicReference<>();
@@ -1014,10 +1070,12 @@ class RecoveryTest {
                              new Messages.Replica(2, endpoint(s2))))), sealedFileLength)) {
             ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
             try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
-                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2);
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
 
-                assertEquals(0, sealedInfo.sealedLength());
-                assertEquals(0L, sealedFileLength.get());
+                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertTrue(e.getMessage().contains("unverified above-floor holder"));
+                assertEquals(null, sealedFileLength.get());
             }
         }
     }
@@ -1299,6 +1357,44 @@ class RecoveryTest {
                 }
                 return ScpServer.ok(req, new Messages.AppendResp(append.baseOffset() + req.payloadLength()).encode(),
                         null);
+            }
+            if (op == Opcode.SEAL_CHUNK) {
+                Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
+                return ScpServer.ok(req, new Messages.SealResp(seal.dataLength(), 777).encode(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+    }
+
+    private static ScpServer aboveFloorLedgerFailingReplica(int nodeId, long end, long durable) throws Exception {
+        return new ScpServer(0, nodeId, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.FENCE) {
+                return ScpServer.ok(req, new Messages.FenceResp(2, end, durable, ChunkState.OPEN).encode(), null);
+            }
+            if (op == Opcode.READ_LEDGER) {
+                throw new ScpException(ErrorCode.INTERNAL, "ledger unavailable");
+            }
+            if (op == Opcode.SEAL_CHUNK) {
+                Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
+                return ScpServer.ok(req, new Messages.SealResp(seal.dataLength(), 777).encode(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+    }
+
+    private static ScpServer aboveFloorReadFailingReplica(int nodeId, long end, long durable,
+                                                          List<Messages.LedgerEntry> ledger) throws Exception {
+        return new ScpServer(0, nodeId, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.FENCE) {
+                return ScpServer.ok(req, new Messages.FenceResp(2, end, durable, ChunkState.OPEN).encode(), null);
+            }
+            if (op == Opcode.READ_LEDGER) {
+                return ScpServer.ok(req, new Messages.ReadLedgerResp(ledger).encode(), null);
+            }
+            if (op == Opcode.READ_RECOVERY) {
+                throw new ScpException(ErrorCode.INTERNAL, "recovery read unavailable");
             }
             if (op == Opcode.SEAL_CHUNK) {
                 Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
