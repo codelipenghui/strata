@@ -6,6 +6,7 @@ import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkStore;
 import io.strata.proto.RequestObserver;
+import io.strata.proto.RequestContext;
 import io.strata.proto.ScpServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,6 +24,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static io.strata.common.Fsync.forceDirectory;
 
@@ -42,6 +44,9 @@ public final class DataNode implements AutoCloseable {
     private final ControlLoop controlLoop;
     private final OrphanGc orphanGc; // node-local orphan GC (design §9.2); null in standalone mode
     private final AtomicBoolean draining = new AtomicBoolean(false);
+    private final AtomicLong ownerEpochFenceRejects = new AtomicLong();
+    // Volatile process-local fence memory. Data-node restart forgets it; correctness still comes from
+    // senders stamping current owner epochs and treating FENCED_EPOCH as terminal for stale work.
     private final ConcurrentHashMap<StrataNamespace, Long> highestOwnerEpochByNamespace = new ConcurrentHashMap<>();
 
     private final int nodeId;
@@ -232,6 +237,7 @@ public final class DataNode implements AutoCloseable {
     public int orphanGcBreakerHaltedChunks() {
         return orphanGc == null ? 0 : orphanGc.breakerHaltedChunks();
     }
+    public long ownerEpochFenceRejects() { return ownerEpochFenceRejects.get(); }
 
     /** Installs a per-request latency observer on the data-plane server (used by the metrics layer). */
     public void setRequestObserver(RequestObserver observer) {
@@ -260,24 +266,41 @@ public final class DataNode implements AutoCloseable {
     }
 
     void acceptOwnerEpoch(StrataNamespace namespace, long ownerEpoch) {
+        acceptOwnerEpoch(namespace, ownerEpoch, false);
+    }
+
+    void acceptOwnerEpoch(StrataNamespace namespace, long ownerEpoch, boolean allowUnstampedAfterSeen) {
         if (ownerEpoch < 0) {
             throw new IllegalArgumentException("ownerEpoch must be non-negative: " + ownerEpoch);
         }
+        // Owner epochs fence stale namespace owners; they are not an auth boundary on today's unauthenticated
+        // SCP links. A client that can issue owner-only opcodes can still raise this volatile watermark.
         highestOwnerEpochByNamespace.compute(namespace, (ignored, current) -> {
             long seen = current == null ? 0 : current;
             if (ownerEpoch == 0) {
                 if (seen > 0) {
-                    throw new ScpException(ErrorCode.FENCED_EPOCH,
-                            "stale owner epoch 0 for namespace " + namespace, seen);
+                    if (allowUnstampedAfterSeen) {
+                        return current;
+                    }
+                    throw fencedOwnerEpoch(namespace, ownerEpoch, seen);
                 }
                 return current;
             }
             if (ownerEpoch < seen) {
-                throw new ScpException(ErrorCode.FENCED_EPOCH,
-                        "stale owner epoch " + ownerEpoch + " for namespace " + namespace, seen);
+                throw fencedOwnerEpoch(namespace, ownerEpoch, seen);
             }
             return Math.max(seen, ownerEpoch);
         });
+    }
+
+    private ScpException fencedOwnerEpoch(StrataNamespace namespace, long offered, long required) {
+        ownerEpochFenceRejects.incrementAndGet();
+        log.warn("rejecting stale owner RPC namespace={} offeredOwnerEpoch={} requiredOwnerEpoch={} "
+                        + "clientKind={} clientId={}",
+                namespace, offered, required, RequestContext.clientKind(), RequestContext.clientId());
+        return new ScpException(ErrorCode.FENCED_EPOCH,
+                "stale owner epoch " + offered + " for namespace " + namespace + " (required >= " + required + ")",
+                required);
     }
 
     /** The set of owner endpoints this node has heard a VERIFY_CHUNKS from (orphan-GC membership grace). */

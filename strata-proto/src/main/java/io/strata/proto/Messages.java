@@ -1279,9 +1279,6 @@ public final class Messages {
 
         static Command readRequest(ByteBuffer b) {
             Command c = read(b);
-            if (!b.hasRemaining()) {
-                return c;
-            }
             TaggedFields tags = TaggedFields.readFrom(b);
             long ownerEpoch = readU64Tag(tags, TAG_OWNER_EPOCH, "ownerEpoch");
             return withOwnerEpoch(c, ownerEpoch);
@@ -1417,10 +1414,15 @@ public final class Messages {
             int n = count(b);
             Map<Long, Long> ownerEpochs = new HashMap<>();
             for (int i = 0; i < n; i++) {
+                if (b.remaining() < 2 * Long.BYTES) {
+                    throw new IllegalArgumentException("truncated command-owner-epoch tag");
+                }
                 long commandId = b.getLong();
                 long ownerEpoch = b.getLong();
                 requireNonNegativeOwnerEpoch(ownerEpoch);
-                ownerEpochs.put(commandId, ownerEpoch);
+                if (ownerEpochs.putIfAbsent(commandId, ownerEpoch) != null) {
+                    throw new IllegalArgumentException("duplicate command-owner-epoch id " + commandId);
+                }
             }
             if (b.hasRemaining()) {
                 throw new IllegalArgumentException("trailing bytes in command-owner-epoch tag");
@@ -1431,8 +1433,9 @@ public final class Messages {
         private static List<Command> withCommandOwnerEpochs(List<Command> commands,
                                                             Map<Long, Long> ownerEpochs) {
             List<Command> stamped = new ArrayList<>(commands.size());
+            Map<Long, Long> unmatched = new HashMap<>(ownerEpochs);
             for (Command command : commands) {
-                Long ownerEpoch = ownerEpochs.get(command.commandId());
+                Long ownerEpoch = unmatched.remove(command.commandId());
                 if (ownerEpoch == null) {
                     stamped.add(command);
                     continue;
@@ -1443,6 +1446,10 @@ public final class Messages {
                     case DeleteCmd d -> new DeleteCmd(d.commandId(), d.chunkIds(), d.namespace(), ownerEpoch);
                     case DrainCmd dr -> dr;
                 });
+            }
+            if (!unmatched.isEmpty()) {
+                throw new IllegalArgumentException("owner epoch tag references unknown command ids "
+                        + unmatched.keySet());
             }
             return stamped;
         }

@@ -324,25 +324,52 @@ class DataNodeWireTest {
     @Test
     void ownerEpochFenceRejectsStaleDestructiveAndVerifyRequests() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
-             ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
-            client.call(Opcode.VERIFY_CHUNKS,
-                    new Messages.VerifyChunks(TEST_NS, "owner-a", List.of(id), 8).encode(), null, 5000);
+             ScpClient broker = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "broker");
+             ScpClient owner = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_TOOL, "owner")) {
+            broker.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
+                    1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
+            broker.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
+                    ByteBuffer.wrap("data".getBytes()), 5000);
+            broker.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(id, 1, 4, TEST_NS).encode(), null, 5000);
 
-            ScpException staleVerify = assertThrows(ScpException.class, () -> client.call(Opcode.VERIFY_CHUNKS,
+            owner.call(Opcode.VERIFY_CHUNKS,
+                    new Messages.VerifyChunks(TEST_NS, "owner-a", List.of(id), 7).encode(), null, 5000);
+            owner.call(Opcode.VERIFY_CHUNKS,
+                    new Messages.VerifyChunks(TEST_NS, "owner-a", List.of(id), 7).encode(), null, 5000);
+            owner.call(Opcode.VERIFY_CHUNKS,
+                    new Messages.VerifyChunks(TEST_NS, "owner-a", List.of(id), 8).encode(), null, 5000);
+            owner.call(Opcode.VERIFY_CHUNKS,
+                    new Messages.VerifyChunks(StrataNamespace.of("other"), "owner-b", List.of(id), 1).encode(),
+                    null, 5000);
+
+            ScpException staleVerify = assertThrows(ScpException.class, () -> owner.call(Opcode.VERIFY_CHUNKS,
                     new Messages.VerifyChunks(TEST_NS, "owner-a", List.of(id), 7).encode(), null, 5000));
             assertEquals(ErrorCode.FENCED_EPOCH, staleVerify.code());
             assertEquals(8, staleVerify.detail());
 
-            ScpException staleDelete = assertThrows(ScpException.class, () -> client.call(Opcode.DELETE_CHUNKS,
+            ScpException unstampedVerify = assertThrows(ScpException.class, () -> owner.call(Opcode.VERIFY_CHUNKS,
+                    new Messages.VerifyChunks(TEST_NS, "owner-a", List.of(id)).encode(), null, 5000));
+            assertEquals(ErrorCode.FENCED_EPOCH, unstampedVerify.code());
+            assertEquals(8, unstampedVerify.detail());
+
+            ScpException staleDelete = assertThrows(ScpException.class, () -> owner.call(Opcode.DELETE_CHUNKS,
                     new Messages.DeleteChunks(List.of(id), TEST_NS, 7).encode(), null, 5000));
             assertEquals(ErrorCode.FENCED_EPOCH, staleDelete.code());
             assertEquals(8, staleDelete.detail());
 
+            ByteBuffer statHeader = broker.call(Opcode.STAT_CHUNK,
+                    new Messages.StatChunk(id, TEST_NS).encode(), null, 5000);
+            assertEquals(ChunkState.SEALED, Messages.StatResp.decode(statHeader).state());
+
             var staleReplicate = new Messages.ReplicateCmd(1, id, List.of(), (byte) 1, 0, 0, TEST_NS, 7);
-            ScpException staleExec = assertThrows(ScpException.class, () -> client.call(Opcode.EXEC_REPLICATE,
+            ScpException staleExec = assertThrows(ScpException.class, () -> owner.call(Opcode.EXEC_REPLICATE,
                     encodeCommand(staleReplicate), null, 5000));
             assertEquals(ErrorCode.FENCED_EPOCH, staleExec.code());
             assertEquals(8, staleExec.detail());
+
+            ByteBuffer deleteHeader = broker.call(Opcode.DELETE_CHUNKS,
+                    new Messages.DeleteChunks(List.of(id), TEST_NS).encode(), null, 5000);
+            assertEquals(ErrorCode.OK.code, Messages.DeleteChunksResp.decode(deleteHeader).codes().get(0));
         }
     }
 

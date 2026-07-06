@@ -48,6 +48,7 @@ class ServerMetricsTest {
             assertNotNull(registry.find("strata_data_node_orphan_gc_breaker_halted_chunks").gauge());
             assertNotNull(registry.find("strata_data_node_orphan_gc_breaker_trips_total").functionCounter());
             assertNotNull(registry.find("strata_data_node_orphan_gc_breaker_skipped_chunk_total").functionCounter());
+            assertNotNull(registry.find("strata_data_node_owner_epoch_fence_rejects").functionCounter());
         }
     }
 

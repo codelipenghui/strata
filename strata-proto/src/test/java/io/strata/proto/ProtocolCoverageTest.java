@@ -411,6 +411,37 @@ class ProtocolCoverageTest {
     }
 
     @Test
+    void commandRequestAndHeartbeatOwnerEpochTagsRejectMalformedLayouts() {
+        ChunkId chunkId = new ChunkId(FileId.of(1), 0);
+        StrataNamespace namespace = StrataNamespace.of("test");
+
+        BufWriter legacyCommand = new BufWriter();
+        Messages.Command.write(legacyCommand, new Messages.DeleteCmd(9, List.of(chunkId), namespace));
+        assertThrows(RuntimeException.class,
+                () -> Messages.Command.readRequest(ByteBuffer.wrap(legacyCommand.toBytes())));
+
+        BufWriter truncated = new BufWriter();
+        truncated.varint(1).u64(9);
+        assertThrows(IllegalArgumentException.class,
+                () -> Messages.HeartbeatResp.decode(heartbeatWithOwnerEpochTag(chunkId, namespace,
+                        truncated.toBytes())));
+
+        BufWriter duplicate = new BufWriter();
+        duplicate.varint(2).u64(9).u64(7).u64(9).u64(8);
+        var duplicateError = assertThrows(IllegalArgumentException.class,
+                () -> Messages.HeartbeatResp.decode(heartbeatWithOwnerEpochTag(chunkId, namespace,
+                        duplicate.toBytes())));
+        assertTrue(duplicateError.getMessage().contains("duplicate"));
+
+        BufWriter unknown = new BufWriter();
+        unknown.varint(1).u64(10).u64(7);
+        var unknownError = assertThrows(IllegalArgumentException.class,
+                () -> Messages.HeartbeatResp.decode(heartbeatWithOwnerEpochTag(chunkId, namespace,
+                        unknown.toBytes())));
+        assertTrue(unknownError.getMessage().contains("unknown command ids"));
+    }
+
+    @Test
     void listBackedMessagesDefensivelyCopyAndValidateCounts() {
         ChunkId chunkId = new ChunkId(FileId.of(1), 0);
         List<Messages.Replica> replicas = new ArrayList<>(List.of(new Messages.Replica(1, "node:9000")));
@@ -429,6 +460,15 @@ class ProtocolCoverageTest {
                 () -> new Messages.DeleteChunksResp(List.of(chunkId), List.of()));
         assertThrows(IllegalArgumentException.class,
                 () -> new Messages.DeleteFilesResp(List.of(FileId.of(2)), List.of()));
+    }
+
+    private static ByteBuffer heartbeatWithOwnerEpochTag(ChunkId chunkId, StrataNamespace namespace,
+                                                         byte[] ownerEpochTag) {
+        BufWriter w = new BufWriter();
+        w.u64(100).varint(1);
+        Messages.Command.write(w, new Messages.DeleteCmd(9, List.of(chunkId), namespace));
+        TaggedFields.of(Map.of(Messages.HeartbeatResp.TAG_COMMAND_OWNER_EPOCHS, ownerEpochTag)).writeTo(w);
+        return ByteBuffer.wrap(w.toBytes());
     }
 
     @Test

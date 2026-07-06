@@ -8,6 +8,7 @@ import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.RequestContext;
+import io.strata.proto.ScpClient;
 import io.strata.proto.ScpServer;
 
 import java.io.IOException;
@@ -150,7 +151,8 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case DELETE_CHUNKS -> {
                 var m = Messages.DeleteChunks.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
-                node.acceptOwnerEpoch(m.namespace(), m.ownerEpoch());
+                boolean brokerCleanup = m.ownerEpoch() == 0 && RequestContext.clientKind() == ScpClient.KIND_BROKER;
+                node.acceptOwnerEpoch(m.namespace(), m.ownerEpoch(), brokerCleanup);
                 List<Short> codes = new ArrayList<>(m.chunkIds().size());
                 for (var id : m.chunkIds()) codes.add(deletes.delete(m.namespace(), id).code);
                 yield ScpServer.ok(req, new Messages.DeleteChunksResp(m.chunkIds(), codes).encode(), null);

@@ -11,6 +11,9 @@ package io.strata.proto;
  */
 public final class RequestContext {
     private static final ThreadLocal<String> NAMESPACE = new ThreadLocal<>();
+    private static final ThreadLocal<Client> CLIENT = new ThreadLocal<>();
+
+    private record Client(byte kind, String id) {}
 
     private RequestContext() {
     }
@@ -20,10 +23,31 @@ public final class RequestContext {
         NAMESPACE.set(namespace);
     }
 
+    /** Records the declared SCP HELLO identity for the request currently being decoded. */
+    static void setClient(byte kind, String id) {
+        CLIENT.set(new Client(kind, id));
+    }
+
+    /** Client kind from the SCP HELLO frame, or {@code 0} before HELLO / outside a request. */
+    public static byte clientKind() {
+        Client client = CLIENT.get();
+        return client == null ? 0 : client.kind();
+    }
+
+    /** Client id from the SCP HELLO frame, or {@code "-"} before HELLO / outside a request. */
+    public static String clientId() {
+        Client client = CLIENT.get();
+        return client == null ? "-" : client.id();
+    }
+
     /** Returns the namespace set for the current request and clears it; {@code "-"} when unset. */
     public static String takeNamespace() {
         String ns = NAMESPACE.get();
         NAMESPACE.set(null);
         return ns == null ? "-" : ns;
+    }
+
+    static void clearClient() {
+        CLIENT.set(null);
     }
 }
