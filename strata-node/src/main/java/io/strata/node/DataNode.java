@@ -37,14 +37,14 @@ public final class DataNode implements AutoCloseable {
     private final ChunkDeleteService deleteService;
     private final ScpServer server;
     private final ControlLoop controlLoop;
-    private final OrphanGc orphanGc; // node-local orphan GC (design §20.4); null in standalone mode
+    private final OrphanGc orphanGc; // node-local orphan GC (design §9.2); null in standalone mode
     private final AtomicBoolean draining = new AtomicBoolean(false);
 
     private final int nodeId;
     private final UUID incarnation;
     // Owners (by advertised endpoint) this node has heard a VERIFY_CHUNKS from. Retained as a
     // diagnostic trace of owner-pull verification activity; orphan GC now relies on per-chunk
-    // owner-confirm plus bounded per-pass deletes instead of a global "heard from every owner" gate.
+    // owner-confirm plus latching mass-delete breakers instead of a global "heard from every owner" gate.
     private final Set<String> verifiersHeardFrom = ConcurrentHashMap.newKeySet();
 
     public DataNode(DataNodeConfig config) throws IOException {
@@ -84,7 +84,7 @@ public final class DataNode implements AutoCloseable {
                 this.controlLoop = startedLoop;
                 dataHandler.controlLoop(startedLoop); // serve direct owner-repair EXEC_REPLICATE
                 startedLoop.start();
-                // Node-local orphan GC (design §20.4): reclaim sealed chunks no owner references, after
+                // Node-local orphan GC (design §9.2): reclaim sealed chunks no owner references, after
                 // confirming with the namespace owner. Only a registered node runs it (it needs a nodeId
                 // to recognise itself in a descriptor and controller endpoints to ask).
                 startedGc = new OrphanGc(openedStore, deletes, nodeId, config.controllerEndpoints(),
@@ -210,18 +210,6 @@ public final class DataNode implements AutoCloseable {
     public long deleteOkCount() { return deleteService.okDeletes(); }
     public long deleteNotFoundCount() { return deleteService.notFoundDeletes(); }
     public long deleteFailedCount() { return deleteService.failedDeletes(); }
-    public int orphanGcBudgetLimitedNamespaces() {
-        return orphanGc == null ? 0 : orphanGc.budgetLimitedNamespaces();
-    }
-    public int orphanGcBudgetLimitedChunks() {
-        return orphanGc == null ? 0 : orphanGc.budgetLimitedChunks();
-    }
-    public long orphanGcBudgetLimitedPasses() {
-        return orphanGc == null ? 0 : orphanGc.budgetLimitedPasses();
-    }
-    public long orphanGcBudgetLimitedChunkTotal() {
-        return orphanGc == null ? 0 : orphanGc.budgetLimitedChunkTotal();
-    }
     public int orphanGcBreakerOpenNamespaces() {
         return orphanGc == null ? 0 : orphanGc.breakerOpenNamespaces();
     }
@@ -233,6 +221,12 @@ public final class DataNode implements AutoCloseable {
     }
     public long orphanGcBreakerSkippedChunkTotal() {
         return orphanGc == null ? 0 : orphanGc.breakerSkippedChunkTotal();
+    }
+    public int orphanGcBreakerHaltedNamespaces() {
+        return orphanGc == null ? 0 : orphanGc.breakerHaltedNamespaces();
+    }
+    public int orphanGcBreakerHaltedChunks() {
+        return orphanGc == null ? 0 : orphanGc.breakerHaltedChunks();
     }
 
     /** Installs a per-request latency observer on the data-plane server (used by the metrics layer). */
@@ -256,7 +250,7 @@ public final class DataNode implements AutoCloseable {
         return draining.get();
     }
 
-    /** Records that owner {@code verifierEndpoint} issued a VERIFY_CHUNKS to this node (design §20.4). */
+    /** Records that owner {@code verifierEndpoint} issued a VERIFY_CHUNKS to this node (design §9.2). */
     void noteVerifiedBy(String verifierEndpoint) {
         verifiersHeardFrom.add(verifierEndpoint);
     }

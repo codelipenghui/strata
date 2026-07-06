@@ -191,7 +191,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case VERIFY_CHUNKS -> {
                 // Owner-pull durability verification (design §20.3): report the local state of each
                 // requested chunk (present/state/length/crc) and stamp the present ones as freshly
-                // verified, feeding node-local orphan GC (§20.4). The owner judges missing/corrupt.
+                // verified, feeding node-local orphan GC (§9.2). The owner judges missing/corrupt.
                 var m = Messages.VerifyChunks.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
                 node.noteVerifiedBy(m.verifierEndpoint());
