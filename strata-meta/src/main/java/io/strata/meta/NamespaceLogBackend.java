@@ -867,6 +867,15 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
     }
 
     @Override
+    public long namespaceOwnerEpoch(StrataNamespace namespace) {
+        if (isSystem(namespace)) {
+            return 0;
+        }
+        NamespaceLeadershipHandle handle = namespaces.get(namespace);
+        return handle == null ? 0 : handle.metadataEpoch;
+    }
+
+    @Override
     public ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
         NamespaceLeadershipHandle handle = namespaces.get(namespace);
         if (handle == null) {

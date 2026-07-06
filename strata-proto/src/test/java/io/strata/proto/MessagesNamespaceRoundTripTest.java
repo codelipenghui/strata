@@ -70,11 +70,13 @@ class MessagesNamespaceRoundTripTest {
 
     @Test
     void verifyChunksRequestRoundTrips() {
-        var m = new Messages.VerifyChunks(NS, "127.0.0.1:9301", List.of(CID, new ChunkId(FileId.of(8), 0)));
+        var m = new Messages.VerifyChunks(NS, "127.0.0.1:9301",
+                List.of(CID, new ChunkId(FileId.of(8), 0)), 99);
         var d = Messages.VerifyChunks.decode(ByteBuffer.wrap(m.encode()));
         assertEquals(NS, d.namespace());
         assertEquals("127.0.0.1:9301", d.verifierEndpoint());
         assertEquals(List.of(CID, new ChunkId(FileId.of(8), 0)), d.chunkIds());
+        assertEquals(99, d.ownerEpoch());
     }
 
     @Test

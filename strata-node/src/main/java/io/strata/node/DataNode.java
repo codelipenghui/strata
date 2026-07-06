@@ -1,6 +1,9 @@
 package io.strata.node;
 
 import io.strata.common.Closeables;
+import io.strata.common.ErrorCode;
+import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkStore;
 import io.strata.proto.RequestObserver;
 import io.strata.proto.ScpServer;
@@ -39,6 +42,7 @@ public final class DataNode implements AutoCloseable {
     private final ControlLoop controlLoop;
     private final OrphanGc orphanGc; // node-local orphan GC (design §9.2); null in standalone mode
     private final AtomicBoolean draining = new AtomicBoolean(false);
+    private final ConcurrentHashMap<StrataNamespace, Long> highestOwnerEpochByNamespace = new ConcurrentHashMap<>();
 
     private final int nodeId;
     private final UUID incarnation;
@@ -253,6 +257,27 @@ public final class DataNode implements AutoCloseable {
     /** Records that owner {@code verifierEndpoint} issued a VERIFY_CHUNKS to this node (design §9.2). */
     void noteVerifiedBy(String verifierEndpoint) {
         verifiersHeardFrom.add(verifierEndpoint);
+    }
+
+    void acceptOwnerEpoch(StrataNamespace namespace, long ownerEpoch) {
+        if (ownerEpoch < 0) {
+            throw new IllegalArgumentException("ownerEpoch must be non-negative: " + ownerEpoch);
+        }
+        highestOwnerEpochByNamespace.compute(namespace, (ignored, current) -> {
+            long seen = current == null ? 0 : current;
+            if (ownerEpoch == 0) {
+                if (seen > 0) {
+                    throw new ScpException(ErrorCode.FENCED_EPOCH,
+                            "stale owner epoch 0 for namespace " + namespace, seen);
+                }
+                return current;
+            }
+            if (ownerEpoch < seen) {
+                throw new ScpException(ErrorCode.FENCED_EPOCH,
+                        "stale owner epoch " + ownerEpoch + " for namespace " + namespace, seen);
+            }
+            return Math.max(seen, ownerEpoch);
+        });
     }
 
     /** The set of owner endpoints this node has heard a VERIFY_CHUNKS from (orphan-GC membership grace). */

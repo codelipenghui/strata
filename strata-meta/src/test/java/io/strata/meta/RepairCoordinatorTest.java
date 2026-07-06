@@ -604,6 +604,41 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void namespaceOwnerVerifyStampsCurrentOwnerEpoch() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        List<Messages.VerifyChunks> verifies = new CopyOnWriteArrayList<>();
+        UUID inc = UUID.randomUUID();
+        try (ScpServer node = new ScpServer(0, 777, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                        Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                        verifies.add(vc);
+                        List<Messages.VerifyChunkResult> results = new ArrayList<>();
+                        for (ChunkId id : vc.chunkIds()) {
+                            results.add(new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096, 0xCAFE));
+                        }
+                        return ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
+                    }
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
+                })) {
+            Registered live = registerAt(registry, 881, "epoch-host", "127.0.0.1:" + node.port());
+            liveNodes(registry).remove(live.nodeId());
+            FileId fileId = fileId(0x5152);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(live.nodeId())))));
+
+            long settledActiveSince = System.currentTimeMillis() - 120_000;
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
+                    () -> false, () -> false, ns -> true, activeLeadership(settledActiveSince));
+            owner.verifyPass();
+
+            assertEquals(1, verifies.size());
+            assertEquals(7, verifies.get(0).ownerEpoch());
+        }
+    }
+
+    @Test
     void nonLeaderOwnerKeepsLastLiveReplicaWhenPeerIsDeadInPersistedState() throws Exception {
         // The last-live-replica guard must judge survivors from the persisted snapshot. A peer the leader
         // declared DEAD (persisted) but still stale-REGISTERED in a non-leader owner's frozen registry must
@@ -1288,6 +1323,11 @@ class RepairCoordinatorTest {
             @Override
             public long namespaceActiveSinceMs(StrataNamespace namespace) {
                 return activeSinceMs;
+            }
+
+            @Override
+            public long namespaceOwnerEpoch(StrataNamespace namespace) {
+                return 7;
             }
 
             @Override

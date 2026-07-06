@@ -57,7 +57,7 @@ class MessageRoundtripTest {
         var seal = new Messages.SealChunk(c, 5, 4096, ns);
         assertEquals(seal, Messages.SealChunk.decode(buf(seal.encode())));
 
-        var del = new Messages.DeleteChunks(List.of(c, new ChunkId(f, 4)), ns);
+        var del = new Messages.DeleteChunks(List.of(c, new ChunkId(f, 4)), ns, 42);
         assertEquals(del, Messages.DeleteChunks.decode(buf(del.encode())));
 
         var fetch = new Messages.FetchChunk(c, 0, Integer.MAX_VALUE, ns);
@@ -113,8 +113,9 @@ class MessageRoundtripTest {
         assertEquals(hbEmpty, Messages.NodeHeartbeat.decode(buf(hbEmpty.encode())));
 
         var hbResp = new Messages.HeartbeatResp(123456, List.of(
-                new Messages.ReplicateCmd(1, c, List.of(new Messages.Replica(7, "h7:9000")), (byte) 1, 0xAA, 4096, ns),
-                new Messages.DeleteCmd(2, List.of(c), ns),
+                new Messages.ReplicateCmd(1, c, List.of(new Messages.Replica(7, "h7:9000")),
+                        (byte) 1, 0xAA, 4096, ns, 43),
+                new Messages.DeleteCmd(2, List.of(c), ns, 43),
                 new Messages.DrainCmd(3)));
         assertEquals(hbResp, decodeResp(hbResp.encode(), Messages.HeartbeatResp::decode));
     }

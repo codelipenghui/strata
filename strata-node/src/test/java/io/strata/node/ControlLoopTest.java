@@ -458,6 +458,32 @@ class ControlLoopTest {
     }
 
     @Test
+    void executeCommandsReportsStaleOwnerEpochForHeartbeatDelete() throws Exception {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
+            node.acceptOwnerEpoch(TEST_NS, 8);
+            ControlLoop loop = controlLoop(node, configWithoutMetadata());
+            LinkedBlockingQueue<Messages.Command> commands = get(loop, "commandQueue");
+            ConcurrentLinkedQueue<Messages.CompletedCommand> completed = get(loop, "completed");
+
+            commands.add(new Messages.DeleteCmd(99, List.of(new ChunkId(FileId.of(1), 0)), TEST_NS, 7));
+
+            Thread worker = Thread.ofVirtual().name("control-loop-test-stale-owner-delete").start(() -> {
+                try {
+                    invoke(loop, "executeCommands");
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            waitFor(() -> completed.size() == 1);
+            getClosed(loop).set(true);
+            worker.interrupt();
+            worker.join(2_000);
+
+            assertEquals(ErrorCode.FENCED_EPOCH.code, completed.peek().status());
+        }
+    }
+
+    @Test
     void executeCommandsReportsDeleteFailureStatus() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             ControlLoop loop = controlLoop(node, configWithoutMetadata());

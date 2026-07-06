@@ -339,6 +339,13 @@ class RepairCoordinator implements AutoCloseable {
         return activeSince != 0 && now - activeSince >= settleMs();
     }
 
+    private long ownerEpoch(StrataNamespace namespace) {
+        if (NamespaceLogBackend.isSystem(namespace) || namespaceLeadership == null) {
+            return 0;
+        }
+        return namespaceLeadership.namespaceOwnerEpoch(namespace);
+    }
+
     private ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
         if (namespaceLeadership != null && !NamespaceLogBackend.isSystem(namespace)) {
             return namespaceLeadership.namespaceReconcileLock(namespace);
@@ -612,7 +619,7 @@ class RepairCoordinator implements AutoCloseable {
                 System.currentTimeMillis()));
         registry.enqueue(target.record.nodeId(),
                 new Messages.ReplicateCmd(cmdId, chunkId, sources, (byte) 1, chunk.crc(), chunk.length(),
-                        ns));
+                        ns, ownerEpoch(ns)));
         recordRepairIssued(trigger);
         log.info("repair: {} dead={} -> target={} (cmd {})", chunkId, deadNode, target.record.nodeId(), cmdId);
     }
@@ -789,7 +796,7 @@ class RepairCoordinator implements AutoCloseable {
         }
         try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(), ScpClient.KIND_TOOL, "owner-verify")) {
             ByteBuffer resp = client.call(Opcode.VERIFY_CHUNKS,
-                    new Messages.VerifyChunks(ns, advertisedEndpoint, chunkIds).encode(), null,
+                    new Messages.VerifyChunks(ns, advertisedEndpoint, chunkIds, ownerEpoch(ns)).encode(), null,
                     config.repairCommandTimeoutMs());
             return Messages.VerifyChunksResp.decode(resp).results();
         } catch (Exception e) {
@@ -920,7 +927,7 @@ class RepairCoordinator implements AutoCloseable {
         try {
             long cmdId = commandIds.incrementAndGet();
             Messages.ReplicateCmd cmd = new Messages.ReplicateCmd(cmdId, chunkId, sources,
-                    (byte) 1, chunk.crc(), chunk.length(), ns);
+                    (byte) 1, chunk.crc(), chunk.length(), ns, ownerEpoch(ns));
             if (execReplicate(target, cmd)
                     && applyOwnerRepair(ns, file.fileId(), chunkId, deadNode, target.record.nodeId())) {
                 recordRepairIssued(trigger);
@@ -965,7 +972,7 @@ class RepairCoordinator implements AutoCloseable {
     /** Synchronously tells {@code target} to pull the chunk (EXEC_REPLICATE); true if it acked OK. */
     private boolean execReplicate(NodeRegistry.LiveNode target, Messages.ReplicateCmd cmd) {
         BufWriter w = new BufWriter();
-        Messages.Command.write(w, cmd);
+        Messages.Command.writeRequest(w, cmd);
         return directNodeCall(target.record, cmd.chunkId(), "owner-repair", (client, timeoutMs) -> {
             client.call(Opcode.EXEC_REPLICATE, w.toBytes(), null, timeoutMs);
             return true;
@@ -1003,7 +1010,7 @@ class RepairCoordinator implements AutoCloseable {
     private boolean execDelete(Records.NodeRecord node, ChunkId chunkId, StrataNamespace ns) {
         return directNodeCall(node, chunkId, "owner-delete", (client, timeoutMs) -> {
             ByteBuffer resp = client.call(Opcode.DELETE_CHUNKS,
-                    new Messages.DeleteChunks(List.of(chunkId), ns).encode(), null, timeoutMs);
+                    new Messages.DeleteChunks(List.of(chunkId), ns, ownerEpoch(ns)).encode(), null, timeoutMs);
             Messages.DeleteChunksResp r = Messages.DeleteChunksResp.decode(resp);
             short code = r.codes().isEmpty() ? ErrorCode.OK.code : r.codes().get(0);
             if (code != ErrorCode.OK.code && code != ErrorCode.CHUNK_NOT_FOUND.code) {
@@ -1117,7 +1124,8 @@ class RepairCoordinator implements AutoCloseable {
                     long cmdId = commandIds.incrementAndGet();
                     inflight.put(cmdId, new DeleteAction(ns, file.fileId(), chunkId, nodeId,
                             System.currentTimeMillis()));
-                    registry.enqueue(nodeId, new Messages.DeleteCmd(cmdId, List.of(chunkId), ns));
+                    registry.enqueue(nodeId, new Messages.DeleteCmd(cmdId, List.of(chunkId), ns,
+                            ownerEpoch(ns)));
                 }
             }
         }
