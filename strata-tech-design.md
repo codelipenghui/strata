@@ -177,10 +177,10 @@ The recovering leader must establish the durable prefix without the old leader's
 
 1. `FENCE(chunkId, E+1)` on all reachable replicas — the response carries each replica's local end offset and last-known DO (need ≥2 reachable; with <2 the chunk is unavailable until a replica returns — same fault model as Kafka `min.insync.replicas=2`).
 2. Start from `max(piggybacked DO)` across reachable replicas — everything below is known quorum-durable.
-3. Scan forward batch-by-batch (`READ` + ledger verification): if a batch exists on **any** reachable replica (CRC-valid), re-replicate it to quorum and advance; stop at the first offset found on none.
-4. Seal at the stop point; write footers; commit `SealChunk`.
+3. Scan forward batch-by-batch (`READ` + ledger verification): if a batch exists on **any** reachable replica (CRC-valid), re-replicate it to quorum and advance; stop at the first offset found on none. If a fenced replica claimed bytes above the candidate seal point but its ledger/bytes cannot be verified, abort recovery instead of sealing below that claim; the chunk stays OPEN for a retry.
+4. Seal at the verified stop point; write footers; commit `SealChunk`.
 
-Property: any producer-acked batch existed on at least `ackQuorum` replicas; with failures below the policy's tolerated threshold, at least one holder is reachable, so step 3 preserves it. With the default policy, this is the same tolerance as Kafka RF=3/acks=all/min.isr=2. Batches beyond the seal point were never acked; discarding them is correct.
+Property: any producer-acked batch existed on at least `ackQuorum` replicas; with failures below the policy's tolerated threshold, at least one holder is reachable and verifiable, so step 3 preserves it. With the default policy, this is the same tolerance as Kafka RF=3/acks=all/min.isr=2. If holder evidence exists but is temporarily unreadable or corrupt, aborting is safer than floor-sealing because acked-data loss would be permanent while a later recovery can retry verification.
 
 ### 7.4 Metadata quorum failure
 
