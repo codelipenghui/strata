@@ -40,6 +40,8 @@ class NamespaceMetadataSnapshotCodecTest {
         assertEquals(state.resolvePath(StrataPath.of("/a")), restored.resolvePath(StrataPath.of("/a")));
         assertEquals(state.chunksOn(1), restored.chunksOn(1), "node index is re-derived on restore");
         assertEquals(state.liveFiles(), restored.liveFiles());
+        assertEquals(state.version(live), restored.version(live), "file CAS version survives the snapshot");
+        assertEquals(state.version(dead), restored.version(dead), "tombstone CAS version survives the snapshot");
         assertTrue(restored.hasTombstone(dead), "tombstone survives the snapshot to keep fencing the id");
         assertEquals(999, restored.tombstoneDeletedAt(dead));
         assertTrue(restored.file(dead).isEmpty());
@@ -53,6 +55,7 @@ class NamespaceMetadataSnapshotCodecTest {
         assertEquals(0, decoded.nextFileId());
         assertEquals(0, decoded.nextLogStartOffset());
         assertTrue(decoded.files().isEmpty());
+        assertTrue(decoded.versions().isEmpty());
         assertTrue(decoded.tombstones().isEmpty());
     }
 

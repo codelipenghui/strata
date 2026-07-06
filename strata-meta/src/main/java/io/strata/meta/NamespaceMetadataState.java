@@ -65,18 +65,21 @@ final class NamespaceMetadataState {
     /**
      * The compacted serialized form of this state at a log cut offset (design §9, §10). Path bindings
      * and {@code node -> chunks} are derived on restore (a path binds exactly to its OPEN/SEALED file),
-     * so only the file table and tombstone deletion timestamps are kept.
+     * so only the file table, file CAS versions, and tombstone deletion timestamps are kept.
      */
-    record Snapshot(long nextFileId, long nextLogStartOffset, List<Records.FileRecord> files, Map<FileId, Long> tombstones) {
+    record Snapshot(long nextFileId, long nextLogStartOffset, List<Records.FileRecord> files,
+                    Map<FileId, Integer> versions, Map<FileId, Long> tombstones) {
         Snapshot {
             files = List.copyOf(files);
+            versions = Map.copyOf(versions);
             tombstones = Map.copyOf(tombstones);
         }
     }
 
     /** Captures the current state for a compaction snapshot cut at {@code nextLogStartOffset}. */
     Snapshot exportSnapshot(long nextLogStartOffset) {
-        return new Snapshot(nextFileId, nextLogStartOffset, new ArrayList<>(files.values()), new HashMap<>(tombstones));
+        return new Snapshot(nextFileId, nextLogStartOffset, new ArrayList<>(files.values()),
+                new HashMap<>(versions), new HashMap<>(tombstones));
     }
 
     /** Replaces this state with a snapshot's tables, re-deriving path bindings and the node index. */
@@ -91,7 +94,7 @@ final class NamespaceMetadataState {
         for (Records.FileRecord f : snapshot.files()) {
             files.put(f.fileId(), f);
             addToNodeChunks(f);
-            versions.put(f.fileId(), 0);
+            versions.put(f.fileId(), snapshot.versions().getOrDefault(f.fileId(), 0));
             if (f.state() == FileState.OPEN || f.state() == FileState.SEALED) {
                 pathBindings.put(f.path(), f.fileId());
             }

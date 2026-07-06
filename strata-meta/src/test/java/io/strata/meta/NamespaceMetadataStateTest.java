@@ -132,6 +132,22 @@ class NamespaceMetadataStateTest {
     }
 
     @Test
+    void fileCasVersionSurvivesSnapshotRestore() {
+        state.apply(fileCreated());
+        state.apply(new MetadataLogRecord.WriterEpochAllocated(F, 1));
+        assertEquals(1, state.version(F));
+
+        NamespaceMetadataState restored = new NamespaceMetadataState(NS);
+        restored.restore(state.exportSnapshot(123));
+
+        assertEquals(1, restored.version(F),
+                "snapshot restore must preserve the per-file CAS lineage");
+        restored.apply(new MetadataLogRecord.FileDeleting(F));
+        assertEquals(2, restored.version(F),
+                "the next mutation must advance from the restored version, not restart at zero");
+    }
+
+    @Test
     void applyAdvancesHighWaterFromReplayedCreate() {
         // apply(FileCreated(id=41)) must advance nextFileId to 42.
         state.apply(new MetadataLogRecord.FileCreated(FileId.of(41), NS,

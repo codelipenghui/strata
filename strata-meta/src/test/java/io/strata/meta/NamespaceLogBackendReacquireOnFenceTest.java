@@ -114,6 +114,31 @@ class NamespaceLogBackendReacquireOnFenceTest {
     }
 
     @Test
+    void staleFileCasFromPreviousRepositoryLineageCannotResurrectDeletingFile() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            FenceStaleLogFileStore fileStore = new FenceStaleLogFileStore();
+
+            NamespaceLogBackend ownerA = new NamespaceLogBackend(root, fileStore, false);
+            FileId id = ownerA.createFileOwnerAssigned(template("/aba", 10));
+            MetadataStore.Versioned<Records.FileRecord> created = ownerA.getFile(NS, id).orElseThrow();
+            assertTrue(ownerA.updateFile(created.value().withWriterEpoch(1), created.version()));
+            MetadataStore.Versioned<Records.FileRecord> staleRead = ownerA.getFile(NS, id).orElseThrow();
+            assertEquals(1, staleRead.version());
+
+            NamespaceLogBackend ownerB = new NamespaceLogBackend(root, fileStore, false);
+            MetadataStore.Versioned<Records.FileRecord> bRead = ownerB.getFile(NS, id).orElseThrow();
+            assertEquals(1, bRead.version());
+            assertTrue(ownerB.updateFile(bRead.value().withState(FileState.DELETING), bRead.version()));
+
+            boolean committed = ownerA.updateFile(staleRead.value().withState(FileState.SEALED), staleRead.version());
+
+            assertFalse(committed, "stale CAS from owner A must lose after owner B changes the file lineage");
+            assertEquals(FileState.DELETING, ownerA.getFile(NS, id).orElseThrow().value().state());
+        }
+    }
+
+    @Test
     void ambiguousAppendFailurePoisonsRepoSoNextMutationReAcquires() throws Exception {
         try (TestingServer zk = new TestingServer(true);
              ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
