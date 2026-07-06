@@ -84,7 +84,7 @@ class OrphanGcTest {
             OrphanGc gc = orphanGc(store, List.of("127.0.0.1:1"), 0, 60_000, 0, 5_000);
             gc.gcOnce();
             assertTrue(store.contains(NS, chunk),
-                    "an unreachable owner must never trigger a delete (fail-safe data-loss guard, §20.5)");
+                    "an unreachable owner must never trigger a delete (fail-safe data-loss guard, §9.2)");
         }
     }
 

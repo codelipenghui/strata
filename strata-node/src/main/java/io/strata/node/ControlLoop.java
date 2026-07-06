@@ -366,7 +366,7 @@ final class ControlLoop implements AutoCloseable {
     }
 
     /**
-     * Periodic local data scrub (design §20.3). With durability reconciliation now owner-driven (the
+     * Periodic local data scrub (design §9.2). With durability reconciliation now owner-driven (the
      * owner pulls VERIFY_CHUNKS), there is no inventory push; the node only re-CRCs its sealed chunks so
      * data rot surfaces in the next VERIFY_CHUNKS answer and the owner drops + re-repairs the replica.
      */
