@@ -222,6 +222,18 @@ public final class DataNode implements AutoCloseable {
     public long orphanGcBudgetLimitedChunkTotal() {
         return orphanGc == null ? 0 : orphanGc.budgetLimitedChunkTotal();
     }
+    public int orphanGcBreakerOpenNamespaces() {
+        return orphanGc == null ? 0 : orphanGc.breakerOpenNamespaces();
+    }
+    public int orphanGcNodeBreakerOpen() {
+        return orphanGc != null && orphanGc.nodeBreakerOpen() ? 1 : 0;
+    }
+    public long orphanGcBreakerTrips() {
+        return orphanGc == null ? 0 : orphanGc.breakerTrips();
+    }
+    public long orphanGcBreakerSkippedChunkTotal() {
+        return orphanGc == null ? 0 : orphanGc.breakerSkippedChunkTotal();
+    }
 
     /** Installs a per-request latency observer on the data-plane server (used by the metrics layer). */
     public void setRequestObserver(RequestObserver observer) {

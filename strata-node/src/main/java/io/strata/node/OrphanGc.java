@@ -19,6 +19,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -37,13 +39,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * before it can become a suspect) covers an in-flight create whose {@code FileCreated} is not yet
  * durable. A node-startup grace keeps a just-started node from GC'ing before the owner-pull verify
  * mechanism has had a cycle to attest its chunks. Owner-confirm is the ordinary cleanup signal, and
- * delete budgets below bound each pass so a metadata-plane loss cannot turn many stale descriptors into
- * unbounded physical deletes.
+ * delete breakers below halt a large confirmed-orphan wave so a metadata-plane loss cannot turn many
+ * stale descriptors into cascading physical deletes.
  *
  * <p>Design note (§20.4 deviation): the spec's strict "trust no-owner-verified only after hearing a
  * verify from <em>every</em> owner" would deadlock when an owner has no described chunks on this node
  * (so it never contacts the node) — exactly the all-orphan case. A time-based startup grace plus
- * owner-confirm and bounded per-pass deletes is sufficient for ordinary cleanup without deadlocking.
+ * owner-confirm and halting mass-delete breakers are sufficient for ordinary cleanup without deadlocking.
  * A dynamic owner-set change would reset the startup grace; the v0 owner set is static.
  */
 final class OrphanGc implements AutoCloseable {
@@ -71,6 +73,10 @@ final class OrphanGc implements AutoCloseable {
     private final int maxConfirmedDeletesPerNamespacePerPass;
     private final int maxConfirmedDeletePercentPerNamespacePerPass;
     private final int maxConfirmedDeletesPerNodePass;
+    private final Set<StrataNamespace> openNamespaceBreakers = ConcurrentHashMap.newKeySet();
+    private final AtomicBoolean nodeBreakerOpen = new AtomicBoolean();
+    private final AtomicLong breakerTrips = new AtomicLong();
+    private final AtomicLong breakerSkippedChunkTotal = new AtomicLong();
     private final AtomicLong budgetLimitedPasses = new AtomicLong();
     private final AtomicLong budgetLimitedChunkTotal = new AtomicLong();
     private final long startedAtMs = System.currentTimeMillis();
@@ -120,12 +126,19 @@ final class OrphanGc implements AutoCloseable {
 
     /** One GC pass: confirm each suspect with its owner and delete only confirmed orphans. */
     void gcOnce() throws InterruptedException {
+        if (nodeBreakerOpen.get()) {
+            recordBudgetLimit(0, 0);
+            return;
+        }
         long now = System.currentTimeMillis();
         Map<StrataNamespace, List<ChunkId>> confirmed = new LinkedHashMap<>();
         Map<StrataNamespace, Integer> sealedByNamespace = store.sealedChunksByNamespace();
         for (ChunkStore.SuspectChunk s : store.orphanSuspects(graceMs, now)) {
             if (closed.get()) {
                 return;
+            }
+            if (nodeBreakerOpen.get() || openNamespaceBreakers.contains(s.namespace())) {
+                continue;
             }
             switch (confirm(s.namespace(), s.chunkId())) {
                 case ORPHAN -> confirmed.computeIfAbsent(s.namespace(), ignored -> new ArrayList<>()).add(s.chunkId());
@@ -134,6 +147,12 @@ final class OrphanGc implements AutoCloseable {
         }
         int limitedNamespaces = 0;
         int limitedChunks = 0;
+        int totalConfirmed = confirmed.values().stream().mapToInt(List::size).sum();
+        if (nodeBreakerShouldTrip(totalConfirmed)) {
+            tripNodeBreaker(totalConfirmed, confirmed.size());
+            recordBudgetLimit(confirmed.size(), totalConfirmed);
+            return;
+        }
         int nodeRemaining = maxConfirmedDeletesPerNodePass == 0
                 ? Integer.MAX_VALUE
                 : maxConfirmedDeletesPerNodePass;
@@ -143,6 +162,12 @@ final class OrphanGc implements AutoCloseable {
                 continue;
             }
             int namespaceBudget = namespaceBudget(sealedByNamespace.getOrDefault(e.getKey(), 0));
+            if (namespaceBreakerShouldTrip(chunks.size(), namespaceBudget)) {
+                tripNamespaceBreaker(e.getKey(), chunks.size(), namespaceBudget);
+                limitedNamespaces++;
+                limitedChunks += chunks.size();
+                continue;
+            }
             int allowed = Math.min(chunks.size(), Math.min(namespaceBudget, nodeRemaining));
             if (allowed < chunks.size()) {
                 limitedNamespaces++;
@@ -159,6 +184,34 @@ final class OrphanGc implements AutoCloseable {
             }
         }
         recordBudgetLimit(limitedNamespaces, limitedChunks);
+    }
+
+    private boolean namespaceBreakerShouldTrip(int confirmedChunks, int namespaceBudget) {
+        return namespaceBudget != Integer.MAX_VALUE && confirmedChunks > namespaceBudget;
+    }
+
+    private boolean nodeBreakerShouldTrip(int confirmedChunks) {
+        return maxConfirmedDeletesPerNodePass > 0 && confirmedChunks > maxConfirmedDeletesPerNodePass;
+    }
+
+    private void tripNamespaceBreaker(StrataNamespace namespace, int confirmedChunks, int namespaceBudget) {
+        if (openNamespaceBreakers.add(namespace)) {
+            breakerTrips.incrementAndGet();
+            breakerSkippedChunkTotal.addAndGet(confirmedChunks);
+            log.error("orphan GC breaker opened for namespace {}: {} confirmed orphans exceeds budget {}; "
+                            + "halting orphan deletes for this namespace until operator acknowledgment",
+                    namespace, confirmedChunks, namespaceBudget);
+        }
+    }
+
+    private void tripNodeBreaker(int confirmedChunks, int namespaces) {
+        if (nodeBreakerOpen.compareAndSet(false, true)) {
+            breakerTrips.incrementAndGet();
+            breakerSkippedChunkTotal.addAndGet(confirmedChunks);
+            log.error("orphan GC node-wide breaker opened: {} confirmed orphans across {} namespaces exceeds "
+                            + "node budget {}; halting all orphan deletes until operator acknowledgment",
+                    confirmedChunks, namespaces, maxConfirmedDeletesPerNodePass);
+        }
     }
 
     private int namespaceBudget(int sealedChunkCount) {
@@ -202,6 +255,34 @@ final class OrphanGc implements AutoCloseable {
 
     long budgetLimitedChunkTotal() {
         return budgetLimitedChunkTotal.get();
+    }
+
+    int breakerOpenNamespaces() {
+        return openNamespaceBreakers.size();
+    }
+
+    boolean namespaceBreakerOpen(StrataNamespace namespace) {
+        return openNamespaceBreakers.contains(namespace);
+    }
+
+    boolean nodeBreakerOpen() {
+        return nodeBreakerOpen.get();
+    }
+
+    long breakerTrips() {
+        return breakerTrips.get();
+    }
+
+    long breakerSkippedChunkTotal() {
+        return breakerSkippedChunkTotal.get();
+    }
+
+    void acknowledgeNamespaceBreaker(StrataNamespace namespace) {
+        openNamespaceBreakers.remove(namespace);
+    }
+
+    void acknowledgeNodeBreaker() {
+        nodeBreakerOpen.set(false);
     }
 
     private void deleteConfirmed(StrataNamespace namespace, ChunkId chunkId) throws InterruptedException {

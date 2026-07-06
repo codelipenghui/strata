@@ -147,7 +147,7 @@ class OrphanGcTest {
     }
 
     @Test
-    void massConfirmedOrphansDrainUpToNamespaceLimitPerPass() throws Exception {
+    void massConfirmedOrphansOpenNamespaceBreakerInsteadOfDraining() throws Exception {
         ChunkId first = new ChunkId(FileId.of(1), 0);
         ChunkId second = new ChunkId(FileId.of(2), 0);
         ChunkId third = new ChunkId(FileId.of(3), 0);
@@ -161,22 +161,21 @@ class OrphanGcTest {
 
             gc.gcOnce();
 
-            assertEquals(1, present(store, NS, first, second, third),
-                    "a large orphan wave should drain up to the namespace budget instead of wedging");
-            assertEquals(1, gc.budgetLimitedNamespaces());
-            assertEquals(1, gc.budgetLimitedChunks());
+            assertEquals(3, present(store, NS, first, second, third),
+                    "a large orphan wave should open the namespace breaker before deleting any chunk");
+            assertTrue(gc.namespaceBreakerOpen(NS));
+            assertEquals(1, gc.breakerOpenNamespaces());
 
             gc.gcOnce();
 
-            assertEquals(0, present(store, NS, first, second, third),
-                    "deferred confirmed orphans should be reclaimed on later passes");
-            assertEquals(0, gc.budgetLimitedNamespaces());
-            assertEquals(0, gc.budgetLimitedChunks());
+            assertEquals(3, present(store, NS, first, second, third),
+                    "an open namespace breaker must halt later passes until operator acknowledgment");
+            assertTrue(gc.namespaceBreakerOpen(NS));
         }
     }
 
     @Test
-    void smallNamespaceUsesPercentBudgetEvenWhenAbsoluteLimitIsHigh() throws Exception {
+    void smallNamespaceOpensBreakerWhenConfirmedWaveExceedsPercentBudget() throws Exception {
         ChunkId first = new ChunkId(FileId.of(1), 0);
         ChunkId second = new ChunkId(FileId.of(2), 0);
         ChunkId third = new ChunkId(FileId.of(3), 0);
@@ -190,15 +189,14 @@ class OrphanGcTest {
 
             gc.gcOnce();
 
-            assertEquals(2, present(store, NS, first, second, third),
-                    "the percent budget must prevent a small namespace from being fully deleted in one pass");
-            assertEquals(1, gc.budgetLimitedNamespaces());
-            assertEquals(2, gc.budgetLimitedChunks());
+            assertEquals(3, present(store, NS, first, second, third),
+                    "a confirmed wave above the percent budget must halt instead of rate-limiting deletes");
+            assertTrue(gc.namespaceBreakerOpen(NS));
         }
     }
 
     @Test
-    void nodeWideBudgetCapsDeletesAcrossNamespaces() throws Exception {
+    void nodeWideBudgetOpensGlobalBreakerAcrossNamespaces() throws Exception {
         StrataNamespace a = StrataNamespace.of("a");
         StrataNamespace b = StrataNamespace.of("b");
         ChunkId a1 = new ChunkId(FileId.of(1), 0);
@@ -217,8 +215,8 @@ class OrphanGcTest {
             gc.gcOnce();
 
             int remaining = present(store, a, a1, a2) + present(store, b, b1, b2);
-            assertEquals(2, remaining, "the node-wide budget must cap total deletes across namespaces");
-            assertEquals(2, gc.budgetLimitedChunks());
+            assertEquals(4, remaining, "a node-wide confirmed wave must open the global breaker before deletion");
+            assertTrue(gc.nodeBreakerOpen());
         }
     }
 
