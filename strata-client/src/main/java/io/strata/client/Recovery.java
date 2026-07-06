@@ -199,6 +199,7 @@ final class Recovery {
 
         // 3. merge ledger boundaries above p from all reachable replicas
         TreeMap<Long, List<LedgerCandidate>> boundaries = new TreeMap<>();
+        Set<ReplicaState> unverifiedAboveFloorHolders = new HashSet<>();
         for (ReplicaState rs : reachable) {
             try {
                 ByteBuffer h = readPool.get(rs.replica.endpoint()).call(Opcode.READ_LEDGER,
@@ -206,14 +207,16 @@ final class Recovery {
                 long previousEnd = p;
                 for (Messages.LedgerEntry e : Messages.ReadLedgerResp.decode(h).entries()) {
                     boundaries.computeIfAbsent(e.endOffset(), ignored -> new ArrayList<>())
-                            .add(new LedgerCandidate(previousEnd, e));
+                            .add(new LedgerCandidate(rs, previousEnd, e));
                     previousEnd = e.endOffset();
                 }
             } catch (ScpException e) {
                 log.warn("read ledger {} on {} failed: {}", chunkId, rs.replica.endpoint(), e.getMessage());
+                markUnverifiedAboveFloorHolder(unverifiedAboveFloorHolders, rs, p);
             } catch (RuntimeException e) {
                 log.warn("read ledger {} on {} returned malformed response: {}",
                         chunkId, rs.replica.endpoint(), e.toString());
+                markUnverifiedAboveFloorHolder(unverifiedAboveFloorHolders, rs, p);
             }
         }
 
@@ -222,7 +225,7 @@ final class Recovery {
         // one replica must not block a larger intact append held by a quorum of replicas.
         while (true) {
             Candidate candidate = bestContinuation(chunkId, reachable, boundaries, p, ackQuorum,
-                    unreachableReplicas);
+                    unreachableReplicas, unverifiedAboveFloorHolders);
             if (candidate == null) {
                 break; // no agreed continuation: a true gap, a torn/CRC-invalid tail, or a divergent split
             }
@@ -251,13 +254,14 @@ final class Recovery {
             p = end;
         }
 
+        requireNoUnverifiedAboveFloorHolders(chunkId, unverifiedAboveFloorHolders, p);
         log.info("seal-recovery: chunk {} sealing at {}", chunkId, p);
         return finishSeal(chunkId, writerEpoch, p, reachable, ackQuorum);
     }
 
     private record Candidate(long end, byte[] bytes) {}
 
-    private record LedgerCandidate(long previousEnd, Messages.LedgerEntry entry) {}
+    private record LedgerCandidate(ReplicaState replica, long previousEnd, Messages.LedgerEntry entry) {}
 
     private static final class CandidateCount {
         final byte[] bytes;
@@ -271,7 +275,8 @@ final class Recovery {
 
     private Candidate bestContinuation(ChunkId chunkId, List<ReplicaState> reachable,
                                        TreeMap<Long, List<LedgerCandidate>> boundaries, long p,
-                                       int ackQuorum, int unreachableReplicas) {
+                                       int ackQuorum, int unreachableReplicas,
+                                       Set<ReplicaState> unverifiedAboveFloorHolders) {
         // Farthest boundary first: a longer continuation that is still provable — a reachable quorum,
         // or (issue #29) a single CRC-valid copy that could still have been acked — should win over a
         // shorter one. A sub-quorum single is committed only if no reachable replica holds conflicting
@@ -281,20 +286,31 @@ final class Recovery {
             long end = entry.getKey();
             // The CRC(s) a batch [p, end) is allowed to have, per any reachable replica's ledger.
             Set<Integer> validCrcs = new HashSet<>();
+            Set<ReplicaState> exactLedgerHolders = new HashSet<>();
+            Set<ReplicaState> coveringLedgerHolders = new HashSet<>();
+            for (var boundary : boundaries.tailMap(end, true).entrySet()) {
+                for (LedgerCandidate ledger : boundary.getValue()) {
+                    if (ledger.previousEnd() == p) {
+                        coveringLedgerHolders.add(ledger.replica());
+                    }
+                }
+            }
             for (LedgerCandidate ledger : entry.getValue()) {
                 if (ledger.previousEnd() == p) {
                     validCrcs.add(ledger.entry().payloadCrc());
+                    exactLedgerHolders.add(ledger.replica());
                 }
             }
             if (validCrcs.isEmpty()) continue;
             Agreed agreed = agreedContinuation(chunkId, reachable, p, end, validCrcs, ackQuorum,
-                    unreachableReplicas);
+                    unreachableReplicas, exactLedgerHolders, coveringLedgerHolders,
+                    unverifiedAboveFloorHolders);
             if (agreed == null) continue;
             Candidate candidate = new Candidate(end, agreed.bytes());
             if (agreed.quorum()) {
                 return candidate; // a reachable quorum wins; the seal quorum drops any outlier (§14.6)
             }
-            if (!conflictsAboveFloor(chunkId, reachable, p, candidate)) {
+            if (!conflictsAboveFloor(chunkId, reachable, p, candidate, unverifiedAboveFloorHolders)) {
                 return candidate;
             }
         }
@@ -309,12 +325,17 @@ final class Recovery {
      * instead of truncating cleanly at the floor.
      */
     private boolean conflictsAboveFloor(ChunkId chunkId, List<ReplicaState> reachable, long p,
-                                        Candidate candidate) {
+                                        Candidate candidate, Set<ReplicaState> unverifiedAboveFloorHolders) {
         for (ReplicaState rs : reachable) {
             long overlapEnd = Math.min(rs.end, candidate.end());
             if (overlapEnd <= p) continue; // holds nothing above the floor within the candidate range
             byte[] held = readRange(chunkId, rs, p, overlapEnd);
-            if (held == null) continue; // an unreadable replica is not positive evidence of divergence
+            if (held == null) {
+                markUnverifiedAboveFloorHolder(unverifiedAboveFloorHolders, rs, p);
+                // Not positive evidence of divergence, but not agreement either: if no later
+                // continuation covers this claim, the final seal must fail closed below it.
+                continue;
+            }
             int len = (int) (overlapEnd - p);
             if (!Arrays.equals(held, 0, len, candidate.bytes(), 0, len)) {
                 return true;
@@ -336,18 +357,30 @@ final class Recovery {
      * stops at the floor.
      */
     private Agreed agreedContinuation(ChunkId chunkId, List<ReplicaState> reachable, long from, long to,
-                                      Set<Integer> validCrcs, int ackQuorum, int unreachableReplicas) {
+                                      Set<Integer> validCrcs, int ackQuorum, int unreachableReplicas,
+                                      Set<ReplicaState> exactLedgerHolders,
+                                      Set<ReplicaState> coveringLedgerHolders,
+                                      Set<ReplicaState> unverifiedAboveFloorHolders) {
         List<CandidateCount> counts = new ArrayList<>();
+        List<ReplicaState> crcInvalidLedgerHolders = new ArrayList<>();
         int unverifiedHolders = 0;
         for (ReplicaState rs : reachable) {
             if (rs.end < to) continue;
             byte[] data = readRange(chunkId, rs, from, to);
             if (data == null) {
-                // Null includes transient failures and short responses; both retain fence-time holder credit.
+                // Null includes transient failures and short responses; both retain fence-time holder
+                // credit and mark the replica unverified, so recovery never seals below a claimed end
+                // that it could not read.
                 unverifiedHolders++;
+                markUnverifiedAboveFloorHolder(unverifiedAboveFloorHolders, rs, from);
                 continue;
             }
             if (!validCrcs.contains(Crc.of(data))) {
+                if (exactLedgerHolders.contains(rs) || !coveringLedgerHolders.contains(rs)) {
+                    log.warn("recovery read {} range [{}..{}) from {} mismatched all viable ledger CRC candidates",
+                            chunkId, from, to, rs.replica.endpoint());
+                    crcInvalidLedgerHolders.add(rs);
+                }
                 continue;
             }
             boolean merged = false;
@@ -364,6 +397,18 @@ final class Recovery {
                 counts.add(new CandidateCount(data));
             }
         }
+        int strongestValidCount = 0;
+        for (CandidateCount count : counts) {
+            strongestValidCount = Math.max(strongestValidCount, count.count);
+        }
+        // Counting other-valued valid holders over-approximates ack possibility on purpose:
+        // over-marking aborts for retry, under-marking can lose producer-acked data.
+        if (strongestValidCount + crcInvalidLedgerHolders.size() + unverifiedHolders + unreachableReplicas
+                >= ackQuorum) {
+            for (ReplicaState rs : crcInvalidLedgerHolders) {
+                markUnverifiedAboveFloorHolder(unverifiedAboveFloorHolders, rs, from);
+            }
+        }
         if (counts.size() == 1
                 && counts.get(0).count + unreachableReplicas + unverifiedHolders >= ackQuorum) {
             return new Agreed(counts.get(0).bytes, false);
@@ -372,6 +417,37 @@ final class Recovery {
     }
 
     private record Agreed(byte[] bytes, boolean quorum) {}
+
+    private static void markUnverifiedAboveFloorHolder(Set<ReplicaState> unverifiedAboveFloorHolders,
+                                                       ReplicaState rs, long floor) {
+        if (rs.end > floor) {
+            unverifiedAboveFloorHolders.add(rs);
+        }
+    }
+
+    /**
+     * Issue #84 fail-closed gate. A holder whose fence response claimed bytes above the final seal point
+     * may still contain producer-acked data; losing those bytes by floor-sealing is permanent, while
+     * aborting leaves the chunk OPEN for a later recovery retry. This check intentionally uses the final
+     * seal point, not the floor at marking time, so a holder is forgiven when a later accepted
+     * continuation covers its claim. Eviction from the seal set does not remove the mark because eviction
+     * is not evidence that the holder's above-floor bytes were unacked.
+     */
+    private static void requireNoUnverifiedAboveFloorHolders(ChunkId chunkId,
+                                                             Set<ReplicaState> unverifiedAboveFloorHolders,
+                                                             long sealPoint) {
+        for (ReplicaState rs : unverifiedAboveFloorHolders) {
+            if (rs.end > sealPoint) {
+                log.warn("seal-recovery: chunk {} aborting before seal at {} because replica {} claimed "
+                                + "unverified end {}",
+                        chunkId, sealPoint, rs.replica.nodeId(), rs.end);
+                throw new ScpException(ErrorCode.INTERNAL,
+                        "chunk " + chunkId + " has unverified above-floor holder "
+                                + rs.replica.nodeId() + " at " + rs.end
+                                + " > seal point " + sealPoint);
+            }
+        }
+    }
 
     /**
      * Brings every reachable replica's end up to {@code target} by copying from a replica that
