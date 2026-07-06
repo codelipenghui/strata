@@ -367,6 +367,158 @@
       }
     },
     {
+      "id": 52,
+      "type": "row",
+      "title": "Orphan GC breakers",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "collapsed": false
+    },
+    {
+      "id": 53,
+      "type": "stat",
+      "title": "Namespace breakers open",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 6
+      },
+      "targets": [
+        {
+          "expr": "max(strata_data_node_orphan_gc_breaker_open_namespaces{instance=~\"$node\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "closed",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "open",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "description": "Number of namespace-scoped orphan-GC breakers currently open; alert at >=1."
+    },
+    {
+      "id": 54,
+      "type": "stat",
+      "title": "Node breaker open",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 6
+      },
+      "targets": [
+        {
+          "expr": "max(strata_data_node_orphan_gc_node_breaker_open{instance=~\"$node\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "closed",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "open",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "description": "1 when the node-wide orphan-GC breaker is open; alert at >=1."
+    },
+    {
       "id": 10,
       "type": "row",
       "title": "Throughput & ops",
@@ -374,7 +526,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 5
+        "y": 10
       },
       "collapsed": false
     },
@@ -390,7 +542,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 6
+        "y": 11
       },
       "targets": [
         {
@@ -441,7 +593,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 6
+        "y": 11
       },
       "targets": [
         {
@@ -492,7 +644,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 14
+        "y": 19
       },
       "targets": [
         {
@@ -538,7 +690,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 14
+        "y": 19
       },
       "targets": [
         {
@@ -580,7 +732,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 22
+        "y": 27
       },
       "collapsed": false
     },
@@ -596,7 +748,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 23
+        "y": 28
       },
       "targets": [
         {
@@ -642,7 +794,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 23
+        "y": 28
       },
       "targets": [
         {
@@ -692,7 +844,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 31
+        "y": 36
       },
       "collapsed": false
     },
@@ -708,7 +860,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 37
       },
       "targets": [
         {
@@ -754,7 +906,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 37
       },
       "targets": [
         {
@@ -796,7 +948,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 40
+        "y": 45
       },
       "collapsed": false
     },
@@ -812,7 +964,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 41
+        "y": 46
       },
       "targets": [
         {
@@ -858,7 +1010,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 41
+        "y": 46
       },
       "targets": [
         {
@@ -896,41 +1048,112 @@
       "id": 50,
       "type": "stat",
       "title": "Open file descriptors",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 102 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 107
+      },
       "targets": [
-        { "expr": "max(strata_data_node_open_fds{instance=~\"$node\"})", "refId": "A", "instant": true }
+        {
+          "expr": "max(strata_data_node_open_fds{instance=~\"$node\"})",
+          "refId": "A",
+          "instant": true
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
         }
       },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
     },
     {
       "id": 51,
       "type": "timeseries",
       "title": "Channel cache size vs capacity & hit rate",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 4, "y": 102 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 4,
+        "y": 107
+      },
       "targets": [
-        { "expr": "strata_data_node_filechannel_cache_size{instance=~\"$node\"}", "refId": "A", "legendFormat": "{{instance}} size" },
-        { "expr": "strata_data_node_filechannel_cache_capacity{instance=~\"$node\"}", "refId": "B", "legendFormat": "{{instance}} capacity" },
-        { "expr": "rate(strata_data_node_filechannel_cache_total{instance=~\"$node\",event=\"eviction\"}[5m])", "refId": "C", "legendFormat": "{{instance}} evict/s" }
+        {
+          "expr": "strata_data_node_filechannel_cache_size{instance=~\"$node\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}} size"
+        },
+        {
+          "expr": "strata_data_node_filechannel_cache_capacity{instance=~\"$node\"}",
+          "refId": "B",
+          "legendFormat": "{{instance}} capacity"
+        },
+        {
+          "expr": "rate(strata_data_node_filechannel_cache_total{instance=~\"$node\",event=\"eviction\"}[5m])",
+          "refId": "C",
+          "legendFormat": "{{instance}} evict/s"
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": { "fillOpacity": 10, "showPoints": "never" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
         }
       },
       "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max"] },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       }
     }
   ]

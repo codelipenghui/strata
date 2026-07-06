@@ -226,19 +226,25 @@ final class ServerMetrics {
                 .tag("result", "not_found").register(reg);
         FunctionCounter.builder("strata_data_node_delete", n, DataNode::deleteFailedCount)
                 .tag("result", "failed").register(reg);
-        Gauge.builder("strata_data_node_orphan_gc_budget_limited_namespaces", n,
-                        DataNode::orphanGcBudgetLimitedNamespaces)
-                .description("namespaces with confirmed orphan deletes deferred by the last orphan-GC budgeted pass")
-                .register(reg);
-        Gauge.builder("strata_data_node_orphan_gc_budget_limited_chunks", n,
-                        DataNode::orphanGcBudgetLimitedChunks)
-                .description("confirmed orphan deletes deferred by the last orphan-GC budgeted pass").register(reg);
-        FunctionCounter.builder("strata_data_node_orphan_gc_budget_limited_passes", n,
-                        DataNode::orphanGcBudgetLimitedPasses)
-                .description("orphan-GC passes where confirmed deletes were deferred by budgets").register(reg);
-        FunctionCounter.builder("strata_data_node_orphan_gc_budget_limited_chunk_total", n,
-                        DataNode::orphanGcBudgetLimitedChunkTotal)
-                .description("confirmed orphan deletes deferred by orphan-GC budgets").register(reg);
+        Gauge.builder("strata_data_node_orphan_gc_breaker_open_namespaces", n,
+                        DataNode::orphanGcBreakerOpenNamespaces)
+                .description("namespaces whose orphan-GC breaker is open").register(reg);
+        Gauge.builder("strata_data_node_orphan_gc_node_breaker_open", n,
+                        DataNode::orphanGcNodeBreakerOpen)
+                .description("1 when the node-wide orphan-GC breaker is open").register(reg);
+        Gauge.builder("strata_data_node_orphan_gc_breaker_halted_namespaces", n,
+                        DataNode::orphanGcBreakerHaltedNamespaces)
+                .description("namespaces whose suspect chunks were withheld by open orphan-GC breakers "
+                        + "during the last pass").register(reg);
+        Gauge.builder("strata_data_node_orphan_gc_breaker_halted_chunks", n,
+                        DataNode::orphanGcBreakerHaltedChunks)
+                .description("suspect chunks withheld by open orphan-GC breakers during the last pass").register(reg);
+        FunctionCounter.builder("strata_data_node_orphan_gc_breaker_trips_total", n,
+                        DataNode::orphanGcBreakerTrips)
+                .description("orphan-GC breaker openings").register(reg);
+        FunctionCounter.builder("strata_data_node_orphan_gc_breaker_skipped_chunk_total", n,
+                        DataNode::orphanGcBreakerSkippedChunkTotal)
+                .description("confirmed orphan deletes skipped when opening orphan-GC breakers").register(reg);
 
         // Per-namespace data throughput: register a function-counter per namespace as it first appears
         // (via ioNamespaces()). Refreshed off a daemon timer because the namespace set changes at runtime.

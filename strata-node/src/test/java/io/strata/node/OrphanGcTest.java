@@ -26,7 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** Node-local orphan GC (design §20.4/§20.5): confirm-before-delete and the fail-safe data-loss guard. */
+/** Node-local orphan GC (design §9.2): confirm-before-delete and the fail-safe data-loss guard. */
 class OrphanGcTest {
     private static final StrataNamespace NS = StrataNamespace.of("test");
     private static final int NODE_ID = 7;
@@ -147,12 +147,13 @@ class OrphanGcTest {
     }
 
     @Test
-    void massConfirmedOrphansDrainUpToNamespaceLimitPerPass() throws Exception {
+    void massConfirmedOrphansOpenNamespaceBreakerInsteadOfDraining() throws Exception {
         ChunkId first = new ChunkId(FileId.of(1), 0);
         ChunkId second = new ChunkId(FileId.of(2), 0);
         ChunkId third = new ChunkId(FileId.of(3), 0);
+        AtomicInteger confirms = new AtomicInteger();
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
-             ScpServer owner = fileNotFoundServer()) {
+             ScpServer owner = fileNotFoundServer(confirms)) {
             seal(store, first);
             seal(store, second);
             seal(store, third);
@@ -161,22 +162,102 @@ class OrphanGcTest {
 
             gc.gcOnce();
 
-            assertEquals(1, present(store, NS, first, second, third),
-                    "a large orphan wave should drain up to the namespace budget instead of wedging");
-            assertEquals(1, gc.budgetLimitedNamespaces());
-            assertEquals(1, gc.budgetLimitedChunks());
+            assertEquals(3, present(store, NS, first, second, third),
+                    "a large orphan wave should open the namespace breaker before deleting any chunk");
+            assertTrue(gc.namespaceBreakerOpen(NS));
+            assertEquals(1, gc.breakerOpenNamespaces());
+            assertEquals(1, gc.breakerTrips());
+            assertEquals(3, gc.breakerSkippedChunkTotal());
+            assertEquals(3, gc.breakerHaltedChunks());
+            assertEquals(3, confirms.get());
 
             gc.gcOnce();
 
-            assertEquals(0, present(store, NS, first, second, third),
-                    "deferred confirmed orphans should be reclaimed on later passes");
-            assertEquals(0, gc.budgetLimitedNamespaces());
-            assertEquals(0, gc.budgetLimitedChunks());
+            assertEquals(3, present(store, NS, first, second, third),
+                    "an open namespace breaker must halt later passes until restart");
+            assertTrue(gc.namespaceBreakerOpen(NS));
+            assertEquals(1, gc.breakerTrips(), "an already-open breaker must not count as a new trip");
+            assertEquals(3, gc.breakerSkippedChunkTotal(), "skipped chunks are counted only on the trip pass");
+            assertEquals(3, gc.breakerHaltedChunks());
+            assertEquals(3, confirms.get(), "open namespace breakers must skip owner confirm RPCs");
         }
     }
 
     @Test
-    void smallNamespaceUsesPercentBudgetEvenWhenAbsoluteLimitIsHigh() throws Exception {
+    void namespaceBreakerDoesNotStopHealthyNamespaces() throws Exception {
+        StrataNamespace bad = StrataNamespace.of("bad");
+        StrataNamespace healthy = StrataNamespace.of("healthy");
+        ChunkId bad1 = new ChunkId(FileId.of(1), 0);
+        ChunkId bad2 = new ChunkId(FileId.of(2), 0);
+        ChunkId bad3 = new ChunkId(FileId.of(3), 0);
+        ChunkId healthy1 = new ChunkId(FileId.of(4), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileNotFoundServer()) {
+            seal(store, bad, bad1);
+            seal(store, bad, bad2);
+            seal(store, bad, bad3);
+            seal(store, healthy, healthy1);
+            String endpoint = "127.0.0.1:" + owner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 2, 0, 0);
+
+            gc.gcOnce();
+
+            assertEquals(3, present(store, bad, bad1, bad2, bad3),
+                    "the bad namespace's confirmed wave must be halted");
+            assertEquals(0, present(store, healthy, healthy1),
+                    "a healthy sibling namespace below the breaker threshold must still drain");
+            assertTrue(gc.namespaceBreakerOpen(bad));
+            assertFalse(gc.namespaceBreakerOpen(healthy));
+            assertFalse(gc.nodeBreakerOpen());
+        }
+    }
+
+    @Test
+    void exactNamespaceBudgetDeletesWithoutOpeningBreaker() throws Exception {
+        ChunkId first = new ChunkId(FileId.of(1), 0);
+        ChunkId second = new ChunkId(FileId.of(2), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileNotFoundServer()) {
+            seal(store, first);
+            seal(store, second);
+            String endpoint = "127.0.0.1:" + owner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 2, 0, 0);
+
+            gc.gcOnce();
+
+            assertEquals(0, present(store, NS, first, second));
+            assertFalse(gc.namespaceBreakerOpen(NS));
+            assertEquals(0, gc.breakerTrips());
+        }
+    }
+
+    @Test
+    void cumulativeConfirmedOrphansOpenNamespaceBreakerAcrossPasses() throws Exception {
+        ChunkId first = new ChunkId(FileId.of(1), 0);
+        ChunkId second = new ChunkId(FileId.of(2), 0);
+        ChunkId third = new ChunkId(FileId.of(3), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileNotFoundServer()) {
+            seal(store, first);
+            seal(store, second);
+            String endpoint = "127.0.0.1:" + owner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 2, 0, 0);
+
+            gc.gcOnce();
+            assertEquals(0, present(store, NS, first, second));
+            assertFalse(gc.namespaceBreakerOpen(NS));
+
+            seal(store, third);
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, third),
+                    "the breaker must account for recent confirmed orphans, not only the current pass");
+            assertTrue(gc.namespaceBreakerOpen(NS));
+        }
+    }
+
+    @Test
+    void smallNamespaceOpensBreakerWhenConfirmedWaveExceedsPercentBudget() throws Exception {
         ChunkId first = new ChunkId(FileId.of(1), 0);
         ChunkId second = new ChunkId(FileId.of(2), 0);
         ChunkId third = new ChunkId(FileId.of(3), 0);
@@ -190,35 +271,49 @@ class OrphanGcTest {
 
             gc.gcOnce();
 
-            assertEquals(2, present(store, NS, first, second, third),
-                    "the percent budget must prevent a small namespace from being fully deleted in one pass");
-            assertEquals(1, gc.budgetLimitedNamespaces());
-            assertEquals(2, gc.budgetLimitedChunks());
+            assertEquals(3, present(store, NS, first, second, third),
+                    "a confirmed wave above the percent budget must halt instead of rate-limiting deletes");
+            assertTrue(gc.namespaceBreakerOpen(NS));
         }
     }
 
     @Test
-    void nodeWideBudgetCapsDeletesAcrossNamespaces() throws Exception {
+    void nodeWideBudgetOpensGlobalBreakerAcrossNamespaces() throws Exception {
         StrataNamespace a = StrataNamespace.of("a");
         StrataNamespace b = StrataNamespace.of("b");
         ChunkId a1 = new ChunkId(FileId.of(1), 0);
         ChunkId a2 = new ChunkId(FileId.of(2), 0);
         ChunkId b1 = new ChunkId(FileId.of(3), 0);
         ChunkId b2 = new ChunkId(FileId.of(4), 0);
+        AtomicInteger confirms = new AtomicInteger();
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
-             ScpServer owner = fileNotFoundServer()) {
+             ScpServer owner = fileNotFoundServer(confirms)) {
             seal(store, a, a1);
             seal(store, a, a2);
             seal(store, b, b1);
             seal(store, b, b2);
             String endpoint = "127.0.0.1:" + owner.port();
-            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 64, 0, 2);
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 64, 0, 3);
 
             gc.gcOnce();
 
             int remaining = present(store, a, a1, a2) + present(store, b, b1, b2);
-            assertEquals(2, remaining, "the node-wide budget must cap total deletes across namespaces");
-            assertEquals(2, gc.budgetLimitedChunks());
+            assertEquals(4, remaining, "a node-wide confirmed wave must open the global breaker before deletion");
+            assertTrue(gc.nodeBreakerOpen());
+            assertEquals(0, gc.breakerOpenNamespaces());
+            assertEquals(1, gc.breakerTrips());
+            assertEquals(4, gc.breakerSkippedChunkTotal());
+            assertEquals(4, gc.breakerHaltedChunks());
+            assertEquals(4, confirms.get());
+
+            gc.gcOnce();
+
+            assertEquals(4, present(store, a, a1, a2) + present(store, b, b1, b2));
+            assertTrue(gc.nodeBreakerOpen());
+            assertEquals(0, gc.breakerOpenNamespaces());
+            assertEquals(1, gc.breakerTrips());
+            assertEquals(4, gc.breakerSkippedChunkTotal());
+            assertEquals(4, confirms.get(), "open node breakers must skip owner confirm RPCs");
         }
     }
 
@@ -292,9 +387,16 @@ class OrphanGcTest {
     }
 
     private static ScpServer fileNotFoundServer() throws Exception {
+        return fileNotFoundServer(null);
+    }
+
+    private static ScpServer fileNotFoundServer(AtomicInteger calls) throws Exception {
         return new ScpServer(0, 0, 0, 0, req -> {
             if (req.opcode() != Opcode.LOOKUP_FILE.code) {
                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+            }
+            if (calls != null) {
+                calls.incrementAndGet();
             }
             throw new ScpException(ErrorCode.FILE_NOT_FOUND, "no such file");
         });

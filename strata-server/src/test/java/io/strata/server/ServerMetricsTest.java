@@ -42,10 +42,12 @@ class ServerMetricsTest {
             assertNotNull(registry.find("strata_data_node_filechannel_cache_size").gauge());
             assertNotNull(registry.find("strata_data_node_filechannel_cache_capacity").gauge());
             assertNotNull(registry.find("strata_data_node_open_fds").gauge());
-            assertNotNull(registry.find("strata_data_node_orphan_gc_budget_limited_namespaces").gauge());
-            assertNotNull(registry.find("strata_data_node_orphan_gc_budget_limited_chunks").gauge());
-            assertNotNull(registry.find("strata_data_node_orphan_gc_budget_limited_passes").functionCounter());
-            assertNotNull(registry.find("strata_data_node_orphan_gc_budget_limited_chunk_total").functionCounter());
+            assertNotNull(registry.find("strata_data_node_orphan_gc_breaker_open_namespaces").gauge());
+            assertNotNull(registry.find("strata_data_node_orphan_gc_node_breaker_open").gauge());
+            assertNotNull(registry.find("strata_data_node_orphan_gc_breaker_halted_namespaces").gauge());
+            assertNotNull(registry.find("strata_data_node_orphan_gc_breaker_halted_chunks").gauge());
+            assertNotNull(registry.find("strata_data_node_orphan_gc_breaker_trips_total").functionCounter());
+            assertNotNull(registry.find("strata_data_node_orphan_gc_breaker_skipped_chunk_total").functionCounter());
         }
     }
 
