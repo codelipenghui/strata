@@ -156,7 +156,7 @@ class MessageGoldenCorpusTest {
                         // EXEC_REPLICATE moved from 0x020a (control-plane range) to 0x001b (data-plane)
                         // to fix combined-node routing: opcodes >= 0x0100 route to Controller, but
                         // EXEC_REPLICATE is handled by DataNodeHandlers (Bug B fix). VERIFY_CHUNKS (0x001c)
-                        // appended (§20.3); INVENTORY_REPORT (0x0103) removed (§20.3) — count back to 0x19.
+                        // appended (§9.2); INVENTORY_REPORT (0x0103) removed (§9.2) — count back to 0x19.
                         "0000000101020304050607080000002a11112222333344445555666677778888"
                                 + "040000000000000040000000190001000100100001001100010012000100130001"
                                 + "001400010015000100160001001700010018000100190001001a000101010001"

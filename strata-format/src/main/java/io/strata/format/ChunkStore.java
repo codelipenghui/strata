@@ -621,9 +621,9 @@ public final class ChunkStore implements AutoCloseable {
         long sealedLength = -1;
         int dataCrc;
         int[] sealedRangeCrcs = EMPTY_INT_ARRAY;
-        // Last time an owner attested this replica via VERIFY_CHUNKS (design §20.3); seeded to when this
+        // Last time an owner attested this replica via VERIFY_CHUNKS (design §9.2); seeded to when this
         // node first learned of the chunk so a freshly-created/recovered chunk gets the full orphan grace
-        // (§20.4) before it can be considered a suspect. In-memory only: a restart re-earns verification.
+        // before it can be considered a suspect. In-memory only: a restart re-earns verification.
         volatile long lastVerifiedAtMs = System.currentTimeMillis();
         // Repair imports are locally durable before the controller commits the descriptor swap. During that
         // window LOOKUP_FILE truthfully does not list this node yet, so node-local orphan GC must not confirm
@@ -2564,8 +2564,8 @@ public final class ChunkStore implements AutoCloseable {
     public record VerifyResult(ChunkId chunkId, boolean present, ChunkState state, long length, int crc) {}
 
     /**
-     * Owner-pull verification (design §20.3): report the local state of each requested chunk and stamp
-     * the present ones as freshly verified — which both refreshes the orphan-GC grace (§20.4) and lets
+     * Owner-pull verification (design §9.2): report the local state of each requested chunk and stamp
+     * the present ones as freshly verified — which both refreshes the orphan-GC grace and lets
      * the owner compare state/length/crc against its descriptor to find missing/corrupt replicas. An
      * absent chunk reports {@code present == false} (a missing replica). Read-only on the data itself.
      */
@@ -2593,7 +2593,7 @@ public final class ChunkStore implements AutoCloseable {
     public record SuspectChunk(StrataNamespace namespace, ChunkId chunkId) {}
 
     /**
-     * Node-local orphan-GC candidates (design §20.4): sealed chunks no owner has attested within
+     * Node-local orphan-GC candidates (design §9.2): sealed chunks no owner has attested within
      * {@code olderThanMs} (via {@link #verify}). Open chunks (in-flight writes) and freshly-known chunks
      * (still inside grace) are excluded. Returns a snapshot; the caller confirms each with the owner
      * before deleting — a suspect is not yet a confirmed orphan.

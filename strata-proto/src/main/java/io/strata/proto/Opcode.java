@@ -20,7 +20,7 @@ public enum Opcode {
     // control plane (data node -> metadata)
     REGISTER_NODE(0x0101),
     NODE_HEARTBEAT(0x0102),
-    // (0x0103 INVENTORY_REPORT removed: durability reconciliation is owner-pull VERIFY_CHUNKS, §20.3)
+    // (0x0103 INVENTORY_REPORT removed: durability reconciliation is owner-pull VERIFY_CHUNKS, §9.2)
     // v0 client -> metadata (v1 moves broker-facing APIs to Kafka RPC)
     CREATE_FILE(0x0201),
     CREATE_CHUNK(0x0202),
@@ -36,7 +36,7 @@ public enum Opcode {
     // ControlLoop.replicate path). Data-plane opcode (< 0x0100) so the combined-node router sends it to
     // DataNodeHandlers, not the Controller. Append-only — kept last in the data-plane block (design §11).
     EXEC_REPLICATE(0x001B),
-    // owner-pull durability verification (design §20.3): a namespace owner asks a data node, in bounded
+    // owner-pull durability verification (design §9.2): a namespace owner asks a data node, in bounded
     // batches, for the local state of the chunks it expects that node to hold (present/missing/corrupt).
     // Replaces the central inventory push. Owner -> node, so a data-plane opcode (< 0x0100) routed to
     // DataNodeHandlers. Append-only — kept last in the data-plane block.

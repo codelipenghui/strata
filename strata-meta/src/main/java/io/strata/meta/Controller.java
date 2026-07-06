@@ -132,7 +132,7 @@ public final class Controller implements AutoCloseable {
             this.repair = openedRepair;
             this.ownership = openedOwnership;
             this.namespaceLeadership = openedNamespaceLeadership;
-            // The owner-pull verifier identifies itself by its advertised endpoint (design §20.4) so a
+            // The owner-pull verifier identifies itself by its advertised endpoint (design §9.2) so a
             // node can record which owner attested each chunk; it is also this node's rendezvous identity.
             openedRepair.advertisedEndpoint(this.advertisedEndpoint);
             openedLatch.start();

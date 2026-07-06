@@ -26,7 +26,7 @@ public record DataNodeConfig(
         String rack,
         String host,
         long capacityBytes,
-        int scrubIntervalMs,             // cadence of the node-local sealed-chunk re-CRC scrub (design §20.3)
+        int scrubIntervalMs,             // cadence of the node-local sealed-chunk re-CRC scrub (design §9.2)
         ConnectionPolicy connectionPolicy,
         int nodeId,                      // -1 = standalone/unregistered; otherwise >= 1
         long orphanGraceMs,

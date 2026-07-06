@@ -1276,13 +1276,13 @@ public final class Messages {
         }
     }
 
-    /* ---------- owner-pull chunk verification (design §20.3) ---------- */
+    /* ---------- owner-pull chunk verification (design §9.2) ---------- */
 
     /**
      * Owner -> node: verify the listed chunks of one namespace. The node answers with the actual local
      * state of each (see {@link VerifyChunkResult}); the owner compares against its descriptor to decide
      * present-ok / missing / corrupt. {@code verifierEndpoint} is the asking owner's advertised endpoint,
-     * so the node can record "last verified by which owner, when" for node-local orphan GC (design §20.4).
+     * so the node can record "last verified by which owner, when" for node-local orphan GC (design §9.2).
      */
     public record VerifyChunks(StrataNamespace namespace, String verifierEndpoint, List<ChunkId> chunkIds) {
         public VerifyChunks {

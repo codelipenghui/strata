@@ -214,7 +214,7 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /** This owner's advertised endpoint, sent as the {@code verifierEndpoint} in VERIFY_CHUNKS so a node
-     *  can record which owner attested it (design §20.4). Set by the controller before {@link #start}. */
+     *  can record which owner attested it (design §9.2). Set by the controller before {@link #start}. */
     private volatile String advertisedEndpoint = "";
 
     void advertisedEndpoint(String endpoint) {
@@ -670,7 +670,7 @@ class RepairCoordinator implements AutoCloseable {
         }
     }
 
-    /* ---------- owner-pull verification (design §20.3): replaces the central inventory push ---------- */
+    /* ---------- owner-pull verification (design §9.2): replaces the central inventory push ---------- */
 
     private void verifyLoop() {
         while (!closed.get()) {
@@ -688,7 +688,7 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /**
-     * Owner-pull verification (design §20.3): for each namespace this controller owns, ask every live
+     * Owner-pull verification (design §9.2): for each namespace this controller owns, ask every live
      * node that should hold a sealed chunk to report its local state, and compare against the descriptor
      * — missing/corrupt drops the replica so the under-replication scan re-replicates within the
      * namespace. Replaces "every node pushes its full chunk list to the leader". Runs off the repair
