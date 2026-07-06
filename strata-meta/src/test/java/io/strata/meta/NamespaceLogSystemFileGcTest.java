@@ -99,6 +99,44 @@ class NamespaceLogSystemFileGcTest {
     }
 
     @Test
+    void retainsManifestPreviousGenerationAsCorruptionFallbackEvenAfterSafetyDelay() throws Exception {
+        String owner = "tenant-previous-fallback";
+        FileId currentSnapshot = FileId.of(0x81);
+        FileId currentLog = FileId.of(0x82);
+        FileId previousSnapshot = FileId.of(0x71);
+        FileId previousLog = FileId.of(0x72);
+        FileId olderSuperseded = FileId.of(0x61);
+
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            putSystemFile(root, currentSnapshot, owner, 8, "snapshot", FileState.SEALED);
+            putSystemFile(root, currentLog, owner, 8, "log", FileState.OPEN);
+            putSystemFile(root, previousSnapshot, owner, 7, "snapshot", FileState.SEALED);
+            putSystemFile(root, previousLog, owner, 7, "log", FileState.OPEN);
+            putSystemFile(root, olderSuperseded, owner, 6, "snapshot", FileState.SEALED);
+            Records.NamespaceManifest.NamespaceManifestRef previous =
+                    new Records.NamespaceManifest.NamespaceManifestRef(7L, 0L, 0L,
+                            Optional.of(previousSnapshot), Optional.of(previousLog));
+            root.putNamespaceManifest(new Records.NamespaceManifest(StrataNamespace.of(owner), 1L, 8L, 0L, 0L,
+                    Optional.of(currentSnapshot), Optional.of(currentLog), Optional.of(previous)), -1);
+
+            RecordingFileStore fs = new RecordingFileStore();
+            NamespaceLogBackend backend = new NamespaceLogBackend(root, fs, false);
+
+            assertEquals(1, backend.gcOrphanedSystemFiles(1600L, 500L),
+                    "only generations older than manifest.previous() are eligible once retention expires");
+            assertTrue(fs.deleted.contains(olderSuperseded), "older unreferenced generations can still be reaped");
+            assertFalse(fs.deleted.contains(previousSnapshot),
+                    "manifest.previous() snapshot remains the corruption fallback source");
+            assertFalse(fs.deleted.contains(previousLog),
+                    "manifest.previous() log remains the corruption fallback source");
+            assertFalse(fs.deleted.contains(currentSnapshot), "the current snapshot is never reaped");
+            assertFalse(fs.deleted.contains(currentLog), "the current log is never reaped");
+            backend.close();
+        }
+    }
+
+    @Test
     void retainsTheJustSupersededGenerationUntilTheSafetyDelayElapsesThenReclaimsIt() throws Exception {
         // Issue #8: a superseded snapshot/log generation must survive a configurable safety delay (a rollback
         // margin), not be deleted the instant the new manifest is durable. The window is timed off the

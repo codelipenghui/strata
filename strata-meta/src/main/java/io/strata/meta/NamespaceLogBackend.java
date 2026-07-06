@@ -273,6 +273,10 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
                 publishedGen.put(ns, m.generation());
                 m.snapshotFileId().ifPresent(referenced::add);
                 m.logFileId().ifPresent(referenced::add);
+                m.previous().ifPresent(previous -> {
+                    previous.snapshotFileId().ifPresent(referenced::add);
+                    previous.logFileId().ifPresent(referenced::add);
+                });
             });
         }
         // First pass: record each generation's creation time (keyed (namespace, generation)) and collect the
