@@ -286,16 +286,25 @@ final class Recovery {
             long end = entry.getKey();
             // The CRC(s) a batch [p, end) is allowed to have, per any reachable replica's ledger.
             Set<Integer> validCrcs = new HashSet<>();
-            Set<ReplicaState> ledgerHolders = new HashSet<>();
+            Set<ReplicaState> exactLedgerHolders = new HashSet<>();
+            Set<ReplicaState> coveringLedgerHolders = new HashSet<>();
+            for (var boundary : boundaries.tailMap(end, true).entrySet()) {
+                for (LedgerCandidate ledger : boundary.getValue()) {
+                    if (ledger.previousEnd() == p) {
+                        coveringLedgerHolders.add(ledger.replica());
+                    }
+                }
+            }
             for (LedgerCandidate ledger : entry.getValue()) {
                 if (ledger.previousEnd() == p) {
                     validCrcs.add(ledger.entry().payloadCrc());
-                    ledgerHolders.add(ledger.replica());
+                    exactLedgerHolders.add(ledger.replica());
                 }
             }
             if (validCrcs.isEmpty()) continue;
             Agreed agreed = agreedContinuation(chunkId, reachable, p, end, validCrcs, ackQuorum,
-                    unreachableReplicas, ledgerHolders, unverifiedAboveFloorHolders);
+                    unreachableReplicas, exactLedgerHolders, coveringLedgerHolders,
+                    unverifiedAboveFloorHolders);
             if (agreed == null) continue;
             Candidate candidate = new Candidate(end, agreed.bytes());
             if (agreed.quorum()) {
@@ -349,7 +358,8 @@ final class Recovery {
      */
     private Agreed agreedContinuation(ChunkId chunkId, List<ReplicaState> reachable, long from, long to,
                                       Set<Integer> validCrcs, int ackQuorum, int unreachableReplicas,
-                                      Set<ReplicaState> ledgerHolders,
+                                      Set<ReplicaState> exactLedgerHolders,
+                                      Set<ReplicaState> coveringLedgerHolders,
                                       Set<ReplicaState> unverifiedAboveFloorHolders) {
         List<CandidateCount> counts = new ArrayList<>();
         List<ReplicaState> crcInvalidLedgerHolders = new ArrayList<>();
@@ -366,8 +376,8 @@ final class Recovery {
                 continue;
             }
             if (!validCrcs.contains(Crc.of(data))) {
-                if (ledgerHolders.contains(rs)) {
-                    log.warn("recovery read {} range [{}..{}) from {} mismatched its ledger CRC",
+                if (exactLedgerHolders.contains(rs) || !coveringLedgerHolders.contains(rs)) {
+                    log.warn("recovery read {} range [{}..{}) from {} mismatched all viable ledger CRC candidates",
                             chunkId, from, to, rs.replica.endpoint());
                     crcInvalidLedgerHolders.add(rs);
                 }
@@ -391,6 +401,8 @@ final class Recovery {
         for (CandidateCount count : counts) {
             strongestValidCount = Math.max(strongestValidCount, count.count);
         }
+        // Counting other-valued valid holders over-approximates ack possibility on purpose:
+        // over-marking aborts for retry, under-marking can lose producer-acked data.
         if (strongestValidCount + crcInvalidLedgerHolders.size() + unverifiedHolders + unreachableReplicas
                 >= ackQuorum) {
             for (ReplicaState rs : crcInvalidLedgerHolders) {

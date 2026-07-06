@@ -746,6 +746,38 @@ class RecoveryTest {
     }
 
     @Test
+    void crcInvalidHolderWithMissingUpperLedgerBoundaryAbortsInsteadOfFloorSeal() throws Exception {
+        FileId fileId = FileId.of(47);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean holderSeal = new AtomicBoolean();
+        byte[] full = new byte[] {1, 2, 3, 4, 5, 6, 7, 8};
+        byte[] prefix = new byte[] {1, 2, 3, 4};
+        byte[] corruptFull = new byte[] {1, 2, 3, 4, 9, 9, 9, 9};
+        List<Messages.LedgerEntry> fullLedger = List.of(new Messages.LedgerEntry(8, Crc.of(full), 1));
+        List<Messages.LedgerEntry> prefixOnlyLedger = List.of(new Messages.LedgerEntry(4, Crc.of(prefix), 1));
+
+        try (ScpServer donor = ledgerOrderingReplica(1, full.length, fullLedger, full, null);
+             ScpServer holder = crcInvalidAboveFloorReplica(2, 8, 0, prefixOnlyLedger, corruptFull, holderSeal);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(donor)),
+                             new Messages.Replica(2, endpoint(holder)),
+                             new Messages.Replica(3, "127.0.0.1:1")))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
+
+                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertTrue(e.getMessage().contains("unverified above-floor holder"));
+                assertEquals(null, sealedFileLength.get());
+                assertFalse(holderSeal.get());
+            }
+        }
+    }
+
+    @Test
     void malformedAboveFloorLedgerResponseAbortsInsteadOfFloorSeal() throws Exception {
         FileId fileId = FileId.of(44);
         ChunkId chunkId = new ChunkId(fileId, 0);
