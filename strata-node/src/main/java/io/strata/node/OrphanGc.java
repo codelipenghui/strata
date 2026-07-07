@@ -310,14 +310,19 @@ final class OrphanGc implements AutoCloseable {
         return breakerHaltedChunks;
     }
 
-    private void deleteConfirmed(StrataNamespace namespace, ChunkId chunkId) throws InterruptedException {
+    boolean deleteConfirmed(StrataNamespace namespace, ChunkId chunkId) throws InterruptedException {
         ErrorCode result = deletes.delete(namespace, chunkId);
         if (result == ErrorCode.OK) {
             log.info("orphan GC: deleted unreferenced sealed chunk {} in ns={}", chunkId, namespace);
-        } else {
-            log.warn("orphan GC: confirmed orphan {} in ns={} failed to delete: {}",
-                    chunkId, namespace, result);
+            return true;
         }
+        if (result == ErrorCode.CHUNK_NOT_FOUND) {
+            log.debug("orphan GC: confirmed orphan {} in ns={} was already deleted", chunkId, namespace);
+            return true;
+        }
+        log.warn("orphan GC: confirmed orphan {} in ns={} failed to delete: {}",
+                chunkId, namespace, result);
+        return false;
     }
 
     private enum Verdict { ORPHAN, KEEP, UNREACHABLE }

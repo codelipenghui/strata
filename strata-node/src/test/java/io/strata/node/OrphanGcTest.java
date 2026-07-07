@@ -347,6 +347,24 @@ class OrphanGcTest {
     }
 
     @Test
+    void confirmedDeleteTreatsAlreadyDeletedChunkAsBenign() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"))) {
+            seal(store, chunk);
+            ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
+            assertEquals(ErrorCode.OK, deletes.delete(NS, chunk),
+                    "normal delete wins the race before orphan GC reaches its stale suspect");
+            OrphanGc gc = new OrphanGc(store, deletes, NODE_ID, List.of(),
+                    0, 60_000, 0, 5_000, 64, 0, 0);
+
+            assertTrue(gc.deleteConfirmed(NS, chunk),
+                    "CHUNK_NOT_FOUND is an idempotent success when another delete already removed the chunk");
+            assertEquals(1, deletes.notFoundDeletes());
+            assertEquals(0, deletes.failedDeletes());
+        }
+    }
+
+    @Test
     void zeroDeleteBudgetsDisableCaps() throws Exception {
         ChunkId first = new ChunkId(FileId.of(1), 0);
         ChunkId second = new ChunkId(FileId.of(2), 0);
