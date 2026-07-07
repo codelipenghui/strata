@@ -226,6 +226,13 @@ class MessageGoldenCorpusTest {
                         () -> new Messages.DeleteChunks(List.of(CHUNK_ID, new ChunkId(FILE_ID, 4)), NS).encode(),
                         Messages.DeleteChunks::decode,
                         "02111111112222333300000003111111112222333300000004" + "0474657374" + "00"),
+                request("deleteChunksOwnerEpoch",
+                        new Messages.DeleteChunks(List.of(CHUNK_ID, new ChunkId(FILE_ID, 4)), NS, 43),
+                        () -> new Messages.DeleteChunks(List.of(CHUNK_ID, new ChunkId(FILE_ID, 4)), NS, 43)
+                                .encode(),
+                        Messages.DeleteChunks::decode,
+                        "021111111122223333000000031111111122223333000000040474657374"
+                                + "010008000000000000002b"),
                 response("deleteChunksResp",
                         new Messages.DeleteChunksResp(List.of(CHUNK_ID), List.of((short) 0)),
                         () -> new Messages.DeleteChunksResp(List.of(CHUNK_ID), List.of((short) 0)).encode(),
@@ -303,6 +310,45 @@ class MessageGoldenCorpusTest {
                         "0000000000000001e240030000000000000001011111111122223333000000030100000007"
                                 + "0768373a3930303001000000aa00000000000010000474657374"
                                 + "000000000000000202011111111122223333000000030474657374" + "0000000000000003" + "03" + "00"),
+                response("heartbeatRespOwnerEpochs",
+                        new Messages.HeartbeatResp(123_456, List.of(
+                                new Messages.ReplicateCmd(1, CHUNK_ID,
+                                        List.of(new Messages.Replica(7, "h7:9000")),
+                                        (byte) 1, 0xAA, 4096, NS, 43),
+                                new Messages.DeleteCmd(2, List.of(CHUNK_ID), NS, 44),
+                                new Messages.DrainCmd(3))),
+                        () -> new Messages.HeartbeatResp(123_456, List.of(
+                                new Messages.ReplicateCmd(1, CHUNK_ID,
+                                        List.of(new Messages.Replica(7, "h7:9000")),
+                                        (byte) 1, 0xAA, 4096, NS, 43),
+                                new Messages.DeleteCmd(2, List.of(CHUNK_ID), NS, 44),
+                                new Messages.DrainCmd(3))).encode(),
+                        Messages.HeartbeatResp::decode,
+                        "0000000000000001e240030000000000000001011111111122223333000000030100000007"
+                                + "0768373a3930303001000000aa00000000000010000474657374"
+                                + "000000000000000202011111111122223333000000030474657374"
+                                + "000000000000000303010121020000000000000001000000000000002b"
+                                + "0000000000000002000000000000002c"),
+                request("execReplicateOwnerEpoch",
+                        (Messages.Command) new Messages.ReplicateCmd(1, CHUNK_ID,
+                                List.of(new Messages.Replica(7, "h7:9000")),
+                                (byte) 1, 0xAA, 4096, NS, 43),
+                        () -> {
+                            BufWriter w = new BufWriter();
+                            Messages.Command.writeRequest(w, new Messages.ReplicateCmd(1, CHUNK_ID,
+                                    List.of(new Messages.Replica(7, "h7:9000")),
+                                    (byte) 1, 0xAA, 4096, NS, 43));
+                            return w.toBytes();
+                        },
+                        Messages.Command::readRequest,
+                        "00000000000000010111111111222233330000000301000000070768373a39303030"
+                                + "01000000aa00000000000010000474657374010008000000000000002b"),
+                request("verifyChunksOwnerEpoch",
+                        new Messages.VerifyChunks(NS, "owner:9000", List.of(CHUNK_ID), 43),
+                        () -> new Messages.VerifyChunks(NS, "owner:9000", List.of(CHUNK_ID), 43).encode(),
+                        Messages.VerifyChunks::decode,
+                        "04746573740a6f776e65723a3930303001111111112222333300000003"
+                                + "010008000000000000002b"),
                 request("createFile",
                         new Messages.CreateFile("test", "/kafka/topicA/0/00000000000000000000",
                                 OP_ID_MSB, OP_ID_LSB),

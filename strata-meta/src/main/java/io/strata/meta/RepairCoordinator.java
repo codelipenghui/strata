@@ -7,6 +7,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.FileState;
 import io.strata.common.NsChunkId;
+import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.proto.BufWriter;
 import io.strata.proto.Messages;
@@ -96,6 +97,7 @@ class RepairCoordinator implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicLong commandIds = new AtomicLong(System.currentTimeMillis());
     private final Map<Long, Action> inflight = new ConcurrentHashMap<>();
+    private final Set<StrataNamespace> zeroOwnerEpochWarned = ConcurrentHashMap.newKeySet();
     private final ExecutorService deleteDispatchExecutor = Executors.newSingleThreadExecutor(
             Thread.ofVirtual().name("meta-delete-dispatch-", 0).factory());
     private final ExecutorService completionExecutor = Executors.newSingleThreadExecutor(
@@ -337,6 +339,22 @@ class RepairCoordinator implements AutoCloseable {
         }
         long activeSince = namespaceLeadership.namespaceActiveSinceMs(namespace);
         return activeSince != 0 && now - activeSince >= settleMs();
+    }
+
+    private long ownerEpoch(StrataNamespace namespace) {
+        if (NamespaceLogBackend.isSystem(namespace) || namespaceLeadership == null) {
+            return 0;
+        }
+        long epoch = namespaceLeadership.namespaceOwnerEpoch(namespace);
+        if (epoch == 0) {
+            if (zeroOwnerEpochWarned.add(namespace)) {
+                log.warn("namespace {} is active but has owner epoch 0; owner RPCs may be fenced until "
+                        + "leadership is re-read", namespace);
+            }
+        } else {
+            zeroOwnerEpochWarned.remove(namespace);
+        }
+        return epoch;
     }
 
     private ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
@@ -612,7 +630,7 @@ class RepairCoordinator implements AutoCloseable {
                 System.currentTimeMillis()));
         registry.enqueue(target.record.nodeId(),
                 new Messages.ReplicateCmd(cmdId, chunkId, sources, (byte) 1, chunk.crc(), chunk.length(),
-                        ns));
+                        ns, ownerEpoch(ns)));
         recordRepairIssued(trigger);
         log.info("repair: {} dead={} -> target={} (cmd {})", chunkId, deadNode, target.record.nodeId(), cmdId);
     }
@@ -787,11 +805,21 @@ class RepairCoordinator implements AutoCloseable {
                     node.endpoint(), node.nodeId(), e.getMessage());
             return List.of();
         }
+        long epoch = ownerEpoch(ns);
         try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(), ScpClient.KIND_TOOL, "owner-verify")) {
             ByteBuffer resp = client.call(Opcode.VERIFY_CHUNKS,
-                    new Messages.VerifyChunks(ns, advertisedEndpoint, chunkIds).encode(), null,
+                    new Messages.VerifyChunks(ns, advertisedEndpoint, chunkIds, epoch).encode(), null,
                     config.repairCommandTimeoutMs());
             return Messages.VerifyChunksResp.decode(resp).results();
+        } catch (ScpException e) {
+            if (e.code() == ErrorCode.FENCED_EPOCH || !e.retriable()) {
+                log.warn("owner-verify to node {} failed with {} ns={} offeredOwnerEpoch={} "
+                                + "requiredOwnerEpoch={} — treating verdict as terminal for this pass",
+                        node.nodeId(), e.code(), ns, epoch, e.detail());
+            } else {
+                log.debug("owner-verify to node {} failed: {}", node.nodeId(), e.getMessage());
+            }
+            return List.of();
         } catch (Exception e) {
             log.debug("owner-verify to node {} failed: {}", node.nodeId(), e.getMessage());
             return List.of();
@@ -920,7 +948,7 @@ class RepairCoordinator implements AutoCloseable {
         try {
             long cmdId = commandIds.incrementAndGet();
             Messages.ReplicateCmd cmd = new Messages.ReplicateCmd(cmdId, chunkId, sources,
-                    (byte) 1, chunk.crc(), chunk.length(), ns);
+                    (byte) 1, chunk.crc(), chunk.length(), ns, ownerEpoch(ns));
             if (execReplicate(target, cmd)
                     && applyOwnerRepair(ns, file.fileId(), chunkId, deadNode, target.record.nodeId())) {
                 recordRepairIssued(trigger);
@@ -956,6 +984,14 @@ class RepairCoordinator implements AutoCloseable {
         int timeoutMs = Math.max(30_000, config.repairCommandTimeoutMs());
         try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(), ScpClient.KIND_TOOL, label)) {
             return call.run(client, timeoutMs);
+        } catch (ScpException e) {
+            if (e.code() == ErrorCode.FENCED_EPOCH || !e.retriable()) {
+                log.warn("{} to node {} for {} failed with {} requiredOwnerEpoch={} — terminal for this attempt",
+                        label, node.nodeId(), chunkId, e.code(), e.detail());
+            } else {
+                log.warn("{} to node {} for {} failed: {}", label, node.nodeId(), chunkId, e.getMessage());
+            }
+            return false;
         } catch (Exception e) {
             log.warn("{} to node {} for {} failed: {}", label, node.nodeId(), chunkId, e.getMessage());
             return false;
@@ -965,7 +1001,7 @@ class RepairCoordinator implements AutoCloseable {
     /** Synchronously tells {@code target} to pull the chunk (EXEC_REPLICATE); true if it acked OK. */
     private boolean execReplicate(NodeRegistry.LiveNode target, Messages.ReplicateCmd cmd) {
         BufWriter w = new BufWriter();
-        Messages.Command.write(w, cmd);
+        Messages.Command.writeRequest(w, cmd);
         return directNodeCall(target.record, cmd.chunkId(), "owner-repair", (client, timeoutMs) -> {
             client.call(Opcode.EXEC_REPLICATE, w.toBytes(), null, timeoutMs);
             return true;
@@ -1003,7 +1039,7 @@ class RepairCoordinator implements AutoCloseable {
     private boolean execDelete(Records.NodeRecord node, ChunkId chunkId, StrataNamespace ns) {
         return directNodeCall(node, chunkId, "owner-delete", (client, timeoutMs) -> {
             ByteBuffer resp = client.call(Opcode.DELETE_CHUNKS,
-                    new Messages.DeleteChunks(List.of(chunkId), ns).encode(), null, timeoutMs);
+                    new Messages.DeleteChunks(List.of(chunkId), ns, ownerEpoch(ns)).encode(), null, timeoutMs);
             Messages.DeleteChunksResp r = Messages.DeleteChunksResp.decode(resp);
             short code = r.codes().isEmpty() ? ErrorCode.OK.code : r.codes().get(0);
             if (code != ErrorCode.OK.code && code != ErrorCode.CHUNK_NOT_FOUND.code) {
@@ -1117,7 +1153,8 @@ class RepairCoordinator implements AutoCloseable {
                     long cmdId = commandIds.incrementAndGet();
                     inflight.put(cmdId, new DeleteAction(ns, file.fileId(), chunkId, nodeId,
                             System.currentTimeMillis()));
-                    registry.enqueue(nodeId, new Messages.DeleteCmd(cmdId, List.of(chunkId), ns));
+                    registry.enqueue(nodeId, new Messages.DeleteCmd(cmdId, List.of(chunkId), ns,
+                            ownerEpoch(ns)));
                 }
             }
         }
@@ -1241,16 +1278,22 @@ class RepairCoordinator implements AutoCloseable {
                 chunksBeingRepaired.remove(new NsChunkId(r.namespace(), r.chunkId()));
                 if (completion.status() == 0) {
                     applyReplicaSwap(r);
+                } else if (ErrorCode.fromCode(completion.status()) == ErrorCode.FENCED_EPOCH) {
+                    log.warn("replicate cmd {} for {} was fenced by node {} — stale owner command dropped",
+                            completion.commandId(), r.chunkId(), reportingNode);
                 } else {
                     log.warn("replicate cmd {} for {} failed with {} — next scan retries",
-                            completion.commandId(), r.chunkId(), completion.status());
+                            completion.commandId(), r.chunkId(), ErrorCode.fromCode(completion.status()));
                 }
             } else if (action instanceof DeleteAction d) {
                 if (completion.status() == 0) {
                     applyDeleteConfirmed(d.namespace(), d.fileId(), d.chunkId(), d.nodeId());
+                } else if (ErrorCode.fromCode(completion.status()) == ErrorCode.FENCED_EPOCH) {
+                    log.warn("delete cmd {} for {} was fenced by node {} — stale owner command dropped",
+                            completion.commandId(), d.chunkId(), reportingNode);
                 } else {
                     log.warn("delete cmd {} for {} failed with {} — next scan retries",
-                            completion.commandId(), d.chunkId(), completion.status());
+                            completion.commandId(), d.chunkId(), ErrorCode.fromCode(completion.status()));
                 }
             }
         } catch (Exception e) {

@@ -56,6 +56,11 @@ public final class NamespaceLogMetadataStore implements MetadataStore, Namespace
     }
 
     @Override
+    public long namespaceOwnerEpoch(StrataNamespace namespace) {
+        return backend.namespaceOwnerEpoch(namespace);
+    }
+
+    @Override
     public ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
         return backend.namespaceReconcileLock(namespace);
     }

@@ -393,6 +393,8 @@ public final class ScpServer implements AutoCloseable {
         private final AtomicBoolean connectionOpen = new AtomicBoolean(true);
         private boolean okU64FlushPending;
         private boolean helloComplete;
+        private byte clientKind;
+        private String clientId = "-";
 
         ConnectionHandler(Channel channel) {
             this.channel = channel;
@@ -595,7 +597,9 @@ public final class ScpServer implements AutoCloseable {
                 return;
             }
             try {
-                Messages.Hello.decode(hello.headerReadBuffer()); // validates frame-version overlap
+                Messages.Hello decoded = Messages.Hello.decode(hello.headerReadBuffer()); // validates version overlap
+                clientKind = decoded.clientKind();
+                clientId = decoded.clientId();
             } catch (RuntimeException e) {
                 // incompatible version range or malformed HELLO header: answer with a typed
                 // error instead of silently dropping the connection
@@ -629,6 +633,7 @@ public final class ScpServer implements AutoCloseable {
             long immediateHeaderU64A = 0;
             long immediateHeaderU64B = 0;
             AutoCloseable immediatePayloadCloseable = null;
+            RequestContext.setClient(clientKind, clientId);
             try {
                 if (handler.requiresAsyncHandling(req)) {
                     responseSink.reset();
@@ -713,6 +718,7 @@ public final class ScpServer implements AutoCloseable {
             // decode, on this same connection-handler thread — read it now, before any async completion,
             // and carry it into both the sync and async observe paths.
             String ns = RequestContext.takeNamespace();
+            RequestContext.clearClient();
             if (respF == null) {
                 observeRequest(req, startNanos, !handlerFailed, ns);
                 if (immediateOkU64) {

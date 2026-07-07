@@ -8,6 +8,7 @@ import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpConnectionException;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
 import io.strata.format.ChunkStore;
 import io.strata.proto.ManagedScpConnection;
@@ -215,8 +216,12 @@ final class ControlLoop implements AutoCloseable {
             short status = 0;
             try {
                 switch (cmd) {
-                    case Messages.ReplicateCmd r -> replicate(r);
+                    case Messages.ReplicateCmd r -> {
+                        acceptOwnerEpoch(r.namespace(), r.ownerEpoch());
+                        replicate(r);
+                    }
                     case Messages.DeleteCmd d -> {
+                        acceptOwnerEpoch(d.namespace(), d.ownerEpoch());
                         for (var id : d.chunkIds()) {
                             ErrorCode result = deletes.delete(d.namespace(), id);
                             if (result != ErrorCode.OK && result != ErrorCode.CHUNK_NOT_FOUND) {
@@ -237,6 +242,12 @@ final class ControlLoop implements AutoCloseable {
                 status = ErrorCode.INTERNAL.code;
             }
             completed.add(new Messages.CompletedCommand(cmd.commandId(), status));
+        }
+    }
+
+    private void acceptOwnerEpoch(StrataNamespace namespace, long ownerEpoch) {
+        if (node != null) {
+            node.acceptOwnerEpoch(namespace, ownerEpoch);
         }
     }
 

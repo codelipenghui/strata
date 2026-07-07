@@ -20,6 +20,9 @@ interface NamespaceLeadership {
     /** Wall-clock activation time used only by destructive verify settle gates. */
     long namespaceActiveSinceMs(StrataNamespace namespace);
 
+    /** Current metadata-log owner epoch for this locally owned namespace, or 0 when no epoch applies. */
+    long namespaceOwnerEpoch(StrataNamespace namespace);
+
     /** Reconcile lock for a locally active user namespace; callers must not request one for inactive namespaces. */
     ReentrantLock namespaceReconcileLock(StrataNamespace namespace);
 }

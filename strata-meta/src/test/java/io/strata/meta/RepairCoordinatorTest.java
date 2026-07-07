@@ -62,7 +62,8 @@ class RepairCoordinatorTest {
         FileId fileId = fileId(2);
         store.createFile(file(fileId, FileState.SEALED,
                 List.of(sealed(0, 256, 2002, List.of(source.nodeId())))));
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(),
+                () -> true, () -> true, ns -> true, activeLeadership(System.currentTimeMillis()));
 
         coordinator.scanOnce();
         assertTrue(heartbeat(registry, coordinator, source, List.of()).commands().isEmpty());
@@ -74,6 +75,7 @@ class RepairCoordinatorTest {
         Messages.ReplicateCmd replicate = assertInstanceOf(Messages.ReplicateCmd.class, command);
         assertEquals(new ChunkId(fileId, 0), replicate.chunkId());
         assertEquals(List.of(new Messages.Replica(source.nodeId(), "source:9000")), replicate.sources());
+        assertEquals(7, replicate.ownerEpoch());
     }
 
     @Test
@@ -519,7 +521,7 @@ class RepairCoordinatorTest {
         try (ScpServer targetServer = new ScpServer(0, 999, inc.getMostSignificantBits(),
                 inc.getLeastSignificantBits(), req -> {
                     if (req.opcode() == Opcode.EXEC_REPLICATE.code) {
-                        received.add((Messages.ReplicateCmd) Messages.Command.read(req.headerSlice()));
+                        received.add((Messages.ReplicateCmd) Messages.Command.readRequest(req.headerSlice()));
                         return ScpServer.ok(req, Messages.okHeader(), null);
                     }
                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
@@ -542,11 +544,12 @@ class RepairCoordinatorTest {
 
             // a sharded non-controller owner of the namespace heals the chunk directly
             RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
-                    () -> false, () -> false, ns -> true);
+                    () -> false, () -> false, ns -> true, activeLeadership(System.currentTimeMillis()));
             owner.ownerRepairPass();
 
             assertEquals(1, received.size(), "owner sent exactly one EXEC_REPLICATE");
             assertEquals(new ChunkId(fileId, 0), received.get(0).chunkId());
+            assertEquals(7, received.get(0).ownerEpoch());
             List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
             assertTrue(replicas.contains(target.nodeId()), "the repair target became a replica");
             assertFalse(replicas.contains(dead.nodeId()), "the dead replica was swapped out");
@@ -600,6 +603,41 @@ class RepairCoordinatorTest {
             assertEquals(1, verifies.size(),
                     "owner issued VERIFY_CHUNKS for a node present only in the persisted snapshot");
             assertEquals(List.of(new ChunkId(fileId, 0)), verifies.get(0).chunkIds());
+        }
+    }
+
+    @Test
+    void namespaceOwnerVerifyStampsCurrentOwnerEpoch() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        List<Messages.VerifyChunks> verifies = new CopyOnWriteArrayList<>();
+        UUID inc = UUID.randomUUID();
+        try (ScpServer node = new ScpServer(0, 777, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                        Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                        verifies.add(vc);
+                        List<Messages.VerifyChunkResult> results = new ArrayList<>();
+                        for (ChunkId id : vc.chunkIds()) {
+                            results.add(new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096, 0xCAFE));
+                        }
+                        return ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
+                    }
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
+                })) {
+            Registered live = registerAt(registry, 881, "epoch-host", "127.0.0.1:" + node.port());
+            liveNodes(registry).remove(live.nodeId());
+            FileId fileId = fileId(0x5152);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(live.nodeId())))));
+
+            long settledActiveSince = System.currentTimeMillis() - 120_000;
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
+                    () -> false, () -> false, ns -> true, activeLeadership(settledActiveSince));
+            owner.verifyPass();
+
+            assertEquals(1, verifies.size());
+            assertEquals(7, verifies.get(0).ownerEpoch());
         }
     }
 
@@ -804,7 +842,7 @@ class RepairCoordinatorTest {
         try (ScpServer targetServer = new ScpServer(0, 999, inc.getMostSignificantBits(),
                 inc.getLeastSignificantBits(), req -> {
                     if (req.opcode() == Opcode.EXEC_REPLICATE.code) {
-                        received.add((Messages.ReplicateCmd) Messages.Command.read(req.headerSlice()));
+                        received.add((Messages.ReplicateCmd) Messages.Command.readRequest(req.headerSlice()));
                         return ScpServer.ok(req, Messages.okHeader(), null);
                     }
                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
@@ -871,11 +909,12 @@ class RepairCoordinatorTest {
                     List.of(sealed(0, 4096, 0xCAFE, List.of(target.nodeId())))));
 
             RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
-                    () -> false, () -> false, ns -> true);
+                    () -> false, () -> false, ns -> true, activeLeadership(System.currentTimeMillis()));
             owner.ownerRepairPass();
 
             assertEquals(1, received.size(), "owner sent exactly one DELETE_CHUNKS");
             assertEquals(List.of(new ChunkId(fileId, 0)), received.get(0).chunkIds());
+            assertEquals(7, received.get(0).ownerEpoch());
             assertFalse(store.files.containsKey(fileId),
                     "the deleted file's record was reclaimed once its only replica confirmed");
         }
@@ -1022,7 +1061,8 @@ class RepairCoordinatorTest {
                 FileState.DELETING, 1,
                 List.of(sealed(0, 64, 0xAA, List.of(node.nodeId())))));
 
-        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(),
+                () -> true, () -> true, ns -> true, activeLeadership(System.currentTimeMillis()));
 
         // scanOnce drives nsA's deletion: enqueues DeleteCmd(nsA/sharedFileId/chunk0, node) into inflight.
         coordinator.scanOnce();
@@ -1030,7 +1070,8 @@ class RepairCoordinatorTest {
         // Drain nsA's DeleteCmd from the registry queue (heartbeat without completions — action stays inflight).
         Messages.HeartbeatResp afterNsA = heartbeat(registry, coordinator, node, List.of());
         assertEquals(1, afterNsA.commands().size(), "nsA DeleteCmd must be enqueued");
-        assertInstanceOf(Messages.DeleteCmd.class, afterNsA.commands().get(0));
+        Messages.DeleteCmd deleteA = assertInstanceOf(Messages.DeleteCmd.class, afterNsA.commands().get(0));
+        assertEquals(7, deleteA.ownerEpoch());
 
         // Drive driveDeletion for nsB with the SAME fileId and chunk index (identical ChunkId, different ns).
         // driveDeletion is private; call it reflectively, same pattern as issueReplicate above.
@@ -1046,7 +1087,8 @@ class RepairCoordinatorTest {
         Messages.HeartbeatResp afterNsB = heartbeat(registry, coordinator, node, List.of());
         assertEquals(1, afterNsB.commands().size(),
                 "nsB DeleteCmd must be enqueued; namespace-blind dedup suppressed it (pre-fix bug)");
-        assertInstanceOf(Messages.DeleteCmd.class, afterNsB.commands().get(0));
+        Messages.DeleteCmd deleteB = assertInstanceOf(Messages.DeleteCmd.class, afterNsB.commands().get(0));
+        assertEquals(7, deleteB.ownerEpoch());
     }
 
     /**
@@ -1288,6 +1330,11 @@ class RepairCoordinatorTest {
             @Override
             public long namespaceActiveSinceMs(StrataNamespace namespace) {
                 return activeSinceMs;
+            }
+
+            @Override
+            public long namespaceOwnerEpoch(StrataNamespace namespace) {
+                return 7;
             }
 
             @Override

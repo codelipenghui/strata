@@ -101,7 +101,7 @@ class CombinedServerTest {
 
                 // Build a minimal EXEC_REPLICATE payload (a ReplicateCmd with no sources).
                 BufWriter w = new BufWriter();
-                Messages.Command.write(w, new Messages.ReplicateCmd(
+                Messages.Command.writeRequest(w, new Messages.ReplicateCmd(
                         1L,
                         new ChunkId(FileId.of(42), 0),
                         List.of(),

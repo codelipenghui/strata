@@ -10,6 +10,7 @@ import io.strata.common.Varint;
 import java.nio.ByteBuffer;
 import java.nio.BufferUnderflowException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -22,10 +23,43 @@ import java.util.UUID;
  */
 public final class Messages {
     private Messages() {}
+    private static final int TAG_OWNER_EPOCH = 0;
 
     /** Bounded list-count reader (see {@link Varint#readCount}). */
     static int count(ByteBuffer b) {
         return Varint.readCount(b, "list");
+    }
+
+    private static void requireNonNegativeOwnerEpoch(long ownerEpoch) {
+        if (ownerEpoch < 0) {
+            throw new IllegalArgumentException("ownerEpoch must be non-negative: " + ownerEpoch);
+        }
+    }
+
+    private static byte[] u64Field(long value) {
+        BufWriter w = new BufWriter(8);
+        w.u64(value);
+        return w.toBytes();
+    }
+
+    private static long readU64Tag(TaggedFields tags, int tag, String name) {
+        byte[] raw = tags.get(tag);
+        if (raw == null) {
+            return 0;
+        }
+        if (raw.length != Long.BYTES) {
+            throw new IllegalArgumentException(name + " tag must be 8 bytes, got " + raw.length);
+        }
+        return ByteBuffer.wrap(raw).getLong();
+    }
+
+    private static void writeOwnerEpochTags(BufWriter w, long ownerEpoch) {
+        requireNonNegativeOwnerEpoch(ownerEpoch);
+        if (ownerEpoch == 0) {
+            w.noTags();
+        } else {
+            TaggedFields.of(Map.of(TAG_OWNER_EPOCH, u64Field(ownerEpoch))).writeTo(w);
+        }
     }
 
     /* ---------- shared sub-structs ---------- */
@@ -940,17 +974,23 @@ public final class Messages {
         }
     }
 
-    public record DeleteChunks(List<ChunkId> chunkIds, StrataNamespace namespace) {
+    public record DeleteChunks(List<ChunkId> chunkIds, StrataNamespace namespace, long ownerEpoch) {
+        public DeleteChunks(List<ChunkId> chunkIds, StrataNamespace namespace) {
+            this(chunkIds, namespace, 0);
+        }
+
         public DeleteChunks {
             chunkIds = List.copyOf(chunkIds);
             namespace = Objects.requireNonNull(namespace, "namespace");
+            requireNonNegativeOwnerEpoch(ownerEpoch);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.varint(chunkIds.size());
             for (ChunkId c : chunkIds) w.chunkId(c);
-            w.namespace(namespace).noTags();
+            w.namespace(namespace);
+            writeOwnerEpochTags(w, ownerEpoch);
             return w.toBytes();
         }
 
@@ -959,8 +999,8 @@ public final class Messages {
             List<ChunkId> ids = new ArrayList<>(n);
             for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
             StrataNamespace namespace = StrataNamespace.readFrom(b);
-            TaggedFields.readFrom(b);
-            return new DeleteChunks(ids, namespace);
+            TaggedFields tags = TaggedFields.readFrom(b);
+            return new DeleteChunks(ids, namespace, readU64Tag(tags, TAG_OWNER_EPOCH, "ownerEpoch"));
         }
     }
 
@@ -1231,27 +1271,74 @@ public final class Messages {
                 default -> throw new IllegalArgumentException("unknown command type " + type);
             };
         }
+
+        static void writeRequest(BufWriter w, Command c) {
+            write(w, c);
+            writeOwnerEpochTags(w, ownerEpoch(c));
+        }
+
+        static Command readRequest(ByteBuffer b) {
+            Command c = read(b);
+            TaggedFields tags = TaggedFields.readFrom(b);
+            long ownerEpoch = readU64Tag(tags, TAG_OWNER_EPOCH, "ownerEpoch");
+            return withOwnerEpoch(c, ownerEpoch);
+        }
+
+        private static long ownerEpoch(Command c) {
+            return switch (c) {
+                case ReplicateCmd r -> r.ownerEpoch();
+                case DeleteCmd d -> d.ownerEpoch();
+                case DrainCmd ignored -> 0;
+            };
+        }
+
+        private static Command withOwnerEpoch(Command c, long ownerEpoch) {
+            if (ownerEpoch == 0) {
+                return c;
+            }
+            return switch (c) {
+                case ReplicateCmd r -> new ReplicateCmd(r.commandId(), r.chunkId(), r.sources(), r.priority(),
+                        r.expectedCrc(), r.expectedLength(), r.namespace(), ownerEpoch);
+                case DeleteCmd d -> new DeleteCmd(d.commandId(), d.chunkIds(), d.namespace(), ownerEpoch);
+                case DrainCmd dr -> dr;
+            };
+        }
     }
 
     public record ReplicateCmd(long commandId, ChunkId chunkId, List<Replica> sources,
                                byte priority, int expectedCrc, long expectedLength,
-                               StrataNamespace namespace) implements Command {
+                               StrataNamespace namespace, long ownerEpoch) implements Command {
+        public ReplicateCmd(long commandId, ChunkId chunkId, List<Replica> sources,
+                            byte priority, int expectedCrc, long expectedLength,
+                            StrataNamespace namespace) {
+            this(commandId, chunkId, sources, priority, expectedCrc, expectedLength, namespace, 0);
+        }
+
         public ReplicateCmd {
             sources = List.copyOf(sources);
             namespace = Objects.requireNonNull(namespace, "namespace");
+            requireNonNegativeOwnerEpoch(ownerEpoch);
         }
     }
 
-    public record DeleteCmd(long commandId, List<ChunkId> chunkIds, StrataNamespace namespace) implements Command {
+    public record DeleteCmd(long commandId, List<ChunkId> chunkIds,
+                            StrataNamespace namespace, long ownerEpoch) implements Command {
+        public DeleteCmd(long commandId, List<ChunkId> chunkIds, StrataNamespace namespace) {
+            this(commandId, chunkIds, namespace, 0);
+        }
+
         public DeleteCmd {
             chunkIds = List.copyOf(chunkIds);
             namespace = Objects.requireNonNull(namespace, "namespace");
+            requireNonNegativeOwnerEpoch(ownerEpoch);
         }
     }
 
     public record DrainCmd(long commandId) implements Command {}
 
     public record HeartbeatResp(long leaseValidUntilMs, List<Command> commands) {
+        public static final int TAG_COMMAND_OWNER_EPOCHS = 1;
+
         public HeartbeatResp {
             commands = List.copyOf(commands);
         }
@@ -1262,7 +1349,16 @@ public final class Messages {
             w.u64(leaseValidUntilMs);
             w.varint(commands.size());
             for (Command c : commands) Command.write(w, c);
-            w.noTags();
+            Map<Integer, byte[]> tags = new HashMap<>();
+            byte[] ownerEpochs = commandOwnerEpochs(commands);
+            if (ownerEpochs.length > 0) {
+                tags.put(TAG_COMMAND_OWNER_EPOCHS, ownerEpochs);
+            }
+            if (tags.isEmpty()) {
+                w.noTags();
+            } else {
+                TaggedFields.of(tags).writeTo(w);
+            }
             return w.toBytes();
         }
 
@@ -1271,8 +1367,91 @@ public final class Messages {
             int n = count(b);
             List<Command> cs = new ArrayList<>(n);
             for (int i = 0; i < n; i++) cs.add(Command.read(b));
-            TaggedFields.readFrom(b);
+            TaggedFields tags = TaggedFields.readFrom(b);
+            Map<Long, Long> ownerEpochs = readCommandOwnerEpochs(tags);
+            if (!ownerEpochs.isEmpty()) {
+                cs = withCommandOwnerEpochs(cs, ownerEpochs);
+            }
             return new HeartbeatResp(lease, cs);
+        }
+
+        private static byte[] commandOwnerEpochs(List<Command> commands) {
+            BufWriter ownerEpochs = new BufWriter();
+            int count = 0;
+            for (Command command : commands) {
+                long ownerEpoch = commandOwnerEpoch(command);
+                if (ownerEpoch > 0) {
+                    count++;
+                }
+            }
+            if (count == 0) {
+                return new byte[0];
+            }
+            ownerEpochs.varint(count);
+            for (Command command : commands) {
+                long ownerEpoch = commandOwnerEpoch(command);
+                if (ownerEpoch > 0) {
+                    ownerEpochs.u64(command.commandId()).u64(ownerEpoch);
+                }
+            }
+            return ownerEpochs.toBytes();
+        }
+
+        private static long commandOwnerEpoch(Command command) {
+            return switch (command) {
+                case ReplicateCmd r -> r.ownerEpoch();
+                case DeleteCmd d -> d.ownerEpoch();
+                case DrainCmd ignored -> 0;
+            };
+        }
+
+        private static Map<Long, Long> readCommandOwnerEpochs(TaggedFields tags) {
+            byte[] raw = tags.get(TAG_COMMAND_OWNER_EPOCHS);
+            if (raw == null) {
+                return Map.of();
+            }
+            ByteBuffer b = ByteBuffer.wrap(raw);
+            int n = count(b);
+            Map<Long, Long> ownerEpochs = new HashMap<>();
+            for (int i = 0; i < n; i++) {
+                if (b.remaining() < 2 * Long.BYTES) {
+                    throw new IllegalArgumentException("truncated command-owner-epoch tag");
+                }
+                long commandId = b.getLong();
+                long ownerEpoch = b.getLong();
+                requireNonNegativeOwnerEpoch(ownerEpoch);
+                if (ownerEpochs.putIfAbsent(commandId, ownerEpoch) != null) {
+                    throw new IllegalArgumentException("duplicate command-owner-epoch id " + commandId);
+                }
+            }
+            if (b.hasRemaining()) {
+                throw new IllegalArgumentException("trailing bytes in command-owner-epoch tag");
+            }
+            return ownerEpochs;
+        }
+
+        private static List<Command> withCommandOwnerEpochs(List<Command> commands,
+                                                            Map<Long, Long> ownerEpochs) {
+            List<Command> stamped = new ArrayList<>(commands.size());
+            Map<Long, Long> unmatched = new HashMap<>(ownerEpochs);
+            for (Command command : commands) {
+                Long ownerEpoch = unmatched.remove(command.commandId());
+                if (ownerEpoch == null) {
+                    stamped.add(command);
+                    continue;
+                }
+                stamped.add(switch (command) {
+                    case ReplicateCmd r -> new ReplicateCmd(r.commandId(), r.chunkId(), r.sources(),
+                            r.priority(), r.expectedCrc(), r.expectedLength(), r.namespace(), ownerEpoch);
+                    case DeleteCmd d -> new DeleteCmd(d.commandId(), d.chunkIds(), d.namespace(), ownerEpoch);
+                    case DrainCmd dr -> dr;
+                });
+            }
+            if (!unmatched.isEmpty()) {
+                throw new IllegalArgumentException("owner epoch tag references unknown command ids "
+                        + unmatched.keySet());
+            }
+            return stamped;
         }
     }
 
@@ -1284,18 +1463,24 @@ public final class Messages {
      * present-ok / missing / corrupt. {@code verifierEndpoint} is the asking owner's advertised endpoint,
      * so the node can record "last verified by which owner, when" for node-local orphan GC (design §9.2).
      */
-    public record VerifyChunks(StrataNamespace namespace, String verifierEndpoint, List<ChunkId> chunkIds) {
+    public record VerifyChunks(StrataNamespace namespace, String verifierEndpoint,
+                               List<ChunkId> chunkIds, long ownerEpoch) {
+        public VerifyChunks(StrataNamespace namespace, String verifierEndpoint, List<ChunkId> chunkIds) {
+            this(namespace, verifierEndpoint, chunkIds, 0);
+        }
+
         public VerifyChunks {
             namespace = Objects.requireNonNull(namespace, "namespace");
             verifierEndpoint = Objects.requireNonNull(verifierEndpoint, "verifierEndpoint");
             chunkIds = List.copyOf(chunkIds);
+            requireNonNegativeOwnerEpoch(ownerEpoch);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
             w.namespace(namespace).string(verifierEndpoint).varint(chunkIds.size());
             for (ChunkId c : chunkIds) w.chunkId(c);
-            w.noTags();
+            writeOwnerEpochTags(w, ownerEpoch);
             return w.toBytes();
         }
 
@@ -1305,8 +1490,8 @@ public final class Messages {
             int n = count(b);
             List<ChunkId> ids = new ArrayList<>(n);
             for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
-            TaggedFields.readFrom(b);
-            return new VerifyChunks(ns, verifier, ids);
+            TaggedFields tags = TaggedFields.readFrom(b);
+            return new VerifyChunks(ns, verifier, ids, readU64Tag(tags, TAG_OWNER_EPOCH, "ownerEpoch"));
         }
     }
 

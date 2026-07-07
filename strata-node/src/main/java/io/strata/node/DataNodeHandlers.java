@@ -8,6 +8,7 @@ import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.RequestContext;
+import io.strata.proto.ScpClient;
 import io.strata.proto.ScpServer;
 
 import java.io.IOException;
@@ -150,6 +151,8 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case DELETE_CHUNKS -> {
                 var m = Messages.DeleteChunks.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
+                boolean brokerCleanup = m.ownerEpoch() == 0 && RequestContext.clientKind() == ScpClient.KIND_BROKER;
+                node.acceptOwnerEpoch(m.namespace(), m.ownerEpoch(), brokerCleanup);
                 List<Short> codes = new ArrayList<>(m.chunkIds().size());
                 for (var id : m.chunkIds()) codes.add(deletes.delete(m.namespace(), id).code);
                 yield ScpServer.ok(req, new Messages.DeleteChunksResp(m.chunkIds(), codes).encode(), null);
@@ -176,14 +179,15 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 // A namespace owner that is not the cluster controller drives repair directly: pull the
                 // chunk from a live source via the proven control-loop path (design §11). Synchronous —
                 // the response confirms the pull+import completed.
+                if (!(Messages.Command.readRequest(req.headerReadBuffer()) instanceof Messages.ReplicateCmd cmd)) {
+                    throw new ScpException(ErrorCode.PRECONDITION_FAILED, "EXEC_REPLICATE requires a ReplicateCmd");
+                }
+                RequestContext.setNamespace(cmd.namespace().value());
+                node.acceptOwnerEpoch(cmd.namespace(), cmd.ownerEpoch());
                 ControlLoop loop = controlLoop;
                 if (loop == null) {
                     throw new ScpException(ErrorCode.INTERNAL, "control loop unavailable for EXEC_REPLICATE");
                 }
-                if (!(Messages.Command.read(req.headerReadBuffer()) instanceof Messages.ReplicateCmd cmd)) {
-                    throw new ScpException(ErrorCode.PRECONDITION_FAILED, "EXEC_REPLICATE requires a ReplicateCmd");
-                }
-                RequestContext.setNamespace(cmd.namespace().value());
                 loop.replicate(cmd);
                 yield ScpServer.ok(req, Messages.okHeader(), null);
             }
@@ -194,6 +198,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 // verified, feeding node-local orphan GC. The owner judges missing/corrupt.
                 var m = Messages.VerifyChunks.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
+                node.acceptOwnerEpoch(m.namespace(), m.ownerEpoch());
                 node.noteVerifiedBy(m.verifierEndpoint());
                 List<Messages.VerifyChunkResult> results = new ArrayList<>(m.chunkIds().size());
                 for (ChunkStore.VerifyResult r : store.verify(m.namespace(), m.chunkIds())) {

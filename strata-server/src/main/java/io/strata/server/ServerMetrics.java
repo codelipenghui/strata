@@ -226,6 +226,9 @@ final class ServerMetrics {
                 .tag("result", "not_found").register(reg);
         FunctionCounter.builder("strata_data_node_delete", n, DataNode::deleteFailedCount)
                 .tag("result", "failed").register(reg);
+        FunctionCounter.builder("strata_data_node_owner_epoch_fence_rejects", n,
+                        DataNode::ownerEpochFenceRejects)
+                .description("owner RPCs rejected because their owner epoch is stale").register(reg);
         Gauge.builder("strata_data_node_orphan_gc_breaker_open_namespaces", n,
                         DataNode::orphanGcBreakerOpenNamespaces)
                 .description("namespaces whose orphan-GC breaker is open").register(reg);
