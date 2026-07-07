@@ -69,8 +69,13 @@ class OrphanGcTest {
             seal(store, orphan);
             seal(store, listed);
             String endpoint = "127.0.0.1:" + owner.port();
-            // grace 0 + startup 0 → every sealed chunk is an immediate suspect; gcOnce confirms each.
+            // grace 0 + startup 0 -> every sealed chunk is an immediate suspect. FILE_NOT_FOUND
+            // needs a later pass before delete; descriptor-present orphan answers can delete immediately.
             OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000);
+            gc.gcOnce();
+            assertTrue(store.contains(NS, orphan),
+                    "FILE_NOT_FOUND must be corroborated by a later pass before deleting");
+
             gc.gcOnce();
 
             assertFalse(store.contains(NS, orphan), "an unreferenced chunk (FILE_NOT_FOUND) must be GC'd");
@@ -125,6 +130,10 @@ class OrphanGcTest {
             // the non-owner is listed FIRST: confirm must redirect past its NOT_LEADER to the real owner.
             OrphanGc gc = orphanGc(store,
                     List.of("127.0.0.1:" + notOwner.port(), "127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000);
+            gc.gcOnce();
+            assertTrue(store.contains(NS, orphan),
+                    "FILE_NOT_FOUND from the owning controller must be corroborated by a later pass");
+
             gc.gcOnce();
 
             assertFalse(store.contains(NS, orphan),
@@ -188,6 +197,10 @@ class OrphanGcTest {
             OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 2, 0, 0);
 
             gc.gcOnce();
+            assertEquals(3, present(store, NS, first, second, third),
+                    "FILE_NOT_FOUND suspects must wait for a later corroborating pass");
+
+            gc.gcOnce();
 
             assertEquals(3, present(store, NS, first, second, third),
                     "a large orphan wave should open the namespace breaker before deleting any chunk");
@@ -196,7 +209,7 @@ class OrphanGcTest {
             assertEquals(1, gc.breakerTrips());
             assertEquals(3, gc.breakerSkippedChunkTotal());
             assertEquals(3, gc.breakerHaltedChunks());
-            assertEquals(3, confirms.get());
+            assertEquals(6, confirms.get());
 
             gc.gcOnce();
 
@@ -206,7 +219,7 @@ class OrphanGcTest {
             assertEquals(1, gc.breakerTrips(), "an already-open breaker must not count as a new trip");
             assertEquals(3, gc.breakerSkippedChunkTotal(), "skipped chunks are counted only on the trip pass");
             assertEquals(3, gc.breakerHaltedChunks());
-            assertEquals(3, confirms.get(), "open namespace breakers must skip owner confirm RPCs");
+            assertEquals(6, confirms.get(), "open namespace breakers must skip owner confirm RPCs");
         }
     }
 
@@ -226,6 +239,10 @@ class OrphanGcTest {
             seal(store, healthy, healthy1);
             String endpoint = "127.0.0.1:" + owner.port();
             OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 2, 0, 0);
+
+            gc.gcOnce();
+            assertEquals(3, present(store, bad, bad1, bad2, bad3));
+            assertEquals(1, present(store, healthy, healthy1));
 
             gc.gcOnce();
 
@@ -251,6 +268,9 @@ class OrphanGcTest {
             OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 2, 0, 0);
 
             gc.gcOnce();
+            assertEquals(2, present(store, NS, first, second));
+
+            gc.gcOnce();
 
             assertEquals(0, present(store, NS, first, second));
             assertFalse(gc.namespaceBreakerOpen(NS));
@@ -271,10 +291,16 @@ class OrphanGcTest {
             OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 2, 0, 0);
 
             gc.gcOnce();
+            assertEquals(2, present(store, NS, first, second));
+
+            gc.gcOnce();
             assertEquals(0, present(store, NS, first, second));
             assertFalse(gc.namespaceBreakerOpen(NS));
 
             seal(store, third);
+            gc.gcOnce();
+            assertTrue(store.contains(NS, third));
+
             gc.gcOnce();
 
             assertTrue(store.contains(NS, third),
@@ -295,6 +321,9 @@ class OrphanGcTest {
             seal(store, third);
             String endpoint = "127.0.0.1:" + owner.port();
             OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 64, 34, 0);
+
+            gc.gcOnce();
+            assertEquals(3, present(store, NS, first, second, third));
 
             gc.gcOnce();
 
@@ -323,6 +352,9 @@ class OrphanGcTest {
             OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 64, 0, 3);
 
             gc.gcOnce();
+            assertEquals(4, present(store, a, a1, a2) + present(store, b, b1, b2));
+
+            gc.gcOnce();
 
             int remaining = present(store, a, a1, a2) + present(store, b, b1, b2);
             assertEquals(4, remaining, "a node-wide confirmed wave must open the global breaker before deletion");
@@ -331,7 +363,7 @@ class OrphanGcTest {
             assertEquals(1, gc.breakerTrips());
             assertEquals(4, gc.breakerSkippedChunkTotal());
             assertEquals(4, gc.breakerHaltedChunks());
-            assertEquals(4, confirms.get());
+            assertEquals(8, confirms.get());
 
             gc.gcOnce();
 
@@ -340,7 +372,7 @@ class OrphanGcTest {
             assertEquals(0, gc.breakerOpenNamespaces());
             assertEquals(1, gc.breakerTrips());
             assertEquals(4, gc.breakerSkippedChunkTotal());
-            assertEquals(4, confirms.get(), "open node breakers must skip owner confirm RPCs");
+            assertEquals(8, confirms.get(), "open node breakers must skip owner confirm RPCs");
         }
     }
 
@@ -366,10 +398,40 @@ class OrphanGcTest {
             OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 64, 0, 0);
 
             gc.gcOnce();
+            assertTrue(store.contains(NS, chunk),
+                    "first FILE_NOT_FOUND only arms the delayed corroboration gate");
+
+            gc.gcOnce();
 
             assertTrue(store.contains(NS, chunk),
                     "a chunk re-listed by its owner immediately before delete must be kept");
             assertEquals(2, confirms.get(), "confirmed orphans must be checked again at delete time");
+        }
+    }
+
+    @Test
+    void fileNotFoundPendingIsPrunedWhenChunkLeavesSuspectSet() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger confirms = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileNotFoundServer(confirms)) {
+            seal(store, chunk);
+            String endpoint = "127.0.0.1:" + owner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 64, 0, 0);
+
+            gc.gcOnce();
+            assertTrue(store.contains(NS, chunk),
+                    "first FILE_NOT_FOUND only arms the delayed corroboration gate");
+
+            assertEquals(ErrorCode.OK, store.delete(NS, chunk));
+            gc.gcOnce();
+
+            seal(store, chunk);
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, chunk),
+                    "a reused chunk id must not inherit a stale FILE_NOT_FOUND corroboration key");
+            assertEquals(2, confirms.get(), "the empty pass should prune without another owner confirm");
         }
     }
 
@@ -392,12 +454,17 @@ class OrphanGcTest {
                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "no such file");
             })) {
                 gc = new OrphanGc(store, deletes, NODE_ID,
-                        List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000, 64, 0, 0);
+                        List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000, 64, 0, 0, 0, 0);
+
+                gc.gcOnce();
+                assertTrue(store.contains(NS, chunk),
+                        "first FILE_NOT_FOUND only arms the delayed corroboration gate");
 
                 gc.gcOnce();
             }
 
-            assertEquals(2, confirms.get(), "gcOnce must confirm before and immediately before delete");
+            assertEquals(3, confirms.get(),
+                    "two-pass FILE_NOT_FOUND must still reconfirm immediately before delete");
             assertFalse(store.contains(NS, chunk));
             assertEquals(1, deletes.okDeletes());
             assertEquals(1, deletes.notFoundDeletes());
@@ -427,12 +494,16 @@ class OrphanGcTest {
                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "no such file");
             })) {
                 gc = new OrphanGc(store, deletes, NODE_ID,
-                        List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000, 64, 0, 0);
+                        List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000, 64, 0, 0, 0, 0);
+
+                gc.gcOnce();
+                assertTrue(store.contains(NS, chunk),
+                        "first FILE_NOT_FOUND only arms the delayed corroboration gate");
 
                 gc.gcOnce();
             }
 
-            assertEquals(2, confirms.get(), "gcOnce must still reach the delete-time reconfirm");
+            assertEquals(3, confirms.get(), "gcOnce must still reach the delete-time reconfirm");
             assertEquals(1, deletes.okDeletes());
             assertEquals(0, deletes.notFoundDeletes(),
                     "INTERNAL must not be widened into the idempotent already-deleted path");
@@ -452,13 +523,74 @@ class OrphanGcTest {
             seal(store, second);
             seal(store, third);
             String endpoint = "127.0.0.1:" + owner.port();
-            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 0, 0, 0);
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000, 0, 0, 0, 0, 0);
+
+            gc.gcOnce();
+            assertTrue(store.contains(NS, first));
+            assertTrue(store.contains(NS, second));
+            assertTrue(store.contains(NS, third));
 
             gc.gcOnce();
 
             assertFalse(store.contains(NS, first), "zero budgets disable delete caps");
             assertFalse(store.contains(NS, second), "zero budgets disable delete caps");
             assertFalse(store.contains(NS, third), "zero budgets disable delete caps");
+        }
+    }
+
+    @Test
+    void cumulativeNamespaceDeleteCapHaltsSlowDripAcrossPasses() throws Exception {
+        ChunkId first = new ChunkId(FileId.of(1), 0);
+        ChunkId second = new ChunkId(FileId.of(2), 0);
+        ChunkId third = new ChunkId(FileId.of(3), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileExistsWithoutChunkServer()) {
+            seal(store, first);
+            seal(store, second);
+            String endpoint = "127.0.0.1:" + owner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000,
+                    64, 0, 0, 2, 0);
+
+            gc.gcOnce();
+            assertEquals(0, present(store, NS, first, second));
+            assertFalse(gc.namespaceBreakerOpen(NS));
+
+            seal(store, third);
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, third),
+                    "once the lifetime namespace delete cap is spent, later slow-drip orphans must halt");
+            assertTrue(gc.namespaceBreakerOpen(NS));
+            assertEquals(1, gc.breakerTrips());
+            assertEquals(1, gc.cumulativeBreakerTrips());
+            assertEquals(1, gc.breakerSkippedChunkTotal());
+        }
+    }
+
+    @Test
+    void cumulativeNodeDeleteCapHaltsAcrossNamespaces() throws Exception {
+        StrataNamespace a = StrataNamespace.of("a");
+        StrataNamespace b = StrataNamespace.of("b");
+        StrataNamespace c = StrataNamespace.of("c");
+        ChunkId a1 = new ChunkId(FileId.of(1), 0);
+        ChunkId b1 = new ChunkId(FileId.of(2), 0);
+        ChunkId c1 = new ChunkId(FileId.of(3), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileExistsWithoutChunkServer()) {
+            seal(store, a, a1);
+            seal(store, b, b1);
+            seal(store, c, c1);
+            String endpoint = "127.0.0.1:" + owner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000,
+                    64, 0, 0, 0, 2);
+
+            gc.gcOnce();
+
+            assertEquals(1, present(store, a, a1) + present(store, b, b1) + present(store, c, c1),
+                    "node lifetime cap allows only two physical orphan deletes before halting the node");
+            assertTrue(gc.nodeBreakerOpen());
+            assertEquals(1, gc.breakerTrips());
+            assertEquals(1, gc.cumulativeBreakerTrips());
         }
     }
 
@@ -508,6 +640,16 @@ class OrphanGcTest {
         return new NsChunkId(NS, id);
     }
 
+    private static ScpServer fileExistsWithoutChunkServer() throws Exception {
+        return new ScpServer(0, 0, 0, 0, req -> {
+            if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+            }
+            return ScpServer.ok(req, new Messages.LookupFileResp(NS, StrataPath.of("/empty"),
+                    Messages.WritePolicy.DEFAULT, (byte) 0, List.of()).encode(), null);
+        });
+    }
+
     private static OrphanGc orphanGc(ChunkStore store, List<String> controllerEndpoints,
                                      long graceMs, long scanIntervalMs,
                                      long startupGraceMs, int confirmTimeoutMs) {
@@ -531,10 +673,26 @@ class OrphanGcTest {
                                      int maxConfirmedDeletesPerNamespacePerPass,
                                      int maxConfirmedDeletePercentPerNamespacePerPass,
                                      int maxConfirmedDeletesPerNodePass) {
+        return orphanGc(store, controllerEndpoints, graceMs, scanIntervalMs, startupGraceMs,
+                confirmTimeoutMs, maxConfirmedDeletesPerNamespacePerPass,
+                maxConfirmedDeletePercentPerNamespacePerPass, maxConfirmedDeletesPerNodePass,
+                OrphanGc.DEFAULT_MAX_CUMULATIVE_DELETES_PER_NAMESPACE,
+                OrphanGc.DEFAULT_MAX_CUMULATIVE_DELETES_PER_NODE);
+    }
+
+    private static OrphanGc orphanGc(ChunkStore store, List<String> controllerEndpoints,
+                                     long graceMs, long scanIntervalMs,
+                                     long startupGraceMs, int confirmTimeoutMs,
+                                     int maxConfirmedDeletesPerNamespacePerPass,
+                                     int maxConfirmedDeletePercentPerNamespacePerPass,
+                                     int maxConfirmedDeletesPerNodePass,
+                                     int maxCumulativeDeletesPerNamespace,
+                                     int maxCumulativeDeletesPerNode) {
         ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
         return new OrphanGc(store, deletes, NODE_ID, controllerEndpoints,
                 graceMs, scanIntervalMs, startupGraceMs, confirmTimeoutMs,
                 maxConfirmedDeletesPerNamespacePerPass, maxConfirmedDeletePercentPerNamespacePerPass,
-                maxConfirmedDeletesPerNodePass);
+                maxConfirmedDeletesPerNodePass, maxCumulativeDeletesPerNamespace,
+                maxCumulativeDeletesPerNode);
     }
 }
