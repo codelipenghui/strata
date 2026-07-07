@@ -10,10 +10,12 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class NamespaceMetadataStateTest {
@@ -129,6 +131,35 @@ class NamespaceMetadataStateTest {
         restored.restore(snap);
         assertEquals(FileId.of(2), restored.peekNextFileId(),
                 "restored state must not regress nextFileId — would reuse a durable id");
+    }
+
+    @Test
+    void fileCasVersionSurvivesSnapshotRestore() {
+        state.apply(fileCreated());
+        state.apply(new MetadataLogRecord.WriterEpochAllocated(F, 1));
+        assertEquals(1, state.version(F));
+
+        NamespaceMetadataState restored = new NamespaceMetadataState(NS);
+        restored.restore(state.exportSnapshot(123));
+
+        assertEquals(1, restored.version(F),
+                "snapshot restore must preserve the per-file CAS lineage");
+        restored.apply(new MetadataLogRecord.FileDeleting(F));
+        assertEquals(2, restored.version(F),
+                "the next mutation must advance from the restored version, not restart at zero");
+    }
+
+    @Test
+    void restoreRejectsSnapshotMissingFileCasVersion() {
+        state.apply(fileCreated());
+        NamespaceMetadataState.Snapshot snapshot = new NamespaceMetadataState.Snapshot(
+                state.peekNextFileId().id(), 123, List.of(state.file(F).orElseThrow()), Map.of(), Map.of());
+
+        NamespaceMetadataState restored = new NamespaceMetadataState(NS);
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> restored.restore(snapshot));
+
+        assertTrue(thrown.getMessage().contains("has no CAS version entry"));
     }
 
     @Test

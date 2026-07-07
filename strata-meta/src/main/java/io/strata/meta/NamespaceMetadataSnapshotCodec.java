@@ -12,19 +12,23 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * CRC-protected envelope for a compacted namespace snapshot (design §9, §10). The body holds the
- * next log start offset, the file table (each FileRecord length-prefixed), and the tombstone deletion
- * timestamps; a trailing CRC32C over the body detects corruption of a sealed snapshot system file.
+ * CRC-protected envelope for a compacted namespace snapshot (design §4.2). The body holds the
+ * snapshot version, next file id high-water, next log start offset, file table, per-file CAS versions,
+ * and tombstone deletion timestamps; a trailing CRC32C detects corruption of a sealed snapshot system file.
  */
 final class NamespaceMetadataSnapshotCodec {
     private NamespaceMetadataSnapshotCodec() {}
 
     static byte[] encode(NamespaceMetadataState.Snapshot snapshot) {
         BufWriter w = new BufWriter(256);
-        w.u8(1).u64(snapshot.nextFileId()).u64(snapshot.nextLogStartOffset()).varint(snapshot.files().size());
+        w.u8(2).u64(snapshot.nextFileId()).u64(snapshot.nextLogStartOffset()).varint(snapshot.files().size());
         for (Records.FileRecord f : snapshot.files()) {
             byte[] rec = f.encode();
             w.varint(rec.length).raw(rec);
+        }
+        w.varint(snapshot.versions().size());
+        for (Map.Entry<FileId, Integer> e : snapshot.versions().entrySet()) {
+            w.fileId(e.getKey()).i32(e.getValue());
         }
         w.varint(snapshot.tombstones().size());
         for (Map.Entry<FileId, Long> e : snapshot.tombstones().entrySet()) {
@@ -45,7 +49,7 @@ final class NamespaceMetadataSnapshotCodec {
         }
         ByteBuffer b = ByteBuffer.wrap(bytes, 0, bodyLen);
         byte version = b.get();
-        if (version != 1) {
+        if (version != 2) {
             throw new IllegalArgumentException("snapshot version " + version);
         }
         long nextFid = b.getLong();
@@ -58,12 +62,17 @@ final class NamespaceMetadataSnapshotCodec {
             b.get(rec);
             files.add(Records.FileRecord.decode(rec));
         }
+        Map<FileId, Integer> versions = new HashMap<>();
+        int versionCount = Varint.readCount(b, "file version");
+        for (int i = 0; i < versionCount; i++) {
+            versions.put(FileId.readFrom(b), b.getInt());
+        }
         int tombCount = Varint.readCount(b, "tombstone");
         Map<FileId, Long> tombstones = new HashMap<>();
         for (int i = 0; i < tombCount; i++) {
             FileId id = FileId.readFrom(b);
             tombstones.put(id, b.getLong());
         }
-        return new NamespaceMetadataState.Snapshot(nextFid, nextOffset, files, tombstones);
+        return new NamespaceMetadataState.Snapshot(nextFid, nextOffset, files, versions, tombstones);
     }
 }

@@ -19,7 +19,7 @@ import java.util.UUID;
 import java.util.function.UnaryOperator;
 
 /**
- * The in-memory replay image of one namespace's metadata log (design §8.1, §9). Applying the
+ * The in-memory replay image of one namespace's metadata log (design §4.2). Applying the
  * authoritative {@link MetadataLogRecord}s in order reconstructs the current file table, path
  * bindings, chunk descriptors, deletion tombstones (with timestamps for bounded sweep), and the
  * derived {@code node -> chunks} reverse index. All derived state is rebuildable from the log plus the
@@ -63,20 +63,23 @@ final class NamespaceMetadataState {
     }
 
     /**
-     * The compacted serialized form of this state at a log cut offset (design §9, §10). Path bindings
-     * and {@code node -> chunks} are derived on restore (a path binds exactly to its OPEN/SEALED file),
-     * so only the file table and tombstone deletion timestamps are kept.
+     * The compacted serialized form of this state at a log cut offset (design §4.2). Path bindings,
+     * opId idempotency, and {@code node -> chunks} are derived on restore; the snapshot keeps the
+     * durable counters, file table, file CAS versions, and tombstone deletion timestamps.
      */
-    record Snapshot(long nextFileId, long nextLogStartOffset, List<Records.FileRecord> files, Map<FileId, Long> tombstones) {
+    record Snapshot(long nextFileId, long nextLogStartOffset, List<Records.FileRecord> files,
+                    Map<FileId, Integer> versions, Map<FileId, Long> tombstones) {
         Snapshot {
             files = List.copyOf(files);
+            versions = Map.copyOf(versions);
             tombstones = Map.copyOf(tombstones);
         }
     }
 
     /** Captures the current state for a compaction snapshot cut at {@code nextLogStartOffset}. */
     Snapshot exportSnapshot(long nextLogStartOffset) {
-        return new Snapshot(nextFileId, nextLogStartOffset, new ArrayList<>(files.values()), new HashMap<>(tombstones));
+        return new Snapshot(nextFileId, nextLogStartOffset, new ArrayList<>(files.values()),
+                new HashMap<>(versions), new HashMap<>(tombstones));
     }
 
     /** Replaces this state with a snapshot's tables, re-deriving path bindings and the node index. */
@@ -88,14 +91,27 @@ final class NamespaceMetadataState {
         nodeChunks.clear();
         versions.clear();
         opIdIndex.clear();
+        Set<FileId> restoredFiles = new HashSet<>();
         for (Records.FileRecord f : snapshot.files()) {
+            if (!restoredFiles.add(f.fileId())) {
+                throw new IllegalArgumentException("snapshot integrity: duplicate file " + f.fileId());
+            }
             files.put(f.fileId(), f);
             addToNodeChunks(f);
-            versions.put(f.fileId(), 0);
+            Integer v = snapshot.versions().get(f.fileId());
+            if (v == null) {
+                throw new IllegalArgumentException(
+                        "snapshot integrity: file " + f.fileId() + " has no CAS version entry");
+            }
+            versions.put(f.fileId(), v);
             if (f.state() == FileState.OPEN || f.state() == FileState.SEALED) {
                 pathBindings.put(f.path(), f.fileId());
             }
             opIdIndex.put(new UUID(f.createOpMsb(), f.createOpLsb()), f.fileId());
+        }
+        if (snapshot.versions().size() != restoredFiles.size()) {
+            throw new IllegalArgumentException("snapshot integrity: CAS version table has "
+                    + snapshot.versions().size() + " entries for " + restoredFiles.size() + " files");
         }
         tombstones.putAll(snapshot.tombstones());
     }

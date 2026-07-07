@@ -146,6 +146,9 @@ class NamespaceLogCowCompactionTest {
                 for (int i = 1; i <= 3; i++) {
                     backend.createFile(file(i, "/f" + i));
                 }
+                MetadataStore.Versioned<Records.FileRecord> f1 =
+                        backend.getFile(NS, FileId.of(1)).orElseThrow();
+                assertTrue(backend.updateFile(f1.value().withWriterEpoch(1), f1.version()));
                 blocking.armed = true;
 
                 CompletableFuture<Integer> compaction = CompletableFuture.supplyAsync(() ->
@@ -171,6 +174,10 @@ class NamespaceLogCowCompactionTest {
                     assertTrue(successor.state().file(FileId.of(i)).isPresent(),
                             "file " + i + " must survive compaction (f4 is the freeze→CAS-window append)");
                 }
+                assertEquals(1, successor.state().version(FileId.of(1)),
+                        "file 1's snapshot-side CAS version must survive compaction");
+                assertEquals(0, successor.state().version(FileId.of(4)),
+                        "the freeze-to-CAS-window append must replay with its own CAS version");
             }
         }
     }
