@@ -272,6 +272,9 @@ final class NamespaceMetadataLogRepository {
             // The CAS may have committed but returned an ambiguous retry conflict (Curator retry after a lost
             // response). Do not delete the files the committed manifest may now reference; the system-file GC
             // will later reclaim only generations proven unreachable from published manifests.
+            log.warn("namespace metadata manifest CAS lost/ambiguous namespace={} generation={} "
+                            + "snapshotFile={} logFile={}; leaving files for manifest-aware GC",
+                    namespace, frozen.newGeneration(), newSnapshot, newLog);
             throw new IllegalStateException("manifest CAS lost or ambiguous for namespace " + namespace
                     + " — fenced; recover again under a new epoch");
         }
@@ -332,6 +335,9 @@ final class NamespaceMetadataLogRepository {
             // The CAS may have committed but returned an ambiguous retry conflict (Curator retry after a lost
             // response). Do not delete the files the committed manifest may now reference; the system-file GC
             // will later reclaim only generations proven unreachable from published manifests.
+            log.warn("namespace metadata manifest CAS lost/ambiguous namespace={} generation={} "
+                            + "snapshotFile={} logFile={}; leaving files for manifest-aware GC",
+                    namespace, newGeneration, newSnapshot, newLog);
             throw new IllegalStateException("manifest CAS lost or ambiguous for namespace " + namespace
                     + " — fenced; recover again under a new epoch");
         }
@@ -351,6 +357,10 @@ final class NamespaceMetadataLogRepository {
         // rather than an inline best-effort delete that no retention window could honor.
     }
 
+    /**
+     * Only safe before the manifest CAS runs: every remaining caller is cleaning files that no manifest can
+     * reference yet. Never call this after an empty CAS result.
+     */
     private void deleteQuietly(FileId id) {
         if (id == null) {
             return;

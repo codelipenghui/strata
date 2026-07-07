@@ -192,8 +192,8 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
         // or raced compactions (same ns/generation/kind) therefore never collide at the ZK path level and
         // cannot trigger NodeExistsException. Readers always look up files by FileId via openById(), not by
         // path, so the unique leaf does not affect correctness. A retried/raced compaction, ambiguous
-        // manifest CAS, or crash between file-create and manifest-CAS leaves at most one orphan snapshot+log;
-        // reclamation is deferred to manifest-aware system-file GC.
+        // manifest CAS, or crash between file-create and manifest-CAS leaves at most one orphan snapshot+log
+        // per generation attempt; reclamation is deferred to manifest-aware system-file GC.
         return new StrataClient.FileSpec(NamespaceLogBackend.SYSTEM_NAMESPACE,
                 StrataPath.of("/metadata-log/" + ns + "/gen-" + generation + "/" + kind + "-"
                         + UUID.randomUUID()), policy);

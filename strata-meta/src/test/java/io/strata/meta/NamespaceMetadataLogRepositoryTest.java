@@ -7,6 +7,7 @@ import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.List;
 import java.util.OptionalInt;
@@ -293,12 +294,15 @@ class NamespaceMetadataLogRepositoryTest {
         }
     }
 
-    private static MetadataStore commitManifestButReportEmptyOnce(MetadataStore delegate, AtomicBoolean armed) {
+    private static MetadataStore commitManifestButReportEmptyOnce(MetadataStore delegate, AtomicBoolean armed)
+            throws NoSuchMethodException {
+        Method putNamespaceManifest = MetadataStore.class.getMethod("putNamespaceManifest",
+                Records.NamespaceManifest.class, int.class);
         return (MetadataStore) Proxy.newProxyInstance(
                 MetadataStore.class.getClassLoader(),
                 new Class<?>[]{MetadataStore.class},
                 (proxy, method, methodArgs) -> {
-                    if (method.getName().equals("putNamespaceManifest") && armed.compareAndSet(true, false)) {
+                    if (method.equals(putNamespaceManifest) && armed.compareAndSet(true, false)) {
                         try {
                             method.invoke(delegate, methodArgs);
                         } catch (InvocationTargetException e) {
