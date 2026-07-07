@@ -787,7 +787,7 @@ class RepairCoordinator implements AutoCloseable {
                 for (Messages.VerifyChunkResult r : results) {
                     Records.ChunkRecord exp = expected.get(r.chunkId());
                     if (exp != null) {
-                        applyVerifyVerdict(ns, fileId, exp, e.getKey(), node, r, now, nodes, droppedThisPass);
+                        applyVerifyVerdict(ns, fileId, exp, e.getKey(), node, r, now, droppedThisPass);
                     }
                 }
             }
@@ -834,7 +834,6 @@ class RepairCoordinator implements AutoCloseable {
      */
     private void applyVerifyVerdict(StrataNamespace ns, FileId fileId, Records.ChunkRecord exp, int nodeId,
                                     Records.NodeRecord node, Messages.VerifyChunkResult r, long now,
-                                    Map<Integer, Records.NodeRecord> nodes,
                                     Map<ChunkId, Set<Integer>> droppedThisPass)
             throws Exception {
         ChunkId chunkId = r.chunkId();
@@ -855,14 +854,11 @@ class RepairCoordinator implements AutoCloseable {
         // live replica of a chunk. A false-positive verdict — a transient miss or a bogus crc — must not
         // turn a recoverable degraded chunk into an unavailable one (0 live replicas). The reconcile scan
         // re-replicates once a healthy peer exists; until then keeping the (possibly bad) last copy
-        // referenced is strictly safer than dropping it. Liveness is judged from the persisted snapshot (not
-        // registry.isDead), so a non-leader owner with a frozen in-memory registry does not miscount a
-        // genuinely-DEAD peer as live and drop the last actually-live copy. Already-dropped replicas from
-        // this verify pass also cannot count as survivors, because they may already be physically unlinked.
-        Set<Integer> dropped = droppedThisPass.getOrDefault(chunkId, Set.of());
-        if (!healthy && exp.replicas().stream()
-                .filter(n -> n != nodeId && !dropped.contains(n) && isPersistedLive(n, nodes))
-                .count() == 0) {
+        // referenced is strictly safer than dropping it. Re-read persisted liveness at verdict-apply time:
+        // the pass-start snapshot can become stale if a peer is declared DEAD while this verify pass is still
+        // blocked in RPCs. Already-dropped replicas from this verify pass also cannot count as survivors,
+        // because they may already be physically unlinked.
+        if (!healthy && wouldDropLastPersistedLiveReplica(exp, nodeId, chunkId, droppedThisPass)) {
             log.warn("verify: keeping last live replica {} of chunk {} despite verdict "
                             + "(present={} state={}) — dropping it would leave 0 live replicas",
                     nodeId, chunkId, r.present(), r.state());
@@ -905,6 +901,15 @@ class RepairCoordinator implements AutoCloseable {
 
     private void recordDroppedThisPass(Map<ChunkId, Set<Integer>> droppedThisPass, ChunkId chunkId, int nodeId) {
         droppedThisPass.computeIfAbsent(chunkId, k -> new HashSet<>()).add(nodeId);
+    }
+
+    private boolean wouldDropLastPersistedLiveReplica(Records.ChunkRecord exp, int nodeId, ChunkId chunkId,
+                                                      Map<ChunkId, Set<Integer>> droppedThisPass)
+            throws Exception {
+        Map<Integer, Records.NodeRecord> latestNodes = nodesById();
+        Set<Integer> dropped = droppedThisPass.getOrDefault(chunkId, Set.of());
+        return exp.replicas().stream()
+                .noneMatch(n -> n != nodeId && !dropped.contains(n) && isPersistedLive(n, latestNodes));
     }
 
     private void ownerRepairChunk(StrataNamespace ns, Records.FileRecord file, Records.ChunkRecord chunk,

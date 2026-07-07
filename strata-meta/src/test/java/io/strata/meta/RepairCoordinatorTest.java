@@ -772,6 +772,37 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void verifyPassReReadsPersistedLivenessBeforeDroppingLastReplica() throws Exception {
+        // A peer can be declared DEAD after verifyPass snapshots nodes but before a destructive verdict is
+        // applied. The last-live guard must use fresh persisted liveness at the drop point, not the pass-start
+        // snapshot, or it can count the now-DEAD peer as a survivor and delete the last live copy.
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        List<Integer> deletes = new CopyOnWriteArrayList<>();
+
+        Registered peer = register(registry, 1252, "peer-host");
+        try (ScpServer node = corruptingVerifyNode(1251, deletes, () -> {
+            Optional<MetadataStore.Versioned<Records.NodeRecord>> rec = store.getNode(peer.nodeId());
+            store.putNode(rec.orElseThrow().value().withState(Records.NodeState.DEAD), rec.get().version());
+        })) {
+            Registered corrupt = registerAt(registry, 1251, "corrupt-host", "127.0.0.1:" + node.port());
+
+            FileId fileId = fileId(0x5150);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(corrupt.nodeId(), peer.nodeId())))));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
+                    () -> false, () -> false, ns -> true);
+            owner.verifyPass();
+
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertEquals(List.of(corrupt.nodeId(), peer.nodeId()), replicas,
+                    "fresh persisted liveness must keep the last live replica referenced");
+            assertTrue(deletes.isEmpty(), "last live replica must not be physically deleted");
+        }
+    }
+
+    @Test
     void verifyPassResealsOpenReplicaOfDescriptorSealedChunkBeforeDropping() throws Exception {
         // Correlated crash after SEAL_CHUNK_META but before every replica's non-fsync trailer reaches disk:
         // descriptor is SEALED, but replicas recover OPEN at the descriptor length with matching data CRC.
@@ -1153,8 +1184,14 @@ class RepairCoordinatorTest {
     }
 
     private static ScpServer corruptingVerifyNode(int serverNodeId, List<Integer> deletes) throws Exception {
+        return corruptingVerifyNode(serverNodeId, deletes, () -> { });
+    }
+
+    private static ScpServer corruptingVerifyNode(int serverNodeId, List<Integer> deletes, Runnable beforeVerdict)
+            throws Exception {
         return new ScpServer(0, serverNodeId, serverNodeId, serverNodeId + 1L, req -> {
             if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                beforeVerdict.run();
                 Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
                 List<Messages.VerifyChunkResult> results = new ArrayList<>();
                 for (ChunkId id : vc.chunkIds()) {
