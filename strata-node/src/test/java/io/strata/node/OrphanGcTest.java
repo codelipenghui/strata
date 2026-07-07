@@ -89,6 +89,30 @@ class OrphanGcTest {
     }
 
     @Test
+    void unreachableConfirmSweepWarnsOncePerIntervalNotSilently() throws Exception {
+        ChunkId first = new ChunkId(FileId.of(1), 0);
+        ChunkId second = new ChunkId(FileId.of(2), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"))) {
+            seal(store, first);
+            seal(store, second);
+            // an unparsable endpoint plus one with nothing listening: every confirm sweep exhausts
+            // all endpoints as UNREACHABLE, so the node can never reclaim and must say why.
+            OrphanGc gc = orphanGc(store, List.of("not-an-endpoint", "127.0.0.1:1"), 0, 60_000, 0, 5_000);
+
+            gc.gcOnce();
+
+            assertEquals(2, present(store, NS, first, second),
+                    "unreachable suspects are kept (fail-safe), but the sweep must leave log evidence");
+            assertEquals(1, gc.unreachableConfirmWarns(),
+                    "one rate-limited warn per interval, not one per suspect and not zero");
+
+            gc.gcOnce();
+            assertEquals(1, gc.unreachableConfirmWarns(),
+                    "repeat sweeps inside the rate-limit interval must not warn again");
+        }
+    }
+
+    @Test
     void confirmSkipsNotLeaderControllersAndTrustsTheOwningController() throws Exception {
         ChunkId orphan = new ChunkId(FileId.of(1), 0);
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));

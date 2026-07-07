@@ -63,6 +63,7 @@ final class OrphanGc implements AutoCloseable {
     static final int DEFAULT_MAX_CONFIRMED_DELETES_PER_NODE_PASS = 256;
     private static final long DEFAULT_BREAKER_WINDOW_MS = 60_000;
     private static final long OPEN_BREAKER_WARN_INTERVAL_MS = 60_000;
+    private static final long UNREACHABLE_CONFIRM_WARN_INTERVAL_MS = 60_000;
     private static final int DEFAULT_CONFIRM_TIMEOUT_MS = 5_000;
 
     private final ChunkStore store;
@@ -89,6 +90,8 @@ final class OrphanGc implements AutoCloseable {
     private volatile int breakerHaltedChunks;
     private volatile long firstBreakerOpenedAtMs;
     private volatile long lastOpenBreakerWarnMs;
+    private final AtomicLong unreachableConfirmWarns = new AtomicLong();
+    private volatile long lastUnreachableConfirmWarnMs;
     private volatile Thread thread;
 
     OrphanGc(ChunkStore store, ChunkDeleteService deletes, int nodeId, List<String> controllerEndpoints,
@@ -347,11 +350,13 @@ final class OrphanGc implements AutoCloseable {
     private Verdict confirm(StrataNamespace ns, ChunkId chunkId) {
         FileId fileId = chunkId.fileId();
         byte[] req = new Messages.LookupFile(ns, fileId).encode();
+        Exception lastFailure = null;
         for (String ep : controllerEndpoints) {
             Endpoint endpoint;
             try {
                 endpoint = Endpoint.parse(ep, "controller endpoint", ErrorCode.INTERNAL);
             } catch (Exception e) {
+                lastFailure = e;
                 continue;
             }
             try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(),
@@ -374,14 +379,39 @@ final class OrphanGc implements AutoCloseable {
                     return Verdict.ORPHAN; // ordinary cleanup signal; breakers still halt mass waves
                 }
                 if (se.code() == ErrorCode.NOT_LEADER) {
+                    lastFailure = se;
                     continue; // this controller is not the owner — try the next endpoint
                 }
                 // any other error: do not trust it as a delete signal — fall through to the next endpoint
+                lastFailure = se;
             } catch (Exception e) {
-                // connection failure: try the next endpoint
+                lastFailure = e; // connection failure: try the next endpoint
             }
         }
+        maybeWarnUnreachableConfirm(ns, chunkId, lastFailure);
         return Verdict.UNREACHABLE; // no owner gave a definitive answer — keep (fail-safe)
+    }
+
+    /**
+     * A node that persistently cannot confirm never reclaims any orphan and fills its disk, so an
+     * all-endpoints-UNREACHABLE sweep must not be silent. Rate-limited node-wide: one warn per interval.
+     */
+    private void maybeWarnUnreachableConfirm(StrataNamespace ns, ChunkId chunkId, Exception lastFailure) {
+        long now = System.currentTimeMillis();
+        long last = lastUnreachableConfirmWarnMs;
+        if (last != 0 && now - last < UNREACHABLE_CONFIRM_WARN_INTERVAL_MS) {
+            return;
+        }
+        lastUnreachableConfirmWarnMs = now;
+        unreachableConfirmWarns.incrementAndGet();
+        log.warn("orphan GC: confirm for chunk {} in ns={} exhausted all {} controller endpoints without a "
+                        + "definitive answer; keeping suspects (fail-safe) but no orphan can be reclaimed "
+                        + "until a confirm succeeds",
+                chunkId, ns, controllerEndpoints.size(), lastFailure);
+    }
+
+    long unreachableConfirmWarns() {
+        return unreachableConfirmWarns.get();
     }
 
     @Override
