@@ -84,6 +84,7 @@ final class OrphanGc implements AutoCloseable {
     private final AtomicBoolean nodeBreakerOpen = new AtomicBoolean();
     private final AtomicLong breakerTrips = new AtomicLong();
     private final AtomicLong breakerSkippedChunkTotal = new AtomicLong();
+    private final AtomicLong alreadyDeletedTotal = new AtomicLong();
     private final long startedAtMs = System.currentTimeMillis();
     private final AtomicBoolean closed = new AtomicBoolean();
     private volatile int breakerHaltedNamespaces;
@@ -305,6 +306,10 @@ final class OrphanGc implements AutoCloseable {
         return breakerSkippedChunkTotal.get();
     }
 
+    long alreadyDeletedTotal() {
+        return alreadyDeletedTotal.get();
+    }
+
     int breakerHaltedNamespaces() {
         return breakerHaltedNamespaces;
     }
@@ -317,10 +322,15 @@ final class OrphanGc implements AutoCloseable {
         ErrorCode result = deletes.delete(namespace, chunkId);
         if (result == ErrorCode.OK) {
             log.info("orphan GC: deleted unreferenced sealed chunk {} in ns={}", chunkId, namespace);
-        } else {
-            log.warn("orphan GC: confirmed orphan {} in ns={} failed to delete: {}",
-                    chunkId, namespace, result);
+            return;
         }
+        if (result == ErrorCode.CHUNK_NOT_FOUND) {
+            alreadyDeletedTotal.incrementAndGet();
+            log.debug("orphan GC: confirmed orphan {} in ns={} was already deleted", chunkId, namespace);
+            return;
+        }
+        log.warn("orphan GC: confirmed orphan {} in ns={} failed to delete: {}",
+                chunkId, namespace, result);
     }
 
     private enum Verdict { ORPHAN, KEEP, UNREACHABLE }
