@@ -850,22 +850,11 @@ class RepairCoordinator implements AutoCloseable {
             replicaMissingSince.remove(key);
             return;
         }
-        // Last-live-replica guard (data-loss hardening): never let a verdict drop the only remaining
-        // live replica of a chunk. A false-positive verdict — a transient miss or a bogus crc — must not
-        // turn a recoverable degraded chunk into an unavailable one (0 live replicas). The reconcile scan
-        // re-replicates once a healthy peer exists; until then keeping the (possibly bad) last copy
-        // referenced is strictly safer than dropping it. Re-read persisted liveness at verdict-apply time:
-        // the pass-start snapshot can become stale if a peer is declared DEAD while this verify pass is still
-        // blocked in RPCs. Already-dropped replicas from this verify pass also cannot count as survivors,
-        // because they may already be physically unlinked.
-        if (!healthy && wouldDropLastPersistedLiveReplica(exp, nodeId, chunkId, droppedThisPass)) {
-            log.warn("verify: keeping last live replica {} of chunk {} despite verdict "
-                            + "(present={} state={}) — dropping it would leave 0 live replicas",
-                    nodeId, chunkId, r.present(), r.state());
-            return;
-        }
         if (!r.present()) {
             if (replicaUnhealthyPastGrace(key, now)) {
+                if (shouldKeepLastPersistedLiveReplica(exp, nodeId, chunkId, r, droppedThisPass)) {
+                    return;
+                }
                 log.warn("verify: node {} missing sealed chunk {} (>= {}ms) — dropping replica for re-repair",
                         nodeId, chunkId, config.replicaMissingGraceMs());
                 replicaMissingSince.remove(key);
@@ -874,6 +863,9 @@ class RepairCoordinator implements AutoCloseable {
             }
         } else if (r.state() != ChunkState.SEALED) {
             if (replicaUnhealthyPastGrace(key, now)) {
+                if (shouldKeepLastPersistedLiveReplica(exp, nodeId, chunkId, r, droppedThisPass)) {
+                    return;
+                }
                 log.warn("verify: node {} holds {} copy of sealed chunk {} (>= {}ms) — dropping replica",
                         nodeId, r.state(), chunkId, config.replicaMissingGraceMs());
                 replicaMissingSince.remove(key);
@@ -885,6 +877,9 @@ class RepairCoordinator implements AutoCloseable {
             // Corrupt sealed bytes are still protected by the store's digest check, so honor grace
             // before delete; immediate delete could let one bogus verdict destroy the last live copy.
             if (replicaUnhealthyPastGrace(key, now)) {
+                if (shouldKeepLastPersistedLiveReplica(exp, nodeId, chunkId, r, droppedThisPass)) {
+                    return;
+                }
                 replicaMissingSince.remove(key);
                 log.warn("verify: node {} holds corrupt sealed chunk {} (len {}/{} crc {}/{}, >= {}ms) "
                                 + "— dropping replica",
@@ -903,6 +898,26 @@ class RepairCoordinator implements AutoCloseable {
         droppedThisPass.computeIfAbsent(chunkId, k -> new HashSet<>()).add(nodeId);
     }
 
+    private boolean shouldKeepLastPersistedLiveReplica(Records.ChunkRecord exp, int nodeId, ChunkId chunkId,
+                                                       Messages.VerifyChunkResult r,
+                                                       Map<ChunkId, Set<Integer>> droppedThisPass)
+            throws Exception {
+        if (!wouldDropLastPersistedLiveReplica(exp, nodeId, chunkId, droppedThisPass)) {
+            return false;
+        }
+        log.warn("verify: keeping last live replica {} of chunk {} despite verdict "
+                        + "(present={} state={}) — dropping it would leave 0 live replicas",
+                nodeId, chunkId, r.present(), r.state());
+        return true;
+    }
+
+    /**
+     * Last-live-replica guard (data-loss hardening): once a verdict has passed grace and is about
+     * to drop/delete a replica, re-read persisted liveness and make sure a peer still survives.
+     * Liveness stays persisted-based (see {@link #isPersistedLive}) rather than registry-based so
+     * non-leader namespace owners do not use a frozen in-memory registry. Already-dropped replicas
+     * from this verify pass also cannot count as survivors because they may already be unlinked.
+     */
     private boolean wouldDropLastPersistedLiveReplica(Records.ChunkRecord exp, int nodeId, ChunkId chunkId,
                                                       Map<ChunkId, Set<Integer>> droppedThisPass)
             throws Exception {

@@ -790,6 +790,7 @@ class RepairCoordinatorTest {
             FileId fileId = fileId(0x5150);
             store.createFile(file(fileId, FileState.SEALED,
                     List.of(sealed(0, 4096, 0xCAFE, List.of(corrupt.nodeId(), peer.nodeId())))));
+            int beforeVersion = store.files.get(fileId).version();
 
             RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
                     () -> false, () -> false, ns -> true);
@@ -798,7 +799,43 @@ class RepairCoordinatorTest {
             List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
             assertEquals(List.of(corrupt.nodeId(), peer.nodeId()), replicas,
                     "fresh persisted liveness must keep the last live replica referenced");
+            assertEquals(beforeVersion, store.files.get(fileId).version(),
+                    "last-live guard must return before descriptor mutation");
             assertTrue(deletes.isEmpty(), "last live replica must not be physically deleted");
+        }
+    }
+
+    @Test
+    void verifyPassCombinesFreshLivenessWithAlreadyDroppedReplicas() throws Exception {
+        // A mid-pass peer death should still allow one corrupt replica to be dropped while preventing a
+        // second corrupt verdict from counting that already-dropped replica as a survivor.
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        List<Integer> deletes = new CopyOnWriteArrayList<>();
+
+        Registered deadMidPass = registerAt(registry, 1263, "dead-mid-pass-host", "127.0.0.1:1");
+        try (ScpServer nodeA = corruptingVerifyNode(1261, deletes, () -> {
+            Optional<MetadataStore.Versioned<Records.NodeRecord>> rec = store.getNode(deadMidPass.nodeId());
+            store.putNode(rec.orElseThrow().value().withState(Records.NodeState.DEAD), rec.get().version());
+        });
+             ScpServer nodeB = corruptingVerifyNode(1262, deletes)) {
+            Registered a = registerAt(registry, 1261, "corrupt-a-host", "127.0.0.1:" + nodeA.port());
+            Registered b = registerAt(registry, 1262, "corrupt-b-host", "127.0.0.1:" + nodeB.port());
+
+            FileId fileId = fileId(0x5153);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(a.nodeId(), b.nodeId(), deadMidPass.nodeId())))));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
+                    () -> false, () -> false, ns -> true);
+            owner.verifyPass();
+
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertEquals(List.of(b.nodeId(), deadMidPass.nodeId()), replicas,
+                    "first corrupt replica can drop, but the second is kept once only a dead peer remains");
+            assertEquals(List.of(a.nodeId()), deletes,
+                    "only the replica with a live replacement survivor should be physically deleted");
+            assertEquals(1, store.files.get(fileId).version(), "exactly one descriptor mutation should land");
         }
     }
 
