@@ -142,6 +142,162 @@ class OrphanGcTest {
     }
 
     @Test
+    void keepsSuspectWhenFileNotFoundComesFromStaleOwnerEpoch() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger calls = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer staleOwner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 calls.incrementAndGet();
+                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "stale owner missing file", 7);
+             })) {
+            seal(store, chunk);
+            String endpoint = "127.0.0.1:" + staleOwner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000,
+                    (namespace, ownerEpoch) -> {
+                        if (ownerEpoch < 8) {
+                            throw new ScpException(ErrorCode.FENCED_EPOCH,
+                                    "stale owner epoch " + ownerEpoch, 8);
+                        }
+                    });
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, chunk),
+                    "a stale owner's FILE_NOT_FOUND must not authorize physical deletion");
+            assertEquals(1, calls.get(), "a fenced confirm must not be retried as a delete candidate");
+        }
+    }
+
+    @Test
+    void keepsSuspectWhenLookupSuccessComesFromStaleOwnerEpoch() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger calls = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer staleOwner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 calls.incrementAndGet();
+                 return ScpServer.ok(req, new Messages.LookupFileResp(NS, StrataPath.of("/f1"),
+                         Messages.WritePolicy.DEFAULT, (byte) 0, List.of(), 7).encode(), null);
+             })) {
+            seal(store, chunk);
+            String endpoint = "127.0.0.1:" + staleOwner.port();
+            OrphanGc gc = orphanGc(store, List.of(endpoint), 0, 60_000, 0, 5_000,
+                    (namespace, ownerEpoch) -> {
+                        if (ownerEpoch < 8) {
+                            throw new ScpException(ErrorCode.FENCED_EPOCH,
+                                    "stale owner epoch " + ownerEpoch, 8);
+                        }
+                    });
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, chunk),
+                    "a stale owner's descriptor must not authorize physical deletion");
+            assertEquals(1, calls.get(), "a fenced confirm must not be retried as a delete candidate");
+        }
+    }
+
+    @Test
+    void skipsStaleOwnerEpochAndTrustsLaterFreshOwnerConfirm() throws Exception {
+        ChunkId orphan = new ChunkId(FileId.of(1), 0);
+        AtomicInteger staleCalls = new AtomicInteger();
+        AtomicInteger freshCalls = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer staleOwner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 staleCalls.incrementAndGet();
+                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "stale owner missing file", 7);
+             });
+             ScpServer freshOwner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 freshCalls.incrementAndGet();
+                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "fresh owner missing file", 8);
+             })) {
+            seal(store, orphan);
+            OrphanGc gc = orphanGc(store, List.of(
+                            "127.0.0.1:" + staleOwner.port(),
+                            "127.0.0.1:" + freshOwner.port()),
+                    0, 60_000, 0, 5_000,
+                    (namespace, ownerEpoch) -> {
+                        if (ownerEpoch < 8) {
+                            throw new ScpException(ErrorCode.FENCED_EPOCH,
+                                    "stale owner epoch " + ownerEpoch, 8);
+                        }
+                    });
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, orphan),
+                    "fresh FILE_NOT_FOUND must still wait for a later corroborating pass");
+            assertEquals(1, staleCalls.get(), "stale answer is skipped on the first confirm pass");
+            assertEquals(1, freshCalls.get(), "fresh owner is consulted on the first confirm pass");
+
+            gc.gcOnce();
+
+            assertFalse(store.contains(NS, orphan),
+                    "a fresh owner's FILE_NOT_FOUND should still authorize ordinary orphan cleanup");
+            assertEquals(3, staleCalls.get(), "stale answers are skipped during confirm and delete checks");
+            assertEquals(3, freshCalls.get(), "fresh owner is consulted during confirm and delete checks");
+        }
+    }
+
+    @Test
+    void skipsMalformedOwnerEpochAndTrustsLaterFreshOwnerConfirm() throws Exception {
+        ChunkId orphan = new ChunkId(FileId.of(1), 0);
+        AtomicInteger malformedCalls = new AtomicInteger();
+        AtomicInteger freshCalls = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer malformedOwner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 malformedCalls.incrementAndGet();
+                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "malformed owner epoch", -1);
+             });
+             ScpServer freshOwner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 freshCalls.incrementAndGet();
+                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "fresh owner missing file", 8);
+             })) {
+            seal(store, orphan);
+            OrphanGc gc = orphanGc(store, List.of(
+                            "127.0.0.1:" + malformedOwner.port(),
+                            "127.0.0.1:" + freshOwner.port()),
+                    0, 60_000, 0, 5_000,
+                    (namespace, ownerEpoch) -> {
+                        if (ownerEpoch < 0) {
+                            throw new IllegalArgumentException("ownerEpoch must be non-negative: " + ownerEpoch);
+                        }
+                    });
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, orphan),
+                    "fresh FILE_NOT_FOUND must still wait for a later corroborating pass");
+            assertEquals(1, malformedCalls.get(), "malformed answer is skipped on the first confirm pass");
+            assertEquals(1, freshCalls.get(), "fresh owner is consulted on the first confirm pass");
+
+            gc.gcOnce();
+
+            assertFalse(store.contains(NS, orphan),
+                    "a malformed owner epoch must be skipped without aborting later fresh owner cleanup");
+            assertEquals(3, malformedCalls.get(), "malformed answers are skipped during confirm and delete checks");
+            assertEquals(3, freshCalls.get(), "fresh owner is still consulted during confirm and delete checks");
+        }
+    }
+
+    @Test
     void keepsSuspectWhenEveryControllerRedirectsNotLeaderFailSafe() throws Exception {
         ChunkId chunk = new ChunkId(FileId.of(1), 0);
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
@@ -660,6 +816,18 @@ class OrphanGcTest {
     private static OrphanGc orphanGc(ChunkStore store, List<String> controllerEndpoints,
                                      long graceMs, long scanIntervalMs,
                                      long startupGraceMs, int confirmTimeoutMs,
+                                     OrphanGc.OwnerEpochAcceptor ownerEpochAcceptor) {
+        return orphanGc(store, controllerEndpoints, graceMs, scanIntervalMs, startupGraceMs,
+                confirmTimeoutMs, OrphanGc.DEFAULT_MAX_CONFIRMED_DELETES_PER_NAMESPACE_PER_PASS,
+                OrphanGc.DEFAULT_MAX_CONFIRMED_DELETE_PERCENT_PER_NAMESPACE_PER_PASS,
+                OrphanGc.DEFAULT_MAX_CONFIRMED_DELETES_PER_NODE_PASS,
+                OrphanGc.DEFAULT_MAX_CUMULATIVE_DELETES_PER_NAMESPACE,
+                OrphanGc.DEFAULT_MAX_CUMULATIVE_DELETES_PER_NODE, ownerEpochAcceptor);
+    }
+
+    private static OrphanGc orphanGc(ChunkStore store, List<String> controllerEndpoints,
+                                     long graceMs, long scanIntervalMs,
+                                     long startupGraceMs, int confirmTimeoutMs,
                                      int maxConfirmedDeletesPerNamespacePerPass) {
         return orphanGc(store, controllerEndpoints, graceMs, scanIntervalMs, startupGraceMs,
                 confirmTimeoutMs, maxConfirmedDeletesPerNamespacePerPass,
@@ -688,11 +856,27 @@ class OrphanGcTest {
                                      int maxConfirmedDeletesPerNodePass,
                                      int maxCumulativeDeletesPerNamespace,
                                      int maxCumulativeDeletesPerNode) {
+        return orphanGc(store, controllerEndpoints, graceMs, scanIntervalMs, startupGraceMs,
+                confirmTimeoutMs, maxConfirmedDeletesPerNamespacePerPass,
+                maxConfirmedDeletePercentPerNamespacePerPass, maxConfirmedDeletesPerNodePass,
+                maxCumulativeDeletesPerNamespace, maxCumulativeDeletesPerNode,
+                (namespace, ownerEpoch) -> {});
+    }
+
+    private static OrphanGc orphanGc(ChunkStore store, List<String> controllerEndpoints,
+                                     long graceMs, long scanIntervalMs,
+                                     long startupGraceMs, int confirmTimeoutMs,
+                                     int maxConfirmedDeletesPerNamespacePerPass,
+                                     int maxConfirmedDeletePercentPerNamespacePerPass,
+                                     int maxConfirmedDeletesPerNodePass,
+                                     int maxCumulativeDeletesPerNamespace,
+                                     int maxCumulativeDeletesPerNode,
+                                     OrphanGc.OwnerEpochAcceptor ownerEpochAcceptor) {
         ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
         return new OrphanGc(store, deletes, NODE_ID, controllerEndpoints,
                 graceMs, scanIntervalMs, startupGraceMs, confirmTimeoutMs,
                 maxConfirmedDeletesPerNamespacePerPass, maxConfirmedDeletePercentPerNamespacePerPass,
                 maxConfirmedDeletesPerNodePass, maxCumulativeDeletesPerNamespace,
-                maxCumulativeDeletesPerNode);
+                maxCumulativeDeletesPerNode, ownerEpochAcceptor);
     }
 }

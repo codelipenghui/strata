@@ -102,7 +102,7 @@ public final class DataNode implements AutoCloseable {
                         config.orphanDeleteMaxNamespacePercentPerPass(),
                         config.orphanDeleteMaxConfirmedPerNodePass(),
                         config.orphanDeleteMaxCumulativePerNamespace(),
-                        config.orphanDeleteMaxCumulativePerNode());
+                        config.orphanDeleteMaxCumulativePerNode(), this::acceptOwnerEpoch);
                 this.orphanGc = startedGc;
                 startedGc.start();
             } else {

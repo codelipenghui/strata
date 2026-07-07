@@ -184,6 +184,10 @@ class MessageRoundtripTest {
                         new Messages.ChunkInfo(c, ChunkState.OPEN, 0, 0, 5,
                                 List.of(new Messages.Replica(1, "a:1")))));
         assertEquals(lfr, decodeResp(lfr.encode(), Messages.LookupFileResp::decode));
+        var stampedLookup = new Messages.LookupFileResp("test",
+                "/kafka/topicA/0/00000000000000000000",
+                Messages.WritePolicy.DEFAULT, (byte) 0, List.of(), 7);
+        assertEquals(stampedLookup, decodeResp(stampedLookup.encode(), Messages.LookupFileResp::decode));
 
         var df = new Messages.DeleteFiles(ns, List.of(f));
         assertEquals(df, Messages.DeleteFiles.decode(buf(df.encode())));

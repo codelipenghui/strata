@@ -1899,10 +1899,20 @@ public final class Messages {
 
     public record LookupFileResp(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy,
                                  byte fileState,
-                                 List<ChunkInfo> chunks) {
+                                 List<ChunkInfo> chunks, long ownerEpoch) {
         public LookupFileResp(String namespace, String path, WritePolicy writePolicy, byte fileState,
                               List<ChunkInfo> chunks) {
-            this(StrataNamespace.of(namespace), StrataPath.of(path), writePolicy, fileState, chunks);
+            this(StrataNamespace.of(namespace), StrataPath.of(path), writePolicy, fileState, chunks, 0);
+        }
+
+        public LookupFileResp(String namespace, String path, WritePolicy writePolicy, byte fileState,
+                              List<ChunkInfo> chunks, long ownerEpoch) {
+            this(StrataNamespace.of(namespace), StrataPath.of(path), writePolicy, fileState, chunks, ownerEpoch);
+        }
+
+        public LookupFileResp(StrataNamespace namespace, StrataPath path, WritePolicy writePolicy,
+                              byte fileState, List<ChunkInfo> chunks) {
+            this(namespace, path, writePolicy, fileState, chunks, 0);
         }
 
         public LookupFileResp {
@@ -1910,6 +1920,7 @@ public final class Messages {
             path = Objects.requireNonNull(path, "path");
             writePolicy = Objects.requireNonNull(writePolicy, "writePolicy");
             chunks = List.copyOf(chunks);
+            requireNonNegativeOwnerEpoch(ownerEpoch);
         }
 
         public byte[] encode() {
@@ -1919,7 +1930,7 @@ public final class Messages {
             writePolicy.writeTo(w);
             w.u8(fileState).varint(chunks.size());
             for (ChunkInfo c : chunks) ChunkInfo.write(w, c);
-            w.noTags();
+            writeOwnerEpochTags(w, ownerEpoch);
             return w.toBytes();
         }
 
@@ -1931,8 +1942,9 @@ public final class Messages {
             int n = count(b);
             List<ChunkInfo> cs = new ArrayList<>(n);
             for (int i = 0; i < n; i++) cs.add(ChunkInfo.read(b));
-            TaggedFields.readFrom(b);
-            return new LookupFileResp(namespace, path, writePolicy, state, cs);
+            TaggedFields tags = TaggedFields.readFrom(b);
+            return new LookupFileResp(namespace, path, writePolicy, state, cs,
+                    readU64Tag(tags, TAG_OWNER_EPOCH, "ownerEpoch"));
         }
     }
 

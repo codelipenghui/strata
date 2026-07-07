@@ -469,6 +469,14 @@ public final class Controller implements AutoCloseable {
         }
     }
 
+    private long namespaceOwnerEpoch(StrataNamespace namespace) {
+        NamespaceLeadership leadership = namespaceLeadership;
+        if (leadership == null || NamespaceLogBackend.isSystem(namespace)) {
+            return 0;
+        }
+        return leadership.namespaceOwnerEpoch(namespace);
+    }
+
     /** Test/inspection hook: this node's namespace-ownership resolver. */
     NamespaceOwnership ownership() {
         return ownership;
@@ -897,7 +905,8 @@ public final class Controller implements AutoCloseable {
 
     private Messages.LookupFileResp lookup(StrataNamespace namespace, FileId fileId) throws Exception {
         var opt = getFile(namespace, fileId);
-        if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, fileId.toString());
+        long ownerEpoch = namespaceOwnerEpoch(namespace);
+        if (opt.isEmpty()) throw new ScpException(ErrorCode.FILE_NOT_FOUND, fileId.toString(), ownerEpoch);
         Records.FileRecord file = opt.get().value();
         List<Messages.ChunkInfo> chunks = new ArrayList<>(file.chunks().size());
         for (Records.ChunkRecord c : file.chunks()) {
@@ -910,7 +919,7 @@ public final class Controller implements AutoCloseable {
         }
         return new Messages.LookupFileResp(file.namespace(), file.path(),
                 new Messages.WritePolicy(file.replicationFactor(), file.ackQuorum(), file.fsyncOnAck()),
-                file.state().value, chunks);
+                file.state().value, chunks, ownerEpoch);
     }
 
     private FileId lookupPath(StrataNamespace namespace,
