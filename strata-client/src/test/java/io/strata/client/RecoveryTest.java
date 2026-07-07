@@ -475,7 +475,7 @@ class RecoveryTest {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
 
-                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
                 assertTrue(e.getMessage().contains("unverified above-floor holder"));
                 assertEquals(null, sealedFileLength.get());
             }
@@ -669,12 +669,147 @@ class RecoveryTest {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
 
-                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
                 assertTrue(e.getMessage().contains("unverified above-floor holder"));
                 assertEquals(null, sealedFileLength.get());
                 assertFalse(holderASeal.get());
                 assertFalse(holderBSeal.get());
                 assertFalse(laggingSeal.get());
+            }
+        }
+    }
+
+    @Test
+    void unsafeSealOverrideEvictsBlockedHolderAndSealsRemainingQuorum() throws Exception {
+        FileId fileId = FileId.of(48);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean blockedHolderSeal = new AtomicBoolean();
+        AtomicBoolean floorASeal = new AtomicBoolean();
+        AtomicBoolean floorBSeal = new AtomicBoolean();
+
+        try (ScpServer blockedHolder = aboveFloorLedgerFailingReplica(1, 8, 4, blockedHolderSeal);
+             ScpServer floorA = openReplicaWithFenceAndSeal(2, 4, 4, 4, 777, floorASeal);
+             ScpServer floorB = openReplicaWithFenceAndSeal(3, 4, 4, 4, 777, floorBSeal);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(blockedHolder)),
+                             new Messages.Replica(2, endpoint(floorA)),
+                             new Messages.Replica(3, endpoint(floorB))))), sealedFileLength);
+             AutoCloseable ignored = unsafeSealOverride(chunkId)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                        .recoverAndSeal(fileId, 2);
+
+                assertEquals(4, sealedInfo.sealedLength());
+                assertEquals(4L, sealedFileLength.get());
+                assertFalse(blockedHolderSeal.get(),
+                        "the override must evict the unverified holder instead of sealing it short");
+                assertTrue(floorASeal.get());
+                assertTrue(floorBSeal.get());
+                assertEquals(null, System.getProperty(Recovery.UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY),
+                        "the unsafe override must be consumed after one matching recovery");
+            }
+        }
+    }
+
+    @Test
+    void unsafeSealOverrideForDifferentChunkDoesNotBypassBlockedHolder() throws Exception {
+        FileId fileId = FileId.of(49);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean blockedHolderSeal = new AtomicBoolean();
+        AtomicBoolean floorASeal = new AtomicBoolean();
+        AtomicBoolean floorBSeal = new AtomicBoolean();
+
+        try (ScpServer blockedHolder = aboveFloorLedgerFailingReplica(1, 8, 4, blockedHolderSeal);
+             ScpServer floorA = openReplicaWithFenceAndSeal(2, 4, 4, 4, 777, floorASeal);
+             ScpServer floorB = openReplicaWithFenceAndSeal(3, 4, 4, 4, 777, floorBSeal);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(blockedHolder)),
+                             new Messages.Replica(2, endpoint(floorA)),
+                             new Messages.Replica(3, endpoint(floorB))))), sealedFileLength);
+             AutoCloseable ignored = unsafeSealOverride(new ChunkId(FileId.of(999), 0))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
+
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
+                assertEquals(null, sealedFileLength.get());
+                assertFalse(blockedHolderSeal.get());
+                assertFalse(floorASeal.get());
+                assertFalse(floorBSeal.get());
+            }
+        }
+    }
+
+    @Test
+    void unsafeSealOverrideBelowQuorumStillReportsSealRecoveryBlocked() throws Exception {
+        FileId fileId = FileId.of(51);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean blockedHolderSeal = new AtomicBoolean();
+        AtomicBoolean floorSeal = new AtomicBoolean();
+
+        try (ScpServer blockedHolder = aboveFloorLedgerFailingReplica(1, 8, 4, blockedHolderSeal);
+             ScpServer floor = openReplicaWithFenceAndSeal(2, 4, 4, 4, 777, floorSeal);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(blockedHolder)),
+                             new Messages.Replica(2, endpoint(floor)),
+                             new Messages.Replica(3, "127.0.0.1:1")))), sealedFileLength);
+             AutoCloseable ignored = unsafeSealOverride(chunkId)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
+
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
+                assertTrue(e.getMessage().contains("leaving 1 usable replica(s), need 2"));
+                assertEquals(null, sealedFileLength.get());
+                assertFalse(blockedHolderSeal.get());
+                assertFalse(floorSeal.get());
+            }
+        }
+    }
+
+    @Test
+    void unsafeSealOverrideMatchesOneTokenFromListAndConsumesOnlyThatToken() throws Exception {
+        FileId fileId = FileId.of(50);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        ChunkId otherChunk = new ChunkId(FileId.of(1000), 0);
+        String otherKey = "test:" + otherChunk;
+        String targetKey = "test:" + chunkId;
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean blockedHolderSeal = new AtomicBoolean();
+        AtomicBoolean floorASeal = new AtomicBoolean();
+        AtomicBoolean floorBSeal = new AtomicBoolean();
+
+        try (ScpServer blockedHolder = aboveFloorLedgerFailingReplica(1, 8, 4, blockedHolderSeal);
+             ScpServer floorA = openReplicaWithFenceAndSeal(2, 4, 4, 4, 777, floorASeal);
+             ScpServer floorB = openReplicaWithFenceAndSeal(3, 4, 4, 4, 777, floorBSeal);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(blockedHolder)),
+                             new Messages.Replica(2, endpoint(floorA)),
+                             new Messages.Replica(3, endpoint(floorB))))), sealedFileLength);
+             AutoCloseable ignored = unsafeSealOverride(otherKey + ", " + targetKey)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                        .recoverAndSeal(fileId, 2);
+
+                assertEquals(4, sealedInfo.sealedLength());
+                assertEquals(4L, sealedFileLength.get());
+                assertFalse(blockedHolderSeal.get());
+                assertTrue(floorASeal.get());
+                assertTrue(floorBSeal.get());
+                String remaining = System.getProperty(Recovery.UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY);
+                assertTrue(remaining.contains(otherKey));
+                assertFalse(remaining.contains(targetKey));
             }
         }
     }
@@ -703,7 +838,7 @@ class RecoveryTest {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
 
-                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
                 assertTrue(e.getMessage().contains("unverified above-floor holder"));
                 assertEquals(null, sealedFileLength.get());
                 assertFalse(holderASeal.get());
@@ -736,7 +871,7 @@ class RecoveryTest {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
 
-                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
                 assertTrue(e.getMessage().contains("unverified above-floor holder"));
                 assertEquals(null, sealedFileLength.get());
                 assertFalse(holderSeal.get());
@@ -769,7 +904,7 @@ class RecoveryTest {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
 
-                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
                 assertTrue(e.getMessage().contains("unverified above-floor holder"));
                 assertEquals(null, sealedFileLength.get());
                 assertFalse(holderSeal.get());
@@ -799,7 +934,7 @@ class RecoveryTest {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
 
-                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
                 assertTrue(e.getMessage().contains("unverified above-floor holder"));
                 assertEquals(null, sealedFileLength.get());
                 assertFalse(holderASeal.get());
@@ -832,7 +967,7 @@ class RecoveryTest {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
 
-                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
                 assertTrue(e.getMessage().contains("unverified above-floor holder"));
                 assertEquals(null, sealedFileLength.get());
             }
@@ -1217,7 +1352,7 @@ class RecoveryTest {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
 
-                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
                 assertTrue(e.getMessage().contains("unverified above-floor holder"));
                 assertEquals(null, sealedFileLength.get());
                 assertEquals(false, readCalled.get());
@@ -1244,7 +1379,7 @@ class RecoveryTest {
                 ScpException e = assertThrows(ScpException.class,
                         () -> new Recovery(meta, pool, config, StrataNamespace.of("test")).recoverAndSeal(fileId, 2));
 
-                assertEquals(ErrorCode.INTERNAL, e.code());
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
                 assertTrue(e.getMessage().contains("unverified above-floor holder"));
                 assertEquals(null, sealedFileLength.get());
             }
@@ -1961,6 +2096,22 @@ class RecoveryTest {
     private static Messages.ChunkInfo chunk(ChunkId id, ChunkState state, long length, int epoch,
                                             Messages.Replica... replicas) {
         return new Messages.ChunkInfo(id, state, length, 0, epoch, List.of(replicas));
+    }
+
+    private static AutoCloseable unsafeSealOverride(ChunkId chunkId) {
+        return unsafeSealOverride("test:" + chunkId);
+    }
+
+    private static AutoCloseable unsafeSealOverride(String value) {
+        String previous = System.getProperty(Recovery.UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY);
+        System.setProperty(Recovery.UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY, value);
+        return () -> {
+            if (previous == null) {
+                System.clearProperty(Recovery.UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY);
+            } else {
+                System.setProperty(Recovery.UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY, previous);
+            }
+        };
     }
 
     private static String endpoint(ScpServer server) {
