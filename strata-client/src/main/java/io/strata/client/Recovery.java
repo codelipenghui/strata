@@ -45,6 +45,9 @@ import static io.strata.common.Checks.addChunkLength;
  */
 final class Recovery {
     private static final Logger log = LoggerFactory.getLogger(Recovery.class);
+    static final String UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY = "strata.recovery.unsafeSealOverrideChunks";
+    static final String UNSAFE_SEAL_OVERRIDE_CHUNKS_ENV = "STRATA_RECOVERY_UNSAFE_SEAL_OVERRIDE_CHUNKS";
+    private static final Set<String> CONSUMED_ENV_UNSAFE_SEAL_OVERRIDES = new HashSet<>();
     private static final int RECOVERY_READ_MIN_ATTEMPTS = 2;
     private static final int RECOVERY_READ_MIN_PROGRESS_BYTES = 4 * 1024;
     private final ControllerClient controller;
@@ -254,7 +257,7 @@ final class Recovery {
             p = end;
         }
 
-        requireNoUnverifiedAboveFloorHolders(chunkId, unverifiedAboveFloorHolders, p);
+        rejectOrEvictUnverifiedAboveFloorHolders(chunkId, reachable, unverifiedAboveFloorHolders, p, ackQuorum);
         log.info("seal-recovery: chunk {} sealing at {}", chunkId, p);
         return finishSeal(chunkId, writerEpoch, p, reachable, ackQuorum);
     }
@@ -426,26 +429,104 @@ final class Recovery {
     }
 
     /**
-     * Issue #84 fail-closed gate. A holder whose fence response claimed bytes above the final seal point
-     * may still contain producer-acked data; losing those bytes by floor-sealing is permanent, while
-     * aborting leaves the chunk OPEN for a later recovery retry. This check intentionally uses the final
-     * seal point, not the floor at marking time, so a holder is forgiven when a later accepted
-     * continuation covers its claim. Eviction from the seal set does not remove the mark because eviction
-     * is not evidence that the holder's above-floor bytes were unacked.
+     * Issue #84/#102 fail-closed gate. A holder whose fence response claimed bytes above the final
+     * seal point may still contain producer-acked data; losing those bytes by floor-sealing is
+     * permanent, while aborting leaves the chunk OPEN for a later recovery retry. This check
+     * intentionally uses the final seal point, not the floor at marking time, so a holder is
+     * forgiven when a later accepted continuation covers its claim.
+     *
+     * <p>Issue #102 adds the explicit escape hatch we can make without pretending the bytes were
+     * proven: an operator may name one exact namespace/chunk and force recovery to evict the blocking
+     * holders from the seal set, then seal the remaining quorum. The matching token is consumed after
+     * one use. That is intentionally per-chunk and loud because it can discard bytes only the evicted
+     * holder claimed.
      */
-    private static void requireNoUnverifiedAboveFloorHolders(ChunkId chunkId,
-                                                             Set<ReplicaState> unverifiedAboveFloorHolders,
-                                                             long sealPoint) {
+    private void rejectOrEvictUnverifiedAboveFloorHolders(ChunkId chunkId, List<ReplicaState> reachable,
+                                                          Set<ReplicaState> unverifiedAboveFloorHolders,
+                                                          long sealPoint, int ackQuorum) {
+        List<ReplicaState> blockers = new ArrayList<>();
         for (ReplicaState rs : unverifiedAboveFloorHolders) {
             if (rs.end > sealPoint) {
-                log.warn("seal-recovery: chunk {} aborting before seal at {} because replica {} claimed "
-                                + "unverified end {}",
-                        chunkId, sealPoint, rs.replica.nodeId(), rs.end);
-                throw new ScpException(ErrorCode.INTERNAL,
-                        "chunk " + chunkId + " has unverified above-floor holder "
-                                + rs.replica.nodeId() + " at " + rs.end
-                                + " > seal point " + sealPoint);
+                blockers.add(rs);
             }
+        }
+        if (blockers.isEmpty()) {
+            return;
+        }
+
+        String overrideKey = unsafeSealOverrideKey(chunkId);
+        if (!consumeUnsafeSealOverride(overrideKey)) {
+            for (ReplicaState rs : blockers) {
+                log.warn("seal-recovery: chunk {} blocked before seal at {} because replica {} claimed "
+                                + "unverified end {}; override key {}",
+                        chunkId, sealPoint, rs.replica.nodeId(), rs.end, overrideKey);
+            }
+            throw new ScpException(ErrorCode.SEAL_RECOVERY_BLOCKED,
+                    "chunk " + chunkId + " has unverified above-floor holder(s) above seal point "
+                            + sealPoint + "; set " + UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY
+                            + " or " + UNSAFE_SEAL_OVERRIDE_CHUNKS_ENV + " to " + overrideKey
+                            + " only to evict the blocking holder(s) and force floor-seal");
+        }
+
+        for (ReplicaState rs : blockers) {
+            log.error("UNSAFE seal-recovery override {}: evicting replica {} which claimed unverified end {} "
+                            + "above seal point {} for chunk {}",
+                    overrideKey, rs.replica.nodeId(), rs.end, sealPoint, chunkId);
+        }
+        reachable.removeAll(blockers);
+        if (reachable.size() < ackQuorum) {
+            throw new ScpException(ErrorCode.SEAL_RECOVERY_BLOCKED,
+                    "unsafe seal-recovery override " + overrideKey + " evicted "
+                            + blockers.size() + " blocking holder(s), leaving " + reachable.size()
+                            + " usable replica(s), need " + ackQuorum);
+        }
+    }
+
+    private String unsafeSealOverrideKey(ChunkId chunkId) {
+        return namespace + ":" + chunkId;
+    }
+
+    private static boolean consumeUnsafeSealOverride(String overrideKey) {
+        synchronized (CONSUMED_ENV_UNSAFE_SEAL_OVERRIDES) {
+            String property = System.getProperty(UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY);
+            if (overrideTokensContain(property, overrideKey)) {
+                removeUnsafeSealOverridePropertyToken(property, overrideKey);
+                return true;
+            }
+
+            String env = System.getenv(UNSAFE_SEAL_OVERRIDE_CHUNKS_ENV);
+            if (overrideTokensContain(env, overrideKey)
+                    && !CONSUMED_ENV_UNSAFE_SEAL_OVERRIDES.contains(overrideKey)) {
+                CONSUMED_ENV_UNSAFE_SEAL_OVERRIDES.add(overrideKey);
+                return true;
+            }
+            return false;
+        }
+    }
+
+    private static boolean overrideTokensContain(String configured, String overrideKey) {
+        if (configured == null || configured.isBlank()) {
+            return false;
+        }
+        for (String token : configured.split("[,\\s]+")) {
+            if (overrideKey.equals(token)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void removeUnsafeSealOverridePropertyToken(String configured, String overrideKey) {
+        List<String> remaining = new ArrayList<>();
+        for (String token : configured.split("[,\\s]+")) {
+            if (!token.isBlank() && !overrideKey.equals(token)) {
+                remaining.add(token);
+            }
+        }
+        if (remaining.isEmpty()) {
+            System.clearProperty(UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY);
+        } else {
+            System.setProperty(UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY, String.join(",", remaining));
         }
     }
 

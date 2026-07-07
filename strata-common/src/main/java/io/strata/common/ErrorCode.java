@@ -23,7 +23,8 @@ public enum ErrorCode {
     FILE_NOT_FOUND(17, false),
     FILE_SEALED(18, false),
     PRECONDITION_FAILED(19, false),
-    METADATA_RECOVERING(20, true);
+    METADATA_RECOVERING(20, true),
+    SEAL_RECOVERY_BLOCKED(21, true);
 
     public final short code;
     public final boolean retriable;
