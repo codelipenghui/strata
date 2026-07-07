@@ -231,6 +231,9 @@ public final class DataNode implements AutoCloseable {
     public long orphanGcBreakerSkippedChunkTotal() {
         return orphanGc == null ? 0 : orphanGc.breakerSkippedChunkTotal();
     }
+    public long orphanGcAlreadyDeletedTotal() {
+        return orphanGc == null ? 0 : orphanGc.alreadyDeletedTotal();
+    }
     public int orphanGcBreakerHaltedNamespaces() {
         return orphanGc == null ? 0 : orphanGc.breakerHaltedNamespaces();
     }

@@ -248,6 +248,10 @@ final class ServerMetrics {
         FunctionCounter.builder("strata_data_node_orphan_gc_breaker_skipped_chunk_total", n,
                         DataNode::orphanGcBreakerSkippedChunkTotal)
                 .description("confirmed orphan deletes skipped when opening orphan-GC breakers").register(reg);
+        FunctionCounter.builder("strata_data_node_orphan_gc_already_deleted_total", n,
+                        DataNode::orphanGcAlreadyDeletedTotal)
+                .description("confirmed orphan deletes where another delete lane had already removed the chunk")
+                .register(reg);
 
         // Per-namespace data throughput: register a function-counter per namespace as it first appears
         // (via ioNamespaces()). Refreshed off a daemon timer because the namespace set changes at runtime.

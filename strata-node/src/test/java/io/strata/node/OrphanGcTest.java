@@ -4,6 +4,7 @@ import io.strata.common.ChunkId;
 import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
@@ -15,12 +16,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -347,20 +350,70 @@ class OrphanGcTest {
     }
 
     @Test
-    void confirmedDeleteTreatsAlreadyDeletedChunkAsBenign() throws Exception {
+    void gcOnceTreatsAlreadyDeletedChunkAsBenign() throws Exception {
         ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger confirms = new AtomicInteger();
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"))) {
             seal(store, chunk);
             ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
-            assertEquals(ErrorCode.OK, deletes.delete(NS, chunk),
-                    "normal delete wins the race before orphan GC reaches its stale suspect");
-            OrphanGc gc = new OrphanGc(store, deletes, NODE_ID, List.of(),
-                    0, 60_000, 0, 5_000, 64, 0, 0);
+            OrphanGc gc;
+            try (ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                }
+                if (confirms.incrementAndGet() == 2
+                        && deletes.delete(NS, chunk) != ErrorCode.OK) {
+                    throw new ScpException(ErrorCode.INTERNAL, "normal delete should win first");
+                }
+                throw new ScpException(ErrorCode.FILE_NOT_FOUND, "no such file");
+            })) {
+                gc = new OrphanGc(store, deletes, NODE_ID,
+                        List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000, 64, 0, 0);
 
-            assertTrue(gc.deleteConfirmed(NS, chunk),
-                    "CHUNK_NOT_FOUND is an idempotent success when another delete already removed the chunk");
+                gc.gcOnce();
+            }
+
+            assertEquals(2, confirms.get(), "gcOnce must confirm before and immediately before delete");
+            assertFalse(store.contains(NS, chunk));
+            assertEquals(1, deletes.okDeletes());
             assertEquals(1, deletes.notFoundDeletes());
             assertEquals(0, deletes.failedDeletes());
+            assertEquals(1, gc.alreadyDeletedTotal());
+        }
+    }
+
+    @Test
+    void gcOnceKeepsInternalDeleteFailureOnFailurePath() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger confirms = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"))) {
+            seal(store, chunk);
+            ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
+            OrphanGc gc;
+            try (ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                }
+                if (confirms.incrementAndGet() == 2) {
+                    if (deletes.delete(NS, chunk) != ErrorCode.OK) {
+                        throw new ScpException(ErrorCode.INTERNAL, "normal delete should win first");
+                    }
+                    creatingSet(store).add(newNsChunkId(chunk));
+                }
+                throw new ScpException(ErrorCode.FILE_NOT_FOUND, "no such file");
+            })) {
+                gc = new OrphanGc(store, deletes, NODE_ID,
+                        List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000, 64, 0, 0);
+
+                gc.gcOnce();
+            }
+
+            assertEquals(2, confirms.get(), "gcOnce must still reach the delete-time reconfirm");
+            assertEquals(1, deletes.okDeletes());
+            assertEquals(0, deletes.notFoundDeletes(),
+                    "INTERNAL must not be widened into the idempotent already-deleted path");
+            assertEquals(1, deletes.failedDeletes());
+            assertEquals(0, gc.alreadyDeletedTotal());
         }
     }
 
@@ -418,6 +471,17 @@ class OrphanGcTest {
             }
             throw new ScpException(ErrorCode.FILE_NOT_FOUND, "no such file");
         });
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Set<Object> creatingSet(ChunkStore store) throws Exception {
+        Field field = ChunkStore.class.getDeclaredField("creating");
+        field.setAccessible(true);
+        return (Set<Object>) field.get(store);
+    }
+
+    private static Object newNsChunkId(ChunkId id) {
+        return new NsChunkId(NS, id);
     }
 
     private static OrphanGc orphanGc(ChunkStore store, List<String> controllerEndpoints,
