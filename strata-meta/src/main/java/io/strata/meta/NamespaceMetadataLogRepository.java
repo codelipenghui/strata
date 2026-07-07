@@ -19,8 +19,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>On {@link #open} it recovers state from the published manifest, then compacts (writes a fresh
  * snapshot, rolls a new empty open-log file) and CAS-publishes a new manifest BEFORE accepting writes —
  * the metadata-epoch fencing rule: a stale leader holding the old open file cannot append bytes that a
- * successor would later publish (design §8, §13 step 6). A lost manifest CAS means another leader has
- * advanced the namespace, so the caller must re-recover under a new epoch.
+ * successor would later publish (design §8, §13 step 6). A lost or ambiguous manifest CAS means this owner
+ * cannot prove publication, so the caller must re-recover under a new epoch.
  *
  * <p>Durability ordering (design §15): an append writes to the file store first; only a durable append
  * mutates in-memory state, so a failed physical append never advances visible metadata. Manifest
@@ -178,7 +178,7 @@ final class NamespaceMetadataLogRepository {
      * {@code readLog} recover-and-seals the file, which would fence the still-live open log. {@code
      * appliedOffset} is preserved (NOT reset to the cut — that would drop the carried tail's offsets).
      *
-     * @throws IllegalStateException if the manifest CAS is lost — another node owns this namespace now
+     * @throws IllegalStateException if the manifest CAS is lost or ambiguous
      */
     boolean compact(long thresholdBytes) throws Exception {
         Frozen frozen;
@@ -241,10 +241,9 @@ final class NamespaceMetadataLogRepository {
     /**
      * The short locked publish phase: carry the post-freeze tail into the (already-rolled) new open log,
      * CAS-publish the manifest, then swap the in-memory pointers. Mirrors the crash-window invariants of
-     * {@link #publishCompacted}: the new files are written before the CAS, a lost CAS cleans up the new files
-     * and throws (fence), and the just-superseded generation is NOT deleted inline (issue #8) — it is retained
-     * and reclaimed by the retention-gated sweep. It never reads or seals the old open log, so a publish
-     * failure leaves that log writable for the next op / re-acquire.
+     * {@link #publishCompacted}: the new files are written before the CAS, a lost/ambiguous CAS throws
+     * (fence), and system files are reclaimed only by the manifest-aware retention sweep. It never reads or
+     * seals the old open log, so a publish failure leaves that log writable for the next op / re-acquire.
      */
     private boolean publishFrozen(Frozen frozen, FileId newSnapshot, FileId newLog) throws Exception {
         if (poisoned) {
@@ -270,10 +269,13 @@ final class NamespaceMetadataLogRepository {
         FailureInjector.point("meta.log.beforeManifestPublish");
         OptionalInt newVersion = rootStore.putNamespaceManifest(published, frozen.expectedVersion());
         if (newVersion.isEmpty()) {
-            // Best-effort cleanup of the files we just wrote but could not publish.
-            deleteQuietly(newSnapshot);
-            deleteQuietly(newLog);
-            throw new IllegalStateException("manifest CAS lost for namespace " + namespace
+            // The CAS may have committed but returned an ambiguous retry conflict (Curator retry after a lost
+            // response). Do not delete the files the committed manifest may now reference; the system-file GC
+            // will later reclaim only generations proven unreachable from published manifests.
+            log.warn("namespace metadata manifest CAS lost/ambiguous namespace={} generation={} "
+                            + "snapshotFile={} logFile={}; leaving files for manifest-aware GC",
+                    namespace, frozen.newGeneration(), newSnapshot, newLog);
+            throw new IllegalStateException("manifest CAS lost or ambiguous for namespace " + namespace
                     + " — fenced; recover again under a new epoch");
         }
         this.snapshotFileId = newSnapshot;
@@ -330,10 +332,13 @@ final class NamespaceMetadataLogRepository {
         FailureInjector.point("meta.log.beforeManifestPublish");
         OptionalInt newVersion = rootStore.putNamespaceManifest(published, expectedVersion);
         if (newVersion.isEmpty()) {
-            // Best-effort cleanup of the files we just wrote but could not publish.
-            deleteQuietly(newSnapshot);
-            deleteQuietly(newLog);
-            throw new IllegalStateException("manifest CAS lost for namespace " + namespace
+            // The CAS may have committed but returned an ambiguous retry conflict (Curator retry after a lost
+            // response). Do not delete the files the committed manifest may now reference; the system-file GC
+            // will later reclaim only generations proven unreachable from published manifests.
+            log.warn("namespace metadata manifest CAS lost/ambiguous namespace={} generation={} "
+                            + "snapshotFile={} logFile={}; leaving files for manifest-aware GC",
+                    namespace, newGeneration, newSnapshot, newLog);
+            throw new IllegalStateException("manifest CAS lost or ambiguous for namespace " + namespace
                     + " — fenced; recover again under a new epoch");
         }
         this.snapshotFileId = newSnapshot;
@@ -352,6 +357,10 @@ final class NamespaceMetadataLogRepository {
         // rather than an inline best-effort delete that no retention window could honor.
     }
 
+    /**
+     * Only safe before the manifest CAS runs: every remaining caller is cleaning files that no manifest can
+     * reference yet. Never call this after an empty CAS result.
+     */
     private void deleteQuietly(FileId id) {
         if (id == null) {
             return;
@@ -359,7 +368,7 @@ final class NamespaceMetadataLogRepository {
         try {
             fileStore.deleteFile(id);
         } catch (Exception ignore) {
-            // compaction GC is best-effort; an undeleted old file only wastes space (design §10)
+            // Best-effort cleanup for files written before a publish was intentionally skipped.
         }
     }
 }

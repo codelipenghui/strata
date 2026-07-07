@@ -6,7 +6,12 @@ import io.strata.common.StrataPath;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.List;
+import java.util.OptionalInt;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -221,6 +226,56 @@ class NamespaceMetadataLogRepositoryTest {
     }
 
     @Test
+    void ambiguousCommittedManifestCasDoesNotDeletePublishedGenerationFiles() throws Exception {
+        // Issue #99: Curator can commit a manifest CAS, lose the reply, retry, and then surface the retry's
+        // BadVersion/NodeExists as OptionalInt.empty(). The caller must fence, but it must not delete the
+        // snapshot/log files the already-committed manifest now references.
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore delegateRoot = new ZkMetadataStore(zk.getConnectString())) {
+            TestNamespaceMetadataFileStore fs = new TestNamespaceMetadataFileStore();
+            AtomicBoolean commitButReportLost = new AtomicBoolean(false);
+            MetadataStore ambiguousRoot = commitManifestButReportEmptyOnce(delegateRoot, commitButReportLost);
+            NamespaceMetadataLogRepository repo = NamespaceMetadataLogRepository.open(NS, fs, ambiguousRoot, 1);
+
+            FileId a = FileId.of(1);
+            repo.append(fileCreated(a, "/a", 1));
+            commitButReportLost.set(true);
+
+            assertThrows(IllegalStateException.class, repo::compactAndPublish,
+                    "the owner still fences because it cannot prove whether the CAS committed");
+
+            NamespaceMetadataLogRepository successor =
+                    NamespaceMetadataLogRepository.open(NS, fs, delegateRoot, 2);
+            assertTrue(successor.state().file(a).isPresent(),
+                    "successor recovery must read the committed generation's still-live snapshot/log files");
+        }
+    }
+
+    @Test
+    void ambiguousCommittedRecoveryRepublishCasDoesNotDeletePublishedGenerationFiles() throws Exception {
+        // Same issue #99 shape, but for recoverAndRepublish()/publishCompacted during namespace open.
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore delegateRoot = new ZkMetadataStore(zk.getConnectString())) {
+            TestNamespaceMetadataFileStore fs = new TestNamespaceMetadataFileStore();
+            NamespaceMetadataLogRepository leader = NamespaceMetadataLogRepository.open(NS, fs, delegateRoot, 1);
+
+            FileId a = FileId.of(1);
+            leader.append(fileCreated(a, "/a", 1));
+
+            AtomicBoolean commitButReportLost = new AtomicBoolean(true);
+            MetadataStore ambiguousRoot = commitManifestButReportEmptyOnce(delegateRoot, commitButReportLost);
+            assertThrows(IllegalStateException.class,
+                    () -> NamespaceMetadataLogRepository.open(NS, fs, ambiguousRoot, 2),
+                    "the recovering owner still fences because it cannot prove whether the CAS committed");
+
+            NamespaceMetadataLogRepository successor =
+                    NamespaceMetadataLogRepository.open(NS, fs, delegateRoot, 3);
+            assertTrue(successor.state().file(a).isPresent(),
+                    "successor recovery must read the committed republish generation's still-live files");
+        }
+    }
+
+    @Test
     void aFencedLeadersPublishLosesTheManifestCas() throws Exception {
         try (TestingServer zk = new TestingServer(true);
              ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
@@ -237,5 +292,29 @@ class NamespaceMetadataLogRepositoryTest {
             assertThrows(IllegalStateException.class, leader::compactAndPublish,
                     "the fenced leader's manifest CAS must lose");
         }
+    }
+
+    private static MetadataStore commitManifestButReportEmptyOnce(MetadataStore delegate, AtomicBoolean armed)
+            throws NoSuchMethodException {
+        Method putNamespaceManifest = MetadataStore.class.getMethod("putNamespaceManifest",
+                Records.NamespaceManifest.class, int.class);
+        return (MetadataStore) Proxy.newProxyInstance(
+                MetadataStore.class.getClassLoader(),
+                new Class<?>[]{MetadataStore.class},
+                (proxy, method, methodArgs) -> {
+                    if (method.equals(putNamespaceManifest) && armed.compareAndSet(true, false)) {
+                        try {
+                            method.invoke(delegate, methodArgs);
+                        } catch (InvocationTargetException e) {
+                            throw e.getCause();
+                        }
+                        return OptionalInt.empty();
+                    }
+                    try {
+                        return method.invoke(delegate, methodArgs);
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
     }
 }
