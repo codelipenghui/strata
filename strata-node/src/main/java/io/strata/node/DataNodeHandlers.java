@@ -10,6 +10,8 @@ import io.strata.proto.Opcode;
 import io.strata.proto.RequestContext;
 import io.strata.proto.ScpClient;
 import io.strata.proto.ScpServer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -21,6 +23,7 @@ import java.util.concurrent.CompletableFuture;
 
 /** Maps SCP data-plane opcodes onto the ChunkStore engine (tech design §10.3). */
 final class DataNodeHandlers implements ScpServer.Handler {
+    private static final Logger log = LoggerFactory.getLogger(DataNodeHandlers.class);
     private static final ThreadLocal<ChunkStore.AppendOutcome> APPEND_OUTCOME =
             ThreadLocal.withInitial(ChunkStore.AppendOutcome::new);
     private static final int APPEND_PAYLOAD_SCRATCH_BYTES = 64 * 1024;
@@ -154,7 +157,20 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 boolean brokerCleanup = m.ownerEpoch() == 0 && RequestContext.clientKind() == ScpClient.KIND_BROKER;
                 node.acceptOwnerEpoch(m.namespace(), m.ownerEpoch(), brokerCleanup);
                 List<Short> codes = new ArrayList<>(m.chunkIds().size());
-                for (var id : m.chunkIds()) codes.add(deletes.delete(m.namespace(), id).code);
+                int deleted = 0;
+                for (var id : m.chunkIds()) {
+                    ErrorCode result = deletes.delete(m.namespace(), id);
+                    if (result == ErrorCode.OK) deleted++;
+                    codes.add(result.code);
+                }
+                if (!m.chunkIds().isEmpty()) {
+                    // Destructive-RPC forensic trail: this is the lane a buggy owner-side mass-delete
+                    // wave would arrive on, so leave node-side evidence beyond the aggregate counter.
+                    log.info("DELETE_CHUNKS: deleted {}/{} chunk(s) in ns={} [{}..{}] ownerEpoch={} requester={}",
+                            deleted, m.chunkIds().size(), m.namespace().value(),
+                            m.chunkIds().get(0), m.chunkIds().get(m.chunkIds().size() - 1),
+                            m.ownerEpoch(), RequestContext.clientId());
+                }
                 yield ScpServer.ok(req, new Messages.DeleteChunksResp(m.chunkIds(), codes).encode(), null);
             }
 
