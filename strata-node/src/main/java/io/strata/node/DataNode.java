@@ -100,7 +100,9 @@ public final class DataNode implements AutoCloseable {
                         config.orphanGraceMs(), config.orphanScanIntervalMs(), config.orphanStartupGraceMs(),
                         config.orphanConfirmTimeoutMs(), config.orphanDeleteMaxConfirmedPerNamespacePerPass(),
                         config.orphanDeleteMaxNamespacePercentPerPass(),
-                        config.orphanDeleteMaxConfirmedPerNodePass());
+                        config.orphanDeleteMaxConfirmedPerNodePass(),
+                        config.orphanDeleteMaxCumulativePerNamespace(),
+                        config.orphanDeleteMaxCumulativePerNode());
                 this.orphanGc = startedGc;
                 startedGc.start();
             } else {
@@ -227,6 +229,9 @@ public final class DataNode implements AutoCloseable {
     }
     public long orphanGcBreakerTrips() {
         return orphanGc == null ? 0 : orphanGc.breakerTrips();
+    }
+    public long orphanGcCumulativeBreakerTrips() {
+        return orphanGc == null ? 0 : orphanGc.cumulativeBreakerTrips();
     }
     public long orphanGcBreakerSkippedChunkTotal() {
         return orphanGc == null ? 0 : orphanGc.breakerSkippedChunkTotal();

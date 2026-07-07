@@ -128,6 +128,10 @@ class DataNodeConfigTest {
                 c.orphanDeleteMaxNamespacePercentPerPass());
         assertEquals(DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS,
                 c.orphanDeleteMaxConfirmedPerNodePass());
+        assertEquals(DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NAMESPACE,
+                c.orphanDeleteMaxCumulativePerNamespace());
+        assertEquals(DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NODE,
+                c.orphanDeleteMaxCumulativePerNode());
         assertEquals(10_000, c.controlCallTimeoutMs());
         assertEquals(8, c.controlCommandParallelism());
         assertEquals(1024, c.controlMaxQueuedCommands());
@@ -150,6 +154,10 @@ class DataNodeConfigTest {
                 () -> base.withOrphanDeleteMaxNamespacePercentPerPass(101));
         assertThrows(IllegalArgumentException.class,
                 () -> base.withOrphanDeleteMaxConfirmedPerNodePass(-1));
+        assertThrows(IllegalArgumentException.class,
+                () -> base.withOrphanDeleteMaxCumulativePerNamespace(-1));
+        assertThrows(IllegalArgumentException.class,
+                () -> base.withOrphanDeleteMaxCumulativePerNode(-1));
         assertThrows(IllegalArgumentException.class, () -> base.withControlCallTimeoutMs(-1));
         assertThrows(IllegalArgumentException.class, () -> base.withControlCommandLimits(0, 1024));
         assertThrows(IllegalArgumentException.class, () -> base.withControlCommandLimits(8, 7));
@@ -161,6 +169,10 @@ class DataNodeConfigTest {
                 .orphanDeleteMaxNamespacePercentPerPass());
         assertEquals(0, base.withOrphanDeleteMaxConfirmedPerNodePass(0)
                 .orphanDeleteMaxConfirmedPerNodePass());
+        assertEquals(0, base.withOrphanDeleteMaxCumulativePerNamespace(0)
+                .orphanDeleteMaxCumulativePerNamespace());
+        assertEquals(0, base.withOrphanDeleteMaxCumulativePerNode(0)
+                .orphanDeleteMaxCumulativePerNode());
     }
 
     @Test
@@ -170,6 +182,7 @@ class DataNodeConfigTest {
                 .withOrphanGraceMs(1000).withOrphanScanIntervalMs(500).withOrphanStartupGraceMs(1500)
                 .withOrphanConfirmTimeoutMs(2500).withOrphanDeleteMaxConfirmedPerNamespacePerPass(3)
                 .withOrphanDeleteMaxNamespacePercentPerPass(20).withOrphanDeleteMaxConfirmedPerNodePass(9)
+                .withOrphanDeleteMaxCumulativePerNamespace(11).withOrphanDeleteMaxCumulativePerNode(17)
                 .withControlCallTimeoutMs(8000).withRepairFetchBytes(1 << 20)
                 .withControlCommandLimits(4, 128).withDeleteMaxConcurrent(2).withDeleteMinIntervalMs(25)
                 .withChunkStoreConfig(ChunkStoreConfig.DEFAULT.withMaxRequestBytes(4096));
@@ -180,6 +193,8 @@ class DataNodeConfigTest {
         assertEquals(3, c.orphanDeleteMaxConfirmedPerNamespacePerPass());
         assertEquals(20, c.orphanDeleteMaxNamespacePercentPerPass());
         assertEquals(9, c.orphanDeleteMaxConfirmedPerNodePass());
+        assertEquals(11, c.orphanDeleteMaxCumulativePerNamespace());
+        assertEquals(17, c.orphanDeleteMaxCumulativePerNode());
         assertEquals(8000, c.controlCallTimeoutMs());
         assertEquals(4, c.controlCommandParallelism());
         assertEquals(128, c.controlMaxQueuedCommands());

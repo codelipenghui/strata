@@ -245,6 +245,9 @@ final class ServerMetrics {
         FunctionCounter.builder("strata_data_node_orphan_gc_breaker_trips_total", n,
                         DataNode::orphanGcBreakerTrips)
                 .description("orphan-GC breaker openings").register(reg);
+        FunctionCounter.builder("strata_data_node_orphan_gc_cumulative_breaker_trips_total", n,
+                        DataNode::orphanGcCumulativeBreakerTrips)
+                .description("orphan-GC process-lifetime cumulative breaker openings").register(reg);
         FunctionCounter.builder("strata_data_node_orphan_gc_breaker_skipped_chunk_total", n,
                         DataNode::orphanGcBreakerSkippedChunkTotal)
                 .description("confirmed orphan deletes skipped when opening orphan-GC breakers").register(reg);

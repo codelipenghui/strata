@@ -132,6 +132,12 @@ public final class StrataServer {
                 .withOrphanDeleteMaxConfirmedPerNodePass(
                         intEnv("STRATA_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS",
                                 DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS))
+                .withOrphanDeleteMaxCumulativePerNamespace(
+                        intEnv("STRATA_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NAMESPACE",
+                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NAMESPACE))
+                .withOrphanDeleteMaxCumulativePerNode(
+                        intEnv("STRATA_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NODE",
+                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NODE))
                 .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
                 .withControlCommandLimits(intEnv("STRATA_NODE_COMMAND_PARALLELISM", 8),
                         intEnv("STRATA_NODE_MAX_QUEUED_COMMANDS", 1024))
@@ -223,6 +229,12 @@ public final class StrataServer {
                 .withOrphanDeleteMaxConfirmedPerNodePass(
                         intEnv("STRATA_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS",
                                 DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS))
+                .withOrphanDeleteMaxCumulativePerNamespace(
+                        intEnv("STRATA_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NAMESPACE",
+                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NAMESPACE))
+                .withOrphanDeleteMaxCumulativePerNode(
+                        intEnv("STRATA_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NODE",
+                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NODE))
                 .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
                 .withControlCommandLimits(intEnv("STRATA_NODE_COMMAND_PARALLELISM", 8),
                         intEnv("STRATA_NODE_MAX_QUEUED_COMMANDS", 1024))
