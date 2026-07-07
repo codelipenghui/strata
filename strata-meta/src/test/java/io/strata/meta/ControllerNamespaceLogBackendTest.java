@@ -51,6 +51,14 @@ class ControllerNamespaceLogBackendTest {
                 var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
                         new Messages.LookupFile(StrataNamespace.of("tenant-a"), created.fileId()).encode(), null, 5_000));
                 assertEquals("tenant-a", lookup.namespace().value(), "metadata served from the namespace log");
+                assertTrue(lookup.ownerEpoch() > 0, "LOOKUP_FILE responses must carry the namespace owner epoch");
+
+                ScpException missing = assertThrows(ScpException.class, () -> client.call(Opcode.LOOKUP_FILE,
+                        new Messages.LookupFile(StrataNamespace.of("tenant-a"), FileId.of(999)).encode(), null,
+                        5_000));
+                assertEquals(ErrorCode.FILE_NOT_FOUND, missing.code());
+                assertEquals(lookup.ownerEpoch(), missing.detail(),
+                        "destructive orphan-GC FILE_NOT_FOUND confirms must carry the namespace owner epoch");
 
                 var byPath = Messages.LookupPathResp.decode(client.call(Opcode.LOOKUP_PATH,
                         new Messages.LookupPath("tenant-a", "/logs/seg-0").encode(), null, 5_000));
