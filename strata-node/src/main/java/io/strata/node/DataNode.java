@@ -277,6 +277,12 @@ public final class DataNode implements AutoCloseable {
         acceptOwnerEpoch(namespace, ownerEpoch, false);
     }
 
+    /**
+     * Raises or checks the node-local owner watermark for destructive owner lanes. The
+     * allowUnstampedAfterSeen escape is only for broker data-plane requests that predate owner fencing and
+     * never carry an owner epoch: writer SEAL_CHUNK and broker-owned chunk cleanup. Owner/tool lanes must
+     * stamp a nonzero epoch once any owner epoch has been observed for the namespace.
+     */
     void acceptOwnerEpoch(StrataNamespace namespace, long ownerEpoch, boolean allowUnstampedAfterSeen) {
         if (ownerEpoch < 0) {
             throw new IllegalArgumentException("ownerEpoch must be non-negative: " + ownerEpoch);

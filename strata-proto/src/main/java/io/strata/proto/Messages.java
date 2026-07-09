@@ -23,6 +23,10 @@ import java.util.UUID;
  */
 public final class Messages {
     private Messages() {}
+    /**
+     * Optional unsigned owner epoch on owner-fenced lanes. Absence/0 means the message is unstamped for
+     * compatibility; receivers decide whether an epoch-0 request is still allowed for the specific lane.
+     */
     private static final int TAG_OWNER_EPOCH = 0;
 
     /** Bounded list-count reader (see {@link Varint#readCount}). */

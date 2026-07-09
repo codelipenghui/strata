@@ -387,6 +387,34 @@ class DataNodeWireTest {
     }
 
     @Test
+    void staleOwnerSealIsFencedBeforeItCanTruncateOpenChunk() throws Exception {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
+             ScpClient broker = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "broker");
+             ScpClient owner = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_TOOL, "owner")) {
+            byte[] payload = "abcdef".getBytes();
+            broker.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
+                    1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
+            broker.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
+                    ByteBuffer.wrap(payload), 5000);
+
+            owner.call(Opcode.VERIFY_CHUNKS,
+                    new Messages.VerifyChunks(TEST_NS, "owner-a", List.of(id), 8).encode(), null, 5000);
+
+            ScpException staleSeal = assertThrows(ScpException.class, () -> owner.call(Opcode.SEAL_CHUNK,
+                    new Messages.SealChunk(id, 1, 3, TEST_NS, 7).encode(), null, 5000));
+            assertEquals(ErrorCode.FENCED_EPOCH, staleSeal.code());
+            assertEquals(8, staleSeal.detail());
+
+            ByteBuffer statHeader = broker.call(Opcode.STAT_CHUNK,
+                    new Messages.StatChunk(id, TEST_NS).encode(), null, 5000);
+            Messages.StatResp stat = Messages.StatResp.decode(statHeader);
+            assertEquals(ChunkState.OPEN, stat.state());
+            assertEquals(payload.length, stat.localEndOffset(),
+                    "fencing must run before store.seal can truncate the open chunk");
+        }
+    }
+
+    @Test
     void openReadIsClampedToReplicaDurableHighWatermark() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient client = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "test")) {
