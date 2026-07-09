@@ -1566,9 +1566,22 @@ class RecoveryTest {
 
         ScpException e = assertThrows(ScpException.class,
                 () -> invokeValidateFenceResp(chunkId, replica,
-                        new Messages.FenceResp(2, -1, 0, ChunkState.OPEN)));
+                        new Messages.FenceResp(2, -1, 0, ChunkState.OPEN), 2));
 
         assertEquals(ErrorCode.CORRUPT_CHUNK, e.code());
+    }
+
+    @Test
+    void validateFenceRespRejectsHigherReplicaFenceEpoch() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(34), 0);
+        Messages.Replica replica = new Messages.Replica(1, "node");
+
+        ScpException e = assertThrows(ScpException.class,
+                () -> invokeValidateFenceResp(chunkId, replica,
+                        new Messages.FenceResp(3, 0, 0, ChunkState.OPEN), 2));
+
+        assertEquals(ErrorCode.FENCED_EPOCH, e.code());
+        assertEquals(3, e.detail());
     }
 
     @Test
@@ -2036,11 +2049,11 @@ class RecoveryTest {
     }
 
     private static void invokeValidateFenceResp(ChunkId chunkId, Messages.Replica replica,
-                                                Messages.FenceResp fence) throws Exception {
+                                                Messages.FenceResp fence, int recoveryEpoch) throws Exception {
         Method method = Recovery.class.getDeclaredMethod("validateFenceResp",
-                ChunkId.class, Messages.Replica.class, Messages.FenceResp.class);
+                ChunkId.class, Messages.Replica.class, Messages.FenceResp.class, int.class);
         method.setAccessible(true);
-        invoke(method, null, chunkId, replica, fence);
+        invoke(method, null, chunkId, replica, fence, recoveryEpoch);
     }
 
     private static long invokeFinishSeal(Recovery recovery, ChunkId chunkId, int epoch, long dataLength,

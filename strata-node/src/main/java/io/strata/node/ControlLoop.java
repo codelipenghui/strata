@@ -308,7 +308,8 @@ final class ControlLoop implements AutoCloseable {
         try (FileChannel out = FileChannel.open(output,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
             while (fileLength < 0 || offset < fileLength) {
-                var fetch = new Messages.FetchChunk(cmd.chunkId(), offset, fetchBytes, cmd.namespace());
+                var fetch = new Messages.FetchChunk(cmd.chunkId(), offset, fetchBytes, cmd.namespace(),
+                        cmd.ownerEpoch());
                 var frame = src.callFrame(Opcode.FETCH_CHUNK, fetch.encode(), null, callTimeoutMs);
                 Messages.FetchResp resp;
                 try {

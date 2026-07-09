@@ -150,9 +150,10 @@ class DataNodeWireTest {
             byte[] payload = "client-computed".getBytes();
             client.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
                     ByteBuffer.wrap(payload), 5000);
+            client.call(Opcode.FENCE, new Messages.Fence(id, 2, TEST_NS).encode(), null, 5000);
 
             ByteBuffer lh = client.call(Opcode.READ_LEDGER,
-                    new Messages.ReadLedger(id, 0, TEST_NS).encode(), null, 5000);
+                    new Messages.ReadLedger(id, 0, TEST_NS, 2).encode(), null, 5000);
             var ledger = Messages.ReadLedgerResp.decode(lh);
             assertEquals(1, ledger.entries().size());
             assertEquals(Crc.of(ByteBuffer.wrap(payload)),
@@ -281,14 +282,14 @@ class DataNodeWireTest {
             readFrame.payloadSlice().get(got);
             assertArrayEquals("first-batch-second-batch".getBytes(), got);
 
-            // ledger over the wire
-            ByteBuffer lh = client.call(Opcode.READ_LEDGER, new Messages.ReadLedger(id, 0, TEST_NS).encode(), null, 5000);
+            // fence at 2 -> epoch-1 append rejected with typed error
+            client.call(Opcode.FENCE, new Messages.Fence(id, 2, TEST_NS).encode(), null, 5000);
+            ByteBuffer lh = client.call(Opcode.READ_LEDGER,
+                    new Messages.ReadLedger(id, 0, TEST_NS, 2).encode(), null, 5000);
             var ledger = Messages.ReadLedgerResp.decode(lh);
             assertEquals(2, ledger.entries().size());
             assertEquals(a.length, ledger.entries().get(0).endOffset());
 
-            // fence at 2 -> epoch-1 append rejected with typed error
-            client.call(Opcode.FENCE, new Messages.Fence(id, 2, TEST_NS).encode(), null, 5000);
             ScpException fenced = assertThrows(ScpException.class, () -> client.call(Opcode.APPEND,
                     new Messages.Append(id, 1, a.length + b.length, 0, TEST_NS).encode(),
                     ByteBuffer.wrap("x".getBytes()), 5000));
@@ -309,7 +310,7 @@ class DataNodeWireTest {
 
             // fetch whole file and delete
             Frame fetch = client.callFrame(Opcode.FETCH_CHUNK,
-                    new Messages.FetchChunk(id, 0, Integer.MAX_VALUE, TEST_NS).encode(), null, 5000);
+                    new Messages.FetchChunk(id, 0, Integer.MAX_VALUE, TEST_NS, 7).encode(), null, 5000);
             ByteBuffer fh = fetch.headerSlice();
             Resp.check(fh);
             assertEquals(Messages.FetchResp.decode(fh).fileLength(), fetch.payloadLength());
@@ -369,6 +370,16 @@ class DataNodeWireTest {
                     new Messages.DeleteChunks(List.of(id), TEST_NS, 7).encode(), null, 5000));
             assertEquals(ErrorCode.FENCED_EPOCH, staleDelete.code());
             assertEquals(8, staleDelete.detail());
+
+            ScpException unstampedFetch = assertThrows(ScpException.class, () -> owner.call(Opcode.FETCH_CHUNK,
+                    new Messages.FetchChunk(id, 0, Integer.MAX_VALUE, TEST_NS).encode(), null, 5000));
+            assertEquals(ErrorCode.FENCED_EPOCH, unstampedFetch.code());
+            assertEquals(8, unstampedFetch.detail());
+
+            ScpException staleFetch = assertThrows(ScpException.class, () -> owner.call(Opcode.FETCH_CHUNK,
+                    new Messages.FetchChunk(id, 0, Integer.MAX_VALUE, TEST_NS, 7).encode(), null, 5000));
+            assertEquals(ErrorCode.FENCED_EPOCH, staleFetch.code());
+            assertEquals(8, staleFetch.detail());
 
             ByteBuffer statHeader = broker.call(Opcode.STAT_CHUNK,
                     new Messages.StatChunk(id, TEST_NS).encode(), null, 5000);
@@ -461,9 +472,19 @@ class DataNodeWireTest {
             client.call(Opcode.APPEND, new Messages.Append(id, 1, 4, 4, TEST_NS).encode(),
                     ByteBuffer.wrap("TAIL".getBytes()), 5000);
 
+            ScpException unfenced = assertThrows(ScpException.class, () -> client.call(Opcode.READ_RECOVERY,
+                    new Messages.Read(id, 4, 1024, TEST_NS).encode(), null, 5000));
+            assertEquals(ErrorCode.PRECONDITION_FAILED, unfenced.code());
+
+            ScpException notYetFenced = assertThrows(ScpException.class, () -> client.call(Opcode.READ_LEDGER,
+                    new Messages.ReadLedger(id, 0, TEST_NS, 2).encode(), null, 5000));
+            assertEquals(ErrorCode.PRECONDITION_FAILED, notYetFenced.code());
+
+            client.call(Opcode.FENCE, new Messages.Fence(id, 2, TEST_NS).encode(), null, 5000);
+
             // recovery reads the un-acked tail [4,8) that the clamped client READ refuses to serve
             Frame tail = client.callFrame(Opcode.READ_RECOVERY,
-                    new Messages.Read(id, 4, 1024, TEST_NS).encode(), null, 5000);
+                    Messages.Read.recovery(id, 4, 1024, TEST_NS, 2).encode(), null, 5000);
             ByteBuffer tailHeader = tail.headerSlice();
             Resp.check(tailHeader);
             var tailResp = Messages.ReadResp.decode(tailHeader);
@@ -475,7 +496,7 @@ class DataNodeWireTest {
 
             // and the full range is served from offset 0, verified against the integrity ledger
             Frame full = client.callFrame(Opcode.READ_RECOVERY,
-                    new Messages.Read(id, 0, 1024, TEST_NS).encode(), null, 5000);
+                    Messages.Read.recovery(id, 0, 1024, TEST_NS, 2).encode(), null, 5000);
             Resp.check(full.headerSlice());
             byte[] all = new byte[full.payloadLength()];
             full.payloadSlice().get(all);
@@ -643,7 +664,7 @@ class DataNodeWireTest {
                      ScpClient.KIND_DATA_NODE, "repair-test");
              ChunkStore store = new ChunkStore(dir.resolve("oversized-repair-store"))) {
             ControlLoop loop = controlLoop(null, DataNodeConfig.standalone(dir), store);
-            var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS);
+            var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS, 7);
             Path output = dir.resolve("oversized-repair-fetch.chunk");
 
             ScpException e = assertThrows(ScpException.class, () -> loop.fetchWholeFile(src, cmd, output));
@@ -663,7 +684,7 @@ class DataNodeWireTest {
                      ScpClient.KIND_DATA_NODE, "repair-test");
              ChunkStore store = new ChunkStore(dir.resolve("valid-repair-store"))) {
             ControlLoop loop = controlLoop(null, DataNodeConfig.standalone(dir), store);
-            var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS);
+            var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS, 7);
             Path output = dir.resolve("valid-repair-fetch.chunk");
 
             assertEquals(fileBytes.length, loop.fetchWholeFile(src, cmd, output));
@@ -676,7 +697,7 @@ class DataNodeWireTest {
         ChunkId repairChunk = new ChunkId(FileId.of(6), 0);
         try (ChunkStore store = new ChunkStore(dir.resolve("malformed-source-store"))) {
             ControlLoop loop = controlLoop(null, DataNodeConfig.standalone(dir), store);
-            var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS);
+            var cmd = new Messages.ReplicateCmd(1, repairChunk, List.of(), (byte) 1, 0, 4, TEST_NS, 7);
 
             try (ScpServer openSource = new ScpServer(0, 1, 0, 0, req -> ScpServer.ok(req,
                 new Messages.FetchResp(4096 + 4 + 64, ChunkState.OPEN).encode(),

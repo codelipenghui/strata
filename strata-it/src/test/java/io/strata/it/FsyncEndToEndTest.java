@@ -64,7 +64,7 @@ class FsyncEndToEndTest {
         assertTrue(lookup.chunks().size() >= 2);
         for (var c : lookup.chunks()) {
             for (var replica : c.replicas()) {
-                byte[] headerBytes = fetchHeader(replica.endpoint(), c.chunkId());
+                byte[] headerBytes = fetchHeader(replica.endpoint(), c.chunkId(), lookup.ownerEpoch());
                 ChunkFormats.Header header = ChunkFormats.Header.decode(headerBytes);
                 assertTrue(header.fsyncOnAck(),
                         "replica " + replica.nodeId() + " of " + c.chunkId() + " missing fsync policy");
@@ -86,11 +86,12 @@ class FsyncEndToEndTest {
         ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId, sealed.sealedLength());
     }
 
-    private byte[] fetchHeader(String endpoint, ChunkId chunkId) throws Exception {
+    private byte[] fetchHeader(String endpoint, ChunkId chunkId, long ownerEpoch) throws Exception {
         String[] hp = endpoint.split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]), ScpClient.KIND_TOOL, "hdr")) {
             var frame = direct.callFrame(Opcode.FETCH_CHUNK,
-                    new Messages.FetchChunk(chunkId, 0, ChunkFormats.HEADER_SIZE, TEST_NS).encode(), null, 5000);
+                    new Messages.FetchChunk(chunkId, 0, ChunkFormats.HEADER_SIZE, TEST_NS, ownerEpoch).encode(),
+                    null, 5000);
             ByteBuffer h = frame.headerSlice();
             Resp.check(h);
             byte[] bytes = new byte[frame.payloadLength()];
