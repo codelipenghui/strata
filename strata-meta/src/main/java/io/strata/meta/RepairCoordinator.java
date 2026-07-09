@@ -286,7 +286,7 @@ class RepairCoordinator implements AutoCloseable {
     void tick() {
         if (!isLeader.getAsBoolean()) {
             clusterLeaderSince = 0;
-            globalOwnerEpoch = 0;
+            resetGlobalOwnerEpoch();
             return;
         }
         if (clusterLeaderSince == 0) {
@@ -416,6 +416,10 @@ class RepairCoordinator implements AutoCloseable {
         if (!usesGlobalOwnerEpoch(namespace)) {
             return;
         }
+        resetGlobalOwnerEpoch();
+    }
+
+    private void resetGlobalOwnerEpoch() {
         synchronized (globalOwnerEpochLock) {
             globalOwnerEpoch = 0;
         }
@@ -516,7 +520,7 @@ class RepairCoordinator implements AutoCloseable {
     void reconcile() throws Exception {
         if (!isLeader.getAsBoolean()) {
             clusterLeaderSince = 0;
-            globalOwnerEpoch = 0;
+            resetGlobalOwnerEpoch();
             ownerRepairPass();
             return;
         }
@@ -805,7 +809,11 @@ class RepairCoordinator implements AutoCloseable {
         long now = System.currentTimeMillis();
         Map<Integer, Records.NodeRecord> nodes = nodesById();
         for (StrataNamespace ns : store.listNamespaces()) {
-            if (!ownsNamespace.test(ns)) {
+            if (usesGlobalOwnerEpoch(ns)) {
+                if (!isLeader.getAsBoolean()) {
+                    continue;
+                }
+            } else if (!ownsNamespace.test(ns)) {
                 continue;
             }
             if (!namespaceSettledForVerify(ns, now)) {

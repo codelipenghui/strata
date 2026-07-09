@@ -140,6 +140,71 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void leaderRefreshesGlobalOwnerEpochAfterFencedReplicateWithoutLosingLeadership() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Registered source = register(registry, 13, "source-global-fenced-replicate");
+        Registered target = register(registry, 23, "target-global-fenced-replicate");
+        FileId fileId = fileId(23);
+        store.createFile(file(fileId, FileState.SEALED,
+                List.of(sealed(0, 256, 2302, List.of(source.nodeId())))));
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
+
+        coordinator.scanOnce();
+        Messages.ReplicateCmd first = assertInstanceOf(Messages.ReplicateCmd.class,
+                onlyCommand(heartbeat(registry, coordinator, target, List.of())));
+        assertEquals(1, first.ownerEpoch());
+
+        coordinator.onCommandCompleted(target.nodeId(),
+                new Messages.CompletedCommand(first.commandId(), ErrorCode.FENCED_EPOCH.code));
+        coordinator.scanOnce();
+
+        Messages.ReplicateCmd second = assertInstanceOf(Messages.ReplicateCmd.class,
+                onlyCommand(heartbeat(registry, coordinator, target, List.of())));
+        assertEquals(2, second.ownerEpoch(),
+                "leader-side FENCED completion must invalidate the cached global epoch immediately");
+        assertEquals(2, store.allocatedMetadataEpochs());
+    }
+
+    @Test
+    void leaderRefreshesGlobalOwnerEpochAfterFencedDeleteWithoutLosingLeadership() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Registered node = register(registry, 24, "target-global-fenced-delete");
+        FileId fileId = fileId(24);
+        store.createFile(file(fileId, FileState.DELETING,
+                List.of(sealed(0, 256, 2402, List.of(node.nodeId())))));
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
+
+        coordinator.scanOnce();
+        Messages.DeleteCmd first = assertInstanceOf(Messages.DeleteCmd.class,
+                onlyCommand(heartbeat(registry, coordinator, node, List.of())));
+        assertEquals(1, first.ownerEpoch());
+
+        coordinator.onCommandCompleted(node.nodeId(),
+                new Messages.CompletedCommand(first.commandId(), ErrorCode.FENCED_EPOCH.code));
+        coordinator.scanOnce();
+
+        Messages.DeleteCmd second = assertInstanceOf(Messages.DeleteCmd.class,
+                onlyCommand(heartbeat(registry, coordinator, node, List.of())));
+        assertEquals(2, second.ownerEpoch(),
+                "delete completions use the same global-epoch invalidation as replicate completions");
+        assertEquals(2, store.allocatedMetadataEpochs());
+    }
+
+    @Test
+    void nonLeaderLookupOwnerEpochDoesNotAllocateGlobalEpoch() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> false);
+
+        assertEquals(0, coordinator.lookupOwnerEpoch(TEST_NS));
+        assertEquals(0, coordinator.lookupOwnerEpoch(StrataNamespace.of("strata-meta")));
+        assertEquals(0, store.allocatedMetadataEpochs(),
+                "standby LOOKUP_FILE must not mint a global epoch from a non-authoritative view");
+    }
+
+    @Test
     void successfulAddRepairGrowsShortReplicaList() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
@@ -1553,6 +1618,30 @@ class RepairCoordinatorTest {
 
         assertEquals(1, store.getFileCalls(sysFile),
                 "a skipped epoch gate must not charge the system verify throttle window");
+    }
+
+    @Test
+    void verifyPassRunsSystemNamespaceForGlobalLeaderEvenWhenNotRendezvousOwner() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        FileId sysFile = fileId(705);
+        store.createFile(new Records.FileRecord(sysFile, "strata-meta", "/metadata-log/seg-705",
+                3, 2, false, FileState.OPEN, 1234, List.of()));
+        FileId userFile = fileId(706);
+        store.createFile(file(userFile, FileState.OPEN, List.of()));
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(),
+                () -> true, () -> false, ns -> false,
+                activeLeadership(System.currentTimeMillis()));
+        coordinator.becomeLeaderForTest();
+        coordinator.systemVerifyIntervalMsForTest(60_000);
+
+        coordinator.verifyPass();
+
+        assertEquals(1, store.getFileCalls(sysFile),
+                "system verify is keyed to the global owner-epoch authority, not rendezvous ownership");
+        assertEquals(0, store.getFileCalls(userFile),
+                "non-system namespace verify still requires rendezvous ownership");
+        assertEquals(1, store.allocatedMetadataEpochs());
     }
 
     @Test
