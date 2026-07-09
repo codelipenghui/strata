@@ -217,6 +217,12 @@ class MessageGoldenCorpusTest {
                         () -> new Messages.SealChunk(CHUNK_ID, 5, 4096, NS).encode(),
                         Messages.SealChunk::decode,
                         "1111111122223333000000030000000500000000000010000474657374" + "00"),
+                request("sealChunkOwnerEpoch",
+                        new Messages.SealChunk(CHUNK_ID, 5, 4096, NS, 43),
+                        () -> new Messages.SealChunk(CHUNK_ID, 5, 4096, NS, 43).encode(),
+                        Messages.SealChunk::decode,
+                        "1111111122223333000000030000000500000000000010000474657374"
+                                + "010008000000000000002b"),
                 response("sealResp",
                         new Messages.SealResp(4096, 0xBEEF),
                         () -> new Messages.SealResp(4096, 0xBEEF).encode(),

@@ -352,6 +352,19 @@ class DataNodeWireTest {
             assertEquals(ErrorCode.FENCED_EPOCH, unstampedVerify.code());
             assertEquals(8, unstampedVerify.detail());
 
+            ScpException staleSeal = assertThrows(ScpException.class, () -> owner.call(Opcode.SEAL_CHUNK,
+                    new Messages.SealChunk(id, 1, 4, TEST_NS, 7).encode(), null, 5000));
+            assertEquals(ErrorCode.FENCED_EPOCH, staleSeal.code());
+            assertEquals(8, staleSeal.detail());
+
+            ScpException unstampedOwnerSeal = assertThrows(ScpException.class, () -> owner.call(Opcode.SEAL_CHUNK,
+                    new Messages.SealChunk(id, 1, 4, TEST_NS).encode(), null, 5000));
+            assertEquals(ErrorCode.FENCED_EPOCH, unstampedOwnerSeal.code());
+            assertEquals(8, unstampedOwnerSeal.detail());
+
+            broker.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(id, 1, 4, TEST_NS).encode(), null, 5000);
+            owner.call(Opcode.SEAL_CHUNK, new Messages.SealChunk(id, 1, 4, TEST_NS, 8).encode(), null, 5000);
+
             ScpException staleDelete = assertThrows(ScpException.class, () -> owner.call(Opcode.DELETE_CHUNKS,
                     new Messages.DeleteChunks(List.of(id), TEST_NS, 7).encode(), null, 5000));
             assertEquals(ErrorCode.FENCED_EPOCH, staleDelete.code());

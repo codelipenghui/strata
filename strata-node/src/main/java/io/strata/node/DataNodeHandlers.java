@@ -146,6 +146,8 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case SEAL_CHUNK -> {
                 var m = Messages.SealChunk.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
+                boolean brokerWriterSeal = m.ownerEpoch() == 0 && RequestContext.clientKind() == ScpClient.KIND_BROKER;
+                node.acceptOwnerEpoch(m.namespace(), m.ownerEpoch(), brokerWriterSeal);
                 var r = store.seal(m.namespace(), m.chunkId(), m.writeEpoch(), m.dataLength(),
                         req.payloadLength() > 0 ? req.payloadReadBuffer() : null);
                 yield ScpServer.ok(req, new Messages.SealResp(r.finalLength(), r.dataCrc()).encode(), null);

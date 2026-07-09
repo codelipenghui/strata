@@ -16,6 +16,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -95,6 +96,7 @@ class RepairCoordinatorNamespaceKeyTest {
                 new LinkedHashMap<>();
         private final Map<Integer, MetadataStore.Versioned<Records.NodeRecord>> nodes =
                 new LinkedHashMap<>();
+        private final AtomicLong metadataEpoch = new AtomicLong();
 
         @Override
         public void createFile(Records.FileRecord record) {
@@ -177,6 +179,11 @@ class RepairCoordinatorNamespaceKeyTest {
         @Override
         public List<MetadataStore.Versioned<Records.NodeRecord>> listNodes() {
             return new ArrayList<>(nodes.values());
+        }
+
+        @Override
+        public long allocateMetadataEpoch() {
+            return metadataEpoch.incrementAndGet();
         }
 
         @Override

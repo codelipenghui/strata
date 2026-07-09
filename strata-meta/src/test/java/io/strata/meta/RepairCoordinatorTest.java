@@ -27,6 +27,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -76,6 +77,26 @@ class RepairCoordinatorTest {
         assertEquals(new ChunkId(fileId, 0), replicate.chunkId());
         assertEquals(List.of(new Messages.Replica(source.nodeId(), "source:9000")), replicate.sources());
         assertEquals(7, replicate.ownerEpoch());
+    }
+
+    @Test
+    void globalLeaderRepairStampsAllocatedOwnerEpochWithoutNamespaceLeadership() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Registered source = register(registry, 11, "source-global");
+        Registered target = register(registry, 21, "target-global");
+        FileId fileId = fileId(21);
+        store.createFile(file(fileId, FileState.SEALED,
+                List.of(sealed(0, 256, 2102, List.of(source.nodeId())))));
+        RepairCoordinator coordinator = new RepairCoordinator(store, registry, config(), () -> true);
+
+        coordinator.scanOnce();
+
+        Messages.ReplicateCmd replicate = assertInstanceOf(Messages.ReplicateCmd.class,
+                onlyCommand(heartbeat(registry, coordinator, target, List.of())));
+        assertEquals(1, replicate.ownerEpoch(),
+                "ZK/global-latch repair lanes must use a real allocated owner epoch, not 0");
+        assertEquals(1, store.allocatedMetadataEpochs());
     }
 
     @Test
@@ -642,6 +663,44 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void verifyPassUsesOwnerEpochCapturedBeforeFileRead() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        List<Messages.VerifyChunks> verifies = new CopyOnWriteArrayList<>();
+        AtomicLong ownerEpoch = new AtomicLong(7);
+        UUID inc = UUID.randomUUID();
+        try (ScpServer node = new ScpServer(0, 782, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                        Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                        verifies.add(vc);
+                        return ScpServer.ok(req, new Messages.VerifyChunksResp(vc.chunkIds().stream()
+                                .map(id -> new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096,
+                                        0xCAFE))
+                                .toList()).encode(), null);
+                    }
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
+                })) {
+            Registered live = registerAt(registry, 882, "capture-host", "127.0.0.1:" + node.port());
+            liveNodes(registry).remove(live.nodeId());
+            FileId fileId = fileId(0x5153);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(live.nodeId())))));
+            store.afterGetFile = () -> ownerEpoch.set(8);
+
+            long settledActiveSince = System.currentTimeMillis() - 120_000;
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
+                    () -> false, () -> false, ns -> true,
+                    activeLeadership(settledActiveSince, ownerEpoch));
+            owner.verifyPass();
+
+            assertEquals(1, verifies.size());
+            assertEquals(7, verifies.get(0).ownerEpoch(),
+                    "verify must use the epoch captured before reading the file snapshot");
+        }
+    }
+
+    @Test
     void nonLeaderOwnerKeepsLastLiveReplicaWhenPeerIsDeadInPersistedState() throws Exception {
         // The last-live-replica guard must judge survivors from the persisted snapshot. A peer the leader
         // declared DEAD (persisted) but still stale-REGISTERED in a non-leader owner's frozen registry must
@@ -847,11 +906,12 @@ class RepairCoordinatorTest {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
         List<Integer> seals = new CopyOnWriteArrayList<>();
+        List<Long> sealOwnerEpochs = new CopyOnWriteArrayList<>();
         List<Integer> deletes = new CopyOnWriteArrayList<>();
 
-        try (ScpServer nodeA = resealableOpenVerifyNode(1301, 4096, 0xCAFE, seals, deletes);
-             ScpServer nodeB = resealableOpenVerifyNode(1302, 4096, 0xCAFE, seals, deletes);
-             ScpServer nodeC = resealableOpenVerifyNode(1303, 4096, 0xCAFE, seals, deletes)) {
+        try (ScpServer nodeA = resealableOpenVerifyNode(1301, 4096, 0xCAFE, seals, sealOwnerEpochs, deletes);
+             ScpServer nodeB = resealableOpenVerifyNode(1302, 4096, 0xCAFE, seals, sealOwnerEpochs, deletes);
+             ScpServer nodeC = resealableOpenVerifyNode(1303, 4096, 0xCAFE, seals, sealOwnerEpochs, deletes)) {
             Registered a = registerAt(registry, 1301, "open-a-host", "127.0.0.1:" + nodeA.port());
             Registered b = registerAt(registry, 1302, "open-b-host", "127.0.0.1:" + nodeB.port());
             Registered c = registerAt(registry, 1303, "open-c-host", "127.0.0.1:" + nodeC.port());
@@ -869,6 +929,8 @@ class RepairCoordinatorTest {
                     "re-sealed OPEN replicas stay referenced in the SEALED descriptor");
             assertEquals(new TreeSet<>(List.of(a.nodeId(), b.nodeId(), c.nodeId())), new TreeSet<>(seals),
                     "every OPEN replica was re-sealed in place");
+            assertEquals(List.of(1L, 1L, 1L), sealOwnerEpochs,
+                    "owner-reseal SEAL_CHUNK must carry the allocated owner epoch");
             assertTrue(deletes.isEmpty(), "intact OPEN replicas must not be physically deleted");
         }
     }
@@ -1247,7 +1309,8 @@ class RepairCoordinatorTest {
     }
 
     private static ScpServer resealableOpenVerifyNode(int serverNodeId, long length, int crc,
-                                                      List<Integer> seals, List<Integer> deletes)
+                                                      List<Integer> seals, List<Long> sealOwnerEpochs,
+                                                      List<Integer> deletes)
             throws Exception {
         return new ScpServer(0, serverNodeId, serverNodeId, serverNodeId + 1L, req -> {
             if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
@@ -1264,6 +1327,7 @@ class RepairCoordinatorTest {
                     throw new ScpException(ErrorCode.PRECONDITION_FAILED, "unexpected re-seal request");
                 }
                 seals.add(serverNodeId);
+                sealOwnerEpochs.add(seal.ownerEpoch());
                 return ScpServer.ok(req, new Messages.SealResp(length, crc).encode(), null);
             }
             if (req.opcode() == Opcode.DELETE_CHUNKS.code) {
@@ -1388,6 +1452,10 @@ class RepairCoordinatorTest {
     }
 
     private static NamespaceLeadership activeLeadership(long activeSinceMs) {
+        return activeLeadership(activeSinceMs, new AtomicLong(7));
+    }
+
+    private static NamespaceLeadership activeLeadership(long activeSinceMs, AtomicLong ownerEpoch) {
         return new NamespaceLeadership() {
             private final ReentrantLock lock = new ReentrantLock();
 
@@ -1408,7 +1476,7 @@ class RepairCoordinatorTest {
 
             @Override
             public long namespaceOwnerEpoch(StrataNamespace namespace) {
-                return 7;
+                return ownerEpoch.get();
             }
 
             @Override
@@ -1460,9 +1528,10 @@ class RepairCoordinatorTest {
                                        Records.FileRecord file, Records.ChunkRecord chunk) throws Exception {
         Method method = RepairCoordinator.class.getDeclaredMethod(
                 "issueReplicate", StrataNamespace.class, FileId.class, Records.FileRecord.class,
-                Records.ChunkRecord.class, RepairCoordinator.RepairTrigger.class);
+                Records.ChunkRecord.class, RepairCoordinator.RepairTrigger.class, long.class);
         method.setAccessible(true);
-        method.invoke(coordinator, file.namespace(), fileId, file, chunk, RepairCoordinator.RepairTrigger.RECONCILE);
+        method.invoke(coordinator, file.namespace(), fileId, file, chunk,
+                RepairCoordinator.RepairTrigger.RECONCILE, 7L);
     }
 
     private static Object replicateAction(FileId fileId, ChunkId chunkId, int deadNode, int targetNode)
@@ -1541,6 +1610,8 @@ class RepairCoordinatorTest {
         private StrataNamespace blockGetFileNamespace;
         private final CountDownLatch getFileBlocked = new CountDownLatch(1);
         private final CountDownLatch releaseGetFile = new CountDownLatch(1);
+        private final AtomicLong metadataEpoch = new AtomicLong();
+        private Runnable afterGetFile = () -> { };
 
         @Override
         public void createFile(Records.FileRecord record) {
@@ -1577,11 +1648,21 @@ class RepairCoordinatorTest {
             if (throwOnGetFileId != null && throwOnGetFileId.equals(id)) {
                 throw new IllegalStateException("poison file getFile failure for " + id);
             }
+            afterGetFile.run();
             return Optional.ofNullable(files.get(id));
         }
 
         int getFileCalls(FileId id) {
             return getFileCalls.getOrDefault(id, 0);
+        }
+
+        int allocatedMetadataEpochs() {
+            return (int) metadataEpoch.get();
+        }
+
+        @Override
+        public long allocateMetadataEpoch() {
+            return metadataEpoch.incrementAndGet();
         }
 
         @Override

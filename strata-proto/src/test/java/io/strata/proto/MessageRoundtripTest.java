@@ -56,6 +56,8 @@ class MessageRoundtripTest {
 
         var seal = new Messages.SealChunk(c, 5, 4096, ns);
         assertEquals(seal, Messages.SealChunk.decode(buf(seal.encode())));
+        var ownerSeal = new Messages.SealChunk(c, 5, 4096, ns, 43);
+        assertEquals(ownerSeal, Messages.SealChunk.decode(buf(ownerSeal.encode())));
 
         var del = new Messages.DeleteChunks(List.of(c, new ChunkId(f, 4)), ns, 42);
         assertEquals(del, Messages.DeleteChunks.decode(buf(del.encode())));
