@@ -81,7 +81,7 @@ class ChunkStoreLockConcurrencyTest {
                 store.stat(TEST_NS, id);
                 store.append(TEST_NS, id, 1, 0, 0, payload(64));     // normal early-return at the tail
                 store.read(TEST_NS, id, 0, 64);
-                store.readLedger(TEST_NS, id, 0);
+                store.readLedger(TEST_NS, id, 0, 0);
                 store.fence(TEST_NS, id, 5);
             });
             assertEquals(64, store.stat(TEST_NS, id).localEndOffset());
@@ -141,7 +141,7 @@ class ChunkStoreLockConcurrencyTest {
                             switch (which % 6) {
                                 case 0 -> store.stat(TEST_NS, id);
                                 case 1 -> store.read(TEST_NS, id, 0, (int) Math.max(1, Math.min(e, 4096)));
-                                case 2 -> store.readLedger(TEST_NS, id, 0);
+                                case 2 -> store.readLedger(TEST_NS, id, 0, 0);
                                 case 3 -> store.describeChunks();
                                 case 4 -> store.orphanSuspects(0, NOW);
                                 default -> store.usedBytes();

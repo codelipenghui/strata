@@ -28,6 +28,7 @@ public final class Messages {
      * compatibility; receivers decide whether an epoch-0 request is still allowed for the specific lane.
      */
     private static final int TAG_OWNER_EPOCH = 0;
+    /** Optional signed recovery epoch. Absence/0 is unstamped and rejected by recovery wire handlers. */
     private static final int TAG_RECOVERY_EPOCH = 1;
 
     /** Bounded list-count reader (see {@link Varint#readCount}). */
@@ -44,6 +45,12 @@ public final class Messages {
     private static void requireNonNegativeRecoveryEpoch(int recoveryEpoch) {
         if (recoveryEpoch < 0) {
             throw new IllegalArgumentException("recoveryEpoch must be non-negative: " + recoveryEpoch);
+        }
+    }
+
+    private static void requirePositiveRecoveryEpoch(int recoveryEpoch) {
+        if (recoveryEpoch <= 0) {
+            throw new IllegalArgumentException("recoveryEpoch must be positive: " + recoveryEpoch);
         }
     }
 
@@ -692,6 +699,7 @@ public final class Messages {
         }
     }
 
+    /** recoveryEpoch 0 denotes an ordinary READ; READ_RECOVERY requires a positive persisted fence epoch. */
     public record Read(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace,
                        int recoveryEpoch) {
         private static final ThreadLocal<ReadFields> FIELDS = ThreadLocal.withInitial(ReadFields::new);
@@ -704,6 +712,7 @@ public final class Messages {
 
         public static Read recovery(ChunkId chunkId, long offset, int maxBytes,
                                     StrataNamespace namespace, int recoveryEpoch) {
+            requirePositiveRecoveryEpoch(recoveryEpoch);
             return new Read(chunkId, offset, maxBytes, namespace, recoveryEpoch);
         }
 
@@ -1124,6 +1133,7 @@ public final class Messages {
         }
     }
 
+    /** ownerEpoch 0 is accepted only until the node observes a positive namespace owner watermark. */
     public record FetchChunk(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace,
                              long ownerEpoch) {
         public FetchChunk(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace) {
@@ -1168,6 +1178,7 @@ public final class Messages {
         }
     }
 
+    /** recoveryEpoch 0 is legacy/unstamped and is rejected by the READ_LEDGER wire handler. */
     public record ReadLedger(ChunkId chunkId, long fromOffset, StrataNamespace namespace,
                              int recoveryEpoch) {
         public ReadLedger(ChunkId chunkId, long fromOffset, StrataNamespace namespace) {

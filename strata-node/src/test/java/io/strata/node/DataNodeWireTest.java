@@ -476,6 +476,10 @@ class DataNodeWireTest {
                     new Messages.Read(id, 4, 1024, TEST_NS).encode(), null, 5000));
             assertEquals(ErrorCode.PRECONDITION_FAILED, unfenced.code());
 
+            ScpException unstampedLedger = assertThrows(ScpException.class, () -> client.call(Opcode.READ_LEDGER,
+                    new Messages.ReadLedger(id, 0, TEST_NS).encode(), null, 5000));
+            assertEquals(ErrorCode.PRECONDITION_FAILED, unstampedLedger.code());
+
             ScpException notYetFenced = assertThrows(ScpException.class, () -> client.call(Opcode.READ_LEDGER,
                     new Messages.ReadLedger(id, 0, TEST_NS, 2).encode(), null, 5000));
             assertEquals(ErrorCode.PRECONDITION_FAILED, notYetFenced.code());
@@ -501,6 +505,17 @@ class DataNodeWireTest {
             byte[] all = new byte[full.payloadLength()];
             full.payloadSlice().get(all);
             assertArrayEquals("SAFETAIL".getBytes(), all);
+
+            client.call(Opcode.FENCE, new Messages.Fence(id, 3, TEST_NS).encode(), null, 5000);
+            ScpException staleRead = assertThrows(ScpException.class, () -> client.call(Opcode.READ_RECOVERY,
+                    Messages.Read.recovery(id, 0, 1024, TEST_NS, 2).encode(), null, 5000));
+            assertEquals(ErrorCode.FENCED_EPOCH, staleRead.code());
+            assertEquals(3, staleRead.detail());
+
+            ScpException staleLedger = assertThrows(ScpException.class, () -> client.call(Opcode.READ_LEDGER,
+                    new Messages.ReadLedger(id, 0, TEST_NS, 2).encode(), null, 5000));
+            assertEquals(ErrorCode.FENCED_EPOCH, staleLedger.code());
+            assertEquals(3, staleLedger.detail());
         }
     }
 

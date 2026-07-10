@@ -179,7 +179,7 @@ The recovering leader must establish the durable prefix without the old leader's
 
 1. `FENCE(chunkId, E+1)` on all reachable replicas — the response carries each replica's local end offset and last-known DO (need ≥2 reachable; with <2 the chunk is unavailable until a replica returns — same fault model as Kafka `min.insync.replicas=2`).
 2. Start from `max(piggybacked DO)` across reachable replicas — everything below is known quorum-durable.
-3. Scan forward batch-by-batch (`READ` + ledger verification): if a batch exists on **any** reachable replica (CRC-valid), re-replicate it to quorum and advance; stop at the first offset found on none. If a fenced replica claimed bytes above the candidate seal point but its ledger/bytes cannot be verified, abort recovery with `SEAL_RECOVERY_BLOCKED` instead of sealing below that claim; the chunk stays OPEN for a retry.
+3. Scan forward batch-by-batch (`READ_LEDGER` boundaries + `READ_RECOVERY` bytes, both stamped with the exact persisted recovery fence epoch): if a batch exists on **any** reachable replica (CRC-valid), re-replicate it to quorum and advance; stop at the first offset found on none. If a fenced replica claimed bytes above the candidate seal point but its ledger/bytes cannot be verified, abort recovery with `SEAL_RECOVERY_BLOCKED` instead of sealing below that claim; the chunk stays OPEN for a retry. Ordinary `READ` is not used here because it clamps an open chunk to the durable high watermark and therefore hides the tail recovery must re-prove.
 4. Seal at the verified stop point; write footers; commit `SealChunk`.
 
 Property: any producer-acked batch existed on at least `ackQuorum` replicas; with failures below the policy's tolerated threshold, at least one holder is reachable and verifiable, so step 3 preserves it. With the default policy, this is the same tolerance as Kafka RF=3/acks=all/min.isr=2. If holder evidence exists but is temporarily unreadable or corrupt, aborting is safer than floor-sealing because acked-data loss would be permanent while a later recovery can retry verification. A persistent local read fault on an otherwise reachable holder therefore remains visible as `SEAL_RECOVERY_BLOCKED`; an operator may explicitly evict the blocking holder for exactly one namespaced chunk by setting `strata.recovery.unsafeSealOverrideChunks`/`STRATA_RECOVERY_UNSAFE_SEAL_OVERRIDE_CHUNKS` to the exact `namespace:fileId.index` key from the error or log (the `fileId` is the 16-character hex form, e.g. `test:0000000000000030.0`). The override token is consumed after one matching recovery, after which recovery seals the remaining quorum at the verified floor; environment-based overrides are consumed only inside the running process, so operators must also remove the deployment env var after the targeted recovery completes.
@@ -262,19 +262,23 @@ u16  headerLength
 | 0x0012 | `READ` | chunkId, u64 offset, u32 maxBytes | u64 localEndOffset, u64 durableOffset | chunk bytes |
 | 0x0013 | `FENCE` | chunkId, i32 fenceEpoch | i32 persistedFenceEpoch, u64 localEndOffset, u64 lastKnownDO, u8 state | — |
 | 0x0014 | `STAT_CHUNK` | chunkId | u8 state, u64 localEndOffset, u64 lastKnownDO, i32 writeEpoch, i32 fenceEpoch, u64 sealedLength, u32 sealedCrc | — |
-| 0x0015 | `SEAL_CHUNK` | chunkId, i32 writeEpoch, u64 dataLength | u64 finalLength, u32 chunkCrc | footer bytes (§11.2) |
-| 0x0016 | `DELETE_CHUNKS` | varint n, chunkId×n | array{chunkId, u16 code} | — |
-| 0x0017 | `FETCH_CHUNK` | chunkId, u64 offset, u32 maxBytes | u64 fileLength, u8 state | raw chunk-file bytes (header block + data + footer) |
+| 0x0015 | `SEAL_CHUNK` | chunkId, i32 writeEpoch, u64 dataLength; tag 0: u64 ownerEpoch | u64 finalLength, u32 chunkCrc | footer bytes (§11.2) |
+| 0x0016 | `DELETE_CHUNKS` | varint n, chunkId×n; tag 0: u64 ownerEpoch | array{chunkId, u16 code} | — |
+| 0x0017 | `FETCH_CHUNK` | chunkId, u64 offset, u32 maxBytes; tag 0: u64 ownerEpoch | u64 fileLength, u8 state | raw chunk-file bytes (header block + data + footer) |
 | 0x0018 | `PING` | — | — | — |
-| 0x0019 | `READ_LEDGER` | chunkId, u64 fromOffset | array{u64 endOffset, u32 payloadCrc, i32 writeEpoch} | — |
+| 0x0019 | `READ_LEDGER` | chunkId, u64 fromOffset; tag 1: i32 recoveryEpoch (required, >0) | array{u64 endOffset, u32 payloadCrc, i32 writeEpoch} | — |
+| 0x001A | `READ_RECOVERY` | chunkId, u64 offset, u32 maxBytes; tag 1: i32 recoveryEpoch (required, >0) | u64 localEndOffset, u64 durableOffset | open-chunk bytes through local end, including the undurable tail |
 
-`READ_LEDGER` (v0 addition) exposes integrity-ledger entries above an offset: seal recovery (§7.3)
-needs per-append boundaries without parsing the opaque payload. Empty for sealed chunks (the ledger
-is deleted at seal; recovery never needs it then). `SEAL_CHUNK` semantics refined in v0: caller
+`READ_LEDGER` exposes integrity-ledger entries above an offset: seal recovery (§7.3) needs per-append
+boundaries without parsing the opaque payload. `READ_LEDGER` and `READ_RECOVERY` require a positive
+`recoveryEpoch` that exactly matches the chunk's persisted fence epoch; a lower epoch returns
+`FENCED_EPOCH`, while a higher epoch returns `PRECONDITION_FAILED` until `FENCE` persists it. Empty
+for sealed chunks (the ledger is deleted at seal; recovery never needs it then). `SEAL_CHUNK`
+semantics refined in v0: caller
 footer sections are optional, and the node ALWAYS computes CRC_RANGES + STATS itself — recovery-
 sealed chunks therefore stay byte-identical across replicas with no caller input.
 
-Notes: `FETCH_CHUNK` is distinct from `READ` so it can run in a separate QoS/throttle class (repair must never starve foreground reads) and because it copies the *file* representation (header + footer included) — a repaired sealed replica is byte-identical, so whole-file CRCs are comparable across replicas. The node-local sidecar and ledger (§11.3) are never copied; the puller starts fresh ones.
+Notes: `FETCH_CHUNK` is distinct from `READ` so it can run in a separate QoS/throttle class (repair must never starve foreground reads) and because it copies the *file* representation (header + footer included) — a repaired sealed replica is byte-identical, so whole-file CRCs are comparable across replicas. It carries the namespace owner's epoch and participates in the source node's volatile owner watermark; epoch 0 is accepted only before the node observes a positive owner epoch for that namespace. The node-local sidecar and ledger (§11.3) are never copied; the puller starts fresh ones.
 
 ### 10.4 Control-plane opcodes (data node ↔ metadata plane)
 

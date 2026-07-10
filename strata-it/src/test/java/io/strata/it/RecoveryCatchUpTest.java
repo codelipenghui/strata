@@ -72,6 +72,8 @@ class RecoveryCatchUpTest {
             assertEquals(12, sealed.sealedLength(), "all quorum-durable bytes must be preserved");
             Messages.LookupFileResp recovered = ConsistencyVerifier.lookupFile(cluster, fileId);
             var recoveredChunk = recovered.chunks().get(0);
+            assertEquals(3, recoveredChunk.replicas().size(),
+                    "lagging replica must be caught up, not evicted");
 
             // EVERY replica in the descriptor must now serve the full sealed chunk byte-identically
             Set<String> hashes = new HashSet<>();

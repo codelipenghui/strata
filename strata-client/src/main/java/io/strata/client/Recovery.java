@@ -155,7 +155,12 @@ final class Recovery {
                 if (e.code() == ErrorCode.FENCED_EPOCH) {
                     throw e;
                 }
-                log.warn("fence {} on {} failed: {}", chunkId, r.endpoint(), e.getMessage());
+                if (e.code() == ErrorCode.PRECONDITION_FAILED) {
+                    log.error("fence {} on {} returned an inconsistent persisted epoch: {}",
+                            chunkId, r.endpoint(), e.getMessage());
+                } else {
+                    log.warn("fence {} on {} failed: {}", chunkId, r.endpoint(), e.getMessage());
+                }
             } catch (RuntimeException e) {
                 log.warn("fence {} on {} returned malformed response: {}", chunkId, r.endpoint(), e.toString());
             }
@@ -212,7 +217,7 @@ final class Recovery {
         for (ReplicaState rs : reachable) {
             try {
                 ByteBuffer h = readPool.get(rs.replica.endpoint()).call(Opcode.READ_LEDGER,
-                        new Messages.ReadLedger(chunkId, p, namespace, writerEpoch).encode(), null,
+                        new Messages.ReadLedger(chunkId, p, namespace, rs.recoveryEpoch()).encode(), null,
                         config.callTimeoutMs());
                 long previousEnd = p;
                 for (Messages.LedgerEntry e : Messages.ReadLedgerResp.decode(h).entries()) {
@@ -221,6 +226,9 @@ final class Recovery {
                     previousEnd = e.endOffset();
                 }
             } catch (ScpException e) {
+                if (e.code() == ErrorCode.FENCED_EPOCH) {
+                    throw e;
+                }
                 log.warn("read ledger {} on {} failed: {}", chunkId, rs.replica.endpoint(), e.getMessage());
                 markUnverifiedAboveFloorHolder(unverifiedAboveFloorHolders, rs, p);
             } catch (RuntimeException e) {
@@ -646,6 +654,9 @@ final class Recovery {
             }
             return data;
         } catch (ScpException e) {
+            if (e.code() == ErrorCode.FENCED_EPOCH) {
+                throw e;
+            }
             log.warn("recovery read {}@{} from {} failed: {}", chunkId, from + filled,
                     source.replica.endpoint(), e.getMessage());
             return null;
@@ -682,6 +693,7 @@ final class Recovery {
                         "recovery epoch " + recoveryEpoch + " < replica fence "
                                 + fence.persistedFenceEpoch(), fence.persistedFenceEpoch());
             }
+            // A correct FENCE response cannot report less than the requested epoch: fence() persists max().
             throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                     "replica " + replica.nodeId() + " reported fence " + fence.persistedFenceEpoch()
                             + " for recovery epoch " + recoveryEpoch);

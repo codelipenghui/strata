@@ -53,6 +53,8 @@ class MessageRoundtripTest {
         assertEquals(recoveryRead, Messages.Read.decode(buf(recoveryRead.encode())));
         var recoveryReadFields = Messages.Read.decodeFields(buf(recoveryRead.encode()));
         assertEquals(7, recoveryReadFields.recoveryEpoch());
+        assertThrows(IllegalArgumentException.class,
+                () -> Messages.Read.recovery(c, 99, 65536, ns, 0));
 
         var fence = new Messages.Fence(c, 6, ns);
         assertEquals(fence, Messages.Fence.decode(buf(fence.encode())));

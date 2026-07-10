@@ -1032,12 +1032,17 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     private static void requireRecoveryFence(Handle h, int recoveryEpoch, String op) {
+        if (h.fenceEpoch == RECOVERY_FENCE_REQUIRED) {
+            throw new ScpException(ErrorCode.FENCED_EPOCH,
+                    "fresh recovery fence required for " + h.id, nextEpochAfter(h.writeEpoch));
+        }
         if (h.fenceEpoch == recoveryEpoch) {
             return;
         }
         if (h.fenceEpoch > recoveryEpoch) {
             throw new ScpException(ErrorCode.FENCED_EPOCH,
-                    op + " recovery epoch " + recoveryEpoch + " < local fence " + h.fenceEpoch,
+                    op + " recovery epoch " + recoveryEpoch + " < local fence " + h.fenceEpoch
+                            + " for chunk " + h.id,
                     h.fenceEpoch);
         }
         throw new ScpException(ErrorCode.PRECONDITION_FAILED,
@@ -1793,22 +1798,9 @@ public final class ChunkStore implements AutoCloseable {
      * the client read path does — makes recovery seal short and drop quorum-durable bytes. Reads are
      * still integrity-verified (open chunks against the ledger, sealed chunks against footer CRC
      * ranges), and the recovery path does not count toward client read throughput metrics.
+     * A zero recovery epoch is reserved for explicit trusted in-process inspection; wire callers
+     * must supply the positive epoch persisted by {@link #fence}.
      */
-    public ReadRegionResult readRegionForRecovery(StrataNamespace ns, ChunkId id, long offset, int maxBytes)
-            throws IOException {
-        return readRegion0(ns, id, id.fileId().id(), id.index(), offset, maxBytes, true, 0);
-    }
-
-    public ReadRegionResult readRegionForRecovery(StrataNamespace ns, ChunkId id, long offset, int maxBytes,
-                                                   int recoveryEpoch) throws IOException {
-        return readRegion0(ns, id, id.fileId().id(), id.index(), offset, maxBytes, true, recoveryEpoch);
-    }
-
-    public ReadRegionResult readRegionForRecovery(StrataNamespace ns, long fileId, int chunkIndex,
-                                                  long offset, int maxBytes) throws IOException {
-        return readRegion0(ns, null, fileId, chunkIndex, offset, maxBytes, true, 0);
-    }
-
     public ReadRegionResult readRegionForRecovery(StrataNamespace ns, long fileId, int chunkIndex,
                                                   long offset, int maxBytes, int recoveryEpoch) throws IOException {
         return readRegion0(ns, null, fileId, chunkIndex, offset, maxBytes, true, recoveryEpoch);
@@ -2310,10 +2302,7 @@ public final class ChunkStore implements AutoCloseable {
         return (int) whole.getValue();
     }
 
-    public List<ChunkFormats.LedgerEntry> readLedger(StrataNamespace ns, ChunkId id, long fromOffset) {
-        return readLedger(ns, id, fromOffset, 0);
-    }
-
+    /** Zero recovery epoch is reserved for explicit trusted in-process inspection. */
     public List<ChunkFormats.LedgerEntry> readLedger(StrataNamespace ns, ChunkId id, long fromOffset,
                                                      int recoveryEpoch) {
         requireNonNegative(fromOffset, "ledger offset");

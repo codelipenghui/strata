@@ -180,7 +180,9 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case FETCH_CHUNK -> {
                 var m = Messages.FetchChunk.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
-                requireOwnerEpoch(m.namespace(), m.ownerEpoch());
+                // A repair source may receive FETCH_CHUNK as its first stamped owner RPC after restart,
+                // so this read lane intentionally raises the volatile watermark as well as checking it.
+                acceptFetchOwnerEpoch(m.namespace(), m.ownerEpoch());
                 var r = store.fetch(m.namespace(), m.chunkId(), m.offset(), m.maxBytes());
                 yield ScpServer.ok(req, new Messages.FetchResp(r.fileLength(), r.state()).encode(),
                         ByteBuffer.wrap(r.bytes()));
@@ -351,7 +353,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 : store.readRegion(m.namespace(), m.fileId(), m.chunkIndex(), m.offset(), m.maxBytes());
     }
 
-    private void requireOwnerEpoch(StrataNamespace namespace, long ownerEpoch) {
+    private void acceptFetchOwnerEpoch(StrataNamespace namespace, long ownerEpoch) {
         node.acceptOwnerEpoch(namespace, ownerEpoch);
     }
 
