@@ -256,6 +256,34 @@ class ControllerTest {
     }
 
     @Test
+    void controllerRejectsAndCountsAStoreNamespaceContractViolation() throws Exception {
+        StrataNamespace owner = StrataNamespace.of("contract-owner");
+        StrataNamespace requested = StrataNamespace.of("contract-requested");
+        var created = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile(owner, StrataPath.of("/contract-violation"),
+                        Messages.WritePolicy.DEFAULT).encode(), null, 5000));
+        MetadataStore.Versioned<Records.FileRecord> foreign =
+                metadataStore().getFile(owner, created.fileId()).orElseThrow();
+
+        NamespaceContractViolatingStore violating =
+                new NamespaceContractViolatingStore(metadataStore(), created.fileId(), foreign);
+        MetadataStore original = replaceStore(violating);
+        long violationsBefore = service.metadataStoreNamespaceContractViolations();
+        try {
+            ScpException lookup = assertThrows(ScpException.class, () -> client.call(Opcode.LOOKUP_FILE,
+                    new Messages.LookupFile(requested, created.fileId()).encode(), null, 5000));
+
+            assertEquals(ErrorCode.FILE_NOT_FOUND, lookup.code());
+            assertEquals(violationsBefore + 1, service.metadataStoreNamespaceContractViolations(),
+                    "the Controller defense must surface a backend namespace-contract violation");
+            assertEquals(1, violating.getFileCalls,
+                    "the regression must exercise the contract-violating store directly");
+        } finally {
+            replaceStore(original);
+        }
+    }
+
+    @Test
     void lookupPathRejectsMarkerThatPointsAtDifferentLogicalFile() throws Exception {
         var first = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/marker-identity-a")
@@ -778,6 +806,26 @@ class ControllerTest {
                                   FileId expectedFileId) {
             deletePathCalls++;
             return false;
+        }
+    }
+
+    private static final class NamespaceContractViolatingStore extends DelegatingMetadataStore {
+        private final FileId fileId;
+        private final Versioned<Records.FileRecord> foreign;
+        private int getFileCalls;
+
+        private NamespaceContractViolatingStore(MetadataStore delegate, FileId fileId,
+                                                Versioned<Records.FileRecord> foreign) {
+            super(delegate);
+            this.fileId = fileId;
+            this.foreign = foreign;
+        }
+
+        @Override
+        public Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id)
+                throws Exception {
+            getFileCalls++;
+            return fileId.equals(id) ? Optional.of(foreign) : super.getFile(namespace, id);
         }
     }
 

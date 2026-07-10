@@ -437,7 +437,7 @@ The user-facing logical name is `(StrataNamespace, StrataPath)`, not a local fil
 ACL/quota root. `StrataPath` is absolute within that namespace (`/topic/partition/segment`),
 canonical (no trailing slash, empty segment, `.`, or `..`), and unique only inside its namespace
 while a file is live. Parent path segments are explicit namespace nodes so future ACLs can be
-attached above individual files; file identity remains the immutable, globally unique `FileId`.
+attached above individual files; file identity is the immutable `(StrataNamespace, FileId)` tuple.
 
 **Guarantees.**
 - *Single writer:* at most one live `Appender` per file per epoch; a higher epoch anywhere kills lower-epoch appenders permanently (`FencedException`; the appender is dead, not retriable).

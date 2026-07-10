@@ -31,6 +31,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BiFunction;
 import java.util.function.UnaryOperator;
 
@@ -57,6 +58,7 @@ public final class Controller implements AutoCloseable {
     private final NamespaceOwnership ownership; // resolves the controller owner of each namespace (design §6)
     private final NamespaceLeadership namespaceLeadership; // optional: namespace-log ACTIVE/RECOVERING barrier
     private final AtomicLong lastSystemNamespaceRejectWarnMs = new AtomicLong();
+    private final LongAdder metadataStoreNamespaceContractViolations = new LongAdder();
 
     public Controller(ControllerConfig config) throws Exception {
         this(config, null);
@@ -323,6 +325,11 @@ public final class Controller implements AutoCloseable {
     /** Corrupt/unreadable shared live-node snapshots seen by placement readers. */
     public long clusterLiveNodesReadFailures() {
         return registry.clusterLiveNodesReadFailures();
+    }
+
+    /** Records returned by a backend with a namespace different from the requested logical identity. */
+    public long metadataStoreNamespaceContractViolations() {
+        return metadataStoreNamespaceContractViolations.sum();
     }
 
     /** This controller's rendezvous endpoint identity — the {@code owner} label for the namespace-owner
@@ -924,8 +931,22 @@ public final class Controller implements AutoCloseable {
 
     private Optional<MetadataStore.Versioned<Records.FileRecord>> getFile(
             StrataNamespace namespace, FileId fileId) throws Exception {
-        return store.getFile(namespace, fileId)
-                .filter(versioned -> versioned.value().namespace().equals(namespace));
+        Optional<MetadataStore.Versioned<Records.FileRecord>> found = store.getFile(namespace, fileId);
+        if (found.isEmpty()) {
+            return found;
+        }
+        Records.FileRecord record = found.get().value();
+        if (record.namespace().equals(namespace)) {
+            return found;
+        }
+
+        // Defense in depth: reaching this branch means the MetadataStore violated its
+        // (namespace, FileId) lookup contract, most likely due to corrupt replayed state.
+        metadataStoreNamespaceContractViolations.increment();
+        log.error("metadata-store namespace contract violated fileId={} requestedNamespace={} "
+                        + "recordNamespace={}; treating record as absent",
+                fileId, namespace, record.namespace());
+        return Optional.empty();
     }
 
     private Messages.LookupFileResp lookup(StrataNamespace namespace, FileId fileId) throws Exception {
@@ -977,11 +998,12 @@ public final class Controller implements AutoCloseable {
     private void markDeleting(StrataNamespace namespace, FileId id) throws Exception {
         for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
             var opt = getFile(namespace, id);
-            // idempotent after deletion: a DELETED tombstone (and a later swept record) read as
-            // empty here, as does a never-created id. A delete retry whose first response was lost
-            // — or one that lands after a controller failover/tombstone reap — must ack OK rather
-            // than FILE_NOT_FOUND, so the caller observes a single logical deletion. (abortChunk
-            // returns idempotently on the same empty condition.)
+            // Idempotent after deletion: a DELETED tombstone (and a later swept record), a
+            // never-created id, or a FileId belonging to another namespace all read as empty here.
+            // A delete retry whose first response was lost — or one that lands after a controller
+            // failover/tombstone reap — must ack OK rather than FILE_NOT_FOUND, so the caller observes
+            // a single logical deletion. The same response for a wrong namespace avoids disclosing
+            // whether that FileId exists elsewhere. (abortChunk is idempotent on the same condition.)
             if (opt.isEmpty()) return;
             Records.FileRecord current = opt.get().value();
             Records.FileRecord deleting = current.withState(FileState.DELETING);

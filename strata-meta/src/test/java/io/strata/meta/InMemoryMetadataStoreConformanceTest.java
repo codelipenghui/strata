@@ -63,7 +63,7 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
                 Versioned<Records.FileRecord> v = state.files.get(id);
                 if (v == null || !v.value().namespace().equals(namespace)
                         || v.value().state() == FileState.DELETED) {
-                    return Optional.empty();  // a swept-pending tombstone is logically gone
+                    return Optional.empty();  // wrong namespace or swept-pending tombstone: logically absent
                 }
                 return Optional.of(v);
             }
@@ -83,7 +83,9 @@ class InMemoryMetadataStoreConformanceTest extends MetadataStoreConformanceTest 
             synchronized (state) {
                 ensureOpen();
                 Versioned<Records.FileRecord> current = state.files.get(record.fileId());
-                if (current == null || current.version() != expectedVersion) {
+                if (current == null || current.value().state() == FileState.DELETED
+                        || !current.value().namespace().equals(record.namespace())
+                        || current.version() != expectedVersion) {
                     return false;
                 }
                 state.files.put(record.fileId(), new Versioned<>(record, current.version() + 1));

@@ -185,7 +185,13 @@ public final class ZkMetadataStore implements MetadataStore {
             byte[] data = curator.getData().storingStatIn(stat).forPath(FILES + "/" + id);
             record(FILES, false, data.length);
             Records.FileRecord record = Records.FileRecord.decode(data);
-            if (!record.namespace().equals(namespace) || record.state() == FileState.DELETED) {
+            if (!record.namespace().equals(namespace)) {
+                log.warn("metadata file lookup namespace mismatch fileId={} requestedNamespace={} "
+                                + "recordNamespace={}; treating record as absent",
+                        id, namespace, record.namespace());
+                return Optional.empty();
+            }
+            if (record.state() == FileState.DELETED) {
                 return Optional.empty();  // a swept-pending tombstone is logically gone
             }
             return Optional.of(new Versioned<>(record, stat.getVersion()));
@@ -206,6 +212,10 @@ public final class ZkMetadataStore implements MetadataStore {
 
     @Override
     public boolean updateFile(Records.FileRecord record, int expectedVersion) throws Exception {
+        Optional<Versioned<Records.FileRecord>> current = getFile(record.namespace(), record.fileId());
+        if (current.isEmpty() || current.get().version() != expectedVersion) {
+            return false;
+        }
         try {
             byte[] enc = record.encode();
             curator.setData().withVersion(expectedVersion).forPath(FILES + "/" + record.fileId(), enc);
@@ -247,6 +257,9 @@ public final class ZkMetadataStore implements MetadataStore {
             Records.FileRecord record = current.get().value();
             // Defense in depth: keep the destructive path safe even if getFile is later refactored.
             if (!record.namespace().equals(namespace)) {
+                log.warn("metadata file delete namespace mismatch fileId={} requestedNamespace={} "
+                                + "recordNamespace={}; treating record as absent",
+                        id, namespace, record.namespace());
                 return true;
             }
             if (current.get().version() != expectedVersion) {

@@ -18,7 +18,7 @@ This file is the durable source of truth for the development loop — update the
   - Error codes added: 15 NOT_LEADER (tagged leader hint), 16 NO_CAPACITY (placement cannot find 3 nodes).
 - **Epoch source:** metadata allocates a monotonic writer epoch per file; the storage layer is agnostic to how the controller sources it.
 - **v0 controller:** single active instance in tests (Curator leader election implemented); leases in leader memory, registrations + file/chunk records in ZK (CAS via znode versions, leader-only writes).
-- **File naming:** every file has a first-class `StrataNamespace` plus `StrataPath`. `FileId` is globally unique; `(namespace, path)` is unique only while a file is live. The v0 ZK backend stores path bindings under `/strata/namespaces/<namespace>/paths/<path>/__file`, leaving that namespace node as the future ACL/quota root.
+- **File naming:** every file has a first-class `StrataNamespace` plus `StrataPath`; logical identity is `(namespace, FileId)`, and `(namespace, path)` is unique only while a file is live. The v0 ZK backend allocates globally unique numeric FileIds as a physical-layout convenience and stores path bindings under `/strata/namespaces/<namespace>/paths/<path>/__file`, leaving that namespace node as the future ACL/quota root.
 
 ## Module layout
 

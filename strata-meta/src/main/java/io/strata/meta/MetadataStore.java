@@ -39,7 +39,11 @@ public interface MetadataStore extends AutoCloseable {
 
     Optional<FileId> resolvePath(StrataNamespace namespace, StrataPath path) throws Exception;
 
-    /** CAS update; returns false on version conflict. */
+    /**
+     * Namespace-bound CAS update addressed by {@code (record.namespace(), record.fileId())}. Returns
+     * false, without modifying the stored record, when that logical file is absent, belongs to a
+     * different namespace, or has a different version.
+     */
     boolean updateFile(Records.FileRecord record, int expectedVersion) throws Exception;
 
     boolean deletePath(StrataNamespace namespace, StrataPath path, FileId expectedFileId) throws Exception;
