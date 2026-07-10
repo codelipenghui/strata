@@ -470,11 +470,7 @@ public final class Controller implements AutoCloseable {
     }
 
     private long namespaceOwnerEpoch(StrataNamespace namespace) {
-        NamespaceLeadership leadership = namespaceLeadership;
-        if (leadership == null || NamespaceLogBackend.isSystem(namespace)) {
-            return 0;
-        }
-        return leadership.namespaceOwnerEpoch(namespace);
+        return repair.lookupOwnerEpoch(namespace);
     }
 
     /** Test/inspection hook: this node's namespace-ownership resolver. */

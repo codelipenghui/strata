@@ -134,6 +134,14 @@ class ControllerTest {
         var lookup = Messages.LookupFileResp.decode(client.call(Opcode.LOOKUP_FILE,
                 new Messages.LookupFile(StrataNamespace.of("test"), accepted.fileId()).encode(), null, 5000));
         assertEquals(policy, lookup.writePolicy());
+        assertTrue(lookup.ownerEpoch() > 0,
+                "ZK/global-latch LOOKUP_FILE responses must carry the same global owner epoch as repair lanes");
+
+        ScpException missing = assertThrows(ScpException.class, () -> client.call(Opcode.LOOKUP_FILE,
+                new Messages.LookupFile(StrataNamespace.of("test"), FileId.of(9_999_999)).encode(), null, 5000));
+        assertEquals(ErrorCode.FILE_NOT_FOUND, missing.code());
+        assertEquals(lookup.ownerEpoch(), missing.detail(),
+                "orphan-GC FILE_NOT_FOUND confirms must carry the global owner epoch too");
     }
 
     @Test

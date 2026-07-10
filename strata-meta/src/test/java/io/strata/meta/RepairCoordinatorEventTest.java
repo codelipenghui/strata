@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -230,6 +231,7 @@ class RepairCoordinatorEventTest {
     private static final class FakeStore implements MetadataStore {
         private final Map<FileId, Versioned<Records.FileRecord>> files = new LinkedHashMap<>();
         private final Map<Integer, Versioned<Records.NodeRecord>> nodes = new LinkedHashMap<>();
+        private final AtomicLong metadataEpoch = new AtomicLong();
         private volatile byte[] clusterLiveNodes;
 
         @Override
@@ -328,6 +330,11 @@ class RepairCoordinatorEventTest {
         @Override
         public List<Versioned<Records.NodeRecord>> listNodes() {
             return new ArrayList<>(nodes.values());
+        }
+
+        @Override
+        public long allocateMetadataEpoch() {
+            return metadataEpoch.incrementAndGet();
         }
 
         @Override

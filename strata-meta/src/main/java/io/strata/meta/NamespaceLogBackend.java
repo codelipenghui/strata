@@ -876,7 +876,7 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
             return 0;
         }
         NamespaceLeadershipHandle handle = namespaces.get(namespace);
-        return handle == null ? 0 : handle.metadataEpoch;
+        return handle == null || handle.state != NamespaceLeaderState.ACTIVE ? 0 : handle.metadataEpoch;
     }
 
     @Override

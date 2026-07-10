@@ -25,6 +25,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -98,6 +99,7 @@ class RepairCoordinator implements AutoCloseable {
     private final AtomicLong commandIds = new AtomicLong(System.currentTimeMillis());
     private final Map<Long, Action> inflight = new ConcurrentHashMap<>();
     private final Set<StrataNamespace> zeroOwnerEpochWarned = ConcurrentHashMap.newKeySet();
+    private final Object globalOwnerEpochLock = new Object();
     private final ExecutorService deleteDispatchExecutor = Executors.newSingleThreadExecutor(
             Thread.ofVirtual().name("meta-delete-dispatch-", 0).factory());
     private final ExecutorService completionExecutor = Executors.newSingleThreadExecutor(
@@ -235,6 +237,7 @@ class RepairCoordinator implements AutoCloseable {
     // Global controller-leader settle time for cluster-scope node liveness work. Namespace activation only gates
     // access to a recovered local metadata view; verify verdicts add a namespace-level settle delay separately.
     private volatile long clusterLeaderSince;
+    private volatile long globalOwnerEpoch;
 
     private void scanLoop() {
         long lastTombstoneSweep = 0;
@@ -283,6 +286,7 @@ class RepairCoordinator implements AutoCloseable {
     void tick() {
         if (!isLeader.getAsBoolean()) {
             clusterLeaderSince = 0;
+            resetGlobalOwnerEpoch();
             return;
         }
         if (clusterLeaderSince == 0) {
@@ -341,20 +345,84 @@ class RepairCoordinator implements AutoCloseable {
         return activeSince != 0 && now - activeSince >= settleMs();
     }
 
-    private long ownerEpoch(StrataNamespace namespace) {
-        if (NamespaceLogBackend.isSystem(namespace) || namespaceLeadership == null) {
-            return 0;
+    /**
+     * Captures the owner epoch before reading file/verdict state for a namespace pass. Empty means the
+     * namespace-log namespace is not ACTIVE yet, or this controller is not the global leader for a
+     * global/system lane; callers must skip the namespace rather than silently sending owner RPCs at epoch 0.
+     */
+    private OptionalLong readyOwnerEpoch(StrataNamespace namespace) {
+        if (usesGlobalOwnerEpoch(namespace)) {
+            if (!isLeader.getAsBoolean()) {
+                return OptionalLong.empty();
+            }
+            try {
+                return OptionalLong.of(globalOwnerEpoch());
+            } catch (ScpException e) {
+                log.warn("namespace {} owner epoch is not ready; skipping owner repair/verify/delete until "
+                        + "the global epoch can be allocated", namespace, e);
+                return OptionalLong.empty();
+            }
         }
         long epoch = namespaceLeadership.namespaceOwnerEpoch(namespace);
         if (epoch == 0) {
             if (zeroOwnerEpochWarned.add(namespace)) {
-                log.warn("namespace {} is active but has owner epoch 0; owner RPCs may be fenced until "
-                        + "leadership is re-read", namespace);
+                log.warn("namespace {} has no ACTIVE owner epoch; skipping owner repair/verify/delete until "
+                        + "the namespace becomes ACTIVE", namespace);
             }
-        } else {
-            zeroOwnerEpochWarned.remove(namespace);
+            return OptionalLong.empty();
         }
-        return epoch;
+        zeroOwnerEpochWarned.remove(namespace);
+        return OptionalLong.of(epoch);
+    }
+
+    /**
+     * Returns the epoch LOOKUP_FILE should stamp for orphan-GC confirms. Global/system lanes use the same
+     * once-per-leadership-term epoch as destructive repair RPCs, but only the global leader may mint it.
+     */
+    long lookupOwnerEpoch(StrataNamespace namespace) {
+        if (usesGlobalOwnerEpoch(namespace)) {
+            return isLeader.getAsBoolean() ? globalOwnerEpoch() : 0;
+        }
+        return namespaceLeadership.namespaceOwnerEpoch(namespace);
+    }
+
+    private boolean usesGlobalOwnerEpoch(StrataNamespace namespace) {
+        return NamespaceLogBackend.isSystem(namespace) || namespaceLeadership == null;
+    }
+
+    /**
+     * Global/system repair lanes share one monotonically allocated owner epoch for this global-leader term.
+     * Resetting it when leadership is lost or a node fences the command is the fence: the next leader-side
+     * pass must allocate a fresh, higher epoch instead of re-driving stale commands.
+     */
+    private long globalOwnerEpoch() {
+        long epoch = globalOwnerEpoch;
+        if (epoch > 0) {
+            return epoch;
+        }
+        synchronized (globalOwnerEpochLock) {
+            if (globalOwnerEpoch == 0) {
+                try {
+                    globalOwnerEpoch = store.allocateMetadataEpoch();
+                } catch (Exception e) {
+                    throw new ScpException(ErrorCode.INTERNAL, "failed to allocate owner epoch", e);
+                }
+            }
+            return globalOwnerEpoch;
+        }
+    }
+
+    private void invalidateGlobalOwnerEpoch(StrataNamespace namespace) {
+        if (!usesGlobalOwnerEpoch(namespace)) {
+            return;
+        }
+        resetGlobalOwnerEpoch();
+    }
+
+    private void resetGlobalOwnerEpoch() {
+        synchronized (globalOwnerEpochLock) {
+            globalOwnerEpoch = 0;
+        }
     }
 
     private ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
@@ -399,12 +467,17 @@ class RepairCoordinator implements AutoCloseable {
             if (!namespaceActive(ns)) {
                 continue;
             }
+            OptionalLong ownerEpochOpt = readyOwnerEpoch(ns);
+            if (ownerEpochOpt.isEmpty()) {
+                continue;
+            }
+            long ownerEpoch = ownerEpochOpt.getAsLong();
             for (FileId fileId : store.listFileIds(ns)) {
                 Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
                 if (opt.isEmpty()) {
                     continue;
                 }
-                repairFileChunksOnNode(ns, fileId, opt.get().value(), deadNodeId);
+                repairFileChunksOnNode(ns, fileId, opt.get().value(), deadNodeId, ownerEpoch);
             }
         }
     }
@@ -416,7 +489,7 @@ class RepairCoordinator implements AutoCloseable {
      * this method only narrows the candidate set to chunks affected by the dead node.
      */
     private void repairFileChunksOnNode(StrataNamespace ns, FileId fileId, Records.FileRecord file,
-                                         int deadNodeId) {
+                                         int deadNodeId, long ownerEpoch) {
         if (file.state() == FileState.DELETING) {
             return; // deletion, not repair, drives a DELETING file's chunks
         }
@@ -433,7 +506,7 @@ class RepairCoordinator implements AutoCloseable {
                 if (!registry.isDead(nodeId)) live++;
             }
             if (live < file.replicationFactor() && live > 0) {
-                issueReplicate(ns, fileId, file, chunk, RepairTrigger.EVENT);
+                issueReplicate(ns, fileId, file, chunk, RepairTrigger.EVENT, ownerEpoch);
             }
         }
     }
@@ -446,6 +519,8 @@ class RepairCoordinator implements AutoCloseable {
      */
     void reconcile() throws Exception {
         if (!isLeader.getAsBoolean()) {
+            clusterLeaderSince = 0;
+            resetGlobalOwnerEpoch();
             ownerRepairPass();
             return;
         }
@@ -492,6 +567,11 @@ class RepairCoordinator implements AutoCloseable {
             if (!namespaceActive(ns)) {
                 continue;
             }
+            OptionalLong ownerEpochOpt = readyOwnerEpoch(ns);
+            if (ownerEpochOpt.isEmpty()) {
+                continue;
+            }
+            long ownerEpoch = ownerEpochOpt.getAsLong();
             ReentrantLock lock = namespaceReconcileLock(ns);
             lock.lock();
             try {
@@ -503,7 +583,7 @@ class RepairCoordinator implements AutoCloseable {
                         Records.FileRecord file = opt.get().value();
 
                         if (file.state() == FileState.DELETING) {
-                            driveDeletion(file, opt.get().version());
+                            driveDeletion(file, opt.get().version(), ownerEpoch);
                             return;
                         }
                         for (Records.ChunkRecord chunk : file.chunks()) {
@@ -533,7 +613,7 @@ class RepairCoordinator implements AutoCloseable {
                 // cross-namespace head-of-line blocking, so we order fewest-live-first within this namespace.
                 repairs.sort(Comparator.comparingInt(Repair::liveReplicas));
                 for (Repair r : repairs) {
-                    issueReplicate(r.ns(), r.fileId(), r.file(), r.chunk(), RepairTrigger.RECONCILE);
+                    issueReplicate(r.ns(), r.fileId(), r.file(), r.chunk(), RepairTrigger.RECONCILE, ownerEpoch);
                 }
             } finally {
                 lock.unlock();
@@ -590,7 +670,7 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     private void issueReplicate(StrataNamespace ns, FileId fileId, Records.FileRecord file,
-                                Records.ChunkRecord chunk, RepairTrigger trigger) {
+                                Records.ChunkRecord chunk, RepairTrigger trigger, long ownerEpoch) {
         ChunkId chunkId = file.chunkId(chunk.index());
         int deadNode = -1;
         List<Messages.Replica> sources = new ArrayList<>();
@@ -630,7 +710,7 @@ class RepairCoordinator implements AutoCloseable {
                 System.currentTimeMillis()));
         registry.enqueue(target.record.nodeId(),
                 new Messages.ReplicateCmd(cmdId, chunkId, sources, (byte) 1, chunk.crc(), chunk.length(),
-                        ns, ownerEpoch(ns)));
+                        ns, ownerEpoch));
         recordRepairIssued(trigger);
         log.info("repair: {} dead={} -> target={} (cmd {})", chunkId, deadNode, target.record.nodeId(), cmdId);
     }
@@ -659,6 +739,11 @@ class RepairCoordinator implements AutoCloseable {
             if (!ownsNamespace.test(ns) || !namespaceActive(ns)) {
                 continue;
             }
+            OptionalLong ownerEpochOpt = readyOwnerEpoch(ns);
+            if (ownerEpochOpt.isEmpty()) {
+                continue;
+            }
+            long ownerEpoch = ownerEpochOpt.getAsLong();
             ReentrantLock lock = namespaceReconcileLock(ns);
             lock.lock();
             try {
@@ -672,12 +757,12 @@ class RepairCoordinator implements AutoCloseable {
                         if (file.state() == FileState.DELETING) {
                             // the owner reclaims its own deleted files: the leader's heartbeat command channel
                             // cannot reach a non-leader-owned namespace's chunks, so without this they leak.
-                            ownerDriveDeletion(file, opt.get().version(), nodes);
+                            ownerDriveDeletion(file, opt.get().version(), nodes, ownerEpoch);
                             return;
                         }
                         for (Records.ChunkRecord chunk : file.chunks()) {
                             if (chunk.state() == ChunkState.SEALED) {
-                                ownerRepairChunk(ns, file, chunk, dead, RepairTrigger.RECONCILE);
+                                ownerRepairChunk(ns, file, chunk, dead, RepairTrigger.RECONCILE, ownerEpoch);
                             }
                         }
                     });
@@ -724,7 +809,11 @@ class RepairCoordinator implements AutoCloseable {
         long now = System.currentTimeMillis();
         Map<Integer, Records.NodeRecord> nodes = nodesById();
         for (StrataNamespace ns : store.listNamespaces()) {
-            if (!ownsNamespace.test(ns)) {
+            if (usesGlobalOwnerEpoch(ns)) {
+                if (!isLeader.getAsBoolean()) {
+                    continue;
+                }
+            } else if (!ownsNamespace.test(ns)) {
                 continue;
             }
             if (!namespaceSettledForVerify(ns, now)) {
@@ -736,16 +825,23 @@ class RepairCoordinator implements AutoCloseable {
                 if (lastSystemVerifyMs != 0 && now - lastSystemVerifyMs < systemVerifyIntervalMs) {
                     continue;
                 }
+            }
+            OptionalLong ownerEpochOpt = readyOwnerEpoch(ns);
+            if (ownerEpochOpt.isEmpty()) {
+                continue;
+            }
+            long ownerEpoch = ownerEpochOpt.getAsLong();
+            if (NamespaceLogBackend.isSystem(ns)) {
                 lastSystemVerifyMs = now;
             }
             for (FileId fileId : store.listFileIds(ns)) {
-                perFileIsolated(ns, fileId, "verifyPass", () -> verifyFile(ns, fileId, nodes, now));
+                perFileIsolated(ns, fileId, "verifyPass", () -> verifyFile(ns, fileId, nodes, now, ownerEpoch));
             }
         }
     }
 
-    private void verifyFile(StrataNamespace ns, FileId fileId, Map<Integer, Records.NodeRecord> nodes, long now)
-            throws Exception {
+    private void verifyFile(StrataNamespace ns, FileId fileId, Map<Integer, Records.NodeRecord> nodes, long now,
+                            long ownerEpoch) throws Exception {
         Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
         if (opt.isEmpty() || opt.get().value().state() == FileState.DELETING) {
             return; // deletion, not verification, drives a DELETING file's chunks
@@ -781,13 +877,13 @@ class RepairCoordinator implements AutoCloseable {
             int batchSize = config.verifyBatchSize();
             for (int i = 0; i < ids.size(); i += batchSize) {
                 List<ChunkId> batch = ids.subList(i, Math.min(i + batchSize, ids.size()));
-                List<Messages.VerifyChunkResult> results = execVerify(node, ns, batch);
+                List<Messages.VerifyChunkResult> results = execVerify(node, ns, batch, ownerEpoch);
                 // Empty == the RPC could not reach the node: no verdict, so we never drop a replica on an
                 // unreachable owner-verify (fail-safe). A truly dead node is handled by the reconcile scan.
                 for (Messages.VerifyChunkResult r : results) {
                     Records.ChunkRecord exp = expected.get(r.chunkId());
                     if (exp != null) {
-                        applyVerifyVerdict(ns, fileId, exp, e.getKey(), node, r, now, droppedThisPass);
+                        applyVerifyVerdict(ns, fileId, exp, e.getKey(), node, r, now, droppedThisPass, ownerEpoch);
                     }
                 }
             }
@@ -796,7 +892,7 @@ class RepairCoordinator implements AutoCloseable {
 
     /** Synchronous VERIFY_CHUNKS to {@code node}; empty list on any RPC failure (treated as no verdict). */
     private List<Messages.VerifyChunkResult> execVerify(Records.NodeRecord node, StrataNamespace ns,
-                                                        List<ChunkId> chunkIds) {
+                                                        List<ChunkId> chunkIds, long ownerEpoch) {
         Endpoint endpoint;
         try {
             endpoint = Endpoint.parse(node.endpoint(), "node endpoint", ErrorCode.INTERNAL);
@@ -805,17 +901,16 @@ class RepairCoordinator implements AutoCloseable {
                     node.endpoint(), node.nodeId(), e.getMessage());
             return List.of();
         }
-        long epoch = ownerEpoch(ns);
         try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(), ScpClient.KIND_TOOL, "owner-verify")) {
             ByteBuffer resp = client.call(Opcode.VERIFY_CHUNKS,
-                    new Messages.VerifyChunks(ns, advertisedEndpoint, chunkIds, epoch).encode(), null,
+                    new Messages.VerifyChunks(ns, advertisedEndpoint, chunkIds, ownerEpoch).encode(), null,
                     config.repairCommandTimeoutMs());
             return Messages.VerifyChunksResp.decode(resp).results();
         } catch (ScpException e) {
             if (e.code() == ErrorCode.FENCED_EPOCH || !e.retriable()) {
                 log.warn("owner-verify to node {} failed with {} ns={} offeredOwnerEpoch={} "
                                 + "requiredOwnerEpoch={} — treating verdict as terminal for this pass",
-                        node.nodeId(), e.code(), ns, epoch, e.detail());
+                        node.nodeId(), e.code(), ns, ownerEpoch, e.detail());
             } else {
                 log.debug("owner-verify to node {} failed: {}", node.nodeId(), e.getMessage());
             }
@@ -834,7 +929,7 @@ class RepairCoordinator implements AutoCloseable {
      */
     private void applyVerifyVerdict(StrataNamespace ns, FileId fileId, Records.ChunkRecord exp, int nodeId,
                                     Records.NodeRecord node, Messages.VerifyChunkResult r, long now,
-                                    Map<ChunkId, Set<Integer>> droppedThisPass)
+                                    Map<ChunkId, Set<Integer>> droppedThisPass, long ownerEpoch)
             throws Exception {
         ChunkId chunkId = r.chunkId();
         if (isRepairProtected(ns, chunkId, nodeId)) {
@@ -844,7 +939,7 @@ class RepairCoordinator implements AutoCloseable {
         boolean healthy = r.present() && r.state() == ChunkState.SEALED
                 && r.length() == exp.length() && r.crc() == exp.crc();
         if (!healthy && r.present() && r.state() == ChunkState.OPEN && r.length() >= exp.length()
-                && execReseal(node, chunkId, ns, exp)) {
+                && execReseal(node, chunkId, ns, exp, ownerEpoch)) {
             log.info("verify: re-sealed OPEN copy of descriptor-sealed chunk {} on node {} at len {}",
                     chunkId, nodeId, exp.length());
             replicaMissingSince.remove(key);
@@ -871,7 +966,11 @@ class RepairCoordinator implements AutoCloseable {
                 replicaMissingSince.remove(key);
                 applyDeleteConfirmed(ns, fileId, chunkId, nodeId);
                 recordDroppedThisPass(droppedThisPass, chunkId, nodeId);
-                execDelete(node, chunkId, ns);
+                if (!execDelete(node, chunkId, ns, ownerEpoch)) {
+                    log.warn("verify: dropped replica {} from descriptor for chunk {} but physical delete "
+                            + "failed/fenced on node {} — orphan GC must reclaim the stranded copy",
+                            nodeId, chunkId, nodeId);
+                }
             }
         } else if (r.length() != exp.length() || r.crc() != exp.crc()) {
             // Corrupt sealed bytes are still protected by the store's digest check, so honor grace
@@ -887,7 +986,11 @@ class RepairCoordinator implements AutoCloseable {
                         config.replicaMissingGraceMs());
                 applyDeleteConfirmed(ns, fileId, chunkId, nodeId);
                 recordDroppedThisPass(droppedThisPass, chunkId, nodeId);
-                execDelete(node, chunkId, ns);
+                if (!execDelete(node, chunkId, ns, ownerEpoch)) {
+                    log.warn("verify: dropped replica {} from descriptor for corrupt chunk {} but physical "
+                            + "delete failed/fenced on node {} — orphan GC must reclaim the stranded copy",
+                            nodeId, chunkId, nodeId);
+                }
             }
         } else {
             replicaMissingSince.remove(key); // healthy attestation — clear any pending anomaly
@@ -928,7 +1031,7 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     private void ownerRepairChunk(StrataNamespace ns, Records.FileRecord file, Records.ChunkRecord chunk,
-                                  Set<Integer> dead, RepairTrigger trigger) {
+                                  Set<Integer> dead, RepairTrigger trigger, long ownerEpoch) {
         ChunkId chunkId = file.chunkId(chunk.index());
         if (chunksBeingRepaired.contains(new NsChunkId(ns, chunkId))) {
             return;
@@ -968,7 +1071,7 @@ class RepairCoordinator implements AutoCloseable {
         try {
             long cmdId = commandIds.incrementAndGet();
             Messages.ReplicateCmd cmd = new Messages.ReplicateCmd(cmdId, chunkId, sources,
-                    (byte) 1, chunk.crc(), chunk.length(), ns, ownerEpoch(ns));
+                    (byte) 1, chunk.crc(), chunk.length(), ns, ownerEpoch);
             if (execReplicate(target, cmd)
                     && applyOwnerRepair(ns, file.fileId(), chunkId, deadNode, target.record.nodeId())) {
                 recordRepairIssued(trigger);
@@ -1034,10 +1137,11 @@ class RepairCoordinator implements AutoCloseable {
      * unforced trailer did not survive restart, so the replica reports OPEN at or beyond the descriptor end.
      */
     private boolean execReseal(Records.NodeRecord node, ChunkId chunkId, StrataNamespace ns,
-                               Records.ChunkRecord exp) {
+                               Records.ChunkRecord exp, long ownerEpoch) {
         return directNodeCall(node, chunkId, "owner-reseal", (client, timeoutMs) -> {
             ByteBuffer resp = client.call(Opcode.SEAL_CHUNK,
-                    new Messages.SealChunk(chunkId, exp.writeEpoch(), exp.length(), ns).encode(), null, timeoutMs);
+                    new Messages.SealChunk(chunkId, exp.writeEpoch(), exp.length(), ns, ownerEpoch).encode(),
+                    null, timeoutMs);
             Messages.SealResp r = Messages.SealResp.decode(resp);
             if (r.finalLength() != exp.length() || r.chunkCrc() != exp.crc()) {
                 // A successful seal with a bad CRC leaves a sealed-corrupt replica for the next verify
@@ -1056,14 +1160,14 @@ class RepairCoordinator implements AutoCloseable {
      * non-controller owner has no heartbeat command channel, so it deletes its own namespaces' chunks
      * this way. True if the node acked the chunk gone (deleted, or already absent).
      */
-    private boolean execDelete(Records.NodeRecord node, ChunkId chunkId, StrataNamespace ns) {
+    private boolean execDelete(Records.NodeRecord node, ChunkId chunkId, StrataNamespace ns, long ownerEpoch) {
         return directNodeCall(node, chunkId, "owner-delete", (client, timeoutMs) -> {
             ByteBuffer resp = client.call(Opcode.DELETE_CHUNKS,
-                    new Messages.DeleteChunks(List.of(chunkId), ns, ownerEpoch(ns)).encode(), null, timeoutMs);
+                    new Messages.DeleteChunks(List.of(chunkId), ns, ownerEpoch).encode(), null, timeoutMs);
             Messages.DeleteChunksResp r = Messages.DeleteChunksResp.decode(resp);
             short code = r.codes().isEmpty() ? ErrorCode.OK.code : r.codes().get(0);
             if (code != ErrorCode.OK.code && code != ErrorCode.CHUNK_NOT_FOUND.code) {
-                log.warn("owner-delete of {} on node {} returned {} — will retry next pass",
+                log.warn("owner-delete of {} on node {} returned {}",
                         chunkId, node.nodeId(), code);
             }
             return code == ErrorCode.OK.code || code == ErrorCode.CHUNK_NOT_FOUND.code;
@@ -1108,7 +1212,9 @@ class RepairCoordinator implements AutoCloseable {
     /**
      * Dispatches a just-deleted file's chunk deletions immediately, instead of waiting for the next
      * background scan (which is slow under heavy churn), so physical space is reclaimed promptly and the
-     * disk stays bounded under sustained delete load. Synchronized with the scan so they don't race.
+     * disk stays bounded under sustained delete load. If the namespace owner epoch is not ready, promptness
+     * defers silently to the next background pass rather than sending an unstamped destructive command.
+     * Synchronized with the scan so they don't race.
      */
     void driveDeletionNow(StrataNamespace namespace, FileId fileId) {
         if (!namespaceActive(namespace)) {
@@ -1120,17 +1226,22 @@ class RepairCoordinator implements AutoCloseable {
             if (!namespaceActive(namespace)) {
                 return;
             }
+            OptionalLong ownerEpochOpt = readyOwnerEpoch(namespace);
+            if (ownerEpochOpt.isEmpty()) {
+                return;
+            }
+            long ownerEpoch = ownerEpochOpt.getAsLong();
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(namespace, fileId);
             if (opt.isEmpty() || opt.get().value().state() != FileState.DELETING) {
                 return;
             }
             MetadataStore.Versioned<Records.FileRecord> vf = opt.get();
             if (isLeader.getAsBoolean()) {
-                driveDeletion(vf.value(), vf.version());
+                driveDeletion(vf.value(), vf.version(), ownerEpoch);
             } else {
                 // a sharded non-leader owner has no heartbeat command channel to the data nodes,
                 // so it reclaims its own namespace's chunks directly via DELETE_CHUNKS.
-                ownerDriveDeletion(vf.value(), vf.version(), nodesById());
+                ownerDriveDeletion(vf.value(), vf.version(), nodesById(), ownerEpoch);
             }
         } catch (Exception e) {
             log.warn("prompt delete dispatch for {} failed — background scan will retry", fileId, e);
@@ -1147,7 +1258,7 @@ class RepairCoordinator implements AutoCloseable {
         }
     }
 
-    private void driveDeletion(Records.FileRecord file, int version) throws Exception {
+    private void driveDeletion(Records.FileRecord file, int version, long ownerEpoch) throws Exception {
         StrataNamespace ns = file.namespace();
         for (Records.ChunkRecord chunk : file.chunks()) {
             ChunkId chunkId = file.chunkId(chunk.index());
@@ -1174,7 +1285,7 @@ class RepairCoordinator implements AutoCloseable {
                     inflight.put(cmdId, new DeleteAction(ns, file.fileId(), chunkId, nodeId,
                             System.currentTimeMillis()));
                     registry.enqueue(nodeId, new Messages.DeleteCmd(cmdId, List.of(chunkId), ns,
-                            ownerEpoch(ns)));
+                            ownerEpoch));
                 }
             }
         }
@@ -1196,7 +1307,7 @@ class RepairCoordinator implements AutoCloseable {
      * Without this, deleted files in non-leader-owned namespaces never have their physical chunks reclaimed.
      */
     private void ownerDriveDeletion(Records.FileRecord file, int version,
-                                    Map<Integer, Records.NodeRecord> nodes) throws Exception {
+                                    Map<Integer, Records.NodeRecord> nodes, long ownerEpoch) throws Exception {
         StrataNamespace ns = file.namespace();
         for (Records.ChunkRecord chunk : file.chunks()) {
             ChunkId chunkId = file.chunkId(chunk.index());
@@ -1209,7 +1320,7 @@ class RepairCoordinator implements AutoCloseable {
                 if (node == null || node.state() == Records.NodeState.DEAD) {
                     // node gone/dead — its data is unreachable; drop the replica so deletion can converge
                     applyDeleteConfirmed(ns, file.fileId(), chunkId, nodeId);
-                } else if (execDelete(node, chunkId, ns)) {
+                } else if (execDelete(node, chunkId, ns, ownerEpoch)) {
                     applyDeleteConfirmed(ns, file.fileId(), chunkId, nodeId);
                 }
                 // else: still present — a later ownerRepairPass retries
@@ -1299,6 +1410,7 @@ class RepairCoordinator implements AutoCloseable {
                 if (completion.status() == 0) {
                     applyReplicaSwap(r);
                 } else if (ErrorCode.fromCode(completion.status()) == ErrorCode.FENCED_EPOCH) {
+                    invalidateGlobalOwnerEpoch(r.namespace());
                     log.warn("replicate cmd {} for {} was fenced by node {} — stale owner command dropped",
                             completion.commandId(), r.chunkId(), reportingNode);
                 } else {
@@ -1309,6 +1421,7 @@ class RepairCoordinator implements AutoCloseable {
                 if (completion.status() == 0) {
                     applyDeleteConfirmed(d.namespace(), d.fileId(), d.chunkId(), d.nodeId());
                 } else if (ErrorCode.fromCode(completion.status()) == ErrorCode.FENCED_EPOCH) {
+                    invalidateGlobalOwnerEpoch(d.namespace());
                     log.warn("delete cmd {} for {} was fenced by node {} — stale owner command dropped",
                             completion.commandId(), d.chunkId(), reportingNode);
                 } else {

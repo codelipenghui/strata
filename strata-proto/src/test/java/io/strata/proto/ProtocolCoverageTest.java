@@ -193,6 +193,23 @@ class ProtocolCoverageTest {
     }
 
     @Test
+    void sealChunkRejectsMalformedOwnerEpochTag() {
+        StrataNamespace namespace = StrataNamespace.of("test");
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);
+        byte[] base = new Messages.SealChunk(chunkId, 7, 11, namespace).encode();
+        BufWriter malformedTags = new BufWriter();
+        TaggedFields.of(Map.of(0, new byte[] {1})).writeTo(malformedTags);
+        byte[] tags = malformedTags.toBytes();
+        byte[] malformed = new byte[base.length - 1 + tags.length];
+        System.arraycopy(base, 0, malformed, 0, base.length - 1);
+        System.arraycopy(tags, 0, malformed, base.length - 1, tags.length);
+
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                () -> Messages.SealChunk.decode(ByteBuffer.wrap(malformed)));
+        assertTrue(error.getMessage().contains("ownerEpoch"), "got: " + error.getMessage());
+    }
+
+    @Test
     void appendDecodeReadsOwnedDirectHeader() {
         StrataNamespace namespace = StrataNamespace.of("test");
         ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);

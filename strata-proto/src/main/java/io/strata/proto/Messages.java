@@ -23,6 +23,10 @@ import java.util.UUID;
  */
 public final class Messages {
     private Messages() {}
+    /**
+     * Optional unsigned owner epoch on owner-fenced lanes. Absence/0 means the message is unstamped for
+     * compatibility; receivers decide whether an epoch-0 request is still allowed for the specific lane.
+     */
     private static final int TAG_OWNER_EPOCH = 0;
 
     /** Bounded list-count reader (see {@link Varint#readCount}). */
@@ -940,22 +944,32 @@ public final class Messages {
         }
     }
 
-    public record SealChunk(ChunkId chunkId, int writeEpoch, long dataLength, StrataNamespace namespace) {
+    public record SealChunk(ChunkId chunkId, int writeEpoch, long dataLength, StrataNamespace namespace,
+                            long ownerEpoch) {
+        public SealChunk(ChunkId chunkId, int writeEpoch, long dataLength, StrataNamespace namespace) {
+            this(chunkId, writeEpoch, dataLength, namespace, 0);
+        }
+
         public SealChunk {
             namespace = Objects.requireNonNull(namespace, "namespace");
+            requireNonNegativeOwnerEpoch(ownerEpoch);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).i32(writeEpoch).u64(dataLength).namespace(namespace).noTags();
+            w.chunkId(chunkId).i32(writeEpoch).u64(dataLength).namespace(namespace);
+            writeOwnerEpochTags(w, ownerEpoch);
             return w.toBytes();
         }
 
         public static SealChunk decode(ByteBuffer b) {
-            SealChunk m = new SealChunk(ChunkId.readFrom(b), b.getInt(), b.getLong(),
-                    StrataNamespace.readFrom(b));
-            TaggedFields.readFrom(b);
-            return m;
+            ChunkId chunkId = ChunkId.readFrom(b);
+            int writeEpoch = b.getInt();
+            long dataLength = b.getLong();
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
+            TaggedFields tags = TaggedFields.readFrom(b);
+            return new SealChunk(chunkId, writeEpoch, dataLength, namespace,
+                    readU64Tag(tags, TAG_OWNER_EPOCH, "ownerEpoch"));
         }
     }
 

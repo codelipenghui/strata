@@ -102,8 +102,13 @@ class ControllerNamespaceLogBackendTest {
             TestNamespaceMetadataFileStore delegate = new TestNamespaceMetadataFileStore();
             NamespaceLogCowCompactionTest.BlockingSnapshotFileStore blocking =
                     new NamespaceLogCowCompactionTest.BlockingSnapshotFileStore(delegate);
-            BiFunction<ZkMetadataStore, String, MetadataStore> backend =
-                    (root, endpoint) -> new NamespaceLogMetadataStore(new NamespaceLogBackend(root, blocking, true));
+            AtomicReference<NamespaceLogBackend> backendRef = new AtomicReference<>();
+            StrataNamespace namespace = StrataNamespace.of("tenant-a");
+            BiFunction<ZkMetadataStore, String, MetadataStore> backend = (root, endpoint) -> {
+                NamespaceLogBackend logBackend = new NamespaceLogBackend(root, blocking, true);
+                backendRef.set(logBackend);
+                return new NamespaceLogMetadataStore(logBackend);
+            };
 
             try (Controller service =
                          new Controller(ControllerConfig.forTests(zk.getConnectString()), null, backend);
@@ -119,6 +124,9 @@ class ControllerNamespaceLogBackendTest {
                 try {
                     assertTrue(blocking.entered.await(2, TimeUnit.SECONDS),
                             "first request must park inside namespace-log recovery");
+                    assertEquals(NamespaceLeaderState.RECOVERING, backendRef.get().leaderState(namespace));
+                    assertEquals(0, backendRef.get().namespaceOwnerEpoch(namespace),
+                            "RECOVERING owns a manifest epoch but must not expose it to owner RPCs yet");
 
                     ScpException recovering = assertThrows(ScpException.class, () ->
                             probe.call(Opcode.LOOKUP_PATH,
@@ -131,6 +139,8 @@ class ControllerNamespaceLogBackendTest {
                     blocking.block.countDown();
                 }
                 assertEquals(FileId.of(0), create.get(5, TimeUnit.SECONDS));
+                assertTrue(backendRef.get().namespaceOwnerEpoch(namespace) > 0,
+                        "ACTIVE namespaces expose their owner epoch");
             }
         }
     }
@@ -164,6 +174,8 @@ class ControllerNamespaceLogBackendTest {
                 assertEquals(0, logBackend.compactOversizedRepos(1),
                         "lost manifest CAS fences and evicts without publishing a compaction");
                 assertEquals(NamespaceLeaderState.FENCED, logBackend.leaderState(namespace));
+                assertEquals(0, logBackend.namespaceOwnerEpoch(namespace),
+                        "FENCED namespaces must not expose their stale owner epoch");
 
                 var byPath = Messages.LookupPathResp.decode(client.call(Opcode.LOOKUP_PATH,
                         new Messages.LookupPath(namespace.value(), "/logs/seg-fenced").encode(), null, 5_000));
@@ -171,6 +183,8 @@ class ControllerNamespaceLogBackendTest {
                 assertEquals(created.fileId(), byPath.fileId());
                 assertEquals(NamespaceLeaderState.ACTIVE, logBackend.leaderState(namespace),
                         "the next client op lazily re-opens a FENCED namespace");
+                assertTrue(logBackend.namespaceOwnerEpoch(namespace) > 0,
+                        "the reopened ACTIVE namespace exposes the fresh owner epoch");
             }
         }
     }
