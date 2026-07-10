@@ -164,7 +164,7 @@ class CrashRecoveryTest {
         try (ChunkStore recovered = new ChunkStore(dir)) {
             // second append's ledger entry gone -> data beyond first boundary is untrusted
             assertEquals(4, recovered.stat(TEST_NS, id).localEndOffset());
-            assertEquals(1, recovered.readLedger(TEST_NS, id, 0).size());
+            assertEquals(1, recovered.readLedger(TEST_NS, id, 0, 0).size());
         }
     }
 
@@ -599,6 +599,17 @@ class CrashRecoveryTest {
             ScpException stale = assertThrows(ScpException.class,
                     () -> recovered.append(TEST_NS, id, 1, payload.length, payload.length, ByteBuffer.wrap("stale".getBytes())));
             assertEquals(ErrorCode.FENCED_EPOCH, stale.code());
+
+            ScpException sentinelRead = assertThrows(ScpException.class,
+                    () -> recovered.readRegionForRecovery(TEST_NS, id.fileId().id(), id.index(),
+                            0, payload.length, Integer.MAX_VALUE));
+            assertEquals(ErrorCode.FENCED_EPOCH, sentinelRead.code());
+            assertEquals(2, sentinelRead.detail(), "the crash-recovery sentinel is not a usable fence epoch");
+
+            ScpException sentinelLedger = assertThrows(ScpException.class,
+                    () -> recovered.readLedger(TEST_NS, id, 0, Integer.MAX_VALUE));
+            assertEquals(ErrorCode.FENCED_EPOCH, sentinelLedger.code());
+            assertEquals(2, sentinelLedger.detail(), "the crash-recovery sentinel is not a usable fence epoch");
 
             assertEquals(payload.length, recovered.fence(TEST_NS, id, 2).localEndOffset());
             assertEquals(payload.length + 5,

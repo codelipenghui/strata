@@ -185,6 +185,12 @@ class MessageGoldenCorpusTest {
                         () -> new Messages.Read(CHUNK_ID, 99, 65_536, NS).encode(),
                         Messages.Read::decode,
                         "111111112222333300000003000000000000006300010000" + "0474657374" + "00"),
+                request("readRecoveryEpoch",
+                        Messages.Read.recovery(CHUNK_ID, 99, 65_536, NS, 7),
+                        () -> Messages.Read.recovery(CHUNK_ID, 99, 65_536, NS, 7).encode(),
+                        Messages.Read::decode,
+                        "1111111122223333000000030000000000000063000100000474657374"
+                                + "01010400000007"),
                 response("readResp",
                         new Messages.ReadResp(4096, 2048),
                         () -> new Messages.ReadResp(4096, 2048).encode(),
@@ -250,6 +256,12 @@ class MessageGoldenCorpusTest {
                         () -> new Messages.FetchChunk(CHUNK_ID, 0, Integer.MAX_VALUE, NS).encode(),
                         Messages.FetchChunk::decode,
                         "11111111222233330000000300000000000000007fffffff" + "0474657374" + "00"),
+                request("fetchChunkOwnerEpoch",
+                        new Messages.FetchChunk(CHUNK_ID, 0, Integer.MAX_VALUE, NS, 43),
+                        () -> new Messages.FetchChunk(CHUNK_ID, 0, Integer.MAX_VALUE, NS, 43).encode(),
+                        Messages.FetchChunk::decode,
+                        "11111111222233330000000300000000000000007fffffff0474657374"
+                                + "010008000000000000002b"),
                 response("fetchResp",
                         new Messages.FetchResp(8192, ChunkState.SEALED),
                         () -> new Messages.FetchResp(8192, ChunkState.SEALED).encode(),
@@ -260,6 +272,12 @@ class MessageGoldenCorpusTest {
                         () -> new Messages.ReadLedger(CHUNK_ID, 2048, NS).encode(),
                         Messages.ReadLedger::decode,
                         "11111111222233330000000300000000000008000474657374" + "00"),
+                request("readLedgerRecoveryEpoch",
+                        new Messages.ReadLedger(CHUNK_ID, 2048, NS, 7),
+                        () -> new Messages.ReadLedger(CHUNK_ID, 2048, NS, 7).encode(),
+                        Messages.ReadLedger::decode,
+                        "11111111222233330000000300000000000008000474657374"
+                                + "01010400000007"),
                 response("readLedgerResp",
                         new Messages.ReadLedgerResp(List.of(
                                 new Messages.LedgerEntry(100, 1, 5),

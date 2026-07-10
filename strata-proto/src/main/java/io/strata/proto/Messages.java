@@ -28,6 +28,8 @@ public final class Messages {
      * compatibility; receivers decide whether an epoch-0 request is still allowed for the specific lane.
      */
     private static final int TAG_OWNER_EPOCH = 0;
+    /** Optional signed recovery epoch. Absence/0 is unstamped and rejected by recovery wire handlers. */
+    private static final int TAG_RECOVERY_EPOCH = 1;
 
     /** Bounded list-count reader (see {@link Varint#readCount}). */
     static int count(ByteBuffer b) {
@@ -40,10 +42,41 @@ public final class Messages {
         }
     }
 
+    private static void requireNonNegativeRecoveryEpoch(int recoveryEpoch) {
+        if (recoveryEpoch < 0) {
+            throw new IllegalArgumentException("recoveryEpoch must be non-negative: " + recoveryEpoch);
+        }
+    }
+
+    private static void requirePositiveRecoveryEpoch(int recoveryEpoch) {
+        if (recoveryEpoch <= 0) {
+            throw new IllegalArgumentException("recoveryEpoch must be positive: " + recoveryEpoch);
+        }
+    }
+
+    private static byte[] i32Field(int value) {
+        BufWriter w = new BufWriter(Integer.BYTES);
+        w.i32(value);
+        return w.toBytes();
+    }
+
     private static byte[] u64Field(long value) {
         BufWriter w = new BufWriter(8);
         w.u64(value);
         return w.toBytes();
+    }
+
+    private static int readI32Tag(TaggedFields tags, int tag, String name) {
+        byte[] raw = tags.get(tag);
+        if (raw == null) {
+            return 0;
+        }
+        if (raw.length != Integer.BYTES) {
+            throw new IllegalArgumentException(name + " tag must be 4 bytes, got " + raw.length);
+        }
+        int value = ByteBuffer.wrap(raw).getInt();
+        requireNonNegativeRecoveryEpoch(value);
+        return value;
     }
 
     private static long readU64Tag(TaggedFields tags, int tag, String name) {
@@ -63,6 +96,15 @@ public final class Messages {
             w.noTags();
         } else {
             TaggedFields.of(Map.of(TAG_OWNER_EPOCH, u64Field(ownerEpoch))).writeTo(w);
+        }
+    }
+
+    private static void writeRecoveryEpochTags(BufWriter w, int recoveryEpoch) {
+        requireNonNegativeRecoveryEpoch(recoveryEpoch);
+        if (recoveryEpoch == 0) {
+            w.noTags();
+        } else {
+            TaggedFields.of(Map.of(TAG_RECOVERY_EPOCH, i32Field(recoveryEpoch))).writeTo(w);
         }
     }
 
@@ -657,13 +699,26 @@ public final class Messages {
         }
     }
 
-    public record Read(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace) {
+    /** recoveryEpoch 0 denotes an ordinary READ; READ_RECOVERY requires a positive persisted fence epoch. */
+    public record Read(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace,
+                       int recoveryEpoch) {
         private static final ThreadLocal<ReadFields> FIELDS = ThreadLocal.withInitial(ReadFields::new);
         private static final ThreadLocal<OwnedReadDecoder> OWNED_DECODER =
                 ThreadLocal.withInitial(OwnedReadDecoder::new);
 
+        public Read(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace) {
+            this(chunkId, offset, maxBytes, namespace, 0);
+        }
+
+        public static Read recovery(ChunkId chunkId, long offset, int maxBytes,
+                                    StrataNamespace namespace, int recoveryEpoch) {
+            requirePositiveRecoveryEpoch(recoveryEpoch);
+            return new Read(chunkId, offset, maxBytes, namespace, recoveryEpoch);
+        }
+
         public Read {
             namespace = Objects.requireNonNull(namespace, "namespace");
+            requireNonNegativeRecoveryEpoch(recoveryEpoch);
         }
 
         public static final class ReadFields {
@@ -673,15 +728,17 @@ public final class Messages {
             private long offset;
             private int maxBytes;
             private StrataNamespace namespace;
+            private int recoveryEpoch;
 
             private ReadFields set(long fileId, int chunkIndex, long offset, int maxBytes,
-                                   StrataNamespace namespace) {
+                                   StrataNamespace namespace, int recoveryEpoch) {
                 this.chunkId = null;
                 this.fileId = fileId;
                 this.chunkIndex = chunkIndex;
                 this.offset = offset;
                 this.maxBytes = maxBytes;
                 this.namespace = namespace;
+                this.recoveryEpoch = recoveryEpoch;
                 return this;
             }
 
@@ -711,17 +768,23 @@ public final class Messages {
             public StrataNamespace namespace() {
                 return namespace;
             }
+
+            public int recoveryEpoch() {
+                return recoveryEpoch;
+            }
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(offset).u32(maxBytes).namespace(namespace).noTags();
+            w.chunkId(chunkId).u64(offset).u32(maxBytes).namespace(namespace);
+            writeRecoveryEpochTags(w, recoveryEpoch);
             return w.toBytes();
         }
 
         public static Read decode(ByteBuffer b) {
             ReadFields fields = decodeFields(b);
-            return new Read(fields.chunkId(), fields.offset(), fields.maxBytes(), fields.namespace());
+            return new Read(fields.chunkId(), fields.offset(), fields.maxBytes(), fields.namespace(),
+                    fields.recoveryEpoch());
         }
 
         public static ReadFields decodeFields(ByteBuffer b) {
@@ -731,8 +794,9 @@ public final class Messages {
             long offset = b.getLong();
             int maxBytes = b.getInt();
             StrataNamespace namespace = StrataNamespace.readFrom(b);
-            TaggedFields.readFrom(b);
-            return fields.set(fileId, chunkIndex, offset, maxBytes, namespace);
+            TaggedFields tags = TaggedFields.readFrom(b);
+            int recoveryEpoch = readI32Tag(tags, TAG_RECOVERY_EPOCH, "recoveryEpoch");
+            return fields.set(fileId, chunkIndex, offset, maxBytes, namespace, recoveryEpoch);
         }
 
         /**
@@ -768,8 +832,8 @@ public final class Messages {
                     long offset = readLong();
                     int maxBytes = readInt();
                     StrataNamespace namespace = readNamespace();
-                    readTaggedFields();
-                    return fields.set(fileId, chunkIndex, offset, maxBytes, namespace);
+                    int recoveryEpoch = readRecoveryEpochTag();
+                    return fields.set(fileId, chunkIndex, offset, maxBytes, namespace, recoveryEpoch);
                 } finally {
                     this.frame = null;
                 }
@@ -806,15 +870,18 @@ public final class Messages {
                 return namespace;
             }
 
-            private void readTaggedFields() {
+            private int readRecoveryEpochTag() {
                 long n = readUnsigned();
                 if (n == 0) {
                     requireEndOfTaggedFields(remaining());
-                    return;
+                    return 0;
                 }
                 if (n < 0 || n > 1024) {
                     throw new IllegalArgumentException("bad tagged-field count: " + n);
                 }
+                boolean hasRecoveryEpoch = false;
+                int recoveryEpoch = 0;
+                long recoveryEpochSize = -1;
                 for (int i = 0; i < n; i++) {
                     long tagValue = readUnsigned();
                     if (tagValue < 0 || tagValue > Integer.MAX_VALUE) {
@@ -824,9 +891,24 @@ public final class Messages {
                     if (size < 0 || size > remaining()) {
                         throw new IllegalArgumentException("bad tagged-field size: " + size);
                     }
-                    pos += (int) size;
+                    if ((int) tagValue == TAG_RECOVERY_EPOCH) {
+                        hasRecoveryEpoch = true;
+                        recoveryEpochSize = size;
+                        if (size == Integer.BYTES) {
+                            recoveryEpoch = readInt();
+                        } else {
+                            pos += (int) size;
+                        }
+                    } else {
+                        pos += (int) size;
+                    }
                 }
                 requireEndOfTaggedFields(remaining());
+                if (hasRecoveryEpoch && recoveryEpochSize != Integer.BYTES) {
+                    throw new IllegalArgumentException("bad recoveryEpoch tag size: " + recoveryEpochSize);
+                }
+                requireNonNegativeRecoveryEpoch(recoveryEpoch);
+                return recoveryEpoch;
             }
 
             private long readUnsigned() {
@@ -1051,22 +1133,33 @@ public final class Messages {
         }
     }
 
-    public record FetchChunk(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace) {
+    /** ownerEpoch 0 is accepted only until the node observes a positive namespace owner watermark. */
+    public record FetchChunk(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace,
+                             long ownerEpoch) {
+        public FetchChunk(ChunkId chunkId, long offset, int maxBytes, StrataNamespace namespace) {
+            this(chunkId, offset, maxBytes, namespace, 0);
+        }
+
         public FetchChunk {
             namespace = Objects.requireNonNull(namespace, "namespace");
+            requireNonNegativeOwnerEpoch(ownerEpoch);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(offset).u32(maxBytes).namespace(namespace).noTags();
+            w.chunkId(chunkId).u64(offset).u32(maxBytes).namespace(namespace);
+            writeOwnerEpochTags(w, ownerEpoch);
             return w.toBytes();
         }
 
         public static FetchChunk decode(ByteBuffer b) {
-            FetchChunk m = new FetchChunk(ChunkId.readFrom(b), b.getLong(), b.getInt(),
-                    StrataNamespace.readFrom(b));
-            TaggedFields.readFrom(b);
-            return m;
+            ChunkId chunkId = ChunkId.readFrom(b);
+            long offset = b.getLong();
+            int maxBytes = b.getInt();
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
+            TaggedFields tags = TaggedFields.readFrom(b);
+            return new FetchChunk(chunkId, offset, maxBytes, namespace,
+                    readU64Tag(tags, TAG_OWNER_EPOCH, "ownerEpoch"));
         }
     }
 
@@ -1085,22 +1178,32 @@ public final class Messages {
         }
     }
 
-    public record ReadLedger(ChunkId chunkId, long fromOffset, StrataNamespace namespace) {
+    /** recoveryEpoch 0 is legacy/unstamped and is rejected by the READ_LEDGER wire handler. */
+    public record ReadLedger(ChunkId chunkId, long fromOffset, StrataNamespace namespace,
+                             int recoveryEpoch) {
+        public ReadLedger(ChunkId chunkId, long fromOffset, StrataNamespace namespace) {
+            this(chunkId, fromOffset, namespace, 0);
+        }
+
         public ReadLedger {
             namespace = Objects.requireNonNull(namespace, "namespace");
+            requireNonNegativeRecoveryEpoch(recoveryEpoch);
         }
 
         public byte[] encode() {
             BufWriter w = new BufWriter();
-            w.chunkId(chunkId).u64(fromOffset).namespace(namespace).noTags();
+            w.chunkId(chunkId).u64(fromOffset).namespace(namespace);
+            writeRecoveryEpochTags(w, recoveryEpoch);
             return w.toBytes();
         }
 
         public static ReadLedger decode(ByteBuffer b) {
-            ReadLedger m = new ReadLedger(ChunkId.readFrom(b), b.getLong(),
-                    StrataNamespace.readFrom(b));
-            TaggedFields.readFrom(b);
-            return m;
+            ChunkId chunkId = ChunkId.readFrom(b);
+            long fromOffset = b.getLong();
+            StrataNamespace namespace = StrataNamespace.readFrom(b);
+            TaggedFields tags = TaggedFields.readFrom(b);
+            return new ReadLedger(chunkId, fromOffset, namespace,
+                    readI32Tag(tags, TAG_RECOVERY_EPOCH, "recoveryEpoch"));
         }
     }
 

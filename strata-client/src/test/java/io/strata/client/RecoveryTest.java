@@ -171,6 +171,28 @@ class RecoveryTest {
     }
 
     @Test
+    void fencedEpochFromLedgerReadIsPropagated() throws Exception {
+        FileId fileId = FileId.of(7);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        try (ScpServer first = replicaThatFencesOnLedger(1, 3);
+             ScpServer second = replicaThatFencesOnLedger(2, 3);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(first)),
+                             new Messages.Replica(2, endpoint(second))))), null)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                                .recoverAndSeal(fileId, 2));
+
+                assertEquals(ErrorCode.FENCED_EPOCH, e.code());
+                assertEquals(3, e.detail());
+            }
+        }
+    }
+
+    @Test
     void catchUpEvictsReplicaWhenDonorReadFails() throws Exception {
         FileId fileId = FileId.of(7);
         ChunkId chunkId = new ChunkId(fileId, 0);
@@ -1507,6 +1529,28 @@ class RecoveryTest {
     }
 
     @Test
+    void readRangePropagatesFencedEpoch() throws Exception {
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
+            if (Opcode.fromCode(req.opcode()) == Opcode.READ_RECOVERY) {
+                throw new ScpException(ErrorCode.FENCED_EPOCH, "re-fenced", 3);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + req.opcode());
+        })) {
+            ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 500);
+            try (NodePool pool = new NodePool()) {
+                Recovery recovery = new Recovery(null, pool, config, StrataNamespace.of("test"));
+                ChunkId chunkId = new ChunkId(FileId.of(38), 0);
+                Object source = replicaState(new Messages.Replica(1, endpoint(server)), 4, 4, ChunkState.OPEN);
+
+                ScpException e = assertThrows(ScpException.class,
+                        () -> invokeReadRange(recovery, chunkId, source, 0, 4));
+                assertEquals(ErrorCode.FENCED_EPOCH, e.code());
+                assertEquals(3, e.detail());
+            }
+        }
+    }
+
+    @Test
     void readRangeAcceptsServerCappedPartialResponses() throws Exception {
         AtomicInteger reads = new AtomicInteger();
         byte[] source = new byte[] {1, 2, 3, 4};
@@ -1566,9 +1610,34 @@ class RecoveryTest {
 
         ScpException e = assertThrows(ScpException.class,
                 () -> invokeValidateFenceResp(chunkId, replica,
-                        new Messages.FenceResp(2, -1, 0, ChunkState.OPEN)));
+                        new Messages.FenceResp(2, -1, 0, ChunkState.OPEN), 2));
 
         assertEquals(ErrorCode.CORRUPT_CHUNK, e.code());
+    }
+
+    @Test
+    void validateFenceRespRejectsHigherReplicaFenceEpoch() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(34), 0);
+        Messages.Replica replica = new Messages.Replica(1, "node");
+
+        ScpException e = assertThrows(ScpException.class,
+                () -> invokeValidateFenceResp(chunkId, replica,
+                        new Messages.FenceResp(3, 0, 0, ChunkState.OPEN), 2));
+
+        assertEquals(ErrorCode.FENCED_EPOCH, e.code());
+        assertEquals(3, e.detail());
+    }
+
+    @Test
+    void validateFenceRespRejectsLowerReplicaFenceEpoch() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(34), 0);
+        Messages.Replica replica = new Messages.Replica(1, "node");
+
+        ScpException e = assertThrows(ScpException.class,
+                () -> invokeValidateFenceResp(chunkId, replica,
+                        new Messages.FenceResp(1, 0, 0, ChunkState.OPEN), 2));
+
+        assertEquals(ErrorCode.PRECONDITION_FAILED, e.code());
     }
 
     @Test
@@ -1984,6 +2053,23 @@ class RecoveryTest {
         });
     }
 
+    private static ScpServer replicaThatFencesOnLedger(int nodeId, long detail) throws Exception {
+        return new ScpServer(0, nodeId, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.FENCE) {
+                return ScpServer.ok(req, new Messages.FenceResp(2, 0, 0, ChunkState.OPEN).encode(), null);
+            }
+            if (op == Opcode.READ_LEDGER) {
+                Messages.ReadLedger read = Messages.ReadLedger.decode(req.headerSlice());
+                if (read.recoveryEpoch() != 2) {
+                    throw new ScpException(ErrorCode.PRECONDITION_FAILED, "missing recovery epoch");
+                }
+                throw new ScpException(ErrorCode.FENCED_EPOCH, "re-fenced", detail);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+    }
+
     private static ScpServer openReplicaThatFencesOnSeal(int nodeId, long detail) throws Exception {
         return new ScpServer(0, nodeId, 0, 0, req -> {
             Opcode op = Opcode.fromCode(req.opcode());
@@ -2036,11 +2122,11 @@ class RecoveryTest {
     }
 
     private static void invokeValidateFenceResp(ChunkId chunkId, Messages.Replica replica,
-                                                Messages.FenceResp fence) throws Exception {
+                                                Messages.FenceResp fence, int recoveryEpoch) throws Exception {
         Method method = Recovery.class.getDeclaredMethod("validateFenceResp",
-                ChunkId.class, Messages.Replica.class, Messages.FenceResp.class);
+                ChunkId.class, Messages.Replica.class, Messages.FenceResp.class, int.class);
         method.setAccessible(true);
-        invoke(method, null, chunkId, replica, fence);
+        invoke(method, null, chunkId, replica, fence, recoveryEpoch);
     }
 
     private static long invokeFinishSeal(Recovery recovery, ChunkId chunkId, int epoch, long dataLength,

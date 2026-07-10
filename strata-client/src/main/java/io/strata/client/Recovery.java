@@ -76,12 +76,18 @@ final class Recovery {
         long end;
         long durable;
         ChunkState state;
+        final int recoveryEpoch;
 
         ReplicaState(Messages.Replica replica, Messages.FenceResp fence) {
             this.replica = replica;
             this.end = fence.localEndOffset();
             this.durable = fence.lastKnownDO();
             this.state = fence.state();
+            this.recoveryEpoch = fence.persistedFenceEpoch();
+        }
+
+        int recoveryEpoch() {
+            return recoveryEpoch;
         }
     }
 
@@ -143,13 +149,18 @@ final class Recovery {
                 ByteBuffer h = appendPool.get(r.endpoint()).call(Opcode.FENCE,
                         new Messages.Fence(chunkId, writerEpoch, namespace).encode(), null, config.callTimeoutMs());
                 Messages.FenceResp fence = Messages.FenceResp.decode(h);
-                validateFenceResp(chunkId, r, fence);
+                validateFenceResp(chunkId, r, fence, writerEpoch);
                 reachable.add(new ReplicaState(r, fence));
             } catch (ScpException e) {
                 if (e.code() == ErrorCode.FENCED_EPOCH) {
                     throw e;
                 }
-                log.warn("fence {} on {} failed: {}", chunkId, r.endpoint(), e.getMessage());
+                if (e.code() == ErrorCode.PRECONDITION_FAILED) {
+                    log.error("fence {} on {} returned an inconsistent persisted epoch: {}",
+                            chunkId, r.endpoint(), e.getMessage());
+                } else {
+                    log.warn("fence {} on {} failed: {}", chunkId, r.endpoint(), e.getMessage());
+                }
             } catch (RuntimeException e) {
                 log.warn("fence {} on {} returned malformed response: {}", chunkId, r.endpoint(), e.toString());
             }
@@ -206,7 +217,8 @@ final class Recovery {
         for (ReplicaState rs : reachable) {
             try {
                 ByteBuffer h = readPool.get(rs.replica.endpoint()).call(Opcode.READ_LEDGER,
-                        new Messages.ReadLedger(chunkId, p, namespace).encode(), null, config.callTimeoutMs());
+                        new Messages.ReadLedger(chunkId, p, namespace, rs.recoveryEpoch()).encode(), null,
+                        config.callTimeoutMs());
                 long previousEnd = p;
                 for (Messages.LedgerEntry e : Messages.ReadLedgerResp.decode(h).entries()) {
                     boundaries.computeIfAbsent(e.endOffset(), ignored -> new ArrayList<>())
@@ -214,6 +226,9 @@ final class Recovery {
                     previousEnd = e.endOffset();
                 }
             } catch (ScpException e) {
+                if (e.code() == ErrorCode.FENCED_EPOCH) {
+                    throw e;
+                }
                 log.warn("read ledger {} on {} failed: {}", chunkId, rs.replica.endpoint(), e.getMessage());
                 markUnverifiedAboveFloorHolder(unverifiedAboveFloorHolders, rs, p);
             } catch (RuntimeException e) {
@@ -621,7 +636,8 @@ final class Recovery {
                 // READ_RECOVERY (not client READ): recovery must see the never-acked tail above the
                 // donor's durable high watermark — that is exactly the range it is re-proving for seal.
                 try (Frame frame = readPool.get(source.replica.endpoint()).callFrame(Opcode.READ_RECOVERY,
-                        new Messages.Read(chunkId, from + filled, want, namespace).encode(), null,
+                        Messages.Read.recovery(chunkId, from + filled, want, namespace,
+                                source.recoveryEpoch()).encode(), null,
                         timeoutMs)) {
                     ByteBuffer h = frame.headerSlice();
                     Resp.check(h);
@@ -638,6 +654,9 @@ final class Recovery {
             }
             return data;
         } catch (ScpException e) {
+            if (e.code() == ErrorCode.FENCED_EPOCH) {
+                throw e;
+            }
             log.warn("recovery read {}@{} from {} failed: {}", chunkId, from + filled,
                     source.replica.endpoint(), e.getMessage());
             return null;
@@ -661,11 +680,23 @@ final class Recovery {
         return Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos));
     }
 
-    private static void validateFenceResp(ChunkId chunkId, Messages.Replica replica, Messages.FenceResp fence) {
+    private static void validateFenceResp(ChunkId chunkId, Messages.Replica replica, Messages.FenceResp fence,
+                                          int recoveryEpoch) {
         if (fence.localEndOffset() < 0 || fence.lastKnownDO() < 0
                 || fence.lastKnownDO() > fence.localEndOffset()) {
             throw new ScpException(ErrorCode.CORRUPT_CHUNK,
                     "bad fence offsets from replica " + replica.nodeId() + " for " + chunkId);
+        }
+        if (fence.persistedFenceEpoch() != recoveryEpoch) {
+            if (fence.persistedFenceEpoch() > recoveryEpoch) {
+                throw new ScpException(ErrorCode.FENCED_EPOCH,
+                        "recovery epoch " + recoveryEpoch + " < replica fence "
+                                + fence.persistedFenceEpoch(), fence.persistedFenceEpoch());
+            }
+            // A correct FENCE response cannot report less than the requested epoch: fence() persists max().
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                    "replica " + replica.nodeId() + " reported fence " + fence.persistedFenceEpoch()
+                            + " for recovery epoch " + recoveryEpoch);
         }
     }
 

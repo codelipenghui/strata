@@ -507,7 +507,7 @@ final class ConsistencyVerifier {
             AssertionError fetchFailures = new AssertionError("unable to fetch replicas for " + chunk.chunkId());
             for (Messages.Replica replica : chunk.replicas()) {
                 try {
-                    hashes.add(sha256(fetchWholeChunk(replica, chunk)));
+                    hashes.add(sha256(fetchWholeChunk(replica, chunk, lookup.ownerEpoch())));
                     readable++;
                 } catch (Exception | AssertionError e) {
                     fetchFailures.addSuppressed(e);
@@ -524,7 +524,8 @@ final class ConsistencyVerifier {
         }
     }
 
-    private static byte[] fetchWholeChunk(Messages.Replica replica, Messages.ChunkInfo chunk) throws Exception {
+    private static byte[] fetchWholeChunk(Messages.Replica replica, Messages.ChunkInfo chunk,
+                                          long ownerEpoch) throws Exception {
         String[] hp = replica.endpoint().split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                 ScpClient.KIND_TOOL, "consistency-fetch")) {
@@ -533,8 +534,8 @@ final class ConsistencyVerifier {
             long offset = 0;
             while (expectedFileLength < 0 || offset < expectedFileLength) {
                 var frame = direct.callFrame(Opcode.FETCH_CHUNK,
-                        new Messages.FetchChunk(chunk.chunkId(), offset, FETCH_CHUNK_BYTES, TEST_NS).encode(), null,
-                        CALL_TIMEOUT_MS);
+                        new Messages.FetchChunk(chunk.chunkId(), offset, FETCH_CHUNK_BYTES, TEST_NS,
+                                ownerEpoch).encode(), null, CALL_TIMEOUT_MS);
                 ByteBuffer h = frame.headerSlice();
                 Resp.check(h);
                 Messages.FetchResp resp = Messages.FetchResp.decode(h);

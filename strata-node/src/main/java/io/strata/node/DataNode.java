@@ -278,7 +278,7 @@ public final class DataNode implements AutoCloseable {
     }
 
     /**
-     * Raises or checks the node-local owner watermark for destructive owner lanes. The
+     * Raises or checks the node-local owner watermark for owner-scoped lanes. The
      * allowUnstampedAfterSeen escape is only for broker data-plane requests that predate owner fencing and
      * never carry an owner epoch: writer SEAL_CHUNK and broker-owned chunk cleanup. Owner/tool lanes must
      * stamp a nonzero epoch once any owner epoch has been observed for the namespace.
@@ -298,12 +298,21 @@ public final class DataNode implements AutoCloseable {
                     }
                     throw fencedOwnerEpoch(namespace, ownerEpoch, seen);
                 }
+                log.debug("accepting unstamped owner RPC before watermark is established namespace={} "
+                                + "clientKind={} clientId={}",
+                        namespace, RequestContext.clientKind(), RequestContext.clientId());
                 return current;
             }
             if (ownerEpoch < seen) {
                 throw fencedOwnerEpoch(namespace, ownerEpoch, seen);
             }
-            return Math.max(seen, ownerEpoch);
+            if (ownerEpoch > seen) {
+                log.info("raising owner epoch watermark namespace={} previousOwnerEpoch={} acceptedOwnerEpoch={} "
+                                + "clientKind={} clientId={}",
+                        namespace, seen, ownerEpoch, RequestContext.clientKind(), RequestContext.clientId());
+                return ownerEpoch;
+            }
+            return current;
         });
     }
 

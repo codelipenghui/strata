@@ -111,7 +111,7 @@ class ChunkStoreTest {
             int suppliedDigest = 0x1234_5678;
             store.appendAsync(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap("payload".getBytes()), suppliedDigest).join();
 
-            var entries = store.readLedger(TEST_NS, id, 0);
+            var entries = store.readLedger(TEST_NS, id, 0, 0);
             assertEquals(1, entries.size());
             assertEquals(suppliedDigest, entries.get(0).payloadCrc());
         }
@@ -821,7 +821,7 @@ class ChunkStoreTest {
             assertEquals(11, sealed.finalLength());
             // idempotent re-seal returns same result
             assertEquals(sealed, store.seal(TEST_NS, id, 1, 11, null));
-            assertEquals(0, store.readLedger(TEST_NS, id, 0).size());
+            assertEquals(0, store.readLedger(TEST_NS, id, 0, 0).size());
 
             var r2 = store.read(TEST_NS, id, 6, 1024);
             assertArrayEquals("world".getBytes(), r2.bytes());
@@ -1075,7 +1075,7 @@ class ChunkStoreTest {
             ScpException overflow = assertThrows(ScpException.class,
                     () -> store.append(TEST_NS, id, 1, Long.MAX_VALUE - 1, 0, ByteBuffer.wrap(new byte[] {1, 2})));
             assertEquals(ErrorCode.CORRUPT_CHUNK, overflow.code());
-            assertEquals(0, store.readLedger(TEST_NS, id, 0).size());
+            assertEquals(0, store.readLedger(TEST_NS, id, 0, 0).size());
         }
     }
 
@@ -1294,7 +1294,7 @@ class ChunkStoreTest {
             var stat = store.stat(TEST_NS, id);
             assertEquals(4, stat.localEndOffset());
             assertEquals(4, stat.lastKnownDO());
-            assertEquals(1, store.readLedger(TEST_NS, id, 0).size()); // beacon adds no ledger entry
+            assertEquals(1, store.readLedger(TEST_NS, id, 0, 0).size()); // beacon adds no ledger entry
         }
     }
 
@@ -1311,7 +1311,7 @@ class ChunkStoreTest {
 
             assertEquals(ErrorCode.CHUNK_SEALED, e.code());
             assertEquals(2, store.stat(TEST_NS, id).localEndOffset());
-            assertEquals(2, store.readLedger(TEST_NS, id, 0).size());
+            assertEquals(2, store.readLedger(TEST_NS, id, 0, 0).size());
         }
     }
 
@@ -1330,7 +1330,7 @@ class ChunkStoreTest {
 
             assertEquals(ErrorCode.CHUNK_SEALED, e.code());
             assertEquals(2, recovered.stat(TEST_NS, id).localEndOffset());
-            assertEquals(2, recovered.readLedger(TEST_NS, id, 0).size());
+            assertEquals(2, recovered.readLedger(TEST_NS, id, 0, 0).size());
         }
     }
 
@@ -1659,7 +1659,7 @@ class ChunkStoreTest {
             assertThrows(ScpException.class, () -> store.read(TEST_NS, id, -1, 10));
             assertThrows(ScpException.class, () -> store.read(TEST_NS, id, 0, -10));
             assertThrows(ScpException.class, () -> store.fetch(TEST_NS, id, 0, -10));
-            assertThrows(ScpException.class, () -> store.readLedger(TEST_NS, id, -1));
+            assertThrows(ScpException.class, () -> store.readLedger(TEST_NS, id, -1, 0));
             assertThrows(ScpException.class, () -> store.append(TEST_NS, id, 1, -3, 0, bytes("x")));
 
             // and the chunk must be UNDAMAGED: header intact, still appendable, still sealable
@@ -1890,7 +1890,8 @@ class ChunkStoreTest {
 
             // Recovery read includes the undurable tail, materialized + integrity-verified, so seal recovery
             // sees quorum-durable bytes instead of sealing short.
-            ChunkStore.ReadRegionResult recovery = store.readRegionForRecovery(TEST_NS, chunkId, 0, total);
+            ChunkStore.ReadRegionResult recovery = store.readRegionForRecovery(TEST_NS,
+                    chunkId.fileId().id(), chunkId.index(), 0, total, 0);
             assertEquals(total, recovery.length(), "recovery read must include the undurable tail");
             assertArrayEquals(all, recovery.bytes(), "recovery read must return the full verified bytes");
         }
@@ -1907,7 +1908,8 @@ class ChunkStoreTest {
             store.seal(TEST_NS, chunkId, 1, payload.length, null);
 
             ChunkStore.ReadRegionResult recovery =
-                    store.readRegionForRecovery(TEST_NS, chunkId, 0, payload.length);
+                    store.readRegionForRecovery(TEST_NS,
+                            chunkId.fileId().id(), chunkId.index(), 0, payload.length, 0);
             assertEquals(payload.length, recovery.length(), "sealed recovery read must serve the data");
             assertArrayEquals(payload, recovery.bytes(), "sealed recovery read must return verified bytes");
 
@@ -1922,7 +1924,8 @@ class ChunkStoreTest {
             assertEquals(ErrorCode.CRC_MISMATCH, clientError.code());
 
             ScpException e = assertThrows(ScpException.class,
-                    () -> store.readRegionForRecovery(TEST_NS, chunkId, 0, payload.length));
+                    () -> store.readRegionForRecovery(TEST_NS,
+                            chunkId.fileId().id(), chunkId.index(), 0, payload.length, 0));
             assertEquals(ErrorCode.CRC_MISMATCH, e.code());
         }
     }
@@ -1986,7 +1989,7 @@ class ChunkStoreTest {
         try (ChunkStore recovered = newStore()) {
             assertTrue(recovered.contains(TEST_NS, chunkId));
             assertEquals(0, recovered.stat(TEST_NS, chunkId).localEndOffset());
-            assertEquals(0, recovered.readLedger(TEST_NS, chunkId, 0).size());
+            assertEquals(0, recovered.readLedger(TEST_NS, chunkId, 0, 0).size());
             assertEquals(1, recovered.append(TEST_NS, chunkId, 1, 0, 0, bytes("x")).endOffset());
         }
     }

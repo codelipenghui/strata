@@ -2,6 +2,7 @@ package io.strata.node;
 
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
+import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
 import io.strata.format.ChunkStore;
 import io.strata.proto.Frame;
@@ -179,6 +180,9 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case FETCH_CHUNK -> {
                 var m = Messages.FetchChunk.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
+                // A repair source may receive FETCH_CHUNK as its first stamped owner RPC after restart,
+                // so this read lane intentionally raises the volatile watermark as well as checking it.
+                acceptFetchOwnerEpoch(m.namespace(), m.ownerEpoch());
                 var r = store.fetch(m.namespace(), m.chunkId(), m.offset(), m.maxBytes());
                 yield ScpServer.ok(req, new Messages.FetchResp(r.fileLength(), r.state()).encode(),
                         ByteBuffer.wrap(r.bytes()));
@@ -187,7 +191,9 @@ final class DataNodeHandlers implements ScpServer.Handler {
             case READ_LEDGER -> {
                 var m = Messages.ReadLedger.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());
-                List<ChunkFormats.LedgerEntry> entries = store.readLedger(m.namespace(), m.chunkId(), m.fromOffset());
+                requireRecoveryEpoch(m.recoveryEpoch(), "READ_LEDGER");
+                List<ChunkFormats.LedgerEntry> entries =
+                        store.readLedger(m.namespace(), m.chunkId(), m.fromOffset(), m.recoveryEpoch());
                 List<Messages.LedgerEntry> wire = new ArrayList<>(entries.size());
                 for (var e : entries) wire.add(new Messages.LedgerEntry(e.endOffset(), e.payloadCrc(), e.writeEpoch()));
                 yield ScpServer.ok(req, new Messages.ReadLedgerResp(wire).encode(), null);
@@ -338,9 +344,24 @@ final class DataNodeHandlers implements ScpServer.Handler {
     private ChunkStore.ReadRegionResult readRegion(Frame req, boolean recovery) throws IOException {
         var m = Messages.Read.decodeFields(req);
         RequestContext.setNamespace(m.namespace().value());
+        if (recovery) {
+            requireRecoveryEpoch(m.recoveryEpoch(), "READ_RECOVERY");
+        }
         return recovery
-                ? store.readRegionForRecovery(m.namespace(), m.fileId(), m.chunkIndex(), m.offset(), m.maxBytes())
+                ? store.readRegionForRecovery(m.namespace(), m.fileId(), m.chunkIndex(), m.offset(), m.maxBytes(),
+                        m.recoveryEpoch())
                 : store.readRegion(m.namespace(), m.fileId(), m.chunkIndex(), m.offset(), m.maxBytes());
+    }
+
+    private void acceptFetchOwnerEpoch(StrataNamespace namespace, long ownerEpoch) {
+        node.acceptOwnerEpoch(namespace, ownerEpoch);
+    }
+
+    private static void requireRecoveryEpoch(int recoveryEpoch, String opcode) {
+        if (recoveryEpoch <= 0) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                    opcode + " requires a positive recoveryEpoch");
+        }
     }
 
     /** Wire-encodes a verified, materialized {@link ChunkStore.ReadRegionResult}. */

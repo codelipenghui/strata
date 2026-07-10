@@ -70,22 +70,26 @@ class RecoveryCatchUpTest {
 
             var sealed = client.openById(StrataNamespace.of("test"), fileId).recoverAndSeal();
             assertEquals(12, sealed.sealedLength(), "all quorum-durable bytes must be preserved");
+            Messages.LookupFileResp recovered = ConsistencyVerifier.lookupFile(cluster, fileId);
+            var recoveredChunk = recovered.chunks().get(0);
+            assertEquals(3, recoveredChunk.replicas().size(),
+                    "lagging replica must be caught up, not evicted");
 
             // EVERY replica in the descriptor must now serve the full sealed chunk byte-identically
             Set<String> hashes = new HashSet<>();
-            for (var replica : chunk.replicas()) {
+            for (var replica : recoveredChunk.replicas()) {
                 String[] nhp = replica.endpoint().split(":");
                 try (ScpClient node = new ScpClient(nhp[0], Integer.parseInt(nhp[1]),
                         ScpClient.KIND_TOOL, "v")) {
                     var stat = Messages.StatResp.decode(node.call(Opcode.STAT_CHUNK,
-                            new Messages.StatChunk(chunk.chunkId(), TEST_NS).encode(), null, 5000));
+                            new Messages.StatChunk(recoveredChunk.chunkId(), TEST_NS).encode(), null, 5000));
                     assertEquals(ChunkState.SEALED, stat.state(),
                             "replica " + replica.nodeId() + " must be sealed after recovery");
                     assertEquals(12, stat.sealedLength());
 
                     var frame = node.callFrame(Opcode.FETCH_CHUNK,
-                            new Messages.FetchChunk(chunk.chunkId(), 0, Integer.MAX_VALUE, TEST_NS).encode(),
-                            null, 5000);
+                            new Messages.FetchChunk(recoveredChunk.chunkId(), 0, Integer.MAX_VALUE, TEST_NS,
+                                    recovered.ownerEpoch()).encode(), null, 5000);
                     ByteBuffer h = frame.headerSlice();
                     Resp.check(h);
                     byte[] bytes = new byte[frame.payloadLength()];

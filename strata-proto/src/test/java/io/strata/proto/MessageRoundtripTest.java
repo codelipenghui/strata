@@ -47,6 +47,14 @@ class MessageRoundtripTest {
         assertEquals(99, readFields.offset());
         assertEquals(65536, readFields.maxBytes());
         assertEquals(ns, readFields.namespace());
+        assertEquals(0, readFields.recoveryEpoch());
+
+        var recoveryRead = Messages.Read.recovery(c, 99, 65536, ns, 7);
+        assertEquals(recoveryRead, Messages.Read.decode(buf(recoveryRead.encode())));
+        var recoveryReadFields = Messages.Read.decodeFields(buf(recoveryRead.encode()));
+        assertEquals(7, recoveryReadFields.recoveryEpoch());
+        assertThrows(IllegalArgumentException.class,
+                () -> Messages.Read.recovery(c, 99, 65536, ns, 0));
 
         var fence = new Messages.Fence(c, 6, ns);
         assertEquals(fence, Messages.Fence.decode(buf(fence.encode())));
@@ -64,9 +72,13 @@ class MessageRoundtripTest {
 
         var fetch = new Messages.FetchChunk(c, 0, Integer.MAX_VALUE, ns);
         assertEquals(fetch, Messages.FetchChunk.decode(buf(fetch.encode())));
+        var ownedFetch = new Messages.FetchChunk(c, 0, Integer.MAX_VALUE, ns, 42);
+        assertEquals(ownedFetch, Messages.FetchChunk.decode(buf(ownedFetch.encode())));
 
         var rl = new Messages.ReadLedger(c, 2048, ns);
         assertEquals(rl, Messages.ReadLedger.decode(buf(rl.encode())));
+        var recoveryLedger = new Messages.ReadLedger(c, 2048, ns, 7);
+        assertEquals(recoveryLedger, Messages.ReadLedger.decode(buf(recoveryLedger.encode())));
     }
 
     @Test

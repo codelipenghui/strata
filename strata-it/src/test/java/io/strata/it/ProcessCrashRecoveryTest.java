@@ -130,10 +130,11 @@ class ProcessCrashRecoveryTest {
                     ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                             sealed.sealedLength());
 
-                    Messages.ChunkInfo chunk = lookupFile(fileId).chunks().get(0);
+                    Messages.LookupFileResp lookup = lookupFile(fileId);
+                    Messages.ChunkInfo chunk = lookup.chunks().get(0);
                     ChunkId chunkId = chunk.chunkId();
                     ExternalNode dropped = byNodeId(processes).get(chunk.replicas().get(0).nodeId());
-                    deleteChunk(dropped, chunkId);
+                    deleteChunk(dropped, chunkId, lookup.ownerEpoch());
                     waitForChunkReplicaMissing(chunkId, dropped.nodeId(), 2);
 
                     ExternalNode target = waitForUndescriptorCopy(processes, chunkId);
@@ -178,10 +179,11 @@ class ProcessCrashRecoveryTest {
                     ConsistencyVerifier.assertSealedFileConsistent(cluster, client, fileId,
                             sealed.sealedLength());
 
-                    Messages.ChunkInfo chunk = lookupFile(fileId).chunks().get(0);
+                    Messages.LookupFileResp lookup = lookupFile(fileId);
+                    Messages.ChunkInfo chunk = lookup.chunks().get(0);
                     ChunkId chunkId = chunk.chunkId();
                     ExternalNode dropped = byNodeId(processes).get(chunk.replicas().get(0).nodeId());
-                    deleteChunk(dropped, chunkId);
+                    deleteChunk(dropped, chunkId, lookup.ownerEpoch());
                     waitForChunkReplicaMissing(chunkId, dropped.nodeId(), 2);
 
                     ExternalNode target = waitForUndescriptorCopy(processes, chunkId);
@@ -734,12 +736,12 @@ class ProcessCrashRecoveryTest {
                 .toString();
     }
 
-    private void deleteChunk(ExternalNode node, ChunkId chunkId) throws Exception {
+    private void deleteChunk(ExternalNode node, ChunkId chunkId, long ownerEpoch) throws Exception {
         String[] hp = node.endpoint().split(":");
         try (ScpClient direct = new ScpClient(hp[0], Integer.parseInt(hp[1]),
                 ScpClient.KIND_TOOL, "process-direct-delete")) {
             var resp = Messages.DeleteChunksResp.decode(direct.call(Opcode.DELETE_CHUNKS,
-                    new Messages.DeleteChunks(List.of(chunkId), TEST_NS).encode(), null, 5_000));
+                    new Messages.DeleteChunks(List.of(chunkId), TEST_NS, ownerEpoch).encode(), null, 5_000));
             assertEquals(ErrorCode.OK.code, resp.codes().get(0).shortValue(),
                     "direct delete failed for " + chunkId + " on node " + node.nodeId());
         }
