@@ -70,6 +70,60 @@ abstract class MetadataStoreConformanceTest {
     }
 
     @Test
+    void fileIdLookupAndDeleteAreBoundToNamespace() throws Exception {
+        try (Backend backend = startBackend();
+             MetadataStore store = backend.openStore()) {
+            Records.FileRecord file = file(FileId.of(2), "tenant-a",
+                    "/logs/namespace-bound/segment-0", FileState.OPEN);
+            StrataNamespace wrongNamespace = StrataNamespace.of("tenant-b");
+
+            store.createFile(file);
+            MetadataStore.Versioned<Records.FileRecord> before =
+                    store.getFile(file.namespace(), file.fileId()).orElseThrow();
+
+            assertTrue(store.deleteFile(wrongNamespace, file.fileId(), before.version() + 7),
+                    "wrong-namespace delete ignores expectedVersion, like any missing delete");
+            assertTrue(store.deleteFile(wrongNamespace, file.fileId(), before.version()),
+                    "wrong-namespace delete is an idempotent no-op, like any missing delete");
+
+            MetadataStore.Versioned<Records.FileRecord> after =
+                    store.getFile(file.namespace(), file.fileId()).orElseThrow();
+            assertEquals(before, after, "wrong-namespace delete must not mutate the record or version");
+            assertEquals(file.fileId(), store.resolvePath(file.namespace(), file.path()).orElseThrow(),
+                    "wrong-namespace delete must not unbind the owning namespace's path");
+            assertTrue(store.getFile(wrongNamespace, file.fileId()).isEmpty(),
+                    "an existing FileId must be invisible outside its namespace");
+            assertTrue(store.resolvePath(wrongNamespace, file.path()).isEmpty(),
+                    "the same path in another namespace must remain unbound");
+        }
+    }
+
+    @Test
+    void fileUpdateCannotChangeNamespaceIdentity() throws Exception {
+        try (Backend backend = startBackend();
+             MetadataStore store = backend.openStore()) {
+            Records.FileRecord original = file(FileId.of(3), "tenant-a",
+                    "/logs/namespace-update/segment-0", FileState.OPEN);
+            store.createFile(original);
+            MetadataStore.Versioned<Records.FileRecord> before =
+                    store.getFile(original.namespace(), original.fileId()).orElseThrow();
+            Records.FileRecord foreign = new Records.FileRecord(original.fileId(),
+                    StrataNamespace.of("tenant-b"), original.path(), original.replicationFactor(),
+                    original.ackQuorum(), original.fsyncOnAck(), original.writerEpoch(), original.state(),
+                    original.createdAtMs(), original.chunks(), original.createOpMsb(), original.createOpLsb());
+
+            assertFalse(store.updateFile(foreign, before.version()),
+                    "CAS update must not move a FileId into another namespace");
+            assertEquals(before, store.getFile(original.namespace(), original.fileId()).orElseThrow(),
+                    "rejected cross-namespace update must preserve record and version");
+            assertEquals(original.fileId(),
+                    store.resolvePath(original.namespace(), original.path()).orElseThrow(),
+                    "rejected cross-namespace update must preserve the owning path binding");
+            assertTrue(store.getFile(foreign.namespace(), foreign.fileId()).isEmpty());
+        }
+    }
+
+    @Test
     void sweepingDeletedTombstonesFreesTheIdForReuse() throws Exception {
         try (Backend backend = startBackend();
              MetadataStore store = backend.openStore()) {

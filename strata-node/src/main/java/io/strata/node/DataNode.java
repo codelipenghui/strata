@@ -29,6 +29,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static io.strata.common.Fsync.ensureDirectoryDurable;
 import static io.strata.common.Fsync.forceDirectory;
 
 /**
@@ -81,7 +82,7 @@ public final class DataNode implements AutoCloseable {
      */
     public DataNode(DataNodeConfig config, ScpServer.Handler controllerHandler) throws IOException {
         this.config = config;
-        Files.createDirectories(config.dataDir());
+        ensureDirectoryDurable(config.dataDir());
         durableOwnerEpochByNamespace.putAll(loadOwnerEpochs(config.dataDir()));
         highestOwnerEpochByNamespace.putAll(durableOwnerEpochByNamespace);
         Identity identity = loadOrCreateIdentity(config.dataDir(), config.nodeId());

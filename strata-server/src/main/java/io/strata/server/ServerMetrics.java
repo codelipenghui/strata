@@ -70,6 +70,10 @@ final class ServerMetrics {
                         Controller::clusterLiveNodesReadFailures)
                 .description("published cluster live-node snapshots that failed to read or decode on placement readers")
                 .register(reg);
+        FunctionCounter.builder("strata_controller_metadata_store_namespace_contract_violations_total", s,
+                        Controller::metadataStoreNamespaceContractViolations)
+                .description("metadata-store records rejected because their embedded namespace differed from the request")
+                .register(reg);
 
         Gauge.builder("strata_data_nodes", s, Controller::aliveNodes)
                 .tag("state", "alive").description("data nodes by liveness state").register(reg);

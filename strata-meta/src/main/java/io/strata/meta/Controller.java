@@ -14,6 +14,7 @@ import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.RequestContext;
 import io.strata.proto.RequestObserver;
+import io.strata.proto.ScpClient;
 import io.strata.proto.ScpServer;
 import org.apache.curator.framework.recipes.leader.LeaderLatch;
 import org.apache.zookeeper.KeeperException;
@@ -29,6 +30,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BiFunction;
 import java.util.function.UnaryOperator;
 
@@ -40,6 +43,7 @@ import java.util.function.UnaryOperator;
  */
 public final class Controller implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(Controller.class);
+    private static final long SYSTEM_NAMESPACE_REJECT_WARN_INTERVAL_MS = 60_000;
     /** Optimistic-concurrency retry bound, shared with RepairCoordinator's descriptor CAS loops. */
     static final int CAS_RETRIES = 5;
 
@@ -53,6 +57,8 @@ public final class Controller implements AutoCloseable {
     private final String advertisedEndpoint;  // this node's reachable host:port — the leader hint clients redirect to
     private final NamespaceOwnership ownership; // resolves the controller owner of each namespace (design §6)
     private final NamespaceLeadership namespaceLeadership; // optional: namespace-log ACTIVE/RECOVERING barrier
+    private final AtomicLong lastSystemNamespaceRejectWarnMs = new AtomicLong();
+    private final LongAdder metadataStoreNamespaceContractViolations = new LongAdder();
 
     public Controller(ControllerConfig config) throws Exception {
         this(config, null);
@@ -321,6 +327,11 @@ public final class Controller implements AutoCloseable {
         return registry.clusterLiveNodesReadFailures();
     }
 
+    /** Records returned by a backend with a namespace different from the requested logical identity. */
+    public long metadataStoreNamespaceContractViolations() {
+        return metadataStoreNamespaceContractViolations.sum();
+    }
+
     /** This controller's rendezvous endpoint identity — the {@code owner} label for the namespace-owner
      *  gauge ({@code strata_controller_namespace_owner}); same value the latch advertises. */
     public String localControllerEndpoint() {
@@ -443,6 +454,17 @@ public final class Controller implements AutoCloseable {
         // Tag this request's metrics with its namespace (read back by ScpServer's request observer).
         RequestContext.setNamespace(namespace.value());
         if (NamespaceLogBackend.isSystem(namespace)) {
+            // StrataNamespace deliberately permits this literal so internal metadata code can represent
+            // it; controller ingress is where the internal role is enforced.
+            byte clientKind = RequestContext.clientKind();
+            if (clientKind != ScpClient.KIND_METADATA) {
+                String clientId = RequestContext.clientId();
+                int presentedClientKind = Byte.toUnsignedInt(clientKind);
+                maybeWarnSystemNamespaceReject(namespace, presentedClientKind, clientId);
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "namespace " + namespace + " is reserved for internal metadata (client kind="
+                                + presentedClientKind + ")");
+            }
             // Metadata-log system files live in the shared ZK root (CAS-guarded), so any node may serve
             // them — a non-controller owner writes its own namespace's metadata-log files here.
             return;
@@ -457,6 +479,19 @@ public final class Controller implements AutoCloseable {
                     ownership.ownerOf(namespace));
         }
         requireNamespaceActive(namespace);
+    }
+
+    /** Rate-limited because a stale fleet may retry the same rejected internal-namespace request. */
+    private void maybeWarnSystemNamespaceReject(StrataNamespace namespace, int clientKind, String clientId) {
+        long now = System.currentTimeMillis();
+        long last = lastSystemNamespaceRejectWarnMs.get();
+        if (last != 0 && now - last < SYSTEM_NAMESPACE_REJECT_WARN_INTERVAL_MS) {
+            return;
+        }
+        if (lastSystemNamespaceRejectWarnMs.compareAndSet(last, now)) {
+            log.warn("rejecting reserved system namespace request: namespace={} clientKind={} clientId={}",
+                    namespace, clientKind, clientId);
+        }
     }
 
     private void requireNamespaceActive(StrataNamespace namespace) {
@@ -906,7 +941,22 @@ public final class Controller implements AutoCloseable {
 
     private Optional<MetadataStore.Versioned<Records.FileRecord>> getFile(
             StrataNamespace namespace, FileId fileId) throws Exception {
-        return store.getFile(namespace, fileId);
+        Optional<MetadataStore.Versioned<Records.FileRecord>> found = store.getFile(namespace, fileId);
+        if (found.isEmpty()) {
+            return found;
+        }
+        Records.FileRecord record = found.get().value();
+        if (record.namespace().equals(namespace)) {
+            return found;
+        }
+
+        // Defense in depth: reaching this branch means the MetadataStore violated its
+        // (namespace, FileId) lookup contract, most likely due to corrupt replayed state.
+        metadataStoreNamespaceContractViolations.increment();
+        log.error("metadata-store namespace contract violated fileId={} requestedNamespace={} "
+                        + "recordNamespace={}; treating record as absent",
+                fileId, namespace, record.namespace());
+        return Optional.empty();
     }
 
     private Messages.LookupFileResp lookup(StrataNamespace namespace, FileId fileId) throws Exception {
@@ -938,6 +988,11 @@ public final class Controller implements AutoCloseable {
     private Messages.ConfirmOrphanResp confirmOrphan(Messages.ConfirmOrphan request) throws Exception {
         StrataNamespace namespace = request.namespace();
         RequestContext.setNamespace(namespace.value());
+        if (NamespaceLogBackend.isSystem(namespace)) {
+            // CONFIRM_ORPHAN is also namespace-scoped ingress. Preserve the reserved metadata-role
+            // boundary before the root-backed authority path can return a destructive verdict.
+            requireNamespaceOwner(namespace);
+        }
         if (store instanceof NamespaceLogMetadataStore namespaceLog
                 && !NamespaceLogBackend.isSystem(namespace)) {
             requireNamespaceOwner(namespace);
@@ -996,11 +1051,12 @@ public final class Controller implements AutoCloseable {
     private void markDeleting(StrataNamespace namespace, FileId id) throws Exception {
         for (int attempt = 0; attempt < CAS_RETRIES; attempt++) {
             var opt = getFile(namespace, id);
-            // idempotent after deletion: a DELETED tombstone (and a later swept record) read as
-            // empty here, as does a never-created id. A delete retry whose first response was lost
-            // — or one that lands after a controller failover/tombstone reap — must ack OK rather
-            // than FILE_NOT_FOUND, so the caller observes a single logical deletion. (abortChunk
-            // returns idempotently on the same empty condition.)
+            // Idempotent after deletion: a DELETED tombstone (and a later swept record), a
+            // never-created id, or a FileId belonging to another namespace all read as empty here.
+            // A delete retry whose first response was lost — or one that lands after a controller
+            // failover/tombstone reap — must ack OK rather than FILE_NOT_FOUND, so the caller observes
+            // a single logical deletion. The same response for a wrong namespace avoids disclosing
+            // whether that FileId exists elsewhere. (abortChunk is idempotent on the same condition.)
             if (opt.isEmpty()) return;
             Records.FileRecord current = opt.get().value();
             Records.FileRecord deleting = current.withState(FileState.DELETING);

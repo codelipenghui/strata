@@ -10,6 +10,8 @@ import io.strata.format.ChunkStore;
 import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
+import io.strata.proto.RequestContext;
+import io.strata.proto.ScpClient;
 import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -49,6 +51,82 @@ class OrphanGcTest {
     }
 
     @Test
+    void systemNamespaceConfirmUsesMetadataClientKind() throws Exception {
+        StrataNamespace system = StrataNamespace.of("strata-meta");
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger clientKind = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 clientKind.set(RequestContext.clientKind());
+                 Messages.ConfirmOrphan confirm = Messages.ConfirmOrphan.decode(req.headerSlice());
+                 assertEquals(system, confirm.namespace());
+                 assertEquals(chunk, confirm.chunkId());
+                 assertEquals(NODE_ID, confirm.nodeId());
+                 return confirmResponse(req, true, true, 1);
+             })) {
+            seal(store, system, chunk);
+            OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000);
+
+            gc.gcOnce();
+
+            assertEquals(ScpClient.KIND_METADATA, clientKind.get());
+            assertTrue(store.contains(system, chunk), "the controller still lists this system chunk");
+        }
+    }
+
+    @Test
+    void ordinaryNamespaceConfirmUsesToolClientKind() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger clientKind = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 clientKind.set(RequestContext.clientKind());
+                 Messages.ConfirmOrphan confirm = Messages.ConfirmOrphan.decode(req.headerSlice());
+                 assertEquals(NS, confirm.namespace());
+                 assertEquals(chunk, confirm.chunkId());
+                 assertEquals(NODE_ID, confirm.nodeId());
+                 return confirmResponse(req, true, true, 1);
+             })) {
+            seal(store, chunk);
+            OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000);
+
+            gc.gcOnce();
+
+            assertEquals(ScpClient.KIND_TOOL, clientKind.get());
+            assertTrue(store.contains(NS, chunk), "the controller still lists this ordinary chunk");
+        }
+    }
+
+    @Test
+    void keepsSuspectAndWarnsWhenOwnerRejectsConfirm() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                         "namespace is reserved for internal metadata");
+             })) {
+            seal(store, chunk);
+            OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000);
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, chunk),
+                    "a rejected owner confirm must never authorize physical deletion");
+            assertEquals(1, gc.unreachableConfirmWarns(),
+                    "a rejected confirm must surface through unreachable-confirm observability");
+        }
+    }
+
+    @Test
     void deletesConfirmedOrphanButKeepsAChunkTheOwnerStillLists() throws Exception {
         ChunkId orphan = new ChunkId(FileId.of(1), 0); // owner answers FILE_NOT_FOUND
         ChunkId listed = new ChunkId(FileId.of(2), 0); // owner still lists this node for the chunk
@@ -76,6 +154,40 @@ class OrphanGcTest {
 
             assertFalse(store.contains(NS, orphan), "an unreferenced chunk (FILE_NOT_FOUND) must be GC'd");
             assertTrue(store.contains(NS, listed), "a chunk the owner still lists must be kept");
+        }
+    }
+
+    @Test
+    void deletesChunkWhoseFileIdExistsOnlyInAnotherNamespace() throws Exception {
+        StrataNamespace onDiskNamespace = StrataNamespace.of("wrong-on-disk-namespace");
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger onDiskNamespaceConfirms = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 Messages.ConfirmOrphan confirm = Messages.ConfirmOrphan.decode(req.headerSlice());
+                 assertEquals(onDiskNamespace, confirm.namespace(),
+                         "confirmation must stay bound to the chunk's on-disk namespace");
+                 assertEquals(chunk, confirm.chunkId());
+                 assertEquals(NODE_ID, confirm.nodeId());
+                 onDiskNamespaceConfirms.incrementAndGet();
+                 return confirmResponse(req, false, false, 1);
+             })) {
+            seal(store, onDiskNamespace, chunk);
+            OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()),
+                    0, 60_000, 0, 5_000);
+
+            gc.gcOnce();
+            assertTrue(store.contains(onDiskNamespace, chunk),
+                    "namespace-scoped FILE_NOT_FOUND still requires a corroborating pass");
+
+            gc.gcOnce();
+            assertFalse(store.contains(onDiskNamespace, chunk),
+                    "a descriptor in another namespace must not keep this on-disk logical chunk alive");
+            assertEquals(3, onDiskNamespaceConfirms.get(),
+                    "confirm and delete checks must stay bound to the chunk's on-disk namespace");
         }
     }
 

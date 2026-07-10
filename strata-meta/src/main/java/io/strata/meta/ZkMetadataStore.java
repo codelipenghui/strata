@@ -182,13 +182,19 @@ public final class ZkMetadataStore implements MetadataStore {
 
     @Override
     public Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) throws Exception {
-        // ZK backend: file ids are globally unique (all records live under /strata/files/<id>);
-        // the namespace arg satisfies the interface contract but does not change the lookup.
+        // ZK stores globally unique ids in one flat space, but the logical identity remains
+        // (namespace, id): never expose a record through a different namespace.
         try {
             Stat stat = new Stat();
             byte[] data = curator.getData().storingStatIn(stat).forPath(FILES + "/" + id);
             record(FILES, false, data.length);
             Records.FileRecord record = Records.FileRecord.decode(data);
+            if (!record.namespace().equals(namespace)) {
+                log.warn("metadata file lookup namespace mismatch fileId={} requestedNamespace={} "
+                                + "recordNamespace={}; treating record as absent",
+                        id, namespace, record.namespace());
+                return Optional.empty();
+            }
             if (record.state() == FileState.DELETED) {
                 return Optional.empty();  // a swept-pending tombstone is logically gone
             }
@@ -221,6 +227,10 @@ public final class ZkMetadataStore implements MetadataStore {
 
     @Override
     public boolean updateFile(Records.FileRecord record, int expectedVersion) throws Exception {
+        Optional<Versioned<Records.FileRecord>> current = getFile(record.namespace(), record.fileId());
+        if (current.isEmpty() || current.get().version() != expectedVersion) {
+            return false;
+        }
         try {
             byte[] enc = record.encode();
             curator.setData().withVersion(expectedVersion).forPath(FILES + "/" + record.fileId(), enc);
@@ -252,18 +262,24 @@ public final class ZkMetadataStore implements MetadataStore {
 
     @Override
     public boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) throws Exception {
-        // ZK backend: file ids are globally unique; the namespace arg satisfies the interface
-        // contract but does not change the lookup — the record's own namespace() is used below.
+        // ZK's physical key is global, but deletion is scoped to the logical (namespace, id).
         String filePath = FILES + "/" + id;
         try {
             Optional<Versioned<Records.FileRecord>> current = getFile(namespace, id);
             if (current.isEmpty()) {
                 return true;
             }
+            Records.FileRecord record = current.get().value();
+            // Defense in depth: keep the destructive path safe even if getFile is later refactored.
+            if (!record.namespace().equals(namespace)) {
+                log.warn("metadata file delete namespace mismatch fileId={} requestedNamespace={} "
+                                + "recordNamespace={}; treating record as absent",
+                        id, namespace, record.namespace());
+                return true;
+            }
             if (current.get().version() != expectedVersion) {
                 return false;
             }
-            Records.FileRecord record = current.get().value();
             // Leave a DELETED tombstone in place of the record (a swept-later id reservation) so a
             // replayed CREATE for this id still collides on the existing znode; the sweeper reaps it.
             byte[] tombstone = record.withState(FileState.DELETED).encode();

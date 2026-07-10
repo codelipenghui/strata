@@ -1947,6 +1947,7 @@ class RepairCoordinatorTest {
 
     private record Registered(int nodeId, long incMsb, long incLsb, long sessionEpoch) {}
 
+    /** Flat physical map like ZK; the public SPI still enforces namespace-scoped logical identity. */
     private static final class FakeStore implements MetadataStore {
         private final Map<FileId, Versioned<Records.FileRecord>> files = new LinkedHashMap<>();
         private final Map<Name, FileId> paths = new LinkedHashMap<>();
@@ -2006,7 +2007,8 @@ class RepairCoordinatorTest {
                 throw new IllegalStateException("poison file getFile failure for " + id);
             }
             afterGetFile.run();
-            return Optional.ofNullable(files.get(id));
+            return Optional.ofNullable(files.get(id))
+                    .filter(current -> current.value().namespace().equals(namespace));
         }
 
         int getFileCalls(FileId id) {
@@ -2031,7 +2033,8 @@ class RepairCoordinatorTest {
         @Override
         public boolean updateFile(Records.FileRecord record, int expectedVersion) {
             Versioned<Records.FileRecord> current = files.get(record.fileId());
-            if (current == null || current.version() != expectedVersion) {
+            if (current == null || !current.value().namespace().equals(record.namespace())
+                    || current.version() != expectedVersion) {
                 return false;
             }
             if (failUpdateFileAttempts > 0) {
@@ -2062,6 +2065,9 @@ class RepairCoordinatorTest {
         public boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) {
             Versioned<Records.FileRecord> current = files.get(id);
             if (current == null) {
+                return true;
+            }
+            if (!current.value().namespace().equals(namespace)) {
                 return true;
             }
             if (current.version() != expectedVersion) {

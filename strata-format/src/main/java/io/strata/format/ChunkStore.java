@@ -221,7 +221,9 @@ public final class ChunkStore implements AutoCloseable {
         this.directorySyncer = Objects.requireNonNull(directorySyncer, "directorySyncer");
         this.csConfig = csConfig;
         this.channelCache = new ChannelCache(channelCacheCapacity);
-        Files.createDirectories(dir);
+        // The store root's own dirent lives in its parent. Force it on every construction so a retry
+        // cannot mistake a root left behind by a failed or concurrent initializer for a durable one.
+        ensureDirectoryDurable(dir);
         recoverAll();
         this.flusher = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "chunk-writeback-" + dir.getFileName());
@@ -265,6 +267,7 @@ public final class ChunkStore implements AutoCloseable {
         Path root = dir.toAbsolutePath().normalize();
         Path normalized = targetDir.toAbsolutePath().normalize();
         if (normalized.equals(root)) {
+            // The root's own dirent is made durable during construction.
             return;
         }
         if (!normalized.startsWith(root)) {

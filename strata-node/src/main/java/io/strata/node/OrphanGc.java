@@ -600,7 +600,15 @@ final class OrphanGc implements AutoCloseable {
     }
 
     private Confirmation confirm(StrataNamespace ns, ChunkId chunkId) {
+        // Bind destructive confirmation to the chunk's on-disk namespace, full ChunkId (including
+        // FileId), and this node. A same FileId in another namespace is a different logical file and
+        // must never keep this chunk alive through a cross-namespace lookup fallback.
         byte[] req = new Messages.ConfirmOrphan(ns, chunkId, nodeId).encode();
+        // System metadata generations are eligible for orphan GC, but access to the reserved
+        // strata-meta namespace remains scoped to the internal metadata role.
+        byte clientKind = "strata-meta".equals(ns.value())
+                ? ScpClient.KIND_METADATA
+                : ScpClient.KIND_TOOL;
         ConfirmFailure lastFailure = null;
         for (String ep : controllerEndpoints) {
             Endpoint endpoint;
@@ -612,7 +620,7 @@ final class OrphanGc implements AutoCloseable {
                 continue;
             }
             try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(),
-                    ScpClient.KIND_TOOL, "orphan-confirm")) {
+                    clientKind, "orphan-confirm")) {
                 ByteBuffer resp = client.call(Opcode.CONFIRM_ORPHAN, req, null, confirmTimeoutMs);
                 Messages.ConfirmOrphanResp r = Messages.ConfirmOrphanResp.decode(resp);
                 ConfirmFailure ownerEpochFailure = confirmOwnerEpochFailure(ns, r.ownerEpoch(), ep);

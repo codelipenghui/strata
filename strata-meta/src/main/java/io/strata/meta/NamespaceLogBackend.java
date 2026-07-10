@@ -35,8 +35,8 @@ import java.util.function.Predicate;
  * straight to {@code root}, and — crucially — <b>without taking any namespace lock</b>: a user-namespace
  * mutation holds <em>that namespace's</em> lock while it writes its metadata-log file, which (with a
  * replicated-chunk file store) self-loops back into this engine for the system file; if that re-took a
- * namespace lock it would deadlock. {@code getFile(fileId)} has no namespace, so it checks the in-memory
- * user index lock-free, then falls back to the root (system files are only ever in the root).
+ * namespace lock it would deadlock. Namespace-scoped file lookup therefore sends the system namespace
+ * directly to the root without a repo lock, while user namespaces read their own repo under its lock.
  *
  * <p>A single engine is shared across {@link NamespaceLogMetadataStore} handles so multiple in-process
  * leaders observe one consistent log per namespace; cross-process single-writer is enforced by ownership
@@ -812,7 +812,8 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
         return withRepoReacquiringOnFence(record.namespace(), repo -> {
             NamespaceMetadataState state = repo.state();
             Optional<Records.FileRecord> current = state.file(record.fileId());
-            if (current.isEmpty() || state.version(record.fileId()) != expectedVersion) {
+            if (current.isEmpty() || !current.get().namespace().equals(record.namespace())
+                    || state.version(record.fileId()) != expectedVersion) {
                 return false;
             }
             for (MetadataLogRecord r : MetadataLogDiff.diff(current.get(), record)) {

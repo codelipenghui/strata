@@ -14,6 +14,7 @@ import io.strata.proto.ScpClient;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -35,22 +36,39 @@ import java.util.function.Function;
 final class ControllerClient implements AutoCloseable {
     private final ClientConfig config;
     private final List<String> seeds;                       // configured controllers used to bootstrap/round-robin
+    private final byte clientKind;
+    private final String clientId;
     private final Map<String, ManagedScpConnection> conns = new ConcurrentHashMap<>();
     private final Map<Object, String> ownerByKey = new ConcurrentHashMap<>(); // namespace -> owner endpoint
     private final AtomicInteger seedCursor = new AtomicInteger();
 
     ControllerClient(ClientConfig config) {
+        this(config, ScpClient.KIND_BROKER, "strata-client");
+    }
+
+    ControllerClient(ClientConfig config, byte clientKind, String clientId) {
         this.config = config;
         this.seeds = List.copyOf(config.controllerEndpoints());
+        if (clientKind != ScpClient.KIND_BROKER
+                && clientKind != ScpClient.KIND_DATA_NODE
+                && clientKind != ScpClient.KIND_METADATA
+                && clientKind != ScpClient.KIND_TOOL) {
+            throw new IllegalArgumentException("unknown clientKind: " + Byte.toUnsignedInt(clientKind));
+        }
+        this.clientKind = clientKind;
+        this.clientId = Objects.requireNonNull(clientId, "clientId");
         if (seeds.isEmpty()) {
             throw new IllegalArgumentException("at least one controller endpoint is required");
+        }
+        if (clientId.isBlank()) {
+            throw new IllegalArgumentException("clientId must not be blank");
         }
     }
 
     /** A lazily-opened, single-endpoint connection to one controller (auto-reconnecting, no rotation). */
     private ManagedScpConnection connFor(String endpoint) {
         return conns.computeIfAbsent(endpoint, e -> new ManagedScpConnection(List.of(e),
-                config.connectionPolicy(), ScpClient.KIND_BROKER, "strata-client", "controller " + e, false, true));
+                config.connectionPolicy(), clientKind, clientId, "controller " + e, false, true));
     }
 
     private String nextSeed() {

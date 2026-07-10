@@ -213,6 +213,108 @@ class ControllerTest {
         ScpException missing = assertThrows(ScpException.class, () -> client.call(Opcode.LOOKUP_PATH,
                 new Messages.LookupPath("test", "/namespace/topicA/0/segment-0").encode(), null, 5000));
         assertEquals(ErrorCode.FILE_NOT_FOUND, missing.code());
+
+        var stillInOtherNamespace = Messages.LookupPathResp.decode(client.call(Opcode.LOOKUP_PATH,
+                new Messages.LookupPath("test-alt", "/namespace/topicA/0/segment-0").encode(), null, 5000));
+        assertEquals(samePathOtherNamespace.fileId(), stillInOtherNamespace.fileId(),
+                "wrong-namespace delete must leave the other namespace's path bound");
+
+        var deleteOther = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
+                new Messages.DeleteFiles(StrataNamespace.of("test-alt"), List.of(samePathOtherNamespace.fileId())).encode(),
+                null, 5000));
+        assertEquals(List.of(ErrorCode.OK.code), deleteOther.codes());
+    }
+
+    @Test
+    void fileIdOperationsCannotCrossNamespaceBoundaries() throws Exception {
+        StrataNamespace owner = StrataNamespace.of("namespace-owner");
+        StrataNamespace wrong = StrataNamespace.of("namespace-wrong");
+        registerTrio("namespaceBoundaryHost");
+
+        var emptyFile = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile(owner, StrataPath.of("/namespace-boundary-empty"),
+                        new Messages.WritePolicy(3, 2, false)).encode(), null, 5000));
+        MetadataStore.Versioned<Records.FileRecord> emptyBefore =
+                metadataStore().getFile(owner, emptyFile.fileId()).orElseThrow();
+
+        ScpException lookup = assertThrows(ScpException.class, () -> client.call(Opcode.LOOKUP_FILE,
+                new Messages.LookupFile(wrong, emptyFile.fileId()).encode(), null, 5000));
+        assertEquals(ErrorCode.FILE_NOT_FOUND, lookup.code());
+
+        for (byte purpose : List.of(Messages.AllocateWriterEpoch.FOR_APPEND,
+                Messages.AllocateWriterEpoch.FOR_RECOVERY)) {
+            ScpException allocate = assertThrows(ScpException.class, () -> client.call(
+                    Opcode.ALLOCATE_WRITER_EPOCH,
+                    new Messages.AllocateWriterEpoch(wrong, emptyFile.fileId(), purpose).encode(), null, 5000));
+            assertEquals(ErrorCode.FILE_NOT_FOUND, allocate.code());
+        }
+
+        ScpException createChunk = assertThrows(ScpException.class, () -> client.call(Opcode.CREATE_CHUNK,
+                new Messages.CreateChunk(wrong, emptyFile.fileId(), 1, 401, 402).encode(), null, 5000));
+        assertEquals(ErrorCode.FILE_NOT_FOUND, createChunk.code());
+
+        ScpException sealFile = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_FILE,
+                new Messages.SealFile(wrong, emptyFile.fileId(), 0).encode(), null, 5000));
+        assertEquals(ErrorCode.FILE_NOT_FOUND, sealFile.code());
+        assertEquals(emptyBefore, metadataStore().getFile(owner, emptyFile.fileId()).orElseThrow(),
+                "wrong-namespace file operations must not mutate the owning record");
+
+        var chunkedFile = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile(owner, StrataPath.of("/namespace-boundary-chunked"),
+                        new Messages.WritePolicy(3, 2, false)).encode(), null, 5000));
+        var create = new Messages.CreateChunk(owner, chunkedFile.fileId(), 1, 501, 502);
+        Messages.CreateChunkResp chunk = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
+                create.encode(), null, 5000));
+        MetadataStore.Versioned<Records.FileRecord> chunkedBefore =
+                metadataStore().getFile(owner, chunkedFile.fileId()).orElseThrow();
+
+        client.call(Opcode.ABORT_CHUNK_META,
+                new Messages.AbortChunkMeta(wrong, chunk.chunkId(), 1,
+                        create.opIdMsb(), create.opIdLsb()).encode(), null, 5000);
+        assertEquals(chunkedBefore, metadataStore().getFile(owner, chunkedFile.fileId()).orElseThrow(),
+                "wrong-namespace abort must be an idempotent no-op");
+
+        ScpException sealChunk = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
+                new Messages.SealChunkMeta(wrong, chunk.chunkId(), 1, 10, 0xA, List.of()).encode(), null, 5000));
+        assertEquals(ErrorCode.FILE_NOT_FOUND, sealChunk.code());
+
+        Messages.DeleteFilesResp delete = Messages.DeleteFilesResp.decode(client.call(Opcode.DELETE_FILES,
+                new Messages.DeleteFiles(wrong, List.of(chunkedFile.fileId())).encode(), null, 5000));
+        assertEquals(List.of(ErrorCode.OK.code), delete.codes(),
+                "wrong-namespace delete preserves the missing-delete idempotency contract");
+        assertEquals(chunkedBefore, metadataStore().getFile(owner, chunkedFile.fileId()).orElseThrow(),
+                "wrong-namespace delete must not mutate the record, version, or chunks");
+        assertEquals(chunkedFile.fileId(),
+                metadataStore().resolvePath(owner, StrataPath.of("/namespace-boundary-chunked")).orElseThrow(),
+                "wrong-namespace delete must not unbind the owning namespace's path");
+    }
+
+    @Test
+    void controllerRejectsAndCountsAStoreNamespaceContractViolation() throws Exception {
+        StrataNamespace owner = StrataNamespace.of("contract-owner");
+        StrataNamespace requested = StrataNamespace.of("contract-requested");
+        var created = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
+                new Messages.CreateFile(owner, StrataPath.of("/contract-violation"),
+                        Messages.WritePolicy.DEFAULT).encode(), null, 5000));
+        MetadataStore.Versioned<Records.FileRecord> foreign =
+                metadataStore().getFile(owner, created.fileId()).orElseThrow();
+
+        NamespaceContractViolatingStore violating =
+                new NamespaceContractViolatingStore(metadataStore(), created.fileId(), foreign);
+        MetadataStore original = replaceStore(violating);
+        long violationsBefore = service.metadataStoreNamespaceContractViolations();
+        try {
+            ScpException lookup = assertThrows(ScpException.class, () -> client.call(Opcode.LOOKUP_FILE,
+                    new Messages.LookupFile(requested, created.fileId()).encode(), null, 5000));
+
+            assertEquals(ErrorCode.FILE_NOT_FOUND, lookup.code());
+            assertEquals(violationsBefore + 1, service.metadataStoreNamespaceContractViolations(),
+                    "the Controller defense must surface a backend namespace-contract violation");
+            assertEquals(1, violating.getFileCalls,
+                    "the regression must exercise the contract-violating store directly");
+        } finally {
+            replaceStore(original);
+        }
     }
 
     @Test
@@ -745,6 +847,26 @@ class ControllerTest {
                                   FileId expectedFileId) {
             deletePathCalls++;
             return false;
+        }
+    }
+
+    private static final class NamespaceContractViolatingStore extends DelegatingMetadataStore {
+        private final FileId fileId;
+        private final Versioned<Records.FileRecord> foreign;
+        private int getFileCalls;
+
+        private NamespaceContractViolatingStore(MetadataStore delegate, FileId fileId,
+                                                Versioned<Records.FileRecord> foreign) {
+            super(delegate);
+            this.fileId = fileId;
+            this.foreign = foreign;
+        }
+
+        @Override
+        public Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id)
+                throws Exception {
+            getFileCalls++;
+            return fileId.equals(id) ? Optional.of(foreign) : super.getFile(namespace, id);
         }
     }
 

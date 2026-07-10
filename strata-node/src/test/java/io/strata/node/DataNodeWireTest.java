@@ -52,6 +52,18 @@ class DataNodeWireTest {
     private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
 
     @Test
+    void dataDirectoryRequiresExistingParentForDurableCreation() {
+        Path missingParent = dir.resolve("missing");
+        Path nodeDir = missingParent.resolve("node-1");
+
+        assertThrows(IOException.class, () -> {
+            try (DataNode ignored = new DataNode(DataNodeConfig.standalone(nodeDir))) {}
+        });
+        assertFalse(Files.exists(missingParent),
+                "node startup must not create an unanchored data-directory ancestor chain");
+    }
+
+    @Test
     void failedServerBindLeavesDataDirReusable() throws Exception {
         Path nodeDir = dir.resolve("node");
         try (ServerSocket blocker = new ServerSocket(0)) {
