@@ -618,6 +618,368 @@ class RecoveryTest {
     }
 
     @Test
+    void emptyEndpointDescriptorBlocksInsteadOfTruncatingAckedTail() throws Exception {
+        FileId fileId = FileId.of(52);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean laggingAppend = new AtomicBoolean();
+        AtomicBoolean holderSeal = new AtomicBoolean();
+        AtomicBoolean laggingSeal = new AtomicBoolean();
+        byte[] data = new byte[] {1, 2, 3, 4};
+        List<Messages.LedgerEntry> ledger = List.of(
+                new Messages.LedgerEntry(data.length, Crc.of(data), 1));
+
+        try (ScpServer holder = ledgerOrderingReplica(1, data.length, ledger, data, null, holderSeal);
+             ScpServer lagging = ledgerOrderingReplica(3, 0, List.of(), data, laggingAppend, laggingSeal);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(holder)),
+                             new Messages.Replica(2, ""),
+                             new Messages.Replica(3, endpoint(lagging))))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                                .recoverAndSeal(fileId, 2));
+
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
+                assertTrue(e.getMessage().contains("unresolved replica classification"));
+                assertEquals(null, sealedFileLength.get());
+                assertFalse(laggingAppend.get());
+                assertFalse(holderSeal.get());
+                assertFalse(laggingSeal.get());
+            }
+        }
+    }
+
+    @Test
+    void chunkNotFoundFenceBlocksInsteadOfPromotingSingleReplicaTail() throws Exception {
+        FileId fileId = FileId.of(53);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean laggingAppend = new AtomicBoolean();
+        AtomicBoolean holderSeal = new AtomicBoolean();
+        AtomicBoolean laggingSeal = new AtomicBoolean();
+        AtomicBoolean missingFenceCalled = new AtomicBoolean();
+        byte[] data = new byte[] {1, 2, 3, 4};
+        List<Messages.LedgerEntry> ledger = List.of(
+                new Messages.LedgerEntry(data.length, Crc.of(data), 1));
+
+        try (ScpServer holder = ledgerOrderingReplica(1, data.length, ledger, data, null, holderSeal);
+             ScpServer lagging = ledgerOrderingReplica(2, 0, List.of(), data, laggingAppend, laggingSeal);
+             ScpServer missing = new ScpServer(0, 3, 0, 0, req -> {
+                 Opcode op = Opcode.fromCode(req.opcode());
+                 if (op == Opcode.FENCE) {
+                     missingFenceCalled.set(true);
+                     throw new ScpException(ErrorCode.CHUNK_NOT_FOUND, "chunk is not installed");
+                 }
+                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+             });
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(holder)),
+                             new Messages.Replica(2, endpoint(lagging)),
+                             new Messages.Replica(3, endpoint(missing))))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                                .recoverAndSeal(fileId, 2));
+
+                assertTrue(missingFenceCalled.get());
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
+                assertTrue(e.getMessage().contains("unresolved replica classification"));
+                assertEquals(null, sealedFileLength.get());
+                assertFalse(laggingAppend.get());
+                assertFalse(holderSeal.get());
+                assertFalse(laggingSeal.get());
+            }
+        }
+    }
+
+    @Test
+    void malformedFenceResponseBlocksInsteadOfPromotingSingleReplicaTail() throws Exception {
+        FileId fileId = FileId.of(57);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean laggingAppend = new AtomicBoolean();
+        AtomicBoolean holderSeal = new AtomicBoolean();
+        AtomicBoolean laggingSeal = new AtomicBoolean();
+        byte[] data = new byte[] {1, 2, 3, 4};
+        List<Messages.LedgerEntry> ledger = List.of(
+                new Messages.LedgerEntry(data.length, Crc.of(data), 1));
+
+        try (ScpServer holder = ledgerOrderingReplica(1, data.length, ledger, data, null, holderSeal);
+             ScpServer lagging = ledgerOrderingReplica(2, 0, List.of(), data, laggingAppend, laggingSeal);
+             ScpServer malformed = new ScpServer(0, 3, 0, 0, req -> {
+                 Opcode op = Opcode.fromCode(req.opcode());
+                 if (op == Opcode.FENCE) {
+                     return ScpServer.ok(req, new byte[] {0}, null);
+                 }
+                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+             });
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(holder)),
+                             new Messages.Replica(2, endpoint(lagging)),
+                             new Messages.Replica(3, endpoint(malformed))))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                                .recoverAndSeal(fileId, 2));
+
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
+                assertEquals(null, sealedFileLength.get());
+                assertFalse(laggingAppend.get());
+                assertFalse(holderSeal.get());
+                assertFalse(laggingSeal.get());
+            }
+        }
+    }
+
+    @Test
+    void sealedReplicaFastPathBlocksOnUnresolvedHigherTail() throws Exception {
+        FileId fileId = FileId.of(58);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean sealedReplicaSeal = new AtomicBoolean();
+        AtomicBoolean higherReplicaSeal = new AtomicBoolean();
+        byte[] data = new byte[] {1, 2, 3, 4, 5, 6, 7, 8};
+        List<Messages.LedgerEntry> ledger = List.of(
+                new Messages.LedgerEntry(data.length, Crc.of(data), 1));
+
+        try (ScpServer sealed = sealedFenceReplica(1, 4, 777, sealedReplicaSeal);
+             ScpServer higher = ledgerOrderingReplica(2, data.length, ledger, data, null, higherReplicaSeal);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(sealed)),
+                             new Messages.Replica(2, endpoint(higher)),
+                             new Messages.Replica(3, "")))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                                .recoverAndSeal(fileId, 2));
+
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
+                assertEquals(null, sealedFileLength.get());
+                assertFalse(sealedReplicaSeal.get());
+                assertFalse(higherReplicaSeal.get());
+            }
+        }
+    }
+
+    @Test
+    void sealedReplicaFastPathBlocksOnTransportUnreachableHigherTailHolder() throws Exception {
+        FileId fileId = FileId.of(59);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean sealedReplicaSeal = new AtomicBoolean();
+        AtomicBoolean higherReplicaSeal = new AtomicBoolean();
+        byte[] data = new byte[] {1, 2, 3, 4, 5, 6, 7, 8};
+        List<Messages.LedgerEntry> ledger = List.of(
+                new Messages.LedgerEntry(data.length, Crc.of(data), 1));
+
+        try (ScpServer sealed = sealedFenceReplica(1, 4, 777, sealedReplicaSeal);
+             ScpServer higher = ledgerOrderingReplica(2, data.length, ledger, data, null, higherReplicaSeal);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(sealed)),
+                             new Messages.Replica(2, endpoint(higher)),
+                             new Messages.Replica(3, "127.0.0.1:1")))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                                .recoverAndSeal(fileId, 2));
+
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
+                assertEquals(null, sealedFileLength.get());
+                assertFalse(sealedReplicaSeal.get());
+                assertFalse(higherReplicaSeal.get());
+            }
+        }
+    }
+
+    @Test
+    void sealedReplicaFastPathBlocksOnReachableHigherTailQuorum() throws Exception {
+        FileId fileId = FileId.of(60);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean sealedReplicaSeal = new AtomicBoolean();
+        AtomicBoolean higherASeal = new AtomicBoolean();
+        AtomicBoolean higherBSeal = new AtomicBoolean();
+        byte[] data = new byte[] {1, 2, 3, 4, 5, 6, 7, 8};
+        List<Messages.LedgerEntry> ledger = List.of(
+                new Messages.LedgerEntry(data.length, Crc.of(data), 1));
+
+        try (ScpServer sealed = sealedFenceReplica(1, 4, 777, sealedReplicaSeal);
+             ScpServer higherA = ledgerOrderingReplica(2, data.length, ledger, data, null, higherASeal);
+             ScpServer higherB = ledgerOrderingReplica(3, data.length, ledger, data, null, higherBSeal);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(sealed)),
+                             new Messages.Replica(2, endpoint(higherA)),
+                             new Messages.Replica(3, endpoint(higherB))))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                                .recoverAndSeal(fileId, 2));
+
+                assertEquals(ErrorCode.SEAL_RECOVERY_BLOCKED, e.code());
+                assertEquals(null, sealedFileLength.get());
+                assertFalse(sealedReplicaSeal.get());
+                assertFalse(higherASeal.get());
+                assertFalse(higherBSeal.get());
+            }
+        }
+    }
+
+    @Test
+    void sealedReplicaFastPathAcceptsSealedPointWhenSingleHigherTailCannotReachQuorum() throws Exception {
+        FileId fileId = FileId.of(61);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean sealedReplicaSeal = new AtomicBoolean();
+        AtomicBoolean higherReplicaSeal = new AtomicBoolean();
+        AtomicBoolean matchingReplicaSeal = new AtomicBoolean();
+        byte[] higherData = new byte[] {1, 2, 3, 4, 5, 6, 7, 8};
+        byte[] matchingData = new byte[] {1, 2, 3, 4};
+        List<Messages.LedgerEntry> higherLedger = List.of(
+                new Messages.LedgerEntry(higherData.length, Crc.of(higherData), 1));
+        List<Messages.LedgerEntry> matchingLedger = List.of(
+                new Messages.LedgerEntry(matchingData.length, Crc.of(matchingData), 1));
+
+        try (ScpServer sealed = sealedFenceReplica(1, matchingData.length, 777, sealedReplicaSeal);
+             ScpServer higher = ledgerOrderingReplica(2, higherData.length, higherLedger, higherData,
+                     null, higherReplicaSeal);
+             ScpServer matching = ledgerOrderingReplica(3, matchingData.length, matchingLedger, matchingData,
+                     null, matchingReplicaSeal);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(sealed)),
+                             new Messages.Replica(2, endpoint(higher)),
+                             new Messages.Replica(3, endpoint(matching))))), sealedFileLength)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                StrataFile.SealInfo seal = new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                        .recoverAndSeal(fileId, 2);
+
+                assertEquals(matchingData.length, seal.sealedLength());
+                assertEquals((long) matchingData.length, sealedFileLength.get());
+                assertTrue(sealedReplicaSeal.get());
+                assertTrue(higherReplicaSeal.get());
+                assertTrue(matchingReplicaSeal.get());
+            }
+        }
+    }
+
+    @Test
+    void unsafeSealOverrideAllowsFloorSealWithUnresolvedDescriptor() throws Exception {
+        FileId fileId = FileId.of(54);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean laggingAppend = new AtomicBoolean();
+        AtomicBoolean holderSeal = new AtomicBoolean();
+        AtomicBoolean laggingSeal = new AtomicBoolean();
+        byte[] data = new byte[] {1, 2, 3, 4};
+        List<Messages.LedgerEntry> ledger = List.of(
+                new Messages.LedgerEntry(data.length, Crc.of(data), 1));
+
+        try (ScpServer holder = ledgerOrderingReplica(1, data.length, ledger, data, null, holderSeal);
+             ScpServer lagging = ledgerOrderingReplica(3, 0, List.of(), data, laggingAppend, laggingSeal);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(holder)),
+                             new Messages.Replica(2, ""),
+                             new Messages.Replica(3, endpoint(lagging))))), sealedFileLength);
+             AutoCloseable ignored = unsafeSealOverride(chunkId)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                        .recoverAndSeal(fileId, 2);
+
+                assertEquals(0, sealedInfo.sealedLength());
+                assertEquals(0L, sealedFileLength.get());
+                assertFalse(laggingAppend.get());
+                assertTrue(holderSeal.get());
+                assertTrue(laggingSeal.get());
+                assertEquals(null, System.getProperty(Recovery.UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY),
+                        "the unsafe override must be consumed after one matching recovery");
+            }
+        }
+    }
+
+    @Test
+    void emptyEndpointWithoutQuorumPossibleTailDoesNotConsumeOverride() throws Exception {
+        FileId fileId = FileId.of(55);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        String overrideKey = "test:" + chunkId;
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean floorASeal = new AtomicBoolean();
+        AtomicBoolean floorBSeal = new AtomicBoolean();
+
+        try (ScpServer floorA = openReplicaWithFenceAndSeal(1, 0, 0, 0, 777, floorASeal);
+             ScpServer floorB = openReplicaWithFenceAndSeal(3, 0, 0, 0, 777, floorBSeal);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(floorA)),
+                             new Messages.Replica(2, ""),
+                             new Messages.Replica(3, endpoint(floorB))))), sealedFileLength);
+             AutoCloseable ignored = unsafeSealOverride(chunkId)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                        .recoverAndSeal(fileId, 2);
+
+                assertEquals(0, sealedInfo.sealedLength());
+                assertEquals(0L, sealedFileLength.get());
+                assertTrue(floorASeal.get());
+                assertTrue(floorBSeal.get());
+                assertEquals(overrideKey, System.getProperty(Recovery.UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY),
+                        "an unnecessary unsafe override must remain available");
+            }
+        }
+    }
+
+    @Test
+    void emptyEndpointCoveredByReachableQuorumTailDoesNotBlockOrConsumeOverride() throws Exception {
+        FileId fileId = FileId.of(56);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        String overrideKey = "test:" + chunkId;
+        AtomicReference<Long> sealedFileLength = new AtomicReference<>();
+        AtomicBoolean holderASeal = new AtomicBoolean();
+        AtomicBoolean holderBSeal = new AtomicBoolean();
+        byte[] data = new byte[] {1, 2, 3, 4};
+        List<Messages.LedgerEntry> ledger = List.of(
+                new Messages.LedgerEntry(data.length, Crc.of(data), 1));
+
+        try (ScpServer holderA = ledgerOrderingReplica(1, data.length, ledger, data, null, holderASeal);
+             ScpServer holderB = ledgerOrderingReplica(2, data.length, ledger, data, null, holderBSeal);
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     lookup(chunk(chunkId, ChunkState.OPEN, 0, 1,
+                             new Messages.Replica(1, endpoint(holderA)),
+                             new Messages.Replica(2, endpoint(holderB)),
+                             new Messages.Replica(3, "")))), sealedFileLength);
+             AutoCloseable ignored = unsafeSealOverride(chunkId)) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                StrataFile.SealInfo sealedInfo = new Recovery(meta, pool, config, StrataNamespace.of("test"))
+                        .recoverAndSeal(fileId, 2);
+
+                assertEquals(data.length, sealedInfo.sealedLength());
+                assertEquals((long) data.length, sealedFileLength.get());
+                assertTrue(holderASeal.get());
+                assertTrue(holderBSeal.get());
+                assertEquals(overrideKey, System.getProperty(Recovery.UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY),
+                        "a covered descriptor outcome must not consume the unsafe override");
+            }
+        }
+    }
+
+    @Test
     void ackedTailSurvivesTransientReadFailureFromFencedHolder() throws Exception {
         // Issue #42: the second holder fenced successfully and reported end=4, but its READ_RECOVERY
         // transiently fails. That is holder evidence, unlike a CRC-mismatching read, so a single
@@ -1660,6 +2022,11 @@ class RecoveryTest {
     }
 
     private static ScpServer sealedFenceReplica(int nodeId, long length, int sealCrc) throws Exception {
+        return sealedFenceReplica(nodeId, length, sealCrc, null);
+    }
+
+    private static ScpServer sealedFenceReplica(int nodeId, long length, int sealCrc,
+                                                AtomicBoolean sealCalled) throws Exception {
         return new ScpServer(0, nodeId, 0, 0, req -> {
             Opcode op = Opcode.fromCode(req.opcode());
             if (op == Opcode.FENCE) {
@@ -1672,6 +2039,9 @@ class RecoveryTest {
                 return ScpServer.ok(req, new Messages.ReadResp(length, length).encode(), ByteBuffer.wrap(data));
             }
             if (op == Opcode.SEAL_CHUNK) {
+                if (sealCalled != null) {
+                    sealCalled.set(true);
+                }
                 Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
                 return ScpServer.ok(req, new Messages.SealResp(seal.dataLength(), sealCrc).encode(), null);
             }
@@ -1711,6 +2081,12 @@ class RecoveryTest {
 
     private static ScpServer ledgerOrderingReplica(int nodeId, long end, List<Messages.LedgerEntry> ledger,
                                                    byte[] data, AtomicBoolean appendCalled) throws Exception {
+        return ledgerOrderingReplica(nodeId, end, ledger, data, appendCalled, null);
+    }
+
+    private static ScpServer ledgerOrderingReplica(int nodeId, long end, List<Messages.LedgerEntry> ledger,
+                                                   byte[] data, AtomicBoolean appendCalled,
+                                                   AtomicBoolean sealCalled) throws Exception {
         return new ScpServer(0, nodeId, 0, 0, req -> {
             Opcode op = Opcode.fromCode(req.opcode());
             if (op == Opcode.FENCE) {
@@ -1734,6 +2110,9 @@ class RecoveryTest {
                         null);
             }
             if (op == Opcode.SEAL_CHUNK) {
+                if (sealCalled != null) {
+                    sealCalled.set(true);
+                }
                 Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
                 return ScpServer.ok(req, new Messages.SealResp(seal.dataLength(), 777).encode(), null);
             }

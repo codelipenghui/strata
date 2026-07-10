@@ -8,6 +8,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
+import io.strata.common.ScpProtocolException;
 import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 
@@ -987,8 +988,38 @@ class ClientServerTest {
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
             ScpException e = assertThrows(ScpException.class,
                     () -> client.call(Opcode.PING, emptyHeader(), null, 2000));
+            assertEquals(ScpProtocolException.class, e.getClass());
             assertEquals(ErrorCode.INTERNAL, e.code());
             assertEquals(true, client.isClosed());
+        }
+    }
+
+    @Test
+    void malformedFrameBytesBecomeTypedProtocolErrorAndCloseConnection() throws Exception {
+        try (ServerSocket server = new ServerSocket(0)) {
+            CompletableFuture<Void> peer = CompletableFuture.runAsync(() -> {
+                try (Socket socket = server.accept()) {
+                    DataInputStream in = new DataInputStream(socket.getInputStream());
+                    DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                    Frame hello = FrameIO.read(in);
+                    FrameIO.write(out, Frame.response(hello,
+                            new Messages.HelloResp(0, 7, 0, 0, FrameIO.MAX_FRAME_BYTES, 1024).encode(), null));
+                    FrameIO.read(in);
+                    out.writeInt(Frame.PREAMBLE_AFTER_LEN - 1);
+                    out.flush();
+                } catch (Exception e) {
+                    throw new CompletionException(e);
+                }
+            });
+
+            try (ScpClient client = new ScpClient("127.0.0.1", server.getLocalPort(),
+                    ScpClient.KIND_TOOL, "bad-frame")) {
+                ScpProtocolException e = assertThrows(ScpProtocolException.class,
+                        () -> client.callFrame(Opcode.PING, emptyHeader(), null, 2_000));
+                assertTrue(e.getMessage().contains("bad frame length"));
+                assertTrue(client.isClosed());
+            }
+            peer.get(3, TimeUnit.SECONDS);
         }
     }
 
@@ -1108,7 +1139,7 @@ class ClientServerTest {
     }
 
     @Test
-    void wrongOpcodeHandshakeClosesSocketAndThrowsIOException() throws Exception {
+    void wrongOpcodeHandshakeClosesSocketAndThrowsProtocolError() throws Exception {
         try (ServerSocket server = new ServerSocket(0)) {
             CompletableFuture<Boolean> sawClientClose = CompletableFuture.supplyAsync(() -> {
                 try (Socket socket = server.accept()) {
@@ -1129,7 +1160,7 @@ class ClientServerTest {
                 }
             });
 
-            IOException e = assertThrows(IOException.class,
+            ScpProtocolException e = assertThrows(ScpProtocolException.class,
                     () -> new ScpClient("127.0.0.1", server.getLocalPort(), ScpClient.KIND_TOOL, "bad"));
             assertTrue(e.getMessage().contains("handshake failed"));
             assertTrue(sawClientClose.get(3, TimeUnit.SECONDS),
@@ -1138,7 +1169,7 @@ class ClientServerTest {
     }
 
     @Test
-    void nonResponseHelloFrameClosesSocketAndThrowsIOException() throws Exception {
+    void nonResponseHelloFrameClosesSocketAndThrowsProtocolError() throws Exception {
         try (ServerSocket server = new ServerSocket(0)) {
             CompletableFuture<Boolean> sawClientClose = CompletableFuture.supplyAsync(() -> {
                 try (Socket socket = server.accept()) {
@@ -1159,7 +1190,7 @@ class ClientServerTest {
                 }
             });
 
-            IOException e = assertThrows(IOException.class,
+            ScpProtocolException e = assertThrows(ScpProtocolException.class,
                     () -> new ScpClient("127.0.0.1", server.getLocalPort(), ScpClient.KIND_TOOL, "bad"));
             assertTrue(e.getMessage().contains("handshake failed"));
             assertTrue(sawClientClose.get(3, TimeUnit.SECONDS),
@@ -1187,7 +1218,7 @@ class ClientServerTest {
     }
 
     @Test
-    void malformedSuccessfulHandshakeClosesSocketAndThrowsIOException() throws Exception {
+    void malformedSuccessfulHandshakeClosesSocketAndThrowsProtocolError() throws Exception {
         try (ServerSocket server = new ServerSocket(0)) {
             CompletableFuture<Boolean> sawClientClose = CompletableFuture.supplyAsync(() -> {
                 try (Socket socket = server.accept()) {
@@ -1206,7 +1237,7 @@ class ClientServerTest {
                 }
             });
 
-            IOException e = assertThrows(IOException.class,
+            ScpProtocolException e = assertThrows(ScpProtocolException.class,
                     () -> new ScpClient("127.0.0.1", server.getLocalPort(), ScpClient.KIND_TOOL, "bad"));
             assertTrue(e.getMessage().contains("malformed handshake response"));
             assertEquals(true, sawClientClose.get(3, TimeUnit.SECONDS),

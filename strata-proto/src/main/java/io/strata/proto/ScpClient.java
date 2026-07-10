@@ -14,7 +14,9 @@ import io.netty.util.concurrent.ScheduledFuture;
 import io.strata.common.ConnectionPolicy;
 import io.strata.common.EnvConfig;
 import io.strata.common.ErrorCode;
+import io.strata.common.ScpConnectionException;
 import io.strata.common.ScpException;
+import io.strata.common.ScpProtocolException;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -100,7 +102,7 @@ public final class ScpClient implements AutoCloseable {
 
             Frame helloResp = awaitHandshake(connectTimeoutMs);
             if (helloResp == null || helloResp.opcode() != Opcode.HELLO.code || !helloResp.isResponse()) {
-                throw new IOException("handshake failed");
+                throw new ScpProtocolException("handshake failed");
             }
             ByteBuffer hb = helloResp.headerSlice();
             try {
@@ -109,7 +111,7 @@ public final class ScpClient implements AutoCloseable {
             } catch (ScpException e) {
                 throw e;
             } catch (RuntimeException e) {
-                throw new IOException("malformed handshake response: " + e, e);
+                throw new ScpProtocolException("malformed handshake response: " + e, e);
             }
         } catch (IOException | RuntimeException e) {
             closeChannel(connected);
@@ -188,7 +190,8 @@ public final class ScpClient implements AutoCloseable {
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            failAll(asIOException(cause));
+            ScpProtocolException protocolFailure = protocolFailure(cause);
+            failAll(protocolFailure != null ? protocolFailure : asIOException(cause));
             ctx.close();
         }
     }
@@ -325,7 +328,7 @@ public final class ScpClient implements AutoCloseable {
             throw e;
         } catch (RuntimeException e) {
             close();
-            throw new ScpException(ErrorCode.INTERNAL, "malformed response for " + op + ": " + e);
+            throw new ScpProtocolException("malformed response for " + op + ": " + e, e);
         }
         return hb;
     }
@@ -336,11 +339,15 @@ public final class ScpClient implements AutoCloseable {
         try {
             return fut.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (ExecutionException e) {
-            if (e.getCause() instanceof ScpException se) throw se;
-            throw new ScpException(ErrorCode.INTERNAL, String.valueOf(e.getCause()));
+            Throwable cause = e.getCause();
+            if (cause instanceof ScpException se) throw se;
+            if (cause instanceof IOException io) {
+                throw new ScpConnectionException(String.valueOf(io), io);
+            }
+            throw new ScpException(ErrorCode.INTERNAL, String.valueOf(cause));
         } catch (TimeoutException e) {
-            ScpException timeout = new ScpException(ErrorCode.INTERNAL,
-                    "timeout after " + timeoutMs + "ms for " + op);
+            ScpConnectionException timeout = new ScpConnectionException(
+                    "timeout after " + timeoutMs + "ms for " + op, e);
             fut.completeExceptionally(timeout); // releases the correlation entry (cleanup hook)
             close();
             throw timeout;
@@ -362,11 +369,15 @@ public final class ScpClient implements AutoCloseable {
         try {
             return fut.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (ExecutionException e) {
-            if (e.getCause() instanceof ScpException se) throw se;
-            throw new ScpException(ErrorCode.INTERNAL, String.valueOf(e.getCause()));
+            Throwable cause = e.getCause();
+            if (cause instanceof ScpException se) throw se;
+            if (cause instanceof IOException io) {
+                throw new ScpConnectionException(String.valueOf(io), io);
+            }
+            throw new ScpException(ErrorCode.INTERNAL, String.valueOf(cause));
         } catch (TimeoutException e) {
-            ScpException timeout = new ScpException(ErrorCode.INTERNAL,
-                    "timeout after " + timeoutMs + "ms for " + op);
+            ScpConnectionException timeout = new ScpConnectionException(
+                    "timeout after " + timeoutMs + "ms for " + op, e);
             fut.completeExceptionally(timeout);
             close();
             throw timeout;
@@ -418,5 +429,22 @@ public final class ScpClient implements AutoCloseable {
             return io;
         }
         return new IOException(String.valueOf(cause), cause);
+    }
+
+    private static ScpProtocolException protocolFailure(Throwable cause) {
+        Throwable current = cause;
+        while (current != null) {
+            if (current instanceof ScpProtocolException protocol) {
+                return protocol;
+            }
+            if (current instanceof ScpProtocolIOException) {
+                return new ScpProtocolException(current.getMessage(), current);
+            }
+            if (current.getCause() == current) {
+                break;
+            }
+            current = current.getCause();
+        }
+        return null;
     }
 }

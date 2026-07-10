@@ -287,7 +287,13 @@ public final class ManagedScpConnection implements AutoCloseable {
     private RuntimeException classifyFailure(ScpClient seen, RuntimeException e) {
         boolean connectionClosed = seen != null && seen.isClosed();
         invalidateClosed(seen);
-        if (connectionClosed && !(e instanceof ScpConnectionException)) {
+        // ScpClient classifies transport failures at their source. Preserve every protocol/server
+        // ScpException even if the peer closes immediately after its response; reclassifying solely
+        // from the later closed state can turn FENCED_EPOCH or malformed data into holder credit.
+        if (e instanceof ScpException) {
+            return e;
+        }
+        if (connectionClosed) {
             return new ScpConnectionException(endpointLabel + " connection failed: " + e.getMessage(), e);
         }
         return e;

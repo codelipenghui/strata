@@ -29,30 +29,34 @@ public final class FrameIO {
 
     static void checkFrameLength(int frameLen) throws IOException {
         if (frameLen < Frame.PREAMBLE_AFTER_LEN || frameLen > MAX_FRAME_BYTES) {
-            throw new IOException("bad frame length " + frameLen);
+            throw new ScpProtocolIOException("bad frame length " + frameLen);
         }
     }
 
     static void checkMagicAndVersion(byte magic, byte version) throws IOException {
-        if (magic != Frame.MAGIC) throw new IOException("bad magic 0x" + Integer.toHexString(magic & 0xFF));
-        if (version != Frame.FRAME_VERSION) throw new IOException("unsupported frame version " + version);
+        if (magic != Frame.MAGIC) {
+            throw new ScpProtocolIOException("bad magic 0x" + Integer.toHexString(magic & 0xFF));
+        }
+        if (version != Frame.FRAME_VERSION) {
+            throw new ScpProtocolIOException("unsupported frame version " + version);
+        }
     }
 
     static void checkBodyGeometry(int frameLen, int headerLen, int payloadLen) throws IOException {
         if (payloadLen < 0) {
             // a negative payload length can satisfy the equality check below (26+1+(-1)=26) and
             // would blow up later as an unchecked IndexOutOfBounds — reject it as protocol error
-            throw new IOException("negative payload length " + payloadLen);
+            throw new ScpProtocolIOException("negative payload length " + payloadLen);
         }
         if (Frame.PREAMBLE_AFTER_LEN + headerLen + payloadLen != frameLen) {
-            throw new IOException("frame length mismatch: " + frameLen
+            throw new ScpProtocolIOException("frame length mismatch: " + frameLen
                     + " vs header=" + headerLen + " payload=" + payloadLen);
         }
     }
 
     static void checkPayloadCrc(int expected, int actual) throws IOException {
         if (actual != expected) {
-            throw new IOException("payload crc mismatch: expected " + expected + " got " + actual);
+            throw new ScpProtocolIOException("payload crc mismatch: expected " + expected + " got " + actual);
         }
     }
 

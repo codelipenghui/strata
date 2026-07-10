@@ -6,6 +6,7 @@ import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.FileState;
+import io.strata.common.ScpConnectionException;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.proto.Frame;
@@ -37,11 +38,12 @@ import static io.strata.common.Checks.addChunkLength;
  * in the descriptor.
  *
  * Tolerance: a batch above the durable floor is re-replicated to quorum when it could still have
- * been producer-acked — i.e. it is held by an ackQuorum once the replicas we could not fence are
- * counted as possible holders (§7.3 step 3 / issue #29). This preserves an acked batch whose other
- * holder is merely unreachable, even when RF &gt; ackQuorum. A batch that — with every replica
- * reachable — never reached ackQuorum (a never-acked dirty tail), and a divergent split, are
- * truncated at the floor.
+ * been producer-acked — i.e. it is held by an ackQuorum once known-endpoint replicas that could not
+ * be fenced are counted as possible holders (§7.3 step 3 / issue #29). This preserves an acked batch
+ * whose other holder is merely transport-unreachable, even when RF &gt; ackQuorum. Empty descriptor
+ * endpoints, replicas reporting no installed chunk, and untrusted FENCE responses do not promote a
+ * sub-quorum tail; when any such outcome leaves truncation versus promotion ambiguous, recovery
+ * blocks for retry or an explicit unsafe override (issue #120).
  */
 final class Recovery {
     private static final Logger log = LoggerFactory.getLogger(Recovery.class);
@@ -88,6 +90,25 @@ final class Recovery {
 
         int recoveryEpoch() {
             return recoveryEpoch;
+        }
+    }
+
+    /** Explicit FENCE classifications; only transport-unreachable replicas retain issue #29 credit. */
+    private static final class FenceOutcomes {
+        final List<ReplicaState> reachable = new ArrayList<>();
+        final List<Integer> transportUnreachableNodeIds = new ArrayList<>();
+        final List<Integer> unresolvedDescriptorNodeIds = new ArrayList<>();
+        final List<Integer> currentlyAbsentNodeIds = new ArrayList<>();
+        final List<Integer> untrustedFenceNodeIds = new ArrayList<>();
+
+        int promotionCredits() {
+            return transportUnreachableNodeIds.size();
+        }
+
+        int unresolvedClassificationSlots() {
+            return unresolvedDescriptorNodeIds.size()
+                    + currentlyAbsentNodeIds.size()
+                    + untrustedFenceNodeIds.size();
         }
     }
 
@@ -139,12 +160,19 @@ final class Recovery {
                               boolean maySealAbandonedEmptyTail) {
         ChunkId chunkId = chunk.chunkId();
 
-        // 1. fence all reachable replicas; collect their state
-        int placedReplicas = 0;
-        List<ReplicaState> reachable = new ArrayList<>();
+        // 1. fence all reachable replicas; collect their state. Keep non-reachable outcomes
+        // explicit: issue #29 gives known-endpoint FENCE failures legacy possible-holder credit,
+        // while issue #120 requires empty descriptors, CHUNK_NOT_FOUND, and untrusted responses to
+        // remain fail-closed ambiguity instead of either disappearing or promoting a sub-quorum tail.
+        FenceOutcomes fenceOutcomes = new FenceOutcomes();
+        List<ReplicaState> reachable = fenceOutcomes.reachable;
         for (Messages.Replica r : chunk.replicas()) {
-            if (r.endpoint().isEmpty()) continue;
-            placedReplicas++;
+            if (r.endpoint().isEmpty()) {
+                fenceOutcomes.unresolvedDescriptorNodeIds.add(r.nodeId());
+                log.warn("fence {} cannot resolve endpoint for descriptor replica {}; retaining ambiguity",
+                        chunkId, r.nodeId());
+                continue;
+            }
             try {
                 ByteBuffer h = appendPool.get(r.endpoint()).call(Opcode.FENCE,
                         new Messages.Fence(chunkId, writerEpoch, namespace).encode(), null, config.callTimeoutMs());
@@ -155,14 +183,31 @@ final class Recovery {
                 if (e.code() == ErrorCode.FENCED_EPOCH) {
                     throw e;
                 }
+                if (e.code() == ErrorCode.CHUNK_NOT_FOUND) {
+                    fenceOutcomes.currentlyAbsentNodeIds.add(r.nodeId());
+                    log.warn("fence {} on {} reports no installed chunk; excluding replica {} from holder "
+                                    + "credit and retaining historical ambiguity",
+                            chunkId, r.endpoint(), r.nodeId());
+                    continue;
+                }
+                if (e instanceof ScpConnectionException) {
+                    fenceOutcomes.transportUnreachableNodeIds.add(r.nodeId());
+                    log.warn("fence {} on {} is transport-unreachable: {}; retaining issue #29 holder credit",
+                            chunkId, r.endpoint(), e.getMessage());
+                    continue;
+                }
+                fenceOutcomes.untrustedFenceNodeIds.add(r.nodeId());
                 if (e.code() == ErrorCode.PRECONDITION_FAILED) {
                     log.error("fence {} on {} returned an inconsistent persisted epoch: {}",
                             chunkId, r.endpoint(), e.getMessage());
                 } else {
-                    log.warn("fence {} on {} failed: {}", chunkId, r.endpoint(), e.getMessage());
+                    log.warn("fence {} on {} failed without a trustworthy holder classification: {}",
+                            chunkId, r.endpoint(), e.getMessage());
                 }
             } catch (RuntimeException e) {
-                log.warn("fence {} on {} returned malformed response: {}", chunkId, r.endpoint(), e.toString());
+                fenceOutcomes.untrustedFenceNodeIds.add(r.nodeId());
+                log.warn("fence {} on {} returned malformed response; retaining ambiguity: {}",
+                        chunkId, r.endpoint(), e.toString());
             }
         }
         if (maySealAbandonedEmptyTail && reachable.size() < ackQuorum) {
@@ -172,11 +217,11 @@ final class Recovery {
         }
         requireQuorum(chunkId, reachable, ackQuorum);
 
-        // Replicas we could not fence may still hold bytes we cannot see. A batch above the floor
-        // could therefore have reached ackQuorum (i.e. been producer-acked) even if fewer than
-        // ackQuorum reachable replicas hold it (issue #29). Captured before any later eviction so
-        // it counts only genuinely-unreachable replicas, not stale ones we inspected and dropped.
-        final int unreachableReplicas = placedReplicas - reachable.size();
+        // Known-endpoint replicas we could not fence may still hold bytes we cannot see. A batch
+        // above the floor could therefore have reached ackQuorum even if fewer than ackQuorum
+        // reachable replicas hold it (issue #29). Empty descriptors, CHUNK_NOT_FOUND, and untrusted
+        // responses are not promotion credit; the final ambiguity gate handles them without choosing a tail.
+        final int unreachableReplicas = fenceOutcomes.promotionCredits();
 
         // The highest piggybacked DO is the recovery floor: bytes below it were quorum-durable.
         // A sealed replica shorter than this floor is not an authoritative mid-seal remnant; it
@@ -202,6 +247,11 @@ final class Recovery {
             if (rs.state == ChunkState.SEALED) {
                 long len = rs.end;
                 log.info("chunk {} found sealed at {} on {}", chunkId, len, rs.replica.endpoint());
+                // A sealed copy is authoritative when the remaining outcomes do not leave a higher
+                // quorum-possible claim unresolved. The gate also protects upgrades from a partial
+                // floor-seal produced by an older recovery attempt.
+                rejectOrOverrideAmbiguousSeal(chunkId, reachable, Set.of(), fenceOutcomes,
+                        true, len, ackQuorum);
                 catchUp(chunkId, writerEpoch, reachable, len, ackQuorum);
                 return finishSeal(chunkId, writerEpoch, len, reachable, ackQuorum);
             }
@@ -272,7 +322,8 @@ final class Recovery {
             p = end;
         }
 
-        rejectOrEvictUnverifiedAboveFloorHolders(chunkId, reachable, unverifiedAboveFloorHolders, p, ackQuorum);
+        rejectOrOverrideAmbiguousSeal(chunkId, reachable, unverifiedAboveFloorHolders,
+                fenceOutcomes, false, p, ackQuorum);
         log.info("seal-recovery: chunk {} sealing at {}", chunkId, p);
         return finishSeal(chunkId, writerEpoch, p, reachable, ackQuorum);
     }
@@ -444,28 +495,52 @@ final class Recovery {
     }
 
     /**
-     * Issue #84/#102 fail-closed gate. A holder whose fence response claimed bytes above the final
+     * Issue #84/#102/#120 fail-closed gate. A holder whose fence response claimed bytes above the final
      * seal point may still contain producer-acked data; losing those bytes by floor-sealing is
      * permanent, while aborting leaves the chunk OPEN for a later recovery retry. This check
      * intentionally uses the final seal point, not the floor at marking time, so a holder is
      * forgiven when a later accepted continuation covers its claim.
      *
+     * <p>An empty descriptor endpoint, FENCE {@code CHUNK_NOT_FOUND}, or untrusted FENCE response is
+     * never agreement for promoting a sub-quorum tail. None proves that the replica never acknowledged
+     * bytes before its registry record, installed handle, local data, or trustworthy response became
+     * unavailable, though. If those unresolved slots plus the remaining possible holders could have
+     * formed {@code ackQuorum} above the chosen seal point, recovery blocks instead of choosing
+     * truncation or promotion.
+     *
      * <p>Issue #102 adds the explicit escape hatch we can make without pretending the bytes were
-     * proven: an operator may name one exact namespace/chunk and force recovery to evict the blocking
-     * holders from the seal set, then seal the remaining quorum. The matching token is consumed after
-     * one use. That is intentionally per-chunk and loud because it can discard bytes only the evicted
-     * holder claimed.
+     * proven: an operator may name one exact namespace/chunk and force recovery to evict unreadable
+     * blockers and/or accept the unresolved classification, then seal the remaining quorum at the
+     * verified point. The matching token is consumed after one use. That is intentionally per-chunk
+     * and loud because it can discard bytes a blocker or unresolved replica may have acknowledged.
      */
-    private void rejectOrEvictUnverifiedAboveFloorHolders(ChunkId chunkId, List<ReplicaState> reachable,
-                                                          Set<ReplicaState> unverifiedAboveFloorHolders,
-                                                          long sealPoint, int ackQuorum) {
+    private void rejectOrOverrideAmbiguousSeal(ChunkId chunkId, List<ReplicaState> reachable,
+                                               Set<ReplicaState> unverifiedAboveFloorHolders,
+                                               FenceOutcomes fenceOutcomes,
+                                               boolean sealedFastPath, long sealPoint, int ackQuorum) {
         List<ReplicaState> blockers = new ArrayList<>();
         for (ReplicaState rs : unverifiedAboveFloorHolders) {
             if (rs.end > sealPoint) {
                 blockers.add(rs);
             }
         }
-        if (blockers.isEmpty()) {
+
+        int reachableClaimsAboveSealPoint = 0;
+        for (ReplicaState rs : reachable) {
+            if (rs.end > sealPoint) {
+                reachableClaimsAboveSealPoint++;
+            }
+        }
+        int unresolvedReplicaSlots = fenceOutcomes.unresolvedClassificationSlots();
+        boolean unresolvedClassificationBlocks = unresolvedReplicaSlots > 0
+                && unresolvedReplicaSlots + fenceOutcomes.promotionCredits() + reachableClaimsAboveSealPoint
+                >= ackQuorum;
+        boolean sealedHigherTailBlocks = sealedFastPath
+                && reachableClaimsAboveSealPoint > 0
+                && unresolvedReplicaSlots + fenceOutcomes.promotionCredits() + reachableClaimsAboveSealPoint
+                >= ackQuorum;
+        boolean ambiguousSealBlocks = unresolvedClassificationBlocks || sealedHigherTailBlocks;
+        if (blockers.isEmpty() && !ambiguousSealBlocks) {
             return;
         }
 
@@ -476,17 +551,61 @@ final class Recovery {
                                 + "unverified end {}; override key {}",
                         chunkId, sealPoint, rs.replica.nodeId(), rs.end, overrideKey);
             }
+            if (unresolvedClassificationBlocks) {
+                log.warn("seal-recovery: chunk {} blocked before seal at {} because unresolved replica "
+                                + "classification could complete quorum {}: empty-endpoint nodes {}, "
+                                + "chunk-not-found nodes {}, untrusted-fence nodes {}, transport-unreachable "
+                                + "nodes {}, reachable claims above seal point {}; override key {}",
+                        chunkId, sealPoint, ackQuorum, fenceOutcomes.unresolvedDescriptorNodeIds,
+                        fenceOutcomes.currentlyAbsentNodeIds, fenceOutcomes.untrustedFenceNodeIds,
+                        fenceOutcomes.transportUnreachableNodeIds, reachableClaimsAboveSealPoint, overrideKey);
+            }
+            if (sealedHigherTailBlocks) {
+                log.warn("seal-recovery: chunk {} blocked before accepting sealed point {} because {} "
+                                + "reachable replica(s) claim a higher end and, with transport-unreachable "
+                                + "nodes {} plus {} unresolved slot(s), could reach quorum {}; override key {}",
+                        chunkId, sealPoint, reachableClaimsAboveSealPoint,
+                        fenceOutcomes.transportUnreachableNodeIds, unresolvedReplicaSlots, ackQuorum, overrideKey);
+            }
+            String reason;
+            if (blockers.isEmpty()) {
+                reason = unresolvedClassificationBlocks
+                        ? "unresolved replica classification"
+                        : "quorum-possible higher tail above an existing sealed point";
+            } else if (unresolvedClassificationBlocks) {
+                reason = "unverified above-floor holder(s) and unresolved replica classification";
+            } else if (sealedHigherTailBlocks) {
+                reason = "unverified above-floor holder(s) and a quorum-possible higher tail";
+            } else {
+                reason = "unverified above-floor holder(s)";
+            }
             throw new ScpException(ErrorCode.SEAL_RECOVERY_BLOCKED,
-                    "chunk " + chunkId + " has unverified above-floor holder(s) above seal point "
+                    "chunk " + chunkId + " has " + reason + " above seal point "
                             + sealPoint + "; set " + UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY
                             + " or " + UNSAFE_SEAL_OVERRIDE_CHUNKS_ENV + " to " + overrideKey
-                            + " only to evict the blocking holder(s) and force floor-seal");
+                            + " only to accept the potential data loss and force seal at the verified point");
         }
 
         for (ReplicaState rs : blockers) {
             log.error("UNSAFE seal-recovery override {}: evicting replica {} which claimed unverified end {} "
                             + "above seal point {} for chunk {}",
                     overrideKey, rs.replica.nodeId(), rs.end, sealPoint, chunkId);
+        }
+        if (unresolvedClassificationBlocks) {
+            log.error("UNSAFE seal-recovery override {}: forcing chunk {} to seal at {} despite unresolved "
+                            + "replica classification; empty-endpoint nodes {}, chunk-not-found nodes {}, "
+                            + "untrusted-fence nodes {}, transport-unreachable nodes {}, reachable claims "
+                            + "above seal point {}. This may truncate a producer-acked tail",
+                    overrideKey, chunkId, sealPoint, fenceOutcomes.unresolvedDescriptorNodeIds,
+                    fenceOutcomes.currentlyAbsentNodeIds, fenceOutcomes.untrustedFenceNodeIds,
+                    fenceOutcomes.transportUnreachableNodeIds, reachableClaimsAboveSealPoint);
+        }
+        if (sealedHigherTailBlocks) {
+            log.error("UNSAFE seal-recovery override {}: accepting sealed point {} for chunk {} despite {} "
+                            + "reachable higher-end claim(s) and transport-unreachable nodes {}. This may "
+                            + "truncate a producer-acked tail",
+                    overrideKey, sealPoint, chunkId, reachableClaimsAboveSealPoint,
+                    fenceOutcomes.transportUnreachableNodeIds);
         }
         reachable.removeAll(blockers);
         if (reachable.size() < ackQuorum) {
