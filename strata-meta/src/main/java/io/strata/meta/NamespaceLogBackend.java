@@ -1,5 +1,6 @@
 package io.strata.meta;
 
+import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
@@ -49,6 +50,18 @@ import java.util.function.Predicate;
 final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
 
     private static final Logger log = LoggerFactory.getLogger(NamespaceLogBackend.class);
+
+    /** A destructive orphan-GC verdict bound atomically to the owner epoch that authorized it. */
+    record OrphanConfirmation(boolean fileExists, boolean referencedByNode, long ownerEpoch) {
+        OrphanConfirmation {
+            if (ownerEpoch <= 0) {
+                throw new IllegalArgumentException("ownerEpoch must be positive");
+            }
+            if (!fileExists && referencedByNode) {
+                throw new IllegalArgumentException("a missing file cannot reference a replica");
+            }
+        }
+    }
 
     /** Reserved namespace holding the metadata-log/snapshot system files; routed to the ZK root. */
     static final StrataNamespace SYSTEM_NAMESPACE = StrataNamespace.of("strata-meta");
@@ -506,6 +519,81 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
         });
     }
 
+    /**
+     * Runs a read against the already-active repository only after an authoritative consensus-root read
+     * proves that repository's exact published manifest and znode version are still current. This path is
+     * intentionally separate from {@link #repo} / {@link #withRepoReacquiringOnFence}: a stale owner asking
+     * to authorize destructive work must fail closed, never reclaim the namespace by allocating a newer
+     * epoch. The consensus round trip deliberately happens before taking either local lock; the open lock
+     * then keeps the selected handle stable while the repo lock binds manifest validation, metadata state,
+     * verdict, and returned epoch to one repository image. A local publish/replacement during the fetch is
+     * detected by the exact manifest/version and active-repo checks and fails closed.
+     */
+    private <T> T withAuthoritativeRepo(StrataNamespace namespace, RepoTxn<T> read) throws Exception {
+        requireOwnedNamespace(namespace);
+        NamespaceLeadershipHandle handle = namespaces.get(namespace);
+        if (handle == null) {
+            throw new ScpException(ErrorCode.FENCED_EPOCH,
+                    "namespace " + namespace + " has no active local authority");
+        }
+
+        NamespaceMetadataLogRepository selected = handle.activeRepo();
+        if (selected == null) {
+            throw new ScpException(ErrorCode.FENCED_EPOCH,
+                    "namespace " + namespace + " local authority is " + handle.state,
+                    handle.metadataEpoch);
+        }
+        Optional<MetadataStore.Versioned<Records.NamespaceManifest>> current =
+                root.getNamespaceManifestAuthoritative(namespace);
+        if (current.isEmpty()) {
+            throw new ScpException(ErrorCode.FENCED_EPOCH,
+                    "namespace " + namespace + " has no authoritative manifest");
+        }
+
+        handle.openLock.lock();
+        try {
+            NamespaceMetadataLogRepository active = handle.activeRepo();
+            if (active == null || active != selected) {
+                throw new ScpException(ErrorCode.FENCED_EPOCH,
+                        "namespace " + namespace + " local authority changed during validation",
+                        handle.metadataEpoch);
+            }
+            return runLocked(active, repo -> {
+                if (repo.poisoned()) {
+                    throw new ScpException(ErrorCode.INTERNAL,
+                            "namespace " + namespace + " metadata state is uncertain after an append failure",
+                            repo.poisonCause());
+                }
+                MetadataStore.Versioned<Records.NamespaceManifest> authoritative = current.get();
+                if (!repo.matchesPublishedManifest(authoritative) || handle.activeRepo() != repo) {
+                    throw new ScpException(ErrorCode.FENCED_EPOCH,
+                            "namespace " + namespace + " local manifest is no longer authoritative",
+                            authoritative.value().metadataEpoch());
+                }
+                return read.run(repo);
+            });
+        } finally {
+            handle.openLock.unlock();
+        }
+    }
+
+    /**
+     * Authoritatively confirms whether {@code chunkId} still belongs on {@code nodeId}. Missing files are
+     * represented in the response rather than as FILE_NOT_FOUND so only this consensus-validated path can
+     * produce a destructive orphan verdict.
+     */
+    OrphanConfirmation confirmOrphan(StrataNamespace namespace, ChunkId chunkId, int nodeId) throws Exception {
+        if (isSystem(namespace)) {
+            throw new IllegalArgumentException("system namespace orphan confirms use the root leader path");
+        }
+        return withAuthoritativeRepo(namespace, repo -> {
+            Optional<Records.FileRecord> file = repo.state().file(chunkId.fileId());
+            boolean referenced = file.stream().flatMap(f -> f.chunks().stream())
+                    .anyMatch(chunk -> chunk.index() == chunkId.index() && chunk.replicas().contains(nodeId));
+            return new OrphanConfirmation(file.isPresent(), referenced, repo.metadataEpoch());
+        });
+    }
+
     private static Exception poisonFailure(PoisonedMetadataLogRepositoryException e) {
         Throwable cause = e.getCause();
         if (cause instanceof Exception ex) {
@@ -878,6 +966,14 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
         }
         NamespaceLeadershipHandle handle = namespaces.get(namespace);
         return handle == null || handle.state != NamespaceLeaderState.ACTIVE ? 0 : handle.metadataEpoch;
+    }
+
+    @Override
+    public long authoritativeOwnerEpoch(StrataNamespace namespace) throws Exception {
+        if (isSystem(namespace)) {
+            return 0;
+        }
+        return withAuthoritativeRepo(namespace, NamespaceMetadataLogRepository::metadataEpoch);
     }
 
     @Override

@@ -629,8 +629,8 @@ public final class ChunkStore implements AutoCloseable {
         // before it can be considered a suspect. In-memory only: a restart re-earns verification.
         volatile long lastVerifiedAtMs = System.currentTimeMillis();
         // Repair imports are locally durable before the controller commits the descriptor swap. During that
-        // window LOOKUP_FILE truthfully does not list this node yet, so node-local orphan GC must not confirm
-        // and delete the just-copied replica before the completion heartbeat and swap/retry path can land.
+        // window the authoritative owner-confirm truthfully does not list this node yet, so node-local orphan
+        // GC must not delete the just-copied replica before the completion heartbeat and swap/retry path lands.
         volatile long orphanProtectedUntilMs;
 
         // Running CRC state for an OPEN chunk: the whole-chunk CRC and the per-CRC_RANGE_SIZE range

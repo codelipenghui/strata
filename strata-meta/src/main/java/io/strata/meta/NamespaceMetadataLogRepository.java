@@ -112,6 +112,17 @@ final class NamespaceMetadataLogRepository {
         return metadataEpoch;
     }
 
+    /**
+     * True only when an authoritative root read names exactly the manifest this repository published,
+     * including its consensus-store version. Caller must hold {@link #lock()} so the verdict and any state
+     * read that follows are bound to the same repository image and cannot cross a local manifest publish.
+     */
+    boolean matchesPublishedManifest(MetadataStore.Versioned<Records.NamespaceManifest> authoritative) {
+        return publishedManifest != null
+                && authoritative.version() == manifestVersion
+                && authoritative.value().equals(publishedManifest);
+    }
+
     boolean poisoned() {
         return poisoned;
     }

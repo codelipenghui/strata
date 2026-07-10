@@ -34,9 +34,49 @@ import java.util.concurrent.locks.ReentrantLock;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RepairCoordinatorTest {
+
+    @Test
+    void weakBackendDefaultsRejectDestructiveAuthorityReads() {
+        FakeStore store = new FakeStore();
+        assertThrows(UnsupportedOperationException.class,
+                () -> store.getNamespaceManifestAuthoritative(StrataNamespace.of("test")));
+
+        NamespaceLeadership localOnly = new NamespaceLeadership() {
+            private final ReentrantLock lock = new ReentrantLock();
+
+            @Override
+            public NamespaceLeaderState leaderState(StrataNamespace namespace) {
+                return NamespaceLeaderState.ACTIVE;
+            }
+
+            @Override
+            public boolean isNamespaceActive(StrataNamespace namespace) {
+                return true;
+            }
+
+            @Override
+            public long namespaceActiveSinceMs(StrataNamespace namespace) {
+                return 1;
+            }
+
+            @Override
+            public long namespaceOwnerEpoch(StrataNamespace namespace) {
+                return 7;
+            }
+
+            @Override
+            public ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
+                return lock;
+            }
+        };
+        assertThrows(UnsupportedOperationException.class,
+                () -> localOnly.authoritativeOwnerEpoch(StrataNamespace.of("test")));
+    }
+
     private static final StrataNamespace TEST_NS = StrataNamespace.of("test");
     private static final byte MEDIA = 1;
 
@@ -866,6 +906,69 @@ class RepairCoordinatorTest {
         Messages.DeleteCmd delete = assertInstanceOf(Messages.DeleteCmd.class,
                 onlyCommand(heartbeat(registry, owner, node, List.of())));
         assertEquals(7, delete.ownerEpoch());
+    }
+
+    @Test
+    void scanOnceSkipsDestructiveWorkButContinuesRepairWhenOwnerAuthorityRevalidationFails() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Registered source = register(registry, 8841, "authority-failed-source");
+        Registered target = register(registry, 8842, "authority-failed-target");
+        FileId deletingFile = fileId(0x51551);
+        store.createFile(file(deletingFile, FileState.DELETING,
+                List.of(sealed(0, 4096, 0xCAFE, List.of(source.nodeId())))));
+        FileId repairFile = fileId(0x51552);
+        store.createFile(file(repairFile, FileState.SEALED,
+                List.of(sealed(0, 4096, 0xCAFE, List.of(source.nodeId())))));
+        long settledActiveSince = System.currentTimeMillis() - 120_000;
+        NamespaceLeadership failedAuthority = new NamespaceLeadership() {
+            private final ReentrantLock lock = new ReentrantLock();
+
+            @Override
+            public NamespaceLeaderState leaderState(StrataNamespace namespace) {
+                return NamespaceLeaderState.ACTIVE;
+            }
+
+            @Override
+            public boolean isNamespaceActive(StrataNamespace namespace) {
+                return true;
+            }
+
+            @Override
+            public long namespaceActiveSinceMs(StrataNamespace namespace) {
+                return settledActiveSince;
+            }
+
+            @Override
+            public long namespaceOwnerEpoch(StrataNamespace namespace) {
+                return 7;
+            }
+
+            @Override
+            public long authoritativeOwnerEpoch(StrataNamespace namespace) {
+                throw new ScpException(ErrorCode.INTERNAL, "authoritative manifest read failed");
+            }
+
+            @Override
+            public ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
+                return lock;
+            }
+        };
+        RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                () -> true, () -> true, ns -> true, failedAuthority);
+
+        owner.scanOnce();
+
+        assertTrue(heartbeat(registry, owner, source, List.of()).commands().isEmpty(),
+                "manifest revalidation failure must suppress destructive delete commands");
+        Messages.ReplicateCmd repair = assertInstanceOf(Messages.ReplicateCmd.class,
+                onlyCommand(heartbeat(registry, owner, target, List.of())));
+        assertEquals(7, repair.ownerEpoch(),
+                "durability-restoring re-replication continues with the locally ACTIVE epoch");
+        assertTrue(store.getFileCalls(deletingFile) > 0,
+                "the scan may discover deletion work before the lazy authority gate");
+        assertTrue(store.files.containsKey(deletingFile));
+        assertEquals(1, owner.authorityRevalidationSkips());
     }
 
     @Test
@@ -1725,6 +1828,11 @@ class RepairCoordinatorTest {
 
             @Override
             public long namespaceOwnerEpoch(StrataNamespace namespace) {
+                return ownerEpoch.get();
+            }
+
+            @Override
+            public long authoritativeOwnerEpoch(StrataNamespace namespace) {
                 return ownerEpoch.get();
             }
 

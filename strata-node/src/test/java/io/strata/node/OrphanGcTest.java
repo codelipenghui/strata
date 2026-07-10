@@ -1,14 +1,13 @@
 package io.strata.node;
 
 import io.strata.common.ChunkId;
-import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
-import io.strata.common.StrataPath;
 import io.strata.format.ChunkStore;
+import io.strata.proto.Frame;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.RequestContext;
@@ -29,6 +28,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Node-local orphan GC (design §9.2): confirm-before-delete and the fail-safe data-loss guard. */
@@ -57,14 +57,15 @@ class OrphanGcTest {
         AtomicInteger clientKind = new AtomicInteger();
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
              ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
-                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                      throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                  }
                  clientKind.set(RequestContext.clientKind());
-                 Messages.ChunkInfo listed = new Messages.ChunkInfo(chunk, ChunkState.SEALED, 12, 0, 1,
-                         List.of(new Messages.Replica(NODE_ID, "127.0.0.1:1")));
-                 return ScpServer.ok(req, new Messages.LookupFileResp(system, StrataPath.of("/metadata-log/test"),
-                         Messages.WritePolicy.DEFAULT, (byte) 0, List.of(listed), 1).encode(), null);
+                 Messages.ConfirmOrphan confirm = Messages.ConfirmOrphan.decode(req.headerSlice());
+                 assertEquals(system, confirm.namespace());
+                 assertEquals(chunk, confirm.chunkId());
+                 assertEquals(NODE_ID, confirm.nodeId());
+                 return confirmResponse(req, true, true, 1);
              })) {
             seal(store, system, chunk);
             OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000);
@@ -82,14 +83,15 @@ class OrphanGcTest {
         AtomicInteger clientKind = new AtomicInteger();
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
              ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
-                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                      throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                  }
                  clientKind.set(RequestContext.clientKind());
-                 Messages.ChunkInfo listed = new Messages.ChunkInfo(chunk, ChunkState.SEALED, 12, 0, 1,
-                         List.of(new Messages.Replica(NODE_ID, "127.0.0.1:1")));
-                 return ScpServer.ok(req, new Messages.LookupFileResp(NS, StrataPath.of("/ordinary/test"),
-                         Messages.WritePolicy.DEFAULT, (byte) 0, List.of(listed), 1).encode(), null);
+                 Messages.ConfirmOrphan confirm = Messages.ConfirmOrphan.decode(req.headerSlice());
+                 assertEquals(NS, confirm.namespace());
+                 assertEquals(chunk, confirm.chunkId());
+                 assertEquals(NODE_ID, confirm.nodeId());
+                 return confirmResponse(req, true, true, 1);
              })) {
             seal(store, chunk);
             OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000);
@@ -106,7 +108,7 @@ class OrphanGcTest {
         ChunkId chunk = new ChunkId(FileId.of(1), 0);
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
              ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
-                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                      throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                  }
                  throw new ScpException(ErrorCode.PRECONDITION_FAILED,
@@ -130,17 +132,13 @@ class OrphanGcTest {
         ChunkId listed = new ChunkId(FileId.of(2), 0); // owner still lists this node for the chunk
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
              ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
-                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                      throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                  }
-                 Messages.LookupFile m = Messages.LookupFile.decode(req.headerSlice());
-                 if (m.fileId().id() == 1) {
-                     throw new ScpException(ErrorCode.FILE_NOT_FOUND, "no such file");
-                 }
-                 Messages.ChunkInfo ci = new Messages.ChunkInfo(listed, ChunkState.SEALED, 12, 0, 1,
-                         List.of(new Messages.Replica(NODE_ID, "127.0.0.1:1")));
-                 return ScpServer.ok(req, new Messages.LookupFileResp(NS, StrataPath.of("/f2"),
-                         Messages.WritePolicy.DEFAULT, (byte) 0, List.of(ci)).encode(), null);
+                 Messages.ConfirmOrphan m = Messages.ConfirmOrphan.decode(req.headerSlice());
+                 assertEquals(NODE_ID, m.nodeId());
+                 boolean fileExists = m.chunkId().fileId().id() != 1;
+                 return confirmResponse(req, fileExists, fileExists, 1);
              })) {
             seal(store, orphan);
             seal(store, listed);
@@ -161,31 +159,21 @@ class OrphanGcTest {
 
     @Test
     void deletesChunkWhoseFileIdExistsOnlyInAnotherNamespace() throws Exception {
-        StrataNamespace ownerNamespace = StrataNamespace.of("owner-namespace");
         StrataNamespace onDiskNamespace = StrataNamespace.of("wrong-on-disk-namespace");
         ChunkId chunk = new ChunkId(FileId.of(1), 0);
-        AtomicInteger onDiskNamespaceLookups = new AtomicInteger();
-        AtomicInteger ownerNamespaceLookups = new AtomicInteger();
+        AtomicInteger onDiskNamespaceConfirms = new AtomicInteger();
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
              ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
-                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                      throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                  }
-                 Messages.LookupFile lookup = Messages.LookupFile.decode(req.headerSlice());
-                 if (lookup.namespace().equals(onDiskNamespace)) {
-                     onDiskNamespaceLookups.incrementAndGet();
-                     throw new ScpException(ErrorCode.FILE_NOT_FOUND,
-                             "the file id is absent from the chunk's on-disk namespace");
-                 }
-                 if (lookup.namespace().equals(ownerNamespace)) {
-                     ownerNamespaceLookups.incrementAndGet();
-                     Messages.ChunkInfo ci = new Messages.ChunkInfo(chunk, ChunkState.SEALED, 12, 0, 1,
-                             List.of(new Messages.Replica(NODE_ID, "127.0.0.1:1")));
-                     return ScpServer.ok(req, new Messages.LookupFileResp(ownerNamespace,
-                             StrataPath.of("/same-id-in-owner-namespace"), Messages.WritePolicy.DEFAULT,
-                             (byte) 0, List.of(ci)).encode(), null);
-                 }
-                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "unexpected namespace");
+                 Messages.ConfirmOrphan confirm = Messages.ConfirmOrphan.decode(req.headerSlice());
+                 assertEquals(onDiskNamespace, confirm.namespace(),
+                         "confirmation must stay bound to the chunk's on-disk namespace");
+                 assertEquals(chunk, confirm.chunkId());
+                 assertEquals(NODE_ID, confirm.nodeId());
+                 onDiskNamespaceConfirms.incrementAndGet();
+                 return confirmResponse(req, false, false, 1);
              })) {
             seal(store, onDiskNamespace, chunk);
             OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()),
@@ -198,10 +186,8 @@ class OrphanGcTest {
             gc.gcOnce();
             assertFalse(store.contains(onDiskNamespace, chunk),
                     "a descriptor in another namespace must not keep this on-disk logical chunk alive");
-            assertEquals(3, onDiskNamespaceLookups.get(),
+            assertEquals(3, onDiskNamespaceConfirms.get(),
                     "confirm and delete checks must stay bound to the chunk's on-disk namespace");
-            assertEquals(0, ownerNamespaceLookups.get(),
-                    "orphan confirmation must never fall back to a same-id file in another namespace");
         }
     }
 
@@ -215,6 +201,35 @@ class OrphanGcTest {
             gc.gcOnce();
             assertTrue(store.contains(NS, chunk),
                     "an unreachable owner must never trigger a delete (fail-safe data-loss guard, §9.2)");
+        }
+    }
+
+    @Test
+    void oldControllerWithoutDedicatedConfirmFailsClosedWithoutLookupFallback() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger confirmCalls = new AtomicInteger();
+        AtomicInteger lookupCalls = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer oldController = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() == Opcode.CONFIRM_ORPHAN.code) {
+                     confirmCalls.incrementAndGet();
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "upgrade required");
+                 }
+                 if (req.opcode() == Opcode.LOOKUP_FILE.code) {
+                     lookupCalls.incrementAndGet();
+                 }
+                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+             })) {
+            seal(store, chunk);
+            OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + oldController.port()),
+                    0, 60_000, 0, 5_000);
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, chunk),
+                    "an old controller cannot authorize deletion without the consensus-backed opcode");
+            assertEquals(1, confirmCalls.get());
+            assertEquals(0, lookupCalls.get(), "LOOKUP_FILE must never be a destructive-confirm fallback");
         }
     }
 
@@ -269,11 +284,11 @@ class OrphanGcTest {
         AtomicInteger calls = new AtomicInteger();
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
              ScpServer staleOwner = new ScpServer(0, 0, 0, 0, req -> {
-                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                      throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                  }
                  calls.incrementAndGet();
-                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "stale owner missing file", 7);
+                 return confirmResponse(req, false, false, 7);
              })) {
             seal(store, chunk);
             String endpoint = "127.0.0.1:" + staleOwner.port();
@@ -294,17 +309,16 @@ class OrphanGcTest {
     }
 
     @Test
-    void keepsSuspectWhenLookupSuccessComesFromStaleOwnerEpoch() throws Exception {
+    void keepsSuspectWhenConfirmSuccessComesFromStaleOwnerEpoch() throws Exception {
         ChunkId chunk = new ChunkId(FileId.of(1), 0);
         AtomicInteger calls = new AtomicInteger();
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
              ScpServer staleOwner = new ScpServer(0, 0, 0, 0, req -> {
-                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                      throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                  }
                  calls.incrementAndGet();
-                 return ScpServer.ok(req, new Messages.LookupFileResp(NS, StrataPath.of("/f1"),
-                         Messages.WritePolicy.DEFAULT, (byte) 0, List.of(), 7).encode(), null);
+                 return confirmResponse(req, true, false, 7);
              })) {
             seal(store, chunk);
             String endpoint = "127.0.0.1:" + staleOwner.port();
@@ -325,24 +339,65 @@ class OrphanGcTest {
     }
 
     @Test
-    void skipsStaleOwnerEpochAndTrustsLaterFreshOwnerConfirm() throws Exception {
+    void skipsStaleOwnerEpochAndTrustsLaterFreshOwnerReference() throws Exception {
+        ChunkId referenced = new ChunkId(FileId.of(1), 0);
+        AtomicInteger staleCalls = new AtomicInteger();
+        AtomicInteger freshCalls = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer staleOwner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 staleCalls.incrementAndGet();
+                 return confirmResponse(req, false, false, 7);
+             });
+             ScpServer freshOwner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 freshCalls.incrementAndGet();
+                 return confirmResponse(req, true, true, 8);
+             })) {
+            seal(store, referenced);
+            OrphanGc gc = orphanGc(store, List.of(
+                            "127.0.0.1:" + staleOwner.port(),
+                            "127.0.0.1:" + freshOwner.port()),
+                    0, 60_000, 0, 5_000,
+                    (namespace, ownerEpoch) -> {
+                        if (ownerEpoch < 8) {
+                            throw new ScpException(ErrorCode.FENCED_EPOCH,
+                                    "stale owner epoch " + ownerEpoch, 8);
+                        }
+                    });
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, referenced),
+                    "the stale endpoint must not hide a later authoritative reference");
+            assertEquals(1, staleCalls.get(), "stale answer is skipped on the first confirm pass");
+            assertEquals(1, freshCalls.get(), "fresh owner is consulted on the first confirm pass");
+        }
+    }
+
+    @Test
+    void staleEndpointFirstStillAllowsLaterFreshOwnerToDelete() throws Exception {
         ChunkId orphan = new ChunkId(FileId.of(1), 0);
         AtomicInteger staleCalls = new AtomicInteger();
         AtomicInteger freshCalls = new AtomicInteger();
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
              ScpServer staleOwner = new ScpServer(0, 0, 0, 0, req -> {
-                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                      throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                  }
                  staleCalls.incrementAndGet();
-                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "stale owner missing file", 7);
+                 return confirmResponse(req, false, false, 7);
              });
              ScpServer freshOwner = new ScpServer(0, 0, 0, 0, req -> {
-                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                      throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                  }
                  freshCalls.incrementAndGet();
-                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "fresh owner missing file", 8);
+                 return confirmResponse(req, false, false, 8);
              })) {
             seal(store, orphan);
             OrphanGc gc = orphanGc(store, List.of(
@@ -357,18 +412,96 @@ class OrphanGcTest {
                     });
 
             gc.gcOnce();
-
             assertTrue(store.contains(NS, orphan),
-                    "fresh FILE_NOT_FOUND must still wait for a later corroborating pass");
-            assertEquals(1, staleCalls.get(), "stale answer is skipped on the first confirm pass");
-            assertEquals(1, freshCalls.get(), "fresh owner is consulted on the first confirm pass");
+                    "fresh FILE_NOT_FOUND still needs cross-pass corroboration");
 
             gc.gcOnce();
 
             assertFalse(store.contains(NS, orphan),
-                    "a fresh owner's FILE_NOT_FOUND should still authorize ordinary orphan cleanup");
-            assertEquals(3, staleCalls.get(), "stale answers are skipped during confirm and delete checks");
-            assertEquals(3, freshCalls.get(), "fresh owner is consulted during confirm and delete checks");
+                    "a stale first endpoint must not wedge cleanup through a later fresh owner");
+            assertEquals(3, staleCalls.get(), "stale endpoint is skipped in both sweeps and final confirm");
+            assertEquals(3, freshCalls.get(), "fresh endpoint authorizes both sweeps and final delete");
+        }
+    }
+
+    @Test
+    void persistencePoisonConfirmFailuresAreCountedAndWarnedOncePerInterval() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileExistsWithoutChunkServer()) {
+            seal(store, chunk);
+            OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000,
+                    (namespace, ownerEpoch) -> {
+                        throw new DataNode.OwnerEpochPersistenceException(
+                                "floorFile=/data/owner-epochs.properties", new IOException("disk full"));
+                    });
+
+            gc.gcOnce();
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, chunk));
+            assertEquals(2, gc.ownerEpochConfirmRejects());
+            assertEquals(2, gc.persistencePoisonConfirmRejects());
+            assertEquals(1, gc.unreachableConfirmWarns(),
+                    "local persistence poison must use the node-wide warning rate limit");
+        }
+    }
+
+    @Test
+    void ownerEpochAcceptorDoesNotSwallowJvmErrors() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileExistsWithoutChunkServer()) {
+            seal(store, chunk);
+            OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000,
+                    (namespace, ownerEpoch) -> {
+                        throw new AssertionError("fatal acceptor failure");
+                    });
+
+            AssertionError error = assertThrows(AssertionError.class, gc::gcOnce);
+            assertEquals("fatal acceptor failure", error.getMessage());
+            assertTrue(store.contains(NS, chunk));
+        }
+    }
+
+    @Test
+    void restartKeepsReferencedChunkWhenStaleEndpointIsListedBeforeFreshOwner() throws Exception {
+        ChunkId referenced = new ChunkId(FileId.of(1), 0);
+        Path nodeDir = dir.resolve("node");
+        DataNodeConfig config = DataNodeConfig.standalone(nodeDir).withNodeId(NODE_ID);
+        try (DataNode node = new DataNode(config)) {
+            seal(node.store(), referenced);
+            node.acceptAuthoritativeOwnerEpoch(NS, 8);
+        }
+
+        AtomicInteger staleCalls = new AtomicInteger();
+        AtomicInteger freshCalls = new AtomicInteger();
+        try (DataNode restarted = new DataNode(config);
+             ScpServer staleOwner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 staleCalls.incrementAndGet();
+                 return confirmResponse(req, false, false, 7);
+             });
+             ScpServer freshOwner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 freshCalls.incrementAndGet();
+                 return confirmResponse(req, true, true, 8);
+             })) {
+            ChunkDeleteService deletes = new ChunkDeleteService(restarted.store(), 1, 0);
+            OrphanGc gc = new OrphanGc(restarted.store(), deletes, NODE_ID,
+                    List.of("127.0.0.1:" + staleOwner.port(), "127.0.0.1:" + freshOwner.port()),
+                    0, 60_000, 0, 5_000, 64, 0, 0, 0, 0,
+                    restarted::acceptAuthoritativeOwnerEpoch, restarted::deleteConfirmedOrphan);
+
+            gc.gcOnce();
+
+            assertTrue(restarted.store().contains(NS, referenced));
+            assertEquals(1, staleCalls.get(), "the stale A response is fenced by the persisted E8 floor");
+            assertEquals(1, freshCalls.get(), "GC must continue to B and honor its live reference");
         }
     }
 
@@ -379,18 +512,18 @@ class OrphanGcTest {
         AtomicInteger freshCalls = new AtomicInteger();
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
              ScpServer malformedOwner = new ScpServer(0, 0, 0, 0, req -> {
-                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                      throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                  }
                  malformedCalls.incrementAndGet();
-                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "malformed owner epoch", -1);
+                 return confirmResponse(req, false, false, -1);
              });
              ScpServer freshOwner = new ScpServer(0, 0, 0, 0, req -> {
-                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                      throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                  }
                  freshCalls.incrementAndGet();
-                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "fresh owner missing file", 8);
+                 return confirmResponse(req, false, false, 8);
              })) {
             seal(store, orphan);
             OrphanGc gc = orphanGc(store, List.of(
@@ -660,16 +793,13 @@ class OrphanGcTest {
         AtomicInteger confirms = new AtomicInteger();
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
              ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
-                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                      throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                  }
                  if (confirms.incrementAndGet() == 1) {
-                     throw new ScpException(ErrorCode.FILE_NOT_FOUND, "transiently absent");
+                     return confirmResponse(req, false, false, 1);
                  }
-                 Messages.ChunkInfo ci = new Messages.ChunkInfo(chunk, ChunkState.SEALED, 12, 0, 1,
-                         List.of(new Messages.Replica(NODE_ID, "127.0.0.1:1")));
-                 return ScpServer.ok(req, new Messages.LookupFileResp(NS, StrataPath.of("/f1"),
-                         Messages.WritePolicy.DEFAULT, (byte) 0, List.of(ci)).encode(), null);
+                 return confirmResponse(req, true, true, 1);
              })) {
             seal(store, chunk);
             String endpoint = "127.0.0.1:" + owner.port();
@@ -684,6 +814,75 @@ class OrphanGcTest {
             assertTrue(store.contains(NS, chunk),
                     "a chunk re-listed by its owner immediately before delete must be kept");
             assertEquals(2, confirms.get(), "confirmed orphans must be checked again at delete time");
+        }
+    }
+
+    @Test
+    void finalDeleteUsesTheEpochFromTheLastConfirmationAndKeepsWhenFenced() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger guardedDeletes = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 return confirmResponse(req, true, false, 8);
+             })) {
+            seal(store, chunk);
+            ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
+            OrphanGc gc = new OrphanGc(store, deletes, NODE_ID,
+                    List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000,
+                    64, 0, 0, 0, 0,
+                    (namespace, ownerEpoch) -> {},
+                    (namespace, confirmedChunk, confirmedOwnerEpoch) -> {
+                        assertEquals(NS, namespace);
+                        assertEquals(chunk, confirmedChunk);
+                        assertEquals(8, confirmedOwnerEpoch,
+                                "the delete gate must recheck the final response's epoch");
+                        guardedDeletes.incrementAndGet();
+                        throw new ScpException(ErrorCode.FENCED_EPOCH, "new owner observed", 9);
+                    });
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, chunk));
+            assertEquals(1, guardedDeletes.get());
+            assertEquals(0, deletes.okDeletes(), "the fenced gate must run before physical unlink");
+        }
+    }
+
+    @Test
+    void internalDeleteGateFailureKeepsOneChunkAndContinuesThePass() throws Exception {
+        ChunkId failed = new ChunkId(FileId.of(1), 0);
+        ChunkId healthy = new ChunkId(FileId.of(2), 0);
+        AtomicInteger guardedDeletes = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 return confirmResponse(req, true, false, 8);
+             })) {
+            seal(store, failed);
+            seal(store, healthy);
+            ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
+            OrphanGc gc = new OrphanGc(store, deletes, NODE_ID,
+                    List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000,
+                    64, 0, 0, 0, 0,
+                    (namespace, ownerEpoch) -> {},
+                    (namespace, chunkId, confirmedOwnerEpoch) -> {
+                        guardedDeletes.incrementAndGet();
+                        if (chunkId.equals(failed)) {
+                            throw new ScpException(ErrorCode.INTERNAL, "poisoned final gate");
+                        }
+                        return store.delete(namespace, chunkId);
+                    });
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, failed), "INTERNAL final gate must fail this chunk closed");
+            assertFalse(store.contains(NS, healthy), "a sibling chunk must still drain in the same pass");
+            assertEquals(2, guardedDeletes.get());
         }
     }
 
@@ -722,14 +921,14 @@ class OrphanGcTest {
             ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
             OrphanGc gc;
             try (ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
-                if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                 }
                 if (confirms.incrementAndGet() == 2
                         && deletes.delete(NS, chunk) != ErrorCode.OK) {
                     throw new ScpException(ErrorCode.INTERNAL, "normal delete should win first");
                 }
-                throw new ScpException(ErrorCode.FILE_NOT_FOUND, "no such file");
+                return confirmResponse(req, false, false, 1);
             })) {
                 gc = new OrphanGc(store, deletes, NODE_ID,
                         List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000, 64, 0, 0, 0, 0);
@@ -760,7 +959,7 @@ class OrphanGcTest {
             ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
             OrphanGc gc;
             try (ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
-                if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
                 }
                 if (confirms.incrementAndGet() == 2) {
@@ -769,7 +968,7 @@ class OrphanGcTest {
                     }
                     creatingSet(store).add(newNsChunkId(chunk));
                 }
-                throw new ScpException(ErrorCode.FILE_NOT_FOUND, "no such file");
+                return confirmResponse(req, false, false, 1);
             })) {
                 gc = new OrphanGc(store, deletes, NODE_ID,
                         List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000, 64, 0, 0, 0, 0);
@@ -884,7 +1083,7 @@ class OrphanGcTest {
 
     private static ScpServer notLeaderServer() throws Exception {
         return new ScpServer(0, 0, 0, 0, req -> {
-            if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+            if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
             }
             throw new ScpException(ErrorCode.NOT_LEADER, "not the owner of this namespace");
@@ -897,13 +1096,13 @@ class OrphanGcTest {
 
     private static ScpServer fileNotFoundServer(AtomicInteger calls) throws Exception {
         return new ScpServer(0, 0, 0, 0, req -> {
-            if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+            if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
             }
             if (calls != null) {
                 calls.incrementAndGet();
             }
-            throw new ScpException(ErrorCode.FILE_NOT_FOUND, "no such file");
+            return confirmResponse(req, false, false, 1);
         });
     }
 
@@ -920,12 +1119,17 @@ class OrphanGcTest {
 
     private static ScpServer fileExistsWithoutChunkServer() throws Exception {
         return new ScpServer(0, 0, 0, 0, req -> {
-            if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+            if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
             }
-            return ScpServer.ok(req, new Messages.LookupFileResp(NS, StrataPath.of("/empty"),
-                    Messages.WritePolicy.DEFAULT, (byte) 0, List.of()).encode(), null);
+            return confirmResponse(req, true, false, 1);
         });
+    }
+
+    private static Frame confirmResponse(Frame req, boolean fileExists,
+                                         boolean referencedByNode, long ownerEpoch) {
+        return ScpServer.ok(req,
+                new Messages.ConfirmOrphanResp(fileExists, referencedByNode, ownerEpoch).encode(), null);
     }
 
     private static OrphanGc orphanGc(ChunkStore store, List<String> controllerEndpoints,

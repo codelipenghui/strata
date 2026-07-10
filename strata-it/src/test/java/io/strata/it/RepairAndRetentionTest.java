@@ -114,7 +114,7 @@ class RepairAndRetentionTest {
         }
         assertTrue(node.store().contains(TEST_NS, orphan));
 
-        // node-local orphan GC (grace -> owner-confirm via LOOKUP_FILE -> delete) reaps the unreferenced chunk
+        // node-local orphan GC (grace -> consensus-backed CONFIRM_ORPHAN -> delete) reaps the unreferenced chunk
         long deadline = System.currentTimeMillis() + 30_000;
         while (System.currentTimeMillis() < deadline && node.store().contains(TEST_NS, orphan)) {
             Thread.sleep(250);

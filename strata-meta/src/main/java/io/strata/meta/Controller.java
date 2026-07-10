@@ -386,6 +386,11 @@ public final class Controller implements AutoCloseable {
         return repair.reconcileSkippedFiles();
     }
 
+    /** Destructive namespace passes skipped because consensus authority could not be established. */
+    public long authorityRevalidationSkips() {
+        return repair.authorityRevalidationSkips();
+    }
+
     public int aliveNodes() {
         return registry.livenessCounts().alive();
     }
@@ -615,6 +620,11 @@ public final class Controller implements AutoCloseable {
                 var m = Messages.LookupFile.decode(h);
                 requireNamespaceOwner(m.namespace());
                 yield ScpServer.ok(req, lookup(m.namespace(), m.fileId()).encode(), null);
+            }
+
+            case CONFIRM_ORPHAN -> {
+                var m = Messages.ConfirmOrphan.decode(h);
+                yield ScpServer.ok(req, confirmOrphan(m).encode(), null);
             }
 
             case LOOKUP_PATH -> {
@@ -966,6 +976,49 @@ public final class Controller implements AutoCloseable {
         return new Messages.LookupFileResp(file.namespace(), file.path(),
                 new Messages.WritePolicy(file.replicationFactor(), file.ackQuorum(), file.fsyncOnAck()),
                 file.state().value, chunks, ownerEpoch);
+    }
+
+    /**
+     * Destructive orphan confirmation has a stricter authority path than ordinary LOOKUP_FILE. A user
+     * namespace backed by a metadata log is answered only after the local repo proves an exact match with
+     * the synchronized consensus manifest. Root-backed namespaces are answered only by the current global
+     * leader and carry its nonzero owner epoch. Missing files are data in the response, never FILE_NOT_FOUND,
+     * so an error/uncertain authority cannot be mistaken for permission to delete.
+     */
+    private Messages.ConfirmOrphanResp confirmOrphan(Messages.ConfirmOrphan request) throws Exception {
+        StrataNamespace namespace = request.namespace();
+        RequestContext.setNamespace(namespace.value());
+        if (NamespaceLogBackend.isSystem(namespace)) {
+            // CONFIRM_ORPHAN is also namespace-scoped ingress. Preserve the reserved metadata-role
+            // boundary before the root-backed authority path can return a destructive verdict.
+            requireNamespaceOwner(namespace);
+        }
+        if (store instanceof NamespaceLogMetadataStore namespaceLog
+                && !NamespaceLogBackend.isSystem(namespace)) {
+            requireNamespaceOwner(namespace);
+            NamespaceLogBackend.OrphanConfirmation confirmation = namespaceLog.confirmOrphan(
+                    namespace, request.chunkId(), request.nodeId());
+            return new Messages.ConfirmOrphanResp(confirmation.fileExists(),
+                    confirmation.referencedByNode(), confirmation.ownerEpoch());
+        }
+
+        // The direct-ZK backend and namespace-log system files live in the shared root. Only the global
+        // leader may turn that state into a destructive verdict; standbys return NOT_LEADER.
+        requireLeader();
+        long ownerEpoch = repair.lookupOwnerEpoch(namespace);
+        if (ownerEpoch <= 0) {
+            throw new ScpException(ErrorCode.FENCED_EPOCH,
+                    "global owner epoch is not ready for orphan confirmation");
+        }
+        Optional<MetadataStore.Versioned<Records.FileRecord>> file =
+                rootZk.getFileAuthoritative(namespace, request.chunkId().fileId());
+        boolean referenced = file.stream().flatMap(f -> f.value().chunks().stream())
+                .anyMatch(chunk -> chunk.index() == request.chunkId().index()
+                        && chunk.replicas().contains(request.nodeId()));
+        // Close the leadership-loss window around the root read. A deposed process must not return a root
+        // verdict merely because it was leader when the request began.
+        requireLeader();
+        return new Messages.ConfirmOrphanResp(file.isPresent(), referenced, ownerEpoch);
     }
 
     private FileId lookupPath(StrataNamespace namespace,

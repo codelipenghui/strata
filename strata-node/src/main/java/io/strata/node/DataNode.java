@@ -1,6 +1,7 @@
 package io.strata.node;
 
 import io.strata.common.Closeables;
+import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
@@ -18,7 +19,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
@@ -46,9 +49,20 @@ public final class DataNode implements AutoCloseable {
     private final OrphanGc orphanGc; // node-local orphan GC (design §9.2); null in standalone mode
     private final AtomicBoolean draining = new AtomicBoolean(false);
     private final AtomicLong ownerEpochFenceRejects = new AtomicLong();
-    // Volatile process-local fence memory. Data-node restart forgets it; correctness still comes from
-    // senders stamping current owner epochs and treating FENCED_EPOCH as terminal for stale work.
-    private final ConcurrentHashMap<StrataNamespace, Long> highestOwnerEpochByNamespace = new ConcurrentHashMap<>();
+    private final AtomicLong ownerEpochPersistenceRejects = new AtomicLong();
+    private final AtomicLong ownerEpochDeleteClaimRejects = new AtomicLong();
+    private final Map<StrataNamespace, Object> ownerEpochLocks = new ConcurrentHashMap<>();
+    private final Map<StrataNamespace, DeleteClaim> activeOrphanDeletes = new ConcurrentHashMap<>();
+    private final Object ownerEpochPersistenceLock = new Object();
+    // Process-local observations still fence ordinary owner RPCs, but only a dedicated orphan-confirm
+    // response from a configured controller endpoint, after that server validates consensus authority,
+    // may raise the volume-bound floor. This trusts that configured endpoint addresses reach real
+    // controllers (the node initiates the connection); SCP itself is plaintext and unauthenticated, so any
+    // transport security must come from the deployment network. Persisting epochs supplied by arbitrary
+    // inbound callers would turn a process-lifetime DoS into a permanent one.
+    private final Map<StrataNamespace, Long> highestOwnerEpochByNamespace = new ConcurrentHashMap<>();
+    private final Map<StrataNamespace, Long> durableOwnerEpochByNamespace = new HashMap<>();
+    private volatile Exception ownerEpochPersistenceFailure;
 
     private final int nodeId;
     private final UUID incarnation;
@@ -69,6 +83,8 @@ public final class DataNode implements AutoCloseable {
     public DataNode(DataNodeConfig config, ScpServer.Handler controllerHandler) throws IOException {
         this.config = config;
         ensureDirectoryDurable(config.dataDir());
+        durableOwnerEpochByNamespace.putAll(loadOwnerEpochs(config.dataDir()));
+        highestOwnerEpochByNamespace.putAll(durableOwnerEpochByNamespace);
         Identity identity = loadOrCreateIdentity(config.dataDir(), config.nodeId());
         this.nodeId = identity.nodeId;
         this.incarnation = identity.incarnation;
@@ -103,7 +119,8 @@ public final class DataNode implements AutoCloseable {
                         config.orphanDeleteMaxNamespacePercentPerPass(),
                         config.orphanDeleteMaxConfirmedPerNodePass(),
                         config.orphanDeleteMaxCumulativePerNamespace(),
-                        config.orphanDeleteMaxCumulativePerNode(), this::acceptOwnerEpoch);
+                        config.orphanDeleteMaxCumulativePerNode(), this::acceptAuthoritativeOwnerEpoch,
+                        this::deleteConfirmedOrphan);
                 this.orphanGc = startedGc;
                 startedGc.start();
             } else {
@@ -247,6 +264,15 @@ public final class DataNode implements AutoCloseable {
         return orphanGc == null ? 0 : orphanGc.breakerHaltedChunks();
     }
     public long ownerEpochFenceRejects() { return ownerEpochFenceRejects.get(); }
+    public int ownerEpochPersistencePoisoned() { return ownerEpochPersistenceFailure == null ? 0 : 1; }
+    public long ownerEpochPersistenceRejects() { return ownerEpochPersistenceRejects.get(); }
+    public long ownerEpochDeleteClaimRejects() { return ownerEpochDeleteClaimRejects.get(); }
+    public long orphanGcOwnerEpochConfirmRejects() {
+        return orphanGc == null ? 0 : orphanGc.ownerEpochConfirmRejects();
+    }
+    public long orphanGcPersistencePoisonConfirmRejects() {
+        return orphanGc == null ? 0 : orphanGc.persistencePoisonConfirmRejects();
+    }
 
     /** Installs a per-request latency observer on the data-plane server (used by the metrics layer). */
     public void setRequestObserver(RequestObserver observer) {
@@ -289,42 +315,215 @@ public final class DataNode implements AutoCloseable {
             throw new IllegalArgumentException("ownerEpoch must be non-negative: " + ownerEpoch);
         }
         // Owner epochs fence stale namespace owners; they are not an auth boundary on today's unauthenticated
-        // SCP links. A client that can issue owner-only opcodes can still raise this volatile watermark.
-        highestOwnerEpochByNamespace.compute(namespace, (ignored, current) -> {
-            long seen = current == null ? 0 : current;
+        // SCP links. A client that can issue owner-only opcodes can still raise this process-local watermark.
+        synchronized (ownerEpochLock(namespace)) {
+            long seen = highestOwnerEpochByNamespace.getOrDefault(namespace, 0L);
             if (ownerEpoch == 0) {
                 if (seen > 0) {
                     if (allowUnstampedAfterSeen) {
-                        return current;
+                        rejectOwnerRpcDuringCommittedDelete(namespace, ownerEpoch);
+                        return;
                     }
                     throw fencedOwnerEpoch(namespace, ownerEpoch, seen);
                 }
+                rejectOwnerRpcDuringCommittedDelete(namespace, ownerEpoch);
                 log.debug("accepting unstamped owner RPC before watermark is established namespace={} "
                                 + "clientKind={} clientId={}",
                         namespace, RequestContext.clientKind(), RequestContext.clientId());
-                return current;
+                return;
             }
             if (ownerEpoch < seen) {
                 throw fencedOwnerEpoch(namespace, ownerEpoch, seen);
             }
+            rejectOwnerRpcDuringCommittedDelete(namespace, ownerEpoch);
             if (ownerEpoch > seen) {
+                highestOwnerEpochByNamespace.put(namespace, ownerEpoch);
                 log.info("raising owner epoch watermark namespace={} previousOwnerEpoch={} acceptedOwnerEpoch={} "
                                 + "clientKind={} clientId={}",
                         namespace, seen, ownerEpoch, RequestContext.clientKind(), RequestContext.clientId());
-                return ownerEpoch;
+                return;
             }
-            return current;
-        });
+        }
+    }
+
+    /**
+     * Accepts an epoch from the dedicated orphan-confirm response returned by a configured controller
+     * endpoint after server-side consensus validation. Unlike ordinary owner RPCs, this trusted response
+     * may raise the volume-bound floor that survives node restart; the node does not verify a cryptographic
+     * consensus proof itself. The node trusts that its configured endpoint addresses reach real controllers;
+     * SCP is plaintext and unauthenticated, so any transport security must come from the deployment network.
+     */
+    void acceptAuthoritativeOwnerEpoch(StrataNamespace namespace, long ownerEpoch) {
+        if (ownerEpoch <= 0) {
+            throw new IllegalArgumentException("authoritative ownerEpoch must be positive: " + ownerEpoch);
+        }
+        synchronized (ownerEpochLock(namespace)) {
+            long seen = highestOwnerEpochByNamespace.getOrDefault(namespace, 0L);
+            if (ownerEpoch < seen) {
+                throw fencedOwnerEpoch(namespace, ownerEpoch, seen);
+            }
+            rejectOwnerRpcDuringCommittedDelete(namespace, ownerEpoch);
+            if (ownerEpochPersistenceFailure != null) {
+                throw ownerEpochPersistenceFailed(namespace, ownerEpoch, ownerEpochPersistenceFailure);
+            }
+            synchronized (ownerEpochPersistenceLock) {
+                if (ownerEpochPersistenceFailure != null) {
+                    throw ownerEpochPersistenceFailed(namespace, ownerEpoch, ownerEpochPersistenceFailure);
+                }
+                long durableSeen = durableOwnerEpochByNamespace.getOrDefault(namespace, 0L);
+                if (ownerEpoch <= durableSeen) {
+                    highestOwnerEpochByNamespace.put(namespace, Math.max(seen, ownerEpoch));
+                    return;
+                }
+
+                Map<StrataNamespace, Long> raised = new HashMap<>(durableOwnerEpochByNamespace);
+                raised.put(namespace, ownerEpoch);
+                try {
+                    persistOwnerEpochs(config.dataDir(), raised);
+                } catch (IOException | RuntimeException e) {
+                    // The failure may have happened after rename but before the directory fsync. Poison the
+                    // durable-confirm/delete lane for this process so a later request cannot overwrite an
+                    // uncertain higher floor. Keep the accepted authoritative epoch as the volatile floor so
+                    // ordinary owner RPCs remain available without letting an older epoch through this process.
+                    highestOwnerEpochByNamespace.put(namespace, Math.max(seen, ownerEpoch));
+                    ownerEpochPersistenceFailure = e;
+                    log.error("failed to persist authoritative owner epoch floor namespace={} "
+                                    + "previousOwnerEpoch={} offeredOwnerEpoch={} floorFile={}; authoritative "
+                                    + "floor raises and orphan deletes are poisoned fail-closed, while ordinary "
+                                    + "owner RPCs remain enabled. Repair the data volume, verify the floor file, "
+                                    + "and restart the node",
+                            namespace, durableSeen, ownerEpoch, ownerEpochFloorFile(), e);
+                    throw ownerEpochPersistenceFailed(namespace, ownerEpoch, e);
+                }
+                durableOwnerEpochByNamespace.put(namespace, ownerEpoch);
+                highestOwnerEpochByNamespace.put(namespace, ownerEpoch);
+                log.info("raising durable owner epoch floor namespace={} previousOwnerEpoch={} acceptedOwnerEpoch={}",
+                        namespace, durableSeen, ownerEpoch);
+            }
+        }
+    }
+
+    /**
+     * Waits for the shared delete throttle before committing a short namespace-local delete claim. The
+     * claim binds the final epoch check to the unlink without holding the namespace monitor across either
+     * the throttle wait or physical I/O. Owner RPCs that arrive after the claim commit fail fast with a
+     * retriable error and can retry once the unlink finishes.
+     */
+    ErrorCode deleteConfirmedOrphan(StrataNamespace namespace, ChunkId chunkId, long confirmedOwnerEpoch)
+            throws InterruptedException {
+        try (ChunkDeleteService.PreparedDelete prepared = deleteService.prepare()) {
+            return deleteConfirmedOrphan(namespace, chunkId, confirmedOwnerEpoch,
+                    () -> prepared.delete(namespace, chunkId));
+        }
+    }
+
+    @FunctionalInterface
+    interface PhysicalDelete {
+        ErrorCode delete() throws InterruptedException;
+    }
+
+    ErrorCode deleteConfirmedOrphan(StrataNamespace namespace, ChunkId chunkId, long confirmedOwnerEpoch,
+                                     PhysicalDelete physicalDelete) throws InterruptedException {
+        if (confirmedOwnerEpoch <= 0) {
+            throw new IllegalArgumentException("confirmedOwnerEpoch must be positive: " + confirmedOwnerEpoch);
+        }
+        if (physicalDelete == null) {
+            throw new IllegalArgumentException("physicalDelete must be non-null");
+        }
+        DeleteClaim claim = new DeleteClaim(chunkId, confirmedOwnerEpoch);
+        synchronized (ownerEpochLock(namespace)) {
+            if (ownerEpochPersistenceFailure != null) {
+                throw ownerEpochPersistenceFailed(namespace, confirmedOwnerEpoch, ownerEpochPersistenceFailure);
+            }
+            long seen = highestOwnerEpochByNamespace.getOrDefault(namespace, 0L);
+            if (confirmedOwnerEpoch < seen) {
+                throw fencedOwnerEpoch(namespace, confirmedOwnerEpoch, seen);
+            }
+            long durableSeen;
+            synchronized (ownerEpochPersistenceLock) {
+                if (ownerEpochPersistenceFailure != null) {
+                    throw ownerEpochPersistenceFailed(
+                            namespace, confirmedOwnerEpoch, ownerEpochPersistenceFailure);
+                }
+                durableSeen = durableOwnerEpochByNamespace.getOrDefault(namespace, 0L);
+            }
+            if (confirmedOwnerEpoch != seen || durableSeen < confirmedOwnerEpoch) {
+                throw new ScpException(ErrorCode.INTERNAL,
+                        "orphan confirmation epoch " + confirmedOwnerEpoch + " is not the committed current floor "
+                                + "for namespace " + namespace + " (seen=" + seen + ", durable=" + durableSeen + ")");
+            }
+            DeleteClaim existing = activeOrphanDeletes.putIfAbsent(namespace, claim);
+            if (existing != null) {
+                throw new ScpException(ErrorCode.INTERNAL,
+                        "orphan delete already committed for namespace " + namespace + " chunk "
+                                + existing.chunkId() + "; retry chunk " + chunkId);
+            }
+        }
+        try {
+            return physicalDelete.delete();
+        } finally {
+            synchronized (ownerEpochLock(namespace)) {
+                activeOrphanDeletes.remove(namespace, claim);
+            }
+        }
+    }
+
+    private record DeleteClaim(ChunkId chunkId, long ownerEpoch) {}
+
+    private Object ownerEpochLock(StrataNamespace namespace) {
+        return ownerEpochLocks.computeIfAbsent(namespace, ignored -> new Object());
+    }
+
+    private void rejectOwnerRpcDuringCommittedDelete(StrataNamespace namespace, long offered) {
+        DeleteClaim claim = activeOrphanDeletes.get(namespace);
+        if (claim == null) {
+            return;
+        }
+        ownerEpochDeleteClaimRejects.incrementAndGet();
+        log.info("rejecting owner RPC during committed orphan unlink namespace={} chunkId={} "
+                        + "deleteOwnerEpoch={} offeredOwnerEpoch={} clientKind={} clientId={}; caller may retry",
+                namespace, claim.chunkId(), claim.ownerEpoch(), offered,
+                RequestContext.clientKind(), RequestContext.clientId());
+        throw new ScpException(ErrorCode.INTERNAL,
+                "orphan unlink is committed for namespace " + namespace + " chunk " + claim.chunkId()
+                        + " at owner epoch " + claim.ownerEpoch() + "; retry owner RPC");
+    }
+
+    private OwnerEpochPersistenceException ownerEpochPersistenceFailed(
+            StrataNamespace namespace, long offered, Exception cause) {
+        ownerEpochPersistenceRejects.incrementAndGet();
+        return new OwnerEpochPersistenceException(
+                "authoritative owner epoch floor is unavailable for namespace " + namespace
+                        + "; rejecting epoch " + offered + " and orphan delete fail-closed; floorFile="
+                        + ownerEpochFloorFile() + "; repair the data volume, verify the floor file, and restart",
+                cause);
+    }
+
+    static final class OwnerEpochPersistenceException extends ScpException {
+        OwnerEpochPersistenceException(String message, Throwable cause) {
+            super(ErrorCode.INTERNAL, message, cause);
+        }
     }
 
     private ScpException fencedOwnerEpoch(StrataNamespace namespace, long offered, long required) {
         ownerEpochFenceRejects.incrementAndGet();
+        long durableRequired;
+        synchronized (ownerEpochPersistenceLock) {
+            durableRequired = durableOwnerEpochByNamespace.getOrDefault(namespace, 0L);
+        }
         log.warn("rejecting stale owner RPC namespace={} offeredOwnerEpoch={} requiredOwnerEpoch={} "
-                        + "clientKind={} clientId={}",
-                namespace, offered, required, RequestContext.clientKind(), RequestContext.clientId());
+                        + "durableOwnerEpoch={} floorFile={} clientKind={} clientId={}; if the durable floor is "
+                        + "unexpected, stop the node and reconcile this volume file with authoritative metadata "
+                        + "before restart",
+                namespace, offered, required, durableRequired, ownerEpochFloorFile(),
+                RequestContext.clientKind(), RequestContext.clientId());
         return new ScpException(ErrorCode.FENCED_EPOCH,
                 "stale owner epoch " + offered + " for namespace " + namespace + " (required >= " + required + ")",
                 required);
+    }
+
+    private Path ownerEpochFloorFile() {
+        return config.dataDir().resolve("owner-epochs.properties").toAbsolutePath();
     }
 
     /** The set of owner endpoints this node has heard a VERIFY_CHUNKS from (orphan-GC membership grace). */
@@ -409,6 +608,70 @@ public final class DataNode implements AutoCloseable {
             ch.force(true);
         }
         Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE);
+        forceDirectory(dataDir);
+    }
+
+    /* ---------------- volume-bound owner epoch floors ---------------- */
+
+    private static Map<StrataNamespace, Long> loadOwnerEpochs(Path dataDir) throws IOException {
+        Path file = dataDir.resolve("owner-epochs.properties");
+        if (!Files.exists(file)) {
+            return Map.of();
+        }
+        Properties properties = new StrictProperties();
+        try (var in = Files.newInputStream(file)) {
+            properties.load(in);
+        } catch (IllegalArgumentException e) {
+            throw new IOException("invalid data node owner epoch floor file: " + file, e);
+        }
+        if (properties.isEmpty()) {
+            throw new IOException("data node owner epoch floor file is empty: " + file);
+        }
+        Map<StrataNamespace, Long> loaded = new HashMap<>();
+        for (String namespaceText : properties.stringPropertyNames()) {
+            String epochText = properties.getProperty(namespaceText);
+            try {
+                StrataNamespace namespace = StrataNamespace.of(namespaceText);
+                long epoch = Long.parseLong(epochText);
+                if (epoch <= 0) {
+                    throw new IllegalArgumentException("owner epoch " + epoch + " <= 0");
+                }
+                loaded.put(namespace, epoch);
+            } catch (IllegalArgumentException e) {
+                throw new IOException("invalid data node owner epoch floor entry for namespace '"
+                        + namespaceText + "' in " + file, e);
+            }
+        }
+        return loaded;
+    }
+
+    /** Properties parser that treats duplicate namespace floors as corruption instead of taking the last one. */
+    private static final class StrictProperties extends Properties {
+        @Override
+        public synchronized Object put(Object key, Object value) {
+            if (containsKey(key)) {
+                throw new IllegalArgumentException("duplicate property: " + key);
+            }
+            return super.put(key, value);
+        }
+    }
+
+    private static void persistOwnerEpochs(Path dataDir, Map<StrataNamespace, Long> epochs) throws IOException {
+        Properties properties = new Properties();
+        for (Map.Entry<StrataNamespace, Long> entry : epochs.entrySet()) {
+            properties.setProperty(entry.getKey().value(), Long.toString(entry.getValue()));
+        }
+        Path file = dataDir.resolve("owner-epochs.properties");
+        Path tmp = dataDir.resolve("owner-epochs.properties.tmp");
+        try (FileChannel ch = FileChannel.open(tmp, StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+             var out = Channels.newOutputStream(ch)) {
+            properties.store(out, "strata data node owner epoch floors — bound to this volume");
+            out.flush();
+            ch.force(true);
+        }
+        Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING,
                 StandardCopyOption.ATOMIC_MOVE);
         forceDirectory(dataDir);
     }

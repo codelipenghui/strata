@@ -50,6 +50,13 @@ class ServerMetricsTest {
             assertNotNull(registry.find("strata_data_node_orphan_gc_breaker_skipped_chunk_total").functionCounter());
             assertNotNull(registry.find("strata_data_node_orphan_gc_already_deleted_total").functionCounter());
             assertNotNull(registry.find("strata_data_node_owner_epoch_fence_rejects").functionCounter());
+            assertNotNull(registry.find("strata_data_node_owner_epoch_persistence_poisoned").gauge());
+            assertNotNull(registry.find("strata_data_node_owner_epoch_persistence_rejects_total").functionCounter());
+            assertNotNull(registry.find("strata_data_node_owner_epoch_delete_claim_rejects_total").functionCounter());
+            assertNotNull(registry.find("strata_data_node_orphan_gc_owner_epoch_confirm_rejects_total")
+                    .functionCounter());
+            assertNotNull(registry.find("strata_data_node_orphan_gc_persistence_poison_confirm_rejects_total")
+                    .functionCounter());
         }
     }
 

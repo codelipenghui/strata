@@ -85,15 +85,24 @@ class ControllerNamespaceLogBackendTest {
                 assertSystemNamespaceRejected(() -> tool.call(Opcode.LOOKUP_FILE,
                         new Messages.LookupFile(NamespaceLogBackend.SYSTEM_NAMESPACE, systemFile).encode(),
                         null, 5_000));
+                assertSystemNamespaceRejected(() -> tool.call(Opcode.CONFIRM_ORPHAN,
+                        new Messages.ConfirmOrphan(NamespaceLogBackend.SYSTEM_NAMESPACE,
+                                new ChunkId(systemFile, 0), 7).encode(), null, 5_000));
 
                 var lookup = Messages.LookupFileResp.decode(metadata.call(Opcode.LOOKUP_FILE,
                         new Messages.LookupFile(NamespaceLogBackend.SYSTEM_NAMESPACE, systemFile).encode(),
                         null, 5_000));
+                var confirmation = Messages.ConfirmOrphanResp.decode(metadata.call(Opcode.CONFIRM_ORPHAN,
+                        new Messages.ConfirmOrphan(NamespaceLogBackend.SYSTEM_NAMESPACE,
+                                new ChunkId(systemFile, 0), 7).encode(), null, 5_000));
                 var byPath = Messages.LookupPathResp.decode(metadata.call(Opcode.LOOKUP_PATH,
                         new Messages.LookupPath("strata-meta", "/metadata-log/internal-test").encode(),
                         null, 5_000));
                 assertEquals(systemFile, byPath.fileId());
                 assertEquals(NamespaceLogBackend.SYSTEM_NAMESPACE, lookup.namespace());
+                assertTrue(confirmation.fileExists());
+                assertFalse(confirmation.referencedByNode());
+                assertTrue(confirmation.ownerEpoch() > 0);
                 assertTrue(Messages.AllocateWriterEpochResp.decode(metadata.call(Opcode.ALLOCATE_WRITER_EPOCH,
                         Messages.AllocateWriterEpoch.forRecovery(
                                 NamespaceLogBackend.SYSTEM_NAMESPACE, systemFile).encode(), null, 5_000))
@@ -128,7 +137,24 @@ class ControllerNamespaceLogBackendTest {
                         5_000));
                 assertEquals(ErrorCode.FILE_NOT_FOUND, missing.code());
                 assertEquals(lookup.ownerEpoch(), missing.detail(),
-                        "destructive orphan-GC FILE_NOT_FOUND confirms must carry the namespace owner epoch");
+                        "legacy LOOKUP_FILE misses keep carrying the namespace owner epoch detail");
+
+                Messages.ConfirmOrphanResp confirmation = Messages.ConfirmOrphanResp.decode(client.call(
+                        Opcode.CONFIRM_ORPHAN,
+                        new Messages.ConfirmOrphan(StrataNamespace.of("tenant-a"),
+                                new ChunkId(created.fileId(), 0), 123).encode(), null, 5_000));
+                assertTrue(confirmation.fileExists());
+                assertEquals(false, confirmation.referencedByNode());
+                assertEquals(lookup.ownerEpoch(), confirmation.ownerEpoch(),
+                        "namespace-log confirms bind the verdict to the validated repo epoch");
+
+                Messages.ConfirmOrphanResp absent = Messages.ConfirmOrphanResp.decode(client.call(
+                        Opcode.CONFIRM_ORPHAN,
+                        new Messages.ConfirmOrphan(StrataNamespace.of("tenant-a"),
+                                new ChunkId(FileId.of(999), 0), 123).encode(), null, 5_000));
+                assertEquals(false, absent.fileExists());
+                assertEquals(false, absent.referencedByNode());
+                assertEquals(lookup.ownerEpoch(), absent.ownerEpoch());
 
                 var byPath = Messages.LookupPathResp.decode(client.call(Opcode.LOOKUP_PATH,
                         new Messages.LookupPath("tenant-a", "/logs/seg-0").encode(), null, 5_000));

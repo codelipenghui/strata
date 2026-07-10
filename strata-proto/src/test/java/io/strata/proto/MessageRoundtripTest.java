@@ -132,6 +132,13 @@ class MessageRoundtripTest {
                 new Messages.DeleteCmd(2, List.of(c), ns, 43),
                 new Messages.DrainCmd(3)));
         assertEquals(hbResp, decodeResp(hbResp.encode(), Messages.HeartbeatResp::decode));
+
+        var confirm = new Messages.ConfirmOrphan(ns, c, 7);
+        assertEquals(confirm, Messages.ConfirmOrphan.decode(buf(confirm.encode())));
+
+        var confirmResp = new Messages.ConfirmOrphanResp(true, true, 43);
+        assertEquals(confirmResp,
+                decodeResp(confirmResp.encode(), Messages.ConfirmOrphanResp::decode));
     }
 
     @Test

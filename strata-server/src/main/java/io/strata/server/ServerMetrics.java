@@ -62,6 +62,10 @@ final class ServerMetrics {
                 .description("repairs issued, by trigger lane (event = node-death driven, reconcile = backstop scan)").register(reg);
         FunctionCounter.builder("strata_controller_reconcile_skipped_files", s, Controller::reconcileSkippedFiles)
                 .description("files skipped in the reconcile pass due to per-file errors (rate() = error frequency)").register(reg);
+        FunctionCounter.builder("strata_controller_authority_revalidation_skips", s,
+                        Controller::authorityRevalidationSkips)
+                .description("destructive namespace passes skipped because owner authority could not be revalidated")
+                .register(reg);
         FunctionCounter.builder("strata_controller_cluster_live_nodes_read_failures", s,
                         Controller::clusterLiveNodesReadFailures)
                 .description("published cluster live-node snapshots that failed to read or decode on placement readers")
@@ -233,6 +237,26 @@ final class ServerMetrics {
         FunctionCounter.builder("strata_data_node_owner_epoch_fence_rejects", n,
                         DataNode::ownerEpochFenceRejects)
                 .description("owner RPCs rejected because their owner epoch is stale").register(reg);
+        Gauge.builder("strata_data_node_owner_epoch_persistence_poisoned", n,
+                        DataNode::ownerEpochPersistencePoisoned)
+                .description("1 when durable orphan-confirm epoch persistence is poisoned until restart")
+                .register(reg);
+        FunctionCounter.builder("strata_data_node_owner_epoch_persistence_rejects_total", n,
+                        DataNode::ownerEpochPersistenceRejects)
+                .description("durable owner-epoch raises or orphan deletes rejected by persistence poison")
+                .register(reg);
+        FunctionCounter.builder("strata_data_node_owner_epoch_delete_claim_rejects_total", n,
+                        DataNode::ownerEpochDeleteClaimRejects)
+                .description("owner RPCs retriably rejected while a committed orphan unlink is in progress")
+                .register(reg);
+        FunctionCounter.builder("strata_data_node_orphan_gc_owner_epoch_confirm_rejects_total", n,
+                        DataNode::orphanGcOwnerEpochConfirmRejects)
+                .description("controller orphan-confirm responses rejected by the node owner-epoch gate")
+                .register(reg);
+        FunctionCounter.builder("strata_data_node_orphan_gc_persistence_poison_confirm_rejects_total", n,
+                        DataNode::orphanGcPersistencePoisonConfirmRejects)
+                .description("orphan-confirm responses rejected because the durable epoch floor is poisoned")
+                .register(reg);
         Gauge.builder("strata_data_node_orphan_gc_breaker_open_namespaces", n,
                         DataNode::orphanGcBreakerOpenNamespaces)
                 .description("namespaces whose orphan-GC breaker is open").register(reg);
