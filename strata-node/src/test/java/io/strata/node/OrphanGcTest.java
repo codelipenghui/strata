@@ -77,6 +77,54 @@ class OrphanGcTest {
     }
 
     @Test
+    void ordinaryNamespaceConfirmUsesToolClientKind() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger clientKind = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 clientKind.set(RequestContext.clientKind());
+                 Messages.ChunkInfo listed = new Messages.ChunkInfo(chunk, ChunkState.SEALED, 12, 0, 1,
+                         List.of(new Messages.Replica(NODE_ID, "127.0.0.1:1")));
+                 return ScpServer.ok(req, new Messages.LookupFileResp(NS, StrataPath.of("/ordinary/test"),
+                         Messages.WritePolicy.DEFAULT, (byte) 0, List.of(listed), 1).encode(), null);
+             })) {
+            seal(store, chunk);
+            OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000);
+
+            gc.gcOnce();
+
+            assertEquals(ScpClient.KIND_TOOL, clientKind.get());
+            assertTrue(store.contains(NS, chunk), "the controller still lists this ordinary chunk");
+        }
+    }
+
+    @Test
+    void keepsSuspectAndWarnsWhenOwnerRejectsConfirm() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                         "namespace is reserved for internal metadata");
+             })) {
+            seal(store, chunk);
+            OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000);
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, chunk),
+                    "a rejected owner confirm must never authorize physical deletion");
+            assertEquals(1, gc.unreachableConfirmWarns(),
+                    "a rejected confirm must surface through unreachable-confirm observability");
+        }
+    }
+
+    @Test
     void deletesConfirmedOrphanButKeepsAChunkTheOwnerStillLists() throws Exception {
         ChunkId orphan = new ChunkId(FileId.of(1), 0); // owner answers FILE_NOT_FOUND
         ChunkId listed = new ChunkId(FileId.of(2), 0); // owner still lists this node for the chunk

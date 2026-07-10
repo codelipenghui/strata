@@ -49,6 +49,12 @@ final class ControllerClient implements AutoCloseable {
     ControllerClient(ClientConfig config, byte clientKind, String clientId) {
         this.config = config;
         this.seeds = List.copyOf(config.controllerEndpoints());
+        if (clientKind != ScpClient.KIND_BROKER
+                && clientKind != ScpClient.KIND_DATA_NODE
+                && clientKind != ScpClient.KIND_METADATA
+                && clientKind != ScpClient.KIND_TOOL) {
+            throw new IllegalArgumentException("unknown clientKind: " + Byte.toUnsignedInt(clientKind));
+        }
         this.clientKind = clientKind;
         this.clientId = Objects.requireNonNull(clientId, "clientId");
         if (seeds.isEmpty()) {

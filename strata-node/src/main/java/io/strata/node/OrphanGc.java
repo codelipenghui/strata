@@ -543,6 +543,12 @@ final class OrphanGc implements AutoCloseable {
     private Verdict confirm(StrataNamespace ns, ChunkId chunkId) {
         FileId fileId = chunkId.fileId();
         byte[] req = new Messages.LookupFile(ns, fileId).encode();
+        // System metadata generations are eligible for orphan GC, but the controller serves their
+        // LOOKUP_FILE only to KIND_METADATA. Keep ordinary namespace maintenance on KIND_TOOL so the
+        // privileged metadata role stays scoped to the reserved strata-meta namespace.
+        byte clientKind = "strata-meta".equals(ns.value())
+                ? ScpClient.KIND_METADATA
+                : ScpClient.KIND_TOOL;
         Exception lastFailure = null;
         for (String ep : controllerEndpoints) {
             Endpoint endpoint;
@@ -553,7 +559,7 @@ final class OrphanGc implements AutoCloseable {
                 continue;
             }
             try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(),
-                    ScpClient.KIND_METADATA, "orphan-confirm")) {
+                    clientKind, "orphan-confirm")) {
                 ByteBuffer resp = client.call(Opcode.LOOKUP_FILE, req, null, confirmTimeoutMs);
                 Messages.LookupFileResp r = Messages.LookupFileResp.decode(resp);
                 Exception ownerEpochFailure = confirmOwnerEpochFailure(ns, r.ownerEpoch(), ep);

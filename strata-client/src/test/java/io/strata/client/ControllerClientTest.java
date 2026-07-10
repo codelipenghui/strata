@@ -29,6 +29,32 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ControllerClientTest {
 
     @Test
+    void acceptsEveryMeaningfulControllerClientKind() {
+        ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 100);
+
+        for (byte clientKind : new byte[]{
+                ScpClient.KIND_BROKER,
+                ScpClient.KIND_DATA_NODE,
+                ScpClient.KIND_METADATA,
+                ScpClient.KIND_TOOL}) {
+            try (ControllerClient ignored = new ControllerClient(config, clientKind, "kind-test")) {
+                // Construction is the assertion; connections remain lazy.
+            }
+        }
+    }
+
+    @Test
+    void rejectsUnknownControllerClientKinds() {
+        ClientConfig config = new ClientConfig(List.of("127.0.0.1:1"), 1024, 100);
+
+        for (byte clientKind : new byte[]{0, 5, (byte) 0xFF}) {
+            IllegalArgumentException rejected = assertThrows(IllegalArgumentException.class,
+                    () -> new ControllerClient(config, clientKind, "kind-test"));
+            assertEquals("unknown clientKind: " + Byte.toUnsignedInt(clientKind), rejected.getMessage());
+        }
+    }
+
+    @Test
     void internalMetadataClientUsesMetadataControllerKind() throws Exception {
         AtomicInteger clientKind = new AtomicInteger();
         try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {

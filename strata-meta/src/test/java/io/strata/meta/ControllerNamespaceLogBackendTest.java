@@ -271,6 +271,10 @@ class ControllerNamespaceLogBackendTest {
         ScpException rejected = assertThrows(ScpException.class, operation);
         assertEquals(ErrorCode.PRECONDITION_FAILED, rejected.code());
         assertFalse(rejected.retriable(), "reserved namespace rejection must not be retried");
+        assertTrue(rejected.getMessage().contains("reserved for internal metadata"),
+                "the request must be rejected by the system-namespace ingress gate");
+        assertTrue(rejected.getMessage().contains("client kind="),
+                "the rejection must identify the presented role for client-side diagnosis");
     }
 
     private static MetadataStore failManifestCasOnce(MetadataStore delegate, AtomicBoolean armed) {

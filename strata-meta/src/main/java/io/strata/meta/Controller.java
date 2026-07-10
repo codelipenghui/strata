@@ -30,6 +30,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
 import java.util.function.UnaryOperator;
 
@@ -41,6 +42,7 @@ import java.util.function.UnaryOperator;
  */
 public final class Controller implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(Controller.class);
+    private static final long SYSTEM_NAMESPACE_REJECT_WARN_INTERVAL_MS = 60_000;
     /** Optimistic-concurrency retry bound, shared with RepairCoordinator's descriptor CAS loops. */
     static final int CAS_RETRIES = 5;
 
@@ -54,6 +56,7 @@ public final class Controller implements AutoCloseable {
     private final String advertisedEndpoint;  // this node's reachable host:port — the leader hint clients redirect to
     private final NamespaceOwnership ownership; // resolves the controller owner of each namespace (design §6)
     private final NamespaceLeadership namespaceLeadership; // optional: namespace-log ACTIVE/RECOVERING barrier
+    private final AtomicLong lastSystemNamespaceRejectWarnMs = new AtomicLong();
 
     public Controller(ControllerConfig config) throws Exception {
         this(config, null);
@@ -439,9 +442,16 @@ public final class Controller implements AutoCloseable {
         // Tag this request's metrics with its namespace (read back by ScpServer's request observer).
         RequestContext.setNamespace(namespace.value());
         if (NamespaceLogBackend.isSystem(namespace)) {
-            if (RequestContext.clientKind() != ScpClient.KIND_METADATA) {
+            // StrataNamespace deliberately permits this literal so internal metadata code can represent
+            // it; controller ingress is where the internal role is enforced.
+            byte clientKind = RequestContext.clientKind();
+            if (clientKind != ScpClient.KIND_METADATA) {
+                String clientId = RequestContext.clientId();
+                int presentedClientKind = Byte.toUnsignedInt(clientKind);
+                maybeWarnSystemNamespaceReject(namespace, presentedClientKind, clientId);
                 throw new ScpException(ErrorCode.PRECONDITION_FAILED,
-                        "namespace is reserved for internal metadata: " + namespace);
+                        "namespace " + namespace + " is reserved for internal metadata (client kind="
+                                + presentedClientKind + ")");
             }
             // Metadata-log system files live in the shared ZK root (CAS-guarded), so any node may serve
             // them — a non-controller owner writes its own namespace's metadata-log files here.
@@ -457,6 +467,19 @@ public final class Controller implements AutoCloseable {
                     ownership.ownerOf(namespace));
         }
         requireNamespaceActive(namespace);
+    }
+
+    /** Rate-limited because a stale fleet may retry the same rejected internal-namespace request. */
+    private void maybeWarnSystemNamespaceReject(StrataNamespace namespace, int clientKind, String clientId) {
+        long now = System.currentTimeMillis();
+        long last = lastSystemNamespaceRejectWarnMs.get();
+        if (last != 0 && now - last < SYSTEM_NAMESPACE_REJECT_WARN_INTERVAL_MS) {
+            return;
+        }
+        if (lastSystemNamespaceRejectWarnMs.compareAndSet(last, now)) {
+            log.warn("rejecting reserved system namespace request: namespace={} clientKind={} clientId={}",
+                    namespace, clientKind, clientId);
+        }
     }
 
     private void requireNamespaceActive(StrataNamespace namespace) {

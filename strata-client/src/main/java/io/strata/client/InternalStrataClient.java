@@ -9,7 +9,9 @@ import java.util.Objects;
  *
  * <p>This class is public only because {@code strata-meta} is a separate Maven module. Application
  * clients must use {@link StrataClient#connect(ClientConfig)}; the metadata role is reserved for the
- * controller's metadata-log/snapshot store and other internal control-plane callers.
+ * controller's metadata-log/snapshot store. The data-node orphan-confirm lane is its only other holder,
+ * and presents it only for LOOKUP_FILE requests in the reserved {@code strata-meta} namespace; ordinary
+ * namespace confirms retain the tool role.
  * The HELLO role is a typed protocol distinction, not authentication on today's unauthenticated SCP
  * transport.
  *
