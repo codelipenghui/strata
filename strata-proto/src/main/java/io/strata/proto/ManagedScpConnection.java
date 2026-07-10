@@ -7,6 +7,9 @@ import io.strata.common.ErrorCode;
 import io.strata.common.FailureInjector;
 import io.strata.common.ScpConnectionException;
 import io.strata.common.ScpException;
+import io.strata.common.ScpProtocolException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -23,6 +26,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * detect when an open-session connection was replaced.
  */
 public final class ManagedScpConnection implements AutoCloseable {
+    private static final Logger log = LoggerFactory.getLogger(ManagedScpConnection.class);
+
     private static final byte[] EMPTY_HEADER = new BufWriter(4).noTags().toBytes();
 
     public record CallResult(ByteBuffer header, long generation) {}
@@ -274,6 +279,16 @@ public final class ManagedScpConnection implements AutoCloseable {
             generation++;
             backoff.reset();
             return client;
+        } catch (ScpProtocolException e) {
+            // A bad preferred HELLO must not pin reconnects to the same hinted endpoint. Preserve
+            // the protocol type (it must never earn transport-unreachable recovery credit), while
+            // applying the same endpoint failover bookkeeping as a failed TCP connection.
+            if (preferred) {
+                preferredEndpoint = null;
+            } else {
+                maybeAdvanceEndpointLocked();
+            }
+            throw e;
         } catch (IOException e) {
             if (preferred) {
                 preferredEndpoint = null;  // hinted leader unreachable — fall back to the configured list
@@ -285,7 +300,6 @@ public final class ManagedScpConnection implements AutoCloseable {
     }
 
     private RuntimeException classifyFailure(ScpClient seen, RuntimeException e) {
-        boolean connectionClosed = seen != null && seen.isClosed();
         invalidateClosed(seen);
         // ScpClient classifies transport failures at their source. Preserve every protocol/server
         // ScpException even if the peer closes immediately after its response; reclassifying solely
@@ -293,10 +307,9 @@ public final class ManagedScpConnection implements AutoCloseable {
         if (e instanceof ScpException) {
             return e;
         }
-        if (connectionClosed) {
-            return new ScpConnectionException(endpointLabel + " connection failed: " + e.getMessage(), e);
-        }
-        return e;
+        // A genuine transport failure is typed by ScpClient at its source. Any residual local
+        // runtime failure is untrusted protocol/client behavior, even when it also closed the channel.
+        return new ScpProtocolException(endpointLabel + " client failure: " + e.getMessage(), e);
     }
 
     private void invalidateClosed(ScpClient seen) {
@@ -388,6 +401,10 @@ public final class ManagedScpConnection implements AutoCloseable {
                 current.call(Opcode.PING, EMPTY_HEADER, null, policy.heartbeatTimeoutMs());
                 backoffReset();
             } catch (RuntimeException e) {
+                if (!closed.get() && maintainConnection) {
+                    log.warn("SCP heartbeat failed for {}; closing generation {} and reconnecting: {}",
+                            endpointLabel, generation, e.toString());
+                }
                 lock.lock();
                 try {
                     closeIfCurrentLocked(current);
@@ -408,6 +425,9 @@ public final class ManagedScpConnection implements AutoCloseable {
             connectLocked();
             return true;
         } catch (RuntimeException e) {
+            if (!closed.get() && maintainConnection) {
+                log.warn("SCP background reconnect failed for {}: {}", endpointLabel, e.toString());
+            }
             return false;
         } finally {
             lock.unlock();

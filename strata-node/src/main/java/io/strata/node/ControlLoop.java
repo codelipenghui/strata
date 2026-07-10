@@ -8,6 +8,7 @@ import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpConnectionException;
 import io.strata.common.ScpException;
+import io.strata.common.ScpProtocolException;
 import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkFormats;
 import io.strata.format.ChunkStore;
@@ -103,8 +104,8 @@ final class ControlLoop implements AutoCloseable {
                 Thread.sleep(heartbeatIntervalMs);
             } catch (InterruptedException e) {
                 return;
-            } catch (ScpConnectionException e) {
-                log.warn("metadata connection problem: {} — reconnecting", e.toString());
+            } catch (ScpConnectionException | ScpProtocolException e) {
+                log.warn("metadata connection/protocol problem: {} — reconnecting", e.toString());
                 rotateEndpoint();
                 sleepQuiet(backoff.nextMs());
             } catch (ScpException e) {

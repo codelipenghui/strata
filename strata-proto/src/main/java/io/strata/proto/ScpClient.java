@@ -10,13 +10,17 @@ import io.netty.channel.ChannelOption;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.CodecException;
 import io.netty.util.concurrent.ScheduledFuture;
 import io.strata.common.ConnectionPolicy;
 import io.strata.common.EnvConfig;
 import io.strata.common.ErrorCode;
+import io.strata.common.FailureInjector;
 import io.strata.common.ScpConnectionException;
 import io.strata.common.ScpException;
 import io.strata.common.ScpProtocolException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -37,6 +41,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * Thread-safe; Netty serializes channel writes, responses are dispatched by the channel pipeline.
  */
 public final class ScpClient implements AutoCloseable {
+    private static final Logger log = LoggerFactory.getLogger(ScpClient.class);
+
     public static final byte KIND_BROKER = 1;
     public static final byte KIND_DATA_NODE = 2;
     public static final byte KIND_METADATA = 3;
@@ -85,7 +91,7 @@ public final class ScpClient implements AutoCloseable {
                 throw new SocketTimeoutException("connect timed out after " + connectTimeoutMs + "ms");
             }
             if (!connectFuture.isSuccess()) {
-                throw asIOException(connectFuture.cause());
+                throw transportIOExceptionOrProtocol(connectFuture.cause(), "connect failed");
             }
             connected = connectFuture.channel();
 
@@ -97,7 +103,7 @@ public final class ScpClient implements AutoCloseable {
                 throw new SocketTimeoutException("handshake write timed out after " + connectTimeoutMs + "ms");
             }
             if (!writeHello.isSuccess()) {
-                throw asIOException(writeHello.cause());
+                throw transportIOExceptionOrProtocol(writeHello.cause(), "handshake write failed");
             }
 
             Frame helloResp = awaitHandshake(connectTimeoutMs);
@@ -143,7 +149,7 @@ public final class ScpClient implements AutoCloseable {
             if (cause instanceof RuntimeException runtime) {
                 throw runtime;
             }
-            throw new IOException(String.valueOf(cause), cause);
+            throw new ScpProtocolException("unexpected handshake failure: " + cause, cause);
         }
     }
 
@@ -164,23 +170,49 @@ public final class ScpClient implements AutoCloseable {
                 handshake.complete(response);
                 return;
             }
-            Pending holder = pending.remove(frame.correlationId());
+            long correlationId = frame.correlationId();
+            Pending holder = pending.get(correlationId);
             if (holder == null) {
+                if (frame.isResponse()) {
+                    log.warn("Dropping unmatched SCP response correlationId={} opcode={} remote={}",
+                            correlationId, frame.opcode(), ctx.channel().remoteAddress());
+                }
                 frame.close();   // abandoned/timed-out: release the retained pooled buffer
                 return;
             }
-            pendingPermits.release();
             if (holder.borrow()) {
-                holder.future().complete(frame);  // ownership transfers to caller; no copy, no close
-            } else {
-                Frame response;
-                try {
-                    response = frame.copyToHeap();
-                } finally {
+                if (!holder.future().complete(frame)) {
                     frame.close();
                 }
-                holder.future().complete(response);
+                return;  // ownership transfers to caller only when completion succeeds
             }
+
+            Frame response = null;
+            Throwable responseFailure = null;
+            try {
+                FailureInjector.point("scp.client.beforeResponseCopy");
+                response = frame.copyToHeap();
+            } catch (Throwable failure) {
+                responseFailure = failure;
+            }
+            try {
+                frame.close();
+            } catch (Throwable closeFailure) {
+                if (responseFailure == null) {
+                    responseFailure = closeFailure;
+                } else {
+                    responseFailure.addSuppressed(closeFailure);
+                }
+            }
+            if (responseFailure != null) {
+                Exception failure = pipelineFailure(responseFailure, "SCP response handling failed");
+                // Mark the client closed before completing the waiter so ManagedScpConnection's
+                // completion observers cannot miss invalidation/endpoint-rotation bookkeeping.
+                failAll(failure);
+                ctx.close();
+                return;
+            }
+            holder.future().complete(response);
         }
 
         @Override
@@ -190,8 +222,12 @@ public final class ScpClient implements AutoCloseable {
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            ScpProtocolException protocolFailure = protocolFailure(cause);
-            failAll(protocolFailure != null ? protocolFailure : asIOException(cause));
+            Exception failure = pipelineFailure(cause, "SCP pipeline failure");
+            if (failure instanceof ScpProtocolException && handshake.isDone() && pending.isEmpty()) {
+                log.warn("SCP protocol failure with no waiting request remote={}",
+                        ctx.channel().remoteAddress(), failure);
+            }
+            failAll(failure);
             ctx.close();
         }
     }
@@ -246,8 +282,8 @@ public final class ScpClient implements AutoCloseable {
         ChannelFuture write;
         try {
             write = channel.writeAndFlush(request);
-        } catch (RuntimeException e) {
-            IOException failure = asIOException(e);
+        } catch (Throwable e) {
+            Exception failure = pipelineFailure(e, "SCP write failed");
             removePending(id, holder);
             failAll(failure);
             fut.completeExceptionally(failure);
@@ -256,7 +292,7 @@ public final class ScpClient implements AutoCloseable {
         write.addListener(f -> {
             if (!f.isSuccess()) {
                 removePending(id, holder);
-                IOException failure = asIOException(f.cause());
+                Exception failure = pipelineFailure(f.cause(), "SCP write failed");
                 failAll(failure);
                 fut.completeExceptionally(failure);
             }
@@ -339,12 +375,7 @@ public final class ScpClient implements AutoCloseable {
         try {
             return fut.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof ScpException se) throw se;
-            if (cause instanceof IOException io) {
-                throw new ScpConnectionException(String.valueOf(io), io);
-            }
-            throw new ScpException(ErrorCode.INTERNAL, String.valueOf(cause));
+            throw callFailure(e.getCause());
         } catch (TimeoutException e) {
             ScpConnectionException timeout = new ScpConnectionException(
                     "timeout after " + timeoutMs + "ms for " + op, e);
@@ -369,12 +400,7 @@ public final class ScpClient implements AutoCloseable {
         try {
             return fut.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof ScpException se) throw se;
-            if (cause instanceof IOException io) {
-                throw new ScpConnectionException(String.valueOf(io), io);
-            }
-            throw new ScpException(ErrorCode.INTERNAL, String.valueOf(cause));
+            throw callFailure(e.getCause());
         } catch (TimeoutException e) {
             ScpConnectionException timeout = new ScpConnectionException(
                     "timeout after " + timeoutMs + "ms for " + op, e);
@@ -424,11 +450,72 @@ public final class ScpClient implements AutoCloseable {
         }
     }
 
-    private static IOException asIOException(Throwable cause) {
-        if (cause instanceof IOException io) {
+    private static ScpException callFailure(Throwable cause) {
+        Throwable root = ScpException.rootCause(cause);
+        if (root instanceof ScpException scp) {
+            return scp;
+        }
+        IOException io = ioFailure(root);
+        if (io != null) {
+            return new ScpConnectionException(String.valueOf(io), io);
+        }
+        return new ScpProtocolException("unexpected local SCP failure: " + root, root);
+    }
+
+    private static IOException transportIOExceptionOrProtocol(Throwable cause, String context) {
+        Exception failure = pipelineFailure(cause, context);
+        if (failure instanceof IOException io) {
             return io;
         }
-        return new IOException(String.valueOf(cause), cause);
+        throw (ScpProtocolException) failure;
+    }
+
+    /**
+     * Pipeline failures are transport failures only when an actual {@link IOException} is present.
+     * Local codec/handler bugs and other non-I/O throwables are untrusted protocol failures; treating
+     * them as connection loss would let recovery count them as possible-holder credit.
+     */
+    private static Exception pipelineFailure(Throwable cause, String context) {
+        ScpProtocolException protocol = protocolFailure(cause);
+        if (protocol != null) {
+            return protocol;
+        }
+        if (hasCodecFailure(cause)) {
+            return new ScpProtocolException(context + ": " + cause, cause);
+        }
+        IOException io = ioFailure(cause);
+        if (io != null) {
+            return io;
+        }
+        return new ScpProtocolException(context + ": " + cause, cause);
+    }
+
+    private static boolean hasCodecFailure(Throwable cause) {
+        Throwable current = cause;
+        while (current != null) {
+            if (current instanceof CodecException) {
+                return true;
+            }
+            if (current.getCause() == current) {
+                break;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private static IOException ioFailure(Throwable cause) {
+        Throwable current = cause;
+        while (current != null) {
+            if (current instanceof IOException io) {
+                return io;
+            }
+            if (current.getCause() == current) {
+                break;
+            }
+            current = current.getCause();
+        }
+        return null;
     }
 
     private static ScpProtocolException protocolFailure(Throwable cause) {
