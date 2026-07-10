@@ -207,6 +207,78 @@ class ChunkStoreTest {
     }
 
     @Test
+    void freshStoreRootForcesParentDirectoryBeforeUse() throws Exception {
+        Path storeRoot = dir.resolve("chunks");
+        Path expectedParent = dir.toAbsolutePath().normalize();
+        List<Path> forced = new ArrayList<>();
+
+        try (ChunkStore ignored = new ChunkStore(
+                storeRoot, false, 1024, ChunkStoreConfig.DEFAULT, path -> {
+                    assertTrue(Files.isDirectory(storeRoot),
+                            "the store root must exist before its parent is forced");
+                    forced.add(path.toAbsolutePath().normalize());
+                })) {}
+
+        assertEquals(List.of(expectedParent), forced,
+                "a fresh empty store must only anchor its root in the parent");
+    }
+
+    @Test
+    void storeRootRequiresExistingParentForDurableCreation() {
+        Path missingParent = dir.resolve("missing");
+        Path storeRoot = missingParent.resolve("chunks");
+
+        assertThrows(IOException.class, () -> {
+            try (ChunkStore ignored = new ChunkStore(
+                    storeRoot, false, 1024, ChunkStoreConfig.DEFAULT, path -> {})) {}
+        });
+        assertFalse(Files.exists(missingParent),
+                "store construction must not create an unanchored ancestor chain");
+    }
+
+    @Test
+    void storeRootParentSyncFailureIsRetriedOnNextConstruction() throws Exception {
+        Path storeRoot = dir.resolve("retry-chunks");
+        Path expectedParent = dir.toAbsolutePath().normalize();
+        AtomicLong attempts = new AtomicLong();
+        ChunkStore.DirectorySyncer syncer = path -> {
+            assertEquals(expectedParent, path.toAbsolutePath().normalize());
+            if (attempts.incrementAndGet() == 1) {
+                throw new IOException("injected store-root parent fsync failure");
+            }
+        };
+
+        assertThrows(IOException.class,
+                () -> new ChunkStore(storeRoot, false, 1024, ChunkStoreConfig.DEFAULT, syncer));
+        assertTrue(Files.isDirectory(storeRoot), "failed construction may leave the new root in place");
+
+        try (ChunkStore ignored = new ChunkStore(
+                storeRoot, false, 1024, ChunkStoreConfig.DEFAULT, syncer)) {
+            assertEquals(2, attempts.get(), "an existing root must retry the parent fsync before use");
+        }
+    }
+
+    @Test
+    void storeRootParentIsForcedOnEverySuccessfulConstruction() throws Exception {
+        Path storeRoot = dir.resolve("reopened-chunks");
+        Path expectedParent = dir.toAbsolutePath().normalize();
+        AtomicLong attempts = new AtomicLong();
+        ChunkStore.DirectorySyncer syncer = path -> {
+            assertEquals(expectedParent, path.toAbsolutePath().normalize());
+            attempts.incrementAndGet();
+        };
+
+        try (ChunkStore ignored = new ChunkStore(
+                storeRoot, false, 1024, ChunkStoreConfig.DEFAULT, syncer)) {
+            assertEquals(1, attempts.get());
+        }
+        try (ChunkStore ignored = new ChunkStore(
+                storeRoot, false, 1024, ChunkStoreConfig.DEFAULT, syncer)) {
+            assertEquals(2, attempts.get(), "each constructor must independently anchor the root");
+        }
+    }
+
+    @Test
     void fsyncOnAckOpenForcesCreatedShardAncestorDirentsWhenSealFsyncDisabled() throws Exception {
         ChunkId chunkId = new ChunkId(FileId.of(0x0102), 0);
         List<Path> forced = new ArrayList<>();
@@ -230,6 +302,7 @@ class ChunkStoreTest {
         List<Path> forced = new ArrayList<>();
 
         try (ChunkStore store = new ChunkStore(dir, false, 1024, ChunkStoreConfig.DEFAULT, forced::add)) {
+            forced.clear(); // isolate the open path from the constructor's store-root parent fsync
             store.open(TEST_NS, chunkId, false, 1, 1718000000000L);
         }
 
@@ -353,10 +426,17 @@ class ChunkStoreTest {
     void startupRecoveryDeletesStaleRootImportTemps() throws Exception {
         Path temp = dir.resolve("0000000000000001.0.import");
         Files.writeString(temp, "partial import");
+        Path expectedParent = dir.toAbsolutePath().normalize().getParent();
+        Path expectedRoot = dir.toAbsolutePath().normalize();
+        List<Path> forced = new ArrayList<>();
 
-        try (ChunkStore ignored = newStore()) {
+        try (ChunkStore ignored = new ChunkStore(
+                dir, false, 1024, ChunkStoreConfig.DEFAULT,
+                path -> forced.add(path.toAbsolutePath().normalize()))) {
             assertFalse(Files.exists(temp), "stale repair import temp must be removed during startup recovery");
         }
+        assertEquals(List.of(expectedParent, expectedRoot), forced,
+                "the root parent must be durable before recovery mutates the store root");
     }
 
     @Test
