@@ -542,6 +542,9 @@ final class OrphanGc implements AutoCloseable {
 
     private Verdict confirm(StrataNamespace ns, ChunkId chunkId) {
         FileId fileId = chunkId.fileId();
+        // ns is part of the chunk's on-disk identity. A same-id record in another namespace is a
+        // different logical file; repeated FILE_NOT_FOUND for ns intentionally reclaims a legacy or
+        // corrupt cross-namespace artifact instead of keeping it alive through a cross-namespace fallback.
         byte[] req = new Messages.LookupFile(ns, fileId).encode();
         // System metadata generations are eligible for orphan GC, but the controller serves their
         // LOOKUP_FILE only to KIND_METADATA. Keep ordinary namespace maintenance on KIND_TOOL so the

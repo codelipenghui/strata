@@ -160,6 +160,52 @@ class OrphanGcTest {
     }
 
     @Test
+    void deletesChunkWhoseFileIdExistsOnlyInAnotherNamespace() throws Exception {
+        StrataNamespace ownerNamespace = StrataNamespace.of("owner-namespace");
+        StrataNamespace onDiskNamespace = StrataNamespace.of("wrong-on-disk-namespace");
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger onDiskNamespaceLookups = new AtomicInteger();
+        AtomicInteger ownerNamespaceLookups = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 Messages.LookupFile lookup = Messages.LookupFile.decode(req.headerSlice());
+                 if (lookup.namespace().equals(onDiskNamespace)) {
+                     onDiskNamespaceLookups.incrementAndGet();
+                     throw new ScpException(ErrorCode.FILE_NOT_FOUND,
+                             "the file id is absent from the chunk's on-disk namespace");
+                 }
+                 if (lookup.namespace().equals(ownerNamespace)) {
+                     ownerNamespaceLookups.incrementAndGet();
+                     Messages.ChunkInfo ci = new Messages.ChunkInfo(chunk, ChunkState.SEALED, 12, 0, 1,
+                             List.of(new Messages.Replica(NODE_ID, "127.0.0.1:1")));
+                     return ScpServer.ok(req, new Messages.LookupFileResp(ownerNamespace,
+                             StrataPath.of("/same-id-in-owner-namespace"), Messages.WritePolicy.DEFAULT,
+                             (byte) 0, List.of(ci)).encode(), null);
+                 }
+                 throw new ScpException(ErrorCode.FILE_NOT_FOUND, "unexpected namespace");
+             })) {
+            seal(store, onDiskNamespace, chunk);
+            OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()),
+                    0, 60_000, 0, 5_000);
+
+            gc.gcOnce();
+            assertTrue(store.contains(onDiskNamespace, chunk),
+                    "namespace-scoped FILE_NOT_FOUND still requires a corroborating pass");
+
+            gc.gcOnce();
+            assertFalse(store.contains(onDiskNamespace, chunk),
+                    "a descriptor in another namespace must not keep this on-disk logical chunk alive");
+            assertEquals(3, onDiskNamespaceLookups.get(),
+                    "confirm and delete checks must stay bound to the chunk's on-disk namespace");
+            assertEquals(0, ownerNamespaceLookups.get(),
+                    "orphan confirmation must never fall back to a same-id file in another namespace");
+        }
+    }
+
+    @Test
     void keepsSuspectWhenOwnerUnreachableFailSafe() throws Exception {
         ChunkId chunk = new ChunkId(FileId.of(1), 0);
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"))) {

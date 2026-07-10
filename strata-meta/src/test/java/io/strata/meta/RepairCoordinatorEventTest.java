@@ -227,7 +227,10 @@ class RepairCoordinatorEventTest {
 
     private record Registered(int nodeId, long incMsb, long incLsb, long sessionEpoch) {}
 
-    /** Minimal in-memory MetadataStore: only the file/node surface the repair path touches. */
+    /**
+     * Minimal in-memory MetadataStore for the file/node surface the repair path touches. Its flat
+     * physical map mirrors ZK, while the public SPI still enforces namespace-scoped logical identity.
+     */
     private static final class FakeStore implements MetadataStore {
         private final Map<FileId, Versioned<Records.FileRecord>> files = new LinkedHashMap<>();
         private final Map<Integer, Versioned<Records.NodeRecord>> nodes = new LinkedHashMap<>();
@@ -251,7 +254,8 @@ class RepairCoordinatorEventTest {
 
         @Override
         public Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) {
-            return Optional.ofNullable(files.get(id));
+            return Optional.ofNullable(files.get(id))
+                    .filter(current -> current.value().namespace().equals(namespace));
         }
 
         @Override
@@ -262,7 +266,8 @@ class RepairCoordinatorEventTest {
         @Override
         public boolean updateFile(Records.FileRecord record, int expectedVersion) {
             Versioned<Records.FileRecord> current = files.get(record.fileId());
-            if (current == null || current.version() != expectedVersion) {
+            if (current == null || !current.value().namespace().equals(record.namespace())
+                    || current.version() != expectedVersion) {
                 return false;
             }
             files.put(record.fileId(), new Versioned<>(record, current.version() + 1));
@@ -276,6 +281,13 @@ class RepairCoordinatorEventTest {
 
         @Override
         public boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) {
+            Versioned<Records.FileRecord> current = files.get(id);
+            if (current == null || !current.value().namespace().equals(namespace)) {
+                return true;
+            }
+            if (current.version() != expectedVersion) {
+                return false;
+            }
             files.remove(id);
             return true;
         }

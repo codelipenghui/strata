@@ -30,24 +30,28 @@ public interface MetadataStore extends AutoCloseable {
     void createFile(Records.FileRecord record) throws Exception;
 
     /**
-     * Namespace-scoped file lookup. For the namespace-log backend, file ids are per-namespace
-     * (each namespace's owner assigns 0, 1, 2, …), so the namespace is required to route to the
-     * correct repo. For the ZK-direct backend file ids are globally unique and the namespace satisfies
-     * the signature but does not change the lookup.
+     * Namespace-scoped file lookup. A file's logical identity is always {@code (namespace, id)}:
+     * backends must return empty when the stored record belongs to a different namespace, even when
+     * their physical key space uses globally unique file ids. Namespace-log stores also use the
+     * namespace to route to the owning repository.
      */
     Optional<Versioned<Records.FileRecord>> getFile(StrataNamespace namespace, FileId id) throws Exception;
 
     Optional<FileId> resolvePath(StrataNamespace namespace, StrataPath path) throws Exception;
 
-    /** CAS update; returns false on version conflict. */
+    /**
+     * Namespace-bound CAS update addressed by {@code (record.namespace(), record.fileId())}. Returns
+     * false, without modifying the stored record, when that logical file is absent, belongs to a
+     * different namespace, or has a different version.
+     */
     boolean updateFile(Records.FileRecord record, int expectedVersion) throws Exception;
 
     boolean deletePath(StrataNamespace namespace, StrataPath path, FileId expectedFileId) throws Exception;
 
     /**
-     * Namespace-scoped CAS delete; returns false on version conflict. For the namespace-log
-     * backend the namespace routes the delete to the correct per-namespace repo. For the ZK v0
-     * backend the namespace satisfies the signature but does not change the lookup.
+     * Namespace-scoped CAS delete; returns false on version conflict. A record in a different
+     * namespace is logically absent, so deleting it is an idempotent no-op just like deleting a
+     * missing record. Namespace-log stores also use the namespace to route to the owning repository.
      */
     boolean deleteFile(StrataNamespace namespace, FileId id, int expectedVersion) throws Exception;
 
