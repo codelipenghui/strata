@@ -1,6 +1,7 @@
 package io.strata.meta;
 
 import io.strata.client.ClientConfig;
+import io.strata.client.InternalStrataClient;
 import io.strata.client.StrataClient;
 import io.strata.client.StrataFile;
 import io.strata.common.FileId;
@@ -204,7 +205,7 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
         if (c == null) {
             synchronized (initLock) {
                 if (client == null) {
-                    client = StrataClient.connect(ClientConfig.of(metaEndpoint.get())
+                    client = InternalStrataClient.connectMetadata(ClientConfig.of(metaEndpoint.get())
                             .withChunkRollBytes(chunkRollBytes));
                 }
                 c = client;

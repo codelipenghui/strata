@@ -1,5 +1,6 @@
 package io.strata.meta;
 
+import io.strata.common.ChunkId;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
@@ -9,6 +10,7 @@ import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
@@ -21,6 +23,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -31,6 +34,73 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * logs instead of direct ZooKeeper znodes (design §16 Step 3). The SCP surface is unchanged.
  */
 class ControllerNamespaceLogBackendTest {
+
+    @Test
+    void brokerCannotAccessSystemNamespaceButMetadataClientCan() throws Exception {
+        try (TestingServer zk = new TestingServer(true)) {
+            TestNamespaceMetadataFileStore fileStore = new TestNamespaceMetadataFileStore();
+            BiFunction<ZkMetadataStore, String, MetadataStore> backend =
+                    (root, endpoint) -> new NamespaceLogMetadataStore(new NamespaceLogBackend(root, fileStore, true));
+            try (Controller service =
+                         new Controller(ControllerConfig.forTests(zk.getConnectString()), null, backend);
+                 ScpClient metadata = new ScpClient("127.0.0.1", service.port(),
+                         ScpClient.KIND_METADATA, "system-metadata-test");
+                 ScpClient broker = new ScpClient("127.0.0.1", service.port(),
+                         ScpClient.KIND_BROKER, "application-test");
+                 ScpClient tool = new ScpClient("127.0.0.1", service.port(),
+                         ScpClient.KIND_TOOL, "operator-test")) {
+                awaitLeader(service);
+
+                FileId systemFile = Messages.CreateFileResp.decode(metadata.call(Opcode.CREATE_FILE,
+                        new Messages.CreateFile("strata-meta", "/metadata-log/internal-test",
+                                new Messages.WritePolicy(3, 2, false)).encode(), null, 5_000)).fileId();
+
+                assertSystemNamespaceRejected(() -> broker.call(Opcode.CREATE_FILE,
+                        new Messages.CreateFile("strata-meta", "/application-file",
+                                new Messages.WritePolicy(3, 2, false)).encode(), null, 5_000));
+                assertSystemNamespaceRejected(() -> broker.call(Opcode.LOOKUP_PATH,
+                        new Messages.LookupPath("strata-meta", "/metadata-log/internal-test").encode(),
+                        null, 5_000));
+                assertSystemNamespaceRejected(() -> broker.call(Opcode.LOOKUP_FILE,
+                        new Messages.LookupFile(NamespaceLogBackend.SYSTEM_NAMESPACE, systemFile).encode(),
+                        null, 5_000));
+                assertSystemNamespaceRejected(() -> broker.call(Opcode.ALLOCATE_WRITER_EPOCH,
+                        Messages.AllocateWriterEpoch.forRecovery(
+                                NamespaceLogBackend.SYSTEM_NAMESPACE, systemFile).encode(), null, 5_000));
+                assertSystemNamespaceRejected(() -> broker.call(Opcode.CREATE_CHUNK,
+                        new Messages.CreateChunk(NamespaceLogBackend.SYSTEM_NAMESPACE, systemFile, 1).encode(),
+                        null, 5_000));
+                assertSystemNamespaceRejected(() -> broker.call(Opcode.SEAL_CHUNK_META,
+                        new Messages.SealChunkMeta(NamespaceLogBackend.SYSTEM_NAMESPACE,
+                                new ChunkId(systemFile, 0), 1, 0, 0, List.of()).encode(), null, 5_000));
+                assertSystemNamespaceRejected(() -> broker.call(Opcode.ABORT_CHUNK_META,
+                        new Messages.AbortChunkMeta(NamespaceLogBackend.SYSTEM_NAMESPACE,
+                                new ChunkId(systemFile, 0), 1, 0, 0).encode(), null, 5_000));
+                assertSystemNamespaceRejected(() -> broker.call(Opcode.SEAL_FILE,
+                        new Messages.SealFile(NamespaceLogBackend.SYSTEM_NAMESPACE, systemFile, 0).encode(),
+                        null, 5_000));
+                assertSystemNamespaceRejected(() -> broker.call(Opcode.DELETE_FILES,
+                        new Messages.DeleteFiles(NamespaceLogBackend.SYSTEM_NAMESPACE, List.of(systemFile)).encode(),
+                        null, 5_000));
+                assertSystemNamespaceRejected(() -> tool.call(Opcode.LOOKUP_FILE,
+                        new Messages.LookupFile(NamespaceLogBackend.SYSTEM_NAMESPACE, systemFile).encode(),
+                        null, 5_000));
+
+                var lookup = Messages.LookupFileResp.decode(metadata.call(Opcode.LOOKUP_FILE,
+                        new Messages.LookupFile(NamespaceLogBackend.SYSTEM_NAMESPACE, systemFile).encode(),
+                        null, 5_000));
+                var byPath = Messages.LookupPathResp.decode(metadata.call(Opcode.LOOKUP_PATH,
+                        new Messages.LookupPath("strata-meta", "/metadata-log/internal-test").encode(),
+                        null, 5_000));
+                assertEquals(systemFile, byPath.fileId());
+                assertEquals(NamespaceLogBackend.SYSTEM_NAMESPACE, lookup.namespace());
+                assertTrue(Messages.AllocateWriterEpochResp.decode(metadata.call(Opcode.ALLOCATE_WRITER_EPOCH,
+                        Messages.AllocateWriterEpoch.forRecovery(
+                                NamespaceLogBackend.SYSTEM_NAMESPACE, systemFile).encode(), null, 5_000))
+                        .writerEpoch() > 0);
+            }
+        }
+    }
 
     @Test
     void serviceServesFileLifecycleOverTheNamespaceLogBackend() throws Exception {
@@ -195,6 +265,16 @@ class ControllerNamespaceLogBackendTest {
             Thread.sleep(20);
         }
         assertTrue(service.isLeader(), "service must acquire leadership");
+    }
+
+    private static void assertSystemNamespaceRejected(Executable operation) {
+        ScpException rejected = assertThrows(ScpException.class, operation);
+        assertEquals(ErrorCode.PRECONDITION_FAILED, rejected.code());
+        assertFalse(rejected.retriable(), "reserved namespace rejection must not be retried");
+        assertTrue(rejected.getMessage().contains("reserved for internal metadata"),
+                "the request must be rejected by the system-namespace ingress gate");
+        assertTrue(rejected.getMessage().contains("client kind="),
+                "the rejection must identify the presented role for client-side diagnosis");
     }
 
     private static MetadataStore failManifestCasOnce(MetadataStore delegate, AtomicBoolean armed) {

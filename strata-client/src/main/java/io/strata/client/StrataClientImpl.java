@@ -6,6 +6,7 @@ import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 import io.strata.proto.Messages;
+import io.strata.proto.ScpClient;
 
 import java.util.List;
 import java.util.Objects;
@@ -18,8 +19,12 @@ final class StrataClientImpl implements StrataClient {
     private final NodePool readPool;
 
     StrataClientImpl(ClientConfig config) {
+        this(config, ScpClient.KIND_BROKER, "strata-client");
+    }
+
+    StrataClientImpl(ClientConfig config, byte controllerClientKind, String controllerClientId) {
         this.config = config;
-        this.controller = new ControllerClient(config);
+        this.controller = new ControllerClient(config, controllerClientKind, controllerClientId);
         this.appendPool = new NodePool(config, "strata-client-append");
         this.readPool = new NodePool(config, "strata-client-read");
     }

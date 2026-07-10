@@ -97,6 +97,8 @@ public record StrataNamespace(String value) implements Comparable<StrataNamespac
         if (raw.equals(".") || raw.equals("..")) {
             throw new IllegalArgumentException("namespace must not be . or ..");
         }
+        // `strata-meta` deliberately remains representable because internal metadata files must encode it.
+        // The controller reserves that literal at ingress and accepts it only from the metadata HELLO role.
         if (raw.equals("__file") || raw.startsWith("__")) {
             throw new IllegalArgumentException("namespace is reserved: " + raw);
         }
