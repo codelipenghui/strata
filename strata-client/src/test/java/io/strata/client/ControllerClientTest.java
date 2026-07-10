@@ -8,6 +8,8 @@ import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
+import io.strata.proto.RequestContext;
+import io.strata.proto.ScpClient;
 import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 
@@ -25,6 +27,21 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ControllerClientTest {
+
+    @Test
+    void internalMetadataClientUsesMetadataControllerKind() throws Exception {
+        AtomicInteger clientKind = new AtomicInteger();
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, req -> {
+                 clientKind.set(RequestContext.clientKind());
+                 return ScpServer.ok(req, new Messages.CreateFileResp(FileId.of(1)).encode(), null);
+             });
+             StrataClient client = InternalStrataClient.connectMetadata(
+                     new ClientConfig(List.of(endpoint(server)), 1024, 100))) {
+            client.create(StrataClient.FileSpec.log("strata-meta", "/metadata-log/test"));
+
+            assertEquals(ScpClient.KIND_METADATA, clientKind.get());
+        }
+    }
 
     @Test
     void endpointParserCoversValidAndInvalidBoundaries() {

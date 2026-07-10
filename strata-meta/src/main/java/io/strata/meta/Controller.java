@@ -14,6 +14,7 @@ import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.RequestContext;
 import io.strata.proto.RequestObserver;
+import io.strata.proto.ScpClient;
 import io.strata.proto.ScpServer;
 import org.apache.curator.framework.recipes.leader.LeaderLatch;
 import org.apache.zookeeper.KeeperException;
@@ -438,6 +439,10 @@ public final class Controller implements AutoCloseable {
         // Tag this request's metrics with its namespace (read back by ScpServer's request observer).
         RequestContext.setNamespace(namespace.value());
         if (NamespaceLogBackend.isSystem(namespace)) {
+            if (RequestContext.clientKind() != ScpClient.KIND_METADATA) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                        "namespace is reserved for internal metadata: " + namespace);
+            }
             // Metadata-log system files live in the shared ZK root (CAS-guarded), so any node may serve
             // them — a non-controller owner writes its own namespace's metadata-log files here.
             return;

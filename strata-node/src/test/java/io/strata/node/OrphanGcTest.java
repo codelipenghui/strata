@@ -11,6 +11,8 @@ import io.strata.common.StrataPath;
 import io.strata.format.ChunkStore;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
+import io.strata.proto.RequestContext;
+import io.strata.proto.ScpClient;
 import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -46,6 +48,32 @@ class OrphanGcTest {
         store.open(ns, id, false, 1, 1_700_000_000_000L);
         store.append(ns, id, 1, 0, 0, ByteBuffer.wrap(bytes));
         store.seal(ns, id, 1, bytes.length, null);
+    }
+
+    @Test
+    void systemNamespaceConfirmUsesMetadataClientKind() throws Exception {
+        StrataNamespace system = StrataNamespace.of("strata-meta");
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        AtomicInteger clientKind = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.LOOKUP_FILE.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 clientKind.set(RequestContext.clientKind());
+                 Messages.ChunkInfo listed = new Messages.ChunkInfo(chunk, ChunkState.SEALED, 12, 0, 1,
+                         List.of(new Messages.Replica(NODE_ID, "127.0.0.1:1")));
+                 return ScpServer.ok(req, new Messages.LookupFileResp(system, StrataPath.of("/metadata-log/test"),
+                         Messages.WritePolicy.DEFAULT, (byte) 0, List.of(listed), 1).encode(), null);
+             })) {
+            seal(store, system, chunk);
+            OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000);
+
+            gc.gcOnce();
+
+            assertEquals(ScpClient.KIND_METADATA, clientKind.get());
+            assertTrue(store.contains(system, chunk), "the controller still lists this system chunk");
+        }
     }
 
     @Test

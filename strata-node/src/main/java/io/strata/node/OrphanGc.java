@@ -553,7 +553,7 @@ final class OrphanGc implements AutoCloseable {
                 continue;
             }
             try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(),
-                    ScpClient.KIND_TOOL, "orphan-confirm")) {
+                    ScpClient.KIND_METADATA, "orphan-confirm")) {
                 ByteBuffer resp = client.call(Opcode.LOOKUP_FILE, req, null, confirmTimeoutMs);
                 Messages.LookupFileResp r = Messages.LookupFileResp.decode(resp);
                 Exception ownerEpochFailure = confirmOwnerEpochFailure(ns, r.ownerEpoch(), ep);
