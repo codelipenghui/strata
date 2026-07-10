@@ -6,6 +6,7 @@ import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.FileState;
+import io.strata.common.ScpConnectionException;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.proto.Frame;
@@ -37,17 +38,20 @@ import static io.strata.common.Checks.addChunkLength;
  * in the descriptor.
  *
  * Tolerance: a batch above the durable floor is re-replicated to quorum when it could still have
- * been producer-acked — i.e. it is held by an ackQuorum once the replicas we could not fence are
- * counted as possible holders (§7.3 step 3 / issue #29). This preserves an acked batch whose other
- * holder is merely unreachable, even when RF &gt; ackQuorum. A batch that — with every replica
- * reachable — never reached ackQuorum (a never-acked dirty tail), and a divergent split, are
- * truncated at the floor.
+ * been producer-acked — i.e. it is held by an ackQuorum once replicas whose FENCE is
+ * transport-unreachable are counted as possible holders (§7.3 step 3 / issue #29). Transport
+ * unreachability includes a FENCE call timeout or mid-call disconnect: either can leave the request
+ * applied remotely even though recovery did not receive its response. Empty descriptor endpoints,
+ * replicas reporting no installed chunk, and untrusted FENCE responses do not promote a sub-quorum
+ * tail; when any such outcome leaves truncation versus promotion ambiguous, recovery blocks for
+ * retry or an explicit unsafe override (issue #120).
  */
 final class Recovery {
     private static final Logger log = LoggerFactory.getLogger(Recovery.class);
     static final String UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY = "strata.recovery.unsafeSealOverrideChunks";
     static final String UNSAFE_SEAL_OVERRIDE_CHUNKS_ENV = "STRATA_RECOVERY_UNSAFE_SEAL_OVERRIDE_CHUNKS";
     private static final Set<String> CONSUMED_ENV_UNSAFE_SEAL_OVERRIDES = new HashSet<>();
+    private static final Set<String> RESERVED_UNSAFE_SEAL_OVERRIDES = new HashSet<>();
     private static final int RECOVERY_READ_MIN_ATTEMPTS = 2;
     private static final int RECOVERY_READ_MIN_PROGRESS_BYTES = 4 * 1024;
     private final ControllerClient controller;
@@ -88,6 +92,46 @@ final class Recovery {
 
         int recoveryEpoch() {
             return recoveryEpoch;
+        }
+    }
+
+    private enum FenceFailure {
+        TRANSPORT_UNREACHABLE,
+        UNRESOLVED_DESCRIPTOR,
+        CURRENTLY_ABSENT,
+        UNTRUSTED_RESPONSE
+    }
+
+    private record UnfencedReplica(int nodeId, FenceFailure failure) {}
+
+    /** Exhaustive FENCE classifications; only transport-unreachable replicas retain issue #29 credit. */
+    private static final class FenceOutcomes {
+        final List<ReplicaState> reachable = new ArrayList<>();
+        final List<UnfencedReplica> unfenced = new ArrayList<>();
+
+        void add(int nodeId, FenceFailure failure) {
+            unfenced.add(new UnfencedReplica(nodeId, failure));
+        }
+
+        int transportUnreachableCredits() {
+            return unfenced.stream().mapToInt(outcome -> switch (outcome.failure()) {
+                case TRANSPORT_UNREACHABLE -> 1;
+                case UNRESOLVED_DESCRIPTOR, CURRENTLY_ABSENT, UNTRUSTED_RESPONSE -> 0;
+            }).sum();
+        }
+
+        int unresolvedClassificationSlots() {
+            return unfenced.stream().mapToInt(outcome -> switch (outcome.failure()) {
+                case TRANSPORT_UNREACHABLE -> 0;
+                case UNRESOLVED_DESCRIPTOR, CURRENTLY_ABSENT, UNTRUSTED_RESPONSE -> 1;
+            }).sum();
+        }
+
+        List<Integer> nodeIds(FenceFailure failure) {
+            return unfenced.stream()
+                    .filter(outcome -> outcome.failure() == failure)
+                    .map(UnfencedReplica::nodeId)
+                    .toList();
         }
     }
 
@@ -139,12 +183,20 @@ final class Recovery {
                               boolean maySealAbandonedEmptyTail) {
         ChunkId chunkId = chunk.chunkId();
 
-        // 1. fence all reachable replicas; collect their state
-        int placedReplicas = 0;
-        List<ReplicaState> reachable = new ArrayList<>();
+        // 1. fence all reachable replicas; collect their state. Keep non-reachable outcomes
+        // explicit: issue #29 gives only transport-unreachable FENCE attempts (including call
+        // timeouts and mid-call disconnects) possible-holder credit, while issue #120 requires empty
+        // descriptors, CHUNK_NOT_FOUND, and untrusted responses to remain fail-closed ambiguity
+        // instead of either disappearing or promoting a sub-quorum tail.
+        FenceOutcomes fenceOutcomes = new FenceOutcomes();
+        List<ReplicaState> reachable = fenceOutcomes.reachable;
         for (Messages.Replica r : chunk.replicas()) {
-            if (r.endpoint().isEmpty()) continue;
-            placedReplicas++;
+            if (r.endpoint().isEmpty()) {
+                fenceOutcomes.add(r.nodeId(), FenceFailure.UNRESOLVED_DESCRIPTOR);
+                log.warn("fence {} cannot resolve endpoint for descriptor replica {}; retaining ambiguity",
+                        chunkId, r.nodeId());
+                continue;
+            }
             try {
                 ByteBuffer h = appendPool.get(r.endpoint()).call(Opcode.FENCE,
                         new Messages.Fence(chunkId, writerEpoch, namespace).encode(), null, config.callTimeoutMs());
@@ -152,17 +204,37 @@ final class Recovery {
                 validateFenceResp(chunkId, r, fence, writerEpoch);
                 reachable.add(new ReplicaState(r, fence));
             } catch (ScpException e) {
+                abortRecoveryIfInterrupted(e);
                 if (e.code() == ErrorCode.FENCED_EPOCH) {
                     throw e;
                 }
+                if (e.code() == ErrorCode.CHUNK_NOT_FOUND) {
+                    fenceOutcomes.add(r.nodeId(), FenceFailure.CURRENTLY_ABSENT);
+                    log.warn("fence {} on {} reports no installed chunk; excluding replica {} from holder "
+                                    + "credit and retaining historical ambiguity",
+                            chunkId, r.endpoint(), r.nodeId());
+                    continue;
+                }
+                if (e instanceof ScpConnectionException) {
+                    fenceOutcomes.add(r.nodeId(), FenceFailure.TRANSPORT_UNREACHABLE);
+                    log.warn("fence {} on {} is transport-unreachable (including timeout or mid-call "
+                                    + "disconnect): {}; retaining issue #29 holder credit",
+                            chunkId, r.endpoint(), e.getMessage());
+                    continue;
+                }
+                fenceOutcomes.add(r.nodeId(), FenceFailure.UNTRUSTED_RESPONSE);
                 if (e.code() == ErrorCode.PRECONDITION_FAILED) {
                     log.error("fence {} on {} returned an inconsistent persisted epoch: {}",
                             chunkId, r.endpoint(), e.getMessage());
                 } else {
-                    log.warn("fence {} on {} failed: {}", chunkId, r.endpoint(), e.getMessage());
+                    log.warn("fence {} on {} failed without a trustworthy holder classification: {}",
+                            chunkId, r.endpoint(), e.getMessage());
                 }
             } catch (RuntimeException e) {
-                log.warn("fence {} on {} returned malformed response: {}", chunkId, r.endpoint(), e.toString());
+                abortRecoveryIfInterrupted(e);
+                fenceOutcomes.add(r.nodeId(), FenceFailure.UNTRUSTED_RESPONSE);
+                log.warn("fence {} on {} returned malformed response; retaining ambiguity: {}",
+                        chunkId, r.endpoint(), e.toString());
             }
         }
         if (maySealAbandonedEmptyTail && reachable.size() < ackQuorum) {
@@ -172,11 +244,12 @@ final class Recovery {
         }
         requireQuorum(chunkId, reachable, ackQuorum);
 
-        // Replicas we could not fence may still hold bytes we cannot see. A batch above the floor
-        // could therefore have reached ackQuorum (i.e. been producer-acked) even if fewer than
-        // ackQuorum reachable replicas hold it (issue #29). Captured before any later eviction so
-        // it counts only genuinely-unreachable replicas, not stale ones we inspected and dropped.
-        final int unreachableReplicas = placedReplicas - reachable.size();
+        // A transport-unreachable FENCE attempt may still have reached a replica that holds bytes we
+        // cannot see. A batch above the floor could therefore have reached ackQuorum even if fewer
+        // than ackQuorum reachable replicas hold it (issue #29). Empty descriptors, CHUNK_NOT_FOUND,
+        // and untrusted responses are not promotion credit; the final ambiguity gate handles them
+        // without choosing a tail.
+        final int transportUnreachableCredits = fenceOutcomes.transportUnreachableCredits();
 
         // The highest piggybacked DO is the recovery floor: bytes below it were quorum-durable.
         // A sealed replica shorter than this floor is not an authoritative mid-seal remnant; it
@@ -202,8 +275,16 @@ final class Recovery {
             if (rs.state == ChunkState.SEALED) {
                 long len = rs.end;
                 log.info("chunk {} found sealed at {} on {}", chunkId, len, rs.replica.endpoint());
-                catchUp(chunkId, writerEpoch, reachable, len, ackQuorum);
-                return finishSeal(chunkId, writerEpoch, len, reachable, ackQuorum);
+                // A sealed copy is authoritative when the remaining outcomes do not leave a higher
+                // quorum-possible claim unresolved. The gate also protects upgrades from a partial
+                // floor-seal produced by an older recovery attempt.
+                try (UnsafeSealOverrideReservation override = reserveOrRejectAmbiguousSeal(
+                        chunkId, reachable, Set.of(), fenceOutcomes, true, len, ackQuorum)) {
+                    catchUp(chunkId, writerEpoch, reachable, len, ackQuorum);
+                    long sealedLength = finishSeal(chunkId, writerEpoch, len, reachable, ackQuorum);
+                    override.commitAfterSeal();
+                    return sealedLength;
+                }
             }
         }
 
@@ -226,12 +307,14 @@ final class Recovery {
                     previousEnd = e.endOffset();
                 }
             } catch (ScpException e) {
+                abortRecoveryIfInterrupted(e);
                 if (e.code() == ErrorCode.FENCED_EPOCH) {
                     throw e;
                 }
                 log.warn("read ledger {} on {} failed: {}", chunkId, rs.replica.endpoint(), e.getMessage());
                 markUnverifiedAboveFloorHolder(unverifiedAboveFloorHolders, rs, p);
             } catch (RuntimeException e) {
+                abortRecoveryIfInterrupted(e);
                 log.warn("read ledger {} on {} returned malformed response: {}",
                         chunkId, rs.replica.endpoint(), e.toString());
                 markUnverifiedAboveFloorHolder(unverifiedAboveFloorHolders, rs, p);
@@ -243,7 +326,7 @@ final class Recovery {
         // one replica must not block a larger intact append held by a quorum of replicas.
         while (true) {
             Candidate candidate = bestContinuation(chunkId, reachable, boundaries, p, ackQuorum,
-                    unreachableReplicas, unverifiedAboveFloorHolders);
+                    transportUnreachableCredits, unverifiedAboveFloorHolders);
             if (candidate == null) {
                 break; // no agreed continuation: a true gap, a torn/CRC-invalid tail, or a divergent split
             }
@@ -260,6 +343,7 @@ final class Recovery {
                     appendAndVerify(chunkId, writerEpoch, rs, p,
                             ByteBuffer.wrap(batch, suffixOffset, suffixLength), end);
                 } catch (ScpException e) {
+                    abortRecoveryIfInterrupted(e);
                     if (e.code() == ErrorCode.FENCED_EPOCH) {
                         throw e;
                     }
@@ -272,9 +356,13 @@ final class Recovery {
             p = end;
         }
 
-        rejectOrEvictUnverifiedAboveFloorHolders(chunkId, reachable, unverifiedAboveFloorHolders, p, ackQuorum);
-        log.info("seal-recovery: chunk {} sealing at {}", chunkId, p);
-        return finishSeal(chunkId, writerEpoch, p, reachable, ackQuorum);
+        try (UnsafeSealOverrideReservation override = reserveOrRejectAmbiguousSeal(
+                chunkId, reachable, unverifiedAboveFloorHolders, fenceOutcomes, false, p, ackQuorum)) {
+            log.info("seal-recovery: chunk {} sealing at {}", chunkId, p);
+            long sealedLength = finishSeal(chunkId, writerEpoch, p, reachable, ackQuorum);
+            override.commitAfterSeal();
+            return sealedLength;
+        }
     }
 
     private record Candidate(long end, byte[] bytes) {}
@@ -293,7 +381,7 @@ final class Recovery {
 
     private Candidate bestContinuation(ChunkId chunkId, List<ReplicaState> reachable,
                                        TreeMap<Long, List<LedgerCandidate>> boundaries, long p,
-                                       int ackQuorum, int unreachableReplicas,
+                                       int ackQuorum, int transportUnreachableCredits,
                                        Set<ReplicaState> unverifiedAboveFloorHolders) {
         // Farthest boundary first: a longer continuation that is still provable — a reachable quorum,
         // or (issue #29) a single CRC-valid copy that could still have been acked — should win over a
@@ -321,7 +409,7 @@ final class Recovery {
             }
             if (validCrcs.isEmpty()) continue;
             Agreed agreed = agreedContinuation(chunkId, reachable, p, end, validCrcs, ackQuorum,
-                    unreachableReplicas, exactLedgerHolders, coveringLedgerHolders,
+                    transportUnreachableCredits, exactLedgerHolders, coveringLedgerHolders,
                     unverifiedAboveFloorHolders);
             if (agreed == null) continue;
             Candidate candidate = new Candidate(end, agreed.bytes());
@@ -368,14 +456,16 @@ final class Recovery {
      * are ignored. A byte-value held by {@code >= ackQuorum} reachable replicas is returned as a
      * {@code quorum} result (it wins outright, dropping divergent outliers, §14.6). Otherwise a single
      * CRC-valid value (no competitor) is returned as a non-quorum result only if it could still have
-     * been producer-acked — its holders plus the replicas we could not fence, or that claimed the
-     * range at fence time but could not be byte-verified, reach {@code ackQuorum} (issues #29/#42);
-     * the caller then verifies that single copy against the other readable replicas before committing
-     * it. Multiple distinct CRC-valid values (a split with no quorum) yield {@code null}, so the seal
-     * stops at the floor.
+     * been producer-acked — its holders plus transport-unreachable FENCE attempts (including call
+     * timeouts and mid-call disconnects), or reachable replicas that claimed the range at fence time
+     * but could not be byte-verified, reach {@code ackQuorum} (issues #29/#42). Empty endpoints,
+     * {@code CHUNK_NOT_FOUND}, and untrusted FENCE responses never contribute promotion credit; the
+     * final ambiguity gate handles them fail-closed. The caller verifies an accepted single copy
+     * against the other readable replicas before committing it. Multiple distinct CRC-valid values
+     * (a split with no quorum) yield {@code null}, so the seal stops at the floor.
      */
     private Agreed agreedContinuation(ChunkId chunkId, List<ReplicaState> reachable, long from, long to,
-                                      Set<Integer> validCrcs, int ackQuorum, int unreachableReplicas,
+                                      Set<Integer> validCrcs, int ackQuorum, int transportUnreachableCredits,
                                       Set<ReplicaState> exactLedgerHolders,
                                       Set<ReplicaState> coveringLedgerHolders,
                                       Set<ReplicaState> unverifiedAboveFloorHolders) {
@@ -421,14 +511,15 @@ final class Recovery {
         }
         // Counting other-valued valid holders over-approximates ack possibility on purpose:
         // over-marking aborts for retry, under-marking can lose producer-acked data.
-        if (strongestValidCount + crcInvalidLedgerHolders.size() + unverifiedHolders + unreachableReplicas
+        if (strongestValidCount + crcInvalidLedgerHolders.size() + unverifiedHolders
+                + transportUnreachableCredits
                 >= ackQuorum) {
             for (ReplicaState rs : crcInvalidLedgerHolders) {
                 markUnverifiedAboveFloorHolder(unverifiedAboveFloorHolders, rs, from);
             }
         }
         if (counts.size() == 1
-                && counts.get(0).count + unreachableReplicas + unverifiedHolders >= ackQuorum) {
+                && counts.get(0).count + transportUnreachableCredits + unverifiedHolders >= ackQuorum) {
             return new Agreed(counts.get(0).bytes, false);
         }
         return null;
@@ -443,79 +534,262 @@ final class Recovery {
         }
     }
 
+    /** Interruption is caller cancellation, never evidence about an individual replica. */
+    private static void abortRecoveryIfInterrupted(RuntimeException failure) {
+        boolean interrupted = Thread.currentThread().isInterrupted();
+        Throwable cause = failure;
+        while (!interrupted && cause != null) {
+            interrupted = cause instanceof InterruptedException;
+            cause = cause.getCause();
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+            throw failure;
+        }
+    }
+
     /**
-     * Issue #84/#102 fail-closed gate. A holder whose fence response claimed bytes above the final
+     * Issue #84/#102/#120 fail-closed gate. A holder whose fence response claimed bytes above the final
      * seal point may still contain producer-acked data; losing those bytes by floor-sealing is
      * permanent, while aborting leaves the chunk OPEN for a later recovery retry. This check
      * intentionally uses the final seal point, not the floor at marking time, so a holder is
      * forgiven when a later accepted continuation covers its claim.
      *
+     * <p>An empty descriptor endpoint, FENCE {@code CHUNK_NOT_FOUND}, or untrusted FENCE response is
+     * never agreement for promoting a sub-quorum tail. None proves that the replica never acknowledged
+     * bytes before its registry record, installed handle, local data, or trustworthy response became
+     * unavailable, though. If those unresolved slots plus the remaining possible holders could have
+     * formed {@code ackQuorum} above the chosen seal point, recovery blocks instead of choosing
+     * truncation or promotion.
+     *
      * <p>Issue #102 adds the explicit escape hatch we can make without pretending the bytes were
-     * proven: an operator may name one exact namespace/chunk and force recovery to evict the blocking
-     * holders from the seal set, then seal the remaining quorum. The matching token is consumed after
-     * one use. That is intentionally per-chunk and loud because it can discard bytes only the evicted
-     * holder claimed.
+     * proven: an operator may name one exact namespace/chunk and force recovery to evict unreadable
+     * blockers and/or accept the unresolved classification, then seal the remaining quorum at the
+     * verified point. The matching token is reserved exclusively at this gate and consumed only
+     * after the chunk metadata seal commits; a failure before that commit releases the reservation
+     * so a retry can reuse the token. That is intentionally per-chunk and loud because it can discard
+     * bytes a blocker or unresolved replica may have acknowledged.
      */
-    private void rejectOrEvictUnverifiedAboveFloorHolders(ChunkId chunkId, List<ReplicaState> reachable,
-                                                          Set<ReplicaState> unverifiedAboveFloorHolders,
-                                                          long sealPoint, int ackQuorum) {
+    private UnsafeSealOverrideReservation reserveOrRejectAmbiguousSeal(
+            ChunkId chunkId, List<ReplicaState> reachable,
+            Set<ReplicaState> unverifiedAboveFloorHolders, FenceOutcomes fenceOutcomes,
+            boolean sealedFastPath, long sealPoint, int ackQuorum) {
         List<ReplicaState> blockers = new ArrayList<>();
         for (ReplicaState rs : unverifiedAboveFloorHolders) {
             if (rs.end > sealPoint) {
                 blockers.add(rs);
             }
         }
-        if (blockers.isEmpty()) {
-            return;
+
+        int reachableClaimsAboveSealPoint = 0;
+        for (ReplicaState rs : reachable) {
+            if (rs.end > sealPoint) {
+                reachableClaimsAboveSealPoint++;
+            }
+        }
+        int unresolvedReplicaSlots = fenceOutcomes.unresolvedClassificationSlots();
+        int possibleHigherTailHolders = unresolvedReplicaSlots
+                + fenceOutcomes.transportUnreachableCredits() + reachableClaimsAboveSealPoint;
+        boolean quorumPossibleAboveSealPoint = possibleHigherTailHolders >= ackQuorum;
+        boolean unresolvedClassificationBlocks = unresolvedReplicaSlots > 0
+                && quorumPossibleAboveSealPoint;
+        boolean sealedHigherTailBlocks = sealedFastPath
+                && reachableClaimsAboveSealPoint > 0
+                && quorumPossibleAboveSealPoint;
+        boolean ambiguousSealBlocks = unresolvedClassificationBlocks || sealedHigherTailBlocks;
+        if (blockers.isEmpty() && !ambiguousSealBlocks) {
+            return UnsafeSealOverrideReservation.none();
         }
 
         String overrideKey = unsafeSealOverrideKey(chunkId);
-        if (!consumeUnsafeSealOverride(overrideKey)) {
+        UnsafeSealOverrideAttempt overrideAttempt = reserveUnsafeSealOverride(overrideKey);
+        if (overrideAttempt.reservation() == null) {
             for (ReplicaState rs : blockers) {
                 log.warn("seal-recovery: chunk {} blocked before seal at {} because replica {} claimed "
                                 + "unverified end {}; override key {}",
                         chunkId, sealPoint, rs.replica.nodeId(), rs.end, overrideKey);
             }
+            if (unresolvedClassificationBlocks) {
+                log.warn("seal-recovery: chunk {} blocked before seal at {} because unresolved replica "
+                                + "classification could complete quorum {}: empty-endpoint nodes {}, "
+                                + "chunk-not-found nodes {}, untrusted-fence nodes {}, transport-unreachable "
+                                + "nodes {}, reachable claims above seal point {}; override key {}",
+                        chunkId, sealPoint, ackQuorum,
+                        fenceOutcomes.nodeIds(FenceFailure.UNRESOLVED_DESCRIPTOR),
+                        fenceOutcomes.nodeIds(FenceFailure.CURRENTLY_ABSENT),
+                        fenceOutcomes.nodeIds(FenceFailure.UNTRUSTED_RESPONSE),
+                        fenceOutcomes.nodeIds(FenceFailure.TRANSPORT_UNREACHABLE),
+                        reachableClaimsAboveSealPoint, overrideKey);
+            }
+            if (sealedHigherTailBlocks) {
+                log.warn("seal-recovery: chunk {} blocked before accepting sealed point {} because {} "
+                                + "reachable replica(s) claim a higher end and, with transport-unreachable "
+                                + "nodes {} plus {} unresolved slot(s), could reach quorum {}; override key {}",
+                        chunkId, sealPoint, reachableClaimsAboveSealPoint,
+                        fenceOutcomes.nodeIds(FenceFailure.TRANSPORT_UNREACHABLE),
+                        unresolvedReplicaSlots, ackQuorum, overrideKey);
+            }
+            List<String> reasons = new ArrayList<>();
+            if (!blockers.isEmpty()) {
+                reasons.add("unverified above-floor holder(s)");
+            }
+            if (unresolvedClassificationBlocks) {
+                reasons.add("unresolved replica classification");
+            }
+            if (sealedHigherTailBlocks) {
+                reasons.add("a quorum-possible higher tail above an existing sealed point");
+            }
             throw new ScpException(ErrorCode.SEAL_RECOVERY_BLOCKED,
-                    "chunk " + chunkId + " has unverified above-floor holder(s) above seal point "
+                    "chunk " + chunkId + " has " + String.join(" and ", reasons) + " above seal point "
                             + sealPoint + "; set " + UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY
                             + " or " + UNSAFE_SEAL_OVERRIDE_CHUNKS_ENV + " to " + overrideKey
-                            + " only to evict the blocking holder(s) and force floor-seal");
+                            + " only to accept the potential data loss and force seal at the verified point"
+                            + overrideAttempt.unavailableReason());
         }
 
+        UnsafeSealOverrideReservation override = overrideAttempt.reservation();
         for (ReplicaState rs : blockers) {
             log.error("UNSAFE seal-recovery override {}: evicting replica {} which claimed unverified end {} "
                             + "above seal point {} for chunk {}",
                     overrideKey, rs.replica.nodeId(), rs.end, sealPoint, chunkId);
         }
+        if (unresolvedClassificationBlocks) {
+            log.error("UNSAFE seal-recovery override {}: forcing chunk {} to seal at {} despite unresolved "
+                            + "replica classification; empty-endpoint nodes {}, chunk-not-found nodes {}, "
+                            + "untrusted-fence nodes {}, transport-unreachable nodes {}, reachable claims "
+                            + "above seal point {}. This may truncate a producer-acked tail",
+                    overrideKey, chunkId, sealPoint,
+                    fenceOutcomes.nodeIds(FenceFailure.UNRESOLVED_DESCRIPTOR),
+                    fenceOutcomes.nodeIds(FenceFailure.CURRENTLY_ABSENT),
+                    fenceOutcomes.nodeIds(FenceFailure.UNTRUSTED_RESPONSE),
+                    fenceOutcomes.nodeIds(FenceFailure.TRANSPORT_UNREACHABLE),
+                    reachableClaimsAboveSealPoint);
+        }
+        if (sealedHigherTailBlocks) {
+            log.error("UNSAFE seal-recovery override {}: accepting sealed point {} for chunk {} despite {} "
+                            + "reachable higher-end claim(s) and transport-unreachable nodes {}. This may "
+                            + "truncate a producer-acked tail",
+                    overrideKey, sealPoint, chunkId, reachableClaimsAboveSealPoint,
+                    fenceOutcomes.nodeIds(FenceFailure.TRANSPORT_UNREACHABLE));
+        }
         reachable.removeAll(blockers);
         if (reachable.size() < ackQuorum) {
+            override.close();
             throw new ScpException(ErrorCode.SEAL_RECOVERY_BLOCKED,
                     "unsafe seal-recovery override " + overrideKey + " evicted "
                             + blockers.size() + " blocking holder(s), leaving " + reachable.size()
                             + " usable replica(s), need " + ackQuorum);
         }
+        return override;
     }
 
     private String unsafeSealOverrideKey(ChunkId chunkId) {
         return namespace + ":" + chunkId;
     }
 
-    private static boolean consumeUnsafeSealOverride(String overrideKey) {
+    private enum UnsafeSealOverrideSource { PROPERTY, ENVIRONMENT }
+
+    private record UnsafeSealOverrideAttempt(UnsafeSealOverrideReservation reservation,
+                                             String unavailableReason) {}
+
+    private static final class UnsafeSealOverrideReservation implements AutoCloseable {
+        private static final UnsafeSealOverrideReservation NONE =
+                new UnsafeSealOverrideReservation(null, null, true);
+
+        private final String overrideKey;
+        private final UnsafeSealOverrideSource source;
+        private boolean finished;
+
+        private UnsafeSealOverrideReservation(String overrideKey, UnsafeSealOverrideSource source,
+                                              boolean finished) {
+            this.overrideKey = overrideKey;
+            this.source = source;
+            this.finished = finished;
+        }
+
+        static UnsafeSealOverrideReservation none() {
+            return NONE;
+        }
+
+        void commitAfterSeal() {
+            if (source == null || finished) {
+                return;
+            }
+            synchronized (CONSUMED_ENV_UNSAFE_SEAL_OVERRIDES) {
+                if (finished) {
+                    return;
+                }
+                if (!RESERVED_UNSAFE_SEAL_OVERRIDES.remove(overrideKey)) {
+                    throw new IllegalStateException("unsafe seal override reservation lost for " + overrideKey);
+                }
+                if (source == UnsafeSealOverrideSource.PROPERTY) {
+                    removeUnsafeSealOverridePropertyToken(
+                            System.getProperty(UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY), overrideKey);
+                } else {
+                    CONSUMED_ENV_UNSAFE_SEAL_OVERRIDES.add(overrideKey);
+                }
+                finished = true;
+            }
+            log.error("UNSAFE seal-recovery override {} consumed after successful chunk seal commit",
+                    overrideKey);
+        }
+
+        @Override
+        public void close() {
+            if (source == null || finished) {
+                return;
+            }
+            synchronized (CONSUMED_ENV_UNSAFE_SEAL_OVERRIDES) {
+                if (finished) {
+                    return;
+                }
+                RESERVED_UNSAFE_SEAL_OVERRIDES.remove(overrideKey);
+                finished = true;
+            }
+            log.error("UNSAFE seal-recovery override {} released because recovery failed before the chunk "
+                    + "seal committed; the configured token remains available for retry", overrideKey);
+        }
+    }
+
+    private static UnsafeSealOverrideAttempt reserveUnsafeSealOverride(String overrideKey) {
         synchronized (CONSUMED_ENV_UNSAFE_SEAL_OVERRIDES) {
             String property = System.getProperty(UNSAFE_SEAL_OVERRIDE_CHUNKS_PROPERTY);
-            if (overrideTokensContain(property, overrideKey)) {
-                removeUnsafeSealOverridePropertyToken(property, overrideKey);
-                return true;
+            String env = System.getenv(UNSAFE_SEAL_OVERRIDE_CHUNKS_ENV);
+            boolean propertyConfigured = overrideTokensContain(property, overrideKey);
+            boolean envConfigured = overrideTokensContain(env, overrideKey);
+            if (RESERVED_UNSAFE_SEAL_OVERRIDES.contains(overrideKey)) {
+                String reason = "; override token " + overrideKey
+                        + " is already reserved by another in-process recovery attempt";
+                log.error("UNSAFE seal-recovery override {} is already reserved by another recovery attempt",
+                        overrideKey);
+                return new UnsafeSealOverrideAttempt(null, reason);
+            }
+            if (propertyConfigured) {
+                RESERVED_UNSAFE_SEAL_OVERRIDES.add(overrideKey);
+                log.error("UNSAFE seal-recovery override {} reserved from system property; it will be "
+                        + "consumed only after the chunk seal commits", overrideKey);
+                return new UnsafeSealOverrideAttempt(
+                        new UnsafeSealOverrideReservation(overrideKey, UnsafeSealOverrideSource.PROPERTY, false),
+                        "");
             }
 
-            String env = System.getenv(UNSAFE_SEAL_OVERRIDE_CHUNKS_ENV);
-            if (overrideTokensContain(env, overrideKey)
-                    && !CONSUMED_ENV_UNSAFE_SEAL_OVERRIDES.contains(overrideKey)) {
-                CONSUMED_ENV_UNSAFE_SEAL_OVERRIDES.add(overrideKey);
-                return true;
+            if (envConfigured) {
+                if (CONSUMED_ENV_UNSAFE_SEAL_OVERRIDES.contains(overrideKey)) {
+                    String reason = "; the configured environment override was already consumed after a "
+                            + "successful in-process seal; remove it and restart with a fresh token to re-arm";
+                    log.error("UNSAFE seal-recovery override {} remains configured in the environment but "
+                            + "was already consumed; remove it and restart with a fresh token to re-arm",
+                            overrideKey);
+                    return new UnsafeSealOverrideAttempt(null, reason);
+                }
+                RESERVED_UNSAFE_SEAL_OVERRIDES.add(overrideKey);
+                log.error("UNSAFE seal-recovery override {} reserved from environment; it will be consumed "
+                        + "only after the chunk seal commits", overrideKey);
+                return new UnsafeSealOverrideAttempt(
+                        new UnsafeSealOverrideReservation(overrideKey, UnsafeSealOverrideSource.ENVIRONMENT, false),
+                        "");
             }
-            return false;
+            return new UnsafeSealOverrideAttempt(null, "");
         }
     }
 
@@ -532,6 +806,9 @@ final class Recovery {
     }
 
     private static void removeUnsafeSealOverridePropertyToken(String configured, String overrideKey) {
+        if (configured == null || configured.isBlank()) {
+            return;
+        }
         List<String> remaining = new ArrayList<>();
         for (String token : configured.split("[,\\s]+")) {
             if (!token.isBlank() && !overrideKey.equals(token)) {
@@ -569,6 +846,7 @@ final class Recovery {
                 }
                 log.info("recovery caught up {} on {} to {}", chunkId, rs.replica.endpoint(), target);
             } catch (ScpException e) {
+                abortRecoveryIfInterrupted(e);
                 if (e.code() == ErrorCode.FENCED_EPOCH) {
                     throw e;
                 }
@@ -654,6 +932,7 @@ final class Recovery {
             }
             return data;
         } catch (ScpException e) {
+            abortRecoveryIfInterrupted(e);
             if (e.code() == ErrorCode.FENCED_EPOCH) {
                 throw e;
             }
@@ -661,6 +940,7 @@ final class Recovery {
                     source.replica.endpoint(), e.getMessage());
             return null;
         } catch (RuntimeException e) {
+            abortRecoveryIfInterrupted(e);
             log.warn("recovery read {}@{} from {} returned malformed response: {}", chunkId, from + filled,
                     source.replica.endpoint(), e.toString());
             return null;
@@ -709,6 +989,7 @@ final class Recovery {
         try {
             actualEnd = Messages.AppendResp.decode(h).endOffset();
         } catch (RuntimeException e) {
+            abortRecoveryIfInterrupted(e);
             throw new ScpException(ErrorCode.CORRUPT_CHUNK,
                     "malformed recovery append response from replica " + target.replica.nodeId() + ": " + e);
         }
@@ -743,6 +1024,7 @@ final class Recovery {
                         config.callTimeoutMs());
                 resp = Messages.SealResp.decode(h);
             } catch (ScpException e) {
+                abortRecoveryIfInterrupted(e);
                 if (e.code() == ErrorCode.FENCED_EPOCH) {
                     throw e;
                 }
@@ -750,6 +1032,7 @@ final class Recovery {
                 log.warn("recovery seal {} on {} failed: {}", chunkId, rs.replica.endpoint(), e.getMessage());
                 continue;
             } catch (RuntimeException e) {
+                abortRecoveryIfInterrupted(e);
                 last = new ScpException(ErrorCode.INTERNAL, "malformed recovery seal response: " + e);
                 log.warn("recovery seal {} on {} returned malformed response: {}",
                         chunkId, rs.replica.endpoint(), e.toString());

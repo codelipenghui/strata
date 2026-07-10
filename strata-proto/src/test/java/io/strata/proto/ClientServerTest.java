@@ -7,7 +7,9 @@ import io.strata.common.ConnectionPolicy;
 import io.strata.common.ErrorCode;
 import io.strata.common.FailureInjector;
 import io.strata.common.FileId;
+import io.strata.common.ScpConnectionException;
 import io.strata.common.ScpException;
+import io.strata.common.ScpProtocolException;
 import io.strata.common.StrataNamespace;
 import org.junit.jupiter.api.Test;
 
@@ -409,6 +411,40 @@ class ClientServerTest {
             waitFor(() -> pings.get() > 1 && conn.generation() > generation);
         } finally {
             release.countDown();
+        }
+    }
+
+    @Test
+    void managedConnectionDropsPreferredEndpointAfterProtocolHandshakeFailure() throws Exception {
+        try (ServerSocket badServer = new ServerSocket(0);
+             ScpServer goodServer = new ScpServer(0, 1, 0, 0,
+                     req -> ScpServer.ok(req, Messages.okHeader(), null));
+             ManagedScpConnection conn = managed(endpoint(goodServer), 10_000, 500, 10_000)) {
+            CompletableFuture<Void> badPeer = serveWrongOpcodeHandshake(badServer);
+            conn.preferEndpoint("127.0.0.1:" + badServer.getLocalPort());
+
+            assertThrows(ScpProtocolException.class,
+                    () -> conn.call(Opcode.PING, emptyHeader(), null, 500));
+            conn.call(Opcode.PING, emptyHeader(), null, 500);
+            badPeer.get(3, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void managedConnectionAdvancesRotatingEndpointAfterProtocolHandshakeFailure() throws Exception {
+        try (ServerSocket badServer = new ServerSocket(0);
+             ScpServer goodServer = new ScpServer(0, 1, 0, 0,
+                     req -> ScpServer.ok(req, Messages.okHeader(), null));
+             ManagedScpConnection conn = new ManagedScpConnection(
+                     List.of("127.0.0.1:" + badServer.getLocalPort(), endpoint(goodServer)),
+                     new ConnectionPolicy(500, 10_000, 500, 10_000, 50, 200),
+                     ScpClient.KIND_TOOL, "rotate-protocol-test", "test endpoint", true, true)) {
+            CompletableFuture<Void> badPeer = serveWrongOpcodeHandshake(badServer);
+
+            assertThrows(ScpProtocolException.class,
+                    () -> conn.call(Opcode.PING, emptyHeader(), null, 500));
+            conn.call(Opcode.PING, emptyHeader(), null, 500);
+            badPeer.get(3, TimeUnit.SECONDS);
         }
     }
 
@@ -897,14 +933,14 @@ class ClientServerTest {
     }
 
     @Test
-    void writeFailureFailsPendingFutureAndClosesConnection() throws Exception {
+    void localEncoderFailureIsProtocolFailureAndClosesConnection() throws Exception {
         try (ScpServer server = new ScpServer(0, 1, 0, 0,
                 req -> ScpServer.ok(req, Messages.okHeader(), null));
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
             CompletableFuture<Frame> failed = client.send(Opcode.PING, new byte[0x1_0000], null);
 
             var e = assertThrows(ExecutionException.class, failed::get);
-            assertEquals(IOException.class, e.getCause().getClass());
+            assertEquals(ScpProtocolException.class, e.getCause().getClass());
             assertTrue(e.getCause().getMessage().contains("header too large"));
             assertEquals(0, client.pendingCount());
             assertTrue(client.isClosed());
@@ -912,7 +948,27 @@ class ClientServerTest {
     }
 
     @Test
-    void synchronousWriteFailureReleasesPendingPermit() throws Exception {
+    void localResponseCopyFailureCompletesWaiterAsProtocolFailure() throws Exception {
+        try (ScpServer server = new ScpServer(0, 1, 0, 0,
+                req -> ScpServer.ok(req, Messages.okHeader(), null));
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "copy-fail")) {
+            FailureInjector.arm("scp.client.beforeResponseCopy", point -> {
+                throw new AssertionError("injected response copy failure");
+            });
+            try {
+                ScpProtocolException e = assertThrows(ScpProtocolException.class,
+                        () -> client.callFrame(Opcode.PING, emptyHeader(), null, 2_000));
+                assertTrue(e.getMessage().contains("injected response copy failure"));
+                assertEquals(0, client.pendingCount());
+                assertTrue(client.isClosed());
+            } finally {
+                FailureInjector.reset();
+            }
+        }
+    }
+
+    @Test
+    void synchronousLocalWriteFailureIsProtocolFailureAndReleasesPendingPermit() throws Exception {
         try (ScpClient client = new ScpClient(new ThrowingWriteChannel(),
                 new Messages.HelloResp(0, 1, 0, 0, FrameIO.MAX_FRAME_BYTES, 1024))) {
             int permitsBefore = availablePendingPermits(client);
@@ -920,7 +976,7 @@ class ClientServerTest {
             CompletableFuture<Frame> failed = client.send(Opcode.PING, emptyHeader(), null);
 
             var e = assertThrows(ExecutionException.class, failed::get);
-            assertEquals(IOException.class, e.getCause().getClass());
+            assertEquals(ScpProtocolException.class, e.getCause().getClass());
             assertTrue(e.getCause().getMessage().contains("sync write failed"));
             assertEquals(0, client.pendingCount());
             assertEquals(permitsBefore, availablePendingPermits(client));
@@ -958,6 +1014,66 @@ class ClientServerTest {
     }
 
     @Test
+    void synchronousCallTimeoutIsConnectionFailure() throws Exception {
+        CountDownLatch releasePeer = new CountDownLatch(1);
+        try (ServerSocket server = new ServerSocket(0)) {
+            CompletableFuture<Void> peer = CompletableFuture.runAsync(() -> {
+                try (Socket socket = server.accept()) {
+                    DataInputStream in = new DataInputStream(socket.getInputStream());
+                    DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                    Frame hello = FrameIO.read(in);
+                    FrameIO.write(out, Frame.response(hello,
+                            new Messages.HelloResp(0, 7, 0, 0, FrameIO.MAX_FRAME_BYTES, 1024).encode(), null));
+                    FrameIO.read(in); // deliberately leave the request unanswered
+                    releasePeer.await(3, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    throw new CompletionException(e);
+                }
+            });
+
+            try (ScpClient client = new ScpClient("127.0.0.1", server.getLocalPort(),
+                    ScpClient.KIND_TOOL, "timeout")) {
+                ScpConnectionException e = assertThrows(ScpConnectionException.class,
+                        () -> client.callFrame(Opcode.PING, emptyHeader(), null, 100));
+                assertTrue(e.getMessage().contains("timeout after 100ms"));
+                assertEquals(0, client.pendingCount());
+                assertTrue(client.isClosed());
+            } finally {
+                releasePeer.countDown();
+            }
+            peer.get(3, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void synchronousCallPeerCloseIsConnectionFailure() throws Exception {
+        try (ServerSocket server = new ServerSocket(0)) {
+            CompletableFuture<Void> peer = CompletableFuture.runAsync(() -> {
+                try (Socket socket = server.accept()) {
+                    DataInputStream in = new DataInputStream(socket.getInputStream());
+                    DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                    Frame hello = FrameIO.read(in);
+                    FrameIO.write(out, Frame.response(hello,
+                            new Messages.HelloResp(0, 7, 0, 0, FrameIO.MAX_FRAME_BYTES, 1024).encode(), null));
+                    FrameIO.read(in); // close the socket while the request is outstanding
+                } catch (Exception e) {
+                    throw new CompletionException(e);
+                }
+            });
+
+            try (ScpClient client = new ScpClient("127.0.0.1", server.getLocalPort(),
+                    ScpClient.KIND_TOOL, "peer-close")) {
+                ScpConnectionException e = assertThrows(ScpConnectionException.class,
+                        () -> client.callFrame(Opcode.PING, emptyHeader(), null, 2_000));
+                assertTrue(e.getMessage().contains("connection closed"), "got: " + e.getMessage());
+                assertEquals(0, client.pendingCount());
+                assertTrue(client.isClosed());
+            }
+            peer.get(3, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void interruptedCallFrameRestoresInterruptAndCleansPendingCorrelation() throws Exception {
         CountDownLatch release = new CountDownLatch(1);
         ScpServer.Handler hang = req -> {
@@ -987,8 +1103,38 @@ class ClientServerTest {
              ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
             ScpException e = assertThrows(ScpException.class,
                     () -> client.call(Opcode.PING, emptyHeader(), null, 2000));
+            assertEquals(ScpProtocolException.class, e.getClass());
             assertEquals(ErrorCode.INTERNAL, e.code());
             assertEquals(true, client.isClosed());
+        }
+    }
+
+    @Test
+    void malformedFrameBytesBecomeTypedProtocolErrorAndCloseConnection() throws Exception {
+        try (ServerSocket server = new ServerSocket(0)) {
+            CompletableFuture<Void> peer = CompletableFuture.runAsync(() -> {
+                try (Socket socket = server.accept()) {
+                    DataInputStream in = new DataInputStream(socket.getInputStream());
+                    DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                    Frame hello = FrameIO.read(in);
+                    FrameIO.write(out, Frame.response(hello,
+                            new Messages.HelloResp(0, 7, 0, 0, FrameIO.MAX_FRAME_BYTES, 1024).encode(), null));
+                    FrameIO.read(in);
+                    out.writeInt(Frame.PREAMBLE_AFTER_LEN - 1);
+                    out.flush();
+                } catch (Exception e) {
+                    throw new CompletionException(e);
+                }
+            });
+
+            try (ScpClient client = new ScpClient("127.0.0.1", server.getLocalPort(),
+                    ScpClient.KIND_TOOL, "bad-frame")) {
+                ScpProtocolException e = assertThrows(ScpProtocolException.class,
+                        () -> client.callFrame(Opcode.PING, emptyHeader(), null, 2_000));
+                assertTrue(e.getMessage().contains("bad frame length"));
+                assertTrue(client.isClosed());
+            }
+            peer.get(3, TimeUnit.SECONDS);
         }
     }
 
@@ -1108,7 +1254,7 @@ class ClientServerTest {
     }
 
     @Test
-    void wrongOpcodeHandshakeClosesSocketAndThrowsIOException() throws Exception {
+    void wrongOpcodeHandshakeClosesSocketAndThrowsProtocolError() throws Exception {
         try (ServerSocket server = new ServerSocket(0)) {
             CompletableFuture<Boolean> sawClientClose = CompletableFuture.supplyAsync(() -> {
                 try (Socket socket = server.accept()) {
@@ -1129,7 +1275,7 @@ class ClientServerTest {
                 }
             });
 
-            IOException e = assertThrows(IOException.class,
+            ScpProtocolException e = assertThrows(ScpProtocolException.class,
                     () -> new ScpClient("127.0.0.1", server.getLocalPort(), ScpClient.KIND_TOOL, "bad"));
             assertTrue(e.getMessage().contains("handshake failed"));
             assertTrue(sawClientClose.get(3, TimeUnit.SECONDS),
@@ -1138,7 +1284,7 @@ class ClientServerTest {
     }
 
     @Test
-    void nonResponseHelloFrameClosesSocketAndThrowsIOException() throws Exception {
+    void nonResponseHelloFrameClosesSocketAndThrowsProtocolError() throws Exception {
         try (ServerSocket server = new ServerSocket(0)) {
             CompletableFuture<Boolean> sawClientClose = CompletableFuture.supplyAsync(() -> {
                 try (Socket socket = server.accept()) {
@@ -1159,7 +1305,7 @@ class ClientServerTest {
                 }
             });
 
-            IOException e = assertThrows(IOException.class,
+            ScpProtocolException e = assertThrows(ScpProtocolException.class,
                     () -> new ScpClient("127.0.0.1", server.getLocalPort(), ScpClient.KIND_TOOL, "bad"));
             assertTrue(e.getMessage().contains("handshake failed"));
             assertTrue(sawClientClose.get(3, TimeUnit.SECONDS),
@@ -1187,7 +1333,7 @@ class ClientServerTest {
     }
 
     @Test
-    void malformedSuccessfulHandshakeClosesSocketAndThrowsIOException() throws Exception {
+    void malformedSuccessfulHandshakeClosesSocketAndThrowsProtocolError() throws Exception {
         try (ServerSocket server = new ServerSocket(0)) {
             CompletableFuture<Boolean> sawClientClose = CompletableFuture.supplyAsync(() -> {
                 try (Socket socket = server.accept()) {
@@ -1206,7 +1352,7 @@ class ClientServerTest {
                 }
             });
 
-            IOException e = assertThrows(IOException.class,
+            ScpProtocolException e = assertThrows(ScpProtocolException.class,
                     () -> new ScpClient("127.0.0.1", server.getLocalPort(), ScpClient.KIND_TOOL, "bad"));
             assertTrue(e.getMessage().contains("malformed handshake response"));
             assertEquals(true, sawClientClose.get(3, TimeUnit.SECONDS),
@@ -1318,7 +1464,7 @@ class ClientServerTest {
     private static final class ThrowingWriteChannel extends EmbeddedChannel {
         @Override
         public ChannelFuture writeAndFlush(Object msg) {
-            throw new IllegalStateException("sync write failed");
+            throw new AssertionError("sync write failed");
         }
     }
 
@@ -1326,6 +1472,21 @@ class ClientServerTest {
         BufWriter w = new BufWriter();
         w.u16(0).u16(0).u8(ScpClient.KIND_TOOL).u64(0).string("old").noTags();
         return w.toBytes();
+    }
+
+    private static CompletableFuture<Void> serveWrongOpcodeHandshake(ServerSocket server) {
+        return CompletableFuture.runAsync(() -> {
+            try (Socket socket = server.accept()) {
+                DataInputStream in = new DataInputStream(socket.getInputStream());
+                DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                Frame hello = FrameIO.read(in);
+                Frame wrongOpcode = new Frame(Opcode.PING.code, (short) 1, Frame.FLAG_RESPONSE,
+                        hello.correlationId(), ByteBuffer.wrap(Messages.okHeader()), null);
+                FrameIO.write(out, wrongOpcode);
+            } catch (Exception e) {
+                throw new CompletionException(e);
+            }
+        });
     }
 
     private static ManagedScpConnection managed(String endpoint, int heartbeatIntervalMs,

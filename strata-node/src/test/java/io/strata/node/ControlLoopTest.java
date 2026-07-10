@@ -13,6 +13,7 @@ import io.strata.format.ChunkFormats;
 import io.strata.format.ChunkStore;
 import io.strata.format.ChunkStoreConfig;
 import io.strata.proto.Frame;
+import io.strata.proto.FrameIO;
 import io.strata.proto.Messages;
 import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
@@ -20,9 +21,13 @@ import io.strata.proto.ScpServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -242,6 +247,152 @@ class ControlLoopTest {
             assertEquals(1, heartbeats.get());
             assertEquals(1, getInt(loop, "endpointIndex"));
             assertEquals(-1, getLong(loop, "sessionEpoch"));
+            loop.close();
+        }
+    }
+
+    @Test
+    void runRotatesMetadataEndpointWhenControllerHelloIsMalformed() throws Exception {
+        AtomicInteger leaderRegistrations = new AtomicInteger();
+        AtomicInteger leaderHeartbeats = new AtomicInteger();
+        AtomicInteger badHelloAttempts = new AtomicInteger();
+        AtomicReference<AtomicBoolean> closedRef = new AtomicReference<>();
+        AtomicReference<Throwable> badPeerFailure = new AtomicReference<>();
+
+        try (ServerSocket badHelloServer = new ServerSocket(0);
+             ScpServer leader = new ScpServer(0, 0, 0, 0, req -> {
+                 Opcode op = Opcode.fromCode(req.opcode());
+                 if (op == Opcode.REGISTER_NODE) {
+                     Messages.RegisterNode.decode(req.headerSlice());
+                     leaderRegistrations.incrementAndGet();
+                     return ScpServer.ok(req, new Messages.RegisterResp(7, 22, 1, 100).encode(), null);
+                 }
+                 if (op == Opcode.NODE_HEARTBEAT) {
+                     Messages.NodeHeartbeat.decode(req.headerSlice());
+                     leaderHeartbeats.incrementAndGet();
+                     closedRef.get().set(true);
+                     return ScpServer.ok(req,
+                             new Messages.HeartbeatResp(System.currentTimeMillis() + 60_000, List.of()).encode(),
+                             null);
+                 }
+                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+            });
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
+            Thread badPeer = Thread.ofVirtual().name("control-loop-test-bad-hello").start(() -> {
+                try {
+                    while (!badHelloServer.isClosed()) {
+                        try (Socket socket = badHelloServer.accept()) {
+                            DataInputStream in = new DataInputStream(socket.getInputStream());
+                            DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                            Frame hello = FrameIO.read(in);
+                            badHelloAttempts.incrementAndGet();
+                            Frame wrongOpcode = new Frame(Opcode.PING.code, (short) 1, Frame.FLAG_RESPONSE,
+                                    hello.correlationId(), ByteBuffer.wrap(Messages.okHeader()), null);
+                            FrameIO.write(out, wrongOpcode);
+                        }
+                    }
+                } catch (Throwable e) {
+                    if (!badHelloServer.isClosed()) {
+                        badPeerFailure.set(e);
+                    }
+                }
+            });
+
+            String badEndpoint = "127.0.0.1:" + badHelloServer.getLocalPort();
+            ControlLoop loop = controlLoop(node,
+                    config(List.of(badEndpoint, endpoint(leader)), 60_000));
+            closedRef.set(getClosed(loop));
+
+            Thread worker = Thread.ofVirtual().name("control-loop-test-hello-rotation").start(() -> {
+                try {
+                    invoke(loop, "run");
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            waitFor(() -> leaderHeartbeats.get() == 1);
+            worker.join(2_000);
+            badHelloServer.close();
+            badPeer.join(2_000);
+
+            assertFalse(worker.isAlive());
+            assertFalse(badPeer.isAlive());
+            assertNull(badPeerFailure.get());
+            assertEquals(1, badHelloAttempts.get(),
+                    "a protocol failure must rotate immediately instead of retrying the bad endpoint");
+            assertEquals(1, leaderRegistrations.get(),
+                    "malformed controller HELLO must rotate and re-register with the next endpoint");
+            assertEquals(1, leaderHeartbeats.get());
+            assertEquals(1, getInt(loop, "endpointIndex"));
+            assertEquals(22, getLong(loop, "sessionEpoch"));
+            loop.close();
+        }
+    }
+
+    @Test
+    void runRotatesMetadataEndpointWhenControllerProtocolFailsMidSession() throws Exception {
+        AtomicInteger firstRegistrations = new AtomicInteger();
+        AtomicInteger firstHeartbeats = new AtomicInteger();
+        AtomicInteger leaderRegistrations = new AtomicInteger();
+        AtomicInteger leaderHeartbeats = new AtomicInteger();
+        AtomicReference<AtomicBoolean> closedRef = new AtomicReference<>();
+
+        try (ScpServer malformed = new ScpServer(0, 0, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.REGISTER_NODE) {
+                Messages.RegisterNode.decode(req.headerSlice());
+                firstRegistrations.incrementAndGet();
+                return ScpServer.ok(req, new Messages.RegisterResp(7, 11, 1, 100).encode(), null);
+            }
+            if (op == Opcode.NODE_HEARTBEAT) {
+                Messages.NodeHeartbeat.decode(req.headerSlice());
+                firstHeartbeats.incrementAndGet();
+                return ScpServer.ok(req, new byte[] {0}, null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+             ScpServer leader = new ScpServer(0, 0, 0, 0, req -> {
+                 Opcode op = Opcode.fromCode(req.opcode());
+                 if (op == Opcode.REGISTER_NODE) {
+                     Messages.RegisterNode.decode(req.headerSlice());
+                     leaderRegistrations.incrementAndGet();
+                     return ScpServer.ok(req, new Messages.RegisterResp(7, 22, 1, 100).encode(), null);
+                 }
+                 if (op == Opcode.NODE_HEARTBEAT) {
+                     Messages.NodeHeartbeat.decode(req.headerSlice());
+                     leaderHeartbeats.incrementAndGet();
+                     closedRef.get().set(true);
+                     return ScpServer.ok(req,
+                             new Messages.HeartbeatResp(System.currentTimeMillis() + 60_000, List.of()).encode(),
+                             null);
+                 }
+                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+             });
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
+            ControlLoop loop = controlLoop(node,
+                    config(List.of(endpoint(malformed), endpoint(leader)), 60_000));
+            closedRef.set(getClosed(loop));
+
+            Thread worker = Thread.ofVirtual().name("control-loop-test-protocol-rotation").start(() -> {
+                try {
+                    invoke(loop, "run");
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            waitFor(() -> leaderHeartbeats.get() == 1);
+            worker.join(2_000);
+
+            assertFalse(worker.isAlive());
+            assertEquals(1, firstRegistrations.get());
+            assertEquals(1, firstHeartbeats.get());
+            assertEquals(1, leaderRegistrations.get(),
+                    "mid-session protocol failure must clear the old session and re-register");
+            assertEquals(1, leaderHeartbeats.get());
+            assertEquals(1, getInt(loop, "endpointIndex"));
+            assertEquals(22, getLong(loop, "sessionEpoch"));
             loop.close();
         }
     }
