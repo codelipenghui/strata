@@ -207,6 +207,47 @@ class ChunkStoreTest {
     }
 
     @Test
+    void freshStoreRootForcesParentDirectoryBeforeUse() throws Exception {
+        Path storeRoot = dir.resolve("chunks");
+        Path expectedParent = dir.toAbsolutePath().normalize();
+        List<Path> forced = new ArrayList<>();
+
+        try (ChunkStore ignored = new ChunkStore(
+                storeRoot, false, 1024, ChunkStoreConfig.DEFAULT, path -> {
+                    assertTrue(Files.isDirectory(storeRoot),
+                            "the store root must exist before its parent is forced");
+                    forced.add(path);
+                })) {
+            assertTrue(forced.stream()
+                            .map(path -> path.toAbsolutePath().normalize())
+                            .anyMatch(expectedParent::equals),
+                    "a newly created store root must be anchored in its parent before use");
+        }
+    }
+
+    @Test
+    void storeRootParentSyncFailureIsRetriedOnNextConstruction() throws Exception {
+        Path storeRoot = dir.resolve("retry-chunks");
+        Path expectedParent = dir.toAbsolutePath().normalize();
+        AtomicLong attempts = new AtomicLong();
+        ChunkStore.DirectorySyncer syncer = path -> {
+            assertEquals(expectedParent, path.toAbsolutePath().normalize());
+            if (attempts.incrementAndGet() == 1) {
+                throw new IOException("injected store-root parent fsync failure");
+            }
+        };
+
+        assertThrows(IOException.class,
+                () -> new ChunkStore(storeRoot, false, 1024, ChunkStoreConfig.DEFAULT, syncer));
+        assertTrue(Files.isDirectory(storeRoot), "failed construction may leave the new root in place");
+
+        try (ChunkStore ignored = new ChunkStore(
+                storeRoot, false, 1024, ChunkStoreConfig.DEFAULT, syncer)) {
+            assertEquals(2, attempts.get(), "an existing root must retry the parent fsync before use");
+        }
+    }
+
+    @Test
     void fsyncOnAckOpenForcesCreatedShardAncestorDirentsWhenSealFsyncDisabled() throws Exception {
         ChunkId chunkId = new ChunkId(FileId.of(0x0102), 0);
         List<Path> forced = new ArrayList<>();
@@ -230,6 +271,7 @@ class ChunkStoreTest {
         List<Path> forced = new ArrayList<>();
 
         try (ChunkStore store = new ChunkStore(dir, false, 1024, ChunkStoreConfig.DEFAULT, forced::add)) {
+            forced.clear(); // isolate the open path from the constructor's store-root parent fsync
             store.open(TEST_NS, chunkId, false, 1, 1718000000000L);
         }
 

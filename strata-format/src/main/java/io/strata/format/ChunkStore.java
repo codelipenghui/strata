@@ -222,6 +222,9 @@ public final class ChunkStore implements AutoCloseable {
         this.csConfig = csConfig;
         this.channelCache = new ChannelCache(channelCacheCapacity);
         Files.createDirectories(dir);
+        // The store root's own dirent lives in its parent. Force it on every construction so a retry
+        // cannot mistake a root left behind by a failed or concurrent initializer for a durable one.
+        ensureDirectoryDurable(dir);
         recoverAll();
         this.flusher = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "chunk-writeback-" + dir.getFileName());
