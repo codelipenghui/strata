@@ -6,6 +6,7 @@ import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.framework.api.SyncBuilder;
 import org.apache.curator.framework.api.transaction.CuratorOp;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.zookeeper.KeeperException;
@@ -20,8 +21,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
@@ -202,7 +206,7 @@ public final class ZkMetadataStore implements MetadataStore {
      */
     Optional<Versioned<Records.FileRecord>> getFileAuthoritative(StrataNamespace namespace, FileId id)
             throws Exception {
-        curator.sync().forPath(FILES + "/" + id);
+        awaitSync(curator.sync(), FILES + "/" + id, connectionTimeoutMs);
         return getFile(namespace, id);
     }
 
@@ -707,16 +711,54 @@ public final class ZkMetadataStore implements MetadataStore {
     public Optional<Versioned<Records.NamespaceManifest>> getNamespaceManifestAuthoritative(
             StrataNamespace namespace) throws Exception {
         String path = manifestPath(namespace);
-        // Force this Curator/ZooKeeper client to catch up with the server's committed state before the read.
-        // Any sync/read failure is deliberately propagated: callers use this only to authorize destructive
-        // work, so an uncertain authority view must fail closed.
-        curator.sync().forPath(path);
+        // Curator's SyncBuilder is background-only: forPath() merely submits the operation. Explicitly
+        // await its callback before issuing getData so a reconnect cannot let the read overtake a queued
+        // sync, and propagate a non-OK result so destructive callers fail closed.
+        awaitSync(curator.sync(), path, connectionTimeoutMs);
         try {
             Stat stat = new Stat();
             byte[] data = curator.getData().storingStatIn(stat).forPath(path);
             return Optional.of(new Versioned<>(Records.NamespaceManifest.decode(data), stat.getVersion()));
         } catch (KeeperException.NoNodeException e) {
             return Optional.empty();
+        }
+    }
+
+    /**
+     * Submits and awaits Curator's asynchronous ZooKeeper {@code sync}. A synchronous-looking
+     * {@link SyncBuilder#forPath(String)} call is insufficient because Curator returns as soon as the
+     * background operation is queued, including while disconnected. The callback result is therefore
+     * part of the authoritative-read contract: only {@link KeeperException.Code#OK} permits the read.
+     */
+    static void awaitSync(SyncBuilder sync, String path) throws Exception {
+        awaitSync(sync, path, 10_000);
+    }
+
+    static void awaitSync(SyncBuilder sync, String path, long timeoutMs) throws Exception {
+        if (timeoutMs <= 0) {
+            throw new IllegalArgumentException("sync timeout must be positive: " + timeoutMs);
+        }
+        CompletableFuture<Integer> result = new CompletableFuture<>();
+        sync.inBackground((ignored, event) -> result.complete(event.getResultCode())).forPath(path);
+
+        final int resultCode;
+        try {
+            resultCode = result.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw e;
+        } catch (TimeoutException e) {
+            throw new IllegalStateException(
+                    "ZooKeeper sync timed out after " + timeoutMs + "ms for " + path, e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception exception) {
+                throw exception;
+            }
+            throw new IllegalStateException("ZooKeeper sync callback failed for " + path, cause);
+        }
+        if (resultCode != KeeperException.Code.OK.intValue()) {
+            throw KeeperException.create(KeeperException.Code.get(resultCode), path);
         }
     }
 

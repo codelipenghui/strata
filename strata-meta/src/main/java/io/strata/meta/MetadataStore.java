@@ -174,12 +174,13 @@ public interface MetadataStore extends AutoCloseable {
     /**
      * Reads the namespace manifest from the consensus authority after synchronizing this client's view.
      * Destructive decisions must use this path rather than a potentially stale local/session view. Backends
-     * without a stronger read primitive inherit the ordinary read; the ZooKeeper root overrides it with a
+     * without a stronger read primitive fail closed; the ZooKeeper root overrides this with an awaited
      * {@code sync} barrier before fetching the manifest.
      */
     default Optional<Versioned<Records.NamespaceManifest>> getNamespaceManifestAuthoritative(
             StrataNamespace namespace) throws Exception {
-        return getNamespaceManifest(namespace);
+        throw new UnsupportedOperationException(
+                "backend has no authoritative manifest read; destructive confirmation unsupported");
     }
 
     /**

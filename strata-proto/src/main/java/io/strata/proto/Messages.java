@@ -54,13 +54,6 @@ public final class Messages {
         }
     }
 
-    private static void requireFullyConsumed(ByteBuffer b, String messageName) {
-        if (b.hasRemaining()) {
-            throw new IllegalArgumentException(
-                    "trailing bytes in " + messageName + ": " + b.remaining());
-        }
-    }
-
     private static byte[] i32Field(int value) {
         BufWriter w = new BufWriter(Integer.BYTES);
         w.i32(value);
@@ -2099,7 +2092,6 @@ public final class Messages {
             ConfirmOrphan m = new ConfirmOrphan(
                     StrataNamespace.readFrom(b), ChunkId.readFrom(b), b.getInt());
             TaggedFields.readFrom(b);
-            requireFullyConsumed(b, "ConfirmOrphan");
             return m;
         }
     }
@@ -2131,7 +2123,6 @@ public final class Messages {
             ConfirmOrphanResp m = new ConfirmOrphanResp(
                     Varint.readBoolean(b), Varint.readBoolean(b), b.getLong());
             TaggedFields.readFrom(b);
-            requireFullyConsumed(b, "ConfirmOrphanResp");
             return m;
         }
     }

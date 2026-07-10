@@ -108,6 +108,8 @@ final class OrphanGc implements AutoCloseable {
     private volatile long firstBreakerOpenedAtMs;
     private volatile long lastOpenBreakerWarnMs;
     private final AtomicLong unreachableConfirmWarns = new AtomicLong();
+    private final AtomicLong ownerEpochConfirmRejects = new AtomicLong();
+    private final AtomicLong persistencePoisonConfirmRejects = new AtomicLong();
     private volatile long lastUnreachableConfirmWarnMs;
     private volatile Thread thread;
 
@@ -519,6 +521,12 @@ final class OrphanGc implements AutoCloseable {
                         chunkId, namespace, confirmedOwnerEpoch, e.detail());
                 return false;
             }
+            if (e.code() == ErrorCode.INTERNAL) {
+                log.warn("orphan GC: final delete gate failed closed for chunk {} in ns={} "
+                                + "confirmedOwnerEpoch={}; keeping chunk and continuing this pass",
+                        chunkId, namespace, confirmedOwnerEpoch, e);
+                return false;
+            }
             throw e;
         }
         if (result == ErrorCode.OK) {
@@ -541,6 +549,10 @@ final class OrphanGc implements AutoCloseable {
 
     private record Confirmation(Verdict verdict, long ownerEpoch) {
         private Confirmation {
+            Objects.requireNonNull(verdict, "verdict");
+            if (verdict == Verdict.UNREACHABLE && ownerEpoch != 0) {
+                throw new IllegalArgumentException("unreachable confirmation must carry owner epoch zero");
+            }
             if (verdict != Verdict.UNREACHABLE && ownerEpoch <= 0) {
                 throw new IllegalArgumentException("definitive confirmation requires a positive owner epoch");
             }
@@ -589,22 +601,23 @@ final class OrphanGc implements AutoCloseable {
 
     private Confirmation confirm(StrataNamespace ns, ChunkId chunkId) {
         byte[] req = new Messages.ConfirmOrphan(ns, chunkId, nodeId).encode();
-        Exception lastFailure = null;
+        ConfirmFailure lastFailure = null;
         for (String ep : controllerEndpoints) {
             Endpoint endpoint;
             try {
                 endpoint = Endpoint.parse(ep, "controller endpoint", ErrorCode.INTERNAL);
             } catch (Exception e) {
-                lastFailure = e;
+                lastFailure = preferFailure(lastFailure,
+                        new ConfirmFailure(ConfirmFailureCategory.ENDPOINT_CONFIGURATION, e));
                 continue;
             }
             try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(),
                     ScpClient.KIND_TOOL, "orphan-confirm")) {
                 ByteBuffer resp = client.call(Opcode.CONFIRM_ORPHAN, req, null, confirmTimeoutMs);
                 Messages.ConfirmOrphanResp r = Messages.ConfirmOrphanResp.decode(resp);
-                Exception ownerEpochFailure = confirmOwnerEpochFailure(ns, r.ownerEpoch(), ep);
+                ConfirmFailure ownerEpochFailure = confirmOwnerEpochFailure(ns, r.ownerEpoch(), ep);
                 if (ownerEpochFailure != null) {
-                    lastFailure = ownerEpochFailure;
+                    lastFailure = preferFailure(lastFailure, ownerEpochFailure);
                     continue;
                 }
                 if (!r.fileExists()) {
@@ -612,17 +625,20 @@ final class OrphanGc implements AutoCloseable {
                 }
                 Verdict verdict = r.referencedByNode()
                         ? Verdict.KEEP // the authoritative owner still lists this node
-                        : Verdict.ORPHAN; // file/chunk absent or this node is no longer a replica
+                        : Verdict.ORPHAN; // descriptor omits the chunk, or this node is no longer a replica
                 return new Confirmation(verdict, r.ownerEpoch());
             } catch (ScpException se) {
                 if (se.code() == ErrorCode.NOT_LEADER) {
-                    lastFailure = se;
+                    lastFailure = preferFailure(lastFailure,
+                            new ConfirmFailure(ConfirmFailureCategory.NOT_OWNER, se));
                     continue; // this controller is not the owner — try the next endpoint
                 }
                 // any other error: do not trust it as a delete signal — fall through to the next endpoint
-                lastFailure = se;
+                lastFailure = preferFailure(lastFailure,
+                        new ConfirmFailure(ConfirmFailureCategory.CONTROLLER_ERROR, se));
             } catch (Exception e) {
-                lastFailure = e; // connection failure: try the next endpoint
+                lastFailure = preferFailure(lastFailure,
+                        new ConfirmFailure(ConfirmFailureCategory.ENDPOINT_IO, e));
             }
         }
         maybeWarnUnreachableConfirm(ns, chunkId, lastFailure);
@@ -633,7 +649,7 @@ final class OrphanGc implements AutoCloseable {
      * A node that persistently cannot confirm never reclaims any orphan and fills its disk, so an
      * all-endpoints-UNREACHABLE sweep must not be silent. Rate-limited node-wide: one warn per interval.
      */
-    private void maybeWarnUnreachableConfirm(StrataNamespace ns, ChunkId chunkId, Exception lastFailure) {
+    private void maybeWarnUnreachableConfirm(StrataNamespace ns, ChunkId chunkId, ConfirmFailure lastFailure) {
         long now = System.currentTimeMillis();
         long last = lastUnreachableConfirmWarnMs;
         if (last != 0 && now - last < UNREACHABLE_CONFIRM_WARN_INTERVAL_MS) {
@@ -641,35 +657,80 @@ final class OrphanGc implements AutoCloseable {
         }
         lastUnreachableConfirmWarnMs = now;
         unreachableConfirmWarns.incrementAndGet();
+        if (lastFailure != null
+                && lastFailure.category() == ConfirmFailureCategory.LOCAL_PERSISTENCE_POISON) {
+            log.warn("orphan GC: local durable owner-epoch persistence is poisoned while confirming chunk {} "
+                            + "in ns={}; keeping suspects fail-closed. Controller endpoint retries cannot recover "
+                            + "this condition; repair the data volume and restart the node. lastFailureCategory={}",
+                    chunkId, ns, lastFailure.category(), lastFailure.cause());
+            return;
+        }
         log.warn("orphan GC: confirm for chunk {} in ns={} exhausted all {} controller endpoints without a "
                         + "definitive answer; keeping suspects (fail-safe) but no orphan can be reclaimed "
-                        + "until a confirm succeeds",
-                chunkId, ns, controllerEndpoints.size(), lastFailure);
+                        + "until a confirm succeeds. lastFailureCategory={}",
+                chunkId, ns, controllerEndpoints.size(),
+                lastFailure == null ? "NONE" : lastFailure.category(),
+                lastFailure == null ? null : lastFailure.cause());
     }
 
     long unreachableConfirmWarns() {
         return unreachableConfirmWarns.get();
     }
 
-    private Exception confirmOwnerEpochFailure(StrataNamespace namespace, long ownerEpoch, String endpoint) {
+    long ownerEpochConfirmRejects() {
+        return ownerEpochConfirmRejects.get();
+    }
+
+    long persistencePoisonConfirmRejects() {
+        return persistencePoisonConfirmRejects.get();
+    }
+
+    private ConfirmFailure confirmOwnerEpochFailure(
+            StrataNamespace namespace, long ownerEpoch, String endpoint) {
         try {
             ownerEpochAcceptor.accept(namespace, ownerEpoch);
             return null;
-        } catch (Throwable t) {
-            if (t instanceof ScpException e && e.code() == ErrorCode.FENCED_EPOCH) {
-                log.warn("orphan GC ignored stale owner-confirm response namespace={} endpoint={} "
-                                + "offeredOwnerEpoch={} requiredOwnerEpoch={}",
-                        namespace, endpoint, ownerEpoch, e.detail());
+        } catch (Exception e) {
+            ownerEpochConfirmRejects.incrementAndGet();
+            ConfirmFailureCategory category;
+            if (e instanceof DataNode.OwnerEpochPersistenceException) {
+                category = ConfirmFailureCategory.LOCAL_PERSISTENCE_POISON;
+                persistencePoisonConfirmRejects.incrementAndGet();
+            } else if (e instanceof ScpException se && se.code() == ErrorCode.FENCED_EPOCH) {
+                category = ConfirmFailureCategory.STALE_OWNER_EPOCH;
             } else {
-                log.warn("orphan GC ignored invalid owner-confirm epoch namespace={} endpoint={} "
-                                + "offeredOwnerEpoch={} error={}",
-                        namespace, endpoint, ownerEpoch, t.toString(), t);
+                category = ConfirmFailureCategory.INVALID_OWNER_EPOCH;
             }
-            if (t instanceof Exception e) {
-                return e;
-            }
-            return new RuntimeException(t);
+            log.debug("orphan GC ignored owner-confirm epoch namespace={} endpoint={} offeredOwnerEpoch={} "
+                            + "failureCategory={}",
+                    namespace, endpoint, ownerEpoch, category, e);
+            return new ConfirmFailure(category, e);
         }
+    }
+
+    private enum ConfirmFailureCategory {
+        ENDPOINT_CONFIGURATION,
+        ENDPOINT_IO,
+        NOT_OWNER,
+        CONTROLLER_ERROR,
+        STALE_OWNER_EPOCH,
+        INVALID_OWNER_EPOCH,
+        LOCAL_PERSISTENCE_POISON
+    }
+
+    private record ConfirmFailure(ConfirmFailureCategory category, Exception cause) {
+        private ConfirmFailure {
+            Objects.requireNonNull(category, "category");
+            Objects.requireNonNull(cause, "cause");
+        }
+    }
+
+    /** Local durable-state poison is actionable on the node and must not be hidden by a later network error. */
+    private static ConfirmFailure preferFailure(ConfirmFailure current, ConfirmFailure candidate) {
+        if (current != null && current.category() == ConfirmFailureCategory.LOCAL_PERSISTENCE_POISON) {
+            return current;
+        }
+        return candidate;
     }
 
     @Override

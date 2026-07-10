@@ -125,7 +125,7 @@ class ControllerTest {
     }
 
     @Test
-    void createFileStoresClientWritePolicy() {
+    void createFileStoresClientWritePolicy() throws Exception {
         assertEquals("127.0.0.1:" + service.port(), service.endpoint());
         Messages.WritePolicy policy = new Messages.WritePolicy(3, 2, true);
         var accepted = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
@@ -143,6 +143,13 @@ class ControllerTest {
         assertEquals(lookup.ownerEpoch(), missing.detail(),
                 "legacy LOOKUP_FILE misses keep carrying the global owner epoch detail");
 
+        int realReplicaNodeId = 321;
+        MetadataStore.Versioned<Records.FileRecord> stored = metadataStore()
+                .getFile(StrataNamespace.of("test"), accepted.fileId()).orElseThrow();
+        Records.ChunkRecord liveChunk = new Records.ChunkRecord(
+                0, ChunkState.SEALED, 64, 0xCAFE, 1, List.of(realReplicaNodeId));
+        assertTrue(metadataStore().updateFile(stored.value().withChunks(List.of(liveChunk)), stored.version()));
+
         Messages.ConfirmOrphanResp present = Messages.ConfirmOrphanResp.decode(client.call(
                 Opcode.CONFIRM_ORPHAN,
                 new Messages.ConfirmOrphan(StrataNamespace.of("test"), new ChunkId(accepted.fileId(), 0), 123)
@@ -151,6 +158,15 @@ class ControllerTest {
         assertEquals(false, present.referencedByNode());
         assertEquals(lookup.ownerEpoch(), present.ownerEpoch(),
                 "root-backed orphan confirms must carry the current global-leader epoch");
+
+        Messages.ConfirmOrphanResp referenced = Messages.ConfirmOrphanResp.decode(client.call(
+                Opcode.CONFIRM_ORPHAN,
+                new Messages.ConfirmOrphan(StrataNamespace.of("test"),
+                        new ChunkId(accepted.fileId(), 0), realReplicaNodeId).encode(), null, 5000));
+        assertTrue(referenced.fileExists());
+        assertTrue(referenced.referencedByNode(),
+                "root-backed confirmation must keep a live replica named by the descriptor");
+        assertEquals(lookup.ownerEpoch(), referenced.ownerEpoch());
 
         Messages.ConfirmOrphanResp absent = Messages.ConfirmOrphanResp.decode(client.call(
                 Opcode.CONFIRM_ORPHAN,

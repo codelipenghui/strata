@@ -44,6 +44,17 @@ final class ChunkDeleteService {
     }
 
     ErrorCode delete(StrataNamespace namespace, ChunkId chunkId) throws InterruptedException {
+        try (PreparedDelete prepared = prepare()) {
+            return prepared.delete(namespace, chunkId);
+        }
+    }
+
+    /**
+     * Acquires the shared delete QoS slot without touching the chunk. Callers that need an additional
+     * correctness gate can wait here, run that short gate afterwards, and invoke {@link PreparedDelete#delete}
+     * only once the delete is committed. This keeps throttle and pacing waits outside caller-owned locks.
+     */
+    PreparedDelete prepare() throws InterruptedException {
         waiting.incrementAndGet();
         boolean acquired = false;
         try {
@@ -58,6 +69,27 @@ final class ChunkDeleteService {
                 }
                 throw e;
             }
+            return new PreparedDelete();
+        } catch (InterruptedException | RuntimeException e) {
+            if (acquired) {
+                permits.release();
+            }
+            throw e;
+        }
+    }
+
+    final class PreparedDelete implements AutoCloseable {
+        private boolean attempted;
+        private boolean closed;
+
+        ErrorCode delete(StrataNamespace namespace, ChunkId chunkId) {
+            if (closed) {
+                throw new IllegalStateException("prepared delete is closed");
+            }
+            if (attempted) {
+                throw new IllegalStateException("prepared delete may be used only once");
+            }
+            attempted = true;
             inFlight.incrementAndGet();
             try {
                 ErrorCode result = store.delete(namespace, chunkId);
@@ -69,8 +101,12 @@ final class ChunkDeleteService {
             } finally {
                 inFlight.decrementAndGet();
             }
-        } finally {
-            if (acquired) {
+        }
+
+        @Override
+        public void close() {
+            if (!closed) {
+                closed = true;
                 permits.release();
             }
         }

@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Node-local orphan GC (design §9.2): confirm-before-delete and the fail-safe data-loss guard. */
@@ -263,6 +264,91 @@ class OrphanGcTest {
                     "the stale endpoint must not hide a later authoritative reference");
             assertEquals(1, staleCalls.get(), "stale answer is skipped on the first confirm pass");
             assertEquals(1, freshCalls.get(), "fresh owner is consulted on the first confirm pass");
+        }
+    }
+
+    @Test
+    void staleEndpointFirstStillAllowsLaterFreshOwnerToDelete() throws Exception {
+        ChunkId orphan = new ChunkId(FileId.of(1), 0);
+        AtomicInteger staleCalls = new AtomicInteger();
+        AtomicInteger freshCalls = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer staleOwner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 staleCalls.incrementAndGet();
+                 return confirmResponse(req, false, false, 7);
+             });
+             ScpServer freshOwner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 freshCalls.incrementAndGet();
+                 return confirmResponse(req, false, false, 8);
+             })) {
+            seal(store, orphan);
+            OrphanGc gc = orphanGc(store, List.of(
+                            "127.0.0.1:" + staleOwner.port(),
+                            "127.0.0.1:" + freshOwner.port()),
+                    0, 60_000, 0, 5_000,
+                    (namespace, ownerEpoch) -> {
+                        if (ownerEpoch < 8) {
+                            throw new ScpException(ErrorCode.FENCED_EPOCH,
+                                    "stale owner epoch " + ownerEpoch, 8);
+                        }
+                    });
+
+            gc.gcOnce();
+            assertTrue(store.contains(NS, orphan),
+                    "fresh FILE_NOT_FOUND still needs cross-pass corroboration");
+
+            gc.gcOnce();
+
+            assertFalse(store.contains(NS, orphan),
+                    "a stale first endpoint must not wedge cleanup through a later fresh owner");
+            assertEquals(3, staleCalls.get(), "stale endpoint is skipped in both sweeps and final confirm");
+            assertEquals(3, freshCalls.get(), "fresh endpoint authorizes both sweeps and final delete");
+        }
+    }
+
+    @Test
+    void persistencePoisonConfirmFailuresAreCountedAndWarnedOncePerInterval() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileExistsWithoutChunkServer()) {
+            seal(store, chunk);
+            OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000,
+                    (namespace, ownerEpoch) -> {
+                        throw new DataNode.OwnerEpochPersistenceException(
+                                "floorFile=/data/owner-epochs.properties", new IOException("disk full"));
+                    });
+
+            gc.gcOnce();
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, chunk));
+            assertEquals(2, gc.ownerEpochConfirmRejects());
+            assertEquals(2, gc.persistencePoisonConfirmRejects());
+            assertEquals(1, gc.unreachableConfirmWarns(),
+                    "local persistence poison must use the node-wide warning rate limit");
+        }
+    }
+
+    @Test
+    void ownerEpochAcceptorDoesNotSwallowJvmErrors() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(1), 0);
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = fileExistsWithoutChunkServer()) {
+            seal(store, chunk);
+            OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000,
+                    (namespace, ownerEpoch) -> {
+                        throw new AssertionError("fatal acceptor failure");
+                    });
+
+            AssertionError error = assertThrows(AssertionError.class, gc::gcOnce);
+            assertEquals("fatal acceptor failure", error.getMessage());
+            assertTrue(store.contains(NS, chunk));
         }
     }
 
@@ -650,6 +736,41 @@ class OrphanGcTest {
             assertTrue(store.contains(NS, chunk));
             assertEquals(1, guardedDeletes.get());
             assertEquals(0, deletes.okDeletes(), "the fenced gate must run before physical unlink");
+        }
+    }
+
+    @Test
+    void internalDeleteGateFailureKeepsOneChunkAndContinuesThePass() throws Exception {
+        ChunkId failed = new ChunkId(FileId.of(1), 0);
+        ChunkId healthy = new ChunkId(FileId.of(2), 0);
+        AtomicInteger guardedDeletes = new AtomicInteger();
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"));
+             ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                 if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                 }
+                 return confirmResponse(req, true, false, 8);
+             })) {
+            seal(store, failed);
+            seal(store, healthy);
+            ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
+            OrphanGc gc = new OrphanGc(store, deletes, NODE_ID,
+                    List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000,
+                    64, 0, 0, 0, 0,
+                    (namespace, ownerEpoch) -> {},
+                    (namespace, chunkId, confirmedOwnerEpoch) -> {
+                        guardedDeletes.incrementAndGet();
+                        if (chunkId.equals(failed)) {
+                            throw new ScpException(ErrorCode.INTERNAL, "poisoned final gate");
+                        }
+                        return store.delete(namespace, chunkId);
+                    });
+
+            gc.gcOnce();
+
+            assertTrue(store.contains(NS, failed), "INTERNAL final gate must fail this chunk closed");
+            assertFalse(store.contains(NS, healthy), "a sibling chunk must still drain in the same pass");
+            assertEquals(2, guardedDeletes.get());
         }
     }
 

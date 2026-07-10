@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -183,12 +184,11 @@ class DataNodeWireTest {
     }
 
     @Test
-    void ownerEpochLocksArePerNamespaceAcrossFinalPhysicalDelete() throws Exception {
+    void committedDeleteClaimRejectsSameNamespaceWithoutBlockingOtherNamespaces() throws Exception {
         StrataNamespace namespaceA = StrataNamespace.of("namespace-a");
         StrataNamespace namespaceB = StrataNamespace.of("namespace-b");
         CountDownLatch deleteEntered = new CountDownLatch(1);
         CountDownLatch releaseDelete = new CountDownLatch(1);
-        CountDownLatch sameNamespaceAttempted = new CountDownLatch(1);
 
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
             node.acceptAuthoritativeOwnerEpoch(namespaceA, 8);
@@ -208,11 +208,10 @@ class DataNodeWireTest {
                     deleteFuture.completeExceptionally(t);
                 }
             });
-            assertTrue(deleteEntered.await(5, TimeUnit.SECONDS), "delete must enter while holding namespace A");
+            assertTrue(deleteEntered.await(5, TimeUnit.SECONDS), "delete must enter after committing its claim");
 
             CompletableFuture<Void> sameNamespaceAdvance = new CompletableFuture<>();
             Thread.ofVirtual().start(() -> {
-                sameNamespaceAttempted.countDown();
                 try {
                     node.acceptOwnerEpoch(namespaceA, 9);
                     sameNamespaceAdvance.complete(null);
@@ -220,7 +219,13 @@ class DataNodeWireTest {
                     sameNamespaceAdvance.completeExceptionally(t);
                 }
             });
-            assertTrue(sameNamespaceAttempted.await(5, TimeUnit.SECONDS));
+
+            ExecutionException sameNamespaceFailure = assertThrows(ExecutionException.class,
+                    () -> sameNamespaceAdvance.get(5, TimeUnit.SECONDS));
+            ScpException retry = (ScpException) sameNamespaceFailure.getCause();
+            assertEquals(ErrorCode.INTERNAL, retry.code());
+            assertTrue(retry.retriable());
+            assertEquals(1, node.ownerEpochDeleteClaimRejects());
 
             CompletableFuture<Void> otherNamespaceAdvance = new CompletableFuture<>();
             Thread.ofVirtual().start(() -> {
@@ -234,14 +239,12 @@ class DataNodeWireTest {
 
             try {
                 otherNamespaceAdvance.get(5, TimeUnit.SECONDS);
-                assertFalse(sameNamespaceAdvance.isDone(),
-                        "namespace A's higher epoch must wait until its physical delete exits");
             } finally {
                 releaseDelete.countDown();
             }
 
             assertEquals(ErrorCode.OK, deleteFuture.get(5, TimeUnit.SECONDS));
-            sameNamespaceAdvance.get(5, TimeUnit.SECONDS);
+            node.acceptOwnerEpoch(namespaceA, 9);
         }
     }
 
@@ -283,11 +286,29 @@ class DataNodeWireTest {
             ScpException failure = assertThrows(ScpException.class,
                     () -> node.acceptAuthoritativeOwnerEpoch(TEST_NS, 8));
             assertEquals(ErrorCode.INTERNAL, failure.code());
+            assertTrue(failure.getMessage().contains("owner-epochs.properties"));
+            assertEquals(1, node.ownerEpochPersistencePoisoned());
 
-            ScpException stillClosed = assertThrows(ScpException.class,
-                    () -> node.acceptOwnerEpoch(StrataNamespace.of("other"), 7));
-            assertEquals(ErrorCode.INTERNAL, stillClosed.code(),
-                    "an uncertain persistence failure must poison every namespace fail-closed");
+            ScpException staleSameNamespace = assertThrows(ScpException.class,
+                    () -> node.acceptOwnerEpoch(TEST_NS, 7));
+            assertEquals(ErrorCode.FENCED_EPOCH, staleSameNamespace.code(),
+                    "a failed durable raise must still advance the process-local fence");
+            node.acceptOwnerEpoch(TEST_NS, 8);
+
+            StrataNamespace other = StrataNamespace.of("other");
+            node.acceptOwnerEpoch(other, 7);
+            assertEquals(0, node.ownerEpochDeleteClaimRejects(),
+                    "ordinary owner RPCs remain available on their volatile watermark");
+
+            ScpException authoritativeStillClosed = assertThrows(ScpException.class,
+                    () -> node.acceptAuthoritativeOwnerEpoch(other, 8));
+            assertEquals(ErrorCode.INTERNAL, authoritativeStillClosed.code());
+
+            ScpException deleteStillClosed = assertThrows(ScpException.class,
+                    () -> node.deleteConfirmedOrphan(TEST_NS, id, 8));
+            assertEquals(ErrorCode.INTERNAL, deleteStillClosed.code());
+            assertEquals(3, node.ownerEpochPersistenceRejects(),
+                    "the initial poison, later durable raise, and final delete are observable rejections");
         }
     }
 

@@ -52,7 +52,16 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
     private static final Logger log = LoggerFactory.getLogger(NamespaceLogBackend.class);
 
     /** A destructive orphan-GC verdict bound atomically to the owner epoch that authorized it. */
-    record OrphanConfirmation(boolean fileExists, boolean referencedByNode, long ownerEpoch) {}
+    record OrphanConfirmation(boolean fileExists, boolean referencedByNode, long ownerEpoch) {
+        OrphanConfirmation {
+            if (ownerEpoch <= 0) {
+                throw new IllegalArgumentException("ownerEpoch must be positive");
+            }
+            if (!fileExists && referencedByNode) {
+                throw new IllegalArgumentException("a missing file cannot reference a replica");
+            }
+        }
+    }
 
     /** Reserved namespace holding the metadata-log/snapshot system files; routed to the ZK root. */
     static final StrataNamespace SYSTEM_NAMESPACE = StrataNamespace.of("strata-meta");
@@ -515,8 +524,10 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
      * proves that repository's exact published manifest and znode version are still current. This path is
      * intentionally separate from {@link #repo} / {@link #withRepoReacquiringOnFence}: a stale owner asking
      * to authorize destructive work must fail closed, never reclaim the namespace by allocating a newer
-     * epoch. The open lock keeps the selected handle stable while the repo lock binds manifest validation,
-     * metadata state, verdict, and returned epoch to one repository image.
+     * epoch. The consensus round trip deliberately happens before taking either local lock; the open lock
+     * then keeps the selected handle stable while the repo lock binds manifest validation, metadata state,
+     * verdict, and returned epoch to one repository image. A local publish/replacement during the fetch is
+     * detected by the exact manifest/version and active-repo checks and fails closed.
      */
     private <T> T withAuthoritativeRepo(StrataNamespace namespace, RepoTxn<T> read) throws Exception {
         requireOwnedNamespace(namespace);
@@ -525,12 +536,26 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
             throw new ScpException(ErrorCode.FENCED_EPOCH,
                     "namespace " + namespace + " has no active local authority");
         }
+
+        NamespaceMetadataLogRepository selected = handle.activeRepo();
+        if (selected == null) {
+            throw new ScpException(ErrorCode.FENCED_EPOCH,
+                    "namespace " + namespace + " local authority is " + handle.state,
+                    handle.metadataEpoch);
+        }
+        Optional<MetadataStore.Versioned<Records.NamespaceManifest>> current =
+                root.getNamespaceManifestAuthoritative(namespace);
+        if (current.isEmpty()) {
+            throw new ScpException(ErrorCode.FENCED_EPOCH,
+                    "namespace " + namespace + " has no authoritative manifest");
+        }
+
         handle.openLock.lock();
         try {
             NamespaceMetadataLogRepository active = handle.activeRepo();
-            if (active == null) {
+            if (active == null || active != selected) {
                 throw new ScpException(ErrorCode.FENCED_EPOCH,
-                        "namespace " + namespace + " local authority is " + handle.state,
+                        "namespace " + namespace + " local authority changed during validation",
                         handle.metadataEpoch);
             }
             return runLocked(active, repo -> {
@@ -538,12 +563,6 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
                     throw new ScpException(ErrorCode.INTERNAL,
                             "namespace " + namespace + " metadata state is uncertain after an append failure",
                             repo.poisonCause());
-                }
-                Optional<MetadataStore.Versioned<Records.NamespaceManifest>> current =
-                        root.getNamespaceManifestAuthoritative(namespace);
-                if (current.isEmpty()) {
-                    throw new ScpException(ErrorCode.FENCED_EPOCH,
-                            "namespace " + namespace + " has no authoritative manifest");
                 }
                 MetadataStore.Versioned<Records.NamespaceManifest> authoritative = current.get();
                 if (!repo.matchesPublishedManifest(authoritative) || handle.activeRepo() != repo) {

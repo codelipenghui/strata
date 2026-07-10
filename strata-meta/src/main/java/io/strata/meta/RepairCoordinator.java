@@ -99,6 +99,7 @@ class RepairCoordinator implements AutoCloseable {
     private final AtomicLong commandIds = new AtomicLong(System.currentTimeMillis());
     private final Map<Long, Action> inflight = new ConcurrentHashMap<>();
     private final Set<StrataNamespace> zeroOwnerEpochWarned = ConcurrentHashMap.newKeySet();
+    private final Set<StrataNamespace> authorityRevalidationWarned = ConcurrentHashMap.newKeySet();
     private final Object globalOwnerEpochLock = new Object();
     private final ExecutorService deleteDispatchExecutor = Executors.newSingleThreadExecutor(
             Thread.ofVirtual().name("meta-delete-dispatch-", 0).factory());
@@ -122,6 +123,7 @@ class RepairCoordinator implements AutoCloseable {
     private final AtomicLong eventRepairs = new AtomicLong();
     private final AtomicLong reconcileRepairs = new AtomicLong();
     private final AtomicLong reconcileSkippedFiles = new AtomicLong();
+    private final AtomicLong authorityRevalidationSkips = new AtomicLong();
     private volatile Thread scanThread;
 
     // Deleted-tombstone TTL is now sourced from config.deletedTombstoneTtlMs() (default 600 000 ms).
@@ -170,6 +172,11 @@ class RepairCoordinator implements AutoCloseable {
     /** Files skipped due to per-file errors in the reconcile pass — monotonic. */
     long reconcileSkippedFiles() {
         return reconcileSkippedFiles.get();
+    }
+
+    /** Destructive namespace passes skipped because consensus authority could not be established. */
+    long authorityRevalidationSkips() {
+        return authorityRevalidationSkips.get();
     }
 
     /** Bumps the counter for {@code trigger}'s lane — called once per repair actually issued. */
@@ -346,9 +353,10 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /**
-     * Captures the owner epoch before reading file/verdict state for a namespace pass. Empty means the
-     * namespace-log namespace is not ACTIVE yet, or this controller is not the global leader for a
-     * global/system lane; callers must skip the namespace rather than silently sending owner RPCs at epoch 0.
+     * Captures the locally ACTIVE owner epoch for non-destructive durability-restoring repair. Empty means
+     * the namespace-log namespace is not ACTIVE yet, or this controller is not the global leader for a
+     * global/system lane; callers must skip rather than silently sending owner RPCs at epoch 0. A stale
+     * repair can copy data but cannot delete it, while its eventual metadata CAS remains owner-fenced.
      */
     private OptionalLong readyOwnerEpoch(StrataNamespace namespace) {
         if (usesGlobalOwnerEpoch(namespace)) {
@@ -363,19 +371,10 @@ class RepairCoordinator implements AutoCloseable {
                 return OptionalLong.empty();
             }
         }
-        long epoch;
-        try {
-            epoch = namespaceLeadership.authoritativeOwnerEpoch(namespace);
-        } catch (Exception e) {
-            if (zeroOwnerEpochWarned.add(namespace)) {
-                log.warn("namespace {} owner authority could not be revalidated; skipping destructive "
-                        + "repair/verify/delete passes until validation succeeds: {}", namespace, e.toString());
-            }
-            return OptionalLong.empty();
-        }
+        long epoch = namespaceLeadership.namespaceOwnerEpoch(namespace);
         if (epoch == 0) {
             if (zeroOwnerEpochWarned.add(namespace)) {
-                log.warn("namespace {} has no ACTIVE owner epoch; skipping owner repair/verify/delete until "
+                log.warn("namespace {} has no ACTIVE owner epoch; skipping owner repair until "
                         + "the namespace becomes ACTIVE", namespace);
             }
             return OptionalLong.empty();
@@ -385,9 +384,43 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /**
-     * Returns the epoch stamped on metadata read responses. Global/system lanes use the same
-     * once-per-leadership-term epoch as destructive repair RPCs, but only the global leader may mint it.
-     * Namespace-log orphan deletion uses the stricter manifest-revalidated CONFIRM_ORPHAN path.
+     * Captures a consensus-revalidated epoch for operations that delete physical replicas or remove a
+     * replica from authoritative metadata. Empty additionally means that authority revalidation failed;
+     * callers must skip only that destructive work, while ordinary re-replication may continue using
+     * {@link #readyOwnerEpoch(StrataNamespace)}.
+     */
+    private OptionalLong readyDestructiveOwnerEpoch(StrataNamespace namespace) {
+        if (usesGlobalOwnerEpoch(namespace)) {
+            return readyOwnerEpoch(namespace);
+        }
+        final long epoch;
+        try {
+            epoch = namespaceLeadership.authoritativeOwnerEpoch(namespace);
+        } catch (Exception e) {
+            authorityRevalidationSkips.incrementAndGet();
+            if (authorityRevalidationWarned.add(namespace)) {
+                log.warn("namespace {} owner authority could not be revalidated; skipping destructive "
+                        + "verify/delete work until validation succeeds", namespace, e);
+            }
+            return OptionalLong.empty();
+        }
+        if (epoch == 0) {
+            authorityRevalidationSkips.incrementAndGet();
+            if (authorityRevalidationWarned.add(namespace)) {
+                log.warn("namespace {} authority revalidation returned no ACTIVE epoch; skipping destructive "
+                        + "verify/delete work until validation succeeds", namespace);
+            }
+            return OptionalLong.empty();
+        }
+        authorityRevalidationWarned.remove(namespace);
+        zeroOwnerEpochWarned.remove(namespace);
+        return OptionalLong.of(epoch);
+    }
+
+    /**
+     * Returns the epoch stamped on metadata read responses and root-lane CONFIRM_ORPHAN verdicts
+     * (leader-gated, epoch &gt; 0 enforced by the caller). Namespace-log CONFIRM_ORPHAN takes its epoch
+     * from the stricter manifest-revalidated repository path instead.
      */
     long lookupOwnerEpoch(StrataNamespace namespace) {
         if (usesGlobalOwnerEpoch(namespace)) {
@@ -586,6 +619,9 @@ class RepairCoordinator implements AutoCloseable {
             lock.lock();
             try {
                 List<Repair> repairs = new ArrayList<>();
+                // Resolve the stronger authority only if this namespace actually has deletion work.
+                // The single-element holder caches the result across all DELETING files in this pass.
+                OptionalLong[] destructiveOwnerEpoch = {null};
                 for (FileId fileId : store.listFileIds(ns)) {
                     perFileIsolated(ns, fileId, "scanOnce", () -> {
                         Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
@@ -593,7 +629,12 @@ class RepairCoordinator implements AutoCloseable {
                         Records.FileRecord file = opt.get().value();
 
                         if (file.state() == FileState.DELETING) {
-                            driveDeletion(file, opt.get().version(), ownerEpoch);
+                            if (destructiveOwnerEpoch[0] == null) {
+                                destructiveOwnerEpoch[0] = readyDestructiveOwnerEpoch(ns);
+                            }
+                            if (destructiveOwnerEpoch[0].isPresent()) {
+                                driveDeletion(file, opt.get().version(), destructiveOwnerEpoch[0].getAsLong());
+                            }
                             return;
                         }
                         for (Records.ChunkRecord chunk : file.chunks()) {
@@ -757,6 +798,9 @@ class RepairCoordinator implements AutoCloseable {
             ReentrantLock lock = namespaceReconcileLock(ns);
             lock.lock();
             try {
+                // Missing-replica repair stays available during a root-read outage. Only a DELETING file
+                // triggers the stronger authority check, cached once for this namespace/pass.
+                OptionalLong[] destructiveOwnerEpoch = {null};
                 for (FileId fileId : store.listFileIds(ns)) {
                     perFileIsolated(ns, fileId, "ownerRepairPass", () -> {
                         Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
@@ -767,7 +811,13 @@ class RepairCoordinator implements AutoCloseable {
                         if (file.state() == FileState.DELETING) {
                             // the owner reclaims its own deleted files: the leader's heartbeat command channel
                             // cannot reach a non-leader-owned namespace's chunks, so without this they leak.
-                            ownerDriveDeletion(file, opt.get().version(), nodes, ownerEpoch);
+                            if (destructiveOwnerEpoch[0] == null) {
+                                destructiveOwnerEpoch[0] = readyDestructiveOwnerEpoch(ns);
+                            }
+                            if (destructiveOwnerEpoch[0].isPresent()) {
+                                ownerDriveDeletion(file, opt.get().version(), nodes,
+                                        destructiveOwnerEpoch[0].getAsLong());
+                            }
                             return;
                         }
                         for (Records.ChunkRecord chunk : file.chunks()) {
@@ -836,7 +886,7 @@ class RepairCoordinator implements AutoCloseable {
                     continue;
                 }
             }
-            OptionalLong ownerEpochOpt = readyOwnerEpoch(ns);
+            OptionalLong ownerEpochOpt = readyDestructiveOwnerEpoch(ns);
             if (ownerEpochOpt.isEmpty()) {
                 continue;
             }
@@ -1236,7 +1286,7 @@ class RepairCoordinator implements AutoCloseable {
             if (!namespaceActive(namespace)) {
                 return;
             }
-            OptionalLong ownerEpochOpt = readyOwnerEpoch(namespace);
+            OptionalLong ownerEpochOpt = readyDestructiveOwnerEpoch(namespace);
             if (ownerEpochOpt.isEmpty()) {
                 return;
             }

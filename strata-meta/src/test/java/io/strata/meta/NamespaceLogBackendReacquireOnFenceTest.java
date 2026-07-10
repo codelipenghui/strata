@@ -11,9 +11,14 @@ import io.strata.common.StrataPath;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -39,6 +44,89 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class NamespaceLogBackendReacquireOnFenceTest {
 
     private static final StrataNamespace NS = StrataNamespace.of("tenant-a");
+
+    @Test
+    void orphanConfirmationRejectsUnboundOrContradictoryVerdicts() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new NamespaceLogBackend.OrphanConfirmation(true, false, 0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new NamespaceLogBackend.OrphanConfirmation(false, true, 1));
+    }
+
+    @Test
+    void orphanConfirmationFailsClosedWithoutLocalHandleOrAuthoritativeManifest() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            NamespaceLogBackend owner = new NamespaceLogBackend(root, new TestNamespaceMetadataFileStore(), false);
+
+            ScpException noHandle = assertThrows(ScpException.class,
+                    () -> owner.confirmOrphan(NS, new ChunkId(FileId.of(0), 0), 42));
+            assertEquals(ErrorCode.FENCED_EPOCH, noHandle.code());
+
+            FileId id = owner.createFileOwnerAssigned(template("/manifest-loss", 1));
+            root.curator().delete().forPath("/strata/meta/namespaces/tenant-a/manifest");
+
+            ScpException missingManifest = assertThrows(ScpException.class,
+                    () -> owner.confirmOrphan(NS, new ChunkId(id, 0), 42));
+            assertEquals(ErrorCode.FENCED_EPOCH, missingManifest.code(),
+                    "manifest loss must never become a missing-file deletion verdict");
+        }
+    }
+
+    @Test
+    void orphanConfirmationFailsInternalForPoisonedRepository() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            DurablyFailingFileStore fileStore = new DurablyFailingFileStore();
+            NamespaceLogBackend owner = new NamespaceLogBackend(root, fileStore, false);
+            FileId id = owner.createFileOwnerAssigned(template("/before-poison", 1));
+
+            fileStore.failNextAppendAfterWritingFrame();
+            assertThrows(ScpException.class,
+                    () -> owner.createFileOwnerAssigned(template("/poison", 2)));
+
+            ScpException poisoned = assertThrows(ScpException.class,
+                    () -> owner.confirmOrphan(NS, new ChunkId(id, 0), 42));
+            assertEquals(ErrorCode.INTERNAL, poisoned.code(),
+                    "uncertain applied state must fail closed as INTERNAL");
+        }
+    }
+
+    @Test
+    void authoritativeFetchDoesNotHoldRepositoryMutationLock() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            AtomicBoolean blockAuthoritativeReturn = new AtomicBoolean();
+            CountDownLatch authoritativeRead = new CountDownLatch(1);
+            CountDownLatch releaseAuthoritativeReturn = new CountDownLatch(1);
+            MetadataStore rootView = blockingAuthoritativeRoot(root, blockAuthoritativeReturn,
+                    authoritativeRead, releaseAuthoritativeReturn);
+            NamespaceLogBackend owner = new NamespaceLogBackend(
+                    rootView, new TestNamespaceMetadataFileStore(), false);
+            FileId first = owner.createFileOwnerAssigned(template("/first", 1));
+
+            blockAuthoritativeReturn.set(true);
+            CompletableFuture<NamespaceLogBackend.OrphanConfirmation> confirmation =
+                    CompletableFuture.supplyAsync(() -> {
+                        try {
+                            return owner.confirmOrphan(NS, new ChunkId(first, 0), 42);
+                        } catch (Exception e) {
+                            throw new CompletionException(e);
+                        }
+                    });
+            assertTrue(authoritativeRead.await(2, TimeUnit.SECONDS));
+
+            CompletableFuture<FileId> mutation = CompletableFuture.supplyAsync(() ->
+                    sup(() -> owner.createFileOwnerAssigned(template("/concurrent", 2))));
+            assertEquals(FileId.of(1), mutation.get(2, TimeUnit.SECONDS),
+                    "append must not wait behind the authoritative ZooKeeper round trip");
+
+            releaseAuthoritativeReturn.countDown();
+            NamespaceLogBackend.OrphanConfirmation result = confirmation.get(2, TimeUnit.SECONDS);
+            assertTrue(result.fileExists());
+            assertFalse(result.referencedByNode());
+        }
+    }
 
     @Test
     void staleOwnerCannotAuthorizeOrphanButCurrentOwnerConfirmsReferencedReplica() throws Exception {
@@ -109,6 +197,10 @@ class NamespaceLogBackendReacquireOnFenceTest {
                         "activeSince is published only after the recovery barrier completes");
                 assertEquals(0, owner.loadedNamespaceCount(),
                         "a recovering repo must not be published as a loaded active namespace");
+                ScpException recovering = assertThrows(ScpException.class,
+                        () -> owner.confirmOrphan(NS, new ChunkId(FileId.of(0), 0), 42));
+                assertEquals(ErrorCode.FENCED_EPOCH, recovering.code(),
+                        "a RECOVERING handle must not authorize an orphan verdict");
 
                 blocking.block.countDown();
                 assertEquals(FileId.of(0), create.get(5, TimeUnit.SECONDS));
@@ -387,6 +479,29 @@ class NamespaceLogBackendReacquireOnFenceTest {
     private static Records.FileRecord template(String path, long opId) {
         return new Records.FileRecord(FileId.of(0), NS, StrataPath.of(path),
                 3, 2, true, FileState.OPEN, 100L, List.of(), opId, opId);
+    }
+
+    private static MetadataStore blockingAuthoritativeRoot(
+            ZkMetadataStore delegate,
+            AtomicBoolean block,
+            CountDownLatch authoritativeRead,
+            CountDownLatch release) {
+        return (MetadataStore) Proxy.newProxyInstance(
+                MetadataStore.class.getClassLoader(), new Class<?>[] {MetadataStore.class},
+                (proxy, method, args) -> {
+                    try {
+                        Object result = method.invoke(delegate, args);
+                        if (method.getName().equals("getNamespaceManifestAuthoritative") && block.get()) {
+                            authoritativeRead.countDown();
+                            if (!release.await(5, TimeUnit.SECONDS)) {
+                                throw new IllegalStateException("timed out waiting to release authoritative read");
+                            }
+                        }
+                        return result;
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
     }
 
     /**

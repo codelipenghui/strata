@@ -375,6 +375,11 @@ public final class Controller implements AutoCloseable {
         return repair.reconcileSkippedFiles();
     }
 
+    /** Destructive namespace passes skipped because consensus authority could not be established. */
+    public long authorityRevalidationSkips() {
+        return repair.authorityRevalidationSkips();
+    }
+
     public int aliveNodes() {
         return registry.livenessCounts().alive();
     }
