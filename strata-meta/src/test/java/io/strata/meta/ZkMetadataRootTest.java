@@ -165,6 +165,22 @@ class ZkMetadataRootTest {
     }
 
     @Test
+    void authoritativeFileReadReturnsCurrentRootRecordAndMissingValue() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore store = new ZkMetadataStore(zk.getConnectString())) {
+            StrataNamespace ns = StrataNamespace.of("tenant-a");
+            FileId id = FileId.of(0x51);
+            Records.FileRecord file = new Records.FileRecord(id, "tenant-a", "/authoritative", 3, 2,
+                    false, FileState.SEALED, 1234, List.of(), 9L, 9L);
+            store.createFile(file);
+
+            assertEquals(file, store.getFileAuthoritative(ns, id).orElseThrow().value());
+            assertTrue(store.getFileAuthoritative(ns, FileId.of(0x52)).isEmpty(),
+                    "sync + getData must preserve authoritative missing as an empty result");
+        }
+    }
+
+    @Test
     void deletedTombstoneStaysIndexedForOpIdReuseScanUntilSwept() throws Exception {
         // C2: deleteFile must NOT drop the per-namespace index entry — listFilesIncludingTombstones (the
         // controller's opId-reuse scan) reads that index, so dropping it lets a stale CREATE replay miss the

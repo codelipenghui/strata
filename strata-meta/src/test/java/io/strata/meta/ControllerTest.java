@@ -141,7 +141,25 @@ class ControllerTest {
                 new Messages.LookupFile(StrataNamespace.of("test"), FileId.of(9_999_999)).encode(), null, 5000));
         assertEquals(ErrorCode.FILE_NOT_FOUND, missing.code());
         assertEquals(lookup.ownerEpoch(), missing.detail(),
-                "orphan-GC FILE_NOT_FOUND confirms must carry the global owner epoch too");
+                "legacy LOOKUP_FILE misses keep carrying the global owner epoch detail");
+
+        Messages.ConfirmOrphanResp present = Messages.ConfirmOrphanResp.decode(client.call(
+                Opcode.CONFIRM_ORPHAN,
+                new Messages.ConfirmOrphan(StrataNamespace.of("test"), new ChunkId(accepted.fileId(), 0), 123)
+                        .encode(), null, 5000));
+        assertTrue(present.fileExists());
+        assertEquals(false, present.referencedByNode());
+        assertEquals(lookup.ownerEpoch(), present.ownerEpoch(),
+                "root-backed orphan confirms must carry the current global-leader epoch");
+
+        Messages.ConfirmOrphanResp absent = Messages.ConfirmOrphanResp.decode(client.call(
+                Opcode.CONFIRM_ORPHAN,
+                new Messages.ConfirmOrphan(StrataNamespace.of("test"),
+                        new ChunkId(FileId.of(9_999_999), 0), 123).encode(), null, 5000));
+        assertEquals(false, absent.fileExists(),
+                "missing metadata is an authoritative response value, not a FILE_NOT_FOUND error");
+        assertEquals(false, absent.referencedByNode());
+        assertTrue(absent.ownerEpoch() > 0);
     }
 
     @Test
@@ -231,6 +249,13 @@ class ControllerTest {
             ScpException e = assertThrows(ScpException.class,
                     () -> followerClient.call(Opcode.PING, Messages.okHeader(), null, 5000));
             assertEquals(ErrorCode.NOT_LEADER, e.code());
+
+            ScpException confirm = assertThrows(ScpException.class, () -> followerClient.call(
+                    Opcode.CONFIRM_ORPHAN,
+                    new Messages.ConfirmOrphan(StrataNamespace.of("test"),
+                            new ChunkId(FileId.of(9_999_999), 0), 123).encode(), null, 5000));
+            assertEquals(ErrorCode.NOT_LEADER, confirm.code(),
+                    "a root-backed standby must never issue destructive orphan verdicts");
         }
     }
 

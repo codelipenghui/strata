@@ -363,7 +363,16 @@ class RepairCoordinator implements AutoCloseable {
                 return OptionalLong.empty();
             }
         }
-        long epoch = namespaceLeadership.namespaceOwnerEpoch(namespace);
+        long epoch;
+        try {
+            epoch = namespaceLeadership.authoritativeOwnerEpoch(namespace);
+        } catch (Exception e) {
+            if (zeroOwnerEpochWarned.add(namespace)) {
+                log.warn("namespace {} owner authority could not be revalidated; skipping destructive "
+                        + "repair/verify/delete passes until validation succeeds: {}", namespace, e.toString());
+            }
+            return OptionalLong.empty();
+        }
         if (epoch == 0) {
             if (zeroOwnerEpochWarned.add(namespace)) {
                 log.warn("namespace {} has no ACTIVE owner epoch; skipping owner repair/verify/delete until "
@@ -376,8 +385,9 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /**
-     * Returns the epoch LOOKUP_FILE should stamp for orphan-GC confirms. Global/system lanes use the same
+     * Returns the epoch stamped on metadata read responses. Global/system lanes use the same
      * once-per-leadership-term epoch as destructive repair RPCs, but only the global leader may mint it.
+     * Namespace-log orphan deletion uses the stricter manifest-revalidated CONFIRM_ORPHAN path.
      */
     long lookupOwnerEpoch(StrataNamespace namespace) {
         if (usesGlobalOwnerEpoch(namespace)) {

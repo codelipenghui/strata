@@ -1,5 +1,6 @@
 package io.strata.meta;
 
+import io.strata.common.ChunkId;
 import io.strata.common.FileId;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
@@ -61,6 +62,11 @@ public final class NamespaceLogMetadataStore implements MetadataStore, Namespace
     }
 
     @Override
+    public long authoritativeOwnerEpoch(StrataNamespace namespace) throws Exception {
+        return backend.authoritativeOwnerEpoch(namespace);
+    }
+
+    @Override
     public ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
         return backend.namespaceReconcileLock(namespace);
     }
@@ -83,6 +89,11 @@ public final class NamespaceLogMetadataStore implements MetadataStore, Namespace
      */
     FileId createFileOwnerAssigned(Records.FileRecord template) throws Exception {
         return backend.createFileOwnerAssigned(template);
+    }
+
+    NamespaceLogBackend.OrphanConfirmation confirmOrphan(
+            StrataNamespace namespace, ChunkId chunkId, int nodeId) throws Exception {
+        return backend.confirmOrphan(namespace, chunkId, nodeId);
     }
 
     @Override
@@ -179,6 +190,12 @@ public final class NamespaceLogMetadataStore implements MetadataStore, Namespace
     public Optional<Versioned<Records.NamespaceManifest>> getNamespaceManifest(StrataNamespace namespace)
             throws Exception {
         return backend.root().getNamespaceManifest(namespace);
+    }
+
+    @Override
+    public Optional<Versioned<Records.NamespaceManifest>> getNamespaceManifestAuthoritative(
+            StrataNamespace namespace) throws Exception {
+        return backend.root().getNamespaceManifestAuthoritative(namespace);
     }
 
     @Override

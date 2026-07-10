@@ -40,7 +40,12 @@ public enum Opcode {
     // batches, for the local state of the chunks it expects that node to hold (present/missing/corrupt).
     // Replaces the central inventory push. Owner -> node, so a data-plane opcode (< 0x0100) routed to
     // DataNodeHandlers. Append-only — kept last in the data-plane block.
-    VERIFY_CHUNKS(0x001C);
+    VERIFY_CHUNKS(0x001C),
+    // data-node orphan GC -> metadata owner: a dedicated destructive confirmation lane. 0x020a
+    // was historically assigned to EXEC_REPLICATE, so it remains retired even though that opcode
+    // moved to the data-plane range. An older metadata owner rejects this unknown opcode, which the
+    // caller treats as no verdict so mixed-version orphan GC fails closed.
+    CONFIRM_ORPHAN(0x020B);
 
     public final short code;
 

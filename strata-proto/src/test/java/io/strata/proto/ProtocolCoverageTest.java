@@ -18,6 +18,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.lang.reflect.Method;
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.ReadOnlyBufferException;
 import java.nio.channels.FileChannel;
@@ -25,6 +26,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -190,6 +192,56 @@ class ProtocolCoverageTest {
         IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
                 () -> Messages.LookupFileResp.decode(buffer));
         assertTrue(error.getMessage().contains("ownerEpoch"), "got: " + error.getMessage());
+    }
+
+    @Test
+    void confirmOrphanRejectsAmbiguousOrExtendedWireValues() {
+        StrataNamespace namespace = StrataNamespace.of("test");
+        ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);
+        Messages.ConfirmOrphan request = new Messages.ConfirmOrphan(namespace, chunkId, 7);
+
+        byte[] requestBytes = request.encode();
+        assertThrows(BufferUnderflowException.class, () -> Messages.ConfirmOrphan.decode(
+                ByteBuffer.wrap(Arrays.copyOf(requestBytes, requestBytes.length - 1))));
+        assertThrows(IllegalArgumentException.class, () -> Messages.ConfirmOrphan.decode(
+                ByteBuffer.wrap(Arrays.copyOf(requestBytes, requestBytes.length + 1))));
+
+        assertThrows(NullPointerException.class,
+                () -> new Messages.ConfirmOrphan(null, chunkId, 7));
+        assertThrows(NullPointerException.class,
+                () -> new Messages.ConfirmOrphan(namespace, null, 7));
+        assertThrows(IllegalArgumentException.class,
+                () -> new Messages.ConfirmOrphan(namespace, chunkId, 0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new Messages.ConfirmOrphan(namespace, chunkId, -1));
+        BufWriter zeroNodeId = new BufWriter();
+        zeroNodeId.namespace(namespace).chunkId(chunkId).u32(0).noTags();
+        assertThrows(IllegalArgumentException.class,
+                () -> Messages.ConfirmOrphan.decode(ByteBuffer.wrap(zeroNodeId.toBytes())));
+        assertThrows(IllegalArgumentException.class,
+                () -> new Messages.ConfirmOrphanResp(false, true, 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> new Messages.ConfirmOrphanResp(true, false, 0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new Messages.ConfirmOrphanResp(true, false, -1));
+
+        assertConfirmOrphanRespDecodeFails(new byte[] {2, 0, 0, 0, 0, 0, 0, 0, 0, 1});
+        assertConfirmOrphanRespDecodeFails(new byte[] {1, 2, 0, 0, 0, 0, 0, 0, 0, 1});
+        assertConfirmOrphanRespDecodeFails(new byte[] {0, 1, 0, 0, 0, 0, 0, 0, 0, 1});
+        assertConfirmOrphanRespDecodeFails(new byte[] {1, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+        assertConfirmOrphanRespDecodeFails(new byte[] {1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0});
+        assertThrows(BufferUnderflowException.class,
+                () -> Messages.ConfirmOrphanResp.decode(ByteBuffer.wrap(new byte[] {1, 0})));
+
+        BufWriter extended = new BufWriter();
+        extended.u8(1).u8(0).u64(7);
+        TaggedFields.of(Map.of(99, new byte[] {4, 5})).writeTo(extended);
+        assertEquals(new Messages.ConfirmOrphanResp(true, false, 7),
+                Messages.ConfirmOrphanResp.decode(ByteBuffer.wrap(extended.toBytes())));
+
+        BufWriter malformedTags = new BufWriter();
+        malformedTags.u8(1).u8(0).u64(7).varint(1).varint(99).varint(2).u8(4);
+        assertConfirmOrphanRespDecodeFails(malformedTags.toBytes());
     }
 
     @Test
@@ -442,6 +494,8 @@ class ProtocolCoverageTest {
         assertTrue(commandError.getMessage().contains("command type"));
 
         assertEquals(Opcode.PING, Opcode.fromCode(Opcode.PING.code));
+        assertNull(Opcode.fromCode((short) 0x020A));
+        assertEquals(Opcode.CONFIRM_ORPHAN, Opcode.fromCode((short) 0x020B));
         assertNull(Opcode.fromCode((short) 0x7FFF));
     }
 
@@ -792,6 +846,11 @@ class ProtocolCoverageTest {
         IOException e = assertThrows(IOException.class,
                 () -> FrameIO.read(new DataInputStream(new ByteArrayInputStream(wire))));
         assertTrue(e.getMessage().contains(messageFragment), "got: " + e.getMessage());
+    }
+
+    private static void assertConfirmOrphanRespDecodeFails(byte[] wire) {
+        assertThrows(IllegalArgumentException.class,
+                () -> Messages.ConfirmOrphanResp.decode(ByteBuffer.wrap(wire)));
     }
 
     private static byte[] frameWithLength(int frameLen, byte[] body) throws IOException {

@@ -3,7 +3,6 @@ package io.strata.node;
 import io.strata.common.ChunkId;
 import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
-import io.strata.common.FileId;
 import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
@@ -90,6 +89,7 @@ final class OrphanGc implements AutoCloseable {
     private final int maxCumulativeDeletesPerNode;
     private final long breakerWindowMs;
     private final OwnerEpochAcceptor ownerEpochAcceptor;
+    private final ConfirmedDelete confirmedDelete;
     private final Set<StrataNamespace> openNamespaceBreakers = ConcurrentHashMap.newKeySet();
     private final Map<StrataNamespace, RollingCounter> namespaceConfirmedWindows = new ConcurrentHashMap<>();
     private final Map<StrataNamespace, AtomicLong> cumulativeDeletesByNamespace = new ConcurrentHashMap<>();
@@ -116,6 +116,12 @@ final class OrphanGc implements AutoCloseable {
         void accept(StrataNamespace namespace, long ownerEpoch);
     }
 
+    @FunctionalInterface
+    interface ConfirmedDelete {
+        ErrorCode delete(StrataNamespace namespace, ChunkId chunkId, long confirmedOwnerEpoch)
+                throws InterruptedException;
+    }
+
     OrphanGc(ChunkStore store, ChunkDeleteService deletes, int nodeId, List<String> controllerEndpoints,
              long graceMs, long scanIntervalMs, long startupGraceMs, int confirmTimeoutMs,
              int maxConfirmedDeletesPerNamespacePerPass, int maxConfirmedDeletePercentPerNamespacePerPass,
@@ -133,6 +139,19 @@ final class OrphanGc implements AutoCloseable {
              int maxConfirmedDeletesPerNamespacePerPass, int maxConfirmedDeletePercentPerNamespacePerPass,
              int maxConfirmedDeletesPerNodePass, int maxCumulativeDeletesPerNamespace,
              int maxCumulativeDeletesPerNode, OwnerEpochAcceptor ownerEpochAcceptor) {
+        this(store, deletes, nodeId, controllerEndpoints, graceMs, scanIntervalMs, startupGraceMs,
+                confirmTimeoutMs, maxConfirmedDeletesPerNamespacePerPass,
+                maxConfirmedDeletePercentPerNamespacePerPass, maxConfirmedDeletesPerNodePass,
+                maxCumulativeDeletesPerNamespace, maxCumulativeDeletesPerNode, ownerEpochAcceptor,
+                (namespace, chunkId, confirmedOwnerEpoch) -> deletes.delete(namespace, chunkId));
+    }
+
+    OrphanGc(ChunkStore store, ChunkDeleteService deletes, int nodeId, List<String> controllerEndpoints,
+             long graceMs, long scanIntervalMs, long startupGraceMs, int confirmTimeoutMs,
+             int maxConfirmedDeletesPerNamespacePerPass, int maxConfirmedDeletePercentPerNamespacePerPass,
+             int maxConfirmedDeletesPerNodePass, int maxCumulativeDeletesPerNamespace,
+             int maxCumulativeDeletesPerNode, OwnerEpochAcceptor ownerEpochAcceptor,
+             ConfirmedDelete confirmedDelete) {
         this.store = Objects.requireNonNull(store, "store");
         this.deletes = Objects.requireNonNull(deletes, "deletes");
         this.nodeId = nodeId;
@@ -147,6 +166,7 @@ final class OrphanGc implements AutoCloseable {
         this.maxCumulativeDeletesPerNamespace = maxCumulativeDeletesPerNamespace;
         this.maxCumulativeDeletesPerNode = maxCumulativeDeletesPerNode;
         this.ownerEpochAcceptor = Objects.requireNonNull(ownerEpochAcceptor, "ownerEpochAcceptor");
+        this.confirmedDelete = Objects.requireNonNull(confirmedDelete, "confirmedDelete");
         this.breakerWindowMs = Math.max(DEFAULT_BREAKER_WINDOW_MS, scanIntervalMs);
     }
 
@@ -206,7 +226,7 @@ final class OrphanGc implements AutoCloseable {
                 haltedByOpenNamespaceBreaker.merge(s.namespace(), 1, Integer::sum);
                 continue;
             }
-            switch (corroboratedVerdict(s.namespace(), s.chunkId())) {
+            switch (corroboratedVerdict(s.namespace(), s.chunkId()).verdict()) {
                 case ORPHAN -> confirmed.computeIfAbsent(s.namespace(), ignored -> new ArrayList<>()).add(s.chunkId());
                 case KEEP, UNREACHABLE, FILE_NOT_FOUND -> { /* fail-safe: never delete an unconfirmed suspect */ }
             }
@@ -281,8 +301,9 @@ final class OrphanGc implements AutoCloseable {
                     return;
                 }
                 remainingDeleteCandidates--;
-                if (corroboratedVerdict(e.getKey(), chunkId) == Verdict.ORPHAN
-                        && deleteConfirmed(e.getKey(), chunkId)) {
+                Confirmation finalConfirmation = corroboratedVerdict(e.getKey(), chunkId);
+                if (finalConfirmation.verdict() == Verdict.ORPHAN
+                        && deleteConfirmed(e.getKey(), chunkId, finalConfirmation.ownerEpoch())) {
                     recordCumulativeDelete(e.getKey());
                 }
             }
@@ -486,8 +507,20 @@ final class OrphanGc implements AutoCloseable {
         return breakerHaltedChunks;
     }
 
-    private boolean deleteConfirmed(StrataNamespace namespace, ChunkId chunkId) throws InterruptedException {
-        ErrorCode result = deletes.delete(namespace, chunkId);
+    private boolean deleteConfirmed(StrataNamespace namespace, ChunkId chunkId, long confirmedOwnerEpoch)
+            throws InterruptedException {
+        ErrorCode result;
+        try {
+            result = confirmedDelete.delete(namespace, chunkId, confirmedOwnerEpoch);
+        } catch (ScpException e) {
+            if (e.code() == ErrorCode.FENCED_EPOCH) {
+                log.info("orphan GC: final delete fenced for chunk {} in ns={} confirmedOwnerEpoch={} "
+                                + "requiredOwnerEpoch={}; keeping chunk",
+                        chunkId, namespace, confirmedOwnerEpoch, e.detail());
+                return false;
+            }
+            throw e;
+        }
         if (result == ErrorCode.OK) {
             log.info("orphan GC: deleted unreferenced sealed chunk {} in ns={}", chunkId, namespace);
             fileNotFoundPending.remove(new NsChunkId(namespace, chunkId));
@@ -505,6 +538,18 @@ final class OrphanGc implements AutoCloseable {
     }
 
     private enum Verdict { ORPHAN, FILE_NOT_FOUND, KEEP, UNREACHABLE }
+
+    private record Confirmation(Verdict verdict, long ownerEpoch) {
+        private Confirmation {
+            if (verdict != Verdict.UNREACHABLE && ownerEpoch <= 0) {
+                throw new IllegalArgumentException("definitive confirmation requires a positive owner epoch");
+            }
+        }
+
+        private static Confirmation unreachable() {
+            return new Confirmation(Verdict.UNREACHABLE, 0);
+        }
+    }
 
     private static final class RollingCounter {
         private long windowStartedAtMs = Long.MIN_VALUE;
@@ -528,21 +573,22 @@ final class OrphanGc implements AutoCloseable {
      * a definitive answer from the authoritative owner deletes; an unreachable owner (or only NOT_LEADER
      * redirects, a rejected owner epoch, or any other error) keeps the chunk.
      */
-    private Verdict corroboratedVerdict(StrataNamespace ns, ChunkId chunkId) {
-        Verdict verdict = confirm(ns, chunkId);
+    private Confirmation corroboratedVerdict(StrataNamespace ns, ChunkId chunkId) {
+        Confirmation confirmation = confirm(ns, chunkId);
+        Verdict verdict = confirmation.verdict();
         NsChunkId key = new NsChunkId(ns, chunkId);
         if (verdict == Verdict.FILE_NOT_FOUND) {
-            return fileNotFoundPending.add(key) ? Verdict.FILE_NOT_FOUND : Verdict.ORPHAN;
+            Verdict corroborated = fileNotFoundPending.add(key) ? Verdict.FILE_NOT_FOUND : Verdict.ORPHAN;
+            return new Confirmation(corroborated, confirmation.ownerEpoch());
         }
         if (verdict == Verdict.KEEP || verdict == Verdict.ORPHAN) {
             fileNotFoundPending.remove(key);
         }
-        return verdict;
+        return confirmation;
     }
 
-    private Verdict confirm(StrataNamespace ns, ChunkId chunkId) {
-        FileId fileId = chunkId.fileId();
-        byte[] req = new Messages.LookupFile(ns, fileId).encode();
+    private Confirmation confirm(StrataNamespace ns, ChunkId chunkId) {
+        byte[] req = new Messages.ConfirmOrphan(ns, chunkId, nodeId).encode();
         Exception lastFailure = null;
         for (String ep : controllerEndpoints) {
             Endpoint endpoint;
@@ -554,33 +600,21 @@ final class OrphanGc implements AutoCloseable {
             }
             try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(),
                     ScpClient.KIND_TOOL, "orphan-confirm")) {
-                ByteBuffer resp = client.call(Opcode.LOOKUP_FILE, req, null, confirmTimeoutMs);
-                Messages.LookupFileResp r = Messages.LookupFileResp.decode(resp);
+                ByteBuffer resp = client.call(Opcode.CONFIRM_ORPHAN, req, null, confirmTimeoutMs);
+                Messages.ConfirmOrphanResp r = Messages.ConfirmOrphanResp.decode(resp);
                 Exception ownerEpochFailure = confirmOwnerEpochFailure(ns, r.ownerEpoch(), ep);
                 if (ownerEpochFailure != null) {
                     lastFailure = ownerEpochFailure;
                     continue;
                 }
-                for (Messages.ChunkInfo ci : r.chunks()) {
-                    if (ci.chunkId().equals(chunkId)) {
-                        for (Messages.Replica rep : ci.replicas()) {
-                            if (rep.nodeId() == nodeId) {
-                                return Verdict.KEEP; // the owner still lists us — not an orphan
-                            }
-                        }
-                        return Verdict.ORPHAN; // chunk exists but the descriptor no longer lists us
-                    }
+                if (!r.fileExists()) {
+                    return new Confirmation(Verdict.FILE_NOT_FOUND, r.ownerEpoch());
                 }
-                return Verdict.ORPHAN; // file exists but has no such chunk — orphan
+                Verdict verdict = r.referencedByNode()
+                        ? Verdict.KEEP // the authoritative owner still lists this node
+                        : Verdict.ORPHAN; // file/chunk absent or this node is no longer a replica
+                return new Confirmation(verdict, r.ownerEpoch());
             } catch (ScpException se) {
-                if (se.code() == ErrorCode.FILE_NOT_FOUND) {
-                    Exception ownerEpochFailure = confirmOwnerEpochFailure(ns, se.detail(), ep);
-                    if (ownerEpochFailure != null) {
-                        lastFailure = ownerEpochFailure;
-                        continue;
-                    }
-                    return Verdict.FILE_NOT_FOUND; // needs a later pass to corroborate metadata loss
-                }
                 if (se.code() == ErrorCode.NOT_LEADER) {
                     lastFailure = se;
                     continue; // this controller is not the owner — try the next endpoint
@@ -592,7 +626,7 @@ final class OrphanGc implements AutoCloseable {
             }
         }
         maybeWarnUnreachableConfirm(ns, chunkId, lastFailure);
-        return Verdict.UNREACHABLE; // no accepted owner answer gave a definitive verdict — keep (fail-safe)
+        return Confirmation.unreachable(); // no accepted owner answer gave a definitive verdict — keep (fail-safe)
     }
 
     /**

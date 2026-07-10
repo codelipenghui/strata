@@ -26,6 +26,16 @@ interface NamespaceLeadership {
      */
     long namespaceOwnerEpoch(StrataNamespace namespace);
 
+    /**
+     * Revalidates this local owner against the consensus manifest and returns its epoch only when the
+     * local repository is still the exactly-published authority. Destructive passes fail closed when this
+     * throws or returns zero. Non-sharded test/backends have no separate manifest and inherit the active
+     * epoch view.
+     */
+    default long authoritativeOwnerEpoch(StrataNamespace namespace) throws Exception {
+        return namespaceOwnerEpoch(namespace);
+    }
+
     /** Reconcile lock for a locally active user namespace; callers must not request one for inactive namespaces. */
     ReentrantLock namespaceReconcileLock(StrataNamespace namespace);
 }

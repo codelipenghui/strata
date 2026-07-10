@@ -195,6 +195,17 @@ public final class ZkMetadataStore implements MetadataStore {
         }
     }
 
+    /**
+     * Consensus-backed file read for destructive root-plane decisions. The sync barrier forces this
+     * ZooKeeper session to observe all writes committed before the barrier; any sync/read failure propagates
+     * so callers fail closed. Package-private because ordinary metadata reads do not require this extra RTT.
+     */
+    Optional<Versioned<Records.FileRecord>> getFileAuthoritative(StrataNamespace namespace, FileId id)
+            throws Exception {
+        curator.sync().forPath(FILES + "/" + id);
+        return getFile(namespace, id);
+    }
+
     @Override
     public Optional<FileId> resolvePath(StrataNamespace namespace, StrataPath path) throws Exception {
         Optional<PathMarker> marker = readPathMarker(namespace, path);
@@ -686,6 +697,23 @@ public final class ZkMetadataStore implements MetadataStore {
         try {
             Stat stat = new Stat();
             byte[] data = curator.getData().storingStatIn(stat).forPath(manifestPath(namespace));
+            return Optional.of(new Versioned<>(Records.NamespaceManifest.decode(data), stat.getVersion()));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    @Override
+    public Optional<Versioned<Records.NamespaceManifest>> getNamespaceManifestAuthoritative(
+            StrataNamespace namespace) throws Exception {
+        String path = manifestPath(namespace);
+        // Force this Curator/ZooKeeper client to catch up with the server's committed state before the read.
+        // Any sync/read failure is deliberately propagated: callers use this only to authorize destructive
+        // work, so an uncertain authority view must fail closed.
+        curator.sync().forPath(path);
+        try {
+            Stat stat = new Stat();
+            byte[] data = curator.getData().storingStatIn(stat).forPath(path);
             return Optional.of(new Versioned<>(Records.NamespaceManifest.decode(data), stat.getVersion()));
         } catch (KeeperException.NoNodeException e) {
             return Optional.empty();

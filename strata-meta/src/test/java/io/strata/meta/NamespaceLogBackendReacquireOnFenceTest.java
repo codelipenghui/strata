@@ -1,5 +1,7 @@
 package io.strata.meta;
 
+import io.strata.common.ChunkId;
+import io.strata.common.ChunkState;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.FileState;
@@ -37,6 +39,52 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class NamespaceLogBackendReacquireOnFenceTest {
 
     private static final StrataNamespace NS = StrataNamespace.of("tenant-a");
+
+    @Test
+    void staleOwnerCannotAuthorizeOrphanButCurrentOwnerConfirmsReferencedReplica() throws Exception {
+        try (TestingServer zk = new TestingServer(true);
+             ZkMetadataStore root = new ZkMetadataStore(zk.getConnectString())) {
+            TestNamespaceMetadataFileStore fileStore = new TestNamespaceMetadataFileStore();
+            NamespaceLogBackend ownerA = new NamespaceLogBackend(root, fileStore, false);
+
+            // A opens the namespace and publishes epoch A, but knows only this placeholder file.
+            assertEquals(FileId.of(0), ownerA.createFileOwnerAssigned(template("/a-placeholder", 100)));
+            long epochA = ownerA.namespaceOwnerEpoch(NS);
+
+            // B takes over, recovers A's placeholder, and then creates a B-only file/chunk. This is the
+            // exact dangerous shape: stale A would report FILE_NOT_FOUND for id1 if its view were trusted.
+            NamespaceLogBackend ownerB = new NamespaceLogBackend(root, fileStore, false);
+            FileId fileId = ownerB.createFileOwnerAssigned(template("/b-only", 101));
+            assertEquals(FileId.of(1), fileId);
+            MetadataStore.Versioned<Records.FileRecord> created = ownerB.getFile(NS, fileId).orElseThrow();
+            Records.ChunkRecord chunk = new Records.ChunkRecord(
+                    0, ChunkState.SEALED, 128, 0xCAFE, 0, List.of(42));
+            assertTrue(ownerB.updateFile(created.value().withChunks(List.of(chunk)), created.version()));
+            long epochB = ownerB.namespaceOwnerEpoch(NS);
+            assertTrue(epochB > epochA);
+
+            ScpException stale = assertThrows(ScpException.class,
+                    () -> ownerA.confirmOrphan(NS, new ChunkId(fileId, 0), 42));
+            assertEquals(ErrorCode.FENCED_EPOCH, stale.code(),
+                    "stale A must fail closed, not return a destructive verdict");
+            ScpException staleRepairEpoch = assertThrows(ScpException.class,
+                    () -> ownerA.authoritativeOwnerEpoch(NS));
+            assertEquals(ErrorCode.FENCED_EPOCH, staleRepairEpoch.code(),
+                    "repair/delete passes must fail the same authoritative manifest gate");
+            assertEquals(epochA, ownerA.namespaceOwnerEpoch(NS),
+                    "orphan confirmation must never auto-reacquire a newer epoch");
+            assertEquals(0, ownerA.metrics().stats().get(NS.value())[NamespaceLogMetrics.REACQUISITIONS],
+                    "stale destructive confirms must not reclaim namespace ownership");
+
+            NamespaceLogBackend.OrphanConfirmation current =
+                    ownerB.confirmOrphan(NS, new ChunkId(fileId, 0), 42);
+            assertTrue(current.fileExists());
+            assertTrue(current.referencedByNode(),
+                    "current B must keep the chunk because its descriptor still references node 42");
+            assertEquals(epochB, current.ownerEpoch(),
+                    "verdict and authority epoch come from the same locked repository image");
+        }
+    }
 
     @Test
     void namespaceIsRecoveringUntilOpenBarrierPublishesActive() throws Exception {

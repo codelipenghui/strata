@@ -30,6 +30,8 @@ import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -138,6 +140,155 @@ class DataNodeWireTest {
         IOException e = assertThrows(IOException.class,
                 () -> new DataNode(DataNodeConfig.standalone(dir).withNodeId(43)));
         assertTrue(e.getMessage().contains("does not match this volume's recorded node id"));
+    }
+
+    @Test
+    void ownerEpochFloorSurvivesRestartOnTheSameVolume() throws Exception {
+        DataNodeConfig config = DataNodeConfig.standalone(dir);
+        try (DataNode node = new DataNode(config)) {
+            node.acceptAuthoritativeOwnerEpoch(TEST_NS, 8);
+        }
+
+        try (DataNode restarted = new DataNode(config)) {
+            ScpException stale = assertThrows(ScpException.class,
+                    () -> restarted.acceptOwnerEpoch(TEST_NS, 7));
+            assertEquals(ErrorCode.FENCED_EPOCH, stale.code());
+            assertEquals(8, stale.detail(),
+                    "the volume-bound floor must fence a pre-restart owner response");
+            restarted.acceptOwnerEpoch(TEST_NS, 8);
+        }
+    }
+
+    @Test
+    void finalOrphanDeleteRejectsAConfirmationFencedAfterItReturned() throws Exception {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
+             ScpClient broker = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "broker")) {
+            broker.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
+                    1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
+            broker.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
+                    ByteBuffer.wrap("data".getBytes()), 5000);
+            broker.call(Opcode.SEAL_CHUNK,
+                    new Messages.SealChunk(id, 1, 4, TEST_NS).encode(), null, 5000);
+
+            node.acceptAuthoritativeOwnerEpoch(TEST_NS, 8); // final confirm has returned at E8
+            node.acceptOwnerEpoch(TEST_NS, 9);              // a newer owner reaches the node before unlink
+
+            ScpException fenced = assertThrows(ScpException.class,
+                    () -> node.deleteConfirmedOrphan(TEST_NS, id, 8));
+            assertEquals(ErrorCode.FENCED_EPOCH, fenced.code());
+            assertEquals(9, fenced.detail());
+            assertTrue(node.store().contains(TEST_NS, id),
+                    "the final epoch recheck must keep a chunk once a newer owner has been observed");
+        }
+    }
+
+    @Test
+    void ownerEpochLocksArePerNamespaceAcrossFinalPhysicalDelete() throws Exception {
+        StrataNamespace namespaceA = StrataNamespace.of("namespace-a");
+        StrataNamespace namespaceB = StrataNamespace.of("namespace-b");
+        CountDownLatch deleteEntered = new CountDownLatch(1);
+        CountDownLatch releaseDelete = new CountDownLatch(1);
+        CountDownLatch sameNamespaceAttempted = new CountDownLatch(1);
+
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
+            node.acceptAuthoritativeOwnerEpoch(namespaceA, 8);
+            node.acceptAuthoritativeOwnerEpoch(namespaceB, 3);
+
+            CompletableFuture<ErrorCode> deleteFuture = new CompletableFuture<>();
+            Thread.ofVirtual().start(() -> {
+                try {
+                    deleteFuture.complete(node.deleteConfirmedOrphan(namespaceA, id, 8, () -> {
+                        deleteEntered.countDown();
+                        if (!releaseDelete.await(5, TimeUnit.SECONDS)) {
+                            throw new AssertionError("timed out waiting to release physical delete");
+                        }
+                        return ErrorCode.OK;
+                    }));
+                } catch (Throwable t) {
+                    deleteFuture.completeExceptionally(t);
+                }
+            });
+            assertTrue(deleteEntered.await(5, TimeUnit.SECONDS), "delete must enter while holding namespace A");
+
+            CompletableFuture<Void> sameNamespaceAdvance = new CompletableFuture<>();
+            Thread.ofVirtual().start(() -> {
+                sameNamespaceAttempted.countDown();
+                try {
+                    node.acceptOwnerEpoch(namespaceA, 9);
+                    sameNamespaceAdvance.complete(null);
+                } catch (Throwable t) {
+                    sameNamespaceAdvance.completeExceptionally(t);
+                }
+            });
+            assertTrue(sameNamespaceAttempted.await(5, TimeUnit.SECONDS));
+
+            CompletableFuture<Void> otherNamespaceAdvance = new CompletableFuture<>();
+            Thread.ofVirtual().start(() -> {
+                try {
+                    node.acceptAuthoritativeOwnerEpoch(namespaceB, 4);
+                    otherNamespaceAdvance.complete(null);
+                } catch (Throwable t) {
+                    otherNamespaceAdvance.completeExceptionally(t);
+                }
+            });
+
+            try {
+                otherNamespaceAdvance.get(5, TimeUnit.SECONDS);
+                assertFalse(sameNamespaceAdvance.isDone(),
+                        "namespace A's higher epoch must wait until its physical delete exits");
+            } finally {
+                releaseDelete.countDown();
+            }
+
+            assertEquals(ErrorCode.OK, deleteFuture.get(5, TimeUnit.SECONDS));
+            sameNamespaceAdvance.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void ordinaryOwnerEpochObservationDoesNotBecomeAPermanentUnauthenticatedFloor() throws Exception {
+        DataNodeConfig config = DataNodeConfig.standalone(dir);
+        try (DataNode node = new DataNode(config)) {
+            node.acceptOwnerEpoch(TEST_NS, 8);
+        }
+
+        try (DataNode restarted = new DataNode(config)) {
+            restarted.acceptOwnerEpoch(TEST_NS, 7);
+        }
+    }
+
+    @Test
+    void corruptOwnerEpochFloorFileFailsStartupClosed() throws Exception {
+        Files.writeString(dir.resolve("owner-epochs.properties"), "test=not-a-number\n");
+
+        IOException failure = assertThrows(IOException.class,
+                () -> new DataNode(DataNodeConfig.standalone(dir)));
+        assertTrue(failure.getMessage().contains("owner epoch floor"));
+    }
+
+    @Test
+    void duplicateOwnerEpochFloorEntryFailsStartupClosed() throws Exception {
+        Files.writeString(dir.resolve("owner-epochs.properties"), "test=8\ntest=7\n");
+
+        IOException failure = assertThrows(IOException.class,
+                () -> new DataNode(DataNodeConfig.standalone(dir)));
+        assertTrue(failure.getMessage().contains("owner epoch floor"));
+    }
+
+    @Test
+    void authoritativeOwnerEpochPersistenceFailureFailsClosed() throws Exception {
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
+            Files.createDirectory(dir.resolve("owner-epochs.properties.tmp"));
+
+            ScpException failure = assertThrows(ScpException.class,
+                    () -> node.acceptAuthoritativeOwnerEpoch(TEST_NS, 8));
+            assertEquals(ErrorCode.INTERNAL, failure.code());
+
+            ScpException stillClosed = assertThrows(ScpException.class,
+                    () -> node.acceptOwnerEpoch(StrataNamespace.of("other"), 7));
+            assertEquals(ErrorCode.INTERNAL, stillClosed.code(),
+                    "an uncertain persistence failure must poison every namespace fail-closed");
+        }
     }
 
     @Test

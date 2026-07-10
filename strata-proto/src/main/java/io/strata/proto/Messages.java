@@ -54,6 +54,13 @@ public final class Messages {
         }
     }
 
+    private static void requireFullyConsumed(ByteBuffer b, String messageName) {
+        if (b.hasRemaining()) {
+            throw new IllegalArgumentException(
+                    "trailing bytes in " + messageName + ": " + b.remaining());
+        }
+    }
+
     private static byte[] i32Field(int value) {
         BufWriter w = new BufWriter(Integer.BYTES);
         w.i32(value);
@@ -2062,6 +2069,70 @@ public final class Messages {
             TaggedFields tags = TaggedFields.readFrom(b);
             return new LookupFileResp(namespace, path, writePolicy, state, cs,
                     readU64Tag(tags, TAG_OWNER_EPOCH, "ownerEpoch"));
+        }
+    }
+
+    /**
+     * Data node -> metadata owner: ask whether a locally held chunk is safe to treat as an orphan.
+     * This is intentionally distinct from {@link LookupFile}: destructive confirmation must bind the
+     * answer to both the querying node and a positive, consensus-backed owner epoch.
+     *
+     * <p>The required fields have a fixed layout. The standard trailing tagged-field block remains
+     * available for future extensions, while malformed tags and bytes after that block are rejected.</p>
+     */
+    public record ConfirmOrphan(StrataNamespace namespace, ChunkId chunkId, int nodeId) {
+        public ConfirmOrphan {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+            chunkId = Objects.requireNonNull(chunkId, "chunkId");
+            if (nodeId <= 0) {
+                throw new IllegalArgumentException("nodeId must be positive: " + nodeId);
+            }
+        }
+
+        public byte[] encode() {
+            BufWriter w = new BufWriter();
+            w.namespace(namespace).chunkId(chunkId).u32(nodeId).noTags();
+            return w.toBytes();
+        }
+
+        public static ConfirmOrphan decode(ByteBuffer b) {
+            ConfirmOrphan m = new ConfirmOrphan(
+                    StrataNamespace.readFrom(b), ChunkId.readFrom(b), b.getInt());
+            TaggedFields.readFrom(b);
+            requireFullyConsumed(b, "ConfirmOrphan");
+            return m;
+        }
+    }
+
+    /**
+     * Metadata owner -> data node orphan confirmation. A response can only authorize decisions from a
+     * positive owner epoch. A missing file cannot simultaneously reference the queried chunk on the
+     * node, which would make the destructive answer internally inconsistent.
+     */
+    public record ConfirmOrphanResp(boolean fileExists, boolean referencedByNode, long ownerEpoch) {
+        public ConfirmOrphanResp {
+            if (!fileExists && referencedByNode) {
+                throw new IllegalArgumentException(
+                        "referencedByNode requires fileExists");
+            }
+            if (ownerEpoch <= 0) {
+                throw new IllegalArgumentException("ownerEpoch must be positive: " + ownerEpoch);
+            }
+        }
+
+        public byte[] encode() {
+            BufWriter w = new BufWriter();
+            Resp.writeOk(w);
+            w.u8(fileExists ? 1 : 0).u8(referencedByNode ? 1 : 0).u64(ownerEpoch).noTags();
+            return w.toBytes();
+        }
+
+        public static ConfirmOrphanResp decode(ByteBuffer b) {
+            ConfirmOrphanResp m = new ConfirmOrphanResp(
+                    Varint.readBoolean(b), Varint.readBoolean(b), b.getLong());
+            TaggedFields.readFrom(b);
+            requireFullyConsumed(b, "ConfirmOrphanResp");
+            return m;
         }
     }
 

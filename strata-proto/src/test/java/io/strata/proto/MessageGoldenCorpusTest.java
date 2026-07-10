@@ -62,7 +62,8 @@ class MessageGoldenCorpusTest {
                 "LOOKUP_PATH=0x0208",
                 "ALLOCATE_WRITER_EPOCH=0x0209",
                 "EXEC_REPLICATE=0x001b",
-                "VERIFY_CHUNKS=0x001c"),
+                "VERIFY_CHUNKS=0x001c",
+                "CONFIRM_ORPHAN=0x020b"),
                 Arrays.stream(Opcode.values())
                         .map(op -> op.name() + "=0x" + String.format("%04x", op.code & 0xFFFF))
                         .toList());
@@ -157,12 +158,13 @@ class MessageGoldenCorpusTest {
                         // EXEC_REPLICATE moved from 0x020a (control-plane range) to 0x001b (data-plane)
                         // to fix combined-node routing: opcodes >= 0x0100 route to Controller, but
                         // EXEC_REPLICATE is handled by DataNodeHandlers (Bug B fix). VERIFY_CHUNKS (0x001c)
-                        // appended (§9.2); INVENTORY_REPORT (0x0103) removed (§9.2) — count back to 0x19.
+                        // appended (§9.2); INVENTORY_REPORT (0x0103) removed (§9.2). CONFIRM_ORPHAN
+                        // uses 0x020b (historical 0x020a remains retired) — count is now 0x1a.
                         "0000000101020304050607080000002a11112222333344445555666677778888"
-                                + "040000000000000040000000190001000100100001001100010012000100130001"
+                                + "0400000000000000400000001a0001000100100001001100010012000100130001"
                                 + "001400010015000100160001001700010018000100190001001a000101010001"
                                 + "0102000102010001020200010203000102040001020500010206000102070001"
-                                + "0208000102090001001b0001001c000100"),
+                                + "0208000102090001001b0001001c0001020b000100"),
                 request("openChunk",
                         new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L, NS),
                         () -> new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L, NS).encode(),
@@ -477,6 +479,16 @@ class MessageGoldenCorpusTest {
                                 Messages.WritePolicy.DEFAULT, (byte) 0, List.of(), 7).encode(),
                         Messages.LookupFileResp::decode,
                         "00000474657374022f6600000003000000020000000100080000000000000007"),
+                request("confirmOrphan",
+                        new Messages.ConfirmOrphan(NS, CHUNK_ID, 7),
+                        () -> new Messages.ConfirmOrphan(NS, CHUNK_ID, 7).encode(),
+                        Messages.ConfirmOrphan::decode,
+                        "04746573741111111122223333000000030000000700"),
+                response("confirmOrphanResp",
+                        new Messages.ConfirmOrphanResp(true, true, 43),
+                        () -> new Messages.ConfirmOrphanResp(true, true, 43).encode(),
+                        Messages.ConfirmOrphanResp::decode,
+                        "00000101000000000000002b00"),
                 request("deleteFiles",
                         new Messages.DeleteFiles(NS, List.of(FILE_ID)),
                         () -> new Messages.DeleteFiles(NS, List.of(FILE_ID)).encode(),

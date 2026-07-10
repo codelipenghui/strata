@@ -869,6 +869,60 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void scanOnceSkipsDestructiveWorkWhenOwnerAuthorityRevalidationFails() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        Registered node = register(registry, 8841, "delete-authority-failed");
+        FileId fileId = fileId(0x51551);
+        store.createFile(file(fileId, FileState.DELETING,
+                List.of(sealed(0, 4096, 0xCAFE, List.of(node.nodeId())))));
+        long settledActiveSince = System.currentTimeMillis() - 120_000;
+        NamespaceLeadership failedAuthority = new NamespaceLeadership() {
+            private final ReentrantLock lock = new ReentrantLock();
+
+            @Override
+            public NamespaceLeaderState leaderState(StrataNamespace namespace) {
+                return NamespaceLeaderState.ACTIVE;
+            }
+
+            @Override
+            public boolean isNamespaceActive(StrataNamespace namespace) {
+                return true;
+            }
+
+            @Override
+            public long namespaceActiveSinceMs(StrataNamespace namespace) {
+                return settledActiveSince;
+            }
+
+            @Override
+            public long namespaceOwnerEpoch(StrataNamespace namespace) {
+                return 7;
+            }
+
+            @Override
+            public long authoritativeOwnerEpoch(StrataNamespace namespace) {
+                throw new ScpException(ErrorCode.INTERNAL, "authoritative manifest read failed");
+            }
+
+            @Override
+            public ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
+                return lock;
+            }
+        };
+        RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                () -> true, () -> true, ns -> true, failedAuthority);
+
+        owner.scanOnce();
+
+        assertTrue(heartbeat(registry, owner, node, List.of()).commands().isEmpty(),
+                "manifest revalidation failure must suppress destructive delete commands");
+        assertEquals(0, store.getFileCalls(fileId),
+                "a failed authority gate must skip the metadata/destructive pass before reading files");
+        assertTrue(store.files.containsKey(fileId));
+    }
+
+    @Test
     void verifyVerdictDeleteUsesOwnerEpochCapturedBeforeFileRead() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
