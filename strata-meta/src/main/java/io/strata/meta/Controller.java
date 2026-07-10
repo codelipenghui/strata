@@ -924,7 +924,8 @@ public final class Controller implements AutoCloseable {
 
     private Optional<MetadataStore.Versioned<Records.FileRecord>> getFile(
             StrataNamespace namespace, FileId fileId) throws Exception {
-        return store.getFile(namespace, fileId);
+        return store.getFile(namespace, fileId)
+                .filter(versioned -> versioned.value().namespace().equals(namespace));
     }
 
     private Messages.LookupFileResp lookup(StrataNamespace namespace, FileId fileId) throws Exception {
