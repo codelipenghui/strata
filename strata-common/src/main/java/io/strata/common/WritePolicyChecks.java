@@ -9,7 +9,7 @@ public final class WritePolicyChecks {
             throw new IllegalArgumentException("replicationFactor must be positive: " + replicationFactor);
         }
         if (ackQuorum <= 0 || ackQuorum > replicationFactor) {
-            throw new IllegalArgumentException("ackQuorum must be in 1..replicationFactor: " + ackQuorum);
+            throw new IllegalArgumentException("ackQuorum must be in 1.." + replicationFactor + ": " + ackQuorum);
         }
         if (ackQuorum <= replicationFactor / 2) {
             throw new IllegalArgumentException("ackQuorum must intersect any other quorum: "
