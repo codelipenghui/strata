@@ -86,9 +86,9 @@ class RepairCoordinator implements AutoCloseable {
     private final NodeRegistry registry;
     private final ControllerConfig config;
     private final BooleanSupplier isLeader;
-    // Whether this node owns every namespace (non-sharded / single-endpoint). When false (sharded), an
-    // chunk encountered during reconciliation whose file this node cannot see may belong to another meta
-    // node, so it must NOT be deleted as an orphan (tech design §14 single-writer safety / data-loss guard).
+    // Whether this node owns every namespace (non-sharded / single-endpoint). In sharded mode this scopes
+    // cluster-leader targeted repair to namespaces this node owns (plus the system namespace); all-owner
+    // deployments skip the separate non-controller owner-repair pass (tech design §4.4 and §7.2).
     private final BooleanSupplier ownsAll;
     // Whether this node is the controller owner of a namespace — scopes the non-controller owner repair pass.
     private final Predicate<StrataNamespace> ownsNamespace;
@@ -577,8 +577,8 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /**
-     * Reaps DELETED-file tombstones at the slow reconcile cadence (tech design §4.5: the namespace owner owns
-     * its namespace's metadata lifecycle, tombstone GC included). The leader sweeps the shared system-root
+     * Reaps DELETED-file tombstones at the slow reconcile cadence (tech design §4.2; see §17.20 for the
+     * namespace-log publication-fence gap). The leader sweeps the shared system-root
      * tombstones globally — and its own loaded repos — via {@link MetadataStore#sweepDeletedFiles}; a
      * non-leader owner reaps only the namespaces it owns ({@link MetadataStore#sweepOwnedNamespaceTombstones}),
      * because their per-namespace metadata-log tombstones live in repos the leader does not hold. Gating the
@@ -766,8 +766,8 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /**
-     * Non-controller owner repair (tech design §4.5 and §9.2): a namespace owner that does not hold the global latch
-     * cannot use the controller's heartbeat command channel, so it heals its own namespaces'
+     * Non-controller owner repair (tech design §4.4 and §7.2): a namespace owner that does not hold the
+     * global latch cannot use the controller's heartbeat command channel, so it heals its own namespaces'
      * under-replicated sealed chunks directly. It reads the controller's authoritative DEAD set from the
      * consensus root, picks a replacement target from the shared live-node snapshot, tells that target
      * to pull the chunk via EXEC_REPLICATE, then writes the replica change itself (single writer for the

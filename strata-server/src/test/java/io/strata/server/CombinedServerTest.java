@@ -7,6 +7,7 @@ import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
+import io.strata.meta.Controller;
 import io.strata.meta.ControllerConfig;
 import io.strata.meta.ZkMetadataStore;
 import io.strata.node.DataNodeConfig;
@@ -16,19 +17,30 @@ import io.strata.proto.Opcode;
 import io.strata.proto.ScpClient;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * The {@code combined} run mode hosts a {@link io.strata.meta.Controller} and a
@@ -37,6 +49,53 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * can create files through that same meta.
  */
 class CombinedServerTest {
+
+    @TempDir
+    Path tempDir;
+
+    @Test
+    void combinedModeRejectsAnEphemeralListenPortBeforeStartingResources() {
+        ControllerConfig controllerConfig = ControllerConfig.forTests("unused.invalid:1");
+        DataNodeConfig nodeConfig = DataNodeConfig
+                .withMetadata(Path.of("unused"), List.of("127.0.0.1:1"), "host-0")
+                .withNodeId(1);
+
+        IllegalArgumentException rejected = assertThrows(IllegalArgumentException.class,
+                () -> StrataServer.startCombined(controllerConfig, nodeConfig));
+
+        assertTrue(rejected.getMessage().contains("fixed node listenPort"));
+    }
+
+    @Test
+    void failedCombinedStartReleasesItsListenerAndControllerLeadership() throws Exception {
+        try (TestingServer zk = new TestingServer(true)) {
+            int port = freePort();
+            ControllerConfig controllerConfig = ControllerConfig.forTests(zk.getConnectString());
+            DataNodeConfig nodeConfig = DataNodeConfig
+                    .withMetadata(tempDir.resolve("failed-combined-start"),
+                            List.of("127.0.0.1:" + port), "host-0")
+                    .withListenPort(port)
+                    .withNodeId(1);
+            IOException startupFailure = new IOException("injected startup failure");
+
+            IOException thrown = assertThrows(IOException.class, () -> StrataServer.startCombined(
+                    controllerConfig, nodeConfig, (registrar, ready) -> {
+                        awaitCondition(ready, "the partially-started combined node to become ready");
+                        throw startupFailure;
+                    }));
+
+            assertSame(startupFailure, thrown, "cleanup must not shadow the original startup failure");
+            try (ServerSocket rebound = new ServerSocket()) {
+                rebound.setReuseAddress(true);
+                rebound.bind(new InetSocketAddress("127.0.0.1", port));
+            }
+
+            try (Controller successor = new Controller(ControllerConfig.forTests(zk.getConnectString()))) {
+                awaitCondition(successor::isLeader,
+                        "a successor controller to acquire leadership after failed combined startup");
+            }
+        }
+    }
 
     @Test
     void combinedNodeServesMetadataAndRegistersItsDataNode() throws Exception {
@@ -121,6 +180,32 @@ class CombinedServerTest {
     private static int freePort() throws IOException {
         try (ServerSocket s = new ServerSocket(0)) {
             return s.getLocalPort();
+        }
+    }
+
+    private static void awaitCondition(BooleanSupplier condition, String description) throws Exception {
+        CompletableFuture<Void> satisfied = new CompletableFuture<>();
+        ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread thread = new Thread(r, "combined-test-condition");
+            thread.setDaemon(true);
+            return thread;
+        });
+        ScheduledFuture<?> polling = poller.scheduleWithFixedDelay(() -> {
+            try {
+                if (condition.getAsBoolean()) {
+                    satisfied.complete(null);
+                }
+            } catch (Throwable t) {
+                satisfied.completeExceptionally(t);
+            }
+        }, 0, 10, TimeUnit.MILLISECONDS);
+        try {
+            satisfied.get(10, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            throw new AssertionError("timed out waiting for " + description, e);
+        } finally {
+            polling.cancel(true);
+            poller.shutdownNow();
         }
     }
 

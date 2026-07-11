@@ -3,8 +3,10 @@ package io.strata.meta;
 import org.apache.curator.test.TestingServer;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Proxy;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
@@ -49,6 +51,20 @@ class NamespaceLogMetadataStoreConformanceTest extends MetadataStoreConformanceT
         }
     }
 
+    @Test
+    void backendCloseStillClosesItsRootWhenFileStoreCloseFails() {
+        AtomicInteger rootCloseCount = new AtomicInteger();
+        MetadataStore root = closeCountingStore(rootCloseCount);
+        CloseCountingFileStore files = new CloseCountingFileStore(true);
+        NamespaceLogBackend backend = new NamespaceLogBackend(root, files, true);
+
+        assertDoesNotThrow(backend::close,
+                "a file-store close failure must not prevent the owned root from closing");
+        assertDoesNotThrow(backend::close, "backend close remains idempotent after the failure path");
+        assertEquals(1, files.closeCount.get(), "the file store is closed exactly once");
+        assertEquals(1, rootCloseCount.get(), "the owned root is closed exactly once");
+    }
+
     @Override
     protected Backend startBackend() throws Exception {
         TestingServer zk = new TestingServer(true);
@@ -70,12 +86,37 @@ class NamespaceLogMetadataStoreConformanceTest extends MetadataStoreConformanceT
         };
     }
 
+    private static MetadataStore closeCountingStore(AtomicInteger closeCount) {
+        return (MetadataStore) Proxy.newProxyInstance(
+                MetadataStore.class.getClassLoader(),
+                new Class<?>[]{MetadataStore.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("close")) {
+                        closeCount.incrementAndGet();
+                        return null;
+                    }
+                    throw new AssertionError("unexpected root operation during backend close: " + method.getName());
+                });
+    }
+
     private static final class CloseCountingFileStore extends TestNamespaceMetadataFileStore {
         private final AtomicInteger closeCount = new AtomicInteger();
+        private final boolean failOnClose;
+
+        private CloseCountingFileStore() {
+            this(false);
+        }
+
+        private CloseCountingFileStore(boolean failOnClose) {
+            this.failOnClose = failOnClose;
+        }
 
         @Override
         public void close() {
             closeCount.incrementAndGet();
+            if (failOnClose) {
+                throw new IllegalStateException("injected file-store close failure");
+            }
         }
     }
 }

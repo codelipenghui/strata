@@ -86,6 +86,7 @@ liveness-aware reassignment remain open (§4.5, §17.17).
 Held directly in ZooKeeper under `/strata`, guarded by version-CAS:
 
 - **Node registry** — `NodeRecord { nodeId, incarnationId, endpoints, topology{zone,rack,host}, capacityBytes, state: REGISTERED|DRAINING|DEAD }`; registration, leases, and incarnation fencing. `SUSPECT` is a derived in-memory lease state inside dead-grace, not a persisted `NodeRecord` value.
+- **Shared cluster-liveness snapshot** — the elected cluster controller periodically publishes `ClusterLiveNodes { publishedAtMs, entries{NodeRecord, freeBytes} }` to the root. A sharded namespace owner, which has no data-node heartbeat channel of its own, merges that snapshot into its local placement and repair view; direct in-memory observations win, and snapshots older than one lease plus two dead-grace windows are ignored. This is placement/repair input, not persisted namespace-owner membership or automatic owner failover.
 - **Namespace ownership schema** — assignment records and generations exist in the SPI/root codec, but current v0 serving uses statically configured controller endpoints and does not persist or fail over those assignments automatically (§4.5, §17.17).
 - **Per-namespace manifest** — the version-CAS pointer to a namespace's current metadata snapshot + open log (the linearizable barrier for metadata-log compaction, modeled in `tla/MetadataManifestCAS.tla`).
 - **Metadata epochs and ID allocation**, and the **descriptors of the metadata-log / snapshot system files** (which are themselves replicated Strata files — §4.2).

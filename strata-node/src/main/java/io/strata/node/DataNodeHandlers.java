@@ -201,7 +201,8 @@ final class DataNodeHandlers implements ScpServer.Handler {
 
             case EXEC_REPLICATE -> {
                 // A namespace owner that is not the cluster controller drives repair directly: pull the
-                // chunk from a live source via the proven control-loop path (tech design §9.2). Synchronous —
+                // chunk from a live source via the proven control-loop path (tech design §7.2; wire contract
+                // §10.3). Synchronous —
                 // the response confirms the pull+import completed.
                 if (!(Messages.Command.readRequest(req.headerReadBuffer()) instanceof Messages.ReplicateCmd cmd)) {
                     throw new ScpException(ErrorCode.PRECONDITION_FAILED, "EXEC_REPLICATE requires a ReplicateCmd");

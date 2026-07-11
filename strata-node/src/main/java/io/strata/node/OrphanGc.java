@@ -134,21 +134,21 @@ final class OrphanGc implements AutoCloseable {
              int maxConfirmedDeletesPerNamespacePerPass, int maxConfirmedDeletePercentPerNamespacePerPass,
              int maxConfirmedDeletesPerNodePass, int maxCumulativeDeletesPerNamespace,
              int maxCumulativeDeletesPerNode, OwnerEpochAcceptor ownerEpochAcceptor) {
-        this(store, deletes, nodeId, controllerEndpoints, graceMs, scanIntervalMs, startupGraceMs,
+        this(Objects.requireNonNull(store, "store"), nodeId, controllerEndpoints,
+                graceMs, scanIntervalMs, startupGraceMs,
                 confirmTimeoutMs, maxConfirmedDeletesPerNamespacePerPass,
                 maxConfirmedDeletePercentPerNamespacePerPass, maxConfirmedDeletesPerNodePass,
                 maxCumulativeDeletesPerNamespace, maxCumulativeDeletesPerNode, ownerEpochAcceptor,
-                (namespace, chunkId, confirmedOwnerEpoch) -> deletes.delete(namespace, chunkId));
+                confirmedDeleteUsing(deletes));
     }
 
-    OrphanGc(ChunkStore store, ChunkDeleteService deletes, int nodeId, List<String> controllerEndpoints,
+    OrphanGc(ChunkStore store, int nodeId, List<String> controllerEndpoints,
              long graceMs, long scanIntervalMs, long startupGraceMs, int confirmTimeoutMs,
              int maxConfirmedDeletesPerNamespacePerPass, int maxConfirmedDeletePercentPerNamespacePerPass,
              int maxConfirmedDeletesPerNodePass, int maxCumulativeDeletesPerNamespace,
              int maxCumulativeDeletesPerNode, OwnerEpochAcceptor ownerEpochAcceptor,
              ConfirmedDelete confirmedDelete) {
         this.store = Objects.requireNonNull(store, "store");
-        Objects.requireNonNull(deletes, "deletes");
         this.nodeId = nodeId;
         this.controllerEndpoints = List.copyOf(controllerEndpoints);
         this.graceMs = graceMs;
@@ -163,6 +163,11 @@ final class OrphanGc implements AutoCloseable {
         this.ownerEpochAcceptor = Objects.requireNonNull(ownerEpochAcceptor, "ownerEpochAcceptor");
         this.confirmedDelete = Objects.requireNonNull(confirmedDelete, "confirmedDelete");
         this.breakerWindowMs = Math.max(DEFAULT_BREAKER_WINDOW_MS, scanIntervalMs);
+    }
+
+    private static ConfirmedDelete confirmedDeleteUsing(ChunkDeleteService deletes) {
+        ChunkDeleteService checkedDeletes = Objects.requireNonNull(deletes, "deletes");
+        return (namespace, chunkId, confirmedOwnerEpoch) -> checkedDeletes.delete(namespace, chunkId);
     }
 
     void start() {

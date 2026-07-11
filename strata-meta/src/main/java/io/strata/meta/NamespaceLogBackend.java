@@ -29,7 +29,8 @@ import java.util.function.Predicate;
  * metadata log whose bytes are stored by the {@link NamespaceMetadataFileStore} and whose physical
  * descriptors live in the consensus root.
  *
- * <p><b>System namespace routing (tech design §4.5).</b> The metadata-log files themselves are stored as Strata
+ * <p><b>System namespace routing (tech design §4.1–§4.2; recursion constraint §4.5).</b> The
+ * metadata-log files themselves are stored as Strata
  * files in the reserved {@link #SYSTEM_NAMESPACE}; their own descriptors live directly in the ZK root
  * store (otherwise the log would recurse into itself). So every op for the system namespace is routed
  * straight to {@code root}, and — crucially — <b>without taking any namespace lock</b>: a user-namespace
