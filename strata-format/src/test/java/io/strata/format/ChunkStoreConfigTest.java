@@ -13,6 +13,11 @@ class ChunkStoreConfigTest {
         assertEquals(10_000L, c.groupCommitDrainTimeoutMs());
         assertEquals(1_000_000L, c.groupCommitMinAccumulationNanos());
         assertEquals(50_000_000L, c.groupCommitMaxAccumulationNanos());
+        assertEquals(false, c.sealFsync());
+        assertEquals(500L, c.backgroundFlushIntervalMs());
+        assertEquals(4L << 20, c.backgroundFlushThresholdBytes());
+        assertEquals(1_000L, c.slowAppendLogMs());
+        assertEquals(500L, c.slowMutationLogMs());
         assertEquals(ChunkLimits.DEFAULT_MAX_OPEN_CHUNK_LEDGER_ENTRIES, c.maxOpenChunkLedgerEntries());
     }
 

@@ -4,7 +4,7 @@ import io.strata.common.FileId;
 import io.strata.common.StrataNamespace;
 
 /**
- * The physical byte-store boundary for one namespace's metadata system files (design §8). The metadata
+ * The physical byte-store boundary for one namespace's metadata system files (tech design §4.2). The metadata
  * log and snapshots are stored as named blobs; the runtime backend ({@code StrataSystemMetadataFileStore})
  * writes them as replicated Strata chunks with their descriptors in the consensus root, while tests use
  * an in-memory double. The repository depends only on this interface, so it is decoupled from the

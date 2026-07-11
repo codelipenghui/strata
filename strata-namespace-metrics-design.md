@@ -1,19 +1,22 @@
 # Strata — per-namespace observability & a namespace dashboard
 
-Design doc · 2026-06-29 · branch `penghui/great-maxwell-0bc82d`
+Design doc · 2026-06-29 · **Implemented** (source-aligned 2026-07-11)
+
+This document preserves the design rationale. Section 2 is the pre-change baseline. Source-level registry
+tests verify selected metric registration and counter behavior; there is no end-to-end Prometheus scrape
+test. `DashboardMetricsGuardTest` currently guards selected removed names and leader-view queries, not every
+emitted metric/dashboard reference.
 
 ## 1. Goal
 
-Make namespace the primary axis of Strata's observability. Today every throughput/latency
-metric is either fleet-global or per-process; the namespace is only visible in two gauges
-(`strata_controller_namespace_files`, `strata_controller_namespace_log_bytes`). We want to answer,
-per namespace:
+Make namespace the primary axis of Strata's observability. The implemented surface answers, per namespace:
 
 - **Throughput** — client write/read bytes & ops.
 - **Latency** — client data-op latency and controller request latency.
 - **Controller request rate & latency** — by opcode.
 - **Namespace-log activity** — write-log, read-log (replay), compaction, recovery, reacquisition.
-- **Ownership** — which controller currently owns the namespace, and *when ownership switched*.
+- **Ownership approximation** — which controller currently exposes a loaded namespace repository, plus
+  cold-open/restart counters; automatic owner handoff and authoritative switch timing are not implemented.
 
 …plus a dedicated Grafana dashboard that keys every panel on a `$namespace` selector, and the
 minimal migration of the existing dashboards so nothing regresses.
@@ -22,7 +25,7 @@ This reverses the historical "namespace stays control-plane" stance for *metrics
 is already in the data plane (`ChunkStore` receives `m.namespace()` on every op; storage is
 `chunks/<ns>/…`), so per-namespace data-plane counters are now natural, not a layering violation.
 
-## 2. Current state (verified)
+## 2. Pre-change baseline (verified before implementation)
 
 Instrumentation lives in `strata-server/ServerMetrics.java` as periodic gauges over in-memory state
 plus monotonic function-counters — no Micrometer in the data path (`strata-format`/`-proto`/`-common`
@@ -52,8 +55,8 @@ dashboards dir is auto-discovered; no `dashboards.yml` edit.
 
 Micrometer appends `_total` to counters and `_seconds_{bucket,count,sum}` to timers at exposition, so
 **code** names omit those suffixes. New per-namespace counters join the existing
-`strata_controller_namespace_*` family. Per project policy (never ships to prod): **clean breaks, no
-back-compat aliases** — the global `strata_controller_log_*` counters are renamed/replaced, not kept.
+`strata_controller_namespace_*` family. The implementation made a clean metric-name break: the global
+`strata_controller_log_*` counters were renamed/replaced rather than retained as aliases.
 
 ### 3.2 Request latency & rate by namespace — *unify, don't split*
 
@@ -94,58 +97,60 @@ before any async (APPEND group-commit) wait, in order, on that thread. So:
 
 ### 3.3 Data throughput by namespace (data plane)
 
-`ChunkStore` (`strata-format`) gains `ConcurrentHashMap<StrataNamespace, IoCounters>` where
-`IoCounters` = `{appendOps, appendBytes, readOps, readBytes}` (`LongAdder`s, lock-free). Incremented in
-`appendAsync(namespace, …)` and `readRegion(namespace, …)` — both already receive the namespace.
-Exposed as `Map<StrataNamespace, long[]> namespaceIoStats()` (via `DataNode`). The current global
-`appendOps()/appendBytes()/readOps()/readBytes()` accessors and their global function-counters are
-**removed**; the fleet view becomes `sum without(namespace)(…)`.
+`ChunkStore` (`strata-format`) uses `ConcurrentHashMap<String, LongAdder[]>`, with each four-element
+array holding `{appendOps, appendBytes, readOps, readBytes}`. It is incremented in
+`appendAsync(namespace, …)` and `readRegion(namespace, …)`. `namespaceIoStats()` exposes a
+`Map<String, long[]>`; `ioNamespaces()` and `ioValue(namespace,index)` support allocation-free lazy
+Micrometer registration. The original global `AtomicLong` counters/accessors remain as internal
+aggregates, but the exported throughput meters are per namespace and the current fleet panels collapse all
+labels with `sum(…)`.
 
 New series (same names + `namespace`): `strata_data_node_append_ops_total{namespace}`,
 `…_append_bytes_total{namespace}`, `…_read_ops_total{namespace}`, `…_read_bytes_total{namespace}`.
 
 ### 3.4 Namespace-log metrics by namespace
 
-`NamespaceLogMetrics` becomes per-namespace keyed: `ConcurrentHashMap<StrataNamespace, Counters>`,
-still held on `NamespaceLogBackend` (so counters survive a repository being rebuilt on
-failover/restart — the existing invariant). Every `record*` gains a `StrataNamespace` arg; callers
-already know it:
+`NamespaceLogMetrics` is keyed by `ConcurrentHashMap<String, LongAdder[]>`, using a documented fixed
+counter-index order. It remains held on `NamespaceLogBackend`, so counters survive an in-process
+repository rebuild or reacquisition; a JVM/process restart creates a fresh metrics object. Every
+`record*` accepts the namespace already known by its caller:
 
 | method | call site (has namespace) |
 |---|---|
-| `recordAppend(ns, bytes)` | `NamespaceMetadataLogRepository:131` |
-| `recordCompaction(ns)` | `NamespaceMetadataLogRepository:201` |
-| `recordRecovery(ns)` | `NamespaceMetadataLogRepository:67` (open/replay) |
-| `recordLogRead(ns, records, bytes)` **(new)** | replay loop in `NamespaceMetadataLogRepository.open` / `NamespaceMetadataRecovery` — counts segment records/bytes replayed = read-log throughput |
-| `recordReacquire(ns)` | `NamespaceLogBackend:352` (fence-driven re-acquire only) |
-| `recordOwnerAcquired(ns)` **(new)** | inside the `repos.computeIfAbsent` lambda on the **cold-acquisition** path in `NamespaceLogBackend.repo()` — NOT the `reacquire()` path (see §3.5) |
+| `recordAppend(ns, bytes)` | durable append in `NamespaceMetadataLogRepository` |
+| `recordCompaction(ns)` | successful repository compaction |
+| `recordRecovery(ns)` | repository open/replay |
+| `recordLogRead(ns, records, bytes)` | recovery replay; counts segment records/bytes replayed |
+| `recordReacquire(ns)` | fence-driven re-acquire only |
+| `recordOwnerAcquired(ns)` | cold repository creation, not the explicit `reacquire()` path (see §3.5) |
 
 New series (label `namespace`, exposed `_total`): `strata_controller_namespace_log_append_records`,
 `…_append_bytes`, `…_read_records`, `…_read_bytes`, `…_compactions`, `…_recoveries`,
-`…_reacquisitions`. These **replace** the global `strata_controller_log_*`. `strata_controller_log_reacquisitions`
+`…_reacquisitions`, and `…_snapshot_fallbacks`. These **replace** the global `strata_controller_log_*`. `strata_controller_log_reacquisitions`
 had no panel anywhere — it gets a home on the new dashboard as an ownership-churn signal.
 
 ### 3.5 Namespace owner & switch timing
 
-Two complementary signals, both emitted **only by the current owner** (a controller has a live
-repository in `repos` only for namespaces it owns; `namespaceStats().keySet()` = owned set):
+Two complementary signals have different lifecycles:
 
 1. **Info gauge** `strata_controller_namespace_owner{namespace,owner}` = `1`, `owner =
    ownership.localEndpoint()`. Emitted via a MultiGauge in the existing 10s `registerPerNamespace`
-   refresh (re-registered each tick, like the files/bytes gauges). Exactly one series per namespace at
-   steady state → a Grafana **state-timeline** shows the owner band and visibly flips on handoff (a
-   brief 0/2-owner window during handoff is itself informative).
-2. **Change counter** `strata_controller_namespace_owner_changes_total{namespace}` — incremented by
-   `recordOwnerAcquired(ns)` inside the `computeIfAbsent` lambda on the **cold-acquisition** path of
-   `NamespaceLogBackend.repo()`: it runs exactly once when this node first opens a repository for a
-   namespace it had none for (a takeover/restart). The fence-driven `reacquire()` path (same node
-   re-opening under a fresh epoch) is *not* counted here — that is what `…_reacquisitions_total`
-   already tracks — so this counter approximates genuine ownership handoffs, not in-place churn. The
-   **info gauge (#1) is the authoritative switch signal**; this counter drives a "switches" graph and
-   dashboard annotations. Sum across the fleet ≈ total handoffs.
+   refresh (re-registered each tick, like the files/bytes gauges). It identifies the configured owner
+   of a loaded repository; a future handoff implementation can make its state timeline a switch signal.
+2. **Cold-open counter** `strata_controller_namespace_owner_changes_total{namespace}` — registered lazily
+   and retained for the process lifetime, so it remains exposed with a frozen value if ownership later leaves
+   this process. It is incremented
+   when this process first opens a repository for a namespace it did not already hold. Process restart
+   and initial load increment it too, so despite the historical metric name it is only an approximation
+   for ownership handoffs. The explicit fence-driven `reacquire()` path is not counted here; that is
+   tracked by `…_reacquisitions_total`.
 
-`$namespace` for the dashboard sources from `label_values(strata_controller_namespace_files, namespace)`
-— stable today, so the selector is populated even before the new counters ship.
+`$namespace` for the dashboard sources from
+`label_values(strata_scp_requests_total{namespace!="-"}, namespace)`. This works with both metadata backends
+after a namespace-scoped request has been observed. It is not an authoritative namespace inventory: after a
+fresh process restart the selector is empty until traffic arrives. The namespace-log-only
+`strata_controller_namespace_files` gauge cannot serve as a backend-independent selector because the current
+ZooKeeper backend returns no `namespaceStats()` rows.
 
 ### 3.6 Cardinality
 
@@ -165,16 +170,16 @@ returns — correct counter semantics, cardinality bounded by namespaces ever ow
   thread through both sync and async observe calls.
 
 **`strata-format`**
-- `ChunkStore` — per-namespace `IoCounters` map; increment in `appendAsync`/`readRegion`; add
-  `namespaceIoStats()`; remove global io accessors.
+- `ChunkStore` — per-namespace `String -> LongAdder[4]` map; increment in `appendAsync`/`readRegion`;
+  expose snapshot, namespace-set, and indexed-value accessors. Global aggregate accessors remain internal.
 
 **`strata-node`**
-- `DataNode` — expose `namespaceIoStats()`; drop global io accessors.
+- `DataNode` — expose `ioNamespaces()` and indexed `ioValue()` for lazy meter registration.
 - `DataNodeHandlers` — `RequestContext.setNamespace(m.namespace().value())` after each decode.
 
 **`strata-meta`**
-- `NamespaceLogMetrics` — per-namespace keyed; `record*(ns, …)`; new `recordLogRead`,
-  `recordOwnerAcquired`; snapshot accessor + `namespaces()`.
+- `NamespaceLogMetrics` — `String -> LongAdder[9]`; `record*(ns, …)`, snapshot, namespace-set, and
+  indexed-value accessors.
 - `NamespaceMetadataLogRepository` / `NamespaceLogBackend` / `NamespaceMetadataRecovery` — pass `ns` to
   `record*`; add owner-acquired increment in `repo()`; add replay-read counting.
 - `Controller` — `requireNamespaceOwner` sets `RequestContext`; new `namespaceLogStats()` and
@@ -195,17 +200,17 @@ returns — correct counter semantics, cardinality bounded by namespaces ever ow
 ### 5.1 New `strata-namespace.json` (uid `strata-namespace`, tag `strata`)
 
 Skeleton cloned from `strata-controller.json` (closest template). Template var `namespace`
-(`label_values(strata_controller_namespace_files, namespace)`, multi+includeAll, matched
+(`label_values(strata_scp_requests_total{namespace!="-"}, namespace)`, multi+includeAll, matched
 `namespace=~"$namespace"`). Rows:
 
 1. **Ownership** — namespace→owner table (`strata_controller_namespace_owner`), owner-over-time
    state-timeline, owner-change rate (`rate(strata_controller_namespace_owner_changes_total[…])`),
-   namespaces-loaded per controller. Owner-change counter also feeds dashboard **annotations**.
+   namespaces-loaded per controller.
 2. **Throughput** — write/read bytes (`Bps`) & ops (`ops`) per namespace from
    `strata_data_node_{append,read}_{bytes,ops}_total{namespace=~"$namespace"}`, `sum by (namespace)`,
    stacked.
 3. **Latency** — client data latency
-   (`histogram_quantile(0.99, sum by (le)(rate(strata_scp_request_duration_seconds_bucket{namespace=~"$namespace",opcode=~"APPEND|READ"}[…])))`)
+   (`histogram_quantile(0.99, sum by (le,namespace)(rate(strata_scp_request_duration_seconds_bucket{namespace=~"$namespace",opcode=~"APPEND|READ"}[…])))`)
    and controller request latency (opcode set CREATE_FILE|LOOKUP_*|SEAL_*|CREATE_CHUNK|…) p50/p95/p99.
 4. **Controller requests** — rate by opcode and error rate
    (`status="error"`) for `$namespace`, from `strata_scp_requests_total`.
@@ -216,36 +221,35 @@ Skeleton cloned from `strata-controller.json` (closest template). Template var `
 Conventions per the audit: `w4 h4` stat banner, `w12 h8` timeseries pairs, legend
 `["last","max","mean"]`, tooltip multi/desc, units `Bps`/`ops`/`bytes`/`s`/`short`.
 
-### 5.2 Existing-dashboard migration (exact)
+### 5.2 Existing-dashboard migration (source-aligned)
 
 `strata-cluster.json`
 - *Metadata ops/s* → `sum(rate(strata_controller_namespace_log_append_records_total[$__rate_interval]))`
-- *Cluster write vs read throughput* (both series) → `sum without(namespace)(rate(strata_data_node_{append,read}_bytes_total[$__rate_interval]))`
+- *Cluster write vs read throughput* (both series) → `sum(rate(strata_data_node_{append,read}_bytes_total[$__rate_interval]))`
 - *Request rate by opcode*, *p99 latency by opcode* — **unchanged** (group by opcode).
 
 `strata-controller.json`
-- *Metadata mutation rate* → `sum without(namespace)(rate(strata_controller_namespace_log_append_records_total{instance=~"$instance"}[…]))`
+- *Metadata mutation rate* → `sum(rate(strata_controller_namespace_log_append_records_total{instance=~"$instance"}[…]))`
 - *Metadata-log write throughput* → `…namespace_log_append_bytes_total…`
-- *Compaction & recovery rate* (2 series) → `…namespace_log_compactions_total…`, `…namespace_log_recoveries_total…`, each `sum without(namespace)`.
+- *Compaction & recovery rate* (2 series) → `…namespace_log_compactions_total…`, `…namespace_log_recoveries_total…`, each aggregated with `sum(...)`.
 
 `strata-node.json`
-- *Write throughput*, *Write vs read throughput* (2), *Write & read ops/s* (2) → `sum without(namespace)(rate(strata_data_node_{append,read}_{bytes,ops}_total{instance=~"$node"}[…]))`
+- *Write throughput*, *Write vs read throughput* (2), *Write & read ops/s* (2) → `sum(rate(strata_data_node_{append,read}_{bytes,ops}_total{instance=~"$node"}[…]))`
 - *p99 latency by opcode*, *Error rate by opcode* — **unchanged** (group by opcode).
 
 `strata-zookeeper.json` — none (ZK-native metrics only).
 
 ## 6. Testing
 
-- **Unit** — `NamespaceLogMetrics` per-namespace accumulation & survival across repo rebuild;
-  `RequestContext` set/take threading (including the async path); owner gauge emits only on the owner;
-  `ServerMetrics` scrape contains the new `namespace`-tagged series and no longer contains the removed
-  global names.
-- **Integration** — a sharded scenario (≥2 controllers, ≥2 namespaces): assert per-namespace request,
-  throughput, and log series exist; assert `strata_controller_namespace_owner` maps each namespace to
-  exactly one owner; trigger a failover and assert `strata_controller_namespace_owner_changes_total`
-  increments and the owner gauge flips.
-- **Dashboard** — all `deploy/grafana/dashboards/*.json` parse as JSON; a guard test asserts no
-  dashboard references a removed metric name (`strata_controller_log_*`, the old global io counters).
+Current coverage includes `NamespaceLogMetrics` per-namespace accumulation/reacquisition behavior,
+`ChunkStore` namespace I/O accounting, `RequestContext` set/take behavior, and `ServerMetrics` request
+and lazy data-node counter registration. `DashboardMetricsGuardTest` parses the provisioned dashboards,
+rejects five removed controller-log names, and guards two leader-view queries.
+
+Remaining coverage gaps are a multi-controller/multi-namespace scrape test that exercises owner movement,
+plus a generated comparison of every emitted metric against every dashboard query. Until those exist,
+the owner-gauge flip and exhaustive dashboard consistency are design expectations rather than verified
+integration guarantees.
 
 ## 7. Out of scope / future (same idea, later)
 

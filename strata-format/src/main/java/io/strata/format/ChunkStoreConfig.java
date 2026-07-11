@@ -19,9 +19,22 @@ public record ChunkStoreConfig(
         int channelCacheMaxSize,
         int maxOpenChunkLedgerEntries) {
 
+    public static final int DEFAULT_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
+    public static final long DEFAULT_GROUP_COMMIT_DRAIN_TIMEOUT_MS = 10_000L;
+    public static final long DEFAULT_GROUP_COMMIT_MIN_ACCUMULATION_NANOS = 1_000_000L;
+    public static final long DEFAULT_GROUP_COMMIT_MAX_ACCUMULATION_NANOS = 50_000_000L;
+    public static final boolean DEFAULT_SEAL_FSYNC = false;
+    public static final long DEFAULT_BACKGROUND_FLUSH_INTERVAL_MS = 500L;
+    public static final long DEFAULT_BACKGROUND_FLUSH_THRESHOLD_BYTES = 4L << 20;
+    public static final long DEFAULT_SLOW_APPEND_LOG_MS = 1_000L;
+    public static final long DEFAULT_SLOW_MUTATION_LOG_MS = 500L;
+
     public static final ChunkStoreConfig DEFAULT =
-            new ChunkStoreConfig(8 * 1024 * 1024, 10_000L, 1_000_000L, 50_000_000L,
-                    false, 500L, 4L << 20, 1_000L, 500L, defaultChannelCacheCapacity(),
+            new ChunkStoreConfig(DEFAULT_MAX_REQUEST_BYTES, DEFAULT_GROUP_COMMIT_DRAIN_TIMEOUT_MS,
+                    DEFAULT_GROUP_COMMIT_MIN_ACCUMULATION_NANOS, DEFAULT_GROUP_COMMIT_MAX_ACCUMULATION_NANOS,
+                    DEFAULT_SEAL_FSYNC, DEFAULT_BACKGROUND_FLUSH_INTERVAL_MS,
+                    DEFAULT_BACKGROUND_FLUSH_THRESHOLD_BYTES, DEFAULT_SLOW_APPEND_LOG_MS,
+                    DEFAULT_SLOW_MUTATION_LOG_MS, defaultChannelCacheCapacity(),
                     ChunkLimits.DEFAULT_MAX_OPEN_CHUNK_LEDGER_ENTRIES);
 
     public ChunkStoreConfig(int maxRequestBytes, long groupCommitDrainTimeoutMs,

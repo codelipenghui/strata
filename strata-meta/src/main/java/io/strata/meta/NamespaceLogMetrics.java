@@ -11,20 +11,20 @@ import java.util.concurrent.atomic.LongAdder;
 /**
  * Per-namespace counters for the namespace-log metadata backend, surfaced as Prometheus metrics through
  * {@code Controller} / {@code ServerMetrics}. Lock-free {@link LongAdder}s (no hot-path cost). Held on the
- * backend rather than per-repository so they survive namespace re-recovery — a repository is rebuilt on
- * every failover/restart, but the counters must not reset.
+ * backend rather than per-repository so they survive in-process namespace re-recovery or reacquisition.
+ * A process restart constructs a fresh metrics object and resets these process-local counters.
  *
  * <p>{@link #stats()} returns a per-namespace snapshot in this fixed index order:
  * <ol start="0">
  *   <li>appendRecords / <li>appendBytes — metadata mutation rate + write throughput of the log
  *   <li>readRecords / <li>readBytes — records/bytes REPLAYED from the open log during recovery (read-log)
- *   <li>compactions — snapshot + open-log roll cycles (design §10)
- *   <li>recoveries — repositories (re)opened from a published manifest (failover/restart churn, §13)
+ *   <li>compactions — snapshot + open-log roll cycles (tech design §4.2)
+ *   <li>recoveries — repositories (re)opened from a published manifest (tech design §4.5)
  *   <li>reacquisitions — stale-epoch meta-log re-acquisitions (ownership contention)
- *   <li>ownerChanges — cold acquisitions of a namespace by this node (ownership handoffs, §6)
+ *   <li>ownerChanges — cold repository opens by this process; an approximate handoff signal that also
+ *       increments after process restart (tech design §4.5)
  *   <li>snapshotFallbacks — CRC-bad published snapshots recovered from a previous generation plus current log
  * </ol>
- * The aggregate accessors ({@link #appendRecords()} etc.) sum across namespaces.
  */
 final class NamespaceLogMetrics {
     static final int APPEND_RECORDS = 0, APPEND_BYTES = 1, READ_RECORDS = 2, READ_BYTES = 3,
@@ -73,7 +73,7 @@ final class NamespaceLogMetrics {
         of(ns)[REACQUISITIONS].increment();
     }
 
-    /** This node cold-acquired the namespace (first repository open) — an ownership handoff to this node. */
+    /** This process cold-opened the namespace; approximates a handoff but also counts restart/initial load. */
     void recordOwnerAcquired(StrataNamespace ns) {
         of(ns)[OWNER_CHANGES].increment();
     }
@@ -101,37 +101,5 @@ final class NamespaceLogMetrics {
     long value(String namespace, int index) {
         LongAdder[] a = byNs.get(namespace);
         return a == null ? 0L : a[index].sum();
-    }
-
-    private long sum(int idx) {
-        long total = 0;
-        for (LongAdder[] a : byNs.values()) {
-            total += a[idx].sum();
-        }
-        return total;
-    }
-
-    long appendRecords() {
-        return sum(APPEND_RECORDS);
-    }
-
-    long appendBytes() {
-        return sum(APPEND_BYTES);
-    }
-
-    long compactions() {
-        return sum(COMPACTIONS);
-    }
-
-    long recoveries() {
-        return sum(RECOVERIES);
-    }
-
-    long reacquisitions() {
-        return sum(REACQUISITIONS);
-    }
-
-    long snapshotFallbacks() {
-        return sum(SNAPSHOT_FALLBACKS);
     }
 }

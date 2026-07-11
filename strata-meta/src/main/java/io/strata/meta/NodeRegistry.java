@@ -57,7 +57,7 @@ final class NodeRegistry {
     private final ControllerConfig config;
     private final Map<Integer, LiveNode> live = new ConcurrentHashMap<>();
     private final AtomicLong sessionCounter = new AtomicLong(System.currentTimeMillis());
-    // Shared cluster-liveness snapshot (design §11): the controller publishes it; any namespace owner
+    // Shared cluster-liveness snapshot (tech design §4.1): the controller publishes it; any namespace owner
     // reads it to fill placement candidates it cannot see live in memory. The placement path caches the
     // read for one publish cadence (repairScanIntervalMs): publishClusterLiveNodes (RepairCoordinator
     // tick) is the only writer, so reading faster just re-fetches identical bytes. The publisher
@@ -347,7 +347,7 @@ final class NodeRegistry {
             // cheap unlocked pre-filter; the authoritative decision re-validates under n.lock
             if (n.record.state() == Records.NodeState.REGISTERED
                     && n.leaseUntil + config.deadGraceMs() < now) {
-                if (declareDeadIfStillExpired(n, now)) {
+                if (declareDeadIfStillExpired(n)) {
                     n.pending.clear();
                     newlyDead.add(n.record.nodeId());
                     log.warn("node {} declared DEAD (lease expired {}ms ago)",
@@ -365,7 +365,7 @@ final class NodeRegistry {
      * decision must be re-validated atomically with the CAS — otherwise a freshly-heartbeated live
      * node could be declared DEAD (TOCTOU, same shape as the idle-connection eviction race).
      */
-    private boolean declareDeadIfStillExpired(LiveNode n, long now) {
+    private boolean declareDeadIfStillExpired(LiveNode n) {
         Lock sessionWrite = n.sessionGate.writeLock();
         sessionWrite.lock();
         try {
@@ -450,7 +450,7 @@ final class NodeRegistry {
                 included.add(n.record.nodeId());
             }
         }
-        // Shared liveness (design §11): a non-controller owner has no heartbeat channel, so fall back
+        // Shared liveness (tech design §4.1): a non-controller owner has no heartbeat channel, so fall back
         // to the controller's published live-node snapshot for nodes it cannot see live in memory.
         // In-memory wins (added first); the snapshot only fills gaps.
         Records.ClusterLiveNodes snapshot = currentSnapshot(now);
@@ -466,7 +466,7 @@ final class NodeRegistry {
 
     /**
      * Controller-only (all call sites are leader-gated): publishes the current live-node set to the
-     * root store so non-controller namespace owners can place and repair replicas (design §11).
+     * root store so non-controller namespace owners can place and repair replicas (tech design §4.1).
      */
     void publishClusterLiveNodes() {
         long now = System.currentTimeMillis();

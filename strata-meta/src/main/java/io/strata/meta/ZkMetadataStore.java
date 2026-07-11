@@ -15,7 +15,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -46,7 +45,7 @@ public final class ZkMetadataStore implements MetadataStore {
     private static final byte PATH_MARKER_TOMBSTONE = 0;
     private static final byte PATH_MARKER_FILE_ID = 1;
     private static final byte[] DELETED_FILE_MARKER = pathMarkerBytes(Optional.empty());
-    // Namespace-sharding consensus root (design §5, §6.1): a single global metadata-epoch counter
+    // Namespace-sharding consensus root (tech design §4.1 and §4.5): a single global metadata-epoch counter
     // and one assignment record per namespace. Distinct from /strata/namespaces (user path/file
     // bindings) so the two never collide.
     private static final String META = "/strata/meta";
@@ -630,7 +629,7 @@ public final class ZkMetadataStore implements MetadataStore {
                     curator.setData().withVersion(stat.getVersion())
                             .forPath(zkPath, zkCounterBytes(next));
                     return next;
-                } catch (KeeperException.BadVersionException retry) {
+                } catch (KeeperException.BadVersionException ignored) {
                     // lost the CAS race; re-read and try again
                 }
             } catch (KeeperException.NoNodeException e) {
@@ -638,7 +637,7 @@ public final class ZkMetadataStore implements MetadataStore {
                     curator.create().creatingParentsIfNeeded()
                             .forPath(zkPath, zkCounterBytes(1L));
                     return 1L;
-                } catch (KeeperException.NodeExistsException created) {
+                } catch (KeeperException.NodeExistsException ignored) {
                     // another writer created it first; loop to CAS-increment off its value
                 }
             }

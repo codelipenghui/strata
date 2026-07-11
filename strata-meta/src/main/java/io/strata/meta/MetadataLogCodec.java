@@ -11,7 +11,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Versioned binary codec for {@link MetadataLogRecord} (design §8). A leading type byte selects the
+ * Versioned binary codec for {@link MetadataLogRecord} (tech design §4.2). A leading type byte selects the
  * record family. Append-only: type bytes are never reused or renumbered, so a sealed log written by an
  * older version always decodes. Node-id lists use fixed u32s (ids are small positive ints).
  */

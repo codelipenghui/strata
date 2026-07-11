@@ -24,12 +24,12 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Predicate;
 
 /**
- * The per-process engine behind {@link NamespaceLogMetadataStore} (design §8). Each USER namespace's
+ * The per-process engine behind {@link NamespaceLogMetadataStore} (tech design §4.2). Each USER namespace's
  * file metadata lives in a {@link NamespaceMetadataLogRepository} — the ZK-backed strata-meta-file: a
  * metadata log whose bytes are stored by the {@link NamespaceMetadataFileStore} and whose physical
  * descriptors live in the consensus root.
  *
- * <p><b>System namespace routing (design §5).</b> The metadata-log files themselves are stored as Strata
+ * <p><b>System namespace routing (tech design §4.5).</b> The metadata-log files themselves are stored as Strata
  * files in the reserved {@link #SYSTEM_NAMESPACE}; their own descriptors live directly in the ZK root
  * store (otherwise the log would recurse into itself). So every op for the system namespace is routed
  * straight to {@code root}, and — crucially — <b>without taking any namespace lock</b>: a user-namespace
@@ -39,8 +39,9 @@ import java.util.function.Predicate;
  * directly to the root without a repo lock, while user namespaces read their own repo under its lock.
  *
  * <p>A single engine is shared across {@link NamespaceLogMetadataStore} handles so multiple in-process
- * leaders observe one consistent log per namespace; cross-process single-writer is enforced by ownership
- * routing (M2). Each {@link NamespaceMetadataLogRepository} owns a per-namespace {@link ReentrantLock}
+ * leaders observe one consistent log per namespace; cross-process single-writer is enforced by configured
+ * ownership routing plus the consensus metadata-epoch and manifest-CAS fences. Each
+ * {@link NamespaceMetadataLogRepository} owns a per-namespace {@link ReentrantLock}
  * (not {@code synchronized}) held across that namespace's durable append, so the blocking root/file-store
  * I/O inside a critical section never pins a virtual-thread carrier — and a slow append in one namespace
      * never head-of-line-blocks a mutation in another. Repo creation/recovery is guarded by that namespace's
@@ -188,7 +189,7 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
         this.ownsNamespace = ownsNamespace;
     }
 
-    // Safety delay (design §10 step 6 / issue #8): a superseded metadata-log generation is retained for this
+    // Safety delay (tech design §4.2 / issue #8): a superseded metadata-log generation is retained for this
     // many ms after it is superseded before the sweep reclaims it — a rollback margin against a bad newest
     // generation. 0 disables the window (reap as soon as the sweep sees the orphan). Set from Controller env.
     private volatile long logRetentionMs;
@@ -199,7 +200,7 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
     }
 
     /**
-     * Starts the periodic open-log compaction sweep (design §8/§10 bounded-storage maintenance). Without
+     * Starts the periodic open-log compaction sweep (tech design §4.2 bounded-storage maintenance). Without
      * it, a per-namespace repo compacts only at open/failover ({@link NamespaceMetadataLogRepository#open}),
      * so a stable long-lived owner's open log grows unbounded between failovers. The sweep snapshot+rolls
      * every owned namespace whose open log has passed {@code thresholdBytes}, bounding steady-state storage
@@ -246,7 +247,7 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
 
     /**
      * Reclaims metadata SYSTEM-namespace files (snapshot/log) that are no longer referenced by a published
-     * manifest (design §8/§10, issue #8): a generation superseded by a later compaction, plus snapshot/log
+     * manifest (tech design §4.2, issue #8): a generation superseded by a later compaction, plus snapshot/log
      * files orphaned by a crash between writing a new generation's files and the manifest CAS. Since the
      * inline delete was removed from {@code publishCompacted}, this is the SOLE reclamation path for
      * superseded generations — not just a crash backstop.
@@ -346,7 +347,7 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
 
     /**
      * Compacts every owned repository whose open log has grown past {@code thresholdBytes}. Compaction is
-     * non-blocking ({@link NamespaceMetadataLogRepository#compact} — copy-on-write, design §10): it manages
+     * non-blocking ({@link NamespaceMetadataLogRepository#compact} — copy-on-write, tech design §4.2): it manages
      * its own locking so the snapshot encode + write happen off the namespace's mutation lock, and a
      * namespace keeps accepting writes for the duration of its own compaction. {@code compact()} skips a
      * repo (returns {@code false}) that is under threshold or already compacting, so this sweep does NOT
@@ -396,8 +397,8 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
         }
         handle.openLock.lock();
         try {
-            // Cold acquisition = this node started owning a namespace it had no repository for: an
-            // ownership handoff to this node, counted as an owner-change.
+            // Cold open = this process has no cached repository for the namespace. This includes initial
+            // load and process restart, so ownerChanges is only an approximation of an ownership handoff.
             return openLocked(handle, true);
         } finally {
             handle.openLock.unlock();
@@ -406,8 +407,8 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
 
     /**
      * Opens (and recovers) this node's repository for {@code namespace} if not already cached; caller holds
-     * the namespace handle's open lock. {@code countAsAcquisition} distinguishes a genuine cold ownership handoff
-     * (counted in {@code ownerChanges}) from the fence-driven in-place {@link #reacquire} — an epoch bump on
+     * the namespace handle's open lock. {@code countAsAcquisition} distinguishes a cold open (counted in
+     * {@code ownerChanges}, including initial load/restart) from the fence-driven in-place {@link #reacquire} — an epoch bump on
      * a namespace this node already owns, which must NOT register as an owner change. If another thread won
      * the open race the existing repo is returned and nothing is counted.
      */
@@ -997,7 +998,7 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
         }
         try {
             fileStore.close();
-        } catch (RuntimeException ignore) {
+        } catch (RuntimeException ignored) {
             // best-effort — file-store close releases an embedded client; never block shutdown
         }
         if (ownsRoot) {

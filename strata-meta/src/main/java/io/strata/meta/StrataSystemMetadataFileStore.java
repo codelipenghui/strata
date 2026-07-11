@@ -16,7 +16,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 /**
- * The production {@link NamespaceMetadataFileStore} (design §5, §8): each namespace's metadata-log and
+ * The production {@link NamespaceMetadataFileStore} (tech design §4.2): each namespace's metadata-log and
  * snapshot bytes are stored as <b>replicated Strata files</b> in the reserved {@code strata-meta} system
  * namespace — their descriptors in the ZooKeeper root, their bytes as replicated chunks on data
  * nodes. This reuses the proven client append/seal/recovery machinery; recovery of an open log
@@ -61,7 +61,7 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
         // page-cache durable on the quorum — fully safe against process/JVM/container crashes (the page
         // cache survives), and the integrity ledger + background writeback make it disk-durable shortly
         // after. This matches the data plane (STRATA_SEAL_FSYNC=false). fsyncOnAck=true
-        // (STRATA_CONTROLLER_LOG_FSYNC) fsyncs every append on the ack quorum (design §15), which only
+        // (STRATA_CONTROLLER_LOG_FSYNC) fsyncs every append on the ack quorum (tech design §5.3), which only
         // adds durability against a *correlated* power loss of the whole ack quorum before writeback — at
         // a large throughput cost when the log shares a disk with the data plane.
         this.policy = new StrataClient.WritePolicy(replicationFactor, ackQuorum, fsyncOnAck);
@@ -218,7 +218,7 @@ final class StrataSystemMetadataFileStore implements NamespaceMetadataFileStore 
         if (appender != null) {
             try {
                 appender.close();
-            } catch (RuntimeException ignore) {
+            } catch (RuntimeException ignored) {
                 // best-effort
             }
         }

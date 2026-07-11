@@ -20,7 +20,6 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -46,7 +45,7 @@ public final class DataNode implements AutoCloseable {
     private final ChunkDeleteService deleteService;
     private final ScpServer server;
     private final ControlLoop controlLoop;
-    private final OrphanGc orphanGc; // node-local orphan GC (design §9.2); null in standalone mode
+    private final OrphanGc orphanGc; // node-local orphan GC (tech design §9.2); null in standalone mode
     private final AtomicBoolean draining = new AtomicBoolean(false);
     private final AtomicLong ownerEpochFenceRejects = new AtomicLong();
     private final AtomicLong ownerEpochPersistenceRejects = new AtomicLong();
@@ -110,7 +109,7 @@ public final class DataNode implements AutoCloseable {
                 this.controlLoop = startedLoop;
                 dataHandler.controlLoop(startedLoop); // serve direct owner-repair EXEC_REPLICATE
                 startedLoop.start();
-                // Node-local orphan GC (design §9.2): reclaim sealed chunks no owner references, after
+                // Node-local orphan GC (tech design §9.2): reclaim sealed chunks no owner references, after
                 // confirming with the namespace owner. Only a registered node runs it (it needs a nodeId
                 // to recognise itself in a descriptor and controller endpoints to ask).
                 startedGc = new OrphanGc(openedStore, deletes, nodeId, config.controllerEndpoints(),
@@ -295,7 +294,7 @@ public final class DataNode implements AutoCloseable {
         return draining.get();
     }
 
-    /** Records that owner {@code verifierEndpoint} issued a VERIFY_CHUNKS to this node (design §9.2). */
+    /** Records that owner {@code verifierEndpoint} issued a VERIFY_CHUNKS to this node (tech design §9.2). */
     void noteVerifiedBy(String verifierEndpoint) {
         verifiersHeardFrom.add(verifierEndpoint);
     }
@@ -341,7 +340,6 @@ public final class DataNode implements AutoCloseable {
                 log.info("raising owner epoch watermark namespace={} previousOwnerEpoch={} acceptedOwnerEpoch={} "
                                 + "clientKind={} clientId={}",
                         namespace, seen, ownerEpoch, RequestContext.clientKind(), RequestContext.clientId());
-                return;
             }
         }
     }

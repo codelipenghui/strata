@@ -13,9 +13,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The namespace-log backend exposes process-wide counters (append/compaction/recovery) and a live
- * loaded-namespace gauge, so the metadata log's own write load and sharding distribution are
- * observable via Prometheus (wired into ServerMetrics as strata_controller_log_* / strata_controller_namespaces_loaded).
+ * The namespace-log backend exposes per-namespace counters and a live loaded-namespace gauge, so
+ * metadata-log write load and sharding distribution are observable via Prometheus.
  */
 class NamespaceLogMetricsTest {
 
@@ -33,11 +32,17 @@ class NamespaceLogMetricsTest {
             store.createFile(file(FileId.of(3), "tenant-b", "/topic-0"));
 
             NamespaceLogMetrics m = store.metrics();
-            assertTrue(m.appendRecords() >= 3, "each createFile appends at least one log record");
-            assertTrue(m.appendBytes() > 0, "appended frames carry bytes");
+            assertTrue(m.value("tenant-a", NamespaceLogMetrics.APPEND_RECORDS)
+                            + m.value("tenant-b", NamespaceLogMetrics.APPEND_RECORDS) >= 3,
+                    "each createFile appends at least one log record");
+            assertTrue(m.value("tenant-a", NamespaceLogMetrics.APPEND_BYTES)
+                            + m.value("tenant-b", NamespaceLogMetrics.APPEND_BYTES) > 0,
+                    "appended frames carry bytes");
             assertEquals(2, store.loadedNamespaceCount(), "two namespaces have live owner repositories");
-            assertEquals(2, m.recoveries(), "one recovery per namespace opened (tenant-a, tenant-b)");
-            assertEquals(0, m.compactions(), "no explicit compaction was triggered");
+            assertEquals(1, m.value("tenant-a", NamespaceLogMetrics.RECOVERIES));
+            assertEquals(1, m.value("tenant-b", NamespaceLogMetrics.RECOVERIES));
+            assertEquals(0, m.value("tenant-a", NamespaceLogMetrics.COMPACTIONS));
+            assertEquals(0, m.value("tenant-b", NamespaceLogMetrics.COMPACTIONS));
 
             backend.close();
         }
@@ -55,7 +60,7 @@ class NamespaceLogMetricsTest {
                 NamespaceLogMetadataStore store = new NamespaceLogMetadataStore(backend);
                 store.createFile(new Records.FileRecord(fileId, ns, StrataPath.of("/topic-0"), 3, 2, true,
                         FileState.OPEN, 1_000, List.of(), 1, 1));
-                assertEquals(1, store.metrics().recoveries());
+                assertEquals(1, store.metrics().value(ns.value(), NamespaceLogMetrics.RECOVERIES));
                 backend.close();
             }
 
@@ -64,7 +69,8 @@ class NamespaceLogMetricsTest {
                 NamespaceLogBackend backend = new NamespaceLogBackend(root, fileStore, false);
                 NamespaceLogMetadataStore store = new NamespaceLogMetadataStore(backend);
                 assertTrue(store.getFile(ns, fileId).isPresent(), "file recovered after restart");
-                assertTrue(store.metrics().recoveries() >= 1, "the restart re-recovered the namespace");
+                assertTrue(store.metrics().value(ns.value(), NamespaceLogMetrics.RECOVERIES) >= 1,
+                        "the restart re-recovered the namespace");
                 assertEquals(1, store.loadedNamespaceCount());
                 backend.close();
             }
@@ -94,10 +100,6 @@ class NamespaceLogMetricsTest {
         assertEquals(1, sa[NamespaceLogMetrics.SNAPSHOT_FALLBACKS], "a snapshotFallbacks");
         assertEquals(1, sb[4], "b compactions");
         assertEquals(1, sb[7], "b ownerChanges");
-        // The aggregate accessors roll up across namespaces (convenience for the meta tests' totals).
-        assertEquals(2, m.appendRecords(), "global appendRecords = sum over namespaces");
-        assertEquals(1, m.compactions(), "global compactions = sum over namespaces");
-        assertEquals(1, m.snapshotFallbacks(), "global snapshotFallbacks = sum over namespaces");
     }
 
     private static Records.FileRecord file(FileId id, String ns, String path) {

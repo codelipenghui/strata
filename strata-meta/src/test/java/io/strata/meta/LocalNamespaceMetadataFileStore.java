@@ -9,15 +9,10 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
 /**
- * A durable, on-disk {@link NamespaceMetadataFileStore}: metadata-log and snapshot bytes are stored as
- * local files under {@code dir}, keyed by a {@link FileId}. This makes the namespace-log backend durable
- * across a single meta-node restart — recovery reads the manifest from the consensus root, then the
- * snapshot/log bytes from disk.
- *
- * <p>Cross-node failover requires the replicated-chunk store ({@code StrataSystemMetadataFileStore}),
- * which stores the same bytes as Strata chunks so a successor on another node can read them; that is the
- * remaining hardening (design §5, §16 Step 3, and the bootstrap open question §19). Durability here
- * relies on the page cache; an fsync-on-append pass is a follow-up for crash-consistency.
+ * Test-only local-disk {@link NamespaceMetadataFileStore}. It lets recovery tests reopen metadata-log
+ * and snapshot bytes across a local backend restart without bringing up replicated data nodes.
+ * Production uses {@link StrataSystemMetadataFileStore}; this fixture deliberately does not model its
+ * cross-node replication or fsync durability contract.
  */
 final class LocalNamespaceMetadataFileStore implements NamespaceMetadataFileStore {
     private final Path dir;

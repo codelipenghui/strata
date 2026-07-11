@@ -13,17 +13,31 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Predicate;
 
 /**
- * The namespace-log {@link MetadataStore} backend (design §8, §16 Step 3). User file/path metadata is
+ * The namespace-log {@link MetadataStore} backend (tech design §4.2 and §16). User file/path metadata is
  * persisted through a per-namespace metadata log (a ZK-backed strata-meta-file); node-registry, epoch,
  * assignment, manifest, and liveness are the consensus root's responsibility and delegate to it. A thin
  * facade over the shared {@link NamespaceLogBackend}, so the existing SCP surface and Controller
- * run unchanged — only where metadata lives changes (design §1, §4).
+ * run unchanged — only where metadata lives changes (tech design §4.2).
  */
 public final class NamespaceLogMetadataStore implements MetadataStore, NamespaceLeadership {
     private final NamespaceLogBackend backend;
+    private final boolean ownsBackend;
 
     NamespaceLogMetadataStore(NamespaceLogBackend backend) {
+        this(backend, true);
+    }
+
+    private NamespaceLogMetadataStore(NamespaceLogBackend backend, boolean ownsBackend) {
         this.backend = backend;
+        this.ownsBackend = ownsBackend;
+    }
+
+    /**
+     * Returns a facade over a process-scoped backend whose lifecycle remains with the caller. This is useful
+     * when several independently closeable store handles model clients of one metadata process.
+     */
+    static NamespaceLogMetadataStore nonOwningView(NamespaceLogBackend backend) {
+        return new NamespaceLogMetadataStore(backend, false);
     }
 
     /** Restricts eager namespace recovery to namespaces this node owns (wired from Controller). */
@@ -216,6 +230,8 @@ public final class NamespaceLogMetadataStore implements MetadataStore, Namespace
 
     @Override
     public void close() {
-        backend.close();
+        if (ownsBackend) {
+            backend.close();
+        }
     }
 }

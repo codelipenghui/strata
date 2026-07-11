@@ -26,7 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Node-local orphan GC (design §9.2). A sealed chunk no owner has verified within {@code graceMs}
+ * Node-local orphan GC (tech design §9.2). A sealed chunk no owner has verified within {@code graceMs}
  * becomes a <em>suspect</em>; before deleting it the node asks the namespace's owner whether the
  * descriptor still lists this node for the chunk:
  *
@@ -58,12 +58,7 @@ import java.util.concurrent.atomic.AtomicLong;
 final class OrphanGc implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(OrphanGc.class);
 
-    // Constants for now (the project does not ship to prod). The grace comfortably exceeds several
-    // owner-pull verify cycles, so a legitimately-held chunk is always re-attested before it could
-    // be suspected; only a truly unreferenced chunk ever reaches the owner-confirm step.
-    static final long DEFAULT_GRACE_MS = 6_000;
-    static final long DEFAULT_SCAN_INTERVAL_MS = 3_000;
-    static final long DEFAULT_STARTUP_GRACE_MS = 6_000;
+    // Mass-delete breaker defaults are surfaced through DataNodeConfig for production wiring.
     static final int DEFAULT_MAX_CONFIRMED_DELETES_PER_NAMESPACE_PER_PASS = 64;
     static final int DEFAULT_MAX_CONFIRMED_DELETE_PERCENT_PER_NAMESPACE_PER_PASS = 25;
     static final int DEFAULT_MAX_CONFIRMED_DELETES_PER_NODE_PASS = 256;
@@ -72,10 +67,8 @@ final class OrphanGc implements AutoCloseable {
     private static final long DEFAULT_BREAKER_WINDOW_MS = 60_000;
     private static final long OPEN_BREAKER_WARN_INTERVAL_MS = 60_000;
     private static final long UNREACHABLE_CONFIRM_WARN_INTERVAL_MS = 60_000;
-    private static final int DEFAULT_CONFIRM_TIMEOUT_MS = 5_000;
 
     private final ChunkStore store;
-    private final ChunkDeleteService deletes;
     private final int nodeId;
     private final List<String> controllerEndpoints;
     private final long graceMs;
@@ -155,7 +148,7 @@ final class OrphanGc implements AutoCloseable {
              int maxCumulativeDeletesPerNode, OwnerEpochAcceptor ownerEpochAcceptor,
              ConfirmedDelete confirmedDelete) {
         this.store = Objects.requireNonNull(store, "store");
-        this.deletes = Objects.requireNonNull(deletes, "deletes");
+        Objects.requireNonNull(deletes, "deletes");
         this.nodeId = nodeId;
         this.controllerEndpoints = List.copyOf(controllerEndpoints);
         this.graceMs = graceMs;
@@ -406,7 +399,8 @@ final class OrphanGc implements AutoCloseable {
         if (maxConfirmedDeletePercentPerNamespacePerPass > 0) {
             int percentBudget = sealedChunkCount <= 0
                     ? 0
-                    : Math.max(1, (int) ((sealedChunkCount * (long) maxConfirmedDeletePercentPerNamespacePerPass) / 100));
+                    : Math.max(1, (int) (sealedChunkCount
+                            * (long) maxConfirmedDeletePercentPerNamespacePerPass / 100));
             budget = Math.min(budget, percentBudget);
         }
         return budget;

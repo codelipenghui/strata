@@ -12,7 +12,7 @@ import java.util.Map;
  * Translates a wholesale {@link Records.FileRecord} mutation (the generic {@code MetadataStore.updateFile}
  * the service issues) into the authoritative semantic log records that reproduce it on replay
  * ({@link NamespaceMetadataState}). This is the bridge from the CAS-replace SPI to the append-only log
- * (design §8.1): the immutable identity fields (id, namespace, path, policy, createdAt) come from the
+ * (tech design §4.2): the immutable identity fields (id, namespace, path, policy, createdAt) come from the
  * original {@code FileCreated}; only writer-epoch, chunk, replica, and lifecycle deltas are emitted.
  */
 final class MetadataLogDiff {

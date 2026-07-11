@@ -11,7 +11,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 
 /**
- * On-disk format constants and codecs (tech design §11, v0 format version 1).
+ * On-disk format constants and codecs (tech design §11, current format version 2).
  *
  * Chunk file: [4096B header][data region (raw logical bytes)][footer — sealed only][64B trailer].
  * Logical chunk offset X lives at file offset 4096 + X (address arithmetic invariant).
@@ -133,7 +133,7 @@ public final class ChunkFormats {
         return 2 + 2 + 4 + content.length + 4;
     }
 
-    /* ---------------- sidecar .meta (512B, single-sector atomic rewrite) ----------------
+    /* ---------------- sidecar .meta (512B, temp-file replace in ChunkStore) ----------------
      * magic u32, u16 ver, i32 writeEpoch, i32 fenceEpoch, u64 lastKnownDO, u8 state, pad, u32 crc at [508)
      */
 

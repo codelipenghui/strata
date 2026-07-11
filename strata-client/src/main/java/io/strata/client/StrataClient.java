@@ -3,6 +3,7 @@ package io.strata.client;
 import io.strata.common.FileId;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
+import io.strata.common.WritePolicyChecks;
 
 import java.util.List;
 import java.util.Objects;
@@ -21,16 +22,7 @@ public interface StrataClient extends AutoCloseable {
         public static final WritePolicy DEFAULT = new WritePolicy(3, 2, false);
 
         public WritePolicy {
-            if (replicationFactor <= 0) {
-                throw new IllegalArgumentException("replicationFactor must be positive: " + replicationFactor);
-            }
-            if (ackQuorum <= 0 || ackQuorum > replicationFactor) {
-                throw new IllegalArgumentException("ackQuorum must be in 1..replicationFactor: " + ackQuorum);
-            }
-            if (ackQuorum <= replicationFactor / 2) {
-                throw new IllegalArgumentException("ackQuorum must intersect any other quorum: "
-                        + ackQuorum + " for replicationFactor " + replicationFactor);
-            }
+            WritePolicyChecks.validate(replicationFactor, ackQuorum);
         }
 
         public static WritePolicy replicated(int replicationFactor, int ackQuorum) {

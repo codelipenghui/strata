@@ -7,11 +7,11 @@ import io.strata.common.StrataPath;
 import java.util.List;
 
 /**
- * Authoritative metadata-log records (design §8). Every mutating metadata operation is represented as
+ * Authoritative metadata-log records (tech design §4.2). Every mutating metadata operation is represented as
  * exactly one append-only record; replaying the log ({@link NamespaceMetadataState}) reconstructs all
  * file identity, path bindings, chunk descriptors, tombstones, and the derived {@code node -> chunks}
  * index. The log NEVER contains derived indexes or command/delivery events — only the resulting
- * metadata transition (design §8, §8.1).
+ * metadata transition (tech design §4.2).
  */
 public sealed interface MetadataLogRecord {
 
@@ -23,10 +23,10 @@ public sealed interface MetadataLogRecord {
                        int replicationFactor, int ackQuorum, boolean fsyncOnAck,
                        long createdAtMs, long createOpMsb, long createOpLsb) implements MetadataLogRecord {}
 
-    /** Records a writer fencing epoch before append or recovery ownership changes (design §8). */
+    /** Records a writer fencing epoch before append or recovery ownership changes (tech design §4.2). */
     record WriterEpochAllocated(FileId fileId, int writerEpoch) implements MetadataLogRecord {}
 
-    /** Commits chunk placement before any chunk byte is written (commit-before-write, design §15). */
+    /** Commits chunk placement before any chunk byte is written (tech design §14 invariant 5). */
     record ChunkCreated(FileId fileId, int chunkIndex, int writeEpoch, List<Integer> replicas,
                         long createOpMsb, long createOpLsb) implements MetadataLogRecord {
         public ChunkCreated {
@@ -71,6 +71,6 @@ public sealed interface MetadataLogRecord {
     /** Records a verified replacement replica for an under-replicated sealed chunk. */
     record ReplicaAdded(FileId fileId, int chunkIndex, int nodeId) implements MetadataLogRecord {}
 
-    /** Final metadata cleanup of a deletion tombstone after the fencing window (design §10). */
+    /** Final metadata cleanup of a deletion tombstone after the fencing window (tech design §4.2). */
     record TombstoneSwept(FileId fileId) implements MetadataLogRecord {}
 }

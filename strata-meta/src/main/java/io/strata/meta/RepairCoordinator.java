@@ -87,8 +87,8 @@ class RepairCoordinator implements AutoCloseable {
     private final ControllerConfig config;
     private final BooleanSupplier isLeader;
     // Whether this node owns every namespace (non-sharded / single-endpoint). When false (sharded), an
-    // inventory chunk whose file this node cannot see may belong to a namespace owned by another meta
-    // node, so it must NOT be deleted as an orphan (design §11 single-writer safety / data-loss guard).
+    // chunk encountered during reconciliation whose file this node cannot see may belong to another meta
+    // node, so it must NOT be deleted as an orphan (tech design §14 single-writer safety / data-loss guard).
     private final BooleanSupplier ownsAll;
     // Whether this node is the controller owner of a namespace — scopes the non-controller owner repair pass.
     private final Predicate<StrataNamespace> ownsNamespace;
@@ -225,7 +225,7 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /** This owner's advertised endpoint, sent as the {@code verifierEndpoint} in VERIFY_CHUNKS so a node
-     *  can record which owner attested it (design §9.2). Set by the controller before {@link #start}. */
+     *  can record which owner attested it (tech design §9.2). Set by the controller before {@link #start}. */
     private volatile String advertisedEndpoint = "";
 
     void advertisedEndpoint(String endpoint) {
@@ -577,7 +577,7 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /**
-     * Reaps DELETED-file tombstones at the slow reconcile cadence (design §6: the namespace owner owns
+     * Reaps DELETED-file tombstones at the slow reconcile cadence (tech design §4.5: the namespace owner owns
      * its namespace's metadata lifecycle, tombstone GC included). The leader sweeps the shared system-root
      * tombstones globally — and its own loaded repos — via {@link MetadataStore#sweepDeletedFiles}; a
      * non-leader owner reaps only the namespaces it owns ({@link MetadataStore#sweepOwnedNamespaceTombstones}),
@@ -595,7 +595,7 @@ class RepairCoordinator implements AutoCloseable {
     /** One reconciliation pass over all files. Idempotent; safe to call while serving. */
     void scanOnce() throws Exception {
         // The controller refreshes the shared live-node snapshot each pass so non-controller namespace
-        // owners have a current placement view (design §11). Leader-gated: a standby must not publish.
+        // owners have a current placement view (tech design §4.1). Leader-gated: a standby must not publish.
         if (isLeader.getAsBoolean()) {
             registry.publishClusterLiveNodes();
         }
@@ -605,7 +605,6 @@ class RepairCoordinator implements AutoCloseable {
         // durability census, published to gauges at the end; int[] lets lambdas increment them
         int[] under = {0}, unavailable = {0}, atMin = {0};
 
-        long now = System.currentTimeMillis();
         for (StrataNamespace ns : store.listNamespaces()) {
             if (!namespaceActive(ns)) {
                 continue;
@@ -767,7 +766,7 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /**
-     * Non-controller owner repair (design §11): a namespace owner that does not hold the global latch
+     * Non-controller owner repair (tech design §4.5 and §9.2): a namespace owner that does not hold the global latch
      * cannot use the controller's heartbeat command channel, so it heals its own namespaces'
      * under-replicated sealed chunks directly. It reads the controller's authoritative DEAD set from the
      * consensus root, picks a replacement target from the shared live-node snapshot, tells that target
@@ -785,7 +784,6 @@ class RepairCoordinator implements AutoCloseable {
                 dead.add(n.nodeId());
             }
         }
-        long now = System.currentTimeMillis();
         for (StrataNamespace ns : store.listNamespaces()) {
             if (!ownsNamespace.test(ns) || !namespaceActive(ns)) {
                 continue;
@@ -833,7 +831,7 @@ class RepairCoordinator implements AutoCloseable {
         }
     }
 
-    /* ---------- owner-pull verification (design §9.2): replaces the central inventory push ---------- */
+    /* ---------- owner-pull verification (tech design §9.2): replaces the central inventory push ---------- */
 
     private void verifyLoop() {
         while (!closed.get()) {
@@ -851,7 +849,7 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /**
-     * Owner-pull verification (design §9.2): for each namespace this controller owns, ask every live
+     * Owner-pull verification (tech design §9.2): for each namespace this controller owns, ask every live
      * node that should hold a sealed chunk to report its local state, and compare against the descriptor
      * — missing/corrupt drops the replica so the under-replication scan re-replicates within the
      * namespace. Replaces "every node pushes its full chunk list to the leader". Runs off the repair

@@ -3,7 +3,7 @@ package io.strata.meta;
 import java.util.List;
 import java.util.Objects;
 
-/** Controller configuration. Production values are minutes; tests use sub-second timings. */
+/** Controller configuration with validated production defaults; tests commonly use shorter timings. */
 public record ControllerConfig(
         String zkConnect,
         int listenPort,            // 0 = ephemeral
@@ -12,16 +12,16 @@ public record ControllerConfig(
         int deadGraceMs,           // lease expiry -> SUSPECT; expiry + grace -> DEAD (repair starts)
         int repairScanIntervalMs,
         int repairCommandTimeoutMs, // in-flight command without completion past this -> re-issue
-        int reconcileIntervalMs,   // slow-reconcile cadence: full inventory sweep vs. repair-log delta
+        int reconcileIntervalMs,   // slow reconciliation/tombstone-sweep cadence
         int zkSessionTimeoutMs,
         int zkConnectionTimeoutMs,
         String advertisedHost,     // host clients/peers reach this meta at; carried in the leader hint
         long replicaMissingGraceMs, // a node-reported-missing sealed replica is dropped only after it
-                                    // stays missing this long (absorbs in-flight inventory snapshots)
+                                    // stays missing this long (absorbs stale verification/liveness snapshots)
         List<String> controllerEndpoints, // eligible controller endpoints for namespace ownership (rendezvous,
-                                        // design §6.1). empty/size<=1 => this node owns every namespace
+                                        // tech design §4.5). empty/size<=1 => this node owns every namespace
                                         // (no sharding — preserves single-leader behavior)
-        int controllerReplicaCount,  // metadata replica-set size per namespace (design §6.1)
+        int controllerReplicaCount,  // metadata replica-set size per namespace (tech design §4.5)
         int verifyIntervalMs,        // owner-pull VERIFY_CHUNKS cadence (RepairCoordinator)
         int verifyBatchSize,         // chunk-ids per VERIFY_CHUNKS RPC
         int systemVerifyIntervalMs,  // slower verify cadence for the system (metadata-log) namespace
@@ -229,7 +229,7 @@ public record ControllerConfig(
 
     /**
      * A copy with the eligible controller endpoints and replica-set size for namespace sharding
-     * (design §6.1). Pass this node's own advertised endpoint among {@code endpoints} so rendezvous
+     * (tech design §4.5). Pass this node's own advertised endpoint among {@code endpoints} so rendezvous
      * can place it; an empty list or a single endpoint means this node owns every namespace.
      */
     public ControllerConfig withControllerEndpoints(List<String> endpoints, int replicaCount) {

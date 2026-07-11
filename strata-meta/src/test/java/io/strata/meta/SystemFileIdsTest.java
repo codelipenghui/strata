@@ -9,7 +9,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** Verifies that {@link SystemFileIds} produces no collisions over the expected cardinality. */
+/** Checks determinism and sample uniqueness for the test-local system-file id mixer. */
 class SystemFileIdsTest {
 
     @Test

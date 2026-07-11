@@ -8,10 +8,10 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * Internal framing for one metadata-log segment (design §8): each record is wrapped in a
+ * Internal framing for one metadata-log segment (tech design §4.2): each record is wrapped in a
  * {@code [frameLen:u32][crc32c:u32][recordBytes]} frame. Recovery reads frames sequentially and stops
  * at the first torn or CRC-invalid frame, yielding only the valid durable prefix — a half-written tail
- * append is never replayed (design §13 step 6).
+ * append is never replayed (tech design §4.5 recovery barrier).
  */
 final class MetadataLogSegmentCodec {
     private MetadataLogSegmentCodec() {}

@@ -39,13 +39,15 @@ class NamespaceLogCompactionSweepTest {
             }
             long openBytes = backend.namespaceStats().get(NS)[1];
             assertTrue(openBytes > 0, "createFile records grow the open log past the snapshot cut");
-            long compactionsBefore = store.metrics().compactions();
+            long compactionsBefore = store.metrics().value(NS.value(), NamespaceLogMetrics.COMPACTIONS);
 
             // a threshold above the accumulated size leaves the namespace alone; one below it compacts.
             assertEquals(0, backend.compactOversizedRepos(openBytes + 1), "under threshold: no compaction");
             assertEquals(1, backend.compactOversizedRepos(1), "over threshold: the namespace is compacted");
 
-            assertEquals(compactionsBefore + 1, store.metrics().compactions(), "exactly one extra compaction");
+            assertEquals(compactionsBefore + 1,
+                    store.metrics().value(NS.value(), NamespaceLogMetrics.COMPACTIONS),
+                    "exactly one extra compaction");
             assertEquals(0, backend.namespaceStats().get(NS)[1],
                     "compaction rolls a fresh empty open log (open-log bytes reset to the snapshot cut)");
 
@@ -77,7 +79,8 @@ class NamespaceLogCompactionSweepTest {
             }
             assertEquals(0, backend.namespaceStats().get(NS)[1],
                     "the background sweep must compact the oversized open log without any failover");
-            assertTrue(store.metrics().compactions() >= 1, "the sweep performed at least one compaction");
+            assertTrue(store.metrics().value(NS.value(), NamespaceLogMetrics.COMPACTIONS) >= 1,
+                    "the sweep performed at least one compaction");
             backend.close();
         }
     }

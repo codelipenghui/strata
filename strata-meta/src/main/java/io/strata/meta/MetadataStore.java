@@ -115,15 +115,15 @@ public interface MetadataStore extends AutoCloseable {
 
     List<Versioned<Records.NodeRecord>> listNodes() throws Exception;
 
-    /* ---- namespace sharding root (design §5, §6.1) ----
+    /* ---- namespace sharding root (tech design §4.1 and §4.5) ----
      * Consensus-root capabilities: the global metadata-epoch fence and per-namespace assignment
      * records. The namespace-log backend delegates these to the underlying root store, so they are
      * not part of the backend-neutral file/path/node contract — backends that are not a consensus
      * root inherit the safe defaults below. */
 
     /**
-     * CAS-increments the global metadata epoch counter and returns the new value (design §5, §13
-     * step 2). Values are unique and strictly monotonic; gaps are allowed. A namespace leader
+     * CAS-increments the global metadata epoch counter and returns the new value (tech design §4.5,
+     * "Per-namespace leader recovery barrier"). Values are unique and strictly monotonic; gaps are allowed. A namespace leader
      * allocates an epoch before activating and fences manifest publication with it.
      */
     default long allocateMetadataEpoch() throws Exception {
@@ -149,7 +149,7 @@ public interface MetadataStore extends AutoCloseable {
         throw new UnsupportedOperationException("file-id assignment requires a backend that tracks per-namespace counters");
     }
 
-    /** The persisted rendezvous assignment for {@code namespace}, if one has been written (design §6.1). */
+    /** The persisted rendezvous assignment for {@code namespace}, if one has been written (tech design §4.5). */
     default Optional<Versioned<Records.NamespaceAssignment>> getNamespaceAssignment(StrataNamespace namespace)
             throws Exception {
         return Optional.empty();
@@ -164,12 +164,12 @@ public interface MetadataStore extends AutoCloseable {
         throw new UnsupportedOperationException("namespace assignment requires a consensus-root backend");
     }
 
-    /** Namespaces that currently have a persisted assignment record (design §6.1). */
+    /** Namespaces that currently have a persisted assignment record (tech design §4.5). */
     default List<StrataNamespace> listAssignedNamespaces() throws Exception {
         return List.of();
     }
 
-    /** The published metadata-log manifest for {@code namespace}, if any (design §5, §9). */
+    /** The published metadata-log manifest for {@code namespace}, if any (tech design §4.2 and §4.5). */
     default Optional<Versioned<Records.NamespaceManifest>> getNamespaceManifest(StrataNamespace namespace)
             throws Exception {
         return Optional.empty();
@@ -188,7 +188,7 @@ public interface MetadataStore extends AutoCloseable {
     }
 
     /**
-     * CAS-publishes a namespace metadata-log manifest — the linearizable cutover barrier (design §9).
+     * CAS-publishes a namespace metadata-log manifest — the linearizable cutover barrier (tech design §4.5).
      * {@code expectedVersion -1} creates (fails if present), otherwise updates only if the stored
      * version matches. Returns the new znode version on success (so the caller can do the next CAS
      * without a read-back), or empty on a version conflict so a fenced leader's publish loses.
@@ -198,7 +198,7 @@ public interface MetadataStore extends AutoCloseable {
         throw new UnsupportedOperationException("namespace manifest requires a consensus-root backend");
     }
 
-    /* ---- shared cluster liveness (design §11) ---- */
+    /* ---- shared cluster liveness (tech design §4.1) ---- */
 
     /**
      * Publishes a compact snapshot of currently-live data nodes to the consensus root so a
@@ -210,7 +210,7 @@ public interface MetadataStore extends AutoCloseable {
         // no-op for non-root backends / test doubles
     }
 
-    /** The latest published live-node snapshot, if any (design §11). */
+    /** The latest published live-node snapshot, if any (tech design §4.1). */
     default Optional<byte[]> getClusterLiveNodes() throws Exception {
         return Optional.empty();
     }

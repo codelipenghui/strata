@@ -11,7 +11,7 @@ import java.util.List;
 
 /**
  * Static rendezvous-hash (HRW) assignment of a namespace to a small replica set of metadata
- * endpoints (design §6.1).
+ * endpoints (tech design §4.5).
  *
  * <p>{@code score = hash(namespace, membershipGeneration, endpoint)}; the replica set is the top
  * {@code replicaCount} endpoints by score and {@code preferredLeader = replicaSet[0]}. The function

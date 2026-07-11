@@ -47,7 +47,6 @@ public final class Controller implements AutoCloseable {
     /** Optimistic-concurrency retry bound, shared with RepairCoordinator's descriptor CAS loops. */
     static final int CAS_RETRIES = 5;
 
-    private final ControllerConfig config;
     private final MetadataStore store;
     private final ZkMetadataStore rootZk; // the consensus root (latch + ZK metrics), under any backend
     private final NodeRegistry registry;
@@ -55,7 +54,7 @@ public final class Controller implements AutoCloseable {
     private final ScpServer server;
     private final LeaderLatch leaderLatch;
     private final String advertisedEndpoint;  // this node's reachable host:port — the leader hint clients redirect to
-    private final NamespaceOwnership ownership; // resolves the controller owner of each namespace (design §6)
+    private final NamespaceOwnership ownership; // resolves each namespace owner (tech design §4.5)
     private final NamespaceLeadership namespaceLeadership; // optional: namespace-log ACTIVE/RECOVERING barrier
     private final AtomicLong lastSystemNamespaceRejectWarnMs = new AtomicLong();
     private final LongAdder metadataStoreNamespaceContractViolations = new LongAdder();
@@ -78,11 +77,10 @@ public final class Controller implements AutoCloseable {
      * Advanced/test hook: the metadata-store backend is supplied as a function of the ZooKeeper root
      * store. The consensus root (leader latch, node registry, sharding root) is always ZooKeeper; the
      * factory chooses whether file/path metadata is served from ZooKeeper directly (default) or from the
-     * namespace-log backend wrapping that same root (design §16 Step 3).
+     * namespace-log backend wrapping that same root (tech design §4.2 and §16).
      */
     Controller(ControllerConfig config, String advertisedEndpoint,
                     BiFunction<ZkMetadataStore, String, MetadataStore> backendFactory) throws Exception {
-        this.config = config;
         boolean embedded = advertisedEndpoint != null;
         ZkMetadataStore openedStore = null;
         LeaderLatch openedLatch = null;
@@ -108,11 +106,11 @@ public final class Controller implements AutoCloseable {
             }
             // Build the backend once the endpoint is known: the namespace-log backend's system-file store
             // connects an embedded client back to this node's own endpoint to store metadata-log bytes as
-            // replicated Strata chunks (design §5, §8).
+            // replicated Strata chunks (tech design §4.2).
             MetadataStore backendStore = backendFactory.apply(openedStore, this.advertisedEndpoint);
             NodeRegistry openedRegistry = new NodeRegistry(backendStore, config);
             openedLatch = new LeaderLatch(openedStore.curator(), "/strata/leader", this.advertisedEndpoint);
-            // Static rendezvous ownership over the configured controller endpoints (design §6.1). With an
+            // Static rendezvous ownership over the configured controller endpoints (tech design §4.5). With an
             // empty/single-endpoint membership this node owns every namespace (no behavior change).
             NamespaceOwnership openedOwnership = new NamespaceOwnership(this.advertisedEndpoint,
                     config.controllerEndpoints(), 0, config.controllerReplicaCount());
@@ -124,8 +122,8 @@ public final class Controller implements AutoCloseable {
                 openedNamespaceLeadership = namespaceLog;
             }
             // Repair's orphan-deletion is gated on owning every namespace (a sharded controller never
-            // deletes an inventory chunk owned by another controller node), and a non-controller owner heals
-            // only the namespaces it owns via the direct EXEC_REPLICATE pass.
+            // authorizes deletion for another controller's namespace), and a non-controller owner heals only
+            // the namespaces it owns via the direct EXEC_REPLICATE pass.
             openedRepair = new RepairCoordinator(backendStore, openedRegistry, config,
                     openedLatch::hasLeadership, openedOwnership::ownsAll, openedOwnership::isOwner,
                     openedNamespaceLeadership);
@@ -138,7 +136,7 @@ public final class Controller implements AutoCloseable {
             this.repair = openedRepair;
             this.ownership = openedOwnership;
             this.namespaceLeadership = openedNamespaceLeadership;
-            // The owner-pull verifier identifies itself by its advertised endpoint (design §9.2) so a
+            // The owner-pull verifier identifies itself by its advertised endpoint (tech design §9.2) so a
             // node can record which owner attested each chunk; it is also this node's rendezvous identity.
             openedRepair.advertisedEndpoint(this.advertisedEndpoint);
             openedLatch.start();
@@ -207,7 +205,7 @@ public final class Controller implements AutoCloseable {
         // Durability by replication (RF/ack); per-append fsync off by default — see StrataSystemMetadataFileStore.
         boolean logFsync = backend.namespaceLogFsync();
         // Steady-state open-log compaction: snapshot+roll an owned namespace once its open log passes this
-        // size, so a stable leader's log is bounded by snapshot cadence (design §8/§10) rather than only
+        // size, so a stable leader's log is bounded by snapshot cadence (tech design §4.2) rather than only
         // compacting at open/failover. 0 on either knob disables the background sweep.
         int compactBytes = backend.namespaceLogCompactBytes();
         int compactIntervalMs = backend.namespaceLogCompactIntervalMs();
@@ -215,7 +213,7 @@ public final class Controller implements AutoCloseable {
         // construction: a file is reaped only if no manifest references it AND its generation is <= its
         // namespace's currently-published generation (an in-flight publish is always at a higher generation).
         boolean orphanGc = backend.namespaceLogOrphanGc();
-        // Safety delay (design §10 step 6 / issue #8): retain a superseded metadata-log generation this many
+        // Safety delay (tech design §4.2 / issue #8): retain a superseded metadata-log generation this many
         // ms after it is superseded before the sweep reclaims it — a rollback margin against a bad newest
         // generation. 0 disables the window: superseded generations are reclaimed on the next sweep.
         int retentionMs = backend.namespaceLogRetentionMs();
@@ -445,7 +443,7 @@ public final class Controller implements AutoCloseable {
     }
 
     /**
-     * Gate a namespace-scoped op (design §6): the controller owner serves once its namespace is ACTIVE; a
+     * Gate a namespace-scoped op (tech design §4.5): the controller owner serves once its namespace is ACTIVE; a
      * non-owner is redirected with a NOT_LEADER hint pointing at the owner endpoint. A non-sharded
      * (single-endpoint) deployment falls back to the global leader latch, then applies the same namespace-log
      * recovery barrier when that backend is enabled.
@@ -473,7 +471,7 @@ public final class Controller implements AutoCloseable {
             requireLeader();
         } else if (!ownership.isOwner(namespace)) {
             // Redirect to the namespace's owner; the owner-aware client caches namespace->owner and
-            // routes directly, re-resolving only on this exception (an ownership change) (design §6).
+            // routes directly, re-resolving only on this exception (an ownership change) (tech design §4.5).
             throw new ScpException(ErrorCode.NOT_LEADER,
                     "namespace " + namespace + " is owned by another controller", 0,
                     ownership.ownerOf(namespace));

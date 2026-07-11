@@ -487,11 +487,10 @@ public final class ScpServer implements AutoCloseable {
 
         private final class SerialRequestExecutor {
             private final ArrayDeque<FrameTask> queue = new ArrayDeque<>();
-            private final Thread worker;
             private boolean shutdown;
 
             private SerialRequestExecutor(Channel channel) {
-                this.worker = Thread.ofVirtual()
+                Thread.ofVirtual()
                         .name("scp-conn-" + channel.remoteAddress() + "-", 0)
                         .start(this::drain);
             }
@@ -942,7 +941,7 @@ public final class ScpServer implements AutoCloseable {
             try {
                 write = ctx.write(out);
                 queued = true;
-                scheduleOkU64Flush(ctx);
+                scheduleOkU64Flush();
             } catch (RuntimeException e) {
                 if (!queued) {
                     out.release();
@@ -955,7 +954,7 @@ public final class ScpServer implements AutoCloseable {
             finishWrite(ctx, write, false, null, req);
         }
 
-        private void scheduleOkU64Flush(ChannelHandlerContext ctx) {
+        private void scheduleOkU64Flush() {
             if (okU64FlushPending) {
                 return;
             }

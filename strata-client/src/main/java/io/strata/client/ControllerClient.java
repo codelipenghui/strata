@@ -212,7 +212,7 @@ final class ControllerClient implements AutoCloseable {
         for (ManagedScpConnection c : conns.values()) {
             try {
                 c.close();
-            } catch (RuntimeException ignore) {
+            } catch (RuntimeException ignored) {
                 // best-effort
             }
         }
