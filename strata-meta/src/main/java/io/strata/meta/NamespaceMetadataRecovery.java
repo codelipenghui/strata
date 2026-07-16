@@ -6,7 +6,7 @@ import io.strata.common.StrataNamespace;
 import java.util.Optional;
 
 /**
- * The metadata-log recovery barrier for one namespace (design §13): load the manifest's snapshot, then
+ * The metadata-log recovery barrier for one namespace (tech design §4.5): load the manifest's snapshot, then
  * replay the durable (CRC-valid) prefix of the open log file past the snapshot cut. A torn tail append
  * is discarded (see {@link MetadataLogSegmentCodec}). Returns the rebuilt state and the durable end
  * offset — the highest offset a successor may treat as committed.
@@ -102,7 +102,7 @@ final class NamespaceMetadataRecovery {
         long skipBytes = Math.max(0L, alreadyRecoveredOffset - m.logStartOffset());
         if (m.logFileId().isPresent()) {
             // Replay the WHOLE open log file, not just up to publishedLogOffset: a fenced successor may
-            // apply additional CRC-valid records already durable in the open tail (design §9).
+            // apply additional CRC-valid records already durable in the open tail (tech design §4.2).
             MetadataLogSegmentCodec.Prefix prefix =
                     MetadataLogSegmentCodec.recoverPrefix(fileStore.readLog(m.logFileId().get()),
                             Math.toIntExact(Math.min(skipBytes, Integer.MAX_VALUE)));

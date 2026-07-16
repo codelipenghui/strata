@@ -10,9 +10,9 @@
 
 - **The gap.** Every modern fix for Kafka's storage problem — WarpStream, AutoMQ, Bufstream, Confluent Freight, Diskless Kafka (KIP-1150) — assumes an S3-class object store underneath. Self-managed datacenters, regulated and air-gapped environments, sovereign clouds, and edge deployments are excluded, yet they feel Kafka's storage pain most acutely.
 - **The product.** Keep the Kafka protocol and ecosystem unchanged. Make brokers diskless and stateless. Store all log data in a purpose-built, quorum-replicated Strata file service on commodity disks. Coordinate with a compact, Strata-native metadata plane.
-- **The wins.** Storage scales by adding data nodes, not brokers. Operations move metadata, never data. Cold data ages in place on cheap media — no tiering pipeline, because nothing ever needs to migrate. Quorum acks keep produce p99 flat.
+- **The wins.** Storage scales by adding data nodes, not brokers. Broker leadership and partition rebalancing move metadata rather than log data. Cold data ages in place on cheap media without a tiering pipeline; data moves only for storage repair, decommission, or explicit relocation. Quorum acks keep produce p99 flat.
 - **The position.** Kafka compatibility + disaggregated storage + no object-store dependency. No product on the market offers all three.
-- **The reach.** Sealed-data placement is pluggable — local media, object store, or hybrid — so one architecture serves both self-managed and cloud deployments.
+- **The reach (roadmap, not current v0).** The target sealed-data placement seam can support local media, object store, or hybrid layouts so one architecture can eventually serve self-managed and cloud deployments.
 
 ## 1. The problem
 
@@ -34,7 +34,7 @@ Strata separates the Kafka protocol from log storage. Three independently scalab
 
 Two operational facts that follow: a failed broker's 1,000 partitions re-lead in seconds with zero data movement; a failed 100 TB data node is re-replicated by the whole pool in parallel — hours, not the days a Kafka broker replacement takes — and the exposure window *shrinks* as the cluster grows.
 
-**Pluggable placement** is the strategic hinge: sealed data can target dense local media (self-managed), object storage (cloud), or both (hybrid) — one architecture for all three deployment modes (§5).
+**Pluggable placement is the strategic hinge and a roadmap item:** current v0 implements replicated local data-node placement only. The target design allows sealed data to use dense local media (self-managed), object storage (cloud), or both (hybrid), subject to a future layout/read/repair/delete design (§5).
 
 ## 3. What you get
 
@@ -68,7 +68,7 @@ Four observations structure the field:
 
 ## 5. Strategy
 
-**One product line, three deployment modes.** Strata is not a parallel bet against object-store streaming — it is the same architecture with a different placement target: dense local media (self-managed), object storage (cloud), hybrid (hot quorum tier local, cold tier in any object store). The quorum-replicated hot layer — the hard, differentiating engineering — is common to all three. This makes the on-prem market the entry point of a single product line, and gives cloud customers a repatriation and hybrid story that S3-native competitors structurally cannot match.
+**One product line, three target deployment modes.** Strata is not a parallel bet against object-store streaming — the roadmap keeps a common architecture with different placement targets: dense local media (self-managed), object storage (cloud), and hybrid. Current v0 implements the quorum-replicated local layer; object and hybrid layouts still require explicit durability, transition, read, repair, and deletion semantics. The on-prem market remains the entry point, while the architecture preserves a future repatriation and hybrid story.
 
 **A banked option, deliberately unbuilt.** The storage layer is Kafka-agnostic by discipline — in substance a general primitive for single-writer log workloads (WAL-as-a-service, lakehouse log layers). The category's graveyard (Pravega, LogDevice, DistributedLog: general stream-storage layers with no committed first tenant) dictates how to hold it: the layer stays Kafka-ignorant inside, the product speaks only Kafka outside, and any second tenant waits until the first has paid for production maturity.
 

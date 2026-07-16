@@ -47,7 +47,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
@@ -1172,15 +1171,6 @@ public final class ChunkStore implements AutoCloseable {
             }
         } catch (IOException e) {
             log.warn("failed to delete {} {}", description, path, e);
-        }
-    }
-
-    private static void closeQuietly(FileChannel ch) {
-        if (ch == null) return;
-        try {
-            ch.close();
-        } catch (IOException e) {
-            log.warn("failed to close transient read channel", e);
         }
     }
 

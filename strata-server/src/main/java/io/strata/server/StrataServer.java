@@ -19,6 +19,11 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+import static io.strata.common.EnvConfig.intEnv;
+import static io.strata.common.EnvConfig.longEnv;
 
 /**
  * Production entrypoint. {@code strata data-node} runs a data node; {@code strata controller} runs a
@@ -32,6 +37,7 @@ import java.util.function.Consumer;
  */
 public final class StrataServer {
     private static final Logger log = LoggerFactory.getLogger(StrataServer.class);
+    private static final Function<String, String> SYSTEM_ENV = System::getenv;
 
     public static void main(String[] args) throws Exception {
         String role = args.length > 0 ? args[0] : env("STRATA_ROLE", null);
@@ -54,114 +60,49 @@ public final class StrataServer {
     }
 
     private static void runController() throws Exception {
-        ControllerConfig config = new ControllerConfig(
-                required("STRATA_ZK_CONNECT"),
-                intEnv("STRATA_LISTEN_PORT", 9_200),
-                intEnv("STRATA_HEARTBEAT_INTERVAL_MS", 3_000),
-                intEnv("STRATA_LEASE_MS", 10_000),
-                intEnv("STRATA_DEAD_GRACE_MS", 30_000),
-                intEnv("STRATA_REPAIR_SCAN_INTERVAL_MS", 5_000),
-                intEnv("STRATA_REPAIR_COMMAND_TIMEOUT_MS", 30_000))
-                // Endpoint a standby returns as the NOT_LEADER redirect hint. In containers/k8s the
-                // hostname() default is the container/pod id — set STRATA_ADVERTISED_HOST to a name
-                // clients can resolve (the service/DNS name) whenever more than one replica runs.
-                .withAdvertisedHost(env("STRATA_ADVERTISED_HOST", hostname()))
-                .withReconcileIntervalMs(intEnv("STRATA_REPAIR_RECONCILE_INTERVAL_MS", 15_000))
-                .withVerifyIntervalMs(intEnv("STRATA_VERIFY_INTERVAL_MS", 2_000))
-                .withVerifyBatchSize(intEnv("STRATA_VERIFY_BATCH_SIZE", 256))
-                .withSystemVerifyIntervalMs(intEnv("STRATA_SYSTEM_VERIFY_INTERVAL_MS", 30_000))
-                .withDeletedTombstoneTtlMs(longEnv("STRATA_CONTROLLER_DELETED_TOMBSTONE_TTL_MS", 600_000))
-                .withMaxCommandsPerHeartbeat(intEnv("STRATA_CONTROLLER_MAX_COMMANDS_PER_HEARTBEAT", 16))
-                .withZkRetryBaseMs(intEnv("STRATA_CONTROLLER_ZK_RETRY_BASE_MS", 100))
-                .withZkRetryMaxRetries(intEnv("STRATA_CONTROLLER_ZK_RETRY_MAX", 5))
-                .withMetadataBackend(metadataBackendConfig());
-        // Namespace sharding is OPT-IN (default off = single global leader). When enabled, namespaces are
-        // rendezvous-assigned across STRATA_CONTROLLER_ENDPOINTS so each controller node owns a shard. The
-        // client (ControllerClient) is sharding-aware: it keeps one connection per owner and routes each op
-        // to its namespace's owner, learning owners from NOT_LEADER redirect hints — so concurrent ops
-        // across owners do not thrash a single connection. Off by default to gate fleet-wide rollout.
-        if (boolEnv("STRATA_CONTROLLER_SHARDING", false)) {
-            config = config.withControllerEndpoints(endpoints(required("STRATA_CONTROLLER_ENDPOINTS")),
-                    intEnv("STRATA_CONTROLLER_REPLICA_COUNT", 3));
-        }
+        // Endpoint a standby returns as the NOT_LEADER redirect hint. In containers/k8s the
+        // hostname() default is the container/pod id — set STRATA_ADVERTISED_HOST to a name
+        // clients can resolve (the service/DNS name) whenever more than one replica runs.
+        ControllerConfig config = standaloneControllerConfigFromEnv(
+                () -> env("STRATA_ADVERTISED_HOST", hostname()));
+        RequestMetricsConfig requestMetrics = requestMetricsConfigFromEnv();
         Controller service = new Controller(config);
         log.info("controller started: endpoint={} zk={} leader={}",
                 service.endpoint(), config.zkConnect(), service.isLeader());
-        long nsRefreshMs = intEnv("STRATA_METRICS_NS_REFRESH_INTERVAL_MS", 10_000);
-        long[] buckets = parseBucketsMs(env("STRATA_METRICS_REQUEST_DURATION_BUCKETS_MS", null),
-                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
-        int latencySampleRate = requestLatencySampleRate();
         AutoCloseable metrics = null;
         try {
             metrics = startMetrics("controller", reg -> {
-                ServerMetrics.registerController(reg, service, nsRefreshMs);
-                service.setRequestObserver(ServerMetrics.requestObserver(reg, buckets, latencySampleRate));
+                ServerMetrics.registerController(reg, service, requestMetrics.namespaceRefreshMs());
+                service.setRequestObserver(ServerMetrics.requestObserver(
+                        reg, requestMetrics.durationBucketsMs(), requestMetrics.latencySampleRate()));
             }, () -> service.isLeader() && service.zkConnected());
             awaitShutdown("controller", metrics, service);
         } catch (Exception e) {
-            closeQuietly(metrics);
-            closeQuietly(service);
+            closeQuietly("controller metrics", metrics);
+            closeQuietly("controller", service);
             throw e;
         }
     }
 
     private static void runDataNode() throws Exception {
         String hostname = hostname();
-        DataNodeConfig config = new DataNodeConfig(
-                Path.of(env("STRATA_DATA_DIR", "/data")),
-                intEnv("STRATA_LISTEN_PORT", 9_100),
-                env("STRATA_ADVERTISED_HOST", hostname),
-                null,
-                endpoints(required("STRATA_CONTROLLER_ENDPOINTS")),
-                env("STRATA_ZONE", "z0"),
-                env("STRATA_RACK", "r0"),
-                env("STRATA_HOST", hostname),
-                longEnv("STRATA_CAPACITY_BYTES", 1L << 40),  // 1 TiB
-                intEnv("STRATA_SCRUB_INTERVAL_MS", 300_000)) // full re-CRC every 5 min (was 30s push x10)
-                .withNodeId(requiredIntEnv("STRATA_NODE_ID"))
-                .withOrphanGraceMs(longEnv("STRATA_ORPHAN_GRACE_MS", 6_000))
-                .withOrphanScanIntervalMs(longEnv("STRATA_ORPHAN_SCAN_INTERVAL_MS", 3_000))
-                .withOrphanStartupGraceMs(longEnv("STRATA_ORPHAN_STARTUP_GRACE_MS", 6_000))
-                .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
-                .withOrphanDeleteMaxConfirmedPerNamespacePerPass(
-                        intEnv("STRATA_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS",
-                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS))
-                .withOrphanDeleteMaxNamespacePercentPerPass(
-                        intEnv("STRATA_ORPHAN_DELETE_MAX_NAMESPACE_PERCENT_PER_PASS",
-                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_NAMESPACE_PERCENT_PER_PASS))
-                .withOrphanDeleteMaxConfirmedPerNodePass(
-                        intEnv("STRATA_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS",
-                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS))
-                .withOrphanDeleteMaxCumulativePerNamespace(
-                        intEnv("STRATA_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NAMESPACE",
-                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NAMESPACE))
-                .withOrphanDeleteMaxCumulativePerNode(
-                        intEnv("STRATA_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NODE",
-                                DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CUMULATIVE_PER_NODE))
-                .withControlCallTimeoutMs(intEnv("STRATA_CONTROL_CALL_TIMEOUT_MS", 10_000))
-                .withControlCommandLimits(intEnv("STRATA_NODE_COMMAND_PARALLELISM", 8),
-                        intEnv("STRATA_NODE_MAX_QUEUED_COMMANDS", 1024))
-                .withRepairFetchBytes(intEnv("STRATA_REPAIR_FETCH_BYTES", 4 * 1024 * 1024))
-                .withDeleteMaxConcurrent(intEnv("STRATA_DELETE_MAX_CONCURRENT", 1))
-                .withDeleteMinIntervalMs(longEnv("STRATA_DELETE_MIN_INTERVAL_MS", 50))
-                .withChunkStoreConfig(chunkStoreConfigFromEnv());
+        DataNodeConfig config = dataNodeConfigFromEnv(hostname,
+                () -> env("STRATA_ADVERTISED_HOST", hostname));
+        RequestMetricsConfig requestMetrics = requestMetricsConfigFromEnv();
         DataNode node = new DataNode(config);
         log.info("data node started: endpoint={} dataDir={} controller={}",
                 node.endpoint(), config.dataDir(), config.controllerEndpoints());
-        long nsRefreshMs = intEnv("STRATA_METRICS_NS_REFRESH_INTERVAL_MS", 10_000);
-        long[] buckets = parseBucketsMs(env("STRATA_METRICS_REQUEST_DURATION_BUCKETS_MS", null),
-                new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
-        int latencySampleRate = requestLatencySampleRate();
         AutoCloseable metrics = null;
         try {
             metrics = startMetrics("data-node", reg -> {
-                ServerMetrics.registerDataNode(reg, node, nsRefreshMs);
-                node.setRequestObserver(ServerMetrics.requestObserver(reg, buckets, latencySampleRate));
+                ServerMetrics.registerDataNode(reg, node, requestMetrics.namespaceRefreshMs());
+                node.setRequestObserver(ServerMetrics.requestObserver(
+                        reg, requestMetrics.durationBucketsMs(), requestMetrics.latencySampleRate()));
             }, node::registered);
             awaitShutdown("data node", metrics, node);
         } catch (Exception e) {
-            closeQuietly(metrics);
-            closeQuietly(node);
+            closeQuietly("data-node metrics", metrics);
+            closeQuietly("data node", node);
             throw e;
         }
     }
@@ -178,48 +119,139 @@ public final class StrataServer {
     private static void runCombined() throws Exception {
         String hostname = hostname();
         String advertisedHost = env("STRATA_ADVERTISED_HOST", hostname);
-        ControllerConfig controllerConfig = new ControllerConfig(
-                required("STRATA_ZK_CONNECT"),
-                intEnv("STRATA_LISTEN_PORT", 9_100),  // unused in embedded mode (controller shares the node's listener)
-                intEnv("STRATA_HEARTBEAT_INTERVAL_MS", 3_000),
-                intEnv("STRATA_LEASE_MS", 10_000),
-                intEnv("STRATA_DEAD_GRACE_MS", 30_000),
-                intEnv("STRATA_REPAIR_SCAN_INTERVAL_MS", 5_000),
-                intEnv("STRATA_REPAIR_COMMAND_TIMEOUT_MS", 30_000))
-                .withAdvertisedHost(advertisedHost)
-                .withReconcileIntervalMs(intEnv("STRATA_REPAIR_RECONCILE_INTERVAL_MS", 15_000))
-                .withVerifyIntervalMs(intEnv("STRATA_VERIFY_INTERVAL_MS", 2_000))
-                .withVerifyBatchSize(intEnv("STRATA_VERIFY_BATCH_SIZE", 256))
-                .withSystemVerifyIntervalMs(intEnv("STRATA_SYSTEM_VERIFY_INTERVAL_MS", 30_000))
-                .withDeletedTombstoneTtlMs(longEnv("STRATA_CONTROLLER_DELETED_TOMBSTONE_TTL_MS", 600_000))
-                .withMaxCommandsPerHeartbeat(intEnv("STRATA_CONTROLLER_MAX_COMMANDS_PER_HEARTBEAT", 16))
-                .withZkRetryBaseMs(intEnv("STRATA_CONTROLLER_ZK_RETRY_BASE_MS", 100))
-                .withZkRetryMaxRetries(intEnv("STRATA_CONTROLLER_ZK_RETRY_MAX", 5))
-                .withMetadataBackend(metadataBackendConfig());
-        // Namespace sharding is OPT-IN (default off = single global leader). The sharding-aware client
-        // (ControllerClient) keeps one connection per owner and routes each op to its namespace's owner,
-        // so it does not thrash a single connection. Off by default to gate rollout. See runController /
-        // STRATA_CONTROLLER_SHARDING.
-        if (boolEnv("STRATA_CONTROLLER_SHARDING", false)) {
-            controllerConfig = controllerConfig.withControllerEndpoints(endpoints(required("STRATA_CONTROLLER_ENDPOINTS")),
-                    intEnv("STRATA_CONTROLLER_REPLICA_COUNT", 3));
+        ControllerConfig controllerConfig = combinedControllerConfigFromEnv(() -> advertisedHost);
+        DataNodeConfig nodeConfig = dataNodeConfigFromEnv(hostname, () -> advertisedHost);
+        Combined combined = startCombined(controllerConfig, nodeConfig);
+        log.info("combined node started: scp={} zk={}", combined.node().endpoint(), controllerConfig.zkConnect());
+        awaitShutdown("combined node", combined);
+    }
+
+    /**
+     * Builds and starts a co-resident controller + data node behind a single combined
+     * metrics endpoint, and returns a handle that closes both (node first, then controller). The controller is
+     * built first so it can join the leader latch before the node tries to register.
+     */
+    static Combined startCombined(ControllerConfig controllerConfig, DataNodeConfig nodeConfig) throws Exception {
+        return startCombined(controllerConfig, nodeConfig,
+                (registrar, ready) -> startMetrics("combined", registrar, ready));
+    }
+
+    static Combined startCombined(ControllerConfig controllerConfig, DataNodeConfig nodeConfig,
+                                  CombinedMetricsStarter metricsStarter) throws Exception {
+        validateCombinedListenPort(nodeConfig);
+        RequestMetricsConfig requestMetrics = requestMetricsConfigFromEnv();
+        return startCombined(controllerConfig, nodeConfig, requestMetrics, metricsStarter);
+    }
+
+    private static Combined startCombined(ControllerConfig controllerConfig, DataNodeConfig nodeConfig,
+                                          RequestMetricsConfig requestMetrics,
+                                          CombinedMetricsStarter metricsStarter) throws Exception {
+        Controller controller = null;
+        DataNode node = null;
+        try {
+            // One SCP listener for both planes: the controller runs embedded (no own port), served on the
+            // node's listener which routes metadata opcodes to it. The controller advertises the node's
+            // reachable endpoint as the NOT_LEADER redirect hint, so combined mode needs a FIXED node
+            // port — an ephemeral (0) port would advertise an unreachable ":0" hint before the real
+            // port is even bound.
+            String combinedEndpoint = nodeConfig.advertisedHost() + ":" + nodeConfig.listenPort();
+            controller = new Controller(controllerConfig, combinedEndpoint);
+            node = new DataNode(nodeConfig, controller.handler());
+            Controller startedController = controller;
+            DataNode startedNode = node;
+            AutoCloseable metrics = metricsStarter.start(reg -> {
+                ServerMetrics.registerController(reg, startedController, requestMetrics.namespaceRefreshMs());
+                ServerMetrics.registerDataNode(reg, startedNode, requestMetrics.namespaceRefreshMs());
+                // The single (node) listener serves both planes, so observe there; the embedded controller
+                // has no server of its own.
+                startedNode.setRequestObserver(ServerMetrics.requestObserver(
+                        reg, requestMetrics.durationBucketsMs(), requestMetrics.latencySampleRate()));
+            }, () -> startedController.isLeader() && startedController.zkConnected() && startedNode.registered());
+            return new Combined(controller, node, metrics);
+        } catch (Exception e) {
+            // a partial start must not leak the controller's ZK session or the node's listener
+            throw cleanupAfterFailedCombinedStart(e, node, controller);
         }
-        DataNodeConfig nodeConfig = new DataNodeConfig(
+    }
+
+    private static void validateCombinedListenPort(DataNodeConfig nodeConfig) {
+        if (nodeConfig.listenPort() == 0) {
+            throw new IllegalArgumentException(
+                    "combined mode requires a fixed node listenPort (not ephemeral 0): the embedded "
+                            + "controller advertises advertisedHost:listenPort as its leader redirect hint");
+        }
+    }
+
+    private static ControllerConfig standaloneControllerConfigFromEnv(Supplier<String> advertisedHost) {
+        return standaloneControllerConfigFromEnv(advertisedHost, SYSTEM_ENV);
+    }
+
+    static ControllerConfig standaloneControllerConfigFromEnv(Supplier<String> advertisedHost,
+                                                               Function<String, String> environment) {
+        return controllerConfigFromEnv(9_200, advertisedHost, environment);
+    }
+
+    private static ControllerConfig combinedControllerConfigFromEnv(Supplier<String> advertisedHost) {
+        return combinedControllerConfigFromEnv(advertisedHost, SYSTEM_ENV);
+    }
+
+    static ControllerConfig combinedControllerConfigFromEnv(Supplier<String> advertisedHost,
+                                                             Function<String, String> environment) {
+        return controllerConfigFromEnv(9_100, advertisedHost, environment);
+    }
+
+    private static ControllerConfig controllerConfigFromEnv(int defaultListenPort, Supplier<String> advertisedHost,
+                                                            Function<String, String> environment) {
+        ControllerConfig config = new ControllerConfig(
+                required(environment, "STRATA_ZK_CONNECT"),
+                intEnvFrom(environment, "STRATA_LISTEN_PORT", defaultListenPort),
+                intEnvFrom(environment, "STRATA_HEARTBEAT_INTERVAL_MS", 3_000),
+                intEnvFrom(environment, "STRATA_LEASE_MS", 10_000),
+                intEnvFrom(environment, "STRATA_DEAD_GRACE_MS", 30_000),
+                intEnvFrom(environment, "STRATA_REPAIR_SCAN_INTERVAL_MS", 5_000),
+                intEnvFrom(environment, "STRATA_REPAIR_COMMAND_TIMEOUT_MS", 30_000))
+                .withAdvertisedHost(advertisedHost.get())
+                .withReconcileIntervalMs(intEnvFrom(environment, "STRATA_REPAIR_RECONCILE_INTERVAL_MS", 15_000))
+                .withVerifyIntervalMs(intEnvFrom(environment, "STRATA_VERIFY_INTERVAL_MS", 2_000))
+                .withVerifyBatchSize(intEnvFrom(environment, "STRATA_VERIFY_BATCH_SIZE", 256))
+                .withSystemVerifyIntervalMs(intEnvFrom(environment, "STRATA_SYSTEM_VERIFY_INTERVAL_MS", 30_000))
+                .withDeletedTombstoneTtlMs(longEnvFrom(
+                        environment, "STRATA_CONTROLLER_DELETED_TOMBSTONE_TTL_MS", 600_000))
+                .withMaxCommandsPerHeartbeat(intEnvFrom(
+                        environment, "STRATA_CONTROLLER_MAX_COMMANDS_PER_HEARTBEAT", 16))
+                .withZkRetryBaseMs(intEnvFrom(environment, "STRATA_CONTROLLER_ZK_RETRY_BASE_MS", 100))
+                .withZkRetryMaxRetries(intEnvFrom(environment, "STRATA_CONTROLLER_ZK_RETRY_MAX", 5))
+                .withMetadataBackend(metadataBackendConfig(environment));
+        // Namespace sharding is opt-in. The owner-aware client keeps one connection per owner,
+        // so concurrent namespace traffic does not thrash a single redirected connection.
+        if (boolEnvFrom(environment, "STRATA_CONTROLLER_SHARDING", false)) {
+            config = config.withControllerEndpoints(
+                    endpoints(required(environment, "STRATA_CONTROLLER_ENDPOINTS")),
+                    intEnvFrom(environment, "STRATA_CONTROLLER_REPLICA_COUNT", 3));
+        }
+        return config;
+    }
+
+    private static DataNodeConfig dataNodeConfigFromEnv(String hostname, Supplier<String> advertisedHost) {
+        return new DataNodeConfig(
                 Path.of(env("STRATA_DATA_DIR", "/data")),
                 intEnv("STRATA_LISTEN_PORT", 9_100),
-                advertisedHost,
+                advertisedHost.get(),
                 null,
                 endpoints(required("STRATA_CONTROLLER_ENDPOINTS")),
                 env("STRATA_ZONE", "z0"),
                 env("STRATA_RACK", "r0"),
                 env("STRATA_HOST", hostname),
                 longEnv("STRATA_CAPACITY_BYTES", 1L << 40),  // 1 TiB
-                intEnv("STRATA_SCRUB_INTERVAL_MS", 300_000)) // full re-CRC every 5 min (was 30s push x10)
+                intEnv("STRATA_SCRUB_INTERVAL_MS", 300_000)) // full re-CRC every 5 min
                 .withNodeId(requiredIntEnv("STRATA_NODE_ID"))
-                .withOrphanGraceMs(longEnv("STRATA_ORPHAN_GRACE_MS", 6_000))
-                .withOrphanScanIntervalMs(longEnv("STRATA_ORPHAN_SCAN_INTERVAL_MS", 3_000))
-                .withOrphanStartupGraceMs(longEnv("STRATA_ORPHAN_STARTUP_GRACE_MS", 6_000))
-                .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS", 5_000))
+                .withOrphanGraceMs(longEnv("STRATA_ORPHAN_GRACE_MS", DataNodeConfig.DEFAULT_ORPHAN_GRACE_MS))
+                .withOrphanScanIntervalMs(longEnv("STRATA_ORPHAN_SCAN_INTERVAL_MS",
+                        DataNodeConfig.DEFAULT_ORPHAN_SCAN_INTERVAL_MS))
+                .withOrphanStartupGraceMs(longEnv("STRATA_ORPHAN_STARTUP_GRACE_MS",
+                        DataNodeConfig.DEFAULT_ORPHAN_STARTUP_GRACE_MS))
+                .withOrphanConfirmTimeoutMs(intEnv("STRATA_ORPHAN_CONFIRM_TIMEOUT_MS",
+                        DataNodeConfig.DEFAULT_ORPHAN_CONFIRM_TIMEOUT_MS))
                 .withOrphanDeleteMaxConfirmedPerNamespacePerPass(
                         intEnv("STRATA_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS",
                                 DataNodeConfig.DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS))
@@ -242,69 +274,58 @@ public final class StrataServer {
                 .withDeleteMaxConcurrent(intEnv("STRATA_DELETE_MAX_CONCURRENT", 1))
                 .withDeleteMinIntervalMs(longEnv("STRATA_DELETE_MIN_INTERVAL_MS", 50))
                 .withChunkStoreConfig(chunkStoreConfigFromEnv());
-        Combined combined = startCombined(controllerConfig, nodeConfig);
-        log.info("combined node started: scp={} zk={}", combined.node().endpoint(), controllerConfig.zkConnect());
-        awaitShutdown("combined node", combined);
-    }
-
-    /**
-     * Builds and starts a co-resident controller + data node behind a single combined
-     * metrics endpoint, and returns a handle that closes both (node first, then controller). The controller is
-     * built first so it can join the leader latch before the node tries to register.
-     */
-    static Combined startCombined(ControllerConfig controllerConfig, DataNodeConfig nodeConfig) throws Exception {
-        Controller controller = null;
-        DataNode node = null;
-        try {
-            // One SCP listener for both planes: the controller runs embedded (no own port), served on the
-            // node's listener which routes metadata opcodes to it. The controller advertises the node's
-            // reachable endpoint as the NOT_LEADER redirect hint, so combined mode needs a FIXED node
-            // port — an ephemeral (0) port would advertise an unreachable ":0" hint before the real
-            // port is even bound.
-            if (nodeConfig.listenPort() == 0) {
-                throw new IllegalArgumentException(
-                        "combined mode requires a fixed node listenPort (not ephemeral 0): the embedded "
-                                + "controller advertises advertisedHost:listenPort as its leader redirect hint");
-            }
-            String combinedEndpoint = nodeConfig.advertisedHost() + ":" + nodeConfig.listenPort();
-            controller = new Controller(controllerConfig, combinedEndpoint);
-            node = new DataNode(nodeConfig, controller.handler());
-            Controller startedController = controller;
-            DataNode startedNode = node;
-            long nsRefreshMs = intEnv("STRATA_METRICS_NS_REFRESH_INTERVAL_MS", 10_000);
-            long[] buckets = parseBucketsMs(env("STRATA_METRICS_REQUEST_DURATION_BUCKETS_MS", null),
-                    new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000});
-            int latencySampleRate = requestLatencySampleRate();
-            AutoCloseable metrics = startMetrics("combined", reg -> {
-                ServerMetrics.registerController(reg, startedController, nsRefreshMs);
-                ServerMetrics.registerDataNode(reg, startedNode, nsRefreshMs);
-                // The single (node) listener serves both planes, so observe there; the embedded controller
-                // has no server of its own.
-                startedNode.setRequestObserver(ServerMetrics.requestObserver(reg, buckets, latencySampleRate));
-            }, () -> startedController.isLeader() && startedController.zkConnected() && startedNode.registered());
-            return new Combined(controller, node, metrics);
-        } catch (Exception e) {
-            // a partial start must not leak the controller's ZK session or the node's listener
-            closeQuietly(node);
-            closeQuietly(controller);
-            throw e;
-        }
     }
 
     private static ChunkStoreConfig chunkStoreConfigFromEnv() {
         return new ChunkStoreConfig(
-                intEnv("STRATA_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
-                longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS", 10_000),
-                longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS", 1_000_000),
-                longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS", 50_000_000),
-                boolEnv("STRATA_SEAL_FSYNC", false),
-                longEnv("STRATA_BG_FLUSH_INTERVAL_MS", 500),
-                longEnv("STRATA_BG_FLUSH_THRESHOLD_BYTES", 4L << 20),
-                longEnv("STRATA_SLOW_APPEND_LOG_MS", 1_000),
-                longEnv("STRATA_SLOW_MUTATION_LOG_MS", 500),
+                intEnv("STRATA_MAX_REQUEST_BYTES", ChunkStoreConfig.DEFAULT_MAX_REQUEST_BYTES),
+                longEnv("STRATA_GROUPCOMMIT_DRAIN_TIMEOUT_MS",
+                        ChunkStoreConfig.DEFAULT_GROUP_COMMIT_DRAIN_TIMEOUT_MS),
+                longEnv("STRATA_GROUPCOMMIT_MIN_ACCUMULATION_NANOS",
+                        ChunkStoreConfig.DEFAULT_GROUP_COMMIT_MIN_ACCUMULATION_NANOS),
+                longEnv("STRATA_GROUPCOMMIT_MAX_ACCUMULATION_NANOS",
+                        ChunkStoreConfig.DEFAULT_GROUP_COMMIT_MAX_ACCUMULATION_NANOS),
+                boolEnv("STRATA_SEAL_FSYNC", ChunkStoreConfig.DEFAULT_SEAL_FSYNC),
+                longEnv("STRATA_BG_FLUSH_INTERVAL_MS", ChunkStoreConfig.DEFAULT_BACKGROUND_FLUSH_INTERVAL_MS),
+                longEnv("STRATA_BG_FLUSH_THRESHOLD_BYTES",
+                        ChunkStoreConfig.DEFAULT_BACKGROUND_FLUSH_THRESHOLD_BYTES),
+                longEnv("STRATA_SLOW_APPEND_LOG_MS", ChunkStoreConfig.DEFAULT_SLOW_APPEND_LOG_MS),
+                longEnv("STRATA_SLOW_MUTATION_LOG_MS", ChunkStoreConfig.DEFAULT_SLOW_MUTATION_LOG_MS),
                 intEnv("STRATA_FILE_CHANNEL_CACHE_MAX_SIZE", ChunkStoreConfig.DEFAULT.channelCacheMaxSize()),
                 intEnv("STRATA_MAX_OPEN_CHUNK_LEDGER_ENTRIES",
                         ChunkStoreConfig.DEFAULT.maxOpenChunkLedgerEntries()));
+    }
+
+    record RequestMetricsConfig(long namespaceRefreshMs, long[] durationBucketsMs, int latencySampleRate) {
+        RequestMetricsConfig {
+            if (namespaceRefreshMs <= 0) {
+                throw new IllegalArgumentException("namespaceRefreshMs must be positive: " + namespaceRefreshMs);
+            }
+            if (durationBucketsMs == null || durationBucketsMs.length == 0) {
+                throw new IllegalArgumentException("durationBucketsMs must be non-null and non-empty");
+            }
+            if (latencySampleRate <= 0) {
+                throw new IllegalArgumentException("latencySampleRate must be positive: " + latencySampleRate);
+            }
+        }
+    }
+
+    @FunctionalInterface
+    interface CombinedMetricsStarter {
+        AutoCloseable start(Consumer<MeterRegistry> registrar, BooleanSupplier ready) throws Exception;
+    }
+
+    private static RequestMetricsConfig requestMetricsConfigFromEnv() {
+        return requestMetricsConfigFromEnv(SYSTEM_ENV);
+    }
+
+    static RequestMetricsConfig requestMetricsConfigFromEnv(Function<String, String> environment) {
+        return new RequestMetricsConfig(
+                parsePositiveIntEnv("STRATA_METRICS_NS_REFRESH_INTERVAL_MS",
+                        env(environment, "STRATA_METRICS_NS_REFRESH_INTERVAL_MS", null), 10_000),
+                parseBucketsMs(env(environment, "STRATA_METRICS_REQUEST_DURATION_BUCKETS_MS", null),
+                        new long[]{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000}),
+                requestLatencySampleRate(environment));
     }
 
     /** Co-resident controller + node + their shared metrics endpoint; closes node before controller on shutdown. */
@@ -329,12 +350,19 @@ public final class StrataServer {
         }
     }
 
-    private static void closeQuietly(AutoCloseable c) {
+    private static Exception cleanupAfterFailedCombinedStart(Exception startupFailure,
+                                                             AutoCloseable node, AutoCloseable controller) {
+        closeQuietly("data node", node);
+        closeQuietly("controller", controller);
+        return startupFailure;
+    }
+
+    private static void closeQuietly(String resource, AutoCloseable c) {
         if (c != null) {
             try {
                 c.close();
-            } catch (Exception ignored) {
-                // best-effort cleanup on a partial start
+            } catch (Exception e) {
+                log.warn("error closing {} after failed startup", resource, e);
             }
         }
     }
@@ -344,10 +372,6 @@ public final class StrataServer {
      * role's domain metrics + JVM binders, and returns a handle that closes both. Returns a no-op
      * when metrics are disabled.
      */
-    private static AutoCloseable startMetrics(String role, Consumer<MeterRegistry> registrar) throws IOException {
-        return startMetrics(role, registrar, () -> true);
-    }
-
     private static AutoCloseable startMetrics(String role, Consumer<MeterRegistry> registrar,
                                               BooleanSupplier ready) throws IOException {
         if (!boolEnv("STRATA_METRICS_ENABLED", true)) {
@@ -399,12 +423,17 @@ public final class StrataServer {
     }
 
     static String env(String key, String def) {
-        String v = System.getenv(key);
+        return env(SYSTEM_ENV, key, def);
+    }
+
+    private static String env(Function<String, String> environment, String key, String def) {
+        String v = environment.apply(key);
         return (v == null || v.isBlank()) ? def : v.trim();
     }
 
-    private static ControllerConfig.MetadataBackendConfig metadataBackendConfig() {
-        String backend = env("STRATA_CONTROLLER_BACKEND", "zk");
+    private static ControllerConfig.MetadataBackendConfig metadataBackendConfig(
+            Function<String, String> environment) {
+        String backend = env(environment, "STRATA_CONTROLLER_BACKEND", "zk");
         if (!"namespace-log".equalsIgnoreCase(backend)) {
             return new ControllerConfig.MetadataBackendConfig(backend, 3, 2, false,
                     4 * 1024 * 1024, 30_000, true,
@@ -412,21 +441,25 @@ public final class StrataServer {
                     ControllerConfig.DEFAULT_NAMESPACE_LOG_CHUNK_ROLL_BYTES);
         }
         return new ControllerConfig.MetadataBackendConfig("namespace-log",
-                intEnv("STRATA_CONTROLLER_LOG_RF", 3),
-                intEnv("STRATA_CONTROLLER_LOG_ACK", 2),
-                boolEnv("STRATA_CONTROLLER_LOG_FSYNC", false),
-                intEnv("STRATA_CONTROLLER_LOG_COMPACT_BYTES", 4 * 1024 * 1024),
-                intEnv("STRATA_CONTROLLER_LOG_COMPACT_INTERVAL_MS", 30_000),
-                boolEnv("STRATA_CONTROLLER_LOG_ORPHAN_GC", true),
-                intEnv("STRATA_CONTROLLER_LOG_RETENTION_MS",
+                intEnvFrom(environment, "STRATA_CONTROLLER_LOG_RF", 3),
+                intEnvFrom(environment, "STRATA_CONTROLLER_LOG_ACK", 2),
+                boolEnvFrom(environment, "STRATA_CONTROLLER_LOG_FSYNC", false),
+                intEnvFrom(environment, "STRATA_CONTROLLER_LOG_COMPACT_BYTES", 4 * 1024 * 1024),
+                intEnvFrom(environment, "STRATA_CONTROLLER_LOG_COMPACT_INTERVAL_MS", 30_000),
+                boolEnvFrom(environment, "STRATA_CONTROLLER_LOG_ORPHAN_GC", true),
+                intEnvFrom(environment, "STRATA_CONTROLLER_LOG_RETENTION_MS",
                         ControllerConfig.DEFAULT_NAMESPACE_LOG_RETENTION_MS),
-                intEnv("STRATA_CONTROLLER_LOG_READ_CHUNK_BYTES", 4 * 1024 * 1024),
-                longEnv("STRATA_CONTROLLER_LOG_CHUNK_ROLL_BYTES",
+                intEnvFrom(environment, "STRATA_CONTROLLER_LOG_READ_CHUNK_BYTES", 4 * 1024 * 1024),
+                longEnvFrom(environment, "STRATA_CONTROLLER_LOG_CHUNK_ROLL_BYTES",
                         ControllerConfig.DEFAULT_NAMESPACE_LOG_CHUNK_ROLL_BYTES));
     }
 
     private static String required(String key) {
-        String v = env(key, null);
+        return required(SYSTEM_ENV, key);
+    }
+
+    private static String required(Function<String, String> environment, String key) {
+        String v = env(environment, key, null);
         if (v == null) {
             System.err.println("missing required environment variable " + key);
             System.exit(2);
@@ -434,27 +467,31 @@ public final class StrataServer {
         return v;
     }
 
-    private static int intEnv(String key, int def) {
-        String v = env(key, null);
-        return v == null ? def : Integer.parseInt(v);
-    }
-
     private static int requiredIntEnv(String key) {
         return Integer.parseInt(required(key));
     }
 
-    private static long longEnv(String key, long def) {
-        String v = env(key, null);
-        return v == null ? def : Long.parseLong(v);
-    }
-
     private static boolean boolEnv(String key, boolean def) {
-        return parseBoolEnv(key, env(key, null), def);
+        return boolEnvFrom(SYSTEM_ENV, key, def);
     }
 
-    private static int requestLatencySampleRate() {
+    private static boolean boolEnvFrom(Function<String, String> environment, String key, boolean def) {
+        return parseBoolEnv(key, env(environment, key, null), def);
+    }
+
+    private static int intEnvFrom(Function<String, String> environment, String key, int def) {
+        String value = env(environment, key, null);
+        return value == null ? def : Integer.parseInt(value);
+    }
+
+    private static long longEnvFrom(Function<String, String> environment, String key, long def) {
+        String value = env(environment, key, null);
+        return value == null ? def : Long.parseLong(value);
+    }
+
+    private static int requestLatencySampleRate(Function<String, String> environment) {
         return parsePositiveIntEnv("STRATA_METRICS_REQUEST_LATENCY_SAMPLE_RATE",
-                env("STRATA_METRICS_REQUEST_LATENCY_SAMPLE_RATE", null),
+                env(environment, "STRATA_METRICS_REQUEST_LATENCY_SAMPLE_RATE", null),
                 ServerMetrics.DEFAULT_REQUEST_LATENCY_SAMPLE_RATE);
     }
 

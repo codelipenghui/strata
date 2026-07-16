@@ -51,6 +51,21 @@ class OrphanGcTest {
     }
 
     @Test
+    void rejectsNullDeleteServiceAtConstruction() throws Exception {
+        try (ChunkStore store = new ChunkStore(dir.resolve("chunks"))) {
+            NullPointerException error = assertThrows(NullPointerException.class,
+                    () -> new OrphanGc(store, null, NODE_ID, List.of(),
+                            0, 60_000, 0, 5_000, 64, 0, 0, 0, 0));
+            assertEquals("deletes", error.getMessage());
+        }
+
+        NullPointerException error = assertThrows(NullPointerException.class,
+                () -> new OrphanGc(null, null, NODE_ID, List.of(),
+                        0, 60_000, 0, 5_000, 64, 0, 0, 0, 0));
+        assertEquals("store", error.getMessage(), "store validation must retain its original precedence");
+    }
+
+    @Test
     void systemNamespaceConfirmUsesMetadataClientKind() throws Exception {
         StrataNamespace system = StrataNamespace.of("strata-meta");
         ChunkId chunk = new ChunkId(FileId.of(1), 0);
@@ -491,8 +506,7 @@ class OrphanGcTest {
                  freshCalls.incrementAndGet();
                  return confirmResponse(req, true, true, 8);
              })) {
-            ChunkDeleteService deletes = new ChunkDeleteService(restarted.store(), 1, 0);
-            OrphanGc gc = new OrphanGc(restarted.store(), deletes, NODE_ID,
+            OrphanGc gc = new OrphanGc(restarted.store(), NODE_ID,
                     List.of("127.0.0.1:" + staleOwner.port(), "127.0.0.1:" + freshOwner.port()),
                     0, 60_000, 0, 5_000, 64, 0, 0, 0, 0,
                     restarted::acceptAuthoritativeOwnerEpoch, restarted::deleteConfirmedOrphan);
@@ -830,7 +844,7 @@ class OrphanGcTest {
              })) {
             seal(store, chunk);
             ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
-            OrphanGc gc = new OrphanGc(store, deletes, NODE_ID,
+            OrphanGc gc = new OrphanGc(store, NODE_ID,
                     List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000,
                     64, 0, 0, 0, 0,
                     (namespace, ownerEpoch) -> {},
@@ -865,8 +879,7 @@ class OrphanGcTest {
              })) {
             seal(store, failed);
             seal(store, healthy);
-            ChunkDeleteService deletes = new ChunkDeleteService(store, 1, 0);
-            OrphanGc gc = new OrphanGc(store, deletes, NODE_ID,
+            OrphanGc gc = new OrphanGc(store, NODE_ID,
                     List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000,
                     64, 0, 0, 0, 0,
                     (namespace, ownerEpoch) -> {},

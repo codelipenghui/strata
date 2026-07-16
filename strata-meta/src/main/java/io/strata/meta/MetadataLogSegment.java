@@ -6,7 +6,7 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * One active metadata-log segment (design §8): an append-only sequence of CRC-framed records starting
+ * One active metadata-log segment (tech design §4.2): an append-only sequence of CRC-framed records starting
  * at {@code baseOffset}. {@link #append} frames a record and advances the byte end offset; {@link
  * #recover} rebuilds a segment from durable bytes keeping only the valid prefix (a torn tail append is
  * discarded). Byte offsets are the log's positions — {@code baseOffset} aligns with the manifest's

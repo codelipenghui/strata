@@ -14,15 +14,15 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Owns one namespace's metadata log: recovery, durable append, snapshot compaction, and manifest
- * version-CAS publication (design §8–§10, §13).
+ * version-CAS publication (tech design §4.2 and §4.5).
  *
  * <p>On {@link #open} it recovers state from the published manifest, then compacts (writes a fresh
  * snapshot, rolls a new empty open-log file) and CAS-publishes a new manifest BEFORE accepting writes —
  * the metadata-epoch fencing rule: a stale leader holding the old open file cannot append bytes that a
- * successor would later publish (design §8, §13 step 6). A lost or ambiguous manifest CAS means this owner
+ * successor would later publish (tech design §4.2 and §4.5). A lost or ambiguous manifest CAS means this owner
  * cannot prove publication, so the caller must re-recover under a new epoch.
  *
- * <p>Durability ordering (design §15): an append writes to the file store first; only a durable append
+ * <p>Durability ordering (tech design §4.2): an append writes to the file store first; only a durable append
  * mutates in-memory state, so a failed physical append never advances visible metadata. Manifest
  * publication is the linearizable barrier validated in {@code tla/MetadataManifestCAS.tla}.
  */
@@ -39,7 +39,6 @@ final class NamespaceMetadataLogRepository {
 
     private NamespaceMetadataState state;
     private FileId logFileId;
-    private FileId snapshotFileId;
     private long logStartOffset; // base offset of the open log file (== the snapshot cut)
     private long appliedOffset;  // durable end offset
     private long generation;
@@ -174,7 +173,7 @@ final class NamespaceMetadataLogRepository {
     }
 
     /**
-     * Non-blocking (copy-on-write) open-log compaction (design §10). Splits compaction into a short locked
+     * Non-blocking (copy-on-write) open-log compaction (tech design §4.2). Splits compaction into a short locked
      * freeze, a long UNLOCKED snapshot encode + write, and a short locked manifest CAS + pointer swap, so
      * the namespace keeps accepting metadata writes for the (size-proportional) duration of its own
      * compaction. Returns {@code true} if a manifest was published, {@code false} if the call was skipped
@@ -289,7 +288,6 @@ final class NamespaceMetadataLogRepository {
             throw new IllegalStateException("manifest CAS lost or ambiguous for namespace " + namespace
                     + " — fenced; recover again under a new epoch");
         }
-        this.snapshotFileId = newSnapshot;
         this.logFileId = newLog;
         this.logStartOffset = frozen.cut();
         // appliedOffset is preserved: the tail [cut, appliedOffset) was carried into the new log, so the
@@ -297,8 +295,8 @@ final class NamespaceMetadataLogRepository {
         this.generation = frozen.newGeneration();
         this.manifestVersion = newVersion.getAsInt();
         this.publishedManifest = published;
-        // The just-superseded generation (old snapshot/log) is NOT deleted inline (issue #8, design §10 step
-        // 6): it is retained as a rollback margin and reclaimed by the retention-gated sweep
+        // The just-superseded generation (old snapshot/log) is NOT deleted inline (issue #8,
+        // tech design §4.2): it is retained as a rollback margin and reclaimed by the retention-gated sweep
         // (NamespaceLogBackend.gcOrphanedSystemFiles) once STRATA_CONTROLLER_LOG_RETENTION_MS has elapsed.
         return true;
     }
@@ -339,7 +337,7 @@ final class NamespaceMetadataLogRepository {
                 newGeneration, cut, cut, Optional.of(newSnapshot), Optional.of(newLog), previous);
         // Crash window: the new snapshot/log files exist but the manifest still points at the old
         // generation. A crash here must leave the OLD manifest fully recoverable — compaction is atomic
-        // at the manifest CAS (design §10) — see the failure-injection test.
+        // at the manifest CAS (tech design §4.2) — see the failure-injection test.
         FailureInjector.point("meta.log.beforeManifestPublish");
         OptionalInt newVersion = rootStore.putNamespaceManifest(published, expectedVersion);
         if (newVersion.isEmpty()) {
@@ -352,7 +350,6 @@ final class NamespaceMetadataLogRepository {
             throw new IllegalStateException("manifest CAS lost or ambiguous for namespace " + namespace
                     + " — fenced; recover again under a new epoch");
         }
-        this.snapshotFileId = newSnapshot;
         this.logFileId = newLog;
         this.logStartOffset = cut;
         this.appliedOffset = cut;
@@ -361,8 +358,8 @@ final class NamespaceMetadataLogRepository {
         // transient read failure leaves manifestVersion stale (which would fence the namespace on next CAS).
         this.manifestVersion = newVersion.getAsInt();
         this.publishedManifest = published;
-        // The just-superseded generation (old snapshot/log) is NOT deleted inline (issue #8, design §10 step
-        // 6): it is retained as a rollback margin and reclaimed by the retention-gated sweep
+        // The just-superseded generation (old snapshot/log) is NOT deleted inline (issue #8,
+        // tech design §4.2): it is retained as a rollback margin and reclaimed by the retention-gated sweep
         // (NamespaceLogBackend.gcOrphanedSystemFiles) once STRATA_CONTROLLER_LOG_RETENTION_MS has elapsed
         // since this publish. Deferring to that sweep keeps reclamation on ONE durable, failover-safe path
         // rather than an inline best-effort delete that no retention window could honor.
@@ -378,7 +375,7 @@ final class NamespaceMetadataLogRepository {
         }
         try {
             fileStore.deleteFile(id);
-        } catch (Exception ignore) {
+        } catch (Exception ignored) {
             // Best-effort cleanup for files written before a publish was intentionally skipped.
         }
     }

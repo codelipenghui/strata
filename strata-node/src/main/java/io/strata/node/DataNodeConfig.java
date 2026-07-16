@@ -26,7 +26,7 @@ public record DataNodeConfig(
         String rack,
         String host,
         long capacityBytes,
-        int scrubIntervalMs,             // cadence of the node-local sealed-chunk re-CRC scrub (design §9.2)
+        int scrubIntervalMs,             // cadence of the node-local sealed-chunk re-CRC scrub (tech design §9.2)
         ConnectionPolicy connectionPolicy,
         int nodeId,                      // -1 = standalone/unregistered; otherwise >= 1
         long orphanGraceMs,
@@ -46,6 +46,10 @@ public record DataNodeConfig(
         long deleteMinIntervalMs,
         ChunkStoreConfig chunkStoreConfig
 ) {
+    public static final long DEFAULT_ORPHAN_GRACE_MS = 6_000L;
+    public static final long DEFAULT_ORPHAN_SCAN_INTERVAL_MS = 3_000L;
+    public static final long DEFAULT_ORPHAN_STARTUP_GRACE_MS = 6_000L;
+    public static final int DEFAULT_ORPHAN_CONFIRM_TIMEOUT_MS = 5_000;
     public static final int DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS =
             OrphanGc.DEFAULT_MAX_CONFIRMED_DELETES_PER_NAMESPACE_PER_PASS;
     public static final int DEFAULT_ORPHAN_DELETE_MAX_NAMESPACE_PERCENT_PER_PASS =
@@ -62,7 +66,8 @@ public record DataNodeConfig(
                       long capacityBytes, int scrubIntervalMs) {
         this(dataDir, listenPort, advertisedHost, advertisedEndpointOverride, controllerEndpoints,
                 zone, rack, host, capacityBytes, scrubIntervalMs, ConnectionPolicy.DEFAULT, -1,
-                6_000L, 3_000L, 6_000L, 5_000,
+                DEFAULT_ORPHAN_GRACE_MS, DEFAULT_ORPHAN_SCAN_INTERVAL_MS,
+                DEFAULT_ORPHAN_STARTUP_GRACE_MS, DEFAULT_ORPHAN_CONFIRM_TIMEOUT_MS,
                 DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NAMESPACE_PER_PASS,
                 DEFAULT_ORPHAN_DELETE_MAX_NAMESPACE_PERCENT_PER_PASS,
                 DEFAULT_ORPHAN_DELETE_MAX_CONFIRMED_PER_NODE_PASS,

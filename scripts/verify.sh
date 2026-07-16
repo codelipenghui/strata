@@ -26,7 +26,7 @@ cd "$(dirname "$0")/.."
 . scripts/correctness-artifacts.sh
 
 FAULT_TESTS="StressFaultTest,ProcessCrashRecoveryTest,MetadataProcessFailoverTest,FailureRecoveryTest,MetadataFailoverTest,OpenQuorumFailureTest,RepairAndRetentionTest,RecoveryCatchUpTest,RecoveryDivergenceTest"
-CURRENT_COMPAT_TESTS="MessageGoldenCorpusTest,ScpV0CompatibilityTest,ZkMetadataStoreConformanceTest,InMemoryMetadataStoreConformanceTest"
+CURRENT_COMPAT_TESTS="MessageGoldenCorpusTest,ScpV0CompatibilityTest,ZkMetadataStoreConformanceTest,NamespaceLogMetadataStoreConformanceTest,InMemoryMetadataStoreConformanceTest"
 
 RUN_DEFAULT=true
 FAULT=false

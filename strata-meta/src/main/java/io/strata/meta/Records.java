@@ -7,6 +7,7 @@ import io.strata.common.FileId;
 import io.strata.common.FileState;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
+import io.strata.common.WritePolicyChecks;
 import io.strata.common.Varint;
 import io.strata.proto.BufWriter;
 
@@ -107,16 +108,7 @@ public final class Records {
             fileId = Objects.requireNonNull(fileId, "fileId");
             namespace = Objects.requireNonNull(namespace, "namespace");
             path = Objects.requireNonNull(path, "path");
-            if (replicationFactor <= 0) {
-                throw new IllegalArgumentException("replicationFactor must be positive: " + replicationFactor);
-            }
-            if (ackQuorum <= 0 || ackQuorum > replicationFactor) {
-                throw new IllegalArgumentException("ackQuorum must be in 1..replicationFactor: " + ackQuorum);
-            }
-            if (ackQuorum <= replicationFactor / 2) {
-                throw new IllegalArgumentException("ackQuorum must intersect any other quorum: "
-                        + ackQuorum + " for replicationFactor " + replicationFactor);
-            }
+            WritePolicyChecks.validate(replicationFactor, ackQuorum);
             if (writerEpoch < 0) {
                 throw new IllegalArgumentException("writerEpoch must be non-negative: " + writerEpoch);
             }
@@ -290,7 +282,7 @@ public final class Records {
 
     /**
      * Persisted rendezvous assignment of a namespace to an ordered replica set of controller endpoints
-     * (design §6.1). {@code preferredLeader} is {@code replicaSet[0]}; {@code generation} pins the
+     * (tech design §4.5). {@code preferredLeader} is {@code replicaSet[0]}; {@code generation} pins the
      * membership the assignment was computed against, so it stays stable while nodes are added.
      */
     public record NamespaceAssignment(StrataNamespace namespace, int generation, List<String> replicaSet) {
@@ -329,7 +321,7 @@ public final class Records {
 
     /**
      * A compact snapshot of currently-live data nodes published by the cluster controller to the
-     * consensus root (design §11). A non-controller namespace owner — which has no heartbeat channel —
+     * consensus root (tech design §4.1). A non-controller namespace owner — which has no heartbeat channel —
      * merges this into its placement view so it can place and repair replicas. {@code publishedAtMs}
      * is the controller's wall clock at publish; a stale snapshot (older than the liveness window) is
      * ignored. Each entry carries the node record plus its last-reported free bytes for placement.
@@ -373,7 +365,7 @@ public final class Records {
     }
 
     /**
-     * The consensus-root manifest pointer for one namespace's metadata log (design §5, §9). It is the
+     * The consensus-root manifest pointer for one namespace's metadata log (tech design §4.2 and §4.5). It is the
      * linearizable publication barrier: a namespace leader CAS-publishes a new manifest (version-CAS on
      * the znode) to atomically cut over the snapshot generation and durable log range. {@code
      * metadataEpoch} fences stale leaders; {@code logStartOffset} is where replay begins (the snapshot

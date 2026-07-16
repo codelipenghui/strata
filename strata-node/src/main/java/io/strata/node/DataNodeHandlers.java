@@ -80,11 +80,11 @@ final class DataNodeHandlers implements ScpServer.Handler {
             return;
         }
         if (req.opcode() == Opcode.READ.code) {
-            readRegionResponse(req, readRegion(req, false), sink);
+            readRegionResponse(readRegion(req, false), sink);
             return;
         }
         if (req.opcode() == Opcode.READ_RECOVERY.code) {
-            readRegionResponse(req, readRegion(req, true), sink);
+            readRegionResponse(readRegion(req, true), sink);
             return;
         }
         sink.result(handle(req));
@@ -201,7 +201,8 @@ final class DataNodeHandlers implements ScpServer.Handler {
 
             case EXEC_REPLICATE -> {
                 // A namespace owner that is not the cluster controller drives repair directly: pull the
-                // chunk from a live source via the proven control-loop path (design §11). Synchronous —
+                // chunk from a live source via the proven control-loop path (tech design §7.2; wire contract
+                // §10.3). Synchronous —
                 // the response confirms the pull+import completed.
                 if (!(Messages.Command.readRequest(req.headerReadBuffer()) instanceof Messages.ReplicateCmd cmd)) {
                     throw new ScpException(ErrorCode.PRECONDITION_FAILED, "EXEC_REPLICATE requires a ReplicateCmd");
@@ -217,7 +218,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
             }
 
             case VERIFY_CHUNKS -> {
-                // Owner-pull durability verification (design §9.2): report the local state of each
+                // Owner-pull durability verification (tech design §9.2): report the local state of each
                 // requested chunk (present/state/length/crc) and stamp the present ones as freshly
                 // verified, feeding node-local orphan GC. The owner judges missing/corrupt.
                 var m = Messages.VerifyChunks.decode(req.headerReadBuffer());
@@ -380,7 +381,7 @@ final class DataNodeHandlers implements ScpServer.Handler {
     }
 
     /** Hands a verified, materialized read payload to the server's direct bytes response path. */
-    private static void readRegionResponse(Frame req, ChunkStore.ReadRegionResult r, ScpServer.ResponseSink sink) {
+    private static void readRegionResponse(ChunkStore.ReadRegionResult r, ScpServer.ResponseSink sink) {
         boolean success = false;
         try {
             sink.twoU64Bytes(r.localEndOffset(), r.lastKnownDO(), r.payloadBytes(), r.length(), r);

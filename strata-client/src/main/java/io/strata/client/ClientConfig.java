@@ -16,7 +16,7 @@ public record ClientConfig(List<String> controllerEndpoints, long chunkRollBytes
                            int appendConnectionPendingHighWatermark, int maxChunkRecords) {
     private static final int DEFAULT_APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK = 64;
     private static final int DEFAULT_APPEND_CONNECTION_PENDING_HIGH_WATERMARK =
-            Math.max(1, (ScpClient.maxPendingRequests() * 3) / 4);
+            Math.max(1, ScpClient.maxPendingRequests() * 3 / 4);
     private static final int DEFAULT_MAX_CHUNK_RECORDS =
             ChunkLimits.DEFAULT_MAX_CLIENT_CHUNK_RECORDS;
 

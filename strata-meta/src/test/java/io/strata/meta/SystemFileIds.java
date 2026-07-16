@@ -6,8 +6,9 @@ import io.strata.common.StrataNamespace;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Deterministic, collision-free {@link FileId} derivation for strata-meta system files (metadata-log
- * segments and snapshot files).
+ * Test-only deterministic {@link FileId} derivation for local metadata-log fixtures. Production system
+ * files use the consensus-root monotonic allocator in {@link NamespaceLogBackend}; this helper is not a
+ * production identity or collision-freedom contract.
  *
  * <h3>Derivation scheme</h3>
  * <p>A system file is identified by three coordinates: {@code (namespace, generation, kind)}.
@@ -27,14 +28,8 @@ import java.nio.charset.StandardCharsets;
  *       nearby inputs across the full 64-bit range.</li>
  * </ol>
  *
- * <h3>Why it is collision-free at this cardinality</h3>
- * <p>The cardinality is a few distinct namespaces × O(thousands) of generations × 2 kinds — well under
- * 2^20 inputs. A uniform 64-bit hash has a birthday-collision probability of ≈ N²/2^65 for N inputs;
- * at N = 2^20 that is ≈ 2^40/2^65 = 2^{-25} ≈ 1-in-33-million, effectively zero. The test confirms
- * the guarantee over 3 namespaces × 1 000 generations × 2 kinds = 6 000 distinct ids.
- *
- * <p>System files live in the reserved {@code strata-meta} namespace; user files live in user namespaces.
- * The distinct namespace axis (system vs. user) means there is no cross-namespace collision concern.
+ * <p>The mixer has a low collision probability at the fixture's small cardinality, and its test checks a
+ * representative sample. That is sufficient for isolated test files, but it is not a mathematical guarantee.
  */
 final class SystemFileIds {
 
@@ -42,7 +37,7 @@ final class SystemFileIds {
     }
 
     /**
-     * Returns a deterministic, collision-free {@link FileId} for a strata-meta system file.
+     * Returns a deterministic test-fixture {@link FileId} for a metadata system file.
      *
      * @param ns         the user namespace whose metadata this system file stores
      * @param generation the manifest generation counter (bumped on every compaction/roll)
@@ -69,7 +64,7 @@ final class SystemFileIds {
         return h;
     }
 
-    /** SplitMix64 finalizer — bijective 64-bit avalanche mixer (no collisions by construction). */
+    /** SplitMix64 finalizer — a bijective avalanche mixer over its 64-bit input. */
     private static long splitMix64(long x) {
         x = (x ^ (x >>> 30)) * 0xbf58476d1ce4e5b9L;
         x = (x ^ (x >>> 27)) * 0x94d049bb133111ebL;

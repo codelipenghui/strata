@@ -1,11 +1,13 @@
 # Strata v0 — Implementation Plan & Status
 
 Working state for the v0 build (tech design §4.4 bootstrap path: ZooKeeper-backed metadata, no Kafka fork).
-This file is the durable source of truth for the development loop — update the checkboxes and decision log as work lands.
+**Status: completed historical implementation record.** Current architecture and correctness claims live in
+[`strata-tech-design.md`](strata-tech-design.md) and [`CORRECTNESS.md`](CORRECTNESS.md); do not use old task
+checkboxes or line-number notes here as the current source contract.
 
 ## Locked decisions
 
-- **Stack:** Java 21 (Corretto), Maven multi-module (Maven 3.8.8 installed), JUnit 5, SLF4J-simple.
+- **Stack:** Java 21 (Temurin in CI and the runtime image), Maven multi-module, JUnit 5, SLF4J-simple.
 - **Networking:** Netty NIO transport for SCP; blocking metadata/storage handlers run off the event loop on serialized per-connection virtual-thread executors.
 - **ZK access:** Apache Curator (framework + recipes + curator-test for embedded ZK in tests).
 - **Chaos:** testcontainers + Toxiproxy (gated on Docker availability).
@@ -26,12 +28,15 @@ This file is the durable source of truth for the development loop — update the
 strata-common   ids (FileId/ChunkId/NodeId), Varint, Crc32C, ErrorCode, exceptions
 strata-proto    SCP frame codec, tagged fields, opcodes, message structs, Netty-backed ScpClient/ScpServer
 strata-format   chunk file header/footer/trailer, sidecar .meta, integrity ledger .j, ChunkStore engine + crash recovery
-strata-node     data node: SCP handlers → ChunkStore; register/heartbeat/inventory loop; REPLICATE executor (pull)
-strata-meta     MetadataStore SPI, ZkMetadataStore, Controller (SCP listener, placement, leases, repair, retention)
-strata-client   StrataClient/StrataFile/Appender/Reader per design §12 (quorum ack, DO, roll, create-ahead, recoverAndSeal)
+strata-node     data node: SCP handlers → ChunkStore; register/heartbeat, owner-pull verification, orphan GC, repair pull
+strata-meta     MetadataStore SPI, ZK root + namespace-log backend, controller, ownership, placement, repair, retention
+strata-client   StrataClient/StrataFile/Appender/Reader per design §12 (quorum ack, DO, roll, recoverAndSeal)
+strata-metrics  Micrometer registry and Prometheus HTTP endpoint
+strata-server   production data-node/controller/combined launcher, metrics wiring, and perf driver
 strata-it       integration tests: in-process cluster + embedded ZK (primary correctness layer); chaos via testcontainers
-tla/            ChunkReplication.tla + TLC config
-scripts/        verify.sh (full pyramid), run helpers
+strata-coverage JaCoCo aggregate report module
+tla/            chunk-replication and metadata correctness models + TLC configs
+scripts/        verification, coverage, compatibility, image, perf, and correctness-artifact tooling
 ```
 
 ## Stages (gate: tests green, then commit) — ALL COMPLETE
@@ -203,12 +208,14 @@ The release-gate map lives in `CORRECTNESS.md`. The short version:
 `scripts/verify.sh --fault` — embedded stress/fault, process-crash, repair, and recovery gate.
 `scripts/verify.sh --chaos` — Docker/Toxiproxy chaos gate.
 `scripts/verify.sh --soak` — bounded multi-seed stress/fault soak; tune with `-Dstrata.soak.iterations`, `-Dstrata.soak.batches`, and `-Dstrata.soak.seed`.
-`scripts/verify.sh --tlc` — TLA+ model checking.
+`scripts/verify.sh --tlc` — current TLA+ gate (`ChunkReplication.tla` only; metadata-model automation remains open).
 
 `.github/workflows/ci.yml` runs the default, current compatibility/conformance, embedded fault,
-and TLA+ model-checking gates on pull requests and pushes to `main`.
-`.github/workflows/correctness.yml` runs the same gates plus Docker chaos and a larger bounded soak
-on scheduled/manual deep-confidence runs.
+Docker chaos, and bounded-soak gates on pull requests and pushes to `main`.
+`.github/workflows/tla.yml` is triggered when a model or its tooling changes, but currently still checks
+only `ChunkReplication.tla` through `scripts/tlc.sh`.
+`.github/workflows/correctness.yml` runs the scheduled/manual matrix, including that current single-model
+TLA+ gate and a larger soak.
 Manual workflow runs can disable individual gates and can replay a soak with explicit
 `soak_iterations`, `soak_batches`, and `soak_seed` inputs.
 Exact stress/fault case replay is supported with

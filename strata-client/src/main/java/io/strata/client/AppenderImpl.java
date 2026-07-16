@@ -598,7 +598,6 @@ final class AppenderImpl implements StrataFile.Appender {
         int ok = 0;
         List<Messages.Replica> opened = new ArrayList<>(s.replicas.size());
         Set<Integer> failedNodeIds = new HashSet<>();
-        ScpException lastErr = null;
         for (int i = 0; i < s.replicas.size(); i++) {
             String endpoint = s.replicas.get(i).endpoint();
             lock.unlock();
@@ -615,7 +614,6 @@ final class AppenderImpl implements StrataFile.Appender {
                 lock.lock();
             }
             if (err != null) {
-                lastErr = err;
                 s.failed[i] = true;
                 failedNodeIds.add(s.replicas.get(i).nodeId());
                 log.warn("open {} on replica {} failed: {}", s.chunkId, endpoint, err.getMessage());

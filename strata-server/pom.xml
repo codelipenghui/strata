@@ -10,7 +10,7 @@
   </parent>
   <artifactId>strata-server</artifactId>
 
-  <!-- Deployable server: a single fat jar whose `node`/`meta` argument selects which role to run. -->
+  <!-- Deployable fat jar; role is data-node, controller, combined, or perf. -->
   <dependencies>
     <dependency>
       <groupId>io.strata</groupId>

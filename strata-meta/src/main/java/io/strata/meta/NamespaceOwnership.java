@@ -9,12 +9,12 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Resolves the controller owner of a namespace from a static membership of controller endpoints using
- * {@link NamespaceAssignmentPolicy} (design §6, §6.1). A single-endpoint (or empty) membership means
+ * {@link NamespaceAssignmentPolicy} (tech design §4.5). A single-endpoint (or empty) membership means
  * this node owns every namespace, preserving single-leader behavior for non-sharded deployments.
  *
  * <p>Ownership is computed, not read from consensus: every node derives the same owner from the same
- * membership, and the lazily-persisted assignment record (see {@code MetadataStore.putNamespaceAssignment})
- * agrees. A request that lands on a non-owner is redirected with NOT_LEADER + the owner endpoint hint.
+ * configured membership. Current serving does not persist or fail over this assignment. A request that
+ * lands on a non-owner is redirected with NOT_LEADER + the owner endpoint hint.
  */
 public final class NamespaceOwnership {
     private final String localEndpoint;

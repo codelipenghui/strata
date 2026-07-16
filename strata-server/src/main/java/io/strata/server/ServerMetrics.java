@@ -134,8 +134,8 @@ final class ServerMetrics {
      * Per-namespace gauges (namespace-stacked dashboard panels): live files + open metadata-log bytes,
      * labelled by {@code namespace}, for the namespaces THIS controller owns. Refreshed off a daemon
      * timer because the namespace set changes at runtime (a {@link MultiGauge} must be re-registered, not
-     * supplier-bound). Cardinality grows with the namespace count — namespace stays control-plane, so
-     * these live only on the controller (data nodes never see namespaces).
+     * supplier-bound). Cardinality grows with the namespace count; these metadata-log gauges live only on
+     * the controller, while data nodes expose their separate per-namespace I/O counters.
      */
     private static void registerPerNamespace(MeterRegistry reg, Controller s, long refreshIntervalMs) {
         MultiGauge files = MultiGauge.builder("strata_controller_namespace_files")

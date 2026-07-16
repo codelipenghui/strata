@@ -183,10 +183,10 @@ final class StrataPerf {
         List<PerfFile> cleanupFiles = Collections.synchronizedList(new ArrayList<>());
 
         logReaderDistribution(lanes);
-        Thread writeReporter = startReporter(writeStats, config.recordSize(), "write");
+        Thread writeReporter = startReporter(writeStats, "write");
         Thread readReporter = config.totalReaders() > 0
-                ? startReporter(readStats, config.readSize(), "read") : null;
-        Thread deleteReporter = startReporter(deleteStats, config.recordSize(), "delete");
+                ? startReporter(readStats, "read") : null;
+        Thread deleteReporter = startReporter(deleteStats, "delete");
 
         try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
             List<Future<?>> futures = new ArrayList<>();
@@ -693,7 +693,7 @@ final class StrataPerf {
         return durationSec <= 0 ? Long.MAX_VALUE : System.nanoTime() + durationSec * 1_000_000_000L;
     }
 
-    private static Thread startReporter(Stats stats, int unitBytes, String label) {
+    private static Thread startReporter(Stats stats, String label) {
         Thread t = new Thread(() -> {
             long startMs = System.currentTimeMillis();
             long lastMs = startMs;
@@ -706,7 +706,7 @@ final class StrataPerf {
                     long ops = stats.ops.sum();
                     long bytes = stats.bytes.sum();
                     double secs = (now - lastMs) / 1000.0;
-                    double mbs = ((bytes - lastBytes) / (double) (1 << 20)) / secs;
+                    double mbs = (bytes - lastBytes) / (double) (1 << 20) / secs;
                     double opsPerSecond = (ops - lastOps) / secs;
                     long[] sample = stats.snapshotSorted();
                     log.info(String.format(Locale.ROOT,
@@ -772,7 +772,7 @@ final class StrataPerf {
                     "DONE %s: %d ops, %.1f MB total, avg %.1f MB/s, %.0f ops/s, errors=%d, "
                             + "p50=%.2fms p95=%.2fms p99=%.2fms max=%.2fms",
                     label, ops.sum(), bytes.sum() / (double) (1 << 20),
-                    (bytes.sum() / (double) (1 << 20)) / secs, ops.sum() / secs, errors.sum(),
+                    bytes.sum() / (double) (1 << 20) / secs, ops.sum() / secs, errors.sum(),
                     ms(pct(sorted, 50)), ms(pct(sorted, 95)), ms(pct(sorted, 99)), ms(pct(sorted, 100))));
         }
     }

@@ -371,23 +371,7 @@ public final class ScpClient implements AutoCloseable {
 
     /** Synchronous call returning the whole frame (for payload-carrying responses); error NOT yet checked. */
     public Frame callFrame(Opcode op, byte[] header, ByteBuffer payload, long timeoutMs) {
-        CompletableFuture<Frame> fut = send(op, header, payload);
-        try {
-            return fut.get(timeoutMs, TimeUnit.MILLISECONDS);
-        } catch (ExecutionException e) {
-            throw callFailure(e.getCause());
-        } catch (TimeoutException e) {
-            ScpConnectionException timeout = new ScpConnectionException(
-                    "timeout after " + timeoutMs + "ms for " + op, e);
-            fut.completeExceptionally(timeout); // releases the correlation entry (cleanup hook)
-            close();
-            throw timeout;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            ScpException interrupted = new ScpException(ErrorCode.INTERNAL, "interrupted");
-            fut.completeExceptionally(interrupted);
-            throw interrupted;
-        }
+        return awaitFrame(op, send(op, header, payload), timeoutMs);
     }
 
     /**
@@ -396,21 +380,24 @@ public final class ScpClient implements AutoCloseable {
      * the 64 MiB max frame), so a slow consumer raises direct-pool residency — close promptly.
      */
     public Frame callFrameBorrowed(Opcode op, byte[] header, ByteBuffer payload, long timeoutMs) {
-        CompletableFuture<Frame> fut = send(op, header, payload, true);
+        return awaitFrame(op, send(op, header, payload, true), timeoutMs);
+    }
+
+    private Frame awaitFrame(Opcode op, CompletableFuture<Frame> future, long timeoutMs) {
         try {
-            return fut.get(timeoutMs, TimeUnit.MILLISECONDS);
+            return future.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (ExecutionException e) {
             throw callFailure(e.getCause());
         } catch (TimeoutException e) {
             ScpConnectionException timeout = new ScpConnectionException(
                     "timeout after " + timeoutMs + "ms for " + op, e);
-            fut.completeExceptionally(timeout);
+            future.completeExceptionally(timeout); // releases the correlation entry (cleanup hook)
             close();
             throw timeout;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             ScpException interrupted = new ScpException(ErrorCode.INTERNAL, "interrupted");
-            fut.completeExceptionally(interrupted);
+            future.completeExceptionally(interrupted);
             throw interrupted;
         }
     }

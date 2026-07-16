@@ -6,6 +6,7 @@ import io.strata.common.FileId;
 import io.strata.common.StrataNamespace;
 import io.strata.common.StrataPath;
 import io.strata.common.Varint;
+import io.strata.common.WritePolicyChecks;
 
 import java.nio.ByteBuffer;
 import java.nio.BufferUnderflowException;
@@ -1572,13 +1573,13 @@ public final class Messages {
         }
     }
 
-    /* ---------- owner-pull chunk verification (design §9.2) ---------- */
+    /* ---------- owner-pull chunk verification (tech design §9.2) ---------- */
 
     /**
      * Owner -> node: verify the listed chunks of one namespace. The node answers with the actual local
      * state of each (see {@link VerifyChunkResult}); the owner compares against its descriptor to decide
      * present-ok / missing / corrupt. {@code verifierEndpoint} is the asking owner's advertised endpoint,
-     * so the node can record "last verified by which owner, when" for node-local orphan GC (design §9.2).
+     * so the node can record "last verified by which owner, when" for node-local orphan GC (tech design §9.2).
      */
     public record VerifyChunks(StrataNamespace namespace, String verifierEndpoint,
                                List<ChunkId> chunkIds, long ownerEpoch) {
@@ -1660,16 +1661,7 @@ public final class Messages {
         public static final WritePolicy DEFAULT = new WritePolicy(3, 2, false);
 
         public WritePolicy {
-            if (replicationFactor <= 0) {
-                throw new IllegalArgumentException("replicationFactor must be positive: " + replicationFactor);
-            }
-            if (ackQuorum <= 0 || ackQuorum > replicationFactor) {
-                throw new IllegalArgumentException("ackQuorum must be in 1..replicationFactor: " + ackQuorum);
-            }
-            if (ackQuorum <= replicationFactor / 2) {
-                throw new IllegalArgumentException("ackQuorum must intersect any other quorum: "
-                        + ackQuorum + " for replicationFactor " + replicationFactor);
-            }
+            WritePolicyChecks.validate(replicationFactor, ackQuorum);
         }
 
         private void writeTo(BufWriter w) {

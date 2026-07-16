@@ -1,6 +1,11 @@
 # Per-namespace observability — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+**Status: completed and archived.** The unchecked steps below preserve the original execution plan;
+they are not an indication that the feature is unfinished. Current behavior lives in the implementation,
+`strata-namespace-metrics-design.md`, and the dashboard guard tests.
+
+> Historical execution note: the unchecked boxes below preserve the original implementation sequence;
+> they are not instructions for current work.
 
 **Goal:** Make namespace the primary axis of Strata metrics — per-namespace request latency, data throughput, namespace-log activity, and owner/switch tracking — plus a `strata-namespace` Grafana dashboard, with the existing dashboards migrated.
 
@@ -144,7 +149,7 @@ In `Controller.requireNamespaceOwner` (`:444`), add as the FIRST line (so every 
 
 - [ ] **Step 8: Set namespace in the data-node handlers**
 
-In `DataNodeHandlers.java`: in `handleAsync` for APPEND, after `var m = Messages.Append.decode(req.headerSlice());` add `io.strata.proto.RequestContext.setNamespace(m.namespace().value());`. In `handle`'s switch, after each `var m = Messages.X.decode(h);` that has a `m.namespace()` (OPEN_CHUNK, READ, READ_RECOVERY, FENCE, STAT_CHUNK, SEAL_CHUNK, DELETE_CHUNKS, FETCH_CHUNK, READ_LEDGER, VERIFY_CHUNKS) add `io.strata.proto.RequestContext.setNamespace(m.namespace().value());`. PING and EXEC_REPLICATE have no namespace — leave unset (defaults to `"-"`).
+In `DataNodeHandlers.java`: in `handleAsync` for APPEND, after `var m = Messages.Append.decode(req.headerSlice());` add `io.strata.proto.RequestContext.setNamespace(m.namespace().value());`. In `handle`'s switch, after each `var m = Messages.X.decode(h);` that has a `m.namespace()` (OPEN_CHUNK, READ, READ_RECOVERY, FENCE, STAT_CHUNK, SEAL_CHUNK, DELETE_CHUNKS, FETCH_CHUNK, READ_LEDGER, VERIFY_CHUNKS) add `io.strata.proto.RequestContext.setNamespace(m.namespace().value());`. `EXEC_REPLICATE` takes its namespace from the decoded `ReplicateCmd`; only PING remains unset (defaults to `"-"`).
 
 - [ ] **Step 9: Tag the namespace in `ServerMetrics.requestObserver`**
 
@@ -684,7 +689,7 @@ git commit -m "feat(metrics): namespace owner gauge + owner-change counter"
 
 ```json
 { "name": "namespace", "type": "query", "datasource": {"type":"prometheus","uid":"prometheus"},
-  "query": "label_values(strata_controller_namespace_files, namespace)",
+  "query": "label_values(strata_scp_requests_total{namespace!=\"-\"}, namespace)",
   "refresh": 2, "includeAll": true, "multi": true,
   "current": {"text":"All","value":"$__all"}, "sort": 1, "label": "namespace" }
 ```
@@ -692,7 +697,7 @@ git commit -m "feat(metrics): namespace owner gauge + owner-change counter"
 Rows + key panel exprs (all filtered `namespace=~"$namespace"`):
 - **Ownership** — table `strata_controller_namespace_owner` (show `namespace`,`owner`); state-timeline `strata_controller_namespace_owner`; `rate(strata_controller_namespace_owner_changes_total[$__rate_interval])`; `strata_controller_namespaces_loaded`.
 - **Throughput** — `sum by (namespace)(rate(strata_data_node_append_bytes_total{namespace=~"$namespace"}[$__rate_interval]))` (+ read, + ops), unit `Bps`/`ops`, stacked, fillOpacity 20.
-- **Latency** — `histogram_quantile(0.99, sum by (le,namespace)(rate(strata_scp_request_duration_seconds_bucket{namespace=~"$namespace",opcode=~"APPEND|READ"}[$__rate_interval])))`; controller op set `opcode=~"CREATE_FILE|CREATE_CHUNK|LOOKUP_FILE|LOOKUP_PATH|SEAL_FILE|SEAL_CHUNK_META|ABORT_CHUNK_META|ALLOCATE_WRITER_EPOCH"`. p50/p95/p99 lines, unit `s`, fillOpacity 10.
+- **Latency** — `histogram_quantile(0.99, sum by (le,namespace)(rate(strata_scp_request_duration_seconds_bucket{namespace=~"$namespace",opcode=~"APPEND|READ"}[$__rate_interval])))`; controller op set `opcode=~"CREATE_FILE|CREATE_CHUNK|LOOKUP_FILE|LOOKUP_PATH|SEAL_FILE|SEAL_CHUNK_META|ABORT_CHUNK_META|ALLOCATE_WRITER_EPOCH|DELETE_FILES"`. p50/p95/p99 lines, unit `s`, fillOpacity 10.
 - **Controller requests** — `sum by (opcode)(rate(strata_scp_requests_total{namespace=~"$namespace"}[$__rate_interval]))` and the `status="error"` variant, unit `ops`.
 - **Namespace log** — `sum by (namespace)(rate(strata_controller_namespace_log_append_records_total{namespace=~"$namespace"}[$__rate_interval]))` and `_append_bytes` (write log), `_read_records`/`_read_bytes` (read log), `_compactions`, `_recoveries`, `_reacquisitions`; plus `strata_controller_namespace_files{namespace=~"$namespace"}` and `strata_controller_namespace_log_bytes{namespace=~"$namespace"}`.
 
