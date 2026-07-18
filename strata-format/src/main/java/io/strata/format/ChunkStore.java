@@ -608,9 +608,14 @@ public final class ChunkStore implements AutoCloseable {
         // state is still OPEN during that window, so this flag is what makes the chunk un-appendable:
         // appendAsync rejects when it is set, so no append can advance end / write bytes that the
         // in-flight seal would then finalize inconsistently. A reversible in-memory flag, deliberately NOT
-        // a new ChunkState: a failed or lost-race seal must restore the chunk to clean OPEN+committer-running
-        // (delete() instead blocks appends with the *terminal* DELETING state). Never persisted.
+        // a new ChunkState: a seal aborted before file mutation must restore clean OPEN+committer-running.
+        // Never persisted.
         boolean sealing;
+        // finalizeSealLocked may fail after partially truncating the data/ledger. Poison further appends
+        // before they mutate that uncertain OPEN state; a seal retry or process recovery can converge it.
+        // This also protects ack-on-replicate chunks, whose null committer is otherwise normal.
+        boolean sealFinalizationFailed;
+        long failedSealLength = -1;
         // SEAL_FSYNC=false leaves a sealed chunk's footer/sidecar unforced, so its ledger is retained
         // as the recovery safety net until reclaimSealedLedgersOnce() forces the SEALED state durable.
         boolean sealedLedgerPending;
@@ -1338,6 +1343,17 @@ public final class ChunkStore implements AutoCloseable {
             // h.sealing: a seal is finalizing this chunk with the lock released for its committer stop;
             // reject as if already sealed so no append slips into that window (see Handle.sealing).
             if (h.state != ChunkState.OPEN || h.sealing) throw new ScpException(ErrorCode.CHUNK_SEALED, id.toString());
+            if (h.sealFinalizationFailed) {
+                throw new ScpException(ErrorCode.INTERNAL,
+                        "append refused after failed seal finalization for " + id);
+            }
+            if (h.header.fsyncOnAck() && h.committer == null) {
+                // A post-detach seal-finalization failure can leave partially truncated files. Do not
+                // mutate them further, and never downgrade this durability tier to page-cache-only acks.
+                // A seal retry or process recovery is responsible for converging the chunk.
+                throw new ScpException(ErrorCode.INTERNAL,
+                        "fsync-on-ack committer unavailable after failed seal for " + id);
+            }
             h.writeEpoch = Math.max(h.writeEpoch, epoch);
             if (baseOffset != h.end) {
                 throw new ScpException(ErrorCode.OFFSET_GAP, "expected " + h.end + " got " + baseOffset, h.end);
@@ -2006,12 +2022,20 @@ public final class ChunkStore implements AutoCloseable {
                 // two sealers never both own it. A retry will observe SEALED and get the idempotent result.
                 throw new ScpException(ErrorCode.CHUNK_SEALED, "seal already in progress for " + id);
             }
+            if (h.sealFinalizationFailed && dataLength > h.failedSealLength) {
+                // A partial footer/trailer can extend beyond the truncated data. Treating a larger retry
+                // length as data could seal those footer bytes, so retries may only keep or lower the target.
+                throw new ScpException(ErrorCode.INTERNAL,
+                        "failed seal retry for " + id + " must not exceed length " + h.failedSealLength
+                                + ", got " + dataLength,
+                        h.failedSealLength);
+            }
             // Validate the caller footer + snapshot CRCs BEFORE stopping the committer: a caller-validation
             // or read-verification failure must leave an OPEN ack-on-fsync chunk with its committer running.
             prep = prepareSealLocked(h, callerSections, dataLength);
             committerToStop = h.committer;
             if (committerToStop == null) {
-                return finalizeSealLocked(h, id, dataLength, prep); // ack-on-replicate: nothing to drain off-lock
+                return finalizeSealFailClosed(h, id, dataLength, prep); // nothing to drain off-lock
             }
             h.sealing = true; // enter the off-lock committer-stop window
         } finally {
@@ -2038,7 +2062,19 @@ public final class ChunkStore implements AutoCloseable {
             }
             h.committer = null; // confirmed stopped above; detach before mutating files
             try {
-                return finalizeSealLocked(h, id, dataLength, prep);
+                // fence() can advance the epoch while the committer is stopped off-lock. Do not let a
+                // sealer validated under the old epoch publish after that newer fence became durable.
+                try {
+                    checkEpoch(h, epoch);
+                } catch (RuntimeException staleSeal) {
+                    // No file mutation has started, so this abort can safely restore clean OPEN service.
+                    h.startCommitterIfFsync(forceCount);
+                    throw staleSeal;
+                }
+                // Do not restart here if finalization throws: truncate/ledger/footer mutation may be
+                // partial. finalizeSealFailClosed poisons further OPEN appends, and a retry can safely
+                // re-run finalization from its original logical end.
+                return finalizeSealFailClosed(h, id, dataLength, prep);
             } finally {
                 h.sealing = false;
             }
@@ -2056,9 +2092,32 @@ public final class ChunkStore implements AutoCloseable {
      */
     private SealPrep prepareSealLocked(Handle h, ByteBuffer callerSections, long dataLength) throws IOException {
         CallerSections caller = readCallerSections(callerSections);
-        CrcScan scan = dataLength == h.end ? h.snapshotRunningCrcs() : scanDataCrcs(h.data, dataLength);
+        // Once finalization has touched the files and failed, the in-memory running CRC may describe
+        // bytes that a partial truncate removed. Every retry must rescan physical data, even when the
+        // requested length still equals the pre-failure logical end.
+        CrcScan scan = dataLength == h.end && !h.sealFinalizationFailed
+                ? h.snapshotRunningCrcs()
+                : scanDataCrcs(h.data, dataLength);
         int ledgerEntryCount = ledgerEntriesThroughSeal(h.ledger, dataLength);
         return new SealPrep(caller, scan, ledgerEntryCount);
+    }
+
+    /** Runs finalization and poisons further OPEN appends if file mutation fails partway through. */
+    private SealResult finalizeSealFailClosed(Handle h, ChunkId id, long dataLength, SealPrep prep)
+            throws IOException {
+        try {
+            return finalizeSealLocked(h, id, dataLength, prep);
+        } catch (IOException | RuntimeException | Error failure) {
+            if (h.state == ChunkState.OPEN) {
+                if (!h.sealFinalizationFailed) {
+                    h.failedSealLength = dataLength;
+                } else {
+                    h.failedSealLength = Math.min(h.failedSealLength, dataLength);
+                }
+                h.sealFinalizationFailed = true;
+            }
+            throw failure;
+        }
     }
 
     /**
@@ -2080,7 +2139,7 @@ public final class ChunkStore implements AutoCloseable {
             h.data.truncate(checkedAdd(DATA_START, dataLength, "chunk file offset"));
             h.ledger.truncateTo(dataLength);
             appendSealBoundaryLedgerEntryIfNeeded(h, dataLength);
-            h.end = dataLength;
+            FailureInjector.point("format.seal.afterTruncate");
         }
         long tTruncate = System.nanoTime();
 
@@ -2114,6 +2173,7 @@ public final class ChunkStore implements AutoCloseable {
         }
         long tForce = System.nanoTime();
 
+        h.end = dataLength;
         h.state = ChunkState.SEALED;
         h.sealedLength = dataLength;
         h.dataCrc = scan.dataCrc;
@@ -2178,6 +2238,11 @@ public final class ChunkStore implements AutoCloseable {
     private void appendSealBoundaryLedgerEntryIfNeeded(Handle h, long dataLength) throws IOException {
         long ledgerEnd = h.ledger.lastEndOffset();
         if (ledgerEnd == dataLength) {
+            if (h.sealFinalizationFailed) {
+                // The first attempt may have appended this boundary and then failed its force. A poisoned
+                // retry must re-force it before publishing SEALED; in-memory presence is not durability.
+                forceSealBoundary(h);
+            }
             return;
         }
         if (ledgerEnd > dataLength) {
@@ -2188,6 +2253,11 @@ public final class ChunkStore implements AutoCloseable {
         h.ledger.append(dataLength, crc, h.writeEpoch);
         // Keep this force even for sealFsync=true: until deleteLedgerDurably completes, recovery can
         // still see the retained ledger beside a durable trailer and needs the boundary to classify it.
+        forceSealBoundary(h);
+    }
+
+    private void forceSealBoundary(Handle h) throws IOException {
+        FailureInjector.point("format.seal.beforeBoundaryForce");
         h.ledger.force();
     }
 
