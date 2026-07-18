@@ -6,6 +6,7 @@ import io.strata.common.ChunkState;
 import io.strata.common.ConnectionPolicy;
 import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
+import io.strata.common.FailureInjector;
 import io.strata.common.ScpConnectionException;
 import io.strata.common.ScpException;
 import io.strata.common.ScpProtocolException;
@@ -31,6 +32,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -253,51 +255,94 @@ final class ControlLoop implements AutoCloseable {
     }
 
     void replicate(Messages.ReplicateCmd cmd) throws IOException, InterruptedException {
-        if (store.contains(cmd.namespace(), cmd.chunkId())) {
-            // command replay — but only a VALID copy counts: a local chunk whose seal state or
-            // crc/length mismatch the descriptor is corrupt and must be replaced, not trusted
-            var stat = store.stat(cmd.namespace(), cmd.chunkId());
-            if (stat.state() == ChunkState.SEALED
-                    && stat.sealedLength() == cmd.expectedLength()
-                    && stat.dataCrc() == cmd.expectedCrc()) {
+        long concurrentImportDeadlineNanos = 0;
+        while (true) {
+            ChunkStore.RepairAdoption adoption = store.adoptRepairReplica(
+                    cmd.namespace(), cmd.chunkId(), cmd.expectedLength(), cmd.expectedCrc());
+            if (adoption.state() == ChunkStore.RepairAdoptionState.ADOPTED) {
                 return;
             }
-            log.warn("local copy of {} mismatches descriptor (state={} len={} crc={}) — re-pulling",
-                    cmd.chunkId(), stat.state(), stat.sealedLength(), stat.dataCrc());
-            ErrorCode deleteResult = deletes.delete(cmd.namespace(), cmd.chunkId());
-            if (deleteResult != ErrorCode.OK && deleteResult != ErrorCode.CHUNK_NOT_FOUND) {
-                throw new ScpException(deleteResult, "delete stale local copy of " + cmd.chunkId() + " failed");
-            }
-        }
-        ScpException last = null;
-        for (Messages.Replica source : cmd.sources()) {
-            if (source.nodeId() == node.nodeId()) continue;
-            try {
-                Endpoint hp = Endpoint.parse(source.endpoint(), "endpoint", ErrorCode.INTERNAL);
-                try (ScpClient src = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_DATA_NODE,
-                        "repair-" + node.nodeId())) {
-                    Path tmp = store.createImportTemp(cmd.chunkId());
-                    try {
-                        long fileLength = fetchWholeFile(src, cmd, tmp);
-                        store.importSealed(cmd.namespace(), cmd.chunkId(), tmp, cmd.expectedLength(), cmd.expectedCrc());
-                        tmp = null; // importSealed consumes the temp file by moving it into place.
-                        log.info("replicated {} from node {} ({} bytes)", cmd.chunkId(), source.nodeId(), fileLength);
-                    } finally {
-                        if (tmp != null) {
-                            Files.deleteIfExists(tmp);
-                        }
-                    }
-                    return;
+            if (adoption.state() == ChunkStore.RepairAdoptionState.IN_PROGRESS) {
+                long now = System.nanoTime();
+                if (concurrentImportDeadlineNanos == 0) {
+                    concurrentImportDeadlineNanos = now
+                            + TimeUnit.MILLISECONDS.toNanos(config.controlCallTimeoutMs());
                 }
-            } catch (ScpException e) {
-                last = e;
-                log.warn("replicate {} from {} failed: {}", cmd.chunkId(), source.endpoint(), e.getMessage());
-            } catch (IOException e) {
-                last = new ScpException(ErrorCode.INTERNAL, "source " + source.endpoint() + ": " + e);
-                log.warn("replicate {} from {} failed: {}", cmd.chunkId(), source.endpoint(), e.toString());
+                if (now >= concurrentImportDeadlineNanos) {
+                    throw new ScpException(ErrorCode.CHUNK_ALREADY_EXISTS,
+                            "concurrent import did not finish for " + cmd.chunkId());
+                }
+                long remainingNanos = concurrentImportDeadlineNanos - now;
+                long sleepMs = Math.max(1, Math.min(10, TimeUnit.NANOSECONDS.toMillis(remainingNanos)));
+                Thread.sleep(sleepMs);
+                continue;
             }
+            concurrentImportDeadlineNanos = 0;
+            if (adoption.state() == ChunkStore.RepairAdoptionState.MISMATCHED) {
+                // Command replay only adopts a VALID copy. Bind deletion to the mismatched generation:
+                // another repair may replace/adopt it after this check but before the delete QoS slot.
+                log.warn("local copy of {} mismatches repair descriptor — re-pulling", cmd.chunkId());
+                FailureInjector.point("node.repair.afterMismatchBeforeDelete");
+                ErrorCode deleteResult = deletes.deleteHandleGeneration(
+                        cmd.namespace(), cmd.chunkId(), adoption.handleGeneration());
+                if (deleteResult == ErrorCode.PRECONDITION_FAILED) {
+                    continue; // the local handle changed; re-evaluate and adopt the winner when valid
+                }
+                if (deleteResult != ErrorCode.OK && deleteResult != ErrorCode.CHUNK_NOT_FOUND) {
+                    throw new ScpException(
+                            deleteResult, "delete stale local copy of " + cmd.chunkId() + " failed");
+                }
+            }
+            ScpException last = null;
+            boolean retryLocal = false;
+            for (Messages.Replica source : cmd.sources()) {
+                if (source.nodeId() == node.nodeId()) continue;
+                try {
+                    Endpoint hp = Endpoint.parse(source.endpoint(), "endpoint", ErrorCode.INTERNAL);
+                    try (ScpClient src = new ScpClient(hp.host(), hp.port(), ScpClient.KIND_DATA_NODE,
+                            "repair-" + node.nodeId())) {
+                        Path tmp = store.createImportTemp(cmd.chunkId());
+                        try {
+                            long fileLength = fetchWholeFile(src, cmd, tmp);
+                            store.importSealed(
+                                    cmd.namespace(), cmd.chunkId(), tmp, cmd.expectedLength(), cmd.expectedCrc());
+                            tmp = null; // importSealed consumes the temp file by moving it into place.
+                            log.info("replicated {} from node {} ({} bytes)",
+                                    cmd.chunkId(), source.nodeId(), fileLength);
+                        } finally {
+                            if (tmp != null) {
+                                Files.deleteIfExists(tmp);
+                            }
+                        }
+                        return;
+                    }
+                } catch (ScpException e) {
+                    if (e.code() == ErrorCode.CHUNK_ALREADY_EXISTS) {
+                        ChunkStore.RepairAdoption collision = store.adoptRepairReplica(
+                                cmd.namespace(), cmd.chunkId(), cmd.expectedLength(), cmd.expectedCrc());
+                        if (collision.state() == ChunkStore.RepairAdoptionState.ADOPTED) {
+                            return;
+                        }
+                        if (collision.state() == ChunkStore.RepairAdoptionState.IN_PROGRESS
+                                || collision.state() == ChunkStore.RepairAdoptionState.MISMATCHED) {
+                            retryLocal = true;
+                            break; // wait for or conditionally replace the concurrent install
+                        }
+                        // No reservation or handle explains the collision. Preserve the source failure
+                        // instead of repeatedly fetching into a persistent orphan on-disk path.
+                    }
+                    last = e;
+                    log.warn("replicate {} from {} failed: {}", cmd.chunkId(), source.endpoint(), e.getMessage());
+                } catch (IOException e) {
+                    last = new ScpException(ErrorCode.INTERNAL, "source " + source.endpoint() + ": " + e);
+                    log.warn("replicate {} from {} failed: {}", cmd.chunkId(), source.endpoint(), e.toString());
+                }
+            }
+            if (retryLocal) {
+                continue;
+            }
+            throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no usable source");
         }
-        throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no usable source");
     }
 
     long fetchWholeFile(ScpClient src, Messages.ReplicateCmd cmd, Path output) throws IOException {

@@ -48,6 +48,7 @@ import java.util.stream.Stream;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -497,7 +498,7 @@ class ChunkStoreTest {
 
             // grace elapsed for everything -> only the SEALED chunk is a suspect, never the OPEN one
             List<ChunkStore.SuspectChunk> suspects = store.orphanSuspects(0, now + 1);
-            assertEquals(List.of(new ChunkStore.SuspectChunk(TEST_NS, sealed)), suspects);
+            assertEquals(List.of(sealed), suspects.stream().map(ChunkStore.SuspectChunk::chunkId).toList());
 
             // a verify stamps the sealed chunk -> within grace it drops out of the suspect set
             store.verify(TEST_NS, List.of(sealed));
@@ -525,9 +526,53 @@ class ChunkStoreTest {
                             0, beforeImport + ChunkStore.REPAIR_IMPORT_ORPHAN_PROTECTION_MS - 1).isEmpty(),
                     "a freshly imported repair target must not be orphan-GC eligible before "
                             + "the descriptor-swap/command-timeout window has elapsed");
-            assertEquals(List.of(new ChunkStore.SuspectChunk(TEST_NS, imported)),
-                    target.orphanSuspects(0, now + ChunkStore.REPAIR_IMPORT_ORPHAN_PROTECTION_MS + 1),
+            assertEquals(List.of(imported),
+                    target.orphanSuspects(0, now + ChunkStore.REPAIR_IMPORT_ORPHAN_PROTECTION_MS + 1)
+                            .stream().map(ChunkStore.SuspectChunk::chunkId).toList(),
                     "once the repair-import protection expires, normal owner-confirm orphan GC resumes");
+        }
+    }
+
+    @Test
+    void repairAdoptionAdvancesGenerationAndRejectsTheStaleSuspect() throws Exception {
+        ChunkId adopted = new ChunkId(FileId.of(4), 0);
+        byte[] payload = "already-present".getBytes(StandardCharsets.UTF_8);
+        try (ChunkStore store = newStore()) {
+            sealedBytes(store, adopted, "already-present");
+            ChunkStore.SuspectChunk stale = store.orphanSuspects(0, System.currentTimeMillis() + 1).getFirst();
+
+            assertEquals(ChunkStore.RepairAdoptionState.ADOPTED,
+                    store.adoptRepairReplica(TEST_NS, adopted, payload.length, Crc.of(payload)).state());
+
+            ChunkStore.SuspectChunk current = store.orphanSuspects(
+                    0, System.currentTimeMillis() + ChunkStore.REPAIR_IMPORT_ORPHAN_PROTECTION_MS + 1).getFirst();
+            assertNotEquals(stale.handleGeneration(), current.handleGeneration(),
+                    "repair adoption must invalidate every suspect captured before command success");
+            assertEquals(ErrorCode.PRECONDITION_FAILED, store.deleteOrphanCandidate(stale, 0));
+            assertTrue(store.contains(TEST_NS, adopted));
+        }
+    }
+
+    @Test
+    void staleSuspectCannotDeleteAReimportedHandleGeneration() throws Exception {
+        ChunkId imported = new ChunkId(FileId.of(5), 0);
+        byte[] replacement = "replacement".getBytes(StandardCharsets.UTF_8);
+        byte[] replacementFile;
+        try (ChunkStore source = new ChunkStore(sourceRoot.resolve("replacement-source"))) {
+            replacementFile = sealedBytes(source, imported, "replacement");
+        }
+
+        try (ChunkStore target = newStore()) {
+            sealedBytes(target, imported, "old-copy");
+            ChunkStore.SuspectChunk stale = target.orphanSuspects(0, System.currentTimeMillis() + 1).getFirst();
+            assertEquals(ErrorCode.OK, target.delete(TEST_NS, imported));
+            target.importSealed(TEST_NS, imported, replacementFile, replacement.length, Crc.of(replacement));
+
+            ChunkStore.SuspectChunk current = target.orphanSuspects(
+                    0, System.currentTimeMillis() + ChunkStore.REPAIR_IMPORT_ORPHAN_PROTECTION_MS + 1).getFirst();
+            assertNotEquals(stale.handleGeneration(), current.handleGeneration());
+            assertEquals(ErrorCode.PRECONDITION_FAILED, target.deleteOrphanCandidate(stale, 0));
+            assertEquals(Crc.of(replacement), target.stat(TEST_NS, imported).dataCrc());
         }
     }
 

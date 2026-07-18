@@ -3,7 +3,6 @@ package io.strata.node;
 import io.strata.common.ChunkId;
 import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
-import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
 import io.strata.format.ChunkStore;
@@ -86,7 +85,7 @@ final class OrphanGc implements AutoCloseable {
     private final Set<StrataNamespace> openNamespaceBreakers = ConcurrentHashMap.newKeySet();
     private final Map<StrataNamespace, RollingCounter> namespaceConfirmedWindows = new ConcurrentHashMap<>();
     private final Map<StrataNamespace, AtomicLong> cumulativeDeletesByNamespace = new ConcurrentHashMap<>();
-    private final Set<NsChunkId> fileNotFoundPending = ConcurrentHashMap.newKeySet();
+    private final Set<ChunkStore.SuspectChunk> fileNotFoundPending = ConcurrentHashMap.newKeySet();
     private final RollingCounter nodeConfirmedWindow = new RollingCounter();
     private final AtomicLong cumulativeNodeDeletes = new AtomicLong();
     private final AtomicBoolean nodeBreakerOpen = new AtomicBoolean();
@@ -113,7 +112,7 @@ final class OrphanGc implements AutoCloseable {
 
     @FunctionalInterface
     interface ConfirmedDelete {
-        ErrorCode delete(StrataNamespace namespace, ChunkId chunkId, long confirmedOwnerEpoch)
+        ErrorCode delete(ChunkStore.SuspectChunk suspect, long confirmedOwnerEpoch)
                 throws InterruptedException;
     }
 
@@ -139,7 +138,7 @@ final class OrphanGc implements AutoCloseable {
                 confirmTimeoutMs, maxConfirmedDeletesPerNamespacePerPass,
                 maxConfirmedDeletePercentPerNamespacePerPass, maxConfirmedDeletesPerNodePass,
                 maxCumulativeDeletesPerNamespace, maxCumulativeDeletesPerNode, ownerEpochAcceptor,
-                confirmedDeleteUsing(deletes));
+                confirmedDeleteUsing(deletes, graceMs));
     }
 
     OrphanGc(ChunkStore store, int nodeId, List<String> controllerEndpoints,
@@ -165,9 +164,9 @@ final class OrphanGc implements AutoCloseable {
         this.breakerWindowMs = Math.max(DEFAULT_BREAKER_WINDOW_MS, scanIntervalMs);
     }
 
-    private static ConfirmedDelete confirmedDeleteUsing(ChunkDeleteService deletes) {
+    private static ConfirmedDelete confirmedDeleteUsing(ChunkDeleteService deletes, long graceMs) {
         ChunkDeleteService checkedDeletes = Objects.requireNonNull(deletes, "deletes");
-        return (namespace, chunkId, confirmedOwnerEpoch) -> checkedDeletes.delete(namespace, chunkId);
+        return (suspect, confirmedOwnerEpoch) -> checkedDeletes.deleteOrphan(suspect, graceMs);
     }
 
     void start() {
@@ -209,7 +208,7 @@ final class OrphanGc implements AutoCloseable {
             return;
         }
         Map<StrataNamespace, Integer> suspectsByNamespace = countByNamespace(suspects);
-        Map<StrataNamespace, List<ChunkId>> confirmed = new LinkedHashMap<>();
+        Map<StrataNamespace, List<ChunkStore.SuspectChunk>> confirmed = new LinkedHashMap<>();
         Map<StrataNamespace, Integer> sealedByNamespace = store.sealedChunksByNamespace();
         Map<StrataNamespace, Integer> haltedByOpenNamespaceBreaker = new LinkedHashMap<>();
         for (ChunkStore.SuspectChunk s : suspects) {
@@ -226,17 +225,17 @@ final class OrphanGc implements AutoCloseable {
                 haltedByOpenNamespaceBreaker.merge(s.namespace(), 1, Integer::sum);
                 continue;
             }
-            switch (corroboratedVerdict(s.namespace(), s.chunkId()).verdict()) {
-                case ORPHAN -> confirmed.computeIfAbsent(s.namespace(), ignored -> new ArrayList<>()).add(s.chunkId());
+            switch (corroboratedVerdict(s).verdict()) {
+                case ORPHAN -> confirmed.computeIfAbsent(s.namespace(), ignored -> new ArrayList<>()).add(s);
                 case KEEP, UNREACHABLE, FILE_NOT_FOUND -> { /* fail-safe: never delete an unconfirmed suspect */ }
             }
         }
 
         int haltedNamespaces = haltedByOpenNamespaceBreaker.size();
         int haltedChunks = haltedByOpenNamespaceBreaker.values().stream().mapToInt(Integer::intValue).sum();
-        Map<StrataNamespace, List<ChunkId>> deleteCandidates = new LinkedHashMap<>();
-        for (Map.Entry<StrataNamespace, List<ChunkId>> e : confirmed.entrySet()) {
-            List<ChunkId> chunks = e.getValue();
+        Map<StrataNamespace, List<ChunkStore.SuspectChunk>> deleteCandidates = new LinkedHashMap<>();
+        for (Map.Entry<StrataNamespace, List<ChunkStore.SuspectChunk>> e : confirmed.entrySet()) {
+            List<ChunkStore.SuspectChunk> chunks = e.getValue();
             if (chunks.isEmpty()) {
                 continue;
             }
@@ -266,13 +265,15 @@ final class OrphanGc implements AutoCloseable {
             }
         }
 
-        List<Map.Entry<StrataNamespace, List<ChunkId>>> deleteEntries = new ArrayList<>(deleteCandidates.entrySet());
+        List<Map.Entry<StrataNamespace, List<ChunkStore.SuspectChunk>>> deleteEntries =
+                new ArrayList<>(deleteCandidates.entrySet());
         int remainingDeleteCandidates = residualConfirmed;
         for (int entryIndex = 0; entryIndex < deleteEntries.size(); entryIndex++) {
-            Map.Entry<StrataNamespace, List<ChunkId>> e = deleteEntries.get(entryIndex);
-            List<ChunkId> chunks = e.getValue();
+            Map.Entry<StrataNamespace, List<ChunkStore.SuspectChunk>> e = deleteEntries.get(entryIndex);
+            List<ChunkStore.SuspectChunk> chunks = e.getValue();
             for (int chunkIndex = 0; chunkIndex < chunks.size(); chunkIndex++) {
-                ChunkId chunkId = chunks.get(chunkIndex);
+                ChunkStore.SuspectChunk suspect = chunks.get(chunkIndex);
+                ChunkId chunkId = suspect.chunkId();
                 if (openNamespaceBreakers.contains(e.getKey())) {
                     int skipped = chunks.size() - chunkIndex;
                     haltedNamespaces++;
@@ -301,9 +302,9 @@ final class OrphanGc implements AutoCloseable {
                     return;
                 }
                 remainingDeleteCandidates--;
-                Confirmation finalConfirmation = corroboratedVerdict(e.getKey(), chunkId);
+                Confirmation finalConfirmation = corroboratedVerdict(suspect);
                 if (finalConfirmation.verdict() == Verdict.ORPHAN
-                        && deleteConfirmed(e.getKey(), chunkId, finalConfirmation.ownerEpoch())) {
+                        && deleteConfirmed(suspect, finalConfirmation.ownerEpoch())) {
                     recordCumulativeDelete(e.getKey());
                 }
             }
@@ -432,15 +433,12 @@ final class OrphanGc implements AutoCloseable {
         if (fileNotFoundPending.isEmpty()) {
             return;
         }
-        Set<NsChunkId> liveSuspects = new HashSet<>();
-        for (ChunkStore.SuspectChunk s : suspects) {
-            liveSuspects.add(new NsChunkId(s.namespace(), s.chunkId()));
-        }
-        fileNotFoundPending.retainAll(liveSuspects);
+        fileNotFoundPending.retainAll(new HashSet<>(suspects));
     }
 
-    private static int remainingNamespaces(List<Map.Entry<StrataNamespace, List<ChunkId>>> entries,
-                                           int entryIndex, int chunkIndex) {
+    private static int remainingNamespaces(
+            List<Map.Entry<StrataNamespace, List<ChunkStore.SuspectChunk>>> entries,
+            int entryIndex, int chunkIndex) {
         int count = 0;
         for (int i = entryIndex; i < entries.size(); i++) {
             int firstChunk = i == entryIndex ? chunkIndex : 0;
@@ -508,11 +506,13 @@ final class OrphanGc implements AutoCloseable {
         return breakerHaltedChunks;
     }
 
-    private boolean deleteConfirmed(StrataNamespace namespace, ChunkId chunkId, long confirmedOwnerEpoch)
+    private boolean deleteConfirmed(ChunkStore.SuspectChunk suspect, long confirmedOwnerEpoch)
             throws InterruptedException {
+        StrataNamespace namespace = suspect.namespace();
+        ChunkId chunkId = suspect.chunkId();
         ErrorCode result;
         try {
-            result = confirmedDelete.delete(namespace, chunkId, confirmedOwnerEpoch);
+            result = confirmedDelete.delete(suspect, confirmedOwnerEpoch);
         } catch (ScpException e) {
             if (e.code() == ErrorCode.FENCED_EPOCH) {
                 log.info("orphan GC: final delete fenced for chunk {} in ns={} confirmedOwnerEpoch={} "
@@ -530,14 +530,19 @@ final class OrphanGc implements AutoCloseable {
         }
         if (result == ErrorCode.OK) {
             log.info("orphan GC: deleted unreferenced sealed chunk {} in ns={}", chunkId, namespace);
-            fileNotFoundPending.remove(new NsChunkId(namespace, chunkId));
+            fileNotFoundPending.remove(suspect);
             return true;
         }
         if (result == ErrorCode.CHUNK_NOT_FOUND) {
             alreadyDeletedTotal.incrementAndGet();
             log.debug("orphan GC: confirmed orphan {} in ns={} was already deleted", chunkId, namespace);
-            fileNotFoundPending.remove(new NsChunkId(namespace, chunkId));
+            fileNotFoundPending.remove(suspect);
             return true;
+        }
+        if (result == ErrorCode.PRECONDITION_FAILED) {
+            log.debug("orphan GC: retained stale or newly protected suspect {} in ns={} generation={}",
+                    chunkId, namespace, suspect.handleGeneration());
+            return false;
         }
         log.warn("orphan GC: confirmed orphan {} in ns={} failed to delete: {}",
                 chunkId, namespace, result);
@@ -584,16 +589,15 @@ final class OrphanGc implements AutoCloseable {
      * a definitive answer from the authoritative owner deletes; an unreachable owner (or only NOT_LEADER
      * redirects, a rejected owner epoch, or any other error) keeps the chunk.
      */
-    private Confirmation corroboratedVerdict(StrataNamespace ns, ChunkId chunkId) {
-        Confirmation confirmation = confirm(ns, chunkId);
+    private Confirmation corroboratedVerdict(ChunkStore.SuspectChunk suspect) {
+        Confirmation confirmation = confirm(suspect.namespace(), suspect.chunkId());
         Verdict verdict = confirmation.verdict();
-        NsChunkId key = new NsChunkId(ns, chunkId);
         if (verdict == Verdict.FILE_NOT_FOUND) {
-            Verdict corroborated = fileNotFoundPending.add(key) ? Verdict.FILE_NOT_FOUND : Verdict.ORPHAN;
+            Verdict corroborated = fileNotFoundPending.add(suspect) ? Verdict.FILE_NOT_FOUND : Verdict.ORPHAN;
             return new Confirmation(corroborated, confirmation.ownerEpoch());
         }
         if (verdict == Verdict.KEEP || verdict == Verdict.ORPHAN) {
-            fileNotFoundPending.remove(key);
+            fileNotFoundPending.remove(suspect);
         }
         return confirmation;
     }

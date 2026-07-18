@@ -12,6 +12,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 
 /**
  * Node-local QoS gate for physical chunk deletion. Foreground appends/reads and background reclaim share
@@ -49,6 +50,19 @@ final class ChunkDeleteService {
         }
     }
 
+    ErrorCode deleteOrphan(ChunkStore.SuspectChunk suspect, long olderThanMs) throws InterruptedException {
+        try (PreparedDelete prepared = prepare()) {
+            return prepared.deleteOrphan(suspect, olderThanMs);
+        }
+    }
+
+    ErrorCode deleteHandleGeneration(StrataNamespace namespace, ChunkId chunkId, long handleGeneration)
+            throws InterruptedException {
+        try (PreparedDelete prepared = prepare()) {
+            return prepared.deleteHandleGeneration(namespace, chunkId, handleGeneration);
+        }
+    }
+
     /**
      * Acquires the shared delete QoS slot without touching the chunk. Callers that need an additional
      * correctness gate can wait here, run that short gate afterwards, and invoke {@link PreparedDelete#delete}
@@ -83,6 +97,18 @@ final class ChunkDeleteService {
         private boolean closed;
 
         ErrorCode delete(StrataNamespace namespace, ChunkId chunkId) {
+            return runDelete(() -> store.delete(namespace, chunkId), false);
+        }
+
+        ErrorCode deleteHandleGeneration(StrataNamespace namespace, ChunkId chunkId, long handleGeneration) {
+            return runDelete(() -> store.deleteHandleGeneration(namespace, chunkId, handleGeneration), true);
+        }
+
+        ErrorCode deleteOrphan(ChunkStore.SuspectChunk suspect, long olderThanMs) {
+            return runDelete(() -> store.deleteOrphanCandidate(suspect, olderThanMs), true);
+        }
+
+        private ErrorCode runDelete(Supplier<ErrorCode> operation, boolean preconditionIsBenign) {
             if (closed) {
                 throw new IllegalStateException("prepared delete is closed");
             }
@@ -92,8 +118,10 @@ final class ChunkDeleteService {
             attempted = true;
             inFlight.incrementAndGet();
             try {
-                ErrorCode result = store.delete(namespace, chunkId);
-                record(result);
+                ErrorCode result = operation.get();
+                if (!preconditionIsBenign || result != ErrorCode.PRECONDITION_FAILED) {
+                    record(result);
+                }
                 return result;
             } catch (RuntimeException e) {
                 failed.increment();
