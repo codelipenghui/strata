@@ -279,22 +279,27 @@ public final class Frame implements AutoCloseable {
     }
 
     public short opcode() {
+        assertOpen();
         return opcode;
     }
 
     public short apiVersion() {
+        assertOpen();
         return apiVersion;
     }
 
     public short flags() {
+        assertOpen();
         return flags;
     }
 
     public long correlationId() {
+        assertOpen();
         return correlationId;
     }
 
     public boolean isResponse() {
+        assertOpen();
         return (flags & FLAG_RESPONSE) != 0;
     }
 
@@ -319,43 +324,53 @@ public final class Frame implements AutoCloseable {
     }
 
     int headerLength() {
+        assertOpen();
         return hasOkU64Header() ? OK_U64_HEADER_LENGTH
                 : owner != null ? ownerHeaderLen : headerBytes != null ? headerBytes.length : header.remaining();
     }
 
     boolean hasOwnedHeader() {
+        assertOpen();
         return owner != null;
     }
 
     boolean hasHeaderBytes() {
+        assertOpen();
         return headerBytes != null;
     }
 
     boolean hasOkU64Header() {
+        assertOpen();
         return headerKind == HEADER_KIND_OK_U64;
     }
 
     long okU64HeaderValue() {
+        assertOpen();
         return headerU64;
     }
 
     byte[] headerBytes() {
+        assertOpen();
         return headerBytes;
     }
 
     boolean hasPayloadBytes() {
+        assertOpen();
         return payloadBytes != null;
     }
 
     byte[] payloadBytes() {
+        assertOpen();
         return payloadBytes;
     }
 
     int payloadBytesOffset() {
+        assertOpen();
         return payloadBytesOffset;
     }
 
     int payloadBytesLength() {
+        assertOpen();
         return payloadBytesLen;
     }
 
@@ -505,14 +520,17 @@ public final class Frame implements AutoCloseable {
 
     /** CRC32C of the payload as computed by the sender and verified at decode; 0 when no payload CRC. */
     public int payloadCrc() {
+        assertOpen();
         return payloadCrc;
     }
 
     public boolean hasFilePayload() {
+        assertOpen();
         return filePayload != null;
     }
 
     public FilePayload filePayload() {
+        assertOpen();
         if (filePayload == null) {
             throw new IllegalStateException("frame has no file payload");
         }
@@ -520,6 +538,7 @@ public final class Frame implements AutoCloseable {
     }
 
     Frame copyToHeap() {
+        assertOpen();
         if (filePayload != null) {
             throw new IllegalStateException("file payload cannot be copied to heap");
         }
@@ -533,6 +552,7 @@ public final class Frame implements AutoCloseable {
     }
 
     public boolean ownsBuffer() {
+        assertOpen();
         return owner != null;
     }
 
@@ -601,7 +621,9 @@ public final class Frame implements AutoCloseable {
     }
 
     private void assertOpen() {
-        assert closed == 0 : "frame is closed and may have been recycled";
+        if (closed != 0) {
+            throw new IllegalStateException("frame is closed and may have been recycled");
+        }
     }
 
     private static ByteBuffer readOnlySlice(ByteBuffer buffer) {

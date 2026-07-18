@@ -684,13 +684,14 @@ class ClientServerTest {
             // it a generous budget: on a slow/loaded CI runner the first connect + round-trip + async
             // dispatch can exceed a few seconds and a tight budget times out spuriously.
             assertTrue(firstStarted.await(30, TimeUnit.SECONDS));
+            Frame firstOk = ScpServer.ok(firstRequest.get(), Messages.okHeader(), null);
 
             CompletableFuture<Frame> rejected = client.send(Opcode.PING, emptyHeader(), null);
             Frame rejectedFrame = rejected.get(30, TimeUnit.SECONDS);
             ScpException e = assertThrows(ScpException.class, () -> Resp.check(rejectedFrame.headerSlice()));
             assertEquals(ErrorCode.THROTTLED, e.code());
 
-            firstResponse.complete(ScpServer.ok(firstRequest.get(), Messages.okHeader(), null));
+            firstResponse.complete(firstOk);
             assertThrows(Exception.class, () -> first.get(1, TimeUnit.SECONDS),
                     "server closes the over-admitted connection after returning THROTTLED");
         }
@@ -820,6 +821,7 @@ class ClientServerTest {
             Frame request = seenRequest.get(30, TimeUnit.SECONDS);
             assertTrue(request.ownsBuffer());
             assertEquals(1, request.ownerRefCnt());
+            Frame response = ScpServer.ok(request, Messages.okHeader(), null);
 
             server.close();
             var e = assertThrows(ExecutionException.class,
@@ -827,7 +829,7 @@ class ClientServerTest {
             assertEquals(IOException.class, e.getCause().getClass());
             waitFor(() -> request.ownerRefCnt() == 0);
 
-            delayed.complete(ScpServer.ok(request, Messages.okHeader(), null));
+            delayed.complete(response);
             assertTrue(delayed.isDone());
         }
     }

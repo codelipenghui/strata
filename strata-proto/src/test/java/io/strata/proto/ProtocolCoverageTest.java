@@ -721,6 +721,32 @@ class ProtocolCoverageTest {
     }
 
     @Test
+    void closedOwnedRequestFrameRejectsStateAccess() {
+        byte[] bytes = {9, 1, 2, 3, 4, 5, 9};
+        Frame frame = Frame.fromOwnedBuffer(Opcode.APPEND.code, (short) 1, Frame.FLAG_PAYLOAD_CRC, 99,
+                Unpooled.wrappedBuffer(bytes), 1, 2, 3, 3, Crc.of(bytes, 3, 3));
+
+        frame.close();
+        assertEquals(0, frame.ownerRefCnt());
+
+        List.<Runnable>of(
+                () -> frame.opcode(),
+                () -> frame.apiVersion(),
+                () -> frame.flags(),
+                () -> frame.correlationId(),
+                () -> frame.isResponse(),
+                () -> frame.headerSlice(),
+                () -> frame.payloadSlice(),
+                () -> frame.payloadLength(),
+                () -> frame.payloadCrc(),
+                () -> frame.hasFilePayload(),
+                () -> frame.filePayload(),
+                () -> frame.copyToHeap(),
+                () -> frame.ownsBuffer())
+                .forEach(ProtocolCoverageTest::assertClosedFrameAccessRejected);
+    }
+
+    @Test
     void ownedRequestFrameClosedOnDifferentThreadDoesNotEnterWrapperPool() throws Exception {
         byte[] firstBytes = {9, 1, 2, 3, 4, 5, 9};
         ByteBuf firstOwner = Unpooled.wrappedBuffer(firstBytes);
@@ -846,6 +872,11 @@ class ProtocolCoverageTest {
         IOException e = assertThrows(IOException.class,
                 () -> FrameIO.read(new DataInputStream(new ByteArrayInputStream(wire))));
         assertTrue(e.getMessage().contains(messageFragment), "got: " + e.getMessage());
+    }
+
+    private static void assertClosedFrameAccessRejected(Runnable access) {
+        IllegalStateException error = assertThrows(IllegalStateException.class, access::run);
+        assertEquals("frame is closed and may have been recycled", error.getMessage());
     }
 
     private static void assertConfirmOrphanRespDecodeFails(byte[] wire) {
