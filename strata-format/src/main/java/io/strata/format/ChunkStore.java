@@ -127,6 +127,7 @@ public final class ChunkStore implements AutoCloseable {
 
     private final Path dir;
     private final Map<ChunkKey, Handle> chunks = new ChunkHandleMap();
+    private final AtomicLong nextHandleGeneration = new AtomicLong();
     private final ChannelCache channelCache;
     private final ReadBufferPool readBufferPool =
             new ReadBufferPool(READ_BUFFER_POOL_MAX_BYTES, READ_BUFFER_POOL_MAX_BUFFERS);
@@ -592,6 +593,8 @@ public final class ChunkStore implements AutoCloseable {
         // on the group-commit flusher join, and on Java 21 a virtual thread that blocks while holding
         // `synchronized` pins its carrier. ReentrantLock unmounts cleanly; no wait/notify is used.
         final ReentrantLock lock = new ReentrantLock();
+        // Process-local version of this installation/adoption; orphan-GC snapshots must match it.
+        long generation;
         final ChunkId id;
         final StrataNamespace ns;
         final ChunkKey mapKey;  // pre-computed map key — avoids per-iteration allocation in background loops
@@ -716,6 +719,7 @@ public final class ChunkStore implements AutoCloseable {
         }
 
         Handle(ChunkId id, ChunkFormats.Header header, StrataNamespace ns) {
+            this.generation = nextHandleGeneration.incrementAndGet();
             this.id = id;
             this.ns = ns;
             this.mapKey = new ChunkKey(ns, id);
@@ -735,6 +739,7 @@ public final class ChunkStore implements AutoCloseable {
          * dataPath rather than recomputed from a namespace, avoiding a second path-encoding step.
          */
         Handle(ChunkId id, ChunkFormats.Header header, Path dataPath, StrataNamespace ns) {
+            this.generation = nextHandleGeneration.incrementAndGet();
             this.id = id;
             this.ns = ns;
             this.mapKey = new ChunkKey(ns, id);
@@ -1967,6 +1972,51 @@ public final class ChunkStore implements AutoCloseable {
         }
     }
 
+    public enum RepairAdoptionState { ADOPTED, IN_PROGRESS, NOT_FOUND, MISMATCHED }
+
+    public record RepairAdoption(RepairAdoptionState state, long handleGeneration) {}
+
+    /**
+     * Atomically validates and adopts an already-present repair target. A matching sealed copy is
+     * protected for the same descriptor-swap window as a fresh {@link #importSealed} copy. The check
+     * and protection stamp share the chunk lock so orphan GC cannot pass its final local precondition
+     * between them.
+     */
+    public RepairAdoption adoptRepairReplica(StrataNamespace ns, ChunkId id,
+                                              long expectedLength, int expectedCrc) {
+        ChunkKey key = new ChunkKey(ns, id);
+        while (true) {
+            Handle h = chunks.get(key);
+            if (h == null) {
+                RepairAdoptionState state = creating.contains(new NsChunkId(ns, id))
+                        ? RepairAdoptionState.IN_PROGRESS
+                        : RepairAdoptionState.NOT_FOUND;
+                return new RepairAdoption(state, 0);
+            }
+            h.lock.lock();
+            try {
+                // A delete/re-import may have replaced the map entry while this thread waited for the
+                // old handle's lock. Retry against the current handle instead of adopting stale state.
+                if (chunks.get(key) != h) {
+                    continue;
+                }
+                if (h.state != ChunkState.SEALED
+                        || h.sealedLength != expectedLength
+                        || h.dataCrc != expectedCrc) {
+                    return new RepairAdoption(RepairAdoptionState.MISMATCHED, h.generation);
+                }
+                long now = System.currentTimeMillis();
+                h.generation = nextHandleGeneration.incrementAndGet();
+                h.lastVerifiedAtMs = now;
+                h.orphanProtectedUntilMs = Math.max(
+                        h.orphanProtectedUntilMs, now + REPAIR_IMPORT_ORPHAN_PROTECTION_MS);
+                return new RepairAdoption(RepairAdoptionState.ADOPTED, h.generation);
+            } finally {
+                h.lock.unlock();
+            }
+        }
+    }
+
     public record SealResult(long finalLength, int dataCrc) {}
 
     /**
@@ -2499,14 +2549,32 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     public ErrorCode delete(StrataNamespace ns, ChunkId id) {
+        return delete(ns, id, 0, false);
+    }
+
+    /** Deletes only the currently mapped handle generation; a replacement is retained fail-closed. */
+    public ErrorCode deleteHandleGeneration(StrataNamespace ns, ChunkId id, long expectedGeneration) {
+        if (expectedGeneration <= 0) {
+            throw new IllegalArgumentException("expectedGeneration must be positive: " + expectedGeneration);
+        }
+        return delete(ns, id, expectedGeneration, true);
+    }
+
+    private ErrorCode delete(StrataNamespace ns, ChunkId id, long expectedGeneration, boolean generationBound) {
         long t0 = System.nanoTime();
         ChunkKey key = new ChunkKey(ns, id);
         Handle h = chunks.get(key);
-        if (h == null && creating.contains(new NsChunkId(ns, id))) return ErrorCode.INTERNAL;
+        if (h == null && creating.contains(new NsChunkId(ns, id))) {
+            return generationBound ? ErrorCode.PRECONDITION_FAILED : ErrorCode.INTERNAL;
+        }
         if (h == null) return ErrorCode.CHUNK_NOT_FOUND;
         GroupCommitter committerToStop;
         h.lock.lock();
         try {
+            if (generationBound
+                    && (chunks.get(key) != h || h.generation != expectedGeneration)) {
+                return ErrorCode.PRECONDITION_FAILED;
+            }
             h.state = ChunkState.DELETING; // blocks appends/seal for the whole teardown
             committerToStop = h.committer;
             if (committerToStop == null) {
@@ -2525,6 +2593,10 @@ public final class ChunkStore implements AutoCloseable {
         }
         h.lock.lock();
         try {
+            if (generationBound
+                    && (chunks.get(key) != h || h.generation != expectedGeneration)) {
+                return ErrorCode.PRECONDITION_FAILED;
+            }
             h.committer = null; // confirmed stopped above; safe to mutate files
             return deleteLocked(h, key, id, t0);
         } finally {
@@ -2607,8 +2679,11 @@ public final class ChunkStore implements AutoCloseable {
         return out;
     }
 
-    /** A locally-held sealed chunk no owner has verified within the grace window (orphan-GC candidate). */
-    public record SuspectChunk(StrataNamespace namespace, ChunkId chunkId) {}
+    /**
+     * A locally-held sealed chunk no owner has verified within the grace window. The handle generation
+     * binds the point-in-time suspect to one concrete local installation/adoption of the chunk id.
+     */
+    public record SuspectChunk(StrataNamespace namespace, ChunkId chunkId, long handleGeneration) {}
 
     /**
      * Node-local orphan-GC candidates (design §9.2): sealed chunks no owner has attested within
@@ -2624,13 +2699,46 @@ public final class ChunkStore implements AutoCloseable {
                 if (h.state == ChunkState.SEALED
                         && now >= h.orphanProtectedUntilMs
                         && now - h.lastVerifiedAtMs >= olderThanMs) {
-                    out.add(new SuspectChunk(h.ns, h.id));
+                    out.add(new SuspectChunk(h.ns, h.id, h.generation));
                 }
             } finally {
                 h.lock.unlock();
             }
         }
         return out;
+    }
+
+    /**
+     * Deletes only the exact handle captured by {@link #orphanSuspects}, after rechecking its current
+     * verification/protection state under that handle's lock. {@link ErrorCode#PRECONDITION_FAILED}
+     * means the suspect became stale or protected and must be retained; it is an expected fail-closed
+     * race outcome, not a storage failure.
+     */
+    public ErrorCode deleteOrphanCandidate(SuspectChunk suspect, long olderThanMs) {
+        Objects.requireNonNull(suspect, "suspect");
+        ChunkKey key = new ChunkKey(suspect.namespace(), suspect.chunkId());
+        Handle h = chunks.get(key);
+        if (h == null) {
+            return creating.contains(new NsChunkId(suspect.namespace(), suspect.chunkId()))
+                    ? ErrorCode.PRECONDITION_FAILED
+                    : ErrorCode.CHUNK_NOT_FOUND;
+        }
+        long t0 = System.nanoTime();
+        h.lock.lock();
+        try {
+            long now = System.currentTimeMillis();
+            if (chunks.get(key) != h
+                    || h.generation != suspect.handleGeneration()
+                    || h.state != ChunkState.SEALED
+                    || now < h.orphanProtectedUntilMs
+                    || now - h.lastVerifiedAtMs < olderThanMs) {
+                return ErrorCode.PRECONDITION_FAILED;
+            }
+            h.state = ChunkState.DELETING;
+            return deleteLocked(h, key, suspect.chunkId(), t0);
+        } finally {
+            h.lock.unlock();
+        }
     }
 
     public long usedBytes() {

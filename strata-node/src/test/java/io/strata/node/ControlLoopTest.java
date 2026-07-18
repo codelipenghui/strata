@@ -6,6 +6,7 @@ import io.strata.common.ConnectionPolicy;
 import io.strata.common.Endpoint;
 import io.strata.common.ErrorCode;
 import io.strata.common.FileId;
+import io.strata.common.FailureInjector;
 import io.strata.common.NsChunkId;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
@@ -36,7 +37,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -723,10 +726,14 @@ class ControlLoopTest {
             store.open(TEST_NS, valid, false, 1, 1L);
             store.append(TEST_NS, valid, 1, 0, 0, ByteBuffer.wrap(data));
             var sealed = store.seal(TEST_NS, valid, 1, data.length, null);
+            ChunkStore.SuspectChunk beforeAdoption =
+                    store.orphanSuspects(0, System.currentTimeMillis() + 1).getFirst();
 
             invokeReplicate(loop, new Messages.ReplicateCmd(10, valid, List.of(), (byte) 0,
                     sealed.dataCrc(), data.length, TEST_NS));
             assertTrue(store.contains(TEST_NS, valid));
+            assertEquals(ErrorCode.PRECONDITION_FAILED, store.deleteOrphanCandidate(beforeAdoption, 0),
+                    "a matching REPLICATE replay must adopt/protect the copy before returning success");
 
             ChunkId stale = new ChunkId(FileId.of(5), 1);
             store.open(TEST_NS, stale, false, 1, 1L);
@@ -752,6 +759,146 @@ class ControlLoopTest {
             assertEquals(ErrorCode.INTERNAL, crcMismatch.code());
             assertFalse(store.contains(TEST_NS, crcZeroDescriptor),
                     "expected CRC zero must not be treated as a wildcard for local replay");
+        }
+    }
+
+    @Test
+    void overlappingRepairsCannotDeleteAConcurrentReplacement() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(21), 0);
+        byte[] expected = "replacement-from-source".getBytes();
+        try (ChunkStore sourceStore = new ChunkStore(dir.resolve("overlap-source"));
+             DataNode node = new DataNode(DataNodeConfig.standalone(dir.resolve("overlap-target")))) {
+            sourceStore.open(TEST_NS, chunkId, false, 1, 1L);
+            sourceStore.append(TEST_NS, chunkId, 1, 0, 0, ByteBuffer.wrap(expected));
+            int expectedCrc = sourceStore.seal(TEST_NS, chunkId, 1, expected.length, null).dataCrc();
+
+            byte[] stale = "mismatched-local-copy".getBytes();
+            node.store().open(TEST_NS, chunkId, false, 1, 1L);
+            node.store().append(TEST_NS, chunkId, 1, 0, 0, ByteBuffer.wrap(stale));
+            node.store().seal(TEST_NS, chunkId, 1, stale.length, null);
+
+            try (ScpServer source = new ScpServer(0, 77, 0, 0, req -> {
+                Opcode op = Opcode.fromCode(req.opcode());
+                if (op == Opcode.FETCH_CHUNK) {
+                    Messages.FetchChunk fetch = Messages.FetchChunk.decode(req.headerSlice());
+                    var result = sourceStore.fetch(
+                            fetch.namespace(), fetch.chunkId(), fetch.offset(), fetch.maxBytes());
+                    return ScpServer.ok(req,
+                            new Messages.FetchResp(result.fileLength(), result.state()).encode(),
+                            ByteBuffer.wrap(result.bytes()));
+                }
+                throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+            })) {
+                ControlLoop loop = controlLoop(node, configWithoutMetadata());
+                CountDownLatch delayedAtMismatch = new CountDownLatch(1);
+                CountDownLatch releaseDelayed = new CountDownLatch(1);
+                AtomicInteger seamHits = new AtomicInteger();
+                AtomicReference<Throwable> delayedFailure = new AtomicReference<>();
+                Thread delayed = null;
+                FailureInjector.arm("node.repair.afterMismatchBeforeDelete", point -> {
+                    if (seamHits.incrementAndGet() == 1) {
+                        delayedAtMismatch.countDown();
+                        if (!releaseDelayed.await(5, TimeUnit.SECONDS)) {
+                            throw new AssertionError("replacement repair did not finish before timeout");
+                        }
+                    }
+                });
+                try {
+                    Messages.ReplicateCmd delayedCmd = new Messages.ReplicateCmd(31, chunkId,
+                            List.of(new Messages.Replica(88, "127.0.0.1:1")),
+                            (byte) 0, expectedCrc, expected.length, TEST_NS);
+                    delayed = Thread.ofVirtual().name("delayed-overlapping-repair").start(() -> {
+                        try {
+                            invokeReplicate(loop, delayedCmd);
+                        } catch (Throwable t) {
+                            delayedFailure.set(t);
+                        }
+                    });
+                    assertTrue(delayedAtMismatch.await(5, TimeUnit.SECONDS),
+                            "delayed repair did not classify the stale handle");
+
+                    invokeReplicate(loop, new Messages.ReplicateCmd(32, chunkId,
+                            List.of(new Messages.Replica(77, endpoint(source))),
+                            (byte) 0, expectedCrc, expected.length, TEST_NS));
+                    releaseDelayed.countDown();
+                    delayed.join(TimeUnit.SECONDS.toMillis(5));
+
+                    assertFalse(delayed.isAlive(), "delayed repair did not finish");
+                    assertNull(delayedFailure.get(), "delayed repair failed: " + delayedFailure.get());
+                    assertEquals(2, seamHits.get(), "both workers must classify the original stale handle");
+                    ChunkStore.StatResult installed = node.store().stat(TEST_NS, chunkId);
+                    assertEquals(ChunkState.SEALED, installed.state());
+                    assertEquals(expected.length, installed.sealedLength());
+                    assertEquals(expectedCrc, installed.dataCrc());
+                } finally {
+                    releaseDelayed.countDown();
+                    FailureInjector.reset();
+                    if (delayed != null && delayed.isAlive()) {
+                        delayed.interrupt();
+                        delayed.join(TimeUnit.SECONDS.toMillis(5));
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void replicateBoundsWaitForAConcurrentImportReservation() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(22), 0);
+        DataNodeConfig config = DataNodeConfig.standalone(dir.resolve("reserved-target"))
+                .withControlCallTimeoutMs(50);
+        try (DataNode node = new DataNode(config)) {
+            Set<Object> creating = creatingSet(node.store());
+            creating.add(new NsChunkId(TEST_NS, chunkId));
+            try {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> invokeReplicate(controlLoop(node, config), new Messages.ReplicateCmd(
+                                33, chunkId, List.of(), (byte) 0, 0, 1, TEST_NS)));
+
+                assertEquals(ErrorCode.CHUNK_ALREADY_EXISTS, e.code());
+                assertTrue(e.getMessage().contains("concurrent import did not finish"));
+            } finally {
+                creating.remove(new NsChunkId(TEST_NS, chunkId));
+            }
+        }
+    }
+
+    @Test
+    void replicateDoesNotRetryAPersistentOnDiskImportCollision() throws Exception {
+        ChunkId chunkId = new ChunkId(FileId.of(23), 0);
+        byte[] expected = "persistent-collision-source".getBytes();
+        DataNodeConfig config = DataNodeConfig.standalone(dir.resolve("collision-target"));
+        try (ChunkStore sourceStore = new ChunkStore(dir.resolve("collision-source"));
+             DataNode node = new DataNode(config)) {
+            sourceStore.open(TEST_NS, chunkId, false, 1, 1L);
+            sourceStore.append(TEST_NS, chunkId, 1, 0, 0, ByteBuffer.wrap(expected));
+            int expectedCrc = sourceStore.seal(TEST_NS, chunkId, 1, expected.length, null).dataCrc();
+
+            Path collision = config.dataDir().resolve("chunks")
+                    .resolve(ChunkFormats.chunkRelativePath(TEST_NS, chunkId) + ".chunk");
+            Files.createDirectories(collision.getParent());
+            Files.write(collision, new byte[] {1});
+            AtomicInteger fetches = new AtomicInteger();
+            try (ScpServer source = new ScpServer(0, 77, 0, 0, req -> {
+                if (Opcode.fromCode(req.opcode()) != Opcode.FETCH_CHUNK) {
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                }
+                fetches.incrementAndGet();
+                Messages.FetchChunk fetch = Messages.FetchChunk.decode(req.headerSlice());
+                var result = sourceStore.fetch(
+                        fetch.namespace(), fetch.chunkId(), fetch.offset(), fetch.maxBytes());
+                return ScpServer.ok(req,
+                        new Messages.FetchResp(result.fileLength(), result.state()).encode(),
+                        ByteBuffer.wrap(result.bytes()));
+            })) {
+                ScpException e = assertThrows(ScpException.class,
+                        () -> invokeReplicate(controlLoop(node, config), new Messages.ReplicateCmd(
+                                34, chunkId, List.of(new Messages.Replica(77, endpoint(source))),
+                                (byte) 0, expectedCrc, expected.length, TEST_NS)));
+
+                assertEquals(ErrorCode.CHUNK_ALREADY_EXISTS, e.code());
+                assertEquals(1, fetches.get(), "persistent collision must not trigger repeated whole-file fetches");
+            }
         }
     }
 
@@ -1161,6 +1308,13 @@ class ControlLoopTest {
         Field field = target.getClass().getDeclaredField(fieldName);
         field.setAccessible(true);
         return (T) field.get(target);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Set<Object> creatingSet(ChunkStore store) throws Exception {
+        Field field = ChunkStore.class.getDeclaredField("creating");
+        field.setAccessible(true);
+        return (Set<Object>) field.get(store);
     }
 
     private static long getLong(ControlLoop loop, String fieldName) throws Exception {

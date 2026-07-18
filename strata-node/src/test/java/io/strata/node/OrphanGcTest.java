@@ -23,6 +23,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -832,6 +835,121 @@ class OrphanGcTest {
     }
 
     @Test
+    void gcCannotDeleteAnAlreadyPresentReplicaAdoptedBeforeDescriptorCommit() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(0x1241), 0);
+        byte[] payload = "already-present".getBytes(StandardCharsets.UTF_8);
+        CountDownLatch finalConfirmEntered = new CountDownLatch(1);
+        CountDownLatch releaseFinalConfirm = new CountDownLatch(1);
+        AtomicInteger confirms = new AtomicInteger();
+        DataNodeConfig config = DataNodeConfig.standalone(dir.resolve("adopted-target"));
+        try (DataNode node = new DataNode(config)) {
+            ChunkStore store = node.store();
+            store.open(NS, chunk, false, 1, 1L);
+            store.append(NS, chunk, 1, 0, 0, ByteBuffer.wrap(payload));
+            int crc = store.seal(NS, chunk, 1, payload.length, null).dataCrc();
+            ControlLoop loop = new ControlLoop(node, config, store, new ChunkDeleteService(store, 1, 0));
+
+            try (ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                }
+                if (confirms.incrementAndGet() == 2) {
+                    finalConfirmEntered.countDown();
+                    if (!releaseFinalConfirm.await(5, TimeUnit.SECONDS)) {
+                        throw new ScpException(ErrorCode.INTERNAL, "timed out waiting for repair adoption");
+                    }
+                }
+                // The descriptor intentionally still omits the target until after command success.
+                return confirmResponse(req, true, false, 1);
+            });
+                 OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()),
+                         0, 60_000, 0, 5_000, 64, 0, 0)) {
+                CompletableFuture<Void> gcRun = runGcOnce(gc);
+                try {
+                    assertTrue(finalConfirmEntered.await(5, TimeUnit.SECONDS));
+                    loop.replicate(new Messages.ReplicateCmd(
+                            1, chunk, List.of(), (byte) 0, crc, payload.length, NS));
+                } finally {
+                    releaseFinalConfirm.countDown();
+                }
+                gcRun.get(10, TimeUnit.SECONDS);
+
+                assertEquals(2, confirms.get());
+                assertTrue(store.contains(NS, chunk),
+                        "a stale GC confirmation must not delete a replica after REPLICATE adopted it");
+                assertEquals(crc, store.stat(NS, chunk).dataCrc());
+            }
+        }
+    }
+
+    @Test
+    void gcCannotDeleteAFreshImportThatReplacedItsSuspectBeforeDescriptorCommit() throws Exception {
+        ChunkId chunk = new ChunkId(FileId.of(0x1242), 0);
+        byte[] oldPayload = "old-copy".getBytes(StandardCharsets.UTF_8);
+        byte[] repairedPayload = "fresh-repair-copy".getBytes(StandardCharsets.UTF_8);
+        CountDownLatch finalConfirmEntered = new CountDownLatch(1);
+        CountDownLatch releaseFinalConfirm = new CountDownLatch(1);
+        AtomicInteger confirms = new AtomicInteger();
+        DataNodeConfig config = DataNodeConfig.standalone(dir.resolve("import-target"));
+
+        try (ChunkStore sourceStore = new ChunkStore(dir.resolve("import-source"));
+             DataNode node = new DataNode(config)) {
+            sourceStore.open(NS, chunk, false, 1, 1L);
+            sourceStore.append(NS, chunk, 1, 0, 0, ByteBuffer.wrap(repairedPayload));
+            int repairedCrc = sourceStore.seal(NS, chunk, 1, repairedPayload.length, null).dataCrc();
+
+            ChunkStore targetStore = node.store();
+            targetStore.open(NS, chunk, false, 1, 1L);
+            targetStore.append(NS, chunk, 1, 0, 0, ByteBuffer.wrap(oldPayload));
+            targetStore.seal(NS, chunk, 1, oldPayload.length, null);
+            ControlLoop loop = new ControlLoop(node, config, targetStore,
+                    new ChunkDeleteService(targetStore, 1, 0));
+
+            try (ScpServer source = new ScpServer(0, 0, 0, 0, req -> {
+                if (req.opcode() != Opcode.FETCH_CHUNK.code) {
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                }
+                Messages.FetchChunk fetch = Messages.FetchChunk.decode(req.headerSlice());
+                ChunkStore.FetchResult result = sourceStore.fetch(
+                        fetch.namespace(), fetch.chunkId(), fetch.offset(), fetch.maxBytes());
+                return ScpServer.ok(req, new Messages.FetchResp(result.fileLength(), result.state()).encode(),
+                        ByteBuffer.wrap(result.bytes()));
+            });
+                 ScpServer owner = new ScpServer(0, 0, 0, 0, req -> {
+                     if (req.opcode() != Opcode.CONFIRM_ORPHAN.code) {
+                         throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected");
+                     }
+                     if (confirms.incrementAndGet() == 2) {
+                         finalConfirmEntered.countDown();
+                         if (!releaseFinalConfirm.await(5, TimeUnit.SECONDS)) {
+                             throw new ScpException(ErrorCode.INTERNAL, "timed out waiting for repair import");
+                         }
+                     }
+                     return confirmResponse(req, true, false, 1);
+                 });
+                 OrphanGc gc = orphanGc(targetStore, List.of("127.0.0.1:" + owner.port()),
+                         0, 60_000, 0, 5_000, 64, 0, 0)) {
+                CompletableFuture<Void> gcRun = runGcOnce(gc);
+                try {
+                    assertTrue(finalConfirmEntered.await(5, TimeUnit.SECONDS));
+                    loop.replicate(new Messages.ReplicateCmd(2, chunk,
+                            List.of(new Messages.Replica(99, "127.0.0.1:" + source.port())),
+                            (byte) 0, repairedCrc, repairedPayload.length, NS));
+                } finally {
+                    releaseFinalConfirm.countDown();
+                }
+                gcRun.get(10, TimeUnit.SECONDS);
+
+                assertEquals(2, confirms.get());
+                assertTrue(targetStore.contains(NS, chunk),
+                        "a stale GC suspect must not delete the replacement repair handle");
+                assertEquals(repairedCrc, targetStore.stat(NS, chunk).dataCrc());
+                assertEquals(repairedPayload.length, targetStore.stat(NS, chunk).sealedLength());
+            }
+        }
+    }
+
+    @Test
     void finalDeleteUsesTheEpochFromTheLastConfirmationAndKeepsWhenFenced() throws Exception {
         ChunkId chunk = new ChunkId(FileId.of(1), 0);
         AtomicInteger guardedDeletes = new AtomicInteger();
@@ -848,9 +966,9 @@ class OrphanGcTest {
                     List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000,
                     64, 0, 0, 0, 0,
                     (namespace, ownerEpoch) -> {},
-                    (namespace, confirmedChunk, confirmedOwnerEpoch) -> {
-                        assertEquals(NS, namespace);
-                        assertEquals(chunk, confirmedChunk);
+                    (suspect, confirmedOwnerEpoch) -> {
+                        assertEquals(NS, suspect.namespace());
+                        assertEquals(chunk, suspect.chunkId());
                         assertEquals(8, confirmedOwnerEpoch,
                                 "the delete gate must recheck the final response's epoch");
                         guardedDeletes.incrementAndGet();
@@ -883,12 +1001,12 @@ class OrphanGcTest {
                     List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000,
                     64, 0, 0, 0, 0,
                     (namespace, ownerEpoch) -> {},
-                    (namespace, chunkId, confirmedOwnerEpoch) -> {
+                    (suspect, confirmedOwnerEpoch) -> {
                         guardedDeletes.incrementAndGet();
-                        if (chunkId.equals(failed)) {
+                        if (suspect.chunkId().equals(failed)) {
                             throw new ScpException(ErrorCode.INTERNAL, "poisoned final gate");
                         }
-                        return store.delete(namespace, chunkId);
+                        return store.deleteOrphanCandidate(suspect, 0);
                     });
 
             gc.gcOnce();
@@ -964,7 +1082,7 @@ class OrphanGcTest {
     }
 
     @Test
-    void gcOnceKeepsInternalDeleteFailureOnFailurePath() throws Exception {
+    void gcOnceTreatsConcurrentImportReservationAsBenign() throws Exception {
         ChunkId chunk = new ChunkId(FileId.of(1), 0);
         AtomicInteger confirms = new AtomicInteger();
         try (ChunkStore store = new ChunkStore(dir.resolve("chunks"))) {
@@ -996,8 +1114,9 @@ class OrphanGcTest {
             assertEquals(3, confirms.get(), "gcOnce must still reach the delete-time reconfirm");
             assertEquals(1, deletes.okDeletes());
             assertEquals(0, deletes.notFoundDeletes(),
-                    "INTERNAL must not be widened into the idempotent already-deleted path");
-            assertEquals(1, deletes.failedDeletes());
+                    "an in-progress replacement must not look like an already-deleted chunk");
+            assertEquals(0, deletes.failedDeletes(),
+                    "a stale suspect racing an import reservation is a benign precondition miss");
             assertEquals(0, gc.alreadyDeletedTotal());
         }
     }
@@ -1143,6 +1262,17 @@ class OrphanGcTest {
                                          boolean referencedByNode, long ownerEpoch) {
         return ScpServer.ok(req,
                 new Messages.ConfirmOrphanResp(fileExists, referencedByNode, ownerEpoch).encode(), null);
+    }
+
+    private static CompletableFuture<Void> runGcOnce(OrphanGc gc) {
+        return CompletableFuture.runAsync(() -> {
+            try {
+                gc.gcOnce();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new CompletionException(e);
+            }
+        });
     }
 
     private static OrphanGc orphanGc(ChunkStore store, List<String> controllerEndpoints,

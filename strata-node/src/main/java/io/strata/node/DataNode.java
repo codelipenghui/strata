@@ -407,6 +407,15 @@ public final class DataNode implements AutoCloseable {
      * the throttle wait or physical I/O. Owner RPCs that arrive after the claim commit fail fast with a
      * retriable error and can retry once the unlink finishes.
      */
+    ErrorCode deleteConfirmedOrphan(ChunkStore.SuspectChunk suspect, long confirmedOwnerEpoch)
+            throws InterruptedException {
+        try (ChunkDeleteService.PreparedDelete prepared = deleteService.prepare()) {
+            return deleteConfirmedOrphan(
+                    suspect.namespace(), suspect.chunkId(), confirmedOwnerEpoch,
+                    () -> prepared.deleteOrphan(suspect, config.orphanGraceMs()));
+        }
+    }
+
     ErrorCode deleteConfirmedOrphan(StrataNamespace namespace, ChunkId chunkId, long confirmedOwnerEpoch)
             throws InterruptedException {
         try (ChunkDeleteService.PreparedDelete prepared = deleteService.prepare()) {
