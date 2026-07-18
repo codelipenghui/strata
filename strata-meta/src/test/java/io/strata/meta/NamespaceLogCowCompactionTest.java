@@ -326,6 +326,34 @@ class NamespaceLogCowCompactionTest {
         }
     }
 
+    @Test
+    void unrelatedIllegalStateDuringCompactionDoesNotFenceTheActiveRepository() throws Exception {
+        try (TestingServer zk = NamespaceLogTestSupport.testingServer();
+             ZkMetadataStore real = NamespaceLogTestSupport.inMemoryRoot(zk)) {
+            AtomicBoolean failNextManifestCas = new AtomicBoolean(false);
+            MetadataStore root = failManifestCasWithIllegalStateOnce(real, failNextManifestCas);
+            try (NamespaceLogBackend backend = new NamespaceLogBackend(
+                    root, NamespaceLogTestSupport.inMemoryFileStore(), false)) {
+                for (int i = 1; i <= 3; i++) {
+                    backend.createFile(file(i, "/f" + i));
+                }
+                long activeEpoch = backend.namespaceOwnerEpoch(NS);
+                assertTrue(activeEpoch > 0);
+                failNextManifestCas.set(true);
+
+                assertEquals(0, backend.compactOversizedRepos(1));
+                assertEquals(NamespaceLeaderState.ACTIVE, backend.leaderState(NS));
+                assertEquals(activeEpoch, backend.namespaceOwnerEpoch(NS),
+                        "an unrelated compaction invariant failure must not evict the current repository");
+
+                backend.createFile(file(4, "/f4"));
+                assertTrue(backend.getFile(NS, FileId.of(4)).isPresent());
+                assertEquals(activeEpoch, backend.namespaceOwnerEpoch(NS),
+                        "the next mutation must reuse the same active repository instead of re-acquiring");
+            }
+        }
+    }
+
     /**
      * Wraps {@code delegate} so the next {@code putNamespaceManifest} (once {@code armed}) throws a transient
      * {@link KeeperException.ConnectionLossException} — the propagating, non-version-conflict failure that
@@ -339,6 +367,23 @@ class NamespaceLogCowCompactionTest {
                 (proxy, method, methodArgs) -> {
                     if (method.getName().equals("putNamespaceManifest") && armed.compareAndSet(true, false)) {
                         throw new KeeperException.ConnectionLossException();
+                    }
+                    try {
+                        return method.invoke(delegate, methodArgs);
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
+    }
+
+    private static MetadataStore failManifestCasWithIllegalStateOnce(
+            MetadataStore delegate, AtomicBoolean armed) {
+        return (MetadataStore) Proxy.newProxyInstance(
+                MetadataStore.class.getClassLoader(),
+                new Class<?>[]{MetadataStore.class},
+                (proxy, method, methodArgs) -> {
+                    if (method.getName().equals("putNamespaceManifest") && armed.compareAndSet(true, false)) {
+                        throw new IllegalStateException("injected non-fencing compaction failure");
                     }
                     try {
                         return method.invoke(delegate, methodArgs);

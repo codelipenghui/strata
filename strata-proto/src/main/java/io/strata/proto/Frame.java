@@ -19,7 +19,10 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * releaser is supplied. Netty-decoded frames may own a retained {@link ByteBuf}; transport code
  * must close owned frames after the handler no longer needs the slices. After {@link #close()}, an
  * owned request frame may be reused for a later request; callers must not touch a frame after
- * closing it. Set {@code STRATA_SCP_OWNED_REQUEST_FRAME_POOL_SIZE=0} to disable that wrapper pool.</p>
+ * closing it. Runtime closed-state checks do not revoke {@link ByteBuffer} views, raw array references,
+ * or {@link FilePayload} leases obtained before close, and a pooled wrapper is open again after reuse
+ * (the ABA window). Callers must therefore treat both the frame and its escaped views as invalid after
+ * close. Set {@code STRATA_SCP_OWNED_REQUEST_FRAME_POOL_SIZE=0} to disable that wrapper pool.</p>
  */
 public final class Frame implements AutoCloseable {
     public static final byte MAGIC = 0x5C;
@@ -556,14 +559,17 @@ public final class Frame implements AutoCloseable {
         return owner != null;
     }
 
+    /** Intentionally usable after close for ownership-release diagnostics. */
     public int ownerRefCnt() {
         return owner == null ? closedOwnerRefCnt : owner.refCnt();
     }
 
     void reserveWireBytes(long bytes) {
+        assertOpen();
         RESERVED_WIRE_BYTES.addAndGet(this, bytes);
     }
 
+    /** Intentionally usable after close so transport cleanup can release the frame's reservation. */
     long drainReservedWireBytes() {
         return RESERVED_WIRE_BYTES.getAndSet(this, 0);
     }

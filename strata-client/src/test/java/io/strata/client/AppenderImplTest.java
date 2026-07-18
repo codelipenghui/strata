@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.HashSet;
@@ -34,6 +35,7 @@ import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -264,6 +266,27 @@ class AppenderImplTest {
         ScpException later = assertThrows(ScpException.class,
                 () -> appender.append(ByteBuffer.allocate(0)));
         assertEquals(ErrorCode.INTERNAL, later.code());
+    }
+
+    @Test
+    void malformedAppendResponseCauseSurvivesQuorumLoss() throws Exception {
+        AppenderImpl appender = appender();
+        Object session = chunkSession();
+        setSession(appender, session);
+        Frame firstMalformed = Frame.response(Frame.request(Opcode.APPEND, new byte[0], null, 7),
+                new byte[] {0, 0}, null);
+        Frame secondMalformed = Frame.response(Frame.request(Opcode.APPEND, new byte[0], null, 8),
+                new byte[] {0, 0}, null);
+
+        onReplicaResponse(appender, session, 0, 5, firstMalformed, null);
+        onReplicaResponse(appender, session, 1, 5, secondMalformed, null);
+
+        ScpException quorumLost = assertThrows(ScpException.class,
+                () -> appender.append(ByteBuffer.allocate(0)));
+        assertEquals(ErrorCode.INTERNAL, quorumLost.code());
+        ScpException malformed = assertInstanceOf(ScpException.class, quorumLost.getCause());
+        assertEquals(ErrorCode.INTERNAL, malformed.code());
+        assertInstanceOf(BufferUnderflowException.class, malformed.getCause());
     }
 
     @Test

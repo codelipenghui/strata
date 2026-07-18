@@ -188,7 +188,7 @@ final class NamespaceMetadataLogRepository {
      * {@code readLog} recover-and-seals the file, which would fence the still-live open log. {@code
      * appliedOffset} is preserved (NOT reset to the cut — that would drop the carried tail's offsets).
      *
-     * @throws IllegalStateException if the manifest CAS is lost or ambiguous
+     * @throws ManifestCasLostException if the manifest CAS is lost or ambiguous
      */
     boolean compact(long thresholdBytes) throws Exception {
         Frozen frozen;
@@ -285,7 +285,7 @@ final class NamespaceMetadataLogRepository {
             log.warn("namespace metadata manifest CAS lost/ambiguous namespace={} generation={} "
                             + "snapshotFile={} logFile={}; leaving files for manifest-aware GC",
                     namespace, frozen.newGeneration(), newSnapshot, newLog);
-            throw new IllegalStateException("manifest CAS lost or ambiguous for namespace " + namespace
+            throw new ManifestCasLostException("manifest CAS lost or ambiguous for namespace " + namespace
                     + " — fenced; recover again under a new epoch");
         }
         this.logFileId = newLog;
@@ -347,7 +347,7 @@ final class NamespaceMetadataLogRepository {
             log.warn("namespace metadata manifest CAS lost/ambiguous namespace={} generation={} "
                             + "snapshotFile={} logFile={}; leaving files for manifest-aware GC",
                     namespace, newGeneration, newSnapshot, newLog);
-            throw new IllegalStateException("manifest CAS lost or ambiguous for namespace " + namespace
+            throw new ManifestCasLostException("manifest CAS lost or ambiguous for namespace " + namespace
                     + " — fenced; recover again under a new epoch");
         }
         this.logFileId = newLog;

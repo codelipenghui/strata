@@ -15,6 +15,7 @@ import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import io.strata.common.EnvConfig;
 import io.strata.common.ErrorCode;
@@ -316,6 +317,12 @@ public final class ScpServer implements AutoCloseable {
         }
     }
 
+    private record RequestSnapshot(short opcode, long correlationId) {
+        private static RequestSnapshot capture(Frame request) {
+            return new RequestSnapshot(request.opcode(), request.correlationId());
+        }
+    }
+
     private final Channel serverChannel;
     private final ChannelGroup connections = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
     private final Handler handler;
@@ -453,8 +460,14 @@ public final class ScpServer implements AutoCloseable {
             int requests = inflightRequests.incrementAndGet();
             long bytes = inflightBytes.addAndGet(frameBytes);
             if (requests <= maxInflightRequests && bytes <= maxInflightBytes) {
-                frame.reserveWireBytes(frameBytes);
-                return true;
+                try {
+                    frame.reserveWireBytes(frameBytes);
+                    return true;
+                } catch (RuntimeException | Error failure) {
+                    inflightRequests.decrementAndGet();
+                    inflightBytes.addAndGet(-frameBytes);
+                    throw failure;
+                }
             }
             inflightRequests.decrementAndGet();
             inflightBytes.addAndGet(-frameBytes);
@@ -465,8 +478,13 @@ public final class ScpServer implements AutoCloseable {
             long frameBytes = frameWireBytes(response);
             long bytes = inflightBytes.addAndGet(frameBytes);
             if (bytes <= maxInflightBytes) {
-                request.reserveWireBytes(frameBytes);
-                return true;
+                try {
+                    request.reserveWireBytes(frameBytes);
+                    return true;
+                } catch (RuntimeException | Error failure) {
+                    inflightBytes.addAndGet(-frameBytes);
+                    throw failure;
+                }
             }
             inflightBytes.addAndGet(-frameBytes);
             return false;
@@ -616,6 +634,7 @@ public final class ScpServer implements AutoCloseable {
 
         private void handleRequest(ChannelHandlerContext ctx, Frame req) {
             long startNanos = System.nanoTime();
+            RequestSnapshot requestSnapshot = RequestSnapshot.capture(req);
             CompletableFuture<?> respF;
             Object immediateResp = null;
             boolean immediateOkU64 = false;
@@ -708,7 +727,9 @@ public final class ScpServer implements AutoCloseable {
                         Frame.response(req, Resp.error(e.code(), e.getMessage(), e.detail(), e.leaderHint()), null));
                 handlerFailed = true;
             } catch (Exception e) {
-                log.warn("handler error for opcode 0x{}", Integer.toHexString(req.opcode()), e);
+                log.warn("handler error for opcode 0x{} corr={}",
+                        Integer.toHexString(requestSnapshot.opcode() & 0xFFFF),
+                        requestSnapshot.correlationId(), e);
                 respF = CompletableFuture.completedFuture(
                         Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(e), 0), null));
                 handlerFailed = true;
@@ -719,7 +740,7 @@ public final class ScpServer implements AutoCloseable {
             String ns = RequestContext.takeNamespace();
             RequestContext.clearClient();
             if (respF == null) {
-                observeRequest(req, startNanos, !handlerFailed, ns);
+                observeRequest(requestSnapshot, startNanos, !handlerFailed, ns);
                 if (immediateOkU64) {
                     writeOkU64Response(ctx, req, immediateOkU64Value);
                     return;
@@ -740,7 +761,7 @@ public final class ScpServer implements AutoCloseable {
             boolean asyncOkU64 = deferredOkU64;
             long asyncOkU64Value = deferredOkU64Value;
             if (respF.isDone() && !respF.isCompletedExceptionally()) {
-                observeRequest(req, startNanos, !handlerFailed, ns);
+                observeRequest(requestSnapshot, startNanos, !handlerFailed, ns);
                 if (asyncOkU64) {
                     writeOkU64Response(ctx, req, asyncOkU64Value);
                 } else {
@@ -751,28 +772,9 @@ public final class ScpServer implements AutoCloseable {
                 // race deterministically (connection closes after handleAsync returns but before the add).
                 FailureInjector.point("scp.handleRequest.beforeInflightAdd");
                 inFlightAsyncRequests.add(req);
-                respF.whenComplete((resp, err) -> {
-                    if (!inFlightAsyncRequests.remove(req)) {
-                        // channelInactive (connection closed) or the close-race guard below already claimed
-                        // and released req — there is no open connection to answer, so stop here.
-                        return;
-                    }
-                    observeRequest(req, startNanos, err == null, ns);
-                    if (err != null) {
-                        Throwable cause = err instanceof CompletionException
-                                ? err.getCause() : err;
-                        Frame frame = cause instanceof ScpException se
-                                ? Frame.response(req, Resp.error(se.code(), se.getMessage(), se.detail(), se.leaderHint()), null)
-                                : Frame.response(req, Resp.error(ErrorCode.INTERNAL, String.valueOf(cause), 0), null);
-                        writeResponse(ctx, frame, false, req);
-                        return;
-                    }
-                    if (asyncOkU64) {
-                        writeOkU64Response(ctx, req, asyncOkU64Value);
-                    } else {
-                        writeResponseObject(ctx, req, requireResponse(req, resp));
-                    }
-                });
+                respF.whenComplete((resp, err) -> completeAsyncResponse(
+                        ctx, req, requestSnapshot, startNanos, ns,
+                        asyncOkU64, asyncOkU64Value, resp, err));
                 // The connection can close between handleAsync returning and the add above; channelInactive
                 // would then drain inFlightAsyncRequests before req was in it, orphaning the request buffer.
                 // Re-check and claim it ourselves — remove() is the single-owner handoff across this path,
@@ -784,17 +786,123 @@ public final class ScpServer implements AutoCloseable {
             }
         }
 
-        private void observeRequest(Frame req, long startNanos, boolean success, String namespace) {
+        private void completeAsyncResponse(ChannelHandlerContext ctx, Frame req,
+                                           RequestSnapshot requestSnapshot, long startNanos, String namespace,
+                                           boolean asyncOkU64, long asyncOkU64Value,
+                                           Object response, Throwable error) {
+            if (!inFlightAsyncRequests.remove(req)) {
+                // channelInactive (connection closed) or the close-race guard already claimed req.
+                // The server still owns a completed Frame response and must release it even though
+                // there is no open connection left to answer.
+                closeDiscardedAsyncResponse(response, requestSnapshot);
+                return;
+            }
+
+            Frame ownedResponse = response instanceof Frame frame ? frame : null;
+            try {
+                observeRequest(requestSnapshot, startNanos, error == null, namespace);
+                if (error != null) {
+                    closeDiscardedAsyncResponse(ownedResponse, requestSnapshot);
+                    ownedResponse = null;
+                    Throwable cause = error instanceof CompletionException ? error.getCause() : error;
+                    Frame errorResponse = cause instanceof ScpException se
+                            ? Frame.response(req,
+                                    Resp.error(se.code(), se.getMessage(), se.detail(), se.leaderHint()), null)
+                            : Frame.response(req,
+                                    Resp.error(ErrorCode.INTERNAL, String.valueOf(cause), 0), null);
+                    ownedResponse = errorResponse;
+                    writeResponse(ctx, errorResponse, false, req);
+                    ownedResponse = null;
+                    return;
+                }
+                if (asyncOkU64) {
+                    // A deferred OK_U64 future is a completion signal; any accidental Frame value
+                    // is not part of the response contract and remains ours to release.
+                    closeDiscardedAsyncResponse(ownedResponse, requestSnapshot);
+                    ownedResponse = null;
+                    writeOkU64Response(ctx, req, asyncOkU64Value);
+                    return;
+                }
+                Object requiredResponse = requireResponse(req, response);
+                if (requiredResponse instanceof Frame frame) {
+                    ownedResponse = frame;
+                }
+                writeResponseObject(ctx, req, requiredResponse);
+                ownedResponse = null;
+            } catch (RuntimeException | Error failure) {
+                closeDiscardedAsyncResponse(ownedResponse, requestSnapshot);
+                handleAsyncResponseFailure(ctx, req, requestSnapshot, failure);
+            }
+        }
+
+        private void handleAsyncResponseFailure(ChannelHandlerContext ctx, Frame req,
+                                                RequestSnapshot requestSnapshot, Throwable failure) {
+            log.warn("async response completion failed opcode=0x{} corr={}",
+                    Integer.toHexString(requestSnapshot.opcode() & 0xFFFF),
+                    requestSnapshot.correlationId(), failure);
+
+            // Construct the best-effort response before closing req. If the request itself is the
+            // closed frame that triggered the failure, construction will fail and we close the
+            // connection below so the client still fails promptly instead of timing out.
+            Frame internal = null;
+            try {
+                internal = Frame.response(req,
+                        Resp.error(ErrorCode.INTERNAL, String.valueOf(failure), 0), null);
+            } catch (RuntimeException | Error responseFailure) {
+                failure.addSuppressed(responseFailure);
+            }
+
+            releaseInbound(req);
+            try {
+                req.close();
+            } catch (RuntimeException | Error closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+
+            if (internal != null) {
+                try {
+                    // The request reservation is already released. Send the terminal error without
+                    // reserving more connection capacity, and close the connection after the write.
+                    writeUnreservedResponse(ctx, internal, true, null);
+                    return;
+                } catch (RuntimeException | Error writeFailure) {
+                    failure.addSuppressed(writeFailure);
+                    try {
+                        internal.close();
+                    } catch (RuntimeException | Error closeFailure) {
+                        failure.addSuppressed(closeFailure);
+                    }
+                }
+            }
+            ctx.close();
+        }
+
+        private void closeDiscardedAsyncResponse(Object response, RequestSnapshot requestSnapshot) {
+            if (!(response instanceof Frame frame)) {
+                return;
+            }
+            try {
+                frame.close();
+            } catch (RuntimeException | Error closeFailure) {
+                log.warn("discarding async response failed opcode=0x{} corr={}",
+                        Integer.toHexString(requestSnapshot.opcode() & 0xFFFF),
+                        requestSnapshot.correlationId(), closeFailure);
+            }
+        }
+
+        private void observeRequest(RequestSnapshot requestSnapshot, long startNanos,
+                                    boolean success, String namespace) {
             RequestObserver obs = requestObserver;
             if (obs == null) {
                 return;
             }
             try {
-                Opcode op = Opcode.fromCode(req.opcode());
+                Opcode op = Opcode.fromCode(requestSnapshot.opcode());
                 obs.observe(op != null ? op.name() : "unknown", namespace, System.nanoTime() - startNanos, success);
             } catch (RuntimeException e) {
                 log.warn("request observer failed opcode=0x{} corr={}",
-                        Integer.toHexString(req.opcode() & 0xFFFF), req.correlationId(), e);
+                        Integer.toHexString(requestSnapshot.opcode() & 0xFFFF),
+                        requestSnapshot.correlationId(), e);
             }
         }
 
@@ -804,7 +912,30 @@ public final class ScpServer implements AutoCloseable {
                 closeFrames(frame, releaseAfterWrite);
                 return;
             }
-            if (!reserveOutbound(frame, releaseAfterWrite)) {
+            boolean reserved;
+            try {
+                reserved = reserveOutbound(frame, releaseAfterWrite);
+            } catch (RuntimeException | Error failure) {
+                try {
+                    frame.close();
+                } catch (RuntimeException | Error closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+                try {
+                    RequestSnapshot.capture(releaseAfterWrite);
+                } catch (IllegalStateException closedRequest) {
+                    // A closed request cannot be used to encode even a terminal error. The caller
+                    // still owns its admission cleanup, but close the transport now so the client
+                    // fails promptly instead of waiting forever for a response that cannot exist.
+                    try {
+                        ctx.close();
+                    } catch (RuntimeException | Error closeFailure) {
+                        failure.addSuppressed(closeFailure);
+                    }
+                }
+                throw failure;
+            }
+            if (!reserved) {
                 frame.close();
                 writeUnreservedResponse(ctx, Frame.response(releaseAfterWrite,
                         Resp.error(ErrorCode.THROTTLED, "too many in-flight response bytes", maxInflightBytes),
@@ -817,8 +948,13 @@ public final class ScpServer implements AutoCloseable {
         private boolean reserveOutboundBytes(long frameBytes, Frame request) {
             long bytes = inflightBytes.addAndGet(frameBytes);
             if (bytes <= maxInflightBytes) {
-                request.reserveWireBytes(frameBytes);
-                return true;
+                try {
+                    request.reserveWireBytes(frameBytes);
+                    return true;
+                } catch (RuntimeException | Error failure) {
+                    inflightBytes.addAndGet(-frameBytes);
+                    throw failure;
+                }
             }
             inflightBytes.addAndGet(-frameBytes);
             return false;
@@ -837,6 +973,7 @@ public final class ScpServer implements AutoCloseable {
         }
 
         private void writeOkU64Response(ChannelHandlerContext ctx, Frame req, long value) {
+            RequestSnapshot requestSnapshot = RequestSnapshot.capture(req);
             if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
                 closeFrames(null, req);
                 return;
@@ -848,19 +985,26 @@ public final class ScpServer implements AutoCloseable {
                 return;
             }
             if (ctx.channel().eventLoop().inEventLoop()) {
-                writeOkU64ResponseOnEventLoop(ctx, req, value);
+                writeOkU64ResponseOnEventLoop(ctx, req, requestSnapshot, value);
                 return;
             }
-            OkU64WriteTask task = okU64WriteTask(ctx, req, value);
+            OkU64WriteTask task = okU64WriteTask(ctx, req, requestSnapshot, value);
             try {
                 ctx.channel().eventLoop().execute(task);
-            } catch (RuntimeException e) {
-                task.closeRejected();
-                throw e;
+            } catch (RuntimeException | Error failure) {
+                try {
+                    task.closeRejected();
+                } catch (RuntimeException | Error closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                } finally {
+                    ctx.close();
+                }
+                throw failure;
             }
         }
 
-        private OkU64WriteTask okU64WriteTask(ChannelHandlerContext ctx, Frame req, long value) {
+        private OkU64WriteTask okU64WriteTask(ChannelHandlerContext ctx, Frame req,
+                                              RequestSnapshot requestSnapshot, long value) {
             OkU64WriteTask task;
             synchronized (okU64WriteTasks) {
                 task = okU64WriteTasks.pollFirst();
@@ -868,7 +1012,7 @@ public final class ScpServer implements AutoCloseable {
             if (task == null) {
                 task = new OkU64WriteTask();
             }
-            task.reset(ctx, req, value);
+            task.reset(ctx, req, requestSnapshot, value);
             return task;
         }
 
@@ -886,11 +1030,14 @@ public final class ScpServer implements AutoCloseable {
         private final class OkU64WriteTask implements Runnable {
             private ChannelHandlerContext ctx;
             private Frame req;
+            private RequestSnapshot requestSnapshot;
             private long value;
 
-            private void reset(ChannelHandlerContext ctx, Frame req, long value) {
+            private void reset(ChannelHandlerContext ctx, Frame req,
+                               RequestSnapshot requestSnapshot, long value) {
                 this.ctx = ctx;
                 this.req = req;
+                this.requestSnapshot = requestSnapshot;
                 this.value = value;
             }
 
@@ -898,12 +1045,14 @@ public final class ScpServer implements AutoCloseable {
             public void run() {
                 ChannelHandlerContext localCtx = ctx;
                 Frame localReq = req;
+                RequestSnapshot localRequestSnapshot = requestSnapshot;
                 long localValue = value;
                 ctx = null;
                 req = null;
+                requestSnapshot = null;
                 value = 0;
                 try {
-                    writeOkU64ResponseOnEventLoop(localCtx, localReq, localValue);
+                    writeOkU64ResponseOnEventLoop(localCtx, localReq, localRequestSnapshot, localValue);
                 } finally {
                     recycleOkU64WriteTask(this);
                 }
@@ -913,6 +1062,7 @@ public final class ScpServer implements AutoCloseable {
                 Frame localReq = req;
                 ctx = null;
                 req = null;
+                requestSnapshot = null;
                 value = 0;
                 try {
                     closeFrames(null, localReq);
@@ -922,7 +1072,8 @@ public final class ScpServer implements AutoCloseable {
             }
         }
 
-        private void writeOkU64ResponseOnEventLoop(ChannelHandlerContext ctx, Frame req, long value) {
+        private void writeOkU64ResponseOnEventLoop(ChannelHandlerContext ctx, Frame req,
+                                                   RequestSnapshot requestSnapshot, long value) {
             if (closed.get() || !connectionOpen.get() || !ctx.channel().isActive()) {
                 closeFrames(null, req);
                 return;
@@ -930,28 +1081,48 @@ public final class ScpServer implements AutoCloseable {
             ByteBuf out;
             try {
                 out = NettyFrameCodec.encodeOkU64Response(ctx.alloc(), req, value);
-            } catch (IOException | RuntimeException e) {
-                logResponseEncodeFailure("OK_U64", req, e);
-                closeFrames(null, req);
-                ctx.close();
+            } catch (IOException | RuntimeException | Error e) {
+                logResponseEncodeFailure("OK_U64", requestSnapshot, e);
+                try {
+                    closeFrames(null, req);
+                } finally {
+                    ctx.close();
+                }
                 return;
             }
-            ChannelFuture write;
             boolean queued = false;
+            boolean listenerOwnsFrames = false;
             try {
-                write = ctx.write(out);
+                ChannelFuture write = ctx.write(out);
                 queued = true;
+                FailureInjector.point("scp.writeOkU64Response.afterQueue");
                 scheduleOkU64Flush();
-            } catch (RuntimeException e) {
-                if (!queued) {
-                    out.release();
-                } else {
-                    ctx.flush();
+                finishWrite(ctx, write, false, null, req);
+                listenerOwnsFrames = true;
+            } catch (RuntimeException | Error failure) {
+                log.warn("OK_U64 response write failed opcode=0x{} corr={}",
+                        Integer.toHexString(requestSnapshot.opcode() & 0xFFFF),
+                        requestSnapshot.correlationId(), failure);
+                try {
+                    if (!queued) {
+                        ReferenceCountUtil.release(out);
+                    } else {
+                        ctx.flush();
+                    }
+                } catch (RuntimeException | Error cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                } finally {
+                    try {
+                        if (!listenerOwnsFrames) {
+                            closeFrames(null, req);
+                        }
+                    } catch (RuntimeException | Error closeFailure) {
+                        failure.addSuppressed(closeFailure);
+                    } finally {
+                        ctx.close();
+                    }
                 }
-                closeFrames(null, req);
-                throw e;
             }
-            finishWrite(ctx, write, false, null, req);
         }
 
         private void scheduleOkU64Flush() {
@@ -961,7 +1132,7 @@ public final class ScpServer implements AutoCloseable {
             okU64FlushPending = true;
             try {
                 channel.eventLoop().execute(okU64FlushTask);
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | Error e) {
                 okU64FlushPending = false;
                 throw e;
             }
@@ -976,10 +1147,11 @@ public final class ScpServer implements AutoCloseable {
 
         private void writeBytesResponse(ChannelHandlerContext ctx, Frame req, byte[] header, byte[] payload,
                                         int payloadLen, Runnable payloadReleaser) {
+            RequestSnapshot requestSnapshot = RequestSnapshot.capture(req);
             long frameBytes;
             try {
                 frameBytes = bytesResponseWireBytes(header, payload, payloadLen);
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | Error e) {
                 releasePayload(payloadReleaser);
                 closeFrames(null, req);
                 throw e;
@@ -989,7 +1161,15 @@ public final class ScpServer implements AutoCloseable {
                 closeFrames(null, req);
                 return;
             }
-            if (!reserveOutboundBytes(frameBytes, req)) {
+            boolean reserved;
+            try {
+                reserved = reserveOutboundBytes(frameBytes, req);
+            } catch (RuntimeException | Error failure) {
+                releasePayload(payloadReleaser);
+                closeFrames(null, req);
+                throw failure;
+            }
+            if (!reserved) {
                 releasePayload(payloadReleaser);
                 writeUnreservedResponse(ctx, Frame.response(req,
                         Resp.error(ErrorCode.THROTTLED, "too many in-flight response bytes", maxInflightBytes),
@@ -1001,7 +1181,7 @@ public final class ScpServer implements AutoCloseable {
             try {
                 out = NettyFrameCodec.encodeBytesResponseComposite(ctx.alloc(), req, header, payload, payloadLen);
             } catch (IOException | RuntimeException e) {
-                logResponseEncodeFailure("BYTES", req, e);
+                logResponseEncodeFailure("BYTES", requestSnapshot, e);
                 releasePayload(payloadReleaser);
                 closeFrames(null, req);
                 ctx.close();
@@ -1021,10 +1201,11 @@ public final class ScpServer implements AutoCloseable {
 
         private void writeTwoU64BytesResponse(ChannelHandlerContext ctx, Frame req, long first, long second,
                                               byte[] payload, int payloadLen, AutoCloseable payloadCloseable) {
+            RequestSnapshot requestSnapshot = RequestSnapshot.capture(req);
             long frameBytes;
             try {
                 frameBytes = twoU64BytesResponseWireBytes(payload, payloadLen);
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | Error e) {
                 closePayload(payloadCloseable);
                 closeFrames(null, req);
                 throw e;
@@ -1034,7 +1215,15 @@ public final class ScpServer implements AutoCloseable {
                 closeFrames(null, req);
                 return;
             }
-            if (!reserveOutboundBytes(frameBytes, req)) {
+            boolean reserved;
+            try {
+                reserved = reserveOutboundBytes(frameBytes, req);
+            } catch (RuntimeException | Error failure) {
+                closePayload(payloadCloseable);
+                closeFrames(null, req);
+                throw failure;
+            }
+            if (!reserved) {
                 closePayload(payloadCloseable);
                 writeUnreservedResponse(ctx, Frame.response(req,
                         Resp.error(ErrorCode.THROTTLED, "too many in-flight response bytes", maxInflightBytes),
@@ -1047,7 +1236,7 @@ public final class ScpServer implements AutoCloseable {
                 out = NettyFrameCodec.encodeTwoU64BytesResponseComposite(ctx.alloc(), req, first, second,
                         payload, payloadLen);
             } catch (IOException | RuntimeException e) {
-                logResponseEncodeFailure("TWO_U64_BYTES", req, e);
+                logResponseEncodeFailure("TWO_U64_BYTES", requestSnapshot, e);
                 closePayload(payloadCloseable);
                 closeFrames(null, req);
                 ctx.close();
@@ -1102,7 +1291,7 @@ public final class ScpServer implements AutoCloseable {
             }
             try {
                 payloadReleaser.run();
-            } catch (RuntimeException e) {
+            } catch (RuntimeException | Error e) {
                 log.warn("response payload release failed", e);
             }
         }
@@ -1113,7 +1302,7 @@ public final class ScpServer implements AutoCloseable {
             }
             try {
                 payloadCloseable.close();
-            } catch (Exception e) {
+            } catch (Exception | Error e) {
                 log.warn("response payload close failed", e);
             }
         }
@@ -1140,6 +1329,8 @@ public final class ScpServer implements AutoCloseable {
 
         private void writeFileResponse(ChannelHandlerContext ctx, Frame frame, boolean closeAfterWrite,
                                        Frame releaseAfterWrite) {
+            RequestSnapshot requestSnapshot = RequestSnapshot.capture(
+                    releaseAfterWrite != null ? releaseAfterWrite : frame);
             // The prefix and the file region are two separate writes that MUST land in the channel's
             // outbound buffer with nothing between them. Async handlers complete on other threads
             // (e.g. the group-commit flusher writing an APPEND ack), and their single writeAndFlush
@@ -1147,31 +1338,71 @@ public final class ScpServer implements AutoCloseable {
             // slotting a whole frame mid-response and corrupting the stream. Issuing both from one
             // event-loop task makes the pair atomic relative to every other write on this channel.
             if (ctx.channel().eventLoop().inEventLoop()) {
-                writeFileResponseOnEventLoop(ctx, frame, closeAfterWrite, releaseAfterWrite);
+                writeFileResponseOnEventLoop(
+                        ctx, frame, requestSnapshot, closeAfterWrite, releaseAfterWrite);
             } else {
                 ctx.channel().eventLoop().execute(
-                        () -> writeFileResponseOnEventLoop(ctx, frame, closeAfterWrite, releaseAfterWrite));
+                        () -> writeFileResponseOnEventLoop(
+                                ctx, frame, requestSnapshot, closeAfterWrite, releaseAfterWrite));
             }
         }
 
         private void writeFileResponseOnEventLoop(ChannelHandlerContext ctx, Frame frame,
+                                                  RequestSnapshot requestSnapshot,
                                                   boolean closeAfterWrite, Frame releaseAfterWrite) {
-            Frame.FilePayload file = frame.filePayload();
-            ByteBuf prefix;
-            DefaultFileRegion region;
+            ByteBuf prefix = null;
+            DefaultFileRegion region = null;
+            boolean prefixQueued = false;
+            boolean regionQueued = false;
+            boolean listenerOwnsFrames = false;
             try {
+                Frame.FilePayload file = frame.filePayload();
                 prefix = NettyFrameCodec.encodeFilePrefix(ctx.alloc(), frame);
                 region = new DefaultFileRegion(file.channel(), file.position(), file.length());
-            } catch (IOException | RuntimeException e) {
-                logResponseEncodeFailure("FILE", releaseAfterWrite != null ? releaseAfterWrite : frame, e);
-                closeFrames(frame, releaseAfterWrite);
-                ctx.close();
+                ctx.write(prefix);
+                prefixQueued = true;
+                FailureInjector.point("scp.writeFileResponse.betweenPrefixAndRegion");
+                ChannelFuture write = ctx.writeAndFlush(region);
+                regionQueued = true;
+                finishWrite(ctx, write, closeAfterWrite, frame, releaseAfterWrite);
+                listenerOwnsFrames = true;
+            } catch (IOException | RuntimeException | Error failure) {
+                log.warn("FILE response write failed opcode=0x{} corr={}",
+                        Integer.toHexString(requestSnapshot.opcode() & 0xFFFF),
+                        requestSnapshot.correlationId(), failure);
+                if (!prefixQueued) {
+                    releaseUnqueued(prefix, failure);
+                }
+                if (!regionQueued) {
+                    releaseUnqueued(region, failure);
+                }
+                try {
+                    try {
+                        ctx.close();
+                    } finally {
+                        if (!listenerOwnsFrames) {
+                            try {
+                                closeFrames(frame, releaseAfterWrite);
+                            } catch (RuntimeException | Error closeFailure) {
+                                failure.addSuppressed(closeFailure);
+                            }
+                        }
+                    }
+                } catch (RuntimeException | Error cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+        }
+
+        private void releaseUnqueued(Object message, Throwable failure) {
+            if (message == null) {
                 return;
             }
-            ctx.write(prefix);
-            FailureInjector.point("scp.writeFileResponse.betweenPrefixAndRegion");
-            ChannelFuture write = ctx.writeAndFlush(region);
-            finishWrite(ctx, write, closeAfterWrite, frame, releaseAfterWrite);
+            try {
+                ReferenceCountUtil.release(message);
+            } catch (RuntimeException | Error cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
         }
 
         private void finishWrite(ChannelHandlerContext ctx, ChannelFuture write, boolean closeAfterWrite,
@@ -1311,9 +1542,11 @@ public final class ScpServer implements AutoCloseable {
             ctx.close();
         }
 
-        private void logResponseEncodeFailure(String responseKind, Frame req, Throwable cause) {
+        private void logResponseEncodeFailure(String responseKind,
+                                              RequestSnapshot requestSnapshot, Throwable cause) {
             log.warn("response encode failed kind={} opcode=0x{} corr={}", responseKind,
-                    Integer.toHexString(req.opcode() & 0xFFFF), req.correlationId(), cause);
+                    Integer.toHexString(requestSnapshot.opcode() & 0xFFFF),
+                    requestSnapshot.correlationId(), cause);
         }
     }
 

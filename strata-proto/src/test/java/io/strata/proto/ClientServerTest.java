@@ -39,6 +39,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -255,6 +256,56 @@ class ClientServerTest {
             Resp.check(header);
             assertEquals(456, Messages.AppendResp.decode(header).endOffset());
             waitFor(() -> seenRequest.get() != null && seenRequest.get().ownerRefCnt() == 0);
+        }
+    }
+
+    @Test
+    void deferredOkU64WriteErrorReleasesRequestAndClosesConnection() throws Exception {
+        CompletionRegistrationFuture<Void> flush = new CompletionRegistrationFuture<>();
+        CompletableFuture<Frame> seenRequest = new CompletableFuture<>();
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("async result path expected");
+            }
+
+            @Override
+            public void handleAsyncResult(Frame request, ScpServer.ResponseSink sink) {
+                seenRequest.complete(request);
+                sink.okU64(789, flush);
+            }
+        };
+
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "u64-error")) {
+            CompletableFuture<Frame> pending = client.send(Opcode.PING, emptyHeader(), null);
+            Frame request = seenRequest.get(30, TimeUnit.SECONDS);
+            flush.awaitRegistration();
+            FailureInjector.arm("scp.writeOkU64Response.afterQueue", point -> {
+                throw new AssertionError("deferred OK_U64 write exploded");
+            });
+
+            flush.complete(null);
+
+            try {
+                Frame response = pending.get(30, TimeUnit.SECONDS);
+                try {
+                    ByteBuffer header = response.headerSlice();
+                    Resp.check(header);
+                    assertEquals(789, Messages.AppendResp.decode(header).endOffset());
+                } finally {
+                    response.close();
+                }
+            } catch (ExecutionException e) {
+                assertEquals(IOException.class, e.getCause().getClass());
+            }
+            waitFor(client::isClosed);
+            waitFor(() -> request.ownerRefCnt() == 0);
+            assertEquals(0, request.drainReservedWireBytes(),
+                    "OK_U64 Error backstop must drain request and response reservations");
+            assertEquals(1, FailureInjector.hits("scp.writeOkU64Response.afterQueue"));
+        } finally {
+            FailureInjector.reset();
         }
     }
 
@@ -546,6 +597,66 @@ class ClientServerTest {
     }
 
     @Test
+    void fileRegionWriteErrorReleasesFileAndRequestAndClosesConnection() throws Exception {
+        var file = Files.createTempFile("strata-file-region-error", ".bin");
+        Files.writeString(file, "file-region-error", StandardCharsets.UTF_8);
+        FileChannel channel = FileChannel.open(file, StandardOpenOption.READ);
+        CompletionRegistrationFuture<Frame> delayed = new CompletionRegistrationFuture<>();
+        CompletableFuture<Frame> seenRequest = new CompletableFuture<>();
+        AtomicInteger fileReleases = new AtomicInteger();
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("handleAsync should be used");
+            }
+
+            @Override
+            public CompletableFuture<Frame> handleAsync(Frame request) {
+                seenRequest.complete(request);
+                return delayed;
+            }
+        };
+
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient(
+                     "127.0.0.1", server.port(), ScpClient.KIND_TOOL, "file-region-error")) {
+            CompletableFuture<Frame> pending = client.send(Opcode.PING, emptyHeader(), null);
+            Frame request = seenRequest.get(30, TimeUnit.SECONDS);
+            Frame response = ScpServer.okFileRegion(
+                    request, Messages.okHeader(), channel, 0, (int) Files.size(file), () -> {
+                        fileReleases.incrementAndGet();
+                        try {
+                            channel.close();
+                        } catch (IOException ignored) {
+                            // Best-effort test resource cleanup; release count is asserted below.
+                        }
+                    });
+            delayed.awaitRegistration();
+            FailureInjector.arm("scp.writeFileResponse.betweenPrefixAndRegion", point -> {
+                throw new AssertionError("file-region write exploded");
+            });
+
+            delayed.complete(response);
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> pending.get(30, TimeUnit.SECONDS));
+            assertEquals(IOException.class, failure.getCause().getClass());
+            waitFor(client::isClosed);
+            waitFor(() -> request.ownerRefCnt() == 0);
+            assertEquals(0, request.drainReservedWireBytes(),
+                    "file write Error backstop must drain request and response reservations");
+            waitFor(() -> fileReleases.get() == 1);
+            assertEquals(1, fileReleases.get(), "file lease must be released exactly once");
+            assertFalse(channel.isOpen());
+            assertEquals(1, FailureInjector.hits("scp.writeFileResponse.betweenPrefixAndRegion"));
+        } finally {
+            FailureInjector.reset();
+            channel.close();
+            Files.deleteIfExists(file);
+        }
+    }
+
+    @Test
     void timedOutCallCleansUpItsPendingCorrelation() throws Exception {
         CountDownLatch release = new CountDownLatch(1);
         ScpServer.Handler hang = req -> {
@@ -692,8 +803,10 @@ class ClientServerTest {
             assertEquals(ErrorCode.THROTTLED, e.code());
 
             firstResponse.complete(firstOk);
-            assertThrows(Exception.class, () -> first.get(1, TimeUnit.SECONDS),
+            ExecutionException closed = assertThrows(ExecutionException.class,
+                    () -> first.get(30, TimeUnit.SECONDS),
                     "server closes the over-admitted connection after returning THROTTLED");
+            assertEquals(IOException.class, closed.getCause().getClass());
         }
     }
 
@@ -706,6 +819,37 @@ class ClientServerTest {
             ScpException e = assertThrows(ScpException.class,
                     () -> client.call(Opcode.PING, emptyHeader(), null, 5_000));
             assertEquals(ErrorCode.THROTTLED, e.code());
+        }
+    }
+
+    @Test
+    void closedRequestDuringResponseReservationReleasesResponseAndFailsClient() throws Exception {
+        AtomicReference<Frame> seenRequest = new AtomicReference<>();
+        AtomicInteger responseReleases = new AtomicInteger();
+        ScpServer.Handler handler = request -> {
+            seenRequest.set(request);
+            Frame response = Frame.response(
+                    request, Messages.okHeader(), null, responseReleases::incrementAndGet);
+            request.close();
+            return response;
+        };
+
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "closed-request")) {
+            CompletableFuture<Frame> pending = client.send(Opcode.PING, emptyHeader(), null);
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> pending.get(30, TimeUnit.SECONDS));
+            assertEquals(IOException.class, failure.getCause().getClass());
+            waitFor(client::isClosed);
+            Frame request = seenRequest.get();
+            assertTrue(request != null, "handler did not receive request");
+            waitFor(() -> request.ownerRefCnt() == 0);
+            assertEquals(0, request.drainReservedWireBytes(),
+                    "closed request must not retain inbound or rolled-back response reservation bytes");
+            waitFor(() -> responseReleases.get() == 1);
+            assertEquals(1, responseReleases.get(),
+                    "response must be closed when outbound reservation fails");
         }
     }
 
@@ -776,6 +920,97 @@ class ClientServerTest {
     }
 
     @Test
+    void asyncResponseProcessingFailureReturnsInternalAndReleasesRequest() throws Exception {
+        CompletionRegistrationFuture<Frame> delayed = new CompletionRegistrationFuture<>();
+        CompletableFuture<Frame> seenRequest = new CompletableFuture<>();
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("handleAsync should be used");
+            }
+
+            @Override
+            public CompletableFuture<Frame> handleAsync(Frame request) {
+                seenRequest.complete(request);
+                return delayed;
+            }
+        };
+
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
+            CompletableFuture<Frame> pending = client.send(Opcode.PING, emptyHeader(), null);
+            Frame request = seenRequest.get(30, TimeUnit.SECONDS);
+            Frame closedResponse = ScpServer.ok(request, Messages.okHeader(), null);
+            closedResponse.close();
+            delayed.awaitRegistration();
+
+            delayed.complete(closedResponse);
+
+            Frame response = pending.get(30, TimeUnit.SECONDS);
+            try {
+                ScpException failure = assertThrows(ScpException.class,
+                        () -> Resp.check(response.headerSlice()));
+                assertEquals(ErrorCode.INTERNAL, failure.code());
+                assertTrue(failure.getMessage().contains("frame is closed"));
+            } finally {
+                response.close();
+            }
+            waitFor(() -> request.ownerRefCnt() == 0);
+            assertEquals(0, request.drainReservedWireBytes(),
+                    "async completion failure must drain the request's admission reservation");
+        }
+    }
+
+    @Test
+    void asyncObserverErrorReturnsInternalAndReleasesResponse() throws Exception {
+        CompletionRegistrationFuture<Frame> delayed = new CompletionRegistrationFuture<>();
+        CompletableFuture<Frame> seenRequest = new CompletableFuture<>();
+        AtomicInteger responseReleases = new AtomicInteger();
+        ScpServer.Handler handler = new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame request) {
+                throw new AssertionError("handleAsync should be used");
+            }
+
+            @Override
+            public CompletableFuture<Frame> handleAsync(Frame request) {
+                seenRequest.complete(request);
+                return delayed;
+            }
+        };
+
+        try (ScpServer server = new ScpServer(0, 1, 0, 0, handler);
+             ScpClient client = new ScpClient("127.0.0.1", server.port(), ScpClient.KIND_TOOL, "t")) {
+            server.setRequestObserver((opcode, namespace, latencyNanos, success) -> {
+                throw new AssertionError("observer exploded");
+            });
+            CompletableFuture<Frame> pending = client.send(Opcode.PING, emptyHeader(), null);
+            Frame request = seenRequest.get(30, TimeUnit.SECONDS);
+            Frame handlerResponse = Frame.response(
+                    request, Messages.okHeader(), null, responseReleases::incrementAndGet);
+            delayed.awaitRegistration();
+
+            delayed.complete(handlerResponse);
+
+            Frame response = pending.get(30, TimeUnit.SECONDS);
+            try {
+                ScpException failure = assertThrows(ScpException.class,
+                        () -> Resp.check(response.headerSlice()));
+                assertEquals(ErrorCode.INTERNAL, failure.code());
+                assertTrue(failure.getMessage().contains("observer exploded"));
+            } finally {
+                response.close();
+            }
+            waitFor(() -> request.ownerRefCnt() == 0);
+            assertEquals(0, request.drainReservedWireBytes(),
+                    "observer failure must drain the request's admission reservation");
+            waitFor(() -> responseReleases.get() == 1);
+            assertEquals(1, responseReleases.get(),
+                    "observer failure must close the untransferred handler response exactly once");
+        }
+    }
+
+    @Test
     void serverContinuesDrainingAfterUncaughtRequestFailure() throws Exception {
         AtomicInteger calls = new AtomicInteger();
         ScpServer.Handler handler = req -> {
@@ -800,8 +1035,9 @@ class ClientServerTest {
 
     @Test
     void serverCloseSkipsDeferredAsyncResponses() throws Exception {
-        CompletableFuture<Frame> delayed = new CompletableFuture<>();
+        CompletionRegistrationFuture<Frame> delayed = new CompletionRegistrationFuture<>();
         CompletableFuture<Frame> seenRequest = new CompletableFuture<>();
+        AtomicInteger responseReleases = new AtomicInteger();
         ScpServer.Handler handler = new ScpServer.Handler() {
             @Override
             public Frame handle(Frame request) {
@@ -821,16 +1057,22 @@ class ClientServerTest {
             Frame request = seenRequest.get(30, TimeUnit.SECONDS);
             assertTrue(request.ownsBuffer());
             assertEquals(1, request.ownerRefCnt());
-            Frame response = ScpServer.ok(request, Messages.okHeader(), null);
+            Frame response = Frame.response(
+                    request, Messages.okHeader(), null, responseReleases::incrementAndGet);
+            delayed.awaitRegistration();
 
             server.close();
             var e = assertThrows(ExecutionException.class,
                     () -> pending.get(30, TimeUnit.SECONDS));
             assertEquals(IOException.class, e.getCause().getClass());
             waitFor(() -> request.ownerRefCnt() == 0);
+            assertThrows(IllegalStateException.class,
+                    () -> ScpServer.ok(request, Messages.okHeader(), null));
 
             delayed.complete(response);
             assertTrue(delayed.isDone());
+            waitFor(() -> responseReleases.get() == 1);
+            assertEquals(1, responseReleases.get());
         }
     }
 
@@ -1461,6 +1703,22 @@ class ClientServerTest {
         Field field = ScpClient.class.getDeclaredField("pendingPermits");
         field.setAccessible(true);
         return ((Semaphore) field.get(client)).availablePermits();
+    }
+
+    private static final class CompletionRegistrationFuture<T> extends CompletableFuture<T> {
+        private final CountDownLatch registered = new CountDownLatch(1);
+
+        @Override
+        public CompletableFuture<T> whenComplete(BiConsumer<? super T, ? super Throwable> action) {
+            CompletableFuture<T> stage = super.whenComplete(action);
+            registered.countDown();
+            return stage;
+        }
+
+        private void awaitRegistration() throws InterruptedException {
+            assertTrue(registered.await(30, TimeUnit.SECONDS),
+                    "server did not register the async completion handler");
+        }
     }
 
     private static final class ThrowingWriteChannel extends EmbeddedChannel {
