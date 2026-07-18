@@ -140,7 +140,7 @@ The two-tier split (§4.1/§4.2) is what lets one Strata cluster hold **100M+ fi
 3. Broker appends the batch to the partition's open chunk: fan-out `APPEND` (§10.3) to all replicas selected by the file's `replicationFactor`.
 4. Each replica: checks `writeEpoch ≥` its locally stored max epoch for the chunk (else `FENCED_EPOCH`), enforces contiguity (`baseOffset` must equal local end, else `OFFSET_GAP`; leader retries), appends payload bytes verbatim to the chunk file, appends an entry to the chunk's integrity ledger (§11.3) carrying the **writer-supplied per-record digest** (the frame's payload CRC, already verified by the frame decoder — the node stores it rather than originating its own), optionally fsyncs (§5.3), acks.
 5. Broker acks the producer at the file's `ackQuorum` replica acks. With the default policy (`replicationFactor=3`, `ackQuorum=2`), latency = second-fastest replica.
-6. Broker inserts the batch into its in-memory tail cache and advances the **durable offset (DO)** = highest contiguous byte acked by at least `ackQuorum` replicas. DO is piggybacked on the next `APPEND` (replicas learn DO with one-round lag — the BookKeeper LAC pattern). On idle partitions, an empty-payload `APPEND` serves as a DO beacon.
+6. Broker inserts the batch into its in-memory tail cache and advances the **durable offset (DO)** = highest contiguous byte acked by at least `ackQuorum` replicas. DO is piggybacked on the next `APPEND` (replicas learn DO with one-round lag — the BookKeeper LAC pattern). Each advance also debounces an automatic empty-payload `APPEND`: a later payload re-arms the timer, while a stream that stays idle for `durableBeaconIdleMs` (100 ms by default) publishes its final DO without another caller append or seal. On healthy pinned replica connections, DO staleness is therefore bounded by `durableBeaconIdleMs` plus one `APPEND` round trip (`callTimeoutMs` bounds that RPC attempt); the beacon carries no payload and adds no integrity-ledger entry.
 
 ### 5.2 Chunk lifecycle driven by the leader
 
@@ -510,7 +510,7 @@ Produce-path latency decomposed by stage (broker processing / storage append / q
 
 ## 17. Open questions
 
-1. **DO staleness bound** — empty-`APPEND` beacons cover idle partitions; the cadence and the maximum staleness a direct reader may observe need a number.
+1. **DO staleness bound — RESOLVED in v0:** `durableBeaconIdleMs` controls automatic empty-`APPEND` publication (100 ms by default); on healthy replica connections, direct-reader staleness is bounded by that idle interval plus one `APPEND` round trip.
 2. **KIP-392 direct-read** — exact Fetch subset a data node must implement; session/quota handling without broker mediation. v1 ships broker-proxied; this is the v1.x decision.
 3. **Intra-namespace metadata sharding** — sharding is by namespace in the opt-in sharded mode; the partitioning design and the descriptor-count/commit-rate threshold for splitting one hot namespace across controllers are both open.
 4. **Segment-roll policy defaults** — balancing chunk-count inflation (metadata sizing) against failover replay bound for low-throughput partition fleets.

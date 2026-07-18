@@ -192,6 +192,392 @@ class AppenderImplTest {
     }
 
     @Test
+    void idleDurableBeaconPublishesFinalOffsetToEveryReplica() throws Exception {
+        FileId fileId = FileId.of(45);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AppendTraffic first = new AppendTraffic(false);
+        AppendTraffic second = new AppendTraffic(false);
+        AppendTraffic third = new AppendTraffic(false);
+
+        try (ScpServer s1 = recordingDataNodeServer(1, first);
+             ScpServer s2 = recordingDataNodeServer(2, second);
+             ScpServer s3 = recordingDataNodeServer(3, third);
+             ScpServer metaServer = metadataForAppender(fileId, chunkId, new AtomicReference<>(),
+                     new AtomicReference<>(),
+                     new Messages.Replica(1, endpoint(s1)),
+                     new Messages.Replica(2, endpoint(s2)),
+                     new Messages.Replica(3, endpoint(s3)))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
+                    .withDurableBeaconIdleMs(25);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+
+                assertEquals(3L, appender.append(ByteBuffer.wrap(new byte[] {1, 2, 3}))
+                        .get(1, TimeUnit.SECONDS));
+                waitFor(() -> first.beacons.get() == 1
+                        && second.beacons.get() == 1
+                        && third.beacons.get() == 1);
+
+                assertPublishedTraffic(first, 3);
+                assertPublishedTraffic(second, 3);
+                assertPublishedTraffic(third, 3);
+                assertFalse(booleanField(currentSession(appender), "needRoll"));
+                appender.close();
+            }
+        }
+    }
+
+    @Test
+    void idleDurableBeaconQueuesBehindUnacknowledgedReplicaPayload() throws Exception {
+        FileId fileId = FileId.of(49);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AppendTraffic first = new AppendTraffic(false);
+        AppendTraffic second = new AppendTraffic(false);
+        AppendTraffic lagging = new AppendTraffic(false);
+        CompletableFuture<Void> releaseLaggingPayloadAck = new CompletableFuture<>();
+
+        try (ScpServer s1 = recordingDataNodeServer(1, first);
+             ScpServer s2 = recordingDataNodeServer(2, second);
+             ScpServer s3 = laggingPayloadAckDataNodeServer(3, lagging, releaseLaggingPayloadAck);
+             ScpServer metaServer = metadataForAppender(fileId, chunkId, new AtomicReference<>(),
+                     new AtomicReference<>(),
+                     new Messages.Replica(1, endpoint(s1)),
+                     new Messages.Replica(2, endpoint(s2)),
+                     new Messages.Replica(3, endpoint(s3)))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
+                    .withDurableBeaconIdleMs(25);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+
+                assertEquals(1L, appender.append(ByteBuffer.wrap(new byte[] {7})).get(1, TimeUnit.SECONDS));
+                waitFor(() -> lagging.beacons.get() == 1);
+
+                assertFalse(releaseLaggingPayloadAck.isDone(),
+                        "beacon must be queued without waiting for the replica's payload response");
+                assertPublishedTraffic(lagging, 1);
+                releaseLaggingPayloadAck.complete(null);
+                waitFor(() -> appendsQuiesced(appender));
+                appender.close();
+            } finally {
+                releaseLaggingPayloadAck.complete(null);
+            }
+        }
+    }
+
+    @Test
+    void idleDurableBeaconPublishesAcknowledgedPrefixWithPipelinedTailOutstanding() throws Exception {
+        FileId fileId = FileId.of(52);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AppendTraffic first = new AppendTraffic(false);
+        AppendTraffic second = new AppendTraffic(false);
+        AppendTraffic third = new AppendTraffic(false);
+        CompletableFuture<Void> releaseSecondPayloadAcks = new CompletableFuture<>();
+
+        try (ScpServer s1 = pipelinedTailDataNodeServer(1, first, releaseSecondPayloadAcks);
+             ScpServer s2 = pipelinedTailDataNodeServer(2, second, releaseSecondPayloadAcks);
+             ScpServer s3 = pipelinedTailDataNodeServer(3, third, releaseSecondPayloadAcks);
+             ScpServer metaServer = metadataForAppender(fileId, chunkId, new AtomicReference<>(),
+                     new AtomicReference<>(),
+                     new Messages.Replica(1, endpoint(s1)),
+                     new Messages.Replica(2, endpoint(s2)),
+                     new Messages.Replica(3, endpoint(s3)))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
+                    .withDurableBeaconIdleMs(25);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+
+                CompletableFuture<Long> acknowledged = appender.append(ByteBuffer.wrap(new byte[] {1}));
+                CompletableFuture<Long> outstanding = appender.append(ByteBuffer.wrap(new byte[] {2}));
+                assertEquals(1L, acknowledged.get(1, TimeUnit.SECONDS));
+                assertFalse(outstanding.isDone());
+                waitFor(() -> first.beacons.get() == 1
+                        && second.beacons.get() == 1 && third.beacons.get() == 1);
+
+                for (AppendTraffic traffic : List.of(first, second, third)) {
+                    assertEquals(2, traffic.lastBeacon.get().baseOffset(),
+                            "beacon must queue behind the admitted pipeline tail");
+                    assertEquals(1, traffic.lastBeacon.get().durableOffset(),
+                            "beacon must publish the exact acknowledged prefix, not the unacked tail");
+                }
+                assertEquals(1, appender.durableOffset());
+
+                releaseSecondPayloadAcks.complete(null);
+                assertEquals(2L, outstanding.get(1, TimeUnit.SECONDS));
+                appender.close();
+            } finally {
+                releaseSecondPayloadAcks.complete(null);
+            }
+        }
+    }
+
+    @Test
+    void finalPayloadReplicaFailureSealsReadableShortSetWithoutAnotherAppend() throws Exception {
+        FileId fileId = FileId.of(50);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicInteger failedPayloads = new AtomicInteger();
+        AppendTraffic second = new AppendTraffic(false);
+        AppendTraffic third = new AppendTraffic(false);
+        AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
+
+        try (ScpServer s1 = failingPayloadDataNodeServer(1, failedPayloads);
+             ScpServer s2 = recordingDataNodeServer(2, second);
+             ScpServer s3 = recordingDataNodeServer(3, third);
+             ScpServer metaServer = metadataForAppender(fileId, chunkId, sealedReplicas,
+                     new AtomicReference<>(),
+                     new Messages.Replica(1, endpoint(s1)),
+                     new Messages.Replica(2, endpoint(s2)),
+                     new Messages.Replica(3, endpoint(s3)))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
+                    .withDurableBeaconIdleMs(25);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+
+                assertEquals(1L, appender.append(ByteBuffer.wrap(new byte[] {8})).get(1, TimeUnit.SECONDS));
+                waitFor(() -> List.of(2, 3).equals(sealedReplicas.get()));
+
+                assertEquals(1, failedPayloads.get());
+                assertEquals(List.of(2, 3), sealedReplicas.get());
+                assertNull(currentSession(appender),
+                        "idle short set must not leave a stale OPEN replica readable forever");
+                appender.close();
+            }
+        }
+    }
+
+    @Test
+    void durableBeaconRetriesOnlyEmptyPayloadOnPinnedGeneration() throws Exception {
+        FileId fileId = FileId.of(46);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AppendTraffic retrying = new AppendTraffic(true);
+        AppendTraffic second = new AppendTraffic(false);
+        AppendTraffic third = new AppendTraffic(false);
+
+        try (ScpServer s1 = recordingDataNodeServer(1, retrying);
+             ScpServer s2 = recordingDataNodeServer(2, second);
+             ScpServer s3 = recordingDataNodeServer(3, third);
+             ScpServer metaServer = metadataForAppender(fileId, chunkId, new AtomicReference<>(),
+                     new AtomicReference<>(),
+                     new Messages.Replica(1, endpoint(s1)),
+                     new Messages.Replica(2, endpoint(s2)),
+                     new Messages.Replica(3, endpoint(s3)))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
+                    .withDurableBeaconIdleMs(20);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+
+                assertEquals(1L, appender.append(ByteBuffer.wrap(new byte[] {9})).get(1, TimeUnit.SECONDS));
+                waitFor(() -> retrying.beacons.get() == 2
+                        && second.beacons.get() == 1
+                        && third.beacons.get() == 1
+                        && appendsQuiesced(appender));
+
+                assertEquals(1, retrying.payloads.get(), "beacon retry must never replay caller payload");
+                assertEquals(2, retrying.beacons.get());
+                assertEquals(1, retrying.lastBeacon.get().baseOffset());
+                assertEquals(1, retrying.lastBeacon.get().durableOffset());
+                assertFalse(booleanArray(currentSession(appender), "failed")[0]);
+                appender.close();
+            }
+        }
+    }
+
+    @Test
+    void durableBeaconResponseCannotAcknowledgeHigherPayload() throws Exception {
+        AppenderImpl appender = appender();
+        Object session = chunkSession();
+        setSession(appender, session);
+        setLong(session, "end", 10);
+        setLong(session, "durable", 5);
+        CompletableFuture<Long> higherPayload = new CompletableFuture<>();
+        pending(session).addLast(pending(10, higherPayload));
+        booleanArray(session, "beaconInFlight")[0] = true;
+
+        onDurableBeaconResponse(appender, session, 0, 10, 5, 1, appendResp(10), null);
+
+        assertFalse(higherPayload.isDone(), "zero-payload response must not count as a payload ack");
+        assertEquals(5, appender.durableOffset());
+        assertEquals(5, longArray(session, "publishedDurable")[0]);
+    }
+
+    @Test
+    void closeQueuesFinalBeaconBeforeLongIdleDelay() throws Exception {
+        FileId fileId = FileId.of(47);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AppendTraffic first = new AppendTraffic(false);
+        AppendTraffic second = new AppendTraffic(false);
+        AppendTraffic third = new AppendTraffic(false);
+
+        try (ScpServer s1 = recordingDataNodeServer(1, first);
+             ScpServer s2 = recordingDataNodeServer(2, second);
+             ScpServer s3 = recordingDataNodeServer(3, third);
+             ScpServer metaServer = metadataForAppender(fileId, chunkId, new AtomicReference<>(),
+                     new AtomicReference<>(),
+                     new Messages.Replica(1, endpoint(s1)),
+                     new Messages.Replica(2, endpoint(s2)),
+                     new Messages.Replica(3, endpoint(s3)))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
+                    .withDurableBeaconIdleMs(10_000);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+
+                assertEquals(1L, appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS));
+                appender.close();
+
+                // close() owns publication completion; immediately closing the surrounding client
+                // pool must not be able to cancel a fire-and-forget beacon.
+                assertPublishedTraffic(first, 1);
+                assertPublishedTraffic(second, 1);
+                assertPublishedTraffic(third, 1);
+            }
+        }
+    }
+
+    @Test
+    void closeRejectsConcurrentAppendWhileWaitingForBeacon() throws Exception {
+        FileId fileId = FileId.of(51);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AppendTraffic blocked = new AppendTraffic(false);
+        AppendTraffic second = new AppendTraffic(false);
+        AppendTraffic third = new AppendTraffic(false);
+        CompletableFuture<Void> releaseBeaconAck = new CompletableFuture<>();
+
+        try (ScpServer s1 = blockingBeaconAckDataNodeServer(1, blocked, releaseBeaconAck);
+             ScpServer s2 = recordingDataNodeServer(2, second);
+             ScpServer s3 = recordingDataNodeServer(3, third);
+             ScpServer metaServer = metadataForAppender(fileId, chunkId, new AtomicReference<>(),
+                     new AtomicReference<>(),
+                     new Messages.Replica(1, endpoint(s1)),
+                     new Messages.Replica(2, endpoint(s2)),
+                     new Messages.Replica(3, endpoint(s3)))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
+                    .withDurableBeaconIdleMs(10_000);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+                assertEquals(1L, appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS));
+
+                CompletableFuture<Void> close = CompletableFuture.runAsync(appender::close);
+                waitFor(() -> blocked.beacons.get() == 1);
+                assertFalse(close.isDone(), "close must retain ownership until beacon completion");
+                ScpException rejected = assertThrows(ScpException.class,
+                        () -> appender.append(ByteBuffer.wrap(new byte[] {2})));
+                assertTrue(rejected.getMessage().contains("closing"));
+
+                releaseBeaconAck.complete(null);
+                close.get(1, TimeUnit.SECONDS);
+            } finally {
+                releaseBeaconAck.complete(null);
+            }
+        }
+    }
+
+    @Test
+    void closeRepublishesDurableOffsetAdvancedWhileWaiting() throws Exception {
+        FileId fileId = FileId.of(53);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AppendTraffic first = new AppendTraffic(false);
+        AppendTraffic second = new AppendTraffic(false);
+        AppendTraffic third = new AppendTraffic(false);
+        CompletableFuture<Void> releaseSecondPayloadAcks = new CompletableFuture<>();
+        CompletableFuture<Void> releaseFirstBeaconAcks = new CompletableFuture<>();
+
+        try (ScpServer s1 = closeAdvanceDataNodeServer(
+                     1, first, releaseSecondPayloadAcks, releaseFirstBeaconAcks);
+             ScpServer s2 = closeAdvanceDataNodeServer(
+                     2, second, releaseSecondPayloadAcks, releaseFirstBeaconAcks);
+             ScpServer s3 = closeAdvanceDataNodeServer(
+                     3, third, releaseSecondPayloadAcks, releaseFirstBeaconAcks);
+             ScpServer metaServer = metadataForAppender(fileId, chunkId, new AtomicReference<>(),
+                     new AtomicReference<>(),
+                     new Messages.Replica(1, endpoint(s1)),
+                     new Messages.Replica(2, endpoint(s2)),
+                     new Messages.Replica(3, endpoint(s3)))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
+                    .withDurableBeaconIdleMs(10_000);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+                CompletableFuture<Long> firstAppend = appender.append(ByteBuffer.wrap(new byte[] {1}));
+                CompletableFuture<Long> secondAppend = appender.append(ByteBuffer.wrap(new byte[] {2}));
+                assertEquals(1L, firstAppend.get(1, TimeUnit.SECONDS));
+
+                CompletableFuture<Void> close = CompletableFuture.runAsync(appender::close);
+                waitFor(() -> first.beacons.get() == 1
+                        && second.beacons.get() == 1 && third.beacons.get() == 1);
+                releaseSecondPayloadAcks.complete(null);
+                assertEquals(2L, secondAppend.get(1, TimeUnit.SECONDS));
+                releaseFirstBeaconAcks.complete(null);
+                waitFor(() -> first.beacons.get() == 2
+                        && second.beacons.get() == 2 && third.beacons.get() == 2);
+                close.get(1, TimeUnit.SECONDS);
+
+                for (AppendTraffic traffic : List.of(first, second, third)) {
+                    assertEquals(2, traffic.lastBeacon.get().baseOffset());
+                    assertEquals(2, traffic.lastBeacon.get().durableOffset(),
+                            "close must republish a DO that advances while an older beacon is pending");
+                }
+            } finally {
+                releaseSecondPayloadAcks.complete(null);
+                releaseFirstBeaconAcks.complete(null);
+            }
+        }
+    }
+
+    @Test
+    void durableBeaconGenerationMismatchNeverReplaysPayload() throws Exception {
+        FileId fileId = FileId.of(48);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AppendTraffic replaced = new AppendTraffic(false);
+        AppendTraffic second = new AppendTraffic(false);
+        AppendTraffic third = new AppendTraffic(false);
+        AtomicReference<List<Integer>> sealedReplicas = new AtomicReference<>();
+
+        try (ScpServer s1 = recordingDataNodeServer(1, replaced);
+             ScpServer s2 = recordingDataNodeServer(2, second);
+             ScpServer s3 = recordingDataNodeServer(3, third);
+             ScpServer metaServer = metadataForAppender(fileId, chunkId, sealedReplicas,
+                     new AtomicReference<>(),
+                     new Messages.Replica(1, endpoint(s1)),
+                     new Messages.Replica(2, endpoint(s2)),
+                     new Messages.Replica(3, endpoint(s3)))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500)
+                    .withDurableBeaconIdleMs(200);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool(config)) {
+                AppenderImpl appender = new AppenderImpl(meta, pool, config, fileId,
+                        StrataNamespace.of("test"), 1, Messages.WritePolicy.DEFAULT, 0);
+
+                assertEquals(1L, appender.append(ByteBuffer.wrap(new byte[] {1})).get(1, TimeUnit.SECONDS));
+                waitFor(() -> replaced.payloads.get() == 1 && second.payloads.get() == 1
+                        && third.payloads.get() == 1 && appendsQuiesced(appender));
+                Object session = currentSession(appender);
+                setLong(session, "lastPayloadAdmissionNanos", System.nanoTime());
+                connections(session)[0].disconnect();
+
+                publishDurableBeacons(appender, session, 1);
+                waitFor(() -> booleanArrayUnchecked(session, "failed", 0)
+                        && second.beacons.get() == 1 && third.beacons.get() == 1
+                        && List.of(2, 3).equals(sealedReplicas.get()));
+
+                assertEquals(1, replaced.payloads.get(), "generation failure must not replay payload");
+                assertEquals(0, replaced.beacons.get(), "generation gate must reject the beacon before send");
+                assertEquals(1, second.payloads.get());
+                assertEquals(1, third.payloads.get());
+                assertTrue(booleanField(session, "needRoll"));
+                assertEquals(List.of(2, 3), sealedReplicas.get(),
+                        "failed generation must be removed from the readable descriptor");
+                assertNull(currentSession(appender));
+                appender.close();
+            }
+        }
+    }
+
+    @Test
     void staleNullReplicaResponseIsIgnoredAfterRoll() throws Exception {
         AppenderImpl appender = appender();
         Object staleSession = chunkSession();
@@ -1315,7 +1701,9 @@ class AppenderImplTest {
                 assertEquals(1, s1Appends.get(), "replaced pinned connection must fail without replaying append");
                 assertEquals(2, s2Appends.get());
                 assertEquals(2, s3Appends.get());
-                assertTrue(booleanField(currentSession(appender), "needRoll"));
+                waitFor(() -> List.of(2, 3).equals(sealedReplicas.get()));
+                assertNull(currentSession(appender),
+                        "idle short set should seal without waiting for another append");
 
                 StrataFile.SealInfo seal = appender.seal();
                 assertEquals(2, seal.sealedLength());
@@ -1707,9 +2095,10 @@ class AppenderImplTest {
 
                 assertEquals(3L, appended.get(1, TimeUnit.SECONDS));
                 assertEquals(1, createCalls.get(), "first append must not immediately roll the short session");
-                assertEquals(0, sealedMetadata.get(), "short session should not seal before accepting first append");
                 assertEquals(2, appends.get(), "append should fan out to the remaining quorum");
-                assertTrue(booleanField(currentSession(appender), "needRoll"));
+                waitFor(() -> sealedMetadata.get() == 1);
+                assertNull(currentSession(appender),
+                        "accepted short session should seal once it becomes idle and durable");
                 appender.close();
             }
         }
@@ -1939,6 +2328,29 @@ class AppenderImplTest {
         method.invoke(appender, session, replicaIndex, expectedEnd, frame, err);
     }
 
+    private static void onDurableBeaconResponse(AppenderImpl appender, Object session, int replicaIndex,
+                                                long base, long target, int attempt, Frame frame, Throwable err)
+            throws Exception {
+        Method method = AppenderImpl.class.getDeclaredMethod("onDurableBeaconResponse",
+                session.getClass(), int.class, long.class, long.class,
+                int.class, Frame.class, Throwable.class);
+        method.setAccessible(true);
+        method.invoke(appender, session, replicaIndex, base, target, attempt, frame, err);
+    }
+
+    private static void publishDurableBeacons(AppenderImpl appender, Object session, long target) throws Exception {
+        ReentrantLock lock = appenderLock(appender);
+        lock.lock();
+        try {
+            Method method = AppenderImpl.class.getDeclaredMethod("publishDurableBeaconsLocked",
+                    session.getClass(), long.class);
+            method.setAccessible(true);
+            method.invoke(appender, session, target);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private static Frame appendResp(long end) {
         return Frame.response(Frame.request(Opcode.APPEND, new byte[0], null, 7),
                 new Messages.AppendResp(end).encode(), null);
@@ -2027,6 +2439,20 @@ class AppenderImplTest {
         return (boolean[]) field.get(target);
     }
 
+    private static boolean booleanArrayUnchecked(Object target, String fieldName, int index) {
+        try {
+            return booleanArray(target, fieldName)[index];
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static long[] longArray(Object target, String fieldName) throws Exception {
+        Field field = target.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return (long[]) field.get(target);
+    }
+
     @SuppressWarnings("unchecked")
     private static Set<Integer> excludedPlacementNodes(AppenderImpl appender) throws Exception {
         Field field = AppenderImpl.class.getDeclaredField("excludedPlacementNodes");
@@ -2107,14 +2533,222 @@ class AppenderImplTest {
                 return ScpServer.ok(req, Messages.okHeader(), null);
             }
             if (op == Opcode.APPEND) {
-                appends.incrementAndGet();
                 Messages.Append append = Messages.Append.decode(req.headerSlice());
+                if (req.payloadLength() > 0) {
+                    appends.incrementAndGet();
+                }
                 return ScpServer.ok(req,
                         new Messages.AppendResp(append.baseOffset() + req.payloadLength()).encode(), null);
             }
             if (op == Opcode.SEAL_CHUNK) {
                 Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
                 return ScpServer.ok(req, new Messages.SealResp(seal.dataLength(), 123).encode(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+    }
+
+    private static final class AppendTraffic {
+        final AtomicInteger payloads = new AtomicInteger();
+        final AtomicInteger beacons = new AtomicInteger();
+        final AtomicReference<Messages.Append> lastBeacon = new AtomicReference<>();
+        final boolean failFirstBeacon;
+
+        AppendTraffic(boolean failFirstBeacon) {
+            this.failFirstBeacon = failFirstBeacon;
+        }
+    }
+
+    private static void assertPublishedTraffic(AppendTraffic traffic, long expectedEnd) {
+        assertEquals(1, traffic.payloads.get(), "caller payload must be sent exactly once");
+        assertEquals(1, traffic.beacons.get(), "final durable offset must be published exactly once");
+        assertNotNull(traffic.lastBeacon.get());
+        assertEquals(expectedEnd, traffic.lastBeacon.get().baseOffset());
+        assertEquals(expectedEnd, traffic.lastBeacon.get().durableOffset());
+    }
+
+    private static ScpServer recordingDataNodeServer(int nodeId, AppendTraffic traffic) throws Exception {
+        return new ScpServer(0, nodeId, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.OPEN_CHUNK) {
+                return ScpServer.ok(req, Messages.okHeader(), null);
+            }
+            if (op == Opcode.APPEND) {
+                Messages.Append append = Messages.Append.decode(req.headerSlice());
+                if (req.payloadLength() > 0) {
+                    traffic.payloads.incrementAndGet();
+                } else {
+                    int attempt = traffic.beacons.incrementAndGet();
+                    traffic.lastBeacon.set(append);
+                    if (traffic.failFirstBeacon && attempt == 1) {
+                        throw new ScpException(ErrorCode.INTERNAL, "injected first beacon failure");
+                    }
+                }
+                return ScpServer.ok(req,
+                        new Messages.AppendResp(append.baseOffset() + req.payloadLength()).encode(), null);
+            }
+            if (op == Opcode.SEAL_CHUNK) {
+                Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
+                return ScpServer.ok(req, new Messages.SealResp(seal.dataLength(), 0).encode(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
+        });
+    }
+
+    private static ScpServer laggingPayloadAckDataNodeServer(
+            int nodeId, AppendTraffic traffic, CompletableFuture<Void> releasePayloadAck) throws Exception {
+        return new ScpServer(0, nodeId, 0, 0, new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame req) {
+                throw new AssertionError("async handler expected");
+            }
+
+            @Override
+            public CompletableFuture<Frame> handleAsync(Frame req) {
+                Opcode op = Opcode.fromCode(req.opcode());
+                if (op == Opcode.OPEN_CHUNK) {
+                    return CompletableFuture.completedFuture(ScpServer.ok(req, Messages.okHeader(), null));
+                }
+                if (op == Opcode.APPEND) {
+                    Messages.Append append = Messages.Append.decode(req.headerSlice());
+                    Frame response = ScpServer.ok(req,
+                            new Messages.AppendResp(append.baseOffset() + req.payloadLength()).encode(), null);
+                    if (req.payloadLength() > 0) {
+                        traffic.payloads.incrementAndGet();
+                        return releasePayloadAck.thenApply(ignored -> response);
+                    }
+                    traffic.beacons.incrementAndGet();
+                    traffic.lastBeacon.set(append);
+                    return CompletableFuture.completedFuture(response);
+                }
+                if (op == Opcode.SEAL_CHUNK) {
+                    Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
+                    return CompletableFuture.completedFuture(ScpServer.ok(req,
+                            new Messages.SealResp(seal.dataLength(), 0).encode(), null));
+                }
+                return CompletableFuture.failedFuture(
+                        new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op));
+            }
+        });
+    }
+
+    private static ScpServer blockingBeaconAckDataNodeServer(
+            int nodeId, AppendTraffic traffic, CompletableFuture<Void> releaseBeaconAck) throws Exception {
+        return new ScpServer(0, nodeId, 0, 0, new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame req) {
+                throw new AssertionError("async handler expected");
+            }
+
+            @Override
+            public CompletableFuture<Frame> handleAsync(Frame req) {
+                Opcode op = Opcode.fromCode(req.opcode());
+                if (op == Opcode.OPEN_CHUNK) {
+                    return CompletableFuture.completedFuture(ScpServer.ok(req, Messages.okHeader(), null));
+                }
+                if (op == Opcode.APPEND) {
+                    Messages.Append append = Messages.Append.decode(req.headerSlice());
+                    Frame response = ScpServer.ok(req,
+                            new Messages.AppendResp(append.baseOffset() + req.payloadLength()).encode(), null);
+                    if (req.payloadLength() > 0) {
+                        traffic.payloads.incrementAndGet();
+                        return CompletableFuture.completedFuture(response);
+                    }
+                    traffic.beacons.incrementAndGet();
+                    traffic.lastBeacon.set(append);
+                    return releaseBeaconAck.thenApply(ignored -> response);
+                }
+                return CompletableFuture.failedFuture(
+                        new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op));
+            }
+        });
+    }
+
+    private static ScpServer pipelinedTailDataNodeServer(
+            int nodeId, AppendTraffic traffic, CompletableFuture<Void> releaseSecondPayloadAck) throws Exception {
+        return new ScpServer(0, nodeId, 0, 0, new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame req) {
+                throw new AssertionError("async handler expected");
+            }
+
+            @Override
+            public CompletableFuture<Frame> handleAsync(Frame req) {
+                Opcode op = Opcode.fromCode(req.opcode());
+                if (op == Opcode.OPEN_CHUNK) {
+                    return CompletableFuture.completedFuture(ScpServer.ok(req, Messages.okHeader(), null));
+                }
+                if (op == Opcode.APPEND) {
+                    Messages.Append append = Messages.Append.decode(req.headerSlice());
+                    Frame response = ScpServer.ok(req,
+                            new Messages.AppendResp(append.baseOffset() + req.payloadLength()).encode(), null);
+                    if (req.payloadLength() > 0) {
+                        int payloadNumber = traffic.payloads.incrementAndGet();
+                        return payloadNumber == 1
+                                ? CompletableFuture.completedFuture(response)
+                                : releaseSecondPayloadAck.thenApply(ignored -> response);
+                    }
+                    traffic.beacons.incrementAndGet();
+                    traffic.lastBeacon.set(append);
+                    return CompletableFuture.completedFuture(response);
+                }
+                if (op == Opcode.SEAL_CHUNK) {
+                    Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
+                    return CompletableFuture.completedFuture(ScpServer.ok(req,
+                            new Messages.SealResp(seal.dataLength(), 0).encode(), null));
+                }
+                return CompletableFuture.failedFuture(
+                        new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op));
+            }
+        });
+    }
+
+    private static ScpServer closeAdvanceDataNodeServer(
+            int nodeId, AppendTraffic traffic, CompletableFuture<Void> releaseSecondPayloadAck,
+            CompletableFuture<Void> releaseFirstBeaconAck) throws Exception {
+        return new ScpServer(0, nodeId, 0, 0, new ScpServer.Handler() {
+            @Override
+            public Frame handle(Frame req) {
+                throw new AssertionError("async handler expected");
+            }
+
+            @Override
+            public CompletableFuture<Frame> handleAsync(Frame req) {
+                Opcode op = Opcode.fromCode(req.opcode());
+                if (op == Opcode.OPEN_CHUNK) {
+                    return CompletableFuture.completedFuture(ScpServer.ok(req, Messages.okHeader(), null));
+                }
+                if (op == Opcode.APPEND) {
+                    Messages.Append append = Messages.Append.decode(req.headerSlice());
+                    Frame response = ScpServer.ok(req,
+                            new Messages.AppendResp(append.baseOffset() + req.payloadLength()).encode(), null);
+                    if (req.payloadLength() > 0) {
+                        int payloadNumber = traffic.payloads.incrementAndGet();
+                        return payloadNumber == 1
+                                ? CompletableFuture.completedFuture(response)
+                                : releaseSecondPayloadAck.thenApply(ignored -> response);
+                    }
+                    int beaconNumber = traffic.beacons.incrementAndGet();
+                    traffic.lastBeacon.set(append);
+                    return beaconNumber == 1
+                            ? releaseFirstBeaconAck.thenApply(ignored -> response)
+                            : CompletableFuture.completedFuture(response);
+                }
+                return CompletableFuture.failedFuture(
+                        new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op));
+            }
+        });
+    }
+
+    private static ScpServer failingPayloadDataNodeServer(int nodeId, AtomicInteger payloads) throws Exception {
+        return new ScpServer(0, nodeId, 0, 0, req -> {
+            Opcode op = Opcode.fromCode(req.opcode());
+            if (op == Opcode.OPEN_CHUNK) {
+                return ScpServer.ok(req, Messages.okHeader(), null);
+            }
+            if (op == Opcode.APPEND && req.payloadLength() > 0) {
+                payloads.incrementAndGet();
+                throw new ScpException(ErrorCode.INTERNAL, "injected payload failure");
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected " + op);
         });
@@ -2130,10 +2764,12 @@ class AppenderImplTest {
             }
             if (op == Opcode.APPEND) {
                 Messages.Append append = Messages.Append.decode(req.headerSlice());
-                if (append.chunkId().equals(new ChunkId(fileId, 0))) {
-                    chunk0Appends.incrementAndGet();
-                } else if (append.chunkId().equals(new ChunkId(fileId, 1))) {
-                    chunk1Appends.incrementAndGet();
+                if (req.payloadLength() > 0) {
+                    if (append.chunkId().equals(new ChunkId(fileId, 0))) {
+                        chunk0Appends.incrementAndGet();
+                    } else if (append.chunkId().equals(new ChunkId(fileId, 1))) {
+                        chunk1Appends.incrementAndGet();
+                    }
                 }
                 return ScpServer.ok(req,
                         new Messages.AppendResp(append.baseOffset() + req.payloadLength()).encode(), null);

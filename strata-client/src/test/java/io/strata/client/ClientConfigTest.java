@@ -43,6 +43,8 @@ class ClientConfigTest {
                 () -> new ClientConfig(List.of("host:123"), 1, 1, ConnectionPolicy.DEFAULT, 1, 1L, 1, 1, 1, 0, 1));
         assertThrows(IllegalArgumentException.class,
                 () -> ClientConfig.of("host:123").withMaxChunkRecords(0));
+        assertThrows(IllegalArgumentException.class,
+                () -> ClientConfig.of("host:123").withDurableBeaconIdleMs(0));
         assertThrows(NullPointerException.class,
                 () -> new ClientConfig(List.of("host:123"), 1, 1, null));
     }
@@ -64,6 +66,7 @@ class ClientConfigTest {
         assertEquals(Math.max(1, (io.strata.proto.ScpClient.maxPendingRequests() * 3) / 4),
                 c.appendConnectionPendingHighWatermark());
         assertEquals(ChunkLimits.DEFAULT_MAX_CLIENT_CHUNK_RECORDS, c.maxChunkRecords());
+        assertEquals(ClientConfig.DEFAULT_DURABLE_BEACON_IDLE_MS, c.durableBeaconIdleMs());
         assertTrue(c.maxChunkRecords() < ChunkLimits.DEFAULT_MAX_OPEN_CHUNK_LEDGER_ENTRIES);
     }
 
@@ -73,13 +76,15 @@ class ClientConfigTest {
                 .withControllerRetryDeadlineMs(30_000L).withControllerRetryBackoffMs(50)
                 .withRecoveryCopyChunkBytes(1 << 20)
                 .withAppendWatermarks(32, 128)
-                .withMaxChunkRecords(512);
+                .withMaxChunkRecords(512)
+                .withDurableBeaconIdleMs(25);
         assertEquals(30_000L, c.controllerRetryDeadlineMs());
         assertEquals(50, c.controllerRetryBackoffMs());
         assertEquals(1 << 20, c.recoveryCopyChunkBytes());
         assertEquals(32, c.appendReplicaInflightHighWatermark());
         assertEquals(128, c.appendConnectionPendingHighWatermark());
         assertEquals(512, c.maxChunkRecords());
+        assertEquals(25, c.durableBeaconIdleMs());
     }
 
     @Test
