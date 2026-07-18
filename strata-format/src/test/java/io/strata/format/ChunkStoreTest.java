@@ -885,6 +885,15 @@ class ChunkStoreTest {
         return field.get(target);
     }
 
+    private static boolean isSealing(ChunkStore.Handle handle) {
+        handle.lock.lock();
+        try {
+            return handle.sealing;
+        } finally {
+            handle.lock.unlock();
+        }
+    }
+
     @Test
     void appendReadSealLifecycle() throws Exception {
         try (ChunkStore store = newStore()) {
@@ -1065,6 +1074,166 @@ class ChunkStoreTest {
             assertTrue(getHandleObject(store, id, "committer") != null,
                     "malformed caller footer must not disable fsync acks on an open chunk");
             assertEquals(0, store.seal(TEST_NS, id, 1, 0, null).finalLength());
+        }
+    }
+
+    @Test
+    void failedSealFinalizationLeavesFsyncChunkFailClosedUntilSealRetry() throws Exception {
+        try (ChunkStore store = newStore()) {
+            store.open(TEST_NS, id, true, 1, 1718000000000L);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("data"));
+
+            FileChannel realData = (FileChannel) getHandleObject(store, id, "data");
+            setHandleObject(store, id, "data", new ZeroProgressFileChannel(false, false, true));
+            try {
+                assertThrows(IOException.class, () -> store.seal(TEST_NS, id, 1, 4, null));
+                assertEquals(ChunkState.OPEN, store.stat(TEST_NS, id).state());
+                assertNull(getHandleObject(store, id, "committer"),
+                        "a possibly partial finalization must not resume writes without recovery");
+            } finally {
+                setHandleObject(store, id, "data", realData);
+            }
+
+            ScpException appendFailure = assertThrows(ScpException.class,
+                    () -> store.append(TEST_NS, id, 1, 4, 4, bytes("more")));
+            assertEquals(ErrorCode.INTERNAL, appendFailure.code());
+            assertEquals(4, store.stat(TEST_NS, id).localEndOffset(),
+                    "the rejected append must not mutate the OPEN chunk");
+
+            assertEquals(4, store.seal(TEST_NS, id, 1, 4, null).finalLength(),
+                    "a seal retry should converge the partially written footer");
+        }
+    }
+
+    @Test
+    void truncatingSealFailureRemainsFailClosedAndCanBeRetried() throws Exception {
+        try (ChunkStore store = newStore()) {
+            store.open(TEST_NS, id, false, 1, 1718000000000L);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("abcdefgh"));
+
+            FailureInjector.arm("format.seal.afterTruncate", point -> {
+                throw new ScpException(ErrorCode.INTERNAL, "injected post-truncate failure");
+            });
+            try {
+                assertEquals(ErrorCode.INTERNAL,
+                        assertThrows(ScpException.class, () -> store.seal(TEST_NS, id, 1, 4, null)).code());
+            } finally {
+                FailureInjector.reset();
+            }
+
+            assertEquals(ChunkState.OPEN, store.stat(TEST_NS, id).state());
+            assertEquals(8, store.stat(TEST_NS, id).localEndOffset(),
+                    "failed truncation must retain the original logical end so retry rescans the prefix");
+            assertEquals(ErrorCode.INTERNAL, assertThrows(ScpException.class,
+                    () -> store.append(TEST_NS, id, 1, 8, 0, bytes("x"))).code());
+            ScpException changedTarget = assertThrows(ScpException.class,
+                    () -> store.seal(TEST_NS, id, 1, 5, null),
+                    "retry must not treat a partially written footer as logical data");
+            assertEquals(ErrorCode.INTERNAL, changedTarget.code());
+            assertEquals(4, changedTarget.detail());
+
+            ChunkStore.SealResult retried = store.seal(TEST_NS, id, 1, 4, null);
+            assertEquals(Crc.of(bytes("abcd")), retried.dataCrc());
+            assertArrayEquals("abcd".getBytes(StandardCharsets.UTF_8), store.read(TEST_NS, id, 0, 4).bytes());
+        }
+    }
+
+    @Test
+    void sealRetryForcesPreviouslyAppendedBoundaryAfterForceFailure() throws Exception {
+        try (ChunkStore store = newStore()) {
+            store.open(TEST_NS, id, false, 1, 1718000000000L);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("abcdefgh"));
+
+            AtomicBoolean failFirstForce = new AtomicBoolean(true);
+            FailureInjector.arm("format.seal.beforeBoundaryForce", point -> {
+                if (failFirstForce.compareAndSet(true, false)) {
+                    throw new ScpException(ErrorCode.INTERNAL, "injected boundary-force failure");
+                }
+            });
+            try {
+                assertEquals(ErrorCode.INTERNAL,
+                        assertThrows(ScpException.class, () -> store.seal(TEST_NS, id, 1, 4, null)).code());
+
+                ChunkStore.SealResult retried = store.seal(TEST_NS, id, 1, 4, null);
+                assertEquals(Crc.of(bytes("abcd")), retried.dataCrc());
+                assertEquals(2, FailureInjector.hits("format.seal.beforeBoundaryForce"),
+                        "retry must re-force the in-memory boundary whose first force failed");
+            } finally {
+                FailureInjector.reset();
+            }
+        }
+    }
+
+    @Test
+    void sealRechecksEpochAfterOffLockCommitterStop() throws Exception {
+        try (ChunkStore store = newStore()) {
+            store.open(TEST_NS, id, true, 1, 1718000000000L);
+            store.append(TEST_NS, id, 1, 0, 0, bytes("data"));
+
+            GroupCommitter original = (GroupCommitter) getHandleObject(store, id, "committer");
+            assertTrue(original.closeAndConfirm());
+
+            CountDownLatch forceEntered = new CountDownLatch(1);
+            CountDownLatch releaseForce = new CountDownLatch(1);
+            GroupCommitter blocking = new GroupCommitter(
+                    "fence-during-seal",
+                    () -> {
+                        forceEntered.countDown();
+                        try {
+                            if (!releaseForce.await(5, TimeUnit.SECONDS)) {
+                                throw new IOException("test did not release force");
+                            }
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new IOException("interrupted", e);
+                        }
+                    },
+                    new AtomicLong(), 10_000L, 1_000_000L, 50_000_000L);
+            setHandleObject(store, id, "committer", blocking);
+            Thread sealer = null;
+            try {
+                CompletableFuture<Void> pendingForce = blocking.awaitFlush(4);
+                assertTrue(forceEntered.await(5, TimeUnit.SECONDS));
+
+                AtomicReference<Throwable> sealFailure = new AtomicReference<>();
+                ChunkStore.Handle sealHandle = (ChunkStore.Handle) handle(store, id);
+                sealer = Thread.ofVirtual().name("stale-epoch-sealer").start(() -> {
+                    try {
+                        store.seal(TEST_NS, id, 1, 4, null);
+                    } catch (Throwable t) {
+                        sealFailure.set(t);
+                    }
+                });
+
+                long sealingDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                while (!isSealing(sealHandle) && System.nanoTime() < sealingDeadline) {
+                    Thread.sleep(10);
+                }
+                assertTrue(isSealing(sealHandle),
+                        "seal did not enter the off-lock committer-stop window");
+
+                store.fence(TEST_NS, id, 2);
+                releaseForce.countDown();
+                sealer.join(5_000);
+                assertFalse(sealer.isAlive(), "seal did not finish after the committer was released");
+                pendingForce.get(1, TimeUnit.SECONDS);
+
+                assertTrue(sealFailure.get() instanceof ScpException e && e.code() == ErrorCode.FENCED_EPOCH,
+                        "stale seal should fail with FENCED_EPOCH, got " + sealFailure.get());
+                assertEquals(ChunkState.OPEN, store.stat(TEST_NS, id).state());
+                Object replacement = getHandleObject(store, id, "committer");
+                assertNotNull(replacement, "the stale seal must not silently disable fsync-on-ack");
+                assertTrue(replacement != blocking,
+                        "the stopped committer must be replaced when the stale seal aborts");
+
+                assertEquals(8, store.append(TEST_NS, id, 2, 4, 4, bytes("more")).endOffset());
+                assertEquals(8, store.seal(TEST_NS, id, 2, 8, null).finalLength());
+            } finally {
+                releaseForce.countDown();
+                if (sealer != null) {
+                    sealer.join(5_000);
+                }
+            }
         }
     }
 
