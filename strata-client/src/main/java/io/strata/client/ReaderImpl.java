@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Consumer;
 
 import static io.strata.common.Checks.addChunkLength;
 
@@ -30,17 +31,25 @@ final class ReaderImpl implements StrataFile.Reader {
     private final ClientConfig config;
     private final FileId fileId;
     private final StrataNamespace namespace;
+    private final Consumer<Frame> borrowedFrameHookForTests;
     private final Map<String, ManagedScpConnection> pinnedConnections = new ConcurrentHashMap<>();
 
     private volatile Messages.LookupFileResp file;
 
     ReaderImpl(ControllerClient controller, NodePool pool, ClientConfig config, FileId fileId,
                StrataNamespace namespace) {
+        this(controller, pool, config, fileId, namespace, null);
+    }
+
+    // Package-private fault-injection seam for verifying ownership cleanup after a borrowed read.
+    ReaderImpl(ControllerClient controller, NodePool pool, ClientConfig config, FileId fileId,
+               StrataNamespace namespace, Consumer<Frame> borrowedFrameHookForTests) {
         this.controller = controller;
         this.pool = pool;
         this.config = config;
         this.fileId = fileId;
         this.namespace = namespace;
+        this.borrowedFrameHookForTests = borrowedFrameHookForTests;
         refresh();
     }
 
@@ -115,6 +124,9 @@ final class ReaderImpl implements StrataFile.Reader {
             try {
                 frame = connectionFor(r.endpoint()).callFrameBorrowed(Opcode.READ,
                         readHeader, null, config.callTimeoutMs());
+                if (borrowedFrameHookForTests != null) {
+                    borrowedFrameHookForTests.accept(frame);
+                }
                 ByteBuffer h = frame.headerSlice();
                 Resp.check(h);
                 var resp = Messages.ReadResp.decode(h);
@@ -162,9 +174,13 @@ final class ReaderImpl implements StrataFile.Reader {
                 return new Borrowed(frame, view);
             } catch (ScpException e) {
                 last = e;
+            } catch (IllegalStateException e) {
+                // Frame lifecycle/invariant failures are local client bugs, not corrupt replica data.
+                // Fail fast so a later healthy replica cannot hide the diagnostic.
+                throw readResponseInvariantFailure(r, e);
             } catch (RuntimeException e) {
                 last = new ScpException(ErrorCode.CORRUPT_CHUNK,
-                        "malformed read response from replica " + r.nodeId() + ": " + e);
+                        "malformed read response from replica " + r.nodeId() + ": " + e, e);
             } finally {
                 // frame is null when callFrameBorrowed itself threw (nothing to release); otherwise
                 // release on validation failure / exception / continue. Success sets transferred.
@@ -172,6 +188,12 @@ final class ReaderImpl implements StrataFile.Reader {
             }
         }
         throw last != null ? last : new ScpException(ErrorCode.INTERNAL, "no readable replica");
+    }
+
+    private static ScpException readResponseInvariantFailure(Messages.Replica replica,
+                                                             IllegalStateException cause) {
+        return new ScpException(ErrorCode.INTERNAL,
+                "read response lifecycle failure from replica " + replica.nodeId() + ": " + cause, cause);
     }
 
     private ManagedScpConnection connectionFor(String endpoint) {

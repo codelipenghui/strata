@@ -30,6 +30,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
@@ -721,6 +722,95 @@ class ProtocolCoverageTest {
     }
 
     @Test
+    void closedOwnedRequestFrameRejectsStateAccess() {
+        byte[] bytes = {9, 1, 2, 3, 4, 5, 9};
+        Frame frame = Frame.fromOwnedBuffer(Opcode.APPEND.code, (short) 1, Frame.FLAG_PAYLOAD_CRC, 99,
+                Unpooled.wrappedBuffer(bytes), 1, 2, 3, 3, Crc.of(bytes, 3, 3));
+
+        frame.close();
+        assertEquals(0, frame.ownerRefCnt());
+
+        List.<Runnable>of(
+                () -> frame.opcode(),
+                () -> frame.apiVersion(),
+                () -> frame.flags(),
+                () -> frame.correlationId(),
+                () -> frame.isResponse(),
+                () -> frame.headerSlice(),
+                () -> frame.headerLength(),
+                () -> frame.hasOwnedHeader(),
+                () -> frame.hasHeaderBytes(),
+                () -> frame.hasOkU64Header(),
+                () -> frame.okU64HeaderValue(),
+                () -> frame.headerBytes(),
+                () -> frame.payloadSlice(),
+                () -> frame.hasPayloadBytes(),
+                () -> frame.payloadBytes(),
+                () -> frame.payloadBytesOffset(),
+                () -> frame.payloadBytesLength(),
+                () -> frame.ownedHeaderByte(0),
+                () -> frame.ownedHeaderInt(0),
+                () -> frame.ownedHeaderLong(0),
+                () -> frame.headerView(),
+                () -> frame.payloadLength(),
+                () -> frame.payloadView(),
+                () -> frame.payloadCrc(),
+                () -> frame.hasFilePayload(),
+                () -> frame.filePayload(),
+                () -> frame.copyToHeap(),
+                () -> frame.ownsBuffer(),
+                () -> frame.reserveWireBytes(1))
+                .forEach(ProtocolCoverageTest::assertClosedFrameAccessRejected);
+    }
+
+    @Test
+    void closedHeapFramesRejectStateAccess() {
+        Frame request = Frame.request(Opcode.PING, new byte[] {1}, ByteBuffer.wrap(new byte[] {2}), 7);
+        Frame okU64 = Frame.okU64Response(request, 42);
+        try {
+            request.close();
+            assertClosedFrameAccessRejected(() -> request.opcode());
+            assertClosedFrameAccessRejected(() -> request.payloadSlice());
+
+            okU64.close();
+            assertClosedFrameAccessRejected(() -> okU64.hasOkU64Header());
+            assertClosedFrameAccessRejected(() -> okU64.okU64HeaderValue());
+        } finally {
+            request.close();
+            okU64.close();
+        }
+    }
+
+    @Test
+    void closedFileFrameRejectsStateAccessAndReleasesOnce() throws Exception {
+        Path tmp = Files.createTempFile("strata-closed-file-frame", ".bin");
+        AtomicInteger releases = new AtomicInteger();
+        Frame request = Frame.request(Opcode.READ, Messages.okHeader(), null, 8);
+        try (FileChannel channel = FileChannel.open(tmp, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            Frame file = Frame.fileResponse(request, Messages.okHeader(),
+                    new Frame.FilePayload(channel, 0, 0, releases::incrementAndGet));
+            file.close();
+            assertClosedFrameAccessRejected(() -> file.hasFilePayload());
+            assertClosedFrameAccessRejected(() -> file.filePayload());
+            file.close();
+            assertEquals(1, releases.get());
+        } finally {
+            request.close();
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    @Test
+    void closedFrameReservationCanStillBeDrained() {
+        Frame frame = Frame.request(Opcode.PING, Messages.okHeader(), null, 9);
+        frame.reserveWireBytes(17);
+        frame.close();
+
+        assertEquals(17, frame.drainReservedWireBytes());
+        assertEquals(0, frame.drainReservedWireBytes());
+    }
+
+    @Test
     void ownedRequestFrameClosedOnDifferentThreadDoesNotEnterWrapperPool() throws Exception {
         byte[] firstBytes = {9, 1, 2, 3, 4, 5, 9};
         ByteBuf firstOwner = Unpooled.wrappedBuffer(firstBytes);
@@ -846,6 +936,11 @@ class ProtocolCoverageTest {
         IOException e = assertThrows(IOException.class,
                 () -> FrameIO.read(new DataInputStream(new ByteArrayInputStream(wire))));
         assertTrue(e.getMessage().contains(messageFragment), "got: " + e.getMessage());
+    }
+
+    private static void assertClosedFrameAccessRejected(Runnable access) {
+        IllegalStateException error = assertThrows(IllegalStateException.class, access::run);
+        assertEquals("frame is closed and may have been recycled", error.getMessage());
     }
 
     private static void assertConfirmOrphanRespDecodeFails(byte[] wire) {

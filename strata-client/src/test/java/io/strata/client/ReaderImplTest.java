@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.ServerSocket;
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +26,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -154,6 +156,44 @@ class ReaderImplTest {
 
                 ScpException e = assertThrows(ScpException.class, () -> reader.read(0, 3));
                 assertEquals(ErrorCode.CORRUPT_CHUNK, e.code());
+            }
+        }
+    }
+
+    @Test
+    void borrowedFrameInvariantFailureIsInternalFailsFastAndReleasesFrame() throws Exception {
+        FileId fileId = FileId.of(16);
+        ChunkId chunkId = new ChunkId(fileId, 0);
+        AtomicInteger replicaReads = new AtomicInteger();
+        AtomicReference<Frame> borrowedFrame = new AtomicReference<>();
+        IllegalStateException cause = new IllegalStateException("injected borrowed-frame invariant failure");
+
+        try (ScpServer firstReplica = countingReadReplica(replicaReads,
+                     new Messages.ReadResp(3, 3), new byte[] {1, 2, 3});
+             ScpServer secondReplica = countingReadReplica(replicaReads,
+                     new Messages.ReadResp(3, 3), new byte[] {1, 2, 3});
+             ScpServer metaServer = metadataServer(new AtomicReference<>(
+                     new Messages.LookupFileResp("test", "/test/file", Messages.WritePolicy.DEFAULT, (byte) 1,
+                             List.of(chunk(chunkId, ChunkState.SEALED, 3,
+                                     new Messages.Replica(1, endpoint(firstReplica)),
+                                     new Messages.Replica(2, endpoint(secondReplica)))))))) {
+            ClientConfig config = new ClientConfig(List.of(endpoint(metaServer)), 1024, 500);
+            try (ControllerClient meta = new ControllerClient(config); NodePool pool = new NodePool()) {
+                ReaderImpl reader = new ReaderImpl(meta, pool, config, fileId, StrataNamespace.of("test"), frame -> {
+                    borrowedFrame.set(frame);
+                    assertTrue(frame.ownsBuffer());
+                    assertTrue(frame.ownerRefCnt() > 0, "borrowed buffer must be live before validation");
+                    throw cause;
+                });
+
+                ScpException failure = assertThrows(ScpException.class, () -> reader.read(0, 3));
+
+                assertEquals(ErrorCode.INTERNAL, failure.code());
+                assertSame(cause, failure.getCause());
+                assertEquals(1, replicaReads.get(), "an invariant failure must not try the next healthy replica");
+                assertNotNull(borrowedFrame.get());
+                assertEquals(0, borrowedFrame.get().ownerRefCnt(),
+                        "failure cleanup must release the borrowed response buffer");
             }
         }
     }
@@ -368,6 +408,7 @@ class ReaderImplTest {
 
                 ScpException e = assertThrows(ScpException.class, () -> reader.read(0, 3));
                 assertEquals(ErrorCode.CORRUPT_CHUNK, e.code());
+                assertInstanceOf(BufferUnderflowException.class, e.getCause());
             }
         }
     }
@@ -451,8 +492,14 @@ class ReaderImplTest {
     }
 
     private static ScpServer readReplica(Messages.ReadResp resp, byte[] payload) throws Exception {
+        return countingReadReplica(new AtomicInteger(), resp, payload);
+    }
+
+    private static ScpServer countingReadReplica(AtomicInteger reads, Messages.ReadResp resp,
+                                                 byte[] payload) throws Exception {
         return new ScpServer(0, 1, 0, 0, req -> {
             if (Opcode.fromCode(req.opcode()) == Opcode.READ) {
+                reads.incrementAndGet();
                 Messages.Read.decode(req.headerSlice());
                 return ScpServer.ok(req, resp.encode(), ByteBuffer.wrap(payload));
             }

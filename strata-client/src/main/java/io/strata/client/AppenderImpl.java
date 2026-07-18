@@ -247,7 +247,7 @@ final class AppenderImpl implements StrataFile.Appender {
                 }
             } catch (RuntimeException e) {
                 onReplicaFailureLocked(s, replicaIndex,
-                        new ScpException(ErrorCode.INTERNAL, "malformed append response: " + e));
+                        new ScpException(ErrorCode.INTERNAL, "malformed append response: " + e, e));
             }
         } finally {
             lock.unlock();
@@ -344,7 +344,8 @@ final class AppenderImpl implements StrataFile.Appender {
         log.warn("replica {} ({}) failed for chunk {}: {}", replicaIndex,
                 s.replicas.get(replicaIndex).endpoint(), s.chunkId, cause.getMessage());
         if (s.replicas.size() - s.failedCount() < ackQuorum) {
-            dieLocked(new ScpException(ErrorCode.INTERNAL, "quorum lost on chunk " + s.chunkId + ": " + cause));
+            dieLocked(new ScpException(ErrorCode.INTERNAL,
+                    "quorum lost on chunk " + s.chunkId + ": " + cause, cause));
             return;
         }
         // failure leaves a short replica set; once the pipeline drains we roll to a fresh set

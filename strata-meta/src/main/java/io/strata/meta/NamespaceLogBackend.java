@@ -367,9 +367,9 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
                 if (repo.compact(thresholdBytes)) {
                     compacted++;
                 }
-            } catch (IllegalStateException fenced) {
-                // The only IllegalStateException compact() raises in steady state is a lost manifest CAS —
-                // another node owns this namespace now; drop the stale repo so the next op re-acquires.
+            } catch (ManifestCasLostException fenced) {
+                // Another node owns this namespace now; drop the stale repo so the next op re-acquires.
+                // Other runtime failures are ordinary compaction failures and must not revoke local authority.
                 e.getValue().fenceIfCurrent(repo);
                 if (!closed) {
                     log.warn("namespace {} open-log compaction fenced — evicting stale repo", e.getKey(), fenced);

@@ -241,7 +241,7 @@ class NamespaceMetadataLogRepositoryTest {
             repo.append(fileCreated(a, "/a", 1));
             commitButReportLost.set(true);
 
-            assertThrows(IllegalStateException.class, repo::compactAndPublish,
+            assertThrows(ManifestCasLostException.class, repo::compactAndPublish,
                     "the owner still fences because it cannot prove whether the CAS committed");
 
             NamespaceMetadataLogRepository successor =
@@ -264,7 +264,7 @@ class NamespaceMetadataLogRepositoryTest {
 
             AtomicBoolean commitButReportLost = new AtomicBoolean(true);
             MetadataStore ambiguousRoot = commitManifestButReportEmptyOnce(delegateRoot, commitButReportLost);
-            assertThrows(IllegalStateException.class,
+            assertThrows(ManifestCasLostException.class,
                     () -> NamespaceMetadataLogRepository.open(NS, fs, ambiguousRoot, 2),
                     "the recovering owner still fences because it cannot prove whether the CAS committed");
 
@@ -289,7 +289,7 @@ class NamespaceMetadataLogRepositoryTest {
             NamespaceMetadataLogRepository successor = NamespaceMetadataLogRepository.open(NS, fs, root, 2);
             successor.append(fileCreated(FileId.of(2), "/b", 2));
 
-            assertThrows(IllegalStateException.class, leader::compactAndPublish,
+            assertThrows(ManifestCasLostException.class, leader::compactAndPublish,
                     "the fenced leader's manifest CAS must lose");
         }
     }
