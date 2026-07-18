@@ -13,12 +13,14 @@ public record ClientConfig(List<String> controllerEndpoints, long chunkRollBytes
                            ConnectionPolicy connectionPolicy, int dataNodeConnectionsPerEndpoint,
                            long controllerRetryDeadlineMs, int controllerRetryBackoffMs,
                            int recoveryCopyChunkBytes, int appendReplicaInflightHighWatermark,
-                           int appendConnectionPendingHighWatermark, int maxChunkRecords) {
+                           int appendConnectionPendingHighWatermark, int maxChunkRecords,
+                           long durableBeaconIdleMs) {
     private static final int DEFAULT_APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK = 64;
     private static final int DEFAULT_APPEND_CONNECTION_PENDING_HIGH_WATERMARK =
             Math.max(1, ScpClient.maxPendingRequests() * 3 / 4);
     private static final int DEFAULT_MAX_CHUNK_RECORDS =
             ChunkLimits.DEFAULT_MAX_CLIENT_CHUNK_RECORDS;
+    public static final long DEFAULT_DURABLE_BEACON_IDLE_MS = 100L;
 
     public ClientConfig(List<String> controllerEndpoints, long chunkRollBytes, long callTimeoutMs) {
         this(controllerEndpoints, chunkRollBytes, callTimeoutMs, ConnectionPolicy.DEFAULT, 1, 15_000L, 200,
@@ -39,7 +41,19 @@ public record ClientConfig(List<String> controllerEndpoints, long chunkRollBytes
                 controllerRetryDeadlineMs, controllerRetryBackoffMs, recoveryCopyChunkBytes,
                 DEFAULT_APPEND_REPLICA_INFLIGHT_HIGH_WATERMARK,
                 DEFAULT_APPEND_CONNECTION_PENDING_HIGH_WATERMARK,
-                DEFAULT_MAX_CHUNK_RECORDS);
+                DEFAULT_MAX_CHUNK_RECORDS, DEFAULT_DURABLE_BEACON_IDLE_MS);
+    }
+
+    /** Source-compatible full constructor from before idle durable-offset publication was configurable. */
+    public ClientConfig(List<String> controllerEndpoints, long chunkRollBytes, long callTimeoutMs,
+                        ConnectionPolicy connectionPolicy, int dataNodeConnectionsPerEndpoint,
+                        long controllerRetryDeadlineMs, int controllerRetryBackoffMs,
+                        int recoveryCopyChunkBytes, int appendReplicaInflightHighWatermark,
+                        int appendConnectionPendingHighWatermark, int maxChunkRecords) {
+        this(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy, dataNodeConnectionsPerEndpoint,
+                controllerRetryDeadlineMs, controllerRetryBackoffMs, recoveryCopyChunkBytes,
+                appendReplicaInflightHighWatermark, appendConnectionPendingHighWatermark, maxChunkRecords,
+                DEFAULT_DURABLE_BEACON_IDLE_MS);
     }
 
     public ClientConfig {
@@ -80,6 +94,9 @@ public record ClientConfig(List<String> controllerEndpoints, long chunkRollBytes
         if (maxChunkRecords <= 0) {
             throw new IllegalArgumentException("maxChunkRecords must be positive: " + maxChunkRecords);
         }
+        if (durableBeaconIdleMs <= 0) {
+            throw new IllegalArgumentException("durableBeaconIdleMs must be positive: " + durableBeaconIdleMs);
+        }
     }
 
     public static ClientConfig of(String metadataEndpoint) {
@@ -90,39 +107,42 @@ public record ClientConfig(List<String> controllerEndpoints, long chunkRollBytes
         return new ClientConfig(controllerEndpoints, bytes, callTimeoutMs, connectionPolicy,
                 dataNodeConnectionsPerEndpoint, controllerRetryDeadlineMs, controllerRetryBackoffMs,
                 recoveryCopyChunkBytes, appendReplicaInflightHighWatermark, appendConnectionPendingHighWatermark,
-                maxChunkRecords);
+                maxChunkRecords, durableBeaconIdleMs);
     }
 
     public ClientConfig withConnectionPolicy(ConnectionPolicy policy) {
         return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, policy,
                 dataNodeConnectionsPerEndpoint, controllerRetryDeadlineMs, controllerRetryBackoffMs,
                 recoveryCopyChunkBytes, appendReplicaInflightHighWatermark, appendConnectionPendingHighWatermark,
-                maxChunkRecords);
+                maxChunkRecords, durableBeaconIdleMs);
     }
 
     public ClientConfig withDataNodeConnectionsPerEndpoint(int connections) {
         return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy,
                 connections, controllerRetryDeadlineMs, controllerRetryBackoffMs, recoveryCopyChunkBytes,
-                appendReplicaInflightHighWatermark, appendConnectionPendingHighWatermark, maxChunkRecords);
+                appendReplicaInflightHighWatermark, appendConnectionPendingHighWatermark, maxChunkRecords,
+                durableBeaconIdleMs);
     }
 
     public ClientConfig withControllerRetryDeadlineMs(long deadlineMs) {
         return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy,
                 dataNodeConnectionsPerEndpoint, deadlineMs, controllerRetryBackoffMs, recoveryCopyChunkBytes,
-                appendReplicaInflightHighWatermark, appendConnectionPendingHighWatermark, maxChunkRecords);
+                appendReplicaInflightHighWatermark, appendConnectionPendingHighWatermark, maxChunkRecords,
+                durableBeaconIdleMs);
     }
 
     public ClientConfig withControllerRetryBackoffMs(int backoffMs) {
         return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy,
                 dataNodeConnectionsPerEndpoint, controllerRetryDeadlineMs, backoffMs, recoveryCopyChunkBytes,
-                appendReplicaInflightHighWatermark, appendConnectionPendingHighWatermark, maxChunkRecords);
+                appendReplicaInflightHighWatermark, appendConnectionPendingHighWatermark, maxChunkRecords,
+                durableBeaconIdleMs);
     }
 
     public ClientConfig withRecoveryCopyChunkBytes(int copyChunkBytes) {
         return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy,
                 dataNodeConnectionsPerEndpoint, controllerRetryDeadlineMs, controllerRetryBackoffMs,
                 copyChunkBytes, appendReplicaInflightHighWatermark, appendConnectionPendingHighWatermark,
-                maxChunkRecords);
+                maxChunkRecords, durableBeaconIdleMs);
     }
 
     public ClientConfig withAppendWatermarks(int replicaInflightHighWatermark,
@@ -130,14 +150,21 @@ public record ClientConfig(List<String> controllerEndpoints, long chunkRollBytes
         return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy,
                 dataNodeConnectionsPerEndpoint, controllerRetryDeadlineMs, controllerRetryBackoffMs,
                 recoveryCopyChunkBytes, replicaInflightHighWatermark, connectionPendingHighWatermark,
-                maxChunkRecords);
+                maxChunkRecords, durableBeaconIdleMs);
     }
 
     public ClientConfig withMaxChunkRecords(int maxRecords) {
         return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy,
                 dataNodeConnectionsPerEndpoint, controllerRetryDeadlineMs, controllerRetryBackoffMs,
                 recoveryCopyChunkBytes, appendReplicaInflightHighWatermark, appendConnectionPendingHighWatermark,
-                maxRecords);
+                maxRecords, durableBeaconIdleMs);
+    }
+
+    public ClientConfig withDurableBeaconIdleMs(long idleMs) {
+        return new ClientConfig(controllerEndpoints, chunkRollBytes, callTimeoutMs, connectionPolicy,
+                dataNodeConnectionsPerEndpoint, controllerRetryDeadlineMs, controllerRetryBackoffMs,
+                recoveryCopyChunkBytes, appendReplicaInflightHighWatermark, appendConnectionPendingHighWatermark,
+                maxChunkRecords, idleMs);
     }
 
     private static void validateEndpoint(String endpoint) {
