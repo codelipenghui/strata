@@ -39,12 +39,16 @@ public enum Opcode {
     // owner-pull durability verification (tech design §9.2): a namespace owner asks a data node, in bounded
     // batches, for the local state of the chunks it expects that node to hold (present/missing/corrupt).
     // Replaces the central inventory push. Owner -> node, so a data-plane opcode (< 0x0100) routed to
-    // DataNodeHandlers. Append-only; currently the highest assigned data-plane opcode.
+    // DataNodeHandlers. Append-only.
     VERIFY_CHUNKS(0x001C),
     // data-node orphan GC -> metadata owner: a dedicated destructive confirmation lane. 0x020a stays
     // deliberately unassigned. An older metadata owner rejects this unknown opcode, which the caller
     // treats as no verdict so mixed-version orphan GC fails closed.
-    CONFIRM_ORPHAN(0x020B);
+    CONFIRM_ORPHAN(0x020B),
+    // Metadata owner -> data node: remove a suspect replica from the live path while retaining its
+    // on-disk files for forensic recovery. This is deliberately a distinct opcode rather than an optional
+    // DELETE_CHUNKS tag: an older node must reject the request, not ignore an unknown tag and unlink bytes.
+    QUARANTINE_CHUNKS(0x001D);
 
     public final short code;
 

@@ -63,7 +63,8 @@ class MessageGoldenCorpusTest {
                 "ALLOCATE_WRITER_EPOCH=0x0209",
                 "EXEC_REPLICATE=0x001b",
                 "VERIFY_CHUNKS=0x001c",
-                "CONFIRM_ORPHAN=0x020b"),
+                "CONFIRM_ORPHAN=0x020b",
+                "QUARANTINE_CHUNKS=0x001d"),
                 Arrays.stream(Opcode.values())
                         .map(op -> op.name() + "=0x" + String.format("%04x", op.code & 0xFFFF))
                         .toList());
@@ -159,12 +160,13 @@ class MessageGoldenCorpusTest {
                         // to fix combined-node routing: opcodes >= 0x0100 route to Controller, but
                         // EXEC_REPLICATE is handled by DataNodeHandlers (Bug B fix). VERIFY_CHUNKS (0x001c)
                         // appended (§9.2); INVENTORY_REPORT (0x0103) removed (§9.2). CONFIRM_ORPHAN
-                        // uses 0x020b (historical 0x020a remains retired) — count is now 0x1a.
+                        // uses 0x020b (historical 0x020a remains retired), and fail-closed replica
+                        // quarantine uses 0x001d — count is now 0x1b.
                         "0000000101020304050607080000002a11112222333344445555666677778888"
-                                + "0400000000000000400000001a0001000100100001001100010012000100130001"
+                                + "0400000000000000400000001b0001000100100001001100010012000100130001"
                                 + "001400010015000100160001001700010018000100190001001a000101010001"
                                 + "0102000102010001020200010203000102040001020500010206000102070001"
-                                + "0208000102090001001b0001001c0001020b000100"),
+                                + "0208000102090001001b0001001c0001020b0001001d000100"),
                 request("openChunk",
                         new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L, NS),
                         () -> new Messages.OpenChunk(CHUNK_ID, 5, true, 1L << 30, 1_718_000_000_000L, NS).encode(),

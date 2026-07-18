@@ -49,10 +49,17 @@ final class ChunkDeleteService {
         }
     }
 
+    ErrorCode quarantine(StrataNamespace namespace, ChunkId chunkId) throws InterruptedException {
+        try (PreparedDelete prepared = prepare()) {
+            return prepared.quarantine(namespace, chunkId);
+        }
+    }
+
     /**
      * Acquires the shared delete QoS slot without touching the chunk. Callers that need an additional
-     * correctness gate can wait here, run that short gate afterwards, and invoke {@link PreparedDelete#delete}
-     * only once the delete is committed. This keeps throttle and pacing waits outside caller-owned locks.
+     * correctness gate can wait here, run that short gate afterwards, and invoke
+     * {@link PreparedDelete#delete} or {@link PreparedDelete#quarantine} only once the removal is committed.
+     * This keeps throttle and pacing waits outside caller-owned locks.
      */
     PreparedDelete prepare() throws InterruptedException {
         waiting.incrementAndGet();
@@ -83,6 +90,14 @@ final class ChunkDeleteService {
         private boolean closed;
 
         ErrorCode delete(StrataNamespace namespace, ChunkId chunkId) {
+            return remove(namespace, chunkId, false);
+        }
+
+        ErrorCode quarantine(StrataNamespace namespace, ChunkId chunkId) {
+            return remove(namespace, chunkId, true);
+        }
+
+        private ErrorCode remove(StrataNamespace namespace, ChunkId chunkId, boolean quarantine) {
             if (closed) {
                 throw new IllegalStateException("prepared delete is closed");
             }
@@ -92,7 +107,9 @@ final class ChunkDeleteService {
             attempted = true;
             inFlight.incrementAndGet();
             try {
-                ErrorCode result = store.delete(namespace, chunkId);
+                ErrorCode result = quarantine
+                        ? store.quarantine(namespace, chunkId)
+                        : store.delete(namespace, chunkId);
                 record(result);
                 return result;
             } catch (RuntimeException e) {

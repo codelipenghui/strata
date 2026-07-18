@@ -389,6 +389,11 @@ public final class Controller implements AutoCloseable {
         return repair.authorityRevalidationSkips();
     }
 
+    /** Verify verdict sets withheld because no returned or rescued replica matched the descriptor. */
+    public long verifyNoMatchBreaks() {
+        return repair.verifyNoMatchBreaks();
+    }
+
     public int aliveNodes() {
         return registry.livenessCounts().alive();
     }
