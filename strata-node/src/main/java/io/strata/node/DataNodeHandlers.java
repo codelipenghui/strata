@@ -177,6 +177,33 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 yield ScpServer.ok(req, new Messages.DeleteChunksResp(m.chunkIds(), codes).encode(), null);
             }
 
+            case QUARANTINE_CHUNKS -> {
+                // Unlike legacy broker cleanup, quarantine is a new owner-only destructive lane and has no
+                // unstamped compatibility mode. Keeping it on a distinct opcode also makes old nodes reject
+                // the request instead of treating an unknown tagged field as an ordinary unlink.
+                var m = Messages.DeleteChunks.decode(req.headerReadBuffer());
+                RequestContext.setNamespace(m.namespace().value());
+                if (m.ownerEpoch() <= 0) {
+                    throw new ScpException(ErrorCode.FENCED_EPOCH,
+                            "QUARANTINE_CHUNKS requires a positive owner epoch", 1);
+                }
+                List<Short> codes = new ArrayList<>(m.chunkIds().size());
+                int quarantined = 0;
+                for (var id : m.chunkIds()) {
+                    ErrorCode result = node.quarantineVerifiedReplica(m.namespace(), id, m.ownerEpoch());
+                    if (result == ErrorCode.OK) quarantined++;
+                    codes.add(result.code);
+                }
+                if (!m.chunkIds().isEmpty()) {
+                    log.warn("QUARANTINE_CHUNKS: quarantined {}/{} chunk(s) in ns={} [{}..{}] "
+                                    + "ownerEpoch={} requester={}",
+                            quarantined, m.chunkIds().size(), m.namespace().value(),
+                            m.chunkIds().get(0), m.chunkIds().get(m.chunkIds().size() - 1),
+                            m.ownerEpoch(), RequestContext.clientId());
+                }
+                yield ScpServer.ok(req, new Messages.DeleteChunksResp(m.chunkIds(), codes).encode(), null);
+            }
+
             case FETCH_CHUNK -> {
                 var m = Messages.FetchChunk.decode(req.headerReadBuffer());
                 RequestContext.setNamespace(m.namespace().value());

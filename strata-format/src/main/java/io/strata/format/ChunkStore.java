@@ -155,6 +155,10 @@ public final class ChunkStore implements AutoCloseable {
             new AtomicLong();
     private final AtomicLong sealedLedgerReclaims =
             new AtomicLong();
+    // Quarantine files are intentionally outside the live handle map, but they still consume physical
+    // capacity. Seeded from disk after startup recovery and incremented at each successful runtime rename.
+    private final AtomicLong quarantinedBytes =
+            new AtomicLong();
 
     // Background writeback: a daemon periodically fsyncs OPEN, non-ack-on-fsync chunks that have
     // accumulated enough new data since their last flush, so the dirty-page backlog never grows to a
@@ -224,6 +228,7 @@ public final class ChunkStore implements AutoCloseable {
         // cannot mistake a root left behind by a failed or concurrent initializer for a durable one.
         ensureDirectoryDurable(dir);
         recoverAll();
+        quarantinedBytes.set(scanQuarantinedBytes());
         this.flusher = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "chunk-writeback-" + dir.getFileName());
             t.setDaemon(true);
@@ -614,6 +619,9 @@ public final class ChunkStore implements AutoCloseable {
         // SEAL_FSYNC=false leaves a sealed chunk's footer/sidecar unforced, so its ledger is retained
         // as the recovery safety net until reclaimSealedLedgersOnce() forces the SEALED state durable.
         boolean sealedLedgerPending;
+        // Chosen once when a runtime quarantine starts so a retry after a partial sidecar move keeps all
+        // evidence in one suffix group. It is in-memory only; startup recovery handles partial groups.
+        String quarantineSuffix;
         ChunkState state;
         long end;               // logical data length
         long bgFlushedOffset;   // end offset already pushed to disk by background writeback
@@ -2499,6 +2507,19 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     public ErrorCode delete(StrataNamespace ns, ChunkId id) {
+        return remove(ns, id, false);
+    }
+
+    /**
+     * Atomically renames a chunk's active files out of the live namespace, preserving their bytes under a
+     * {@code .quarantine-*} suffix for forensic recovery. Each file move is same-directory and atomic; the
+     * shard directory is forced before success is returned. Ordinary retention deletion remains an unlink.
+     */
+    public ErrorCode quarantine(StrataNamespace ns, ChunkId id) {
+        return remove(ns, id, true);
+    }
+
+    private ErrorCode remove(StrataNamespace ns, ChunkId id, boolean quarantine) {
         long t0 = System.nanoTime();
         ChunkKey key = new ChunkKey(ns, id);
         Handle h = chunks.get(key);
@@ -2510,7 +2531,7 @@ public final class ChunkStore implements AutoCloseable {
             h.state = ChunkState.DELETING; // blocks appends/seal for the whole teardown
             committerToStop = h.committer;
             if (committerToStop == null) {
-                return deleteLocked(h, key, id, t0); // nothing to drain off-lock — tear down under the lock
+                return removeLocked(h, key, id, t0, quarantine);
             }
         } finally {
             h.lock.unlock();
@@ -2526,10 +2547,14 @@ public final class ChunkStore implements AutoCloseable {
         h.lock.lock();
         try {
             h.committer = null; // confirmed stopped above; safe to mutate files
-            return deleteLocked(h, key, id, t0);
+            return removeLocked(h, key, id, t0, quarantine);
         } finally {
             h.lock.unlock();
         }
+    }
+
+    private ErrorCode removeLocked(Handle h, ChunkKey key, ChunkId id, long t0, boolean quarantine) {
+        return quarantine ? quarantineLocked(h, key, id, t0) : deleteLocked(h, key, id, t0);
     }
 
     /**
@@ -2558,6 +2583,71 @@ public final class ChunkStore implements AutoCloseable {
             log.info("slow delete {} took {}ms", id, msBetween(t0, System.nanoTime()));
         }
         return ErrorCode.OK;
+    }
+
+    /** Caller holds {@code h.lock}; the group committer is already stopped or absent. */
+    private ErrorCode quarantineLocked(Handle h, ChunkKey key, ChunkId id, long t0) {
+        try {
+            if (h.data != null) h.data.close();
+            if (h.ledger != null) h.ledger.close();
+            if (h.quarantineSuffix == null) {
+                h.quarantineSuffix = availableQuarantineSuffix(h);
+            }
+            String suffix = h.quarantineSuffix;
+            Path quarantinedData = quarantinePath(h.dataPath, suffix);
+            if (!Files.exists(h.dataPath) && !Files.exists(quarantinedData)) {
+                throw new IOException("active chunk data is absent before quarantine: " + h.dataPath);
+            }
+            moveToQuarantineIfPresent(h.dataPath, quarantinedData);
+            // Once the data file leaves its live name, no later read may return a cached descriptor for it.
+            channelCache.invalidate(h.nsKey);
+            moveToQuarantineIfPresent(h.metaPath, quarantinePath(h.metaPath, suffix));
+            moveToQuarantineIfPresent(h.ledgerPath, quarantinePath(h.ledgerPath, suffix));
+            // Quarantine is a preservation boundary, so force it regardless of the optional seal-fsync mode.
+            forceDirectory(h.shardDir);
+            chunks.remove(key, h);
+        } catch (IOException e) {
+            log.warn("quarantine {} failed; retained for retry", id, e);
+            return ErrorCode.INTERNAL;
+        }
+        if (System.nanoTime() - t0 > slowMutationLogNanos()) {
+            log.info("slow quarantine {} took {}ms", id, msBetween(t0, System.nanoTime()));
+        }
+        return ErrorCode.OK;
+    }
+
+    private String availableQuarantineSuffix(Handle h) {
+        String stem = ".quarantine-" + System.currentTimeMillis();
+        String suffix = stem;
+        int attempt = 1;
+        while (quarantineTargetExists(h, suffix)) {
+            suffix = stem + "-" + attempt++;
+        }
+        return suffix;
+    }
+
+    private static boolean quarantineTargetExists(Handle h, String suffix) {
+        return Files.exists(quarantinePath(h.dataPath, suffix))
+                || Files.exists(quarantinePath(h.metaPath, suffix))
+                || Files.exists(quarantinePath(h.ledgerPath, suffix));
+    }
+
+    private static Path quarantinePath(Path source, String suffix) {
+        return source.resolveSibling(source.getFileName() + suffix);
+    }
+
+    private void moveToQuarantineIfPresent(Path source, Path target) throws IOException {
+        if (!Files.exists(source)) {
+            return;
+        }
+        // Never let a retry overwrite previously preserved evidence. A target alongside a newly live
+        // source means another incarnation appeared after a partial quarantine; fail closed for diagnosis.
+        if (Files.exists(target)) {
+            throw new IOException("active and quarantined chunk files both exist: " + source + " / " + target);
+        }
+        long bytes = Files.size(source);
+        Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+        quarantinedBytes.addAndGet(bytes);
     }
 
     /** A point-in-time view of one stored chunk — for tests/diagnostics that inspect the store's contents. */
@@ -2599,7 +2689,10 @@ public final class ChunkStore implements AutoCloseable {
             h.lock.lock();
             try {
                 h.lastVerifiedAtMs = now;
-                out.add(new VerifyResult(id, true, h.state, h.currentEnd(), h.dataCrc));
+                int currentCrc = h.state == ChunkState.OPEN
+                        ? h.snapshotRunningCrcs().dataCrc
+                        : h.dataCrc;
+                out.add(new VerifyResult(id, true, h.state, h.currentEnd(), currentCrc));
             } finally {
                 h.lock.unlock();
             }
@@ -2634,11 +2727,27 @@ public final class ChunkStore implements AutoCloseable {
     }
 
     public long usedBytes() {
-        long total = 0;
+        long total = quarantinedBytes.get();
         for (Handle h : chunks.values()) {
             total += sizeIfExists(h.dataPath);
             total += sizeIfExists(h.metaPath);
             total += sizeIfExists(h.ledgerPath);
+        }
+        return total;
+    }
+
+    private long scanQuarantinedBytes() throws IOException {
+        if (!Files.isDirectory(dir)) {
+            return 0;
+        }
+        long total = 0;
+        try (Stream<Path> files = Files.walk(dir)) {
+            for (Path path : files.filter(Files::isRegularFile).toList()) {
+                Path name = path.getFileName();
+                if (name != null && name.toString().contains(".quarantine-")) {
+                    total = Math.addExact(total, Files.size(path));
+                }
+            }
         }
         return total;
     }

@@ -29,6 +29,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -972,11 +973,11 @@ class RepairCoordinatorTest {
     }
 
     @Test
-    void verifyVerdictDeleteUsesOwnerEpochCapturedBeforeFileRead() throws Exception {
+    void verifyVerdictQuarantineUsesOwnerEpochCapturedBeforeFileRead() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
         AtomicLong ownerEpoch = new AtomicLong(7);
-        List<Long> deleteEpochs = new CopyOnWriteArrayList<>();
+        List<Long> quarantineEpochs = new CopyOnWriteArrayList<>();
         UUID inc = UUID.randomUUID();
         try (ScpServer node = new ScpServer(0, 784, inc.getMostSignificantBits(),
                 inc.getLeastSignificantBits(), req -> {
@@ -987,16 +988,18 @@ class RepairCoordinatorTest {
                                         0xBAD))
                                 .toList()).encode(), null);
                     }
-                    if (req.opcode() == Opcode.DELETE_CHUNKS.code) {
+                    if (req.opcode() == Opcode.QUARANTINE_CHUNKS.code) {
                         Messages.DeleteChunks dc = Messages.DeleteChunks.decode(req.headerSlice());
-                        deleteEpochs.add(dc.ownerEpoch());
+                        quarantineEpochs.add(dc.ownerEpoch());
                         return ScpServer.ok(req, new Messages.DeleteChunksResp(dc.chunkIds(),
                                 dc.chunkIds().stream().map(id -> ErrorCode.OK.code).toList()).encode(), null);
                     }
                     throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
-                })) {
+                });
+             ScpServer peerNode = healthyVerifyNode(785)) {
             Registered corrupt = registerAt(registry, 885, "delete-capture", "127.0.0.1:" + node.port());
-            Registered peer = register(registry, 886, "delete-capture-peer");
+            Registered peer = registerAt(registry, 886, "delete-capture-peer",
+                    "127.0.0.1:" + peerNode.port());
             liveNodes(registry).remove(corrupt.nodeId());
             liveNodes(registry).remove(peer.nodeId());
             FileId fileId = fileId(0x5156);
@@ -1010,8 +1013,9 @@ class RepairCoordinatorTest {
                     activeLeadership(settledActiveSince, ownerEpoch));
             owner.verifyPass();
 
-            assertEquals(List.of(7L), deleteEpochs,
-                    "delete after a verify verdict must use the epoch captured before the file read");
+            assertEquals(List.of(7L), quarantineEpochs,
+                    "quarantine after a verify verdict must use the epoch captured before the file read");
+            assertEquals(0, owner.verifyNoMatchBreaks(), "the healthy peer prevents the no-match breaker");
         }
     }
 
@@ -1063,6 +1067,8 @@ class RepairCoordinatorTest {
             assertTrue(replicas.contains(verified.nodeId()),
                     "the last actually-live replica was kept (guard counted survivors from the persisted view)");
             assertEquals(2, replicas.size(), "the corrupt verdict did not drop the last live replica");
+            assertEquals(1, owner.verifyNoMatchBreaks(),
+                    "with the only peer persisted DEAD, zero returned replicas match the descriptor");
         }
     }
 
@@ -1073,24 +1079,13 @@ class RepairCoordinatorTest {
         // so the persisted-liveness predicate can't be silently narrowed to state == REGISTERED.
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
+        List<Integer> quarantines = new CopyOnWriteArrayList<>();
 
-        UUID inc = UUID.randomUUID();
-        try (ScpServer node = new ScpServer(0, 779, inc.getMostSignificantBits(),
-                inc.getLeastSignificantBits(), req -> {
-                    if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
-                        Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
-                        List<Messages.VerifyChunkResult> results = new ArrayList<>();
-                        for (ChunkId id : vc.chunkIds()) {
-                            results.add(new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096, 0xBAD));
-                        }
-                        return ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
-                    }
-                    // the corrupt replica's delete is expected (a draining survivor exists); ack via failure is
-                    // fine — applyDeleteConfirmed has already mutated the descriptor, which is what we assert.
-                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode " + req.opcode());
-                })) {
+        try (ScpServer node = corruptingVerifyNode(981, quarantines);
+             ScpServer drainingNode = healthyVerifyNode(780)) {
             Registered verified = registerAt(registry, 981, "verified2-host", "127.0.0.1:" + node.port());
-            Registered draining = register(registry, 991, "draining-host");
+            Registered draining = registerAt(registry, 991, "draining-host",
+                    "127.0.0.1:" + drainingNode.port());
             Optional<MetadataStore.Versioned<Records.NodeRecord>> rec = store.getNode(draining.nodeId());
             store.putNode(rec.orElseThrow().value().withState(Records.NodeState.DRAINING), rec.get().version());
 
@@ -1109,20 +1104,23 @@ class RepairCoordinatorTest {
             assertFalse(replicas.contains(verified.nodeId()),
                     "the corrupt replica was dropped because a DRAINING peer counts as a live survivor");
             assertEquals(List.of(draining.nodeId()), replicas, "only the draining survivor remains");
+            assertEquals(List.of(verified.nodeId()), quarantines,
+                    "the committed corrupt-replica drop is physically quarantined");
+            assertEquals(0, owner.verifyNoMatchBreaks(), "the draining peer returned an exact descriptor match");
         }
     }
 
     @Test
-    void verifyPassKeepsOneLiveReplicaWhenAllVerdictsUseSameStaleSnapshot() throws Exception {
-        // The last-live guard must account for replicas already dropped earlier in this verify pass. Otherwise
-        // the stale FileRecord snapshot can count an already-deleted peer as a survivor and delete every copy.
+    void verifyPassBreaksWhenNoReplicaMatchesDescriptor() throws Exception {
+        // A descriptor crc/length bug makes every healthy on-disk replica look corrupt. Treat that unanimous
+        // mismatch as evidence against the descriptor and preserve every copy for operator recovery.
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
-        List<Integer> deletes = new CopyOnWriteArrayList<>();
+        List<Integer> quarantines = new CopyOnWriteArrayList<>();
 
-        try (ScpServer nodeA = corruptingVerifyNode(1101, deletes);
-             ScpServer nodeB = corruptingVerifyNode(1102, deletes);
-             ScpServer nodeC = corruptingVerifyNode(1103, deletes)) {
+        try (ScpServer nodeA = corruptingVerifyNode(1101, quarantines);
+             ScpServer nodeB = corruptingVerifyNode(1102, quarantines);
+             ScpServer nodeC = corruptingVerifyNode(1103, quarantines)) {
             Registered a = registerAt(registry, 1101, "a-host", "127.0.0.1:" + nodeA.port());
             Registered b = registerAt(registry, 1102, "b-host", "127.0.0.1:" + nodeB.port());
             Registered c = registerAt(registry, 1103, "c-host", "127.0.0.1:" + nodeC.port());
@@ -1130,18 +1128,54 @@ class RepairCoordinatorTest {
             FileId fileId = fileId(0x4040);
             store.createFile(file(fileId, FileState.SEALED,
                     List.of(sealed(0, 4096, 0xCAFE, List.of(a.nodeId(), b.nodeId(), c.nodeId())))));
+            int beforeVersion = store.files.get(fileId).version();
 
             RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
                     () -> false, () -> false, ns -> true, activeLeadership(System.currentTimeMillis() - 120_000));
             owner.verifyPass();
 
             List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
-            assertEquals(List.of(c.nodeId()), replicas,
-                    "the final live replica is kept even though the pass began with three corrupt verdicts");
-            assertEquals(2, deletes.size(), "only two replicas should be physically deleted");
-            assertFalse(deletes.contains(c.nodeId()), "the last live replica must not be physically deleted");
-            assertEquals(new TreeSet<>(List.of(a.nodeId(), b.nodeId())), new TreeSet<>(deletes),
-                    "only replicas with a replacement survivor should be physically deleted");
+            assertEquals(List.of(a.nodeId(), b.nodeId(), c.nodeId()), replicas,
+                    "zero descriptor matches must preserve every replica reference");
+            assertEquals(beforeVersion, store.files.get(fileId).version(),
+                    "the no-match breaker must run before descriptor mutation");
+            assertTrue(quarantines.isEmpty(), "the no-match breaker must preserve all physical evidence");
+            assertEquals(1, owner.verifyNoMatchBreaks(), "one affected chunk trips the breaker once per pass");
+        }
+    }
+
+    @Test
+    void verifyPassBreaksBeforeResealingUnanimousOpenMismatch() throws Exception {
+        // A bad descriptor can disagree with every intact OPEN replica. Re-sealing any of those replicas at
+        // the descriptor length would mutate the evidence (and can truncate a longer copy) before the
+        // unanimous-mismatch breaker gets a chance to reject the descriptor.
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        List<Integer> seals = new CopyOnWriteArrayList<>();
+        List<Integer> quarantines = new CopyOnWriteArrayList<>();
+
+        try (ScpServer nodeA = mismatchingOpenVerifyNode(1111, 8192, 0xBEEF, seals, quarantines);
+             ScpServer nodeB = mismatchingOpenVerifyNode(1112, 8192, 0xBEEF, seals, quarantines);
+             ScpServer nodeC = mismatchingOpenVerifyNode(1113, 8192, 0xBEEF, seals, quarantines)) {
+            Registered a = registerAt(registry, 1111, "open-mismatch-a", "127.0.0.1:" + nodeA.port());
+            Registered b = registerAt(registry, 1112, "open-mismatch-b", "127.0.0.1:" + nodeB.port());
+            Registered c = registerAt(registry, 1113, "open-mismatch-c", "127.0.0.1:" + nodeC.port());
+
+            FileId fileId = fileId(0x4141);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(a.nodeId(), b.nodeId(), c.nodeId())))));
+            MetadataStore.Versioned<Records.FileRecord> before = store.files.get(fileId);
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
+                    () -> false, () -> false, ns -> true,
+                    activeLeadership(System.currentTimeMillis() - 120_000));
+            owner.verifyPass();
+
+            MetadataStore.Versioned<Records.FileRecord> after = store.files.get(fileId);
+            assertEquals(before, after, "the wrong descriptor and every replica reference remain unchanged");
+            assertTrue(seals.isEmpty(), "the no-match census must complete before any OPEN replica is re-sealed");
+            assertTrue(quarantines.isEmpty(), "unanimous OPEN mismatch must preserve all physical evidence");
+            assertEquals(1, owner.verifyNoMatchBreaks(), "the unanimous OPEN mismatch trips the breaker once");
         }
     }
 
@@ -1152,18 +1186,22 @@ class RepairCoordinatorTest {
         // snapshot, or it can count the now-DEAD peer as a survivor and delete the last live copy.
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
-        List<Integer> deletes = new CopyOnWriteArrayList<>();
+        List<Integer> quarantines = new CopyOnWriteArrayList<>();
+        AtomicLong persistedPeerNodeId = new AtomicLong(-1);
 
-        Registered peer = register(registry, 1252, "peer-host");
-        try (ScpServer node = corruptingVerifyNode(1251, deletes, () -> {
-            Optional<MetadataStore.Versioned<Records.NodeRecord>> rec = store.getNode(peer.nodeId());
+        try (ScpServer peerNode = healthyVerifyNode(1252);
+             ScpServer node = corruptingVerifyNode(1251, quarantines, () -> {
+            Optional<MetadataStore.Versioned<Records.NodeRecord>> rec =
+                    store.getNode((int) persistedPeerNodeId.get());
             store.putNode(rec.orElseThrow().value().withState(Records.NodeState.DEAD), rec.get().version());
         })) {
+            Registered peer = registerAt(registry, 1252, "peer-host", "127.0.0.1:" + peerNode.port());
+            persistedPeerNodeId.set(peer.nodeId());
             Registered corrupt = registerAt(registry, 1251, "corrupt-host", "127.0.0.1:" + node.port());
 
             FileId fileId = fileId(0x5150);
             store.createFile(file(fileId, FileState.SEALED,
-                    List.of(sealed(0, 4096, 0xCAFE, List.of(corrupt.nodeId(), peer.nodeId())))));
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(peer.nodeId(), corrupt.nodeId())))));
             int beforeVersion = store.files.get(fileId).version();
 
             RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
@@ -1171,11 +1209,13 @@ class RepairCoordinatorTest {
             owner.verifyPass();
 
             List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
-            assertEquals(List.of(corrupt.nodeId(), peer.nodeId()), replicas,
+            assertEquals(List.of(peer.nodeId(), corrupt.nodeId()), replicas,
                     "fresh persisted liveness must keep the last live replica referenced");
             assertEquals(beforeVersion, store.files.get(fileId).version(),
                     "last-live guard must return before descriptor mutation");
-            assertTrue(deletes.isEmpty(), "last live replica must not be physically deleted");
+            assertTrue(quarantines.isEmpty(), "last live replica must not be physically quarantined");
+            assertEquals(0, owner.verifyNoMatchBreaks(),
+                    "the peer's earlier exact response prevents no-match from masking the liveness guard");
         }
     }
 
@@ -1185,14 +1225,19 @@ class RepairCoordinatorTest {
         // second corrupt verdict from counting that already-dropped replica as a survivor.
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
-        List<Integer> deletes = new CopyOnWriteArrayList<>();
+        List<Integer> quarantines = new CopyOnWriteArrayList<>();
+        AtomicLong persistedPeerNodeId = new AtomicLong(-1);
 
-        Registered deadMidPass = registerAt(registry, 1263, "dead-mid-pass-host", "127.0.0.1:1");
-        try (ScpServer nodeA = corruptingVerifyNode(1261, deletes, () -> {
-            Optional<MetadataStore.Versioned<Records.NodeRecord>> rec = store.getNode(deadMidPass.nodeId());
+        try (ScpServer deadMidPassNode = healthyVerifyNode(1263);
+             ScpServer nodeA = corruptingVerifyNode(1261, quarantines, () -> {
+            Optional<MetadataStore.Versioned<Records.NodeRecord>> rec =
+                    store.getNode((int) persistedPeerNodeId.get());
             store.putNode(rec.orElseThrow().value().withState(Records.NodeState.DEAD), rec.get().version());
         });
-             ScpServer nodeB = corruptingVerifyNode(1262, deletes)) {
+             ScpServer nodeB = corruptingVerifyNode(1262, quarantines)) {
+            Registered deadMidPass = registerAt(registry, 1263, "dead-mid-pass-host",
+                    "127.0.0.1:" + deadMidPassNode.port());
+            persistedPeerNodeId.set(deadMidPass.nodeId());
             Registered a = registerAt(registry, 1261, "corrupt-a-host", "127.0.0.1:" + nodeA.port());
             Registered b = registerAt(registry, 1262, "corrupt-b-host", "127.0.0.1:" + nodeB.port());
 
@@ -1207,9 +1252,11 @@ class RepairCoordinatorTest {
             List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
             assertEquals(List.of(b.nodeId(), deadMidPass.nodeId()), replicas,
                     "first corrupt replica can drop, but the second is kept once only a dead peer remains");
-            assertEquals(List.of(a.nodeId()), deletes,
-                    "only the replica with a live replacement survivor should be physically deleted");
+            assertEquals(List.of(a.nodeId()), quarantines,
+                    "only the replica with a live replacement survivor should be physically quarantined");
             assertEquals(1, store.files.get(fileId).version(), "exactly one descriptor mutation should land");
+            assertEquals(0, owner.verifyNoMatchBreaks(),
+                    "the peer's exact response preserves the stale-liveness guard test path");
         }
     }
 
@@ -1222,11 +1269,12 @@ class RepairCoordinatorTest {
         NodeRegistry registry = new NodeRegistry(store, config());
         List<Integer> seals = new CopyOnWriteArrayList<>();
         List<Long> sealOwnerEpochs = new CopyOnWriteArrayList<>();
-        List<Integer> deletes = new CopyOnWriteArrayList<>();
+        List<Integer> quarantines = new CopyOnWriteArrayList<>();
 
-        try (ScpServer nodeA = resealableOpenVerifyNode(1301, 4096, 0xCAFE, seals, sealOwnerEpochs, deletes);
-             ScpServer nodeB = resealableOpenVerifyNode(1302, 4096, 0xCAFE, seals, sealOwnerEpochs, deletes);
-             ScpServer nodeC = resealableOpenVerifyNode(1303, 4096, 0xCAFE, seals, sealOwnerEpochs, deletes)) {
+        try (ScpServer nodeA = resealableOpenVerifyNode(1301, 4096, 0xCAFE, seals, sealOwnerEpochs, quarantines);
+             ScpServer nodeB = resealableOpenVerifyNode(1302, 4096, 0xCAFE, seals, sealOwnerEpochs, quarantines);
+             ScpServer nodeC = resealableOpenVerifyNode(1303, 4096, 0xCAFE, seals, sealOwnerEpochs,
+                     quarantines)) {
             Registered a = registerAt(registry, 1301, "open-a-host", "127.0.0.1:" + nodeA.port());
             Registered b = registerAt(registry, 1302, "open-b-host", "127.0.0.1:" + nodeB.port());
             Registered c = registerAt(registry, 1303, "open-c-host", "127.0.0.1:" + nodeC.port());
@@ -1246,19 +1294,21 @@ class RepairCoordinatorTest {
                     "every OPEN replica was re-sealed in place");
             assertEquals(List.of(7L, 7L, 7L), sealOwnerEpochs,
                     "owner-reseal SEAL_CHUNK must carry the allocated owner epoch");
-            assertTrue(deletes.isEmpty(), "intact OPEN replicas must not be physically deleted");
+            assertTrue(quarantines.isEmpty(), "intact OPEN replicas must not be physically quarantined");
+            assertEquals(0, owner.verifyNoMatchBreaks(), "successful OPEN re-seals count as descriptor matches");
         }
     }
 
     @Test
-    void corruptVerifyVerdictMustPassGraceBeforeDelete() throws Exception {
+    void corruptVerifyVerdictMustPassGraceBeforeQuarantine() throws Exception {
         FakeStore store = new FakeStore();
         NodeRegistry registry = new NodeRegistry(store, config());
-        List<Integer> deletes = new CopyOnWriteArrayList<>();
+        List<Integer> quarantines = new CopyOnWriteArrayList<>();
 
-        try (ScpServer node = corruptingVerifyNode(1201, deletes)) {
+        try (ScpServer node = corruptingVerifyNode(1201, quarantines);
+             ScpServer peerNode = healthyVerifyNode(1202)) {
             Registered corrupt = registerAt(registry, 1201, "corrupt-host", "127.0.0.1:" + node.port());
-            Registered peer = register(registry, 1202, "peer-host");
+            Registered peer = registerAt(registry, 1202, "peer-host", "127.0.0.1:" + peerNode.port());
 
             FileId fileId = fileId(0x5050);
             store.createFile(file(fileId, FileState.SEALED,
@@ -1272,7 +1322,269 @@ class RepairCoordinatorTest {
             List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
             assertEquals(List.of(corrupt.nodeId(), peer.nodeId()), replicas,
                     "a first corrupt verdict is tracked but not dropped before grace expires");
-            assertTrue(deletes.isEmpty(), "corrupt verdict must not physically delete before grace expires");
+            assertTrue(quarantines.isEmpty(),
+                    "corrupt verdict must not physically quarantine before grace expires");
+            assertEquals(0, owner.verifyNoMatchBreaks(), "the healthy peer prevents the no-match breaker");
+        }
+    }
+
+    @Test
+    void mixedHealthyAndCorruptVerdictsCommitDropThenQuarantine() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        List<Integer> quarantines = new CopyOnWriteArrayList<>();
+
+        try (ScpServer corruptNode = corruptingVerifyNode(1211, quarantines);
+             ScpServer healthyNode = healthyVerifyNode(1212)) {
+            Registered corrupt = registerAt(registry, 1211, "mixed-corrupt",
+                    "127.0.0.1:" + corruptNode.port());
+            Registered healthy = registerAt(registry, 1212, "mixed-healthy",
+                    "127.0.0.1:" + healthyNode.port());
+            FileId fileId = fileId(0x5051);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(corrupt.nodeId(), healthy.nodeId())))));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
+                    () -> false, () -> false, ns -> true,
+                    activeLeadership(System.currentTimeMillis() - 120_000));
+            owner.verifyPass();
+
+            assertEquals(List.of(healthy.nodeId()),
+                    store.files.get(fileId).value().chunks().get(0).replicas(),
+                    "the descriptor drops only the corrupt replica");
+            assertEquals(1, store.files.get(fileId).version(), "the descriptor drop committed exactly once");
+            assertEquals(List.of(corrupt.nodeId()), quarantines,
+                    "physical quarantine follows the committed descriptor drop");
+            assertEquals(0, owner.verifyNoMatchBreaks(), "one exact match keeps normal repair enabled");
+        }
+    }
+
+    @Test
+    void staleVerifyVerdictCannotQuarantineTargetWhileRepairCommitIsPublishing() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        CountDownLatch staleVerdictCaptured = new CountDownLatch(1);
+        CountDownLatch releaseStaleVerdict = new CountDownLatch(1);
+        CountDownLatch repairDescriptorCommitted = new CountDownLatch(1);
+        CountDownLatch releaseRepairCommit = new CountDownLatch(1);
+        CountDownLatch verifyApplyWaiting = new CountDownLatch(1);
+        AtomicReference<Thread> verifyThread = new AtomicReference<>();
+        List<Integer> quarantines = new CopyOnWriteArrayList<>();
+        ReentrantLock reconcileLock = new ReentrantLock() {
+            @Override
+            public void lock() {
+                if (Thread.currentThread() == verifyThread.get()) {
+                    verifyApplyWaiting.countDown();
+                }
+                super.lock();
+            }
+        };
+        NamespaceLeadership leadership = new NamespaceLeadership() {
+            @Override
+            public NamespaceLeaderState leaderState(StrataNamespace namespace) {
+                return NamespaceLeaderState.ACTIVE;
+            }
+
+            @Override
+            public boolean isNamespaceActive(StrataNamespace namespace) {
+                return true;
+            }
+
+            @Override
+            public long namespaceActiveSinceMs(StrataNamespace namespace) {
+                return System.currentTimeMillis() - 120_000;
+            }
+
+            @Override
+            public long namespaceOwnerEpoch(StrataNamespace namespace) {
+                return 7;
+            }
+
+            @Override
+            public long authoritativeOwnerEpoch(StrataNamespace namespace) {
+                return 7;
+            }
+
+            @Override
+            public ReentrantLock namespaceReconcileLock(StrataNamespace namespace) {
+                return reconcileLock;
+            }
+        };
+
+        UUID inc = UUID.randomUUID();
+        try (ScpServer sourceNode = healthyVerifyNode(1213);
+             ScpServer targetNode = new ScpServer(0, 1214, inc.getMostSignificantBits(),
+                     inc.getLeastSignificantBits(), req -> {
+                         if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                             Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                             staleVerdictCaptured.countDown();
+                             if (!releaseStaleVerdict.await(5, TimeUnit.SECONDS)) {
+                                 throw new AssertionError("timed out waiting to release the stale verdict");
+                             }
+                             return ScpServer.ok(req, new Messages.VerifyChunksResp(vc.chunkIds().stream()
+                                     .map(id -> new Messages.VerifyChunkResult(id, true, ChunkState.SEALED,
+                                             4096, 0xBAD))
+                                     .toList()).encode(), null);
+                         }
+                         if (req.opcode() == Opcode.QUARANTINE_CHUNKS.code) {
+                             Messages.DeleteChunks dc = Messages.DeleteChunks.decode(req.headerSlice());
+                             quarantines.add(1214);
+                             return ScpServer.ok(req, new Messages.DeleteChunksResp(dc.chunkIds(),
+                                     dc.chunkIds().stream().map(id -> ErrorCode.OK.code).toList()).encode(), null);
+                         }
+                         throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode " + req.opcode());
+                     })) {
+            Registered source = registerAt(registry, 1213, "repair-race-source",
+                    "127.0.0.1:" + sourceNode.port());
+            Registered target = registerAt(registry, 1214, "repair-race-target",
+                    "127.0.0.1:" + targetNode.port());
+            FileId fileId = fileId(0x5053);
+            ChunkId chunkId = new ChunkId(fileId, 0);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(source.nodeId(), target.nodeId())))));
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
+                    () -> false, () -> false, ns -> true, leadership);
+
+            CompletableFuture<Void> verify = CompletableFuture.runAsync(() -> {
+                verifyThread.set(Thread.currentThread());
+                run(owner::verifyPass);
+            });
+            assertTrue(staleVerdictCaptured.await(5, TimeUnit.SECONDS),
+                    "verify must capture the target's pre-repair corrupt verdict");
+
+            applyDeleteConfirmed(owner, fileId, chunkId, target.nodeId());
+            Records.FileRecord underReplicated = store.files.get(fileId).value();
+            issueReplicate(owner, fileId, underReplicated, underReplicated.chunks().get(0));
+            Messages.ReplicateCmd repair = assertInstanceOf(Messages.ReplicateCmd.class,
+                    onlyCommand(heartbeat(registry, owner, target, List.of())));
+
+            store.afterSuccessfulUpdateFile = () -> {
+                repairDescriptorCommitted.countDown();
+                try {
+                    if (!releaseRepairCommit.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("timed out waiting to finish the repair commit");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                }
+            };
+            CompletableFuture<Void> completion = CompletableFuture.runAsync(() -> owner.onCommandCompleted(
+                    target.nodeId(), new Messages.CompletedCommand(repair.commandId(), ErrorCode.OK.code)));
+            assertTrue(repairDescriptorCommitted.await(5, TimeUnit.SECONDS),
+                    "repair must restore the target in the descriptor before publishing its protection");
+
+            releaseStaleVerdict.countDown();
+            assertTrue(verifyApplyWaiting.await(5, TimeUnit.SECONDS),
+                    "stale verify apply must reach the namespace reconciliation lock");
+            assertFalse(verify.isDone(),
+                    "verify apply must wait until repair publishes its freshly committed target");
+
+            releaseRepairCommit.countDown();
+            completion.get(5, TimeUnit.SECONDS);
+            verify.get(5, TimeUnit.SECONDS);
+
+            assertEquals(List.of(source.nodeId(), target.nodeId()),
+                    store.files.get(fileId).value().chunks().get(0).replicas(),
+                    "the stale verdict must not drop the freshly committed target");
+            assertTrue(quarantines.isEmpty(),
+                    "the stale verdict must not quarantine the freshly repaired bytes");
+        } finally {
+            releaseStaleVerdict.countDown();
+            releaseRepairCommit.countDown();
+        }
+    }
+
+    @Test
+    void verifyQuarantineCasExhaustionDoesNotRunAndRetriesWithoutNewGrace() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        List<Integer> quarantines = new CopyOnWriteArrayList<>();
+
+        try (ScpServer corruptNode = corruptingVerifyNode(1221, quarantines);
+             ScpServer healthyNode = healthyVerifyNode(1222)) {
+            Registered corrupt = registerAt(registry, 1221, "cas-corrupt",
+                    "127.0.0.1:" + corruptNode.port());
+            Registered healthy = registerAt(registry, 1222, "cas-healthy",
+                    "127.0.0.1:" + healthyNode.port());
+            FileId fileId = fileId(0x5052);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(corrupt.nodeId(), healthy.nodeId())))));
+
+            ControllerConfig graced = config(5000).withReplicaMissingGraceMs(30_000);
+            RepairCoordinator owner = new RepairCoordinator(store, registry, graced,
+                    () -> false, () -> false, ns -> true,
+                    activeLeadership(System.currentTimeMillis() - 120_000));
+
+            owner.verifyPass();
+            ageReplicaMissingSince(owner);
+            store.failUpdateFileAttempts = Controller.CAS_RETRIES;
+            owner.verifyPass();
+
+            assertEquals(List.of(corrupt.nodeId(), healthy.nodeId()),
+                    store.files.get(fileId).value().chunks().get(0).replicas(),
+                    "CAS exhaustion leaves the authoritative descriptor unchanged");
+            assertTrue(quarantines.isEmpty(), "physical quarantine is gated on a committed descriptor drop");
+
+            owner.verifyPass();
+
+            assertEquals(List.of(healthy.nodeId()),
+                    store.files.get(fileId).value().chunks().get(0).replicas(),
+                    "the next pass retries immediately using the already-earned grace");
+            assertEquals(List.of(corrupt.nodeId()), quarantines,
+                    "the retry quarantines exactly once after its descriptor drop commits");
+            assertEquals(0, owner.verifyNoMatchBreaks(), "the healthy peer prevents no-match throughout");
+        }
+    }
+
+    @Test
+    void malformedDuplicateVerifyResultsAreRejectedBeforeMutation() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+        List<Integer> quarantines = new CopyOnWriteArrayList<>();
+
+        try (ScpServer malformedNode = new ScpServer(0, 1231, 1231, 1232, req -> {
+                 if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                     Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                     List<Messages.VerifyChunkResult> duplicated = new ArrayList<>();
+                     for (ChunkId id : vc.chunkIds()) {
+                         Messages.VerifyChunkResult corrupt =
+                                 new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096, 0xBAD);
+                         duplicated.add(corrupt);
+                         duplicated.add(corrupt);
+                     }
+                     return ScpServer.ok(req, new Messages.VerifyChunksResp(duplicated).encode(), null);
+                 }
+                 if (req.opcode() == Opcode.QUARANTINE_CHUNKS.code) {
+                     Messages.DeleteChunks dc = Messages.DeleteChunks.decode(req.headerSlice());
+                     quarantines.add(1231);
+                     return ScpServer.ok(req, new Messages.DeleteChunksResp(dc.chunkIds(),
+                             dc.chunkIds().stream().map(id -> ErrorCode.OK.code).toList()).encode(), null);
+                 }
+                 throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode " + req.opcode());
+             });
+             ScpServer healthyNode = healthyVerifyNode(1232)) {
+            Registered malformed = registerAt(registry, 1231, "malformed-corrupt",
+                    "127.0.0.1:" + malformedNode.port());
+            Registered healthy = registerAt(registry, 1232, "malformed-healthy",
+                    "127.0.0.1:" + healthyNode.port());
+            FileId fileId = fileId(0x5054);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(malformed.nodeId(), healthy.nodeId())))));
+            int beforeVersion = store.files.get(fileId).version();
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(5000),
+                    () -> false, () -> false, ns -> true,
+                    activeLeadership(System.currentTimeMillis() - 120_000));
+            owner.verifyPass();
+
+            assertEquals(List.of(malformed.nodeId(), healthy.nodeId()),
+                    store.files.get(fileId).value().chunks().get(0).replicas(),
+                    "the malformed batch contributes no destructive verdict");
+            assertEquals(beforeVersion, store.files.get(fileId).version());
+            assertTrue(quarantines.isEmpty(), "malformed responses fail closed before quarantine");
+            assertEquals(0, owner.verifyNoMatchBreaks(),
+                    "a rejected malformed batch does not count as an unhealthy returned verdict");
         }
     }
 
@@ -1613,11 +1925,23 @@ class RepairCoordinatorTest {
                 }
                 return ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
             }
-            if (req.opcode() == Opcode.DELETE_CHUNKS.code) {
+            if (req.opcode() == Opcode.QUARANTINE_CHUNKS.code) {
                 Messages.DeleteChunks dc = Messages.DeleteChunks.decode(req.headerSlice());
                 deletes.add(serverNodeId);
                 return ScpServer.ok(req, new Messages.DeleteChunksResp(dc.chunkIds(),
                         dc.chunkIds().stream().map(id -> ErrorCode.OK.code).toList()).encode(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode " + req.opcode());
+        });
+    }
+
+    private static ScpServer healthyVerifyNode(int serverNodeId) throws Exception {
+        return new ScpServer(0, serverNodeId, serverNodeId, serverNodeId + 1L, req -> {
+            if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                return ScpServer.ok(req, new Messages.VerifyChunksResp(vc.chunkIds().stream()
+                        .map(id -> new Messages.VerifyChunkResult(id, true, ChunkState.SEALED, 4096, 0xCAFE))
+                        .toList()).encode(), null);
             }
             throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode " + req.opcode());
         });
@@ -1645,9 +1969,36 @@ class RepairCoordinatorTest {
                 sealOwnerEpochs.add(seal.ownerEpoch());
                 return ScpServer.ok(req, new Messages.SealResp(length, crc).encode(), null);
             }
-            if (req.opcode() == Opcode.DELETE_CHUNKS.code) {
+            if (req.opcode() == Opcode.QUARANTINE_CHUNKS.code) {
                 Messages.DeleteChunks dc = Messages.DeleteChunks.decode(req.headerSlice());
                 deletes.add(serverNodeId);
+                return ScpServer.ok(req, new Messages.DeleteChunksResp(dc.chunkIds(),
+                        dc.chunkIds().stream().map(id -> ErrorCode.OK.code).toList()).encode(), null);
+            }
+            throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode " + req.opcode());
+        });
+    }
+
+    private static ScpServer mismatchingOpenVerifyNode(int serverNodeId, long length, int crc,
+                                                       List<Integer> seals, List<Integer> quarantines)
+            throws Exception {
+        return new ScpServer(0, serverNodeId, serverNodeId, serverNodeId + 1L, req -> {
+            if (req.opcode() == Opcode.VERIFY_CHUNKS.code) {
+                Messages.VerifyChunks vc = Messages.VerifyChunks.decode(req.headerSlice());
+                return ScpServer.ok(req, new Messages.VerifyChunksResp(vc.chunkIds().stream()
+                        .map(id -> new Messages.VerifyChunkResult(id, true, ChunkState.OPEN, length, crc))
+                        .toList()).encode(), null);
+            }
+            if (req.opcode() == Opcode.SEAL_CHUNK.code) {
+                Messages.SealChunk seal = Messages.SealChunk.decode(req.headerSlice());
+                seals.add(serverNodeId);
+                // Model the dangerous behavior: the node obeys the wrong descriptor length and the
+                // coordinator mistakes the resulting sealed copy for confirmation of that descriptor.
+                return ScpServer.ok(req, new Messages.SealResp(seal.dataLength(), 0xCAFE).encode(), null);
+            }
+            if (req.opcode() == Opcode.QUARANTINE_CHUNKS.code) {
+                Messages.DeleteChunks dc = Messages.DeleteChunks.decode(req.headerSlice());
+                quarantines.add(serverNodeId);
                 return ScpServer.ok(req, new Messages.DeleteChunksResp(dc.chunkIds(),
                         dc.chunkIds().stream().map(id -> ErrorCode.OK.code).toList()).encode(), null);
             }
@@ -1933,6 +2284,15 @@ class RepairCoordinatorTest {
         return FileId.of(lsb);
     }
 
+    @SuppressWarnings("unchecked")
+    private static void ageReplicaMissingSince(RepairCoordinator coordinator) throws Exception {
+        Field field = RepairCoordinator.class.getDeclaredField("replicaMissingSince");
+        field.setAccessible(true);
+        Map<String, Long> pending = (Map<String, Long>) field.get(coordinator);
+        assertFalse(pending.isEmpty(), "the first unhealthy verdict must establish the grace timestamp");
+        pending.replaceAll((key, ignored) -> System.currentTimeMillis() - 60_000);
+    }
+
     private static void markDead(NodeRegistry registry, int nodeId) throws Exception {
         NodeRegistry.LiveNode node = liveNodes(registry).get(nodeId);
         node.record = node.record.withState(Records.NodeState.DEAD);
@@ -1970,6 +2330,7 @@ class RepairCoordinatorTest {
         private final CountDownLatch releaseGetFile = new CountDownLatch(1);
         private final AtomicLong metadataEpoch = new AtomicLong();
         private Runnable afterGetFile = () -> { };
+        private Runnable afterSuccessfulUpdateFile = () -> { };
 
         @Override
         public void createFile(Records.FileRecord record) {
@@ -2043,6 +2404,7 @@ class RepairCoordinatorTest {
                 return false;
             }
             files.put(record.fileId(), new Versioned<>(record, current.version() + 1));
+            afterSuccessfulUpdateFile.run();
             return true;
         }
 

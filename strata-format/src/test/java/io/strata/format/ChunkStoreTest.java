@@ -484,6 +484,26 @@ class ChunkStoreTest {
     }
 
     @Test
+    void verifyReportsCurrentCrcForOpenChunkWithoutSealing() throws Exception {
+        try (ChunkStore store = newStore()) {
+            ChunkId open = new ChunkId(FileId.of(3), 0);
+            byte[] payload = "open-verify-prefix".getBytes(StandardCharsets.UTF_8);
+            open(store, open, 1);
+            store.append(TEST_NS, open, 1, 0, 0, ByteBuffer.wrap(payload));
+
+            ChunkStore.VerifyResult result = store.verify(TEST_NS, List.of(open)).get(0);
+
+            assertTrue(result.present());
+            assertEquals(ChunkState.OPEN, result.state());
+            assertEquals(payload.length, result.length());
+            assertEquals(Crc.of(ByteBuffer.wrap(payload)), result.crc(),
+                    "VERIFY_CHUNKS must expose the OPEN full-data CRC for read-only descriptor corroboration");
+            assertEquals(ChunkState.OPEN, store.stat(TEST_NS, open).state(),
+                    "computing the verification CRC must not seal or truncate the chunk");
+        }
+    }
+
+    @Test
     void orphanSuspectsListsOnlyUnverifiedSealedChunks() throws Exception {
         try (ChunkStore store = newStore()) {
             ChunkId sealed = new ChunkId(FileId.of(1), 0);
@@ -2160,6 +2180,70 @@ class ChunkStoreTest {
             assertEquals(ErrorCode.CHUNK_NOT_FOUND,
                     assertThrows(ScpException.class, () -> store.read(TEST_NS, id, 0, 1)).code());
             assertEquals(0, store.describeChunks().size());
+            try (Stream<Path> files = Files.walk(dir)) {
+                assertEquals(0, files.filter(Files::isRegularFile)
+                                .filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
+                        "ordinary deletion must unlink rather than retain quarantine files");
+            }
+        }
+    }
+
+    @Test
+    void quarantineAtomicallyRenamesEvidenceAndCountsItAcrossRestart() throws Exception {
+        byte[] payload = "preserve-for-forensics".getBytes(StandardCharsets.UTF_8);
+        byte[] fetchedImage;
+        long bytesBefore;
+        Path dataPath = dir.resolve(rel(id) + ".chunk");
+        Path metaPath = dir.resolve(rel(id) + ".meta");
+        Path ledgerPath = dir.resolve(rel(id) + ".j");
+        Path shardDir = dataPath.getParent().toAbsolutePath().normalize();
+        List<Path> forced = new ArrayList<>();
+
+        try (ChunkStore store = new ChunkStore(dir, false, 1024, ChunkStoreConfig.DEFAULT,
+                path -> forced.add(path.toAbsolutePath().normalize()))) {
+            open(store, id, 1);
+            store.append(TEST_NS, id, 1, 0, 0, ByteBuffer.wrap(payload));
+            store.seal(TEST_NS, id, 1, payload.length, null);
+            fetchedImage = store.fetch(TEST_NS, id, 0, Integer.MAX_VALUE).bytes();
+            assertTrue(Files.exists(dataPath));
+            assertTrue(Files.exists(metaPath));
+            assertTrue(Files.exists(ledgerPath));
+            bytesBefore = store.usedBytes();
+
+            forced.clear();
+            assertEquals(ErrorCode.OK, store.quarantine(TEST_NS, id));
+            assertEquals(List.of(shardDir), forced,
+                    "quarantine must force the shard directory even when seal fsync is disabled");
+            assertFalse(store.contains(TEST_NS, id));
+            assertFalse(Files.exists(dataPath));
+            assertFalse(Files.exists(metaPath));
+            assertFalse(Files.exists(ledgerPath));
+            assertEquals(bytesBefore, store.usedBytes(),
+                    "retained evidence must continue consuming advertised capacity");
+
+            List<Path> quarantined;
+            try (Stream<Path> files = Files.list(shardDir)) {
+                quarantined = files.filter(p -> p.getFileName().toString().contains(".quarantine-")).toList();
+            }
+            assertEquals(3, quarantined.size(), "chunk, sidecar, and ledger must all be retained");
+            assertEquals(1, quarantined.stream()
+                            .map(p -> p.getFileName().toString())
+                            .map(name -> name.substring(name.indexOf(".quarantine-")))
+                            .distinct().count(),
+                    "one quarantine operation must use one suffix group");
+            Path quarantinedData = quarantined.stream()
+                    .filter(p -> p.getFileName().toString().contains(".chunk.quarantine-"))
+                    .findFirst().orElseThrow();
+            assertArrayEquals(fetchedImage, Files.readAllBytes(quarantinedData),
+                    "quarantine must preserve the complete sealed chunk image");
+        }
+
+        try (ChunkStore recovered = newStore()) {
+            assertEquals(0, recovered.describeChunks().size(),
+                    "startup recovery must not reinstall quarantined evidence as a live chunk");
+            assertEquals(bytesBefore, recovered.usedBytes(),
+                    "restart must rescan and retain quarantine capacity accounting");
+            assertEquals(ErrorCode.CHUNK_NOT_FOUND, recovered.delete(TEST_NS, id));
         }
     }
 

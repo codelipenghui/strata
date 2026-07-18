@@ -66,6 +66,10 @@ final class ServerMetrics {
                         Controller::authorityRevalidationSkips)
                 .description("destructive namespace passes skipped because owner authority could not be revalidated")
                 .register(reg);
+        FunctionCounter.builder("strata_controller_verify_no_match_breaks", s,
+                        Controller::verifyNoMatchBreaks)
+                .description("verify verdict sets withheld because no replica matched the committed descriptor")
+                .register(reg);
         FunctionCounter.builder("strata_controller_cluster_live_nodes_read_failures", s,
                         Controller::clusterLiveNodesReadFailures)
                 .description("published cluster live-node snapshots that failed to read or decode on placement readers")

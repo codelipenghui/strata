@@ -117,6 +117,9 @@ class RepairCoordinator implements AutoCloseable {
     private final Map<String, Long> replicaMissingSince = new ConcurrentHashMap<>();
     private final Set<NsChunkId> chunksBeingRepaired = ConcurrentHashMap.newKeySet();
     private final Map<ReplicaKey, Long> recentlyCommittedReplicas = new ConcurrentHashMap<>();
+    // A verify verdict drops the descriptor before asking the node to quarantine the local bytes. Keep the
+    // target out of repair placement during that CAS + RPC window so a fresh import cannot race the quarantine.
+    private final Set<ReplicaKey> verifyQuarantinesInFlight = ConcurrentHashMap.newKeySet();
     // Monotonic count of repairs actually issued, split by trigger lane (event vs reconcile). Bumped
     // exactly once at the point a REPLICATE is enqueued / an owner EXEC_REPLICATE is committed, after
     // the chunksBeingRepaired dedup add succeeds — never on a dedup-skip, placement miss, or failure.
@@ -124,6 +127,7 @@ class RepairCoordinator implements AutoCloseable {
     private final AtomicLong reconcileRepairs = new AtomicLong();
     private final AtomicLong reconcileSkippedFiles = new AtomicLong();
     private final AtomicLong authorityRevalidationSkips = new AtomicLong();
+    private final AtomicLong verifyNoMatchBreaks = new AtomicLong();
     private volatile Thread scanThread;
 
     // Deleted-tombstone TTL is now sourced from config.deletedTombstoneTtlMs() (default 600 000 ms).
@@ -179,12 +183,19 @@ class RepairCoordinator implements AutoCloseable {
         return authorityRevalidationSkips.get();
     }
 
+    /** Verify chunks withheld because no returned/rescued replica matched the descriptor — monotonic. */
+    long verifyNoMatchBreaks() {
+        return verifyNoMatchBreaks.get();
+    }
+
     /** Bumps the counter for {@code trigger}'s lane — called once per repair actually issued. */
     private void recordRepairIssued(RepairTrigger trigger) {
         (trigger == RepairTrigger.EVENT ? eventRepairs : reconcileRepairs).incrementAndGet();
     }
 
     private record ReplicaKey(StrataNamespace namespace, ChunkId chunkId, int nodeId) {}
+
+    private record VerifyVerdict(int nodeId, Records.NodeRecord node, Messages.VerifyChunkResult result) {}
 
     RepairCoordinator(MetadataStore store, NodeRegistry registry, ControllerConfig config,
                       BooleanSupplier isLeader) {
@@ -515,12 +526,18 @@ class RepairCoordinator implements AutoCloseable {
                 continue;
             }
             long ownerEpoch = ownerEpochOpt.getAsLong();
-            for (FileId fileId : store.listFileIds(ns)) {
-                Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
-                if (opt.isEmpty()) {
-                    continue;
+            ReentrantLock lock = namespaceReconcileLock(ns);
+            lock.lock();
+            try {
+                for (FileId fileId : store.listFileIds(ns)) {
+                    Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
+                    if (opt.isEmpty()) {
+                        continue;
+                    }
+                    repairFileChunksOnNode(ns, fileId, opt.get().value(), deadNodeId, ownerEpoch);
                 }
-                repairFileChunksOnNode(ns, fileId, opt.get().value(), deadNodeId, ownerEpoch);
+            } finally {
+                lock.unlock();
             }
         }
     }
@@ -725,6 +742,7 @@ class RepairCoordinator implements AutoCloseable {
         int deadNode = -1;
         List<Messages.Replica> sources = new ArrayList<>();
         Set<Integer> existing = new HashSet<>(chunk.replicas());
+        excludeVerifyQuarantines(ns, chunkId, existing);
         Set<String> usedHosts = new HashSet<>();
         for (int nodeId : chunk.replicas()) {
             if (registry.isDead(nodeId)) {
@@ -853,8 +871,8 @@ class RepairCoordinator implements AutoCloseable {
      * node that should hold a sealed chunk to report its local state, and compare against the descriptor
      * — missing/corrupt drops the replica so the under-replication scan re-replicates within the
      * namespace. Replaces "every node pushes its full chunk list to the leader". Runs off the repair
-     * thread (the verify RPCs block); never holds the reconcile lock — the descriptor drops are
-     * CAS-idempotent, exactly as the old push reconciliation was.
+     * thread (the verify RPCs block); collection never holds the reconcile lock, while the short apply
+     * phase is serialized with repair placement/commit so stale verdicts cannot quarantine a fresh import.
      */
     void verifyPass() throws Exception {
         if (isLeader.getAsBoolean()) {
@@ -906,7 +924,8 @@ class RepairCoordinator implements AutoCloseable {
         }
         Records.FileRecord file = opt.get().value();
         Map<Integer, List<ChunkId>> byNode = new LinkedHashMap<>();
-        Map<ChunkId, Records.ChunkRecord> expected = new HashMap<>();
+        Map<ChunkId, Records.ChunkRecord> expected = new LinkedHashMap<>();
+        Map<ChunkId, List<VerifyVerdict>> verdictsByChunk = new HashMap<>();
         Map<ChunkId, Set<Integer>> droppedThisPass = new HashMap<>();
         for (Records.ChunkRecord c : file.chunks()) {
             if (c.state() != ChunkState.SEALED) {
@@ -938,14 +957,153 @@ class RepairCoordinator implements AutoCloseable {
                 List<Messages.VerifyChunkResult> results = execVerify(node, ns, batch, ownerEpoch);
                 // Empty == the RPC could not reach the node: no verdict, so we never drop a replica on an
                 // unreachable owner-verify (fail-safe). A truly dead node is handled by the reconcile scan.
+                if (results.isEmpty()) {
+                    continue;
+                }
+                if (!hasExactVerifyResultIds(batch, results)) {
+                    log.error("owner-verify: rejecting malformed result batch from node {} ns={} "
+                                    + "requested={} returned={}",
+                            node.nodeId(), ns, batch, results.stream()
+                                    .map(Messages.VerifyChunkResult::chunkId).toList());
+                    continue;
+                }
                 for (Messages.VerifyChunkResult r : results) {
-                    Records.ChunkRecord exp = expected.get(r.chunkId());
-                    if (exp != null) {
-                        applyVerifyVerdict(ns, fileId, exp, e.getKey(), node, r, now, droppedThisPass, ownerEpoch);
-                    }
+                    verdictsByChunk.computeIfAbsent(r.chunkId(), ignored -> new ArrayList<>())
+                            .add(new VerifyVerdict(e.getKey(), node, r));
                 }
             }
         }
+
+        // Apply only after every node/batch has been collected. Destructive decisions need the complete
+        // response census so a wrong descriptor cannot make every local copy look independently corrupt.
+        for (Map.Entry<ChunkId, Records.ChunkRecord> entry : expected.entrySet()) {
+            ChunkId chunkId = entry.getKey();
+            Records.ChunkRecord exp = entry.getValue();
+            List<VerifyVerdict> verdicts = verdictsByChunk.getOrDefault(chunkId, List.of());
+            if (verdicts.isEmpty()) {
+                continue; // no returned fact at all; unreachable verification remains fail-safe
+            }
+
+            ReentrantLock applyLock = namespaceReconcileLock(ns);
+            applyLock.lock();
+            try {
+                // The census was collected without the namespace lock. Refuse to apply it if repair or any
+                // other writer changed this descriptor meanwhile; the next pass will verify the new snapshot.
+                if (!verifySnapshotStillCurrent(ns, fileId, chunkId, exp)) {
+                    continue;
+                }
+
+                int confirmedMatches = (int) verdicts.stream()
+                        .filter(verdict -> matchesDescriptor(exp, verdict.result()))
+                        .count();
+                Set<ReplicaKey> resealed = new HashSet<>();
+
+                if (confirmedMatches == 0) {
+                    // Re-sealing at a shorter descriptor length can truncate an OPEN copy. With no SEALED
+                    // corroboration, only mutate an OPEN copy whose current full length+CRC already exactly
+                    // matches the descriptor; this writes a trailer but cannot discard evidence. One such
+                    // successful seal then safely corroborates the descriptor for recovering peers with an
+                    // unacknowledged tail.
+                    for (VerifyVerdict verdict : verdicts) {
+                        if (matchesOpenDescriptorBytes(exp, verdict.result())
+                                && tryResealVerifyVerdict(ns, exp, verdict, ownerEpoch)) {
+                            confirmedMatches++;
+                            resealed.add(new ReplicaKey(ns, chunkId, verdict.nodeId()));
+                        }
+                    }
+                }
+                if (confirmedMatches > 0) {
+                    for (VerifyVerdict verdict : verdicts) {
+                        ReplicaKey key = new ReplicaKey(ns, chunkId, verdict.nodeId());
+                        if (!resealed.contains(key) && !matchesDescriptor(exp, verdict.result())
+                                && tryResealVerifyVerdict(ns, exp, verdict, ownerEpoch)) {
+                            confirmedMatches++;
+                            resealed.add(key);
+                        }
+                    }
+                }
+
+                boolean hasUnhealthyVerdict = verdicts.stream().anyMatch(verdict ->
+                        !matchesDescriptor(exp, verdict.result())
+                                && !resealed.contains(new ReplicaKey(ns, chunkId, verdict.nodeId())));
+                if (hasUnhealthyVerdict && confirmedMatches == 0) {
+                    verifyNoMatchBreaks.incrementAndGet();
+                    long expectedLive = exp.replicas().stream()
+                            .filter(nodeId -> isPersistedLive(nodeId, nodes)).count();
+                    log.error("owner-verify: NO-MATCH BREAKER for ns={} chunk={} — {}/{} live replica "
+                                    + "verdicts returned, but none match descriptor len/crc {}/{}; preserving "
+                                    + "every replica",
+                            ns, chunkId, verdicts.size(), expectedLive, exp.length(), exp.crc());
+                    continue;
+                }
+
+                for (VerifyVerdict verdict : verdicts) {
+                    if (resealed.contains(new ReplicaKey(ns, chunkId, verdict.nodeId()))) {
+                        continue;
+                    }
+                    applyVerifyVerdict(ns, fileId, exp, verdict.nodeId(), verdict.node(), verdict.result(), now,
+                            droppedThisPass, ownerEpoch);
+                }
+            } finally {
+                applyLock.unlock();
+            }
+        }
+    }
+
+    private boolean verifySnapshotStillCurrent(StrataNamespace namespace, FileId fileId, ChunkId chunkId,
+                                               Records.ChunkRecord expected) throws Exception {
+        Optional<MetadataStore.Versioned<Records.FileRecord>> current = store.getFile(namespace, fileId);
+        if (current.isEmpty() || current.get().value().state() == FileState.DELETING) {
+            return false;
+        }
+        Records.FileRecord file = current.get().value();
+        return file.chunks().stream().anyMatch(chunk ->
+                file.chunkId(chunk.index()).equals(chunkId) && chunk.equals(expected));
+    }
+
+    private static boolean hasExactVerifyResultIds(List<ChunkId> requested,
+                                                   List<Messages.VerifyChunkResult> returned) {
+        if (requested.size() != returned.size()) {
+            return false;
+        }
+        Set<ChunkId> requestedIds = new HashSet<>(requested);
+        if (requestedIds.size() != requested.size()) {
+            return false;
+        }
+        Set<ChunkId> returnedIds = new HashSet<>();
+        for (Messages.VerifyChunkResult result : returned) {
+            if (!requestedIds.contains(result.chunkId()) || !returnedIds.add(result.chunkId())) {
+                return false;
+            }
+        }
+        return returnedIds.size() == requestedIds.size();
+    }
+
+    private static boolean matchesDescriptor(Records.ChunkRecord expected, Messages.VerifyChunkResult result) {
+        return result.present() && result.state() == ChunkState.SEALED
+                && result.length() == expected.length() && result.crc() == expected.crc();
+    }
+
+    private static boolean matchesOpenDescriptorBytes(Records.ChunkRecord expected,
+                                                      Messages.VerifyChunkResult result) {
+        return result.present() && result.state() == ChunkState.OPEN
+                && result.length() == expected.length() && result.crc() == expected.crc();
+    }
+
+    private boolean tryResealVerifyVerdict(StrataNamespace ns, Records.ChunkRecord expected,
+                                           VerifyVerdict verdict, long ownerEpoch) {
+        Messages.VerifyChunkResult result = verdict.result();
+        ChunkId chunkId = result.chunkId();
+        if (isRepairProtected(ns, chunkId, verdict.nodeId())
+                || !result.present() || result.state() != ChunkState.OPEN
+                || result.length() < expected.length()
+                || !execReseal(verdict.node(), chunkId, ns, expected, ownerEpoch)) {
+            return false;
+        }
+        log.info("verify: re-sealed OPEN copy of descriptor-sealed chunk {} on node {} at len {}",
+                chunkId, verdict.nodeId(), expected.length());
+        replicaMissingSince.remove(verdict.nodeId() + ":" + ns + ":" + chunkId);
+        return true;
     }
 
     /** Synchronous VERIFY_CHUNKS to {@code node}; empty list on any RPC failure (treated as no verdict). */
@@ -982,8 +1140,8 @@ class RepairCoordinator implements AutoCloseable {
     /**
      * Compares one VERIFY_CHUNKS result against the descriptor and drops the replica when it is missing,
      * non-SEALED past grace, or corrupt — the owner-pull equivalent of the inventory-push reconciliation.
-     * A freshly-repaired replica is protected from a stale verdict; corrupt/bad bytes are physically deleted
-     * after grace so a re-pick of this node cannot read them (the under-replication scan re-replicates).
+     * A freshly-repaired replica is protected from a stale verdict; corrupt/bad bytes are quarantined after
+     * grace so a re-pick of this node cannot read them (the under-replication scan re-replicates).
      */
     private void applyVerifyVerdict(StrataNamespace ns, FileId fileId, Records.ChunkRecord exp, int nodeId,
                                     Records.NodeRecord node, Messages.VerifyChunkResult r, long now,
@@ -994,40 +1152,49 @@ class RepairCoordinator implements AutoCloseable {
             return;
         }
         String key = nodeId + ":" + ns + ":" + chunkId;
-        boolean healthy = r.present() && r.state() == ChunkState.SEALED
-                && r.length() == exp.length() && r.crc() == exp.crc();
-        if (!healthy && r.present() && r.state() == ChunkState.OPEN && r.length() >= exp.length()
-                && execReseal(node, chunkId, ns, exp, ownerEpoch)) {
-            log.info("verify: re-sealed OPEN copy of descriptor-sealed chunk {} on node {} at len {}",
-                    chunkId, nodeId, exp.length());
-            replicaMissingSince.remove(key);
-            return;
-        }
         if (!r.present()) {
             if (replicaUnhealthyPastGrace(key, now)) {
                 if (shouldKeepLastPersistedLiveReplica(exp, nodeId, chunkId, r, droppedThisPass)) {
                     return;
                 }
-                log.warn("verify: node {} missing sealed chunk {} (>= {}ms) — dropping replica for re-repair",
-                        nodeId, chunkId, config.replicaMissingGraceMs());
-                replicaMissingSince.remove(key);
-                applyDeleteConfirmed(ns, fileId, chunkId, nodeId);
-                recordDroppedThisPass(droppedThisPass, chunkId, nodeId);
+                if (applyDeleteConfirmed(ns, fileId, chunkId, nodeId)) {
+                    replicaMissingSince.remove(key);
+                    recordDroppedThisPass(droppedThisPass, chunkId, nodeId);
+                    log.warn("verify: node {} missing sealed chunk {} (>= {}ms) — dropped replica for re-repair",
+                            nodeId, chunkId, config.replicaMissingGraceMs());
+                }
             }
         } else if (r.state() != ChunkState.SEALED) {
             if (replicaUnhealthyPastGrace(key, now)) {
                 if (shouldKeepLastPersistedLiveReplica(exp, nodeId, chunkId, r, droppedThisPass)) {
                     return;
                 }
-                log.warn("verify: node {} holds {} copy of sealed chunk {} (>= {}ms) — dropping replica",
-                        nodeId, r.state(), chunkId, config.replicaMissingGraceMs());
-                replicaMissingSince.remove(key);
-                applyDeleteConfirmed(ns, fileId, chunkId, nodeId);
-                recordDroppedThisPass(droppedThisPass, chunkId, nodeId);
-                if (!execDelete(node, chunkId, ns, ownerEpoch)) {
-                    log.warn("verify: dropped replica {} from descriptor for chunk {} but physical delete "
-                            + "failed/fenced on node {} — orphan GC must reclaim the stranded copy",
-                            nodeId, chunkId, nodeId);
+                ReplicaKey quarantine = new ReplicaKey(ns, chunkId, nodeId);
+                if (!verifyQuarantinesInFlight.add(quarantine)) {
+                    return;
+                }
+                try {
+                    // A repair may have started after the pass-level stale-verdict check but before this
+                    // quarantine marker was installed. Re-check now; repair commit paths also honor the
+                    // marker, closing the opposite side of the placement/descriptor race.
+                    if (isRepairProtected(ns, chunkId, nodeId)) {
+                        return;
+                    }
+                    if (applyDeleteConfirmed(ns, fileId, chunkId, nodeId)) {
+                        replicaMissingSince.remove(key);
+                        recordDroppedThisPass(droppedThisPass, chunkId, nodeId);
+                        log.warn("verify: node {} holds {} copy of sealed chunk {} (>= {}ms) "
+                                        + "— dropped replica and quarantining local bytes",
+                                nodeId, r.state(), chunkId, config.replicaMissingGraceMs());
+                        if (!execQuarantine(node, chunkId, ns, ownerEpoch)) {
+                            log.warn("verify: dropped replica {} from descriptor for chunk {} but physical "
+                                            + "quarantine failed/fenced on node {} — orphan GC must reclaim "
+                                            + "the stranded copy",
+                                    nodeId, chunkId, nodeId);
+                        }
+                    }
+                } finally {
+                    verifyQuarantinesInFlight.remove(quarantine);
                 }
             }
         } else if (r.length() != exp.length() || r.crc() != exp.crc()) {
@@ -1037,17 +1204,30 @@ class RepairCoordinator implements AutoCloseable {
                 if (shouldKeepLastPersistedLiveReplica(exp, nodeId, chunkId, r, droppedThisPass)) {
                     return;
                 }
-                replicaMissingSince.remove(key);
-                log.warn("verify: node {} holds corrupt sealed chunk {} (len {}/{} crc {}/{}, >= {}ms) "
-                                + "— dropping replica",
-                        nodeId, chunkId, r.length(), exp.length(), r.crc(), exp.crc(),
-                        config.replicaMissingGraceMs());
-                applyDeleteConfirmed(ns, fileId, chunkId, nodeId);
-                recordDroppedThisPass(droppedThisPass, chunkId, nodeId);
-                if (!execDelete(node, chunkId, ns, ownerEpoch)) {
-                    log.warn("verify: dropped replica {} from descriptor for corrupt chunk {} but physical "
-                            + "delete failed/fenced on node {} — orphan GC must reclaim the stranded copy",
-                            nodeId, chunkId, nodeId);
+                ReplicaKey quarantine = new ReplicaKey(ns, chunkId, nodeId);
+                if (!verifyQuarantinesInFlight.add(quarantine)) {
+                    return;
+                }
+                try {
+                    if (isRepairProtected(ns, chunkId, nodeId)) {
+                        return;
+                    }
+                    if (applyDeleteConfirmed(ns, fileId, chunkId, nodeId)) {
+                        replicaMissingSince.remove(key);
+                        recordDroppedThisPass(droppedThisPass, chunkId, nodeId);
+                        log.warn("verify: node {} holds corrupt sealed chunk {} "
+                                        + "(len {}/{} crc {}/{}, >= {}ms) — dropped replica and quarantining",
+                                nodeId, chunkId, r.length(), exp.length(), r.crc(), exp.crc(),
+                                config.replicaMissingGraceMs());
+                        if (!execQuarantine(node, chunkId, ns, ownerEpoch)) {
+                            log.warn("verify: dropped replica {} from descriptor for corrupt chunk {} but "
+                                            + "physical quarantine failed/fenced on node {} — orphan GC must "
+                                            + "reclaim the stranded copy",
+                                    nodeId, chunkId, nodeId);
+                        }
+                    }
+                } finally {
+                    verifyQuarantinesInFlight.remove(quarantine);
                 }
             }
         } else {
@@ -1115,9 +1295,11 @@ class RepairCoordinator implements AutoCloseable {
         if (liveReplicas >= file.replicationFactor()) {
             return; // adequately replicated
         }
+        Set<Integer> excludedTargets = new HashSet<>(chunk.replicas());
+        excludeVerifyQuarantines(ns, chunkId, excludedTargets);
         List<NodeRegistry.LiveNode> targets;
         try {
-            targets = Placement.choose(ns, registry, 1, new HashSet<>(chunk.replicas()), usedHosts);
+            targets = Placement.choose(ns, registry, 1, excludedTargets, usedHosts);
         } catch (Exception e) {
             log.warn("no repair target for {} (owner repair): {}", chunkId, e.getMessage());
             return; // no placement capacity right now; a later pass retries
@@ -1140,6 +1322,15 @@ class RepairCoordinator implements AutoCloseable {
             log.warn("owner repair of {} failed", chunkId, e);
         } finally {
             chunksBeingRepaired.remove(new NsChunkId(ns, chunkId));
+        }
+    }
+
+    private void excludeVerifyQuarantines(StrataNamespace namespace, ChunkId chunkId,
+                                          Set<Integer> excludedNodes) {
+        for (ReplicaKey quarantine : verifyQuarantinesInFlight) {
+            if (quarantine.namespace().equals(namespace) && quarantine.chunkId().equals(chunkId)) {
+                excludedNodes.add(quarantine.nodeId());
+            }
         }
     }
 
@@ -1233,13 +1424,37 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     /**
+     * Synchronously removes a verify-rejected replica from the live chunk namespace while preserving its files
+     * under quarantine names. A dedicated opcode deliberately fails closed against an older node: extending
+     * DELETE_CHUNKS with a tag would let an old decoder ignore the tag and unlink the evidence instead.
+     */
+    private boolean execQuarantine(Records.NodeRecord node, ChunkId chunkId, StrataNamespace ns, long ownerEpoch) {
+        return directNodeCall(node, chunkId, "owner-quarantine", (client, timeoutMs) -> {
+            ByteBuffer resp = client.call(Opcode.QUARANTINE_CHUNKS,
+                    new Messages.DeleteChunks(List.of(chunkId), ns, ownerEpoch).encode(), null, timeoutMs);
+            Messages.DeleteChunksResp r = Messages.DeleteChunksResp.decode(resp);
+            short code = r.codes().isEmpty() ? ErrorCode.OK.code : r.codes().get(0);
+            if (code != ErrorCode.OK.code && code != ErrorCode.CHUNK_NOT_FOUND.code) {
+                log.warn("owner-quarantine of {} on node {} returned {}", chunkId, node.nodeId(), code);
+            }
+            return code == ErrorCode.OK.code || code == ErrorCode.CHUNK_NOT_FOUND.code;
+        });
+    }
+
+    /**
      * Writes the owner-repair replica change: swap the dead replica for the target, or add the target.
      * Returns true if the descriptor swap landed; false if the file vanished or every CAS attempt lost
      * (so the caller does not log success or bump the repair metric for a swap that never committed).
      */
     private boolean applyOwnerRepair(StrataNamespace ns, FileId fileId, ChunkId chunkId,
                                       int deadNode, int targetNode) throws Exception {
+        ReplicaKey target = new ReplicaKey(ns, chunkId, targetNode);
         for (int attempt = 0; attempt < Controller.CAS_RETRIES; attempt++) {
+            if (verifyQuarantinesInFlight.contains(target)) {
+                log.warn("owner repair descriptor swap for {} to node {} deferred while verify quarantine is "
+                        + "in flight", chunkId, targetNode);
+                return false;
+            }
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(ns, fileId);
             if (opt.isEmpty()) {
                 return false;
@@ -1260,6 +1475,7 @@ class RepairCoordinator implements AutoCloseable {
                 }
             }
             if (store.updateFile(file.withChunks(chunks), opt.get().version())) {
+                recentlyCommittedReplicas.put(target, System.currentTimeMillis());
                 return true;
             }
         }
@@ -1464,16 +1680,21 @@ class RepairCoordinator implements AutoCloseable {
         if (!inflight.remove(completion.commandId(), action)) return;
         try {
             if (action instanceof ReplicateAction r) {
-                chunksBeingRepaired.remove(new NsChunkId(r.namespace(), r.chunkId()));
-                if (completion.status() == 0) {
-                    applyReplicaSwap(r);
-                } else if (ErrorCode.fromCode(completion.status()) == ErrorCode.FENCED_EPOCH) {
-                    invalidateGlobalOwnerEpoch(r.namespace());
-                    log.warn("replicate cmd {} for {} was fenced by node {} — stale owner command dropped",
-                            completion.commandId(), r.chunkId(), reportingNode);
-                } else {
-                    log.warn("replicate cmd {} for {} failed with {} — next scan retries",
-                            completion.commandId(), r.chunkId(), ErrorCode.fromCode(completion.status()));
+                try {
+                    if (completion.status() == 0) {
+                        applyReplicaSwap(r);
+                    } else if (ErrorCode.fromCode(completion.status()) == ErrorCode.FENCED_EPOCH) {
+                        invalidateGlobalOwnerEpoch(r.namespace());
+                        log.warn("replicate cmd {} for {} was fenced by node {} — stale owner command dropped",
+                                completion.commandId(), r.chunkId(), reportingNode);
+                    } else {
+                        log.warn("replicate cmd {} for {} failed with {} — next scan retries",
+                                completion.commandId(), r.chunkId(), ErrorCode.fromCode(completion.status()));
+                    }
+                } finally {
+                    // Keep stale verify verdicts repair-protected until the descriptor commit is serialized
+                    // and recentlyCommittedReplicas has been published.
+                    chunksBeingRepaired.remove(new NsChunkId(r.namespace(), r.chunkId()));
                 }
             } else if (action instanceof DeleteAction d) {
                 if (completion.status() == 0) {
@@ -1493,6 +1714,16 @@ class RepairCoordinator implements AutoCloseable {
     }
 
     private void applyReplicaSwap(ReplicateAction r) throws Exception {
+        ReentrantLock lock = namespaceReconcileLock(r.namespace());
+        lock.lock();
+        try {
+            applyReplicaSwapLocked(r);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void applyReplicaSwapLocked(ReplicateAction r) throws Exception {
         if (registry.isDead(r.targetNode())) {
             // target completed the copy but died before the swap landed: writing a dead node
             // into the descriptor would hand readers a bad replica — skip; the next scan
@@ -1501,7 +1732,13 @@ class RepairCoordinator implements AutoCloseable {
                     r.targetNode(), r.chunkId());
             return;
         }
+        ReplicaKey target = new ReplicaKey(r.namespace(), r.chunkId(), r.targetNode());
         for (int attempt = 0; attempt < Controller.CAS_RETRIES; attempt++) {
+            if (verifyQuarantinesInFlight.contains(target)) {
+                log.warn("descriptor swap for {} to node {} deferred while verify quarantine is in flight",
+                        r.chunkId(), r.targetNode());
+                return;
+            }
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(r.namespace(), r.fileId());
             if (opt.isEmpty()) return;
             Records.FileRecord file = opt.get().value();
@@ -1528,8 +1765,7 @@ class RepairCoordinator implements AutoCloseable {
             if (!changed) return;
             Records.FileRecord updated = file.withChunks(chunks);
             if (store.updateFile(updated, opt.get().version())) {
-                recentlyCommittedReplicas.put(new ReplicaKey(r.namespace(), r.chunkId(), r.targetNode()),
-                        System.currentTimeMillis());
+                recentlyCommittedReplicas.put(target, System.currentTimeMillis());
                 registry.removePending(r.targetNode(), command ->
                         command instanceof Messages.DeleteCmd d
                                 && d.chunkIds().contains(r.chunkId())
@@ -1541,42 +1777,62 @@ class RepairCoordinator implements AutoCloseable {
         log.warn("descriptor swap for {} kept failing CAS — next scan reconciles", r.chunkId());
     }
 
-    private void applyDeleteConfirmed(StrataNamespace namespace, FileId fileId, ChunkId chunkId,
-                                      int nodeId) throws Exception {
+    private boolean applyDeleteConfirmed(StrataNamespace namespace, FileId fileId, ChunkId chunkId,
+                                         int nodeId) throws Exception {
         for (int attempt = 0; attempt < Controller.CAS_RETRIES; attempt++) {
             Optional<MetadataStore.Versioned<Records.FileRecord>> opt = store.getFile(namespace, fileId);
-            if (opt.isEmpty()) return;
+            if (opt.isEmpty()) {
+                return false;
+            }
             Records.FileRecord file = opt.get().value();
             List<Records.ChunkRecord> chunks = new ArrayList<>();
+            boolean foundChunk = false;
+            boolean changed = false;
             for (Records.ChunkRecord c : file.chunks()) {
                 if (file.chunkId(c.index()).equals(chunkId)) {
+                    foundChunk = true;
                     List<Integer> replicas = new ArrayList<>(c.replicas());
-                    replicas.remove(Integer.valueOf(nodeId));
+                    boolean removed = replicas.remove(Integer.valueOf(nodeId));
                     if (!replicas.isEmpty() || file.state() != FileState.DELETING) {
                         // a LIVE file keeps the chunk record even with zero replicas: erasing it
                         // would silently shorten the file (readers' offset accounting shifts) —
                         // total loss must surface as a hard read failure, not missing data
-                        if (replicas.isEmpty()) {
+                        if (removed && replicas.isEmpty()) {
                             log.error("chunk {} of live file {} has lost ALL replicas — readers "
                                     + "will hard-fail until operator intervention", chunkId, fileId);
                         }
-                        chunks.add(c.withReplicas(replicas));
-                    } // empty AND deleting -> chunk record dropped
+                        chunks.add(removed ? c.withReplicas(replicas) : c);
+                        changed |= removed;
+                    } else {
+                        changed = true; // empty AND deleting -> chunk record dropped
+                    }
                 } else {
                     chunks.add(c);
                 }
+            }
+            if (!foundChunk) {
+                // The authoritative descriptor already stopped naming this chunk/replica. For a fully-drained
+                // DELETING file, preserve the old eager finalization behavior; otherwise absence is success.
+                if (file.state() != FileState.DELETING || !file.chunks().isEmpty()) {
+                    return true;
+                }
+            } else if (!changed) {
+                return true; // existing descriptor, but this replica was removed by a concurrent writer
             }
             Records.FileRecord updated = file.withChunks(chunks);
             if (chunks.isEmpty() && file.state() == FileState.DELETING) {
                 if (store.deleteFile(namespace, fileId, opt.get().version())) {
                     log.info("file {} fully deleted", fileId);
-                    return;
+                    return true;
                 }
                 continue;
             }
-            if (store.updateFile(updated, opt.get().version())) return;
+            if (store.updateFile(updated, opt.get().version())) {
+                return true;
+            }
         }
         log.warn("delete-confirm descriptor update for {} kept failing CAS — next scan reconciles", chunkId);
+        return false;
     }
 
 

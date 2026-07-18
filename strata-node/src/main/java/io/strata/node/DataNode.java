@@ -51,7 +51,7 @@ public final class DataNode implements AutoCloseable {
     private final AtomicLong ownerEpochPersistenceRejects = new AtomicLong();
     private final AtomicLong ownerEpochDeleteClaimRejects = new AtomicLong();
     private final Map<StrataNamespace, Object> ownerEpochLocks = new ConcurrentHashMap<>();
-    private final Map<StrataNamespace, DeleteClaim> activeOrphanDeletes = new ConcurrentHashMap<>();
+    private final Map<StrataNamespace, MutationClaim> activeDestructiveMutations = new ConcurrentHashMap<>();
     private final Object ownerEpochPersistenceLock = new Object();
     // Process-local observations still fence ordinary owner RPCs, but only a dedicated orphan-confirm
     // response from a configured controller endpoint, after that server validates consensus authority,
@@ -320,12 +320,12 @@ public final class DataNode implements AutoCloseable {
             if (ownerEpoch == 0) {
                 if (seen > 0) {
                     if (allowUnstampedAfterSeen) {
-                        rejectOwnerRpcDuringCommittedDelete(namespace, ownerEpoch);
+                        rejectOwnerRpcDuringCommittedMutation(namespace, ownerEpoch);
                         return;
                     }
                     throw fencedOwnerEpoch(namespace, ownerEpoch, seen);
                 }
-                rejectOwnerRpcDuringCommittedDelete(namespace, ownerEpoch);
+                rejectOwnerRpcDuringCommittedMutation(namespace, ownerEpoch);
                 log.debug("accepting unstamped owner RPC before watermark is established namespace={} "
                                 + "clientKind={} clientId={}",
                         namespace, RequestContext.clientKind(), RequestContext.clientId());
@@ -334,7 +334,7 @@ public final class DataNode implements AutoCloseable {
             if (ownerEpoch < seen) {
                 throw fencedOwnerEpoch(namespace, ownerEpoch, seen);
             }
-            rejectOwnerRpcDuringCommittedDelete(namespace, ownerEpoch);
+            rejectOwnerRpcDuringCommittedMutation(namespace, ownerEpoch);
             if (ownerEpoch > seen) {
                 highestOwnerEpochByNamespace.put(namespace, ownerEpoch);
                 log.info("raising owner epoch watermark namespace={} previousOwnerEpoch={} acceptedOwnerEpoch={} "
@@ -360,7 +360,7 @@ public final class DataNode implements AutoCloseable {
             if (ownerEpoch < seen) {
                 throw fencedOwnerEpoch(namespace, ownerEpoch, seen);
             }
-            rejectOwnerRpcDuringCommittedDelete(namespace, ownerEpoch);
+            rejectOwnerRpcDuringCommittedMutation(namespace, ownerEpoch);
             if (ownerEpochPersistenceFailure != null) {
                 throw ownerEpochPersistenceFailed(namespace, ownerEpoch, ownerEpochPersistenceFailure);
             }
@@ -428,7 +428,7 @@ public final class DataNode implements AutoCloseable {
         if (physicalDelete == null) {
             throw new IllegalArgumentException("physicalDelete must be non-null");
         }
-        DeleteClaim claim = new DeleteClaim(chunkId, confirmedOwnerEpoch);
+        MutationClaim claim = new MutationClaim(chunkId, confirmedOwnerEpoch, "orphan unlink");
         synchronized (ownerEpochLock(namespace)) {
             if (ownerEpochPersistenceFailure != null) {
                 throw ownerEpochPersistenceFailed(namespace, confirmedOwnerEpoch, ownerEpochPersistenceFailure);
@@ -450,7 +450,7 @@ public final class DataNode implements AutoCloseable {
                         "orphan confirmation epoch " + confirmedOwnerEpoch + " is not the committed current floor "
                                 + "for namespace " + namespace + " (seen=" + seen + ", durable=" + durableSeen + ")");
             }
-            DeleteClaim existing = activeOrphanDeletes.putIfAbsent(namespace, claim);
+            MutationClaim existing = activeDestructiveMutations.putIfAbsent(namespace, claim);
             if (existing != null) {
                 throw new ScpException(ErrorCode.INTERNAL,
                         "orphan delete already committed for namespace " + namespace + " chunk "
@@ -461,29 +461,88 @@ public final class DataNode implements AutoCloseable {
             return physicalDelete.delete();
         } finally {
             synchronized (ownerEpochLock(namespace)) {
-                activeOrphanDeletes.remove(namespace, claim);
+                activeDestructiveMutations.remove(namespace, claim);
             }
         }
     }
 
-    private record DeleteClaim(ChunkId chunkId, long ownerEpoch) {}
+    /**
+     * Quarantines a verify-rejected replica only after the shared delete throttle has been acquired and
+     * the request epoch has been rechecked under the namespace claim. A newer owner can advance the epoch
+     * while this request waits for QoS; that stale request must not rename a freshly repaired chunk.
+     */
+    ErrorCode quarantineVerifiedReplica(StrataNamespace namespace, ChunkId chunkId, long ownerEpoch)
+            throws InterruptedException {
+        acceptOwnerEpoch(namespace, ownerEpoch);
+        try (ChunkDeleteService.PreparedDelete prepared = deleteService.prepare()) {
+            return quarantineVerifiedReplicaAfterThrottle(namespace, chunkId, ownerEpoch,
+                    () -> prepared.quarantine(namespace, chunkId));
+        }
+    }
+
+    ErrorCode quarantineVerifiedReplica(StrataNamespace namespace, ChunkId chunkId, long ownerEpoch,
+                                        PhysicalDelete physicalDelete) throws InterruptedException {
+        acceptOwnerEpoch(namespace, ownerEpoch);
+        try (ChunkDeleteService.PreparedDelete ignored = deleteService.prepare()) {
+            return quarantineVerifiedReplicaAfterThrottle(namespace, chunkId, ownerEpoch, physicalDelete);
+        }
+    }
+
+    private ErrorCode quarantineVerifiedReplicaAfterThrottle(StrataNamespace namespace, ChunkId chunkId,
+                                                              long ownerEpoch, PhysicalDelete physicalDelete)
+            throws InterruptedException {
+        if (ownerEpoch <= 0) {
+            throw new IllegalArgumentException("quarantine ownerEpoch must be positive: " + ownerEpoch);
+        }
+        if (physicalDelete == null) {
+            throw new IllegalArgumentException("physicalDelete must be non-null");
+        }
+        MutationClaim claim = new MutationClaim(chunkId, ownerEpoch, "verify quarantine");
+        synchronized (ownerEpochLock(namespace)) {
+            long seen = highestOwnerEpochByNamespace.getOrDefault(namespace, 0L);
+            if (ownerEpoch < seen) {
+                throw fencedOwnerEpoch(namespace, ownerEpoch, seen);
+            }
+            if (ownerEpoch != seen) {
+                throw new ScpException(ErrorCode.INTERNAL,
+                        "quarantine epoch " + ownerEpoch + " was not accepted for namespace " + namespace
+                                + " (current=" + seen + ")");
+            }
+            rejectOwnerRpcDuringCommittedMutation(namespace, ownerEpoch);
+            MutationClaim existing = activeDestructiveMutations.putIfAbsent(namespace, claim);
+            if (existing != null) {
+                throw new ScpException(ErrorCode.INTERNAL,
+                        existing.operation() + " already committed for namespace " + namespace + " chunk "
+                                + existing.chunkId() + "; retry quarantine for chunk " + chunkId);
+            }
+        }
+        try {
+            return physicalDelete.delete();
+        } finally {
+            synchronized (ownerEpochLock(namespace)) {
+                activeDestructiveMutations.remove(namespace, claim);
+            }
+        }
+    }
+
+    private record MutationClaim(ChunkId chunkId, long ownerEpoch, String operation) {}
 
     private Object ownerEpochLock(StrataNamespace namespace) {
         return ownerEpochLocks.computeIfAbsent(namespace, ignored -> new Object());
     }
 
-    private void rejectOwnerRpcDuringCommittedDelete(StrataNamespace namespace, long offered) {
-        DeleteClaim claim = activeOrphanDeletes.get(namespace);
+    private void rejectOwnerRpcDuringCommittedMutation(StrataNamespace namespace, long offered) {
+        MutationClaim claim = activeDestructiveMutations.get(namespace);
         if (claim == null) {
             return;
         }
         ownerEpochDeleteClaimRejects.incrementAndGet();
-        log.info("rejecting owner RPC during committed orphan unlink namespace={} chunkId={} "
-                        + "deleteOwnerEpoch={} offeredOwnerEpoch={} clientKind={} clientId={}; caller may retry",
-                namespace, claim.chunkId(), claim.ownerEpoch(), offered,
+        log.info("rejecting owner RPC during committed {} namespace={} chunkId={} "
+                        + "mutationOwnerEpoch={} offeredOwnerEpoch={} clientKind={} clientId={}; caller may retry",
+                claim.operation(), namespace, claim.chunkId(), claim.ownerEpoch(), offered,
                 RequestContext.clientKind(), RequestContext.clientId());
         throw new ScpException(ErrorCode.INTERNAL,
-                "orphan unlink is committed for namespace " + namespace + " chunk " + claim.chunkId()
+                claim.operation() + " is committed for namespace " + namespace + " chunk " + claim.chunkId()
                         + " at owner epoch " + claim.ownerEpoch() + "; retry owner RPC");
     }
 

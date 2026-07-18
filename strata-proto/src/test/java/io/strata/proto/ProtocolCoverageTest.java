@@ -494,6 +494,7 @@ class ProtocolCoverageTest {
         assertTrue(commandError.getMessage().contains("command type"));
 
         assertEquals(Opcode.PING, Opcode.fromCode(Opcode.PING.code));
+        assertEquals(Opcode.QUARANTINE_CHUNKS, Opcode.fromCode((short) 0x001D));
         assertNull(Opcode.fromCode((short) 0x020A));
         assertEquals(Opcode.CONFIRM_ORPHAN, Opcode.fromCode((short) 0x020B));
         assertNull(Opcode.fromCode((short) 0x7FFF));

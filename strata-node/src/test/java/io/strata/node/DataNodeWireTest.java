@@ -34,6 +34,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -192,6 +193,73 @@ class DataNodeWireTest {
             assertEquals(9, fenced.detail());
             assertTrue(node.store().contains(TEST_NS, id),
                     "the final epoch recheck must keep a chunk once a newer owner has been observed");
+        }
+    }
+
+    @Test
+    void quarantineRechecksOwnerEpochAfterWaitingForDeletePermit() throws Exception {
+        StrataNamespace blockedNamespace = StrataNamespace.of("blocked-quarantine");
+        StrataNamespace staleNamespace = StrataNamespace.of("stale-quarantine");
+        ChunkId blockedChunk = new ChunkId(FileId.of(2), 0);
+        CountDownLatch physicalQuarantineEntered = new CountDownLatch(1);
+        CountDownLatch releasePhysicalQuarantine = new CountDownLatch(1);
+        AtomicInteger stalePhysicalQuarantines = new AtomicInteger();
+
+        DataNodeConfig config = DataNodeConfig.standalone(dir)
+                .withDeleteMaxConcurrent(1)
+                .withDeleteMinIntervalMs(0);
+        try (DataNode node = new DataNode(config)) {
+            CompletableFuture<ErrorCode> blockingQuarantine = new CompletableFuture<>();
+            Thread.ofVirtual().start(() -> {
+                try {
+                    blockingQuarantine.complete(node.quarantineVerifiedReplica(
+                            blockedNamespace, blockedChunk, 1, () -> {
+                                physicalQuarantineEntered.countDown();
+                                if (!releasePhysicalQuarantine.await(5, TimeUnit.SECONDS)) {
+                                    throw new AssertionError("timed out waiting to release physical quarantine");
+                                }
+                                return ErrorCode.OK;
+                            }));
+                } catch (Throwable t) {
+                    blockingQuarantine.completeExceptionally(t);
+                }
+            });
+            assertTrue(physicalQuarantineEntered.await(5, TimeUnit.SECONDS),
+                    "the first quarantine must hold the only delete permit");
+
+            CompletableFuture<ErrorCode> staleQuarantine = new CompletableFuture<>();
+            Thread.ofVirtual().start(() -> {
+                try {
+                    staleQuarantine.complete(node.quarantineVerifiedReplica(
+                            staleNamespace, id, 8, () -> {
+                        stalePhysicalQuarantines.incrementAndGet();
+                        return ErrorCode.OK;
+                    }));
+                } catch (Throwable t) {
+                    staleQuarantine.completeExceptionally(t);
+                }
+            });
+
+            long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (node.deleteWaiting() == 0 && System.nanoTime() < deadlineNanos) {
+                Thread.sleep(10);
+            }
+            assertEquals(1, node.deleteWaiting(),
+                    "the stale quarantine must pass its initial epoch check and wait for the delete permit");
+
+            node.acceptOwnerEpoch(staleNamespace, 9);
+            releasePhysicalQuarantine.countDown();
+            assertEquals(ErrorCode.OK, blockingQuarantine.get(5, TimeUnit.SECONDS));
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> staleQuarantine.get(5, TimeUnit.SECONDS));
+            ScpException fenced = (ScpException) failure.getCause();
+            assertEquals(ErrorCode.FENCED_EPOCH, fenced.code());
+            assertEquals(9, fenced.detail());
+            assertEquals(0, stalePhysicalQuarantines.get(),
+                    "the final epoch recheck must fence the stale request before physical quarantine");
+        } finally {
+            releasePhysicalQuarantine.countDown();
         }
     }
 
@@ -555,6 +623,17 @@ class DataNodeWireTest {
             assertEquals(ErrorCode.FENCED_EPOCH, staleDelete.code());
             assertEquals(8, staleDelete.detail());
 
+            ScpException staleQuarantine = assertThrows(ScpException.class,
+                    () -> owner.call(Opcode.QUARANTINE_CHUNKS,
+                            new Messages.DeleteChunks(List.of(id), TEST_NS, 7).encode(), null, 5000));
+            assertEquals(ErrorCode.FENCED_EPOCH, staleQuarantine.code());
+            assertEquals(8, staleQuarantine.detail());
+
+            ScpException unstampedQuarantine = assertThrows(ScpException.class,
+                    () -> owner.call(Opcode.QUARANTINE_CHUNKS,
+                            new Messages.DeleteChunks(List.of(id), TEST_NS).encode(), null, 5000));
+            assertEquals(ErrorCode.FENCED_EPOCH, unstampedQuarantine.code());
+
             ScpException unstampedFetch = assertThrows(ScpException.class, () -> owner.call(Opcode.FETCH_CHUNK,
                     new Messages.FetchChunk(id, 0, Integer.MAX_VALUE, TEST_NS).encode(), null, 5000));
             assertEquals(ErrorCode.FENCED_EPOCH, unstampedFetch.code());
@@ -578,6 +657,51 @@ class DataNodeWireTest {
             ByteBuffer deleteHeader = broker.call(Opcode.DELETE_CHUNKS,
                     new Messages.DeleteChunks(List.of(id), TEST_NS).encode(), null, 5000);
             assertEquals(ErrorCode.OK.code, Messages.DeleteChunksResp.decode(deleteHeader).codes().get(0));
+        }
+    }
+
+    @Test
+    void quarantineChunksPreservesEvidenceAndCapacityAcrossNodeRestart() throws Exception {
+        byte[] payload = "quarantine-wire-evidence".getBytes();
+        long bytesBefore;
+        Path chunksDir = dir.resolve("chunks");
+        Path dataPath = chunksDir.resolve(ChunkFormats.chunkRelativePath(TEST_NS, id) + ".chunk");
+        Path shardDir = dataPath.getParent();
+
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
+             ScpClient broker = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "broker");
+             ScpClient owner = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_TOOL, "owner")) {
+            broker.call(Opcode.OPEN_CHUNK, new Messages.OpenChunk(id, 1, false,
+                    1 << 20, 1718000000000L, TEST_NS).encode(), null, 5000);
+            broker.call(Opcode.APPEND, new Messages.Append(id, 1, 0, 0, TEST_NS).encode(),
+                    ByteBuffer.wrap(payload), 5000);
+            broker.call(Opcode.SEAL_CHUNK,
+                    new Messages.SealChunk(id, 1, payload.length, TEST_NS).encode(), null, 5000);
+            bytesBefore = node.diskUsedBytes();
+
+            ByteBuffer response = owner.call(Opcode.QUARANTINE_CHUNKS,
+                    new Messages.DeleteChunks(List.of(id), TEST_NS, 7).encode(), null, 5000);
+            assertEquals(ErrorCode.OK.code, Messages.DeleteChunksResp.decode(response).codes().get(0));
+            assertEquals(bytesBefore, node.diskUsedBytes(),
+                    "quarantined evidence must remain in data-node capacity accounting");
+            assertFalse(Files.exists(dataPath), "quarantine must free the active chunk path");
+            ScpException absent = assertThrows(ScpException.class, () -> broker.call(Opcode.STAT_CHUNK,
+                    new Messages.StatChunk(id, TEST_NS).encode(), null, 5000));
+            assertEquals(ErrorCode.CHUNK_NOT_FOUND, absent.code());
+
+            try (Stream<Path> files = Files.list(shardDir)) {
+                assertEquals(3, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count(),
+                        "the wire quarantine must retain data, sidecar, and ledger");
+            }
+        }
+
+        try (DataNode recovered = new DataNode(DataNodeConfig.standalone(dir))) {
+            assertEquals(0, recovered.store().describeChunks().size());
+            assertEquals(bytesBefore, recovered.diskUsedBytes(),
+                    "node restart must rescan quarantined capacity without making it live");
+            try (Stream<Path> files = Files.list(shardDir)) {
+                assertEquals(3, files.filter(p -> p.getFileName().toString().contains(".quarantine-")).count());
+            }
         }
     }
 
