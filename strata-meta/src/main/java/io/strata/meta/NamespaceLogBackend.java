@@ -52,6 +52,8 @@ import java.util.function.Predicate;
 final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
 
     private static final Logger log = LoggerFactory.getLogger(NamespaceLogBackend.class);
+    private static final NamespaceOwnership.AuthorityTerm STATIC_ASSIGNMENT_TERM =
+            new NamespaceOwnership.AuthorityTerm(-1, -1);
 
     /** A destructive orphan-GC verdict bound atomically to the owner epoch that authorized it. */
     record OrphanConfirmation(boolean fileExists, boolean referencedByNode, long ownerEpoch) {
@@ -82,6 +84,10 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
     // Only namespaces this node OWNS may be opened here — opening another owner's namespace would
     // republish its manifest and fence the real owner. Default ns->true for single-node / tests.
     private volatile Predicate<StrataNamespace> ownsNamespace = ns -> true;
+    // Non-null in production sharded mode. The exact persisted assignment revision is then part of
+    // repository authority; the Predicate-only seam remains for focused single-process unit tests.
+    private volatile NamespaceOwnership namespaceOwnership;
+    private volatile AutoCloseable ownershipListener;
     private volatile boolean closed;
     private volatile Thread compactionThread;
 
@@ -92,7 +98,9 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
         private volatile NamespaceLeaderState state = NamespaceLeaderState.STANDBY;
         private volatile NamespaceMetadataLogRepository repo;
         private volatile long metadataEpoch;
+        private volatile NamespaceOwnership.AuthorityTerm assignmentTerm = STATIC_ASSIGNMENT_TERM;
         private volatile long activeSinceMs;
+        private boolean reacquirePending;
 
         private NamespaceLeadershipHandle(StrataNamespace namespace) {
             this.namespace = namespace;
@@ -103,15 +111,17 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
             return state == NamespaceLeaderState.ACTIVE && r != null ? r : null;
         }
 
-        private void recovering(long epoch) {
+        private void recovering(long epoch, NamespaceOwnership.AuthorityTerm term) {
             metadataEpoch = epoch;
+            assignmentTerm = term;
             activeSinceMs = 0;
             state = NamespaceLeaderState.RECOVERING;
         }
 
-        private void activate(NamespaceMetadataLogRepository opened) {
+        private void activate(NamespaceMetadataLogRepository opened, NamespaceOwnership.AuthorityTerm term) {
             repo = opened;
             metadataEpoch = opened.metadataEpoch();
+            assignmentTerm = term;
             activeSinceMs = System.currentTimeMillis();
             state = NamespaceLeaderState.ACTIVE;
         }
@@ -124,14 +134,16 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
             }
         }
 
-        private void restore(NamespaceMetadataLogRepository stale) {
+        private void restore(NamespaceMetadataLogRepository stale, NamespaceOwnership.AuthorityTerm term) {
             repo = stale;
             if (stale != null) {
                 metadataEpoch = stale.metadataEpoch();
+                assignmentTerm = term;
                 activeSinceMs = System.currentTimeMillis();
                 state = NamespaceLeaderState.ACTIVE;
             } else {
                 metadataEpoch = 0;
+                assignmentTerm = STATIC_ASSIGNMENT_TERM;
                 activeSinceMs = 0;
                 state = NamespaceLeaderState.STANDBY;
             }
@@ -157,7 +169,7 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
     int loadedNamespaceCount() {
         int count = 0;
         for (NamespaceLeadershipHandle handle : namespaces.values()) {
-            if (handle.activeRepo() != null) {
+            if (activeRepoForCurrentAssignment(handle) != null) {
                 count++;
             }
         }
@@ -171,7 +183,7 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
         // lock-free read would race into a ConcurrentModificationException.
         Map<StrataNamespace, long[]> out = new HashMap<>(namespaces.size());
         for (Map.Entry<StrataNamespace, NamespaceLeadershipHandle> e : namespaces.entrySet()) {
-            NamespaceMetadataLogRepository repo = e.getValue().activeRepo();
+            NamespaceMetadataLogRepository repo = activeRepoForCurrentAssignment(e.getValue());
             if (repo == null) {
                 continue;
             }
@@ -188,6 +200,59 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
     /** Restricts eager recovery to the namespaces this node owns (wired from Controller). */
     void setOwnership(Predicate<StrataNamespace> ownsNamespace) {
         this.ownsNamespace = ownsNamespace;
+        this.namespaceOwnership = null;
+        closeOwnershipListener();
+    }
+
+    /**
+     * Binds repository authority to the exact persisted namespace-assignment revision. A session suspension
+     * or assignment change fences the matching local handle immediately; a delayed LOST callback for an old
+     * revision cannot fence a repository opened after a later legitimate acquisition.
+     */
+    void setOwnership(NamespaceOwnership ownership) {
+        this.namespaceOwnership = java.util.Objects.requireNonNull(ownership, "ownership");
+        this.ownsNamespace = ownership::isOwner;
+        closeOwnershipListener();
+        this.ownershipListener = ownership.addListener(new NamespaceOwnership.Listener() {
+            @Override
+            public void onLost(StrataNamespace namespace, NamespaceOwnership.AuthorityTerm term) {
+                fenceLostOwnership(namespace, term);
+            }
+        });
+    }
+
+    private void fenceLostOwnership(StrataNamespace namespace, NamespaceOwnership.AuthorityTerm lostTerm) {
+        NamespaceLeadershipHandle handle = namespaces.get(namespace);
+        if (handle == null) {
+            return;
+        }
+        handle.openLock.lock();
+        try {
+            NamespaceMetadataLogRepository active = handle.activeRepo();
+            if (handle.assignmentTerm.equals(lostTerm)) {
+                handle.reacquirePending = false;
+                if (active != null) {
+                    handle.fenceIfCurrent(active);
+                }
+                log.info("namespace {} local repository fenced after assignment term {} was lost",
+                        namespace, lostTerm);
+            }
+        } finally {
+            handle.openLock.unlock();
+        }
+    }
+
+    private void closeOwnershipListener() {
+        AutoCloseable listener = ownershipListener;
+        ownershipListener = null;
+        if (listener == null) {
+            return;
+        }
+        try {
+            listener.close();
+        } catch (Exception e) {
+            log.warn("failed to close namespace ownership listener", e);
+        }
     }
 
     // Safety delay (tech design §4.2 / issue #8): a superseded metadata-log generation is retained for this
@@ -359,11 +424,16 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
     int compactOversizedRepos(long thresholdBytes) {
         int compacted = 0;
         for (Map.Entry<StrataNamespace, NamespaceLeadershipHandle> e : namespaces.entrySet()) {
-            NamespaceMetadataLogRepository repo = e.getValue().activeRepo();
+            NamespaceLeadershipHandle handle = e.getValue();
+            NamespaceMetadataLogRepository repo = handle.activeRepo();
             if (repo == null) {
                 continue;
             }
             try {
+                if (!validateLocalAuthority(e.getKey(), handle.assignmentTerm)) {
+                    handle.fenceIfCurrent(repo);
+                    continue;
+                }
                 if (repo.compact(thresholdBytes)) {
                     compacted++;
                 }
@@ -390,17 +460,37 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
     }
 
     private NamespaceMetadataLogRepository repo(StrataNamespace namespace) throws Exception {
-        requireOwnedNamespace(namespace);
+        NamespaceOwnership.AuthorityTerm currentTerm = requireCurrentLocalTerm(namespace);
         NamespaceLeadershipHandle handle = namespaceHandle(namespace);
         NamespaceMetadataLogRepository r = handle.activeRepo();   // fast path, lock-free
-        if (r != null) {
+        if (r != null && handle.assignmentTerm.equals(currentTerm)) {
             return r;
         }
         handle.openLock.lock();
         try {
+            currentTerm = requireCurrentLocalTerm(namespace);
+            r = handle.activeRepo();
+            if (r != null && handle.assignmentTerm.equals(currentTerm)) {
+                return r;
+            }
+            boolean assignmentChanged = r != null;
+            if (assignmentChanged) {
+                // LOST delivery is deliberately asynchronous. The cached assignment term is the correctness
+                // gate: never expose a repository recovered under an earlier owner term while waiting for its
+                // callback to acquire this lock.
+                handle.fenceIfCurrent(r);
+                handle.reacquirePending = false;
+            }
             // Cold open = this process has no cached repository for the namespace. This includes initial
             // load and process restart, so ownerChanges is only an approximation of an ownership handoff.
-            return openLocked(handle, true);
+            boolean retryingReacquire = handle.reacquirePending;
+            if (retryingReacquire) {
+                metrics.recordReacquire(namespace);
+            }
+            NamespaceMetadataLogRepository opened =
+                    openLocked(handle, assignmentChanged || !retryingReacquire);
+            handle.reacquirePending = false;
+            return opened;
         } finally {
             handle.openLock.unlock();
         }
@@ -421,19 +511,23 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
         if (r != null) {
             return r;
         }
+        NamespaceOwnership.AuthorityTerm assignmentTerm = requireAuthoritativeLocalTerm(namespace);
         long epoch = root.allocateMetadataEpoch();
-        handle.recovering(epoch);
+        handle.recovering(epoch, assignmentTerm);
         try {
             r = NamespaceMetadataLogRepository.open(namespace, fileStore, root, epoch, metrics);
             assertRecoveredBeforeActive(handle, r);
-            handle.activate(r);   // publish only after recovery + manifest CAS
+            if (!validateLocalAuthority(namespace, assignmentTerm)) {
+                throw notLocalAuthority(namespace, assignmentTerm);
+            }
+            handle.activate(r, assignmentTerm);   // publish only after recovery + assignment revalidation
             if (countAsAcquisition) {
                 metrics.recordOwnerAcquired(namespace);
             }
             return r;
         } catch (Exception e) {
             if (handle.repo == null) {
-                handle.restore(null);
+                handle.restore(null, STATIC_ASSIGNMENT_TERM);
             }
             throw e;
         }
@@ -503,6 +597,72 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
         }
     }
 
+    /** Returns the current locally-owned cached assignment term without a consensus round trip. */
+    private NamespaceOwnership.AuthorityTerm requireCurrentLocalTerm(StrataNamespace namespace) {
+        requireOwnedNamespace(namespace);
+        NamespaceOwnership ownership = namespaceOwnership;
+        if (ownership == null) {
+            return STATIC_ASSIGNMENT_TERM;
+        }
+        return ownership.cachedLocalAuthorityTerm(namespace).orElseThrow(
+                () -> new ScpException(ErrorCode.NOT_LEADER,
+                        "namespace " + namespace + " has no current local assignment term"));
+    }
+
+    /** Returns the exact persisted assignment term owned by this process, or fails closed. */
+    private NamespaceOwnership.AuthorityTerm requireAuthoritativeLocalTerm(
+            StrataNamespace namespace) throws Exception {
+        NamespaceOwnership.AuthorityTerm term = requireCurrentLocalTerm(namespace);
+        NamespaceOwnership ownership = namespaceOwnership;
+        if (ownership == null) {
+            return STATIC_ASSIGNMENT_TERM;
+        }
+        if (!ownership.validateLocalAuthority(namespace, term)) {
+            throw notLocalAuthority(namespace, term);
+        }
+        return term;
+    }
+
+    /**
+     * Returns an ACTIVE repository only when its opening term is still the locally-owned cached assignment
+     * term. This is intentionally local and lock-free so repair scheduling and metrics do not add ZooKeeper
+     * traffic, while an actual reopen still goes through authoritative validation in {@link #openLocked}.
+     */
+    private NamespaceMetadataLogRepository activeRepoForCurrentAssignment(
+            NamespaceLeadershipHandle handle) {
+        NamespaceMetadataLogRepository active = handle.activeRepo();
+        if (active == null) {
+            return null;
+        }
+        NamespaceOwnership ownership = namespaceOwnership;
+        if (ownership == null) {
+            return ownsNamespace.test(handle.namespace) ? active : null;
+        }
+        return ownership.cachedLocalAuthorityTerm(handle.namespace)
+                .filter(handle.assignmentTerm::equals)
+                .map(ignored -> active)
+                .orElse(null);
+    }
+
+    private boolean validateLocalAuthority(
+            StrataNamespace namespace,
+            NamespaceOwnership.AuthorityTerm expectedTerm) throws Exception {
+        NamespaceOwnership ownership = namespaceOwnership;
+        if (ownership == null) {
+            requireOwnedNamespace(namespace);
+            return expectedTerm.equals(STATIC_ASSIGNMENT_TERM);
+        }
+        return ownership.validateLocalAuthority(namespace, expectedTerm);
+    }
+
+    private static ScpException notLocalAuthority(
+            StrataNamespace namespace,
+            NamespaceOwnership.AuthorityTerm term) {
+        return new ScpException(ErrorCode.NOT_LEADER,
+                "namespace " + namespace + " assignment term " + term
+                        + " is no longer owned by this controller");
+    }
+
     private static <T> T runLocked(NamespaceMetadataLogRepository repo, RepoTxn<T> txn) throws Exception {
         repo.lock();
         try {
@@ -545,6 +705,11 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
                     "namespace " + namespace + " local authority is " + handle.state,
                     handle.metadataEpoch);
         }
+        NamespaceOwnership.AuthorityTerm selectedAssignmentTerm = handle.assignmentTerm;
+        if (!validateLocalAuthority(namespace, selectedAssignmentTerm)) {
+            handle.fenceIfCurrent(selected);
+            throw notLocalAuthority(namespace, selectedAssignmentTerm);
+        }
         Optional<MetadataStore.Versioned<Records.NamespaceManifest>> current =
                 root.getNamespaceManifestAuthoritative(namespace);
         if (current.isEmpty()) {
@@ -559,6 +724,10 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
                 throw new ScpException(ErrorCode.FENCED_EPOCH,
                         "namespace " + namespace + " local authority changed during validation",
                         handle.metadataEpoch);
+            }
+            if (!validateLocalAuthority(namespace, selectedAssignmentTerm)) {
+                handle.fenceIfCurrent(active);
+                throw notLocalAuthority(namespace, selectedAssignmentTerm);
             }
             return runLocked(active, repo -> {
                 if (repo.poisoned()) {
@@ -629,13 +798,24 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
             if (current != null && current != stale) {
                 return current; // another thread already re-acquired
             }
+            NamespaceOwnership.AuthorityTerm staleAssignmentTerm = handle.assignmentTerm;
+            if (!validateLocalAuthority(namespace, staleAssignmentTerm)) {
+                handle.fenceIfCurrent(stale);
+                throw notLocalAuthority(namespace, staleAssignmentTerm);
+            }
+            handle.reacquirePending = true;
             handle.fenceIfCurrent(stale);
             try {
                 // In-place epoch bump on a namespace this node already owns — NOT an ownership handoff, so it
                 // must not increment ownerChanges (recordReacquire already counts this churn separately).
-                return openLocked(handle, false);
+                NamespaceMetadataLogRepository opened = openLocked(handle, false);
+                handle.reacquirePending = false;
+                return opened;
             } catch (Exception e) {
-                handle.restore(stale);
+                // Never resurrect the stale repository. openLocked may already have published a new manifest,
+                // partially installed a higher data-node floor, or discovered that this assignment revision
+                // was lost. A later request may retry from FENCED/STANDBY, but old authority cannot become
+                // ACTIVE again merely because recovery failed.
                 throw e;
             }
         } finally {
@@ -891,7 +1071,7 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
         // HashMap that append() mutates under the same lock, so a lock-free read would race into a CME.
         Set<StrataNamespace> out = new LinkedHashSet<>(root.listNamespaces());
         for (Map.Entry<StrataNamespace, NamespaceLeadershipHandle> e : namespaces.entrySet()) {
-            NamespaceMetadataLogRepository repo = e.getValue().activeRepo();
+            NamespaceMetadataLogRepository repo = activeRepoForCurrentAssignment(e.getValue());
             if (repo != null && runLocked(repo, active -> active.state().hasLiveFiles())) {
                 out.add(e.getKey());
             }
@@ -944,7 +1124,13 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
             return NamespaceLeaderState.ACTIVE;
         }
         NamespaceLeadershipHandle handle = namespaces.get(namespace);
-        return handle == null ? NamespaceLeaderState.STANDBY : handle.state;
+        if (handle == null) {
+            return NamespaceLeaderState.STANDBY;
+        }
+        return handle.state == NamespaceLeaderState.ACTIVE
+                && activeRepoForCurrentAssignment(handle) == null
+                ? NamespaceLeaderState.FENCED
+                : handle.state;
     }
 
     @Override
@@ -958,7 +1144,9 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
             return SYSTEM_NAMESPACE_ACTIVE_SINCE_MS;
         }
         NamespaceLeadershipHandle handle = namespaces.get(namespace);
-        return handle == null ? 0 : handle.activeSinceMs;
+        return handle == null || activeRepoForCurrentAssignment(handle) == null
+                ? 0
+                : handle.activeSinceMs;
     }
 
     @Override
@@ -967,7 +1155,9 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
             return 0;
         }
         NamespaceLeadershipHandle handle = namespaces.get(namespace);
-        return handle == null || handle.state != NamespaceLeaderState.ACTIVE ? 0 : handle.metadataEpoch;
+        return handle == null || activeRepoForCurrentAssignment(handle) == null
+                ? 0
+                : handle.metadataEpoch;
     }
 
     @Override
@@ -976,6 +1166,12 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
             return 0;
         }
         return withAuthoritativeRepo(namespace, NamespaceMetadataLogRepository::metadataEpoch);
+    }
+
+    @Override
+    public boolean requiresDurableOwnerEpochFence(StrataNamespace namespace) {
+        NamespaceOwnership ownership = namespaceOwnership;
+        return ownership != null && !ownership.ownsAll() && !isSystem(namespace);
     }
 
     @Override
@@ -993,6 +1189,7 @@ final class NamespaceLogBackend implements AutoCloseable, NamespaceLeadership {
             return;
         }
         closed = true;
+        closeOwnershipListener();
         Thread sweeper = compactionThread;
         if (sweeper != null) {
             sweeper.interrupt(); // best-effort; the loop also self-exits on the closed flag

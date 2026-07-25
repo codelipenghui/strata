@@ -15,10 +15,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ServerMetricsConfigTest {
     @Test
-    void controllerRoleDefaultsKeepDistinctPortsAndShardingOptIn() {
+    void controllerRoleDefaultsKeepDistinctPortsAndAutomaticallyShardMultipleEndpoints() {
         Map<String, String> environment = new HashMap<>();
         environment.put("STRATA_ZK_CONNECT", " zk:2181 ");
-        environment.put("STRATA_CONTROLLER_ENDPOINTS", "ctrl-a:9100, ctrl-b:9100");
 
         ControllerConfig standalone = StrataServer.standaloneControllerConfigFromEnv(
                 () -> "standalone-host", environment::get);
@@ -28,17 +27,26 @@ class ServerMetricsConfigTest {
         assertEquals(9_200, standalone.listenPort());
         assertEquals(9_100, combined.listenPort());
         assertEquals("zk:2181", standalone.zkConnect(), "environment values remain trimmed");
+        assertEquals(ControllerConfig.DEFAULT_ZK_SESSION_TIMEOUT_MS, standalone.zkSessionTimeoutMs());
         assertEquals(List.of(), standalone.controllerEndpoints());
-        assertEquals(List.of(), combined.controllerEndpoints(),
-                "controller endpoints alone must not enable namespace sharding");
+        assertEquals(List.of(), combined.controllerEndpoints());
 
-        environment.put("STRATA_CONTROLLER_SHARDING", "true");
-        environment.put("STRATA_CONTROLLER_REPLICA_COUNT", "2");
+        environment.put("STRATA_CONTROLLER_ENDPOINTS", "combined-host:9100");
+        ControllerConfig singleEndpoint = StrataServer.combinedControllerConfigFromEnv(
+                () -> "combined-host", environment::get);
+        assertEquals(List.of("combined-host:9100"), singleEndpoint.controllerEndpoints(),
+                "a singleton remains visible so Controller can reject a mismatched local identity");
+        assertEquals(1, singleEndpoint.controllerReplicaCount());
+
+        environment.put("STRATA_CONTROLLER_ENDPOINTS", "ctrl-a:9100, ctrl-b:9100");
+        environment.put("STRATA_CONTROLLER_ZK_SESSION_TIMEOUT_MS", "7500");
         ControllerConfig sharded = StrataServer.combinedControllerConfigFromEnv(
                 () -> "combined-host", environment::get);
 
         assertEquals(List.of("ctrl-a:9100", "ctrl-b:9100"), sharded.controllerEndpoints());
-        assertEquals(2, sharded.controllerReplicaCount());
+        assertEquals(2, sharded.controllerReplicaCount(),
+                "the default replica count is capped by the bootstrap membership size");
+        assertEquals(7_500, sharded.zkSessionTimeoutMs());
     }
 
     @Test

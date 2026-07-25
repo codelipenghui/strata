@@ -1,9 +1,10 @@
 # A runnable single-host Strata cluster: ZooKeeper + a 3-node fleet where each node runs in
 # `combined` mode — one SCP listener (:9100) serving BOTH the data plane and a co-resident metadata
-# service (routed by opcode). One node is elected controller leader; the others are warm standbys, and
-# clients reach the leader via the NOT_LEADER redirect. There is no separate controller to deploy —
-# the control plane scales with the nodes. Clients run inside the cluster network (e.g. the loadgen)
-# and reach nodes by name, following the redirect to the leader, so no port is published to the host.
+# service (routed by opcode). One node is elected cluster coordinator for global work and failover, while
+# every node may concurrently serve namespaces whose persisted assignments name it as owner. There is no
+# separate controller to deploy — the control plane scales with the nodes. Clients run inside the cluster
+# network (e.g. the loadgen) and reach nodes by name, following NOT_LEADER redirects to the persisted
+# namespace owner, so no port is published to the host.
 #
 #   ./scripts/build-image.sh     # packages the jar + builds strata-server:local
 #   docker compose up            # starts the cluster using that image
@@ -39,20 +40,20 @@ services:
       retries: 10
 
   # Each node is `combined`: a DataNode + a Controller sharing one SCP listener (:9100) in one
-  # process. STRATA_CONTROLLER_ENDPOINTS lists all three nodes at that port, so each node and any in-cluster
-  # client find the current leader (one hop, via the redirect). STRATA_ADVERTISED_HOST is the name
-  # peers resolve and is also the leader's NOT_LEADER redirect hint.
+  # process. STRATA_CONTROLLER_ENDPOINTS lists the bootstrap candidates used only when a namespace's
+  # first persisted assignment is created; subsequent serving and failover follow that versioned ZooKeeper
+  # assignment. STRATA_ADVERTISED_HOST is the endpoint identity used in assignments and redirects.
   node1:
     <<: *strata
     command: ["combined"]
     environment:
       STRATA_ZK_CONNECT: "zookeeper:2181"
       STRATA_CONTROLLER_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
-      # Default to the scalable namespace-log metadata backend with namespace sharding ON: each node owns
-      # a shard of namespaces (rendezvous-hash) and forwards non-owned metadata ops to the owner. Override
-      # any of these to "zk"/"false" to fall back to the single-leader in-ZooKeeper store.
+      # Multi-endpoint membership always enables persisted sharding. Rendezvous hashing bootstraps only the
+      # first persisted namespace assignment; live membership plus leader/CAS rotation handles owner loss
+      # without automatic failback. Changing the backend to "zk" changes file/chunk metadata storage; it
+      # does not disable persisted namespace ownership while multiple controller endpoints are configured.
       STRATA_CONTROLLER_BACKEND: "${STRATA_CONTROLLER_BACKEND:-namespace-log}"
-      STRATA_CONTROLLER_SHARDING: "${STRATA_CONTROLLER_SHARDING:-true}"
       STRATA_CONTROLLER_LOG_RF: "${STRATA_CONTROLLER_LOG_RF:-3}"
       STRATA_CONTROLLER_LOG_ACK: "${STRATA_CONTROLLER_LOG_ACK:-2}"
       # Metadata-log durability is by replication (RF/ack), not single-node fsync — page-cache durable on the
@@ -129,11 +130,11 @@ services:
     environment:
       STRATA_ZK_CONNECT: "zookeeper:2181"
       STRATA_CONTROLLER_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
-      # Default to the scalable namespace-log metadata backend with namespace sharding ON: each node owns
-      # a shard of namespaces (rendezvous-hash) and forwards non-owned metadata ops to the owner. Override
-      # any of these to "zk"/"false" to fall back to the single-leader in-ZooKeeper store.
+      # Multi-endpoint membership always enables persisted sharding. Rendezvous hashing bootstraps only the
+      # first persisted namespace assignment; live membership plus leader/CAS rotation handles owner loss
+      # without automatic failback. Changing the backend to "zk" changes file/chunk metadata storage; it
+      # does not disable persisted namespace ownership while multiple controller endpoints are configured.
       STRATA_CONTROLLER_BACKEND: "${STRATA_CONTROLLER_BACKEND:-namespace-log}"
-      STRATA_CONTROLLER_SHARDING: "${STRATA_CONTROLLER_SHARDING:-true}"
       STRATA_CONTROLLER_LOG_RF: "${STRATA_CONTROLLER_LOG_RF:-3}"
       STRATA_CONTROLLER_LOG_ACK: "${STRATA_CONTROLLER_LOG_ACK:-2}"
       # Metadata-log durability is by replication (RF/ack), not single-node fsync — page-cache durable on the
@@ -167,11 +168,11 @@ services:
     environment:
       STRATA_ZK_CONNECT: "zookeeper:2181"
       STRATA_CONTROLLER_ENDPOINTS: "node1:9100,node2:9100,node3:9100"
-      # Default to the scalable namespace-log metadata backend with namespace sharding ON: each node owns
-      # a shard of namespaces (rendezvous-hash) and forwards non-owned metadata ops to the owner. Override
-      # any of these to "zk"/"false" to fall back to the single-leader in-ZooKeeper store.
+      # Multi-endpoint membership always enables persisted sharding. Rendezvous hashing bootstraps only the
+      # first persisted namespace assignment; live membership plus leader/CAS rotation handles owner loss
+      # without automatic failback. Changing the backend to "zk" changes file/chunk metadata storage; it
+      # does not disable persisted namespace ownership while multiple controller endpoints are configured.
       STRATA_CONTROLLER_BACKEND: "${STRATA_CONTROLLER_BACKEND:-namespace-log}"
-      STRATA_CONTROLLER_SHARDING: "${STRATA_CONTROLLER_SHARDING:-true}"
       STRATA_CONTROLLER_LOG_RF: "${STRATA_CONTROLLER_LOG_RF:-3}"
       STRATA_CONTROLLER_LOG_ACK: "${STRATA_CONTROLLER_LOG_ACK:-2}"
       # Metadata-log durability is by replication (RF/ack), not single-node fsync — page-cache durable on the

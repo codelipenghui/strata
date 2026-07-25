@@ -18,9 +18,8 @@ public record ControllerConfig(
         String advertisedHost,     // host clients/peers reach this meta at; carried in the leader hint
         long replicaMissingGraceMs, // a node-reported-missing sealed replica is dropped only after it
                                     // stays missing this long (absorbs stale verification/liveness snapshots)
-        List<String> controllerEndpoints, // eligible controller endpoints for namespace ownership (rendezvous,
-                                        // tech design §4.5). empty/size<=1 => this node owns every namespace
-                                        // (no sharding — preserves single-leader behavior)
+        List<String> controllerEndpoints, // bootstrap candidates for persisted namespace assignments.
+                                        // empty/size<=1 => this node owns every namespace (no sharding)
         int controllerReplicaCount,  // metadata replica-set size per namespace (tech design §4.5)
         int verifyIntervalMs,        // owner-pull VERIFY_CHUNKS cadence (RepairCoordinator)
         int verifyBatchSize,         // chunk-ids per VERIFY_CHUNKS RPC
@@ -31,6 +30,7 @@ public record ControllerConfig(
         int zkRetryMaxRetries,       // Curator ExponentialBackoffRetry max retries
         MetadataBackendConfig metadataBackendConfig
 ) {
+    public static final int DEFAULT_ZK_SESSION_TIMEOUT_MS = 10_000;
     public static final int DEFAULT_NAMESPACE_LOG_RETENTION_MS = 5 * 60_000;
     // Mirrors ClientConfig.of() so namespace metadata logs roll at the same default size as client files.
     public static final long DEFAULT_NAMESPACE_LOG_CHUNK_ROLL_BYTES = 2L << 30;
@@ -134,9 +134,34 @@ public record ControllerConfig(
         if (replicaMissingGraceMs < 0) {
             throw new IllegalArgumentException("replicaMissingGraceMs must be >= 0");
         }
+        if (zkSessionTimeoutMs <= 0) {
+            throw new IllegalArgumentException("zkSessionTimeoutMs must be positive: " + zkSessionTimeoutMs);
+        }
+        if (zkConnectionTimeoutMs <= 0) {
+            throw new IllegalArgumentException("zkConnectionTimeoutMs must be positive: " + zkConnectionTimeoutMs);
+        }
         controllerEndpoints = controllerEndpoints == null ? List.of() : List.copyOf(controllerEndpoints);
+        if (controllerEndpoints.stream().distinct().count() != controllerEndpoints.size()) {
+            throw new IllegalArgumentException("controllerEndpoints must not contain duplicates: "
+                    + controllerEndpoints);
+        }
         if (controllerReplicaCount <= 0) {
             controllerReplicaCount = 3;
+        }
+        if (controllerEndpoints.size() == 1 && controllerReplicaCount != 1) {
+            throw new IllegalArgumentException(
+                    "single-controller configuration requires controllerReplicaCount=1: "
+                            + controllerReplicaCount);
+        }
+        if (controllerEndpoints.size() > 1) {
+            if (controllerReplicaCount < 2) {
+                throw new IllegalArgumentException("sharded metadata requires at least two controller replicas: "
+                        + controllerReplicaCount);
+            }
+            if (controllerReplicaCount > controllerEndpoints.size()) {
+                throw new IllegalArgumentException("controllerReplicaCount (" + controllerReplicaCount
+                        + ") exceeds configured controller endpoints (" + controllerEndpoints.size() + ")");
+            }
         }
         if (verifyIntervalMs <= 0) {
             throw new IllegalArgumentException("verifyIntervalMs must be positive: " + verifyIntervalMs);
@@ -170,7 +195,8 @@ public record ControllerConfig(
     public ControllerConfig(String zkConnect, int listenPort, int heartbeatIntervalMs, int leaseMs,
                       int deadGraceMs, int repairScanIntervalMs, int repairCommandTimeoutMs) {
         this(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs, repairScanIntervalMs,
-                repairCommandTimeoutMs, 60_000, 60_000, 15_000, "127.0.0.1", 90_000, List.of(), 3,
+                repairCommandTimeoutMs, 60_000, DEFAULT_ZK_SESSION_TIMEOUT_MS, 15_000,
+                "127.0.0.1", 90_000, List.of(), 3,
                 2_000, 256, 30_000, 600_000L, 16, 100, 5, MetadataBackendConfig.zk());
     }
 
@@ -208,6 +234,16 @@ public record ControllerConfig(
                 maxCommandsPerHeartbeat, zkRetryBaseMs, zkRetryMaxRetries, metadataBackendConfig);
     }
 
+    /** A copy with the ZooKeeper session timeout used as the controller-owner failure detector. */
+    public ControllerConfig withZkSessionTimeoutMs(int timeoutMs) {
+        return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
+                repairScanIntervalMs, repairCommandTimeoutMs, reconcileIntervalMs, timeoutMs,
+                zkConnectionTimeoutMs, advertisedHost, replicaMissingGraceMs, controllerEndpoints,
+                controllerReplicaCount, verifyIntervalMs, verifyBatchSize, systemVerifyIntervalMs,
+                deletedTombstoneTtlMs, maxCommandsPerHeartbeat, zkRetryBaseMs, zkRetryMaxRetries,
+                metadataBackendConfig);
+    }
+
     /** A copy with the missing-replica grace overridden — lets tests drop a deleted replica promptly. */
     public ControllerConfig withReplicaMissingGraceMs(long graceMs) {
         return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,
@@ -228,9 +264,10 @@ public record ControllerConfig(
     }
 
     /**
-     * A copy with the eligible controller endpoints and replica-set size for namespace sharding
-     * (tech design §4.5). Pass this node's own advertised endpoint among {@code endpoints} so rendezvous
-     * can place it; an empty list or a single endpoint means this node owns every namespace.
+     * A copy with the bootstrap controller endpoints and persisted replica-set size for namespace sharding
+     * (tech design §4.5). Pass this node's own advertised endpoint among {@code endpoints}; rendezvous ordering
+     * is used only when the assignment is first persisted. An empty list or one endpoint with replica count 1
+     * means this node owns every namespace; Controller verifies that a configured singleton names this process.
      */
     public ControllerConfig withControllerEndpoints(List<String> endpoints, int replicaCount) {
         return new ControllerConfig(zkConnect, listenPort, heartbeatIntervalMs, leaseMs, deadGraceMs,

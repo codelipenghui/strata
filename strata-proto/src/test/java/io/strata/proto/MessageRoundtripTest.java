@@ -79,6 +79,10 @@ class MessageRoundtripTest {
         assertEquals(rl, Messages.ReadLedger.decode(buf(rl.encode())));
         var recoveryLedger = new Messages.ReadLedger(c, 2048, ns, 7);
         assertEquals(recoveryLedger, Messages.ReadLedger.decode(buf(recoveryLedger.encode())));
+
+        var installOwnerEpoch = new Messages.InstallOwnerEpoch(ns, 43);
+        assertEquals(installOwnerEpoch,
+                Messages.InstallOwnerEpoch.decode(buf(installOwnerEpoch.encode())));
     }
 
     @Test

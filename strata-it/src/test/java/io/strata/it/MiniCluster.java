@@ -18,18 +18,23 @@ import java.util.function.BiFunction;
 import java.util.stream.Stream;
 
 /**
- * In-process cluster for integration tests: embedded ZooKeeper + controller + N data nodes
- * nodes. This is the primary correctness layer (tech design §16) — real sockets, real disk,
+ * In-process cluster for integration tests: embedded ZooKeeper + controller + N data nodes.
+ * This is the primary correctness layer (tech design §16) — real sockets, real disk,
  * deterministic fault injection by killing components.
  */
 final class MiniCluster implements AutoCloseable {
     TestingServer zk;             // null when an external (containerized) ZK is supplied
+    /** Currently-live controllers only. Closed instances are removed immediately. */
     final List<Controller> metas = new ArrayList<>();
-    Controller meta;         // the first instance (initial leader) — legacy accessor
+    Controller meta;         // first currently-live slot in stable slot order — legacy accessor
     final List<DataNode> nodes = new ArrayList<>();
     final Path root;
     private final BiFunction<String, Integer, ControllerConfig> metaConfigFactory;
     private final int metadataServiceCount;
+    /** Stable controller slots let sharded tests kill/restart one fixed endpoint without shifting identity. */
+    private final Controller[] metaSlots;
+    /** Last endpoint bound by each slot; retained while that slot is stopped. */
+    private final String[] metaSlotEndpoints;
     private String zkConnect;
     // Node ids are now externally supplied (the ZK allocator was removed); each registering node
     // needs a unique id >= 1, stable across restarts on the same dataDir. We hand out ids from a
@@ -56,11 +61,15 @@ final class MiniCluster implements AutoCloseable {
 
     /**
      * A namespace-SHARDED cluster: {@code controllerCount} controllers on fixed ports, each configured with
-     * the full eligible-endpoint set and replica-count 1, so each namespace is owned by exactly one
-     * controller (rendezvous) and a non-owner answers NOT_LEADER carrying the owner endpoint. Exercises the
-     * owner-aware client's redirect/routing over the real write+read data path.
+     * the full eligible-endpoint set and a replica set containing every controller. Exactly one replica is
+     * active at a time; the remaining ordered replicas are eligible successors when owner failover is enabled.
+     * A non-owner answers NOT_LEADER carrying the active owner endpoint. Exercises the owner-aware client's
+     * redirect/routing over the real write+read data path.
      */
     static MiniCluster sharded(int dataNodeCount, int controllerCount) throws Exception {
+        if (controllerCount < 2) {
+            throw new IllegalArgumentException("sharded cluster requires at least two controllers");
+        }
         int[] ports = new int[controllerCount];
         List<String> endpoints = new ArrayList<>(controllerCount);
         for (int i = 0; i < controllerCount; i++) {
@@ -70,7 +79,8 @@ final class MiniCluster implements AutoCloseable {
         List<String> eligible = List.copyOf(endpoints);
         return new MiniCluster(dataNodeCount, null, controllerCount, (zk, idx) ->
                 new ControllerConfig(zk, ports[idx], 200, 1_000, 1_500, 300, 3_000, 60_000, 5_000, 20_000,
-                        "127.0.0.1", 90_000, eligible, 1, 2_000, 256, 30_000, 600_000L, 16, 100, 5)
+                        "127.0.0.1", 90_000, eligible, controllerCount,
+                        2_000, 256, 30_000, 600_000L, 16, 100, 5)
                         .withNamespaceLogBackend());
     }
 
@@ -86,6 +96,8 @@ final class MiniCluster implements AutoCloseable {
         this.root = Files.createTempDirectory("strata-it");
         this.metaConfigFactory = metaConfigFactory;
         this.metadataServiceCount = metaCount;
+        this.metaSlots = new Controller[metaCount];
+        this.metaSlotEndpoints = new String[metaCount];
         try {
             if (zkConnectOverride == null) {
                 this.zk = new TestingServer(true);
@@ -123,26 +135,107 @@ final class MiniCluster implements AutoCloseable {
         return metas.stream().map(Controller::endpoint).toList();
     }
 
+    /** All configured controller endpoints, including a fixed sharded endpoint that is currently stopped. */
+    List<String> configuredMetaEndpoints() {
+        List<String> endpoints = new ArrayList<>(metadataServiceCount);
+        for (int slot = 0; slot < metadataServiceCount; slot++) {
+            String endpoint = metaSlotEndpoints[slot];
+            if (endpoint == null) {
+                throw new IllegalStateException("controller slot " + slot + " has never started");
+            }
+            endpoints.add(endpoint);
+        }
+        return List.copyOf(endpoints);
+    }
+
+    /** Endpoint identity for a stable controller slot, retained across a stop/restart. */
+    String metaEndpoint(int slot) {
+        checkMetaSlot(slot);
+        String endpoint = metaSlotEndpoints[slot];
+        if (endpoint == null) {
+            throw new IllegalStateException("controller slot " + slot + " has never started");
+        }
+        return endpoint;
+    }
+
+    /** Currently-live controller in a stable slot, or {@code null} while that slot is stopped. */
+    Controller metaAtSlot(int slot) {
+        checkMetaSlot(slot);
+        return metaSlots[slot];
+    }
+
+    /**
+     * Legacy active-list kill: callers find an index in {@link #metas}. The closed instance is removed from
+     * that active view immediately; its stable slot can later be restarted with {@link #restartMeta(int)}.
+     */
     void killMeta(int index) throws IOException {
-        metas.get(index).close();
+        Controller victim = metas.get(index);
+        int slot = slotOf(victim);
+        stopMeta(slot);
+    }
+
+    /** Stops one stable controller slot and removes it from every active-cluster view. */
+    void stopMeta(int slot) throws IOException {
+        checkMetaSlot(slot);
+        Controller victim = metaSlots[slot];
+        if (victim == null) {
+            return;
+        }
+        metaSlots[slot] = null;
+        rebuildActiveMetas();
+        victim.close();
+    }
+
+    /** Starts a stopped stable slot. Sharded configurations bind the same fixed endpoint again. */
+    Controller startMeta(int slot) throws Exception {
+        checkMetaSlot(slot);
+        if (metaSlots[slot] != null) {
+            throw new IllegalStateException("controller slot " + slot + " is already running");
+        }
+        Controller started = new Controller(metaConfigFactory.apply(zkConnect, slot));
+        metaSlots[slot] = started;
+        metaSlotEndpoints[slot] = started.endpoint();
+        rebuildActiveMetas();
+        return started;
+    }
+
+    /** Stops and restarts one controller slot, preserving its fixed endpoint in sharded clusters. */
+    Controller restartMeta(int slot) throws Exception {
+        String before = metaEndpoint(slot);
+        stopMeta(slot);
+        Controller restarted = startMeta(slot);
+        if (!before.equals(restarted.endpoint())) {
+            throw new IllegalStateException("controller slot " + slot + " endpoint changed across restart: "
+                    + before + " -> " + restarted.endpoint());
+        }
+        return restarted;
     }
 
     void stopControllers() {
-        for (Controller m : metas) {
+        for (int slot = 0; slot < metaSlots.length; slot++) {
+            Controller controller = metaSlots[slot];
+            metaSlots[slot] = null;
+            if (controller == null) {
+                continue;
+            }
             try {
-                m.close();
+                controller.close();
             } catch (Exception ignored) {
             }
         }
-        metas.clear();
-        meta = null;
+        rebuildActiveMetas();
     }
 
     void startControllers() throws Exception {
-        for (int i = 0; i < metadataServiceCount; i++) {
-            metas.add(new Controller(metaConfigFactory.apply(zkConnect, i)));
+        for (int slot = 0; slot < metadataServiceCount; slot++) {
+            if (metaSlots[slot] != null) {
+                throw new IllegalStateException("controller slot " + slot + " is already running");
+            }
+            Controller started = new Controller(metaConfigFactory.apply(zkConnect, slot));
+            metaSlots[slot] = started;
+            metaSlotEndpoints[slot] = started.endpoint();
         }
-        this.meta = metas.get(0);
+        rebuildActiveMetas();
         awaitAnyLeader();
     }
 
@@ -162,7 +255,7 @@ final class MiniCluster implements AutoCloseable {
     DataNode addNode(String host) throws IOException {
         Path dir = root.resolve(host);
         DataNode node = new DataNode(
-                DataNodeConfig.withMetadata(dir, metaEndpoints(), host).withNodeId(nextNodeId++));
+                DataNodeConfig.withMetadata(dir, controllerSeedEndpoints(), host).withNodeId(nextNodeId++));
         nodes.add(node);
         return node;
     }
@@ -226,7 +319,8 @@ final class MiniCluster implements AutoCloseable {
         for (int i = 0; i < hosts.size(); i++) {
             Path dir = root.resolve(hosts.get(i));
             DataNode node = new DataNode(
-                    DataNodeConfig.withMetadata(dir, metaEndpoints(), hosts.get(i)).withNodeId(nodeIds.get(i)));
+                    DataNodeConfig.withMetadata(dir, controllerSeedEndpoints(), hosts.get(i))
+                            .withNodeId(nodeIds.get(i)));
             nodes.add(node);
         }
     }
@@ -255,12 +349,7 @@ final class MiniCluster implements AutoCloseable {
                 } catch (IOException ignored) {
                 }
             }
-            for (Controller m : metas) {
-                try {
-                    m.close();
-                } catch (Exception ignored) {
-                }
-            }
+            stopControllers();
             if (zk != null) {
                 zk.close();
             }
@@ -270,6 +359,45 @@ final class MiniCluster implements AutoCloseable {
             // which accumulates and fills the disk over many runs.
             deleteRecursively(root);
         }
+    }
+
+    /**
+     * Data nodes should retain every controller seed across a single-controller outage. Before the initial
+     * controller startup finishes, fall back to the live view (constructor cleanup is the only such caller).
+     */
+    private List<String> controllerSeedEndpoints() {
+        for (String endpoint : metaSlotEndpoints) {
+            if (endpoint == null) {
+                return metaEndpoints();
+            }
+        }
+        return configuredMetaEndpoints();
+    }
+
+    private int slotOf(Controller controller) {
+        for (int slot = 0; slot < metaSlots.length; slot++) {
+            if (metaSlots[slot] == controller) {
+                return slot;
+            }
+        }
+        throw new IllegalArgumentException("controller is not active in this cluster");
+    }
+
+    private void checkMetaSlot(int slot) {
+        if (slot < 0 || slot >= metaSlots.length) {
+            throw new IndexOutOfBoundsException("controller slot " + slot + " of " + metaSlots.length);
+        }
+    }
+
+    /** Rebuilds the compatibility list in stable slot order, excluding every stopped/closed controller. */
+    private void rebuildActiveMetas() {
+        metas.clear();
+        for (Controller controller : metaSlots) {
+            if (controller != null) {
+                metas.add(controller);
+            }
+        }
+        meta = metas.isEmpty() ? null : metas.get(0);
     }
 
     private static void deleteRecursively(Path dir) {

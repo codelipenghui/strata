@@ -2,6 +2,7 @@ package io.strata.node;
 
 import io.strata.common.Closeables;
 import io.strata.common.ChunkId;
+import io.strata.common.Crc;
 import io.strata.common.ErrorCode;
 import io.strata.common.ScpException;
 import io.strata.common.StrataNamespace;
@@ -13,6 +14,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -39,6 +42,7 @@ import static io.strata.common.Fsync.forceDirectory;
  */
 public final class DataNode implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(DataNode.class);
+    private static final int OWNER_EPOCH_JOURNAL_MAGIC = 0x534F4546; // "SOEF"
 
     private final DataNodeConfig config;
     private final ChunkStore store;
@@ -53,12 +57,11 @@ public final class DataNode implements AutoCloseable {
     private final Map<StrataNamespace, Object> ownerEpochLocks = new ConcurrentHashMap<>();
     private final Map<StrataNamespace, DeleteClaim> activeOrphanDeletes = new ConcurrentHashMap<>();
     private final Object ownerEpochPersistenceLock = new Object();
-    // Process-local observations still fence ordinary owner RPCs, but only a dedicated orphan-confirm
-    // response from a configured controller endpoint, after that server validates consensus authority,
-    // may raise the volume-bound floor. This trusts that configured endpoint addresses reach real
-    // controllers (the node initiates the connection); SCP itself is plaintext and unauthenticated, so any
-    // transport security must come from the deployment network. Persisting epochs supplied by arbitrary
-    // inbound callers would turn a process-lifetime DoS into a permanent one.
+    // Process-local observations still fence ordinary owner RPCs. Durable raises come from either a
+    // dedicated orphan-confirm response obtained from a configured controller endpoint or the metadata-only
+    // INSTALL_OWNER_EPOCH RPC used before owner repair/destruction. SCP's client-kind byte is not
+    // authentication: production deployments must restrict the data-node control listener to the trusted
+    // controller network until transport authentication is added.
     private final Map<StrataNamespace, Long> highestOwnerEpochByNamespace = new ConcurrentHashMap<>();
     private final Map<StrataNamespace, Long> durableOwnerEpochByNamespace = new HashMap<>();
     private volatile Exception ownerEpochPersistenceFailure;
@@ -374,15 +377,14 @@ public final class DataNode implements AutoCloseable {
                     return;
                 }
 
-                Map<StrataNamespace, Long> raised = new HashMap<>(durableOwnerEpochByNamespace);
-                raised.put(namespace, ownerEpoch);
                 try {
-                    persistOwnerEpochs(config.dataDir(), raised);
+                    appendOwnerEpoch(config.dataDir(), namespace, ownerEpoch);
                 } catch (IOException | RuntimeException e) {
-                    // The failure may have happened after rename but before the directory fsync. Poison the
-                    // durable-confirm/delete lane for this process so a later request cannot overwrite an
-                    // uncertain higher floor. Keep the accepted authoritative epoch as the volatile floor so
-                    // ordinary owner RPCs remain available without letting an older epoch through this process.
+                    // The failure may have happened after the journal write or file force but before the
+                    // directory force. Poison the durable-confirm/delete lane for this process so a later
+                    // request cannot overwrite an uncertain higher floor. Keep the accepted epoch as the
+                    // volatile floor so ordinary owner RPCs remain available without letting an older epoch
+                    // through this process.
                     highestOwnerEpochByNamespace.put(namespace, Math.max(seen, ownerEpoch));
                     ownerEpochPersistenceFailure = e;
                     log.error("failed to persist authoritative owner epoch floor namespace={} "
@@ -521,7 +523,7 @@ public final class DataNode implements AutoCloseable {
     }
 
     private Path ownerEpochFloorFile() {
-        return config.dataDir().resolve("owner-epochs.properties").toAbsolutePath();
+        return config.dataDir().resolve("owner-epochs.log").toAbsolutePath();
     }
 
     /** The set of owner endpoints this node has heard a VERIFY_CHUNKS from (orphan-GC membership grace). */
@@ -613,9 +615,17 @@ public final class DataNode implements AutoCloseable {
     /* ---------------- volume-bound owner epoch floors ---------------- */
 
     private static Map<StrataNamespace, Long> loadOwnerEpochs(Path dataDir) throws IOException {
+        Map<StrataNamespace, Long> loaded = loadLegacyOwnerEpochs(dataDir);
+        replayOwnerEpochJournal(dataDir, loaded);
+        migrateLegacyOwnerEpochs(dataDir, loaded);
+        return loaded;
+    }
+
+    /** Reads the old snapshot once during upgrade; all new raises append to the O(1) journal below. */
+    private static Map<StrataNamespace, Long> loadLegacyOwnerEpochs(Path dataDir) throws IOException {
         Path file = dataDir.resolve("owner-epochs.properties");
         if (!Files.exists(file)) {
-            return Map.of();
+            return new HashMap<>();
         }
         Properties properties = new StrictProperties();
         try (var in = Files.newInputStream(file)) {
@@ -655,23 +665,144 @@ public final class DataNode implements AutoCloseable {
         }
     }
 
-    private static void persistOwnerEpochs(Path dataDir, Map<StrataNamespace, Long> epochs) throws IOException {
-        Properties properties = new Properties();
-        for (Map.Entry<StrataNamespace, Long> entry : epochs.entrySet()) {
-            properties.setProperty(entry.getKey().value(), Long.toString(entry.getValue()));
+    private static void replayOwnerEpochJournal(
+            Path dataDir,
+            Map<StrataNamespace, Long> floors) throws IOException {
+        Path journal = dataDir.resolve("owner-epochs.log");
+        if (!Files.exists(journal)) {
+            return;
         }
-        Path file = dataDir.resolve("owner-epochs.properties");
-        Path tmp = dataDir.resolve("owner-epochs.properties.tmp");
-        try (FileChannel ch = FileChannel.open(tmp, StandardOpenOption.CREATE,
-                StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
-             var out = Channels.newOutputStream(ch)) {
-            properties.store(out, "strata data node owner epoch floors — bound to this volume");
-            out.flush();
-            ch.force(true);
+        try (FileChannel channel = FileChannel.open(journal, StandardOpenOption.READ)) {
+            long offset = 0;
+            while (offset < channel.size()) {
+                ByteBuffer header = ByteBuffer.allocate(Integer.BYTES * 2);
+                readOwnerEpochBytes(channel, header, journal, offset);
+                header.flip();
+                int magic = header.getInt();
+                int namespaceBytes = header.getInt();
+                if (magic != OWNER_EPOCH_JOURNAL_MAGIC
+                        || namespaceBytes <= 0
+                        || namespaceBytes > StrataNamespace.MAX_BYTES) {
+                    throw new IOException("invalid data node owner epoch journal frame at " + offset
+                            + " in " + journal);
+                }
+                ByteBuffer tail = ByteBuffer.allocate(namespaceBytes + Long.BYTES + Integer.BYTES);
+                readOwnerEpochBytes(channel, tail, journal, offset + header.capacity());
+                tail.flip();
+                byte[] namespaceRaw = new byte[namespaceBytes];
+                tail.get(namespaceRaw);
+                long epoch = tail.getLong();
+                int storedCrc = tail.getInt();
+                byte[] body = ownerEpochJournalBody(namespaceRaw, epoch);
+                if (storedCrc != Crc.of(body) || epoch <= 0) {
+                    throw new IOException("invalid data node owner epoch journal checksum/epoch at "
+                            + offset + " in " + journal);
+                }
+                StrataNamespace namespace;
+                try {
+                    namespace = StrataNamespace.of(new String(namespaceRaw, StandardCharsets.US_ASCII));
+                } catch (IllegalArgumentException e) {
+                    throw new IOException("invalid namespace in data node owner epoch journal at "
+                            + offset + " in " + journal, e);
+                }
+                long previous = floors.getOrDefault(namespace, 0L);
+                if (epoch < previous) {
+                    throw new IOException("regressing data node owner epoch journal entry for "
+                            + namespace + ": " + epoch + " < " + previous);
+                }
+                floors.put(namespace, epoch);
+                offset += header.capacity() + tail.capacity();
+            }
         }
-        Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING,
-                StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    private static void appendOwnerEpoch(
+            Path dataDir,
+            StrataNamespace namespace,
+            long epoch) throws IOException {
+        ByteBuffer frame = ownerEpochJournalFrame(namespace, epoch);
+        Path journal = dataDir.resolve("owner-epochs.log");
+        try (FileChannel channel = FileChannel.open(
+                journal, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
+            while (frame.hasRemaining()) {
+                channel.write(frame);
+            }
+            channel.force(true);
+        }
+        // The extra directory force is cheap on this cold, owner-transition-only path and closes the
+        // uncertain first-create window even after a prior process failed between file force and dir force.
         forceDirectory(dataDir);
+    }
+
+    private static void migrateLegacyOwnerEpochs(
+            Path dataDir,
+            Map<StrataNamespace, Long> floors) throws IOException {
+        Path legacy = dataDir.resolve("owner-epochs.properties");
+        if (!Files.exists(legacy)) {
+            // A crash before publishing the temporary compacted image leaves no authoritative state here.
+            Files.deleteIfExists(dataDir.resolve("owner-epochs.log.migrating"));
+            return;
+        }
+        Path journal = dataDir.resolve("owner-epochs.log");
+        Path migrating = dataDir.resolve("owner-epochs.log.migrating");
+        try (FileChannel channel = FileChannel.open(
+                migrating, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE)) {
+            // Emit one compact frame per merged floor instead of copying the old journal. If the journal
+            // publish succeeds but the legacy rename is interrupted, the next boot repeats this operation
+            // at the same bounded size rather than appending O(namespaces) duplicate history forever.
+            for (Map.Entry<StrataNamespace, Long> floor : floors.entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey(
+                            java.util.Comparator.comparing(StrataNamespace::value)))
+                    .toList()) {
+                ByteBuffer frame = ownerEpochJournalFrame(floor.getKey(), floor.getValue());
+                while (frame.hasRemaining()) {
+                    channel.write(frame);
+                }
+            }
+            channel.force(true);
+        }
+        Files.move(migrating, journal,
+                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        forceDirectory(dataDir);
+
+        // Rename only after a complete merged journal was atomically published. A crash before journal
+        // publication leaves the prior journal + legacy snapshot intact; a crash before this legacy rename
+        // repeats a safe, idempotent migration on the next startup.
+        Files.move(legacy, dataDir.resolve("owner-epochs.properties.migrated"),
+                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        forceDirectory(dataDir);
+    }
+
+    private static ByteBuffer ownerEpochJournalFrame(StrataNamespace namespace, long epoch) {
+        byte[] namespaceRaw = namespace.value().getBytes(StandardCharsets.US_ASCII);
+        byte[] body = ownerEpochJournalBody(namespaceRaw, epoch);
+        return ByteBuffer.allocate(body.length + Integer.BYTES)
+                .put(body)
+                .putInt(Crc.of(body))
+                .flip();
+    }
+
+    private static byte[] ownerEpochJournalBody(byte[] namespaceRaw, long epoch) {
+        return ByteBuffer.allocate(Integer.BYTES * 2 + namespaceRaw.length + Long.BYTES)
+                .putInt(OWNER_EPOCH_JOURNAL_MAGIC)
+                .putInt(namespaceRaw.length)
+                .put(namespaceRaw)
+                .putLong(epoch)
+                .array();
+    }
+
+    private static void readOwnerEpochBytes(
+            FileChannel channel,
+            ByteBuffer target,
+            Path journal,
+            long offset) throws IOException {
+        while (target.hasRemaining()) {
+            if (channel.read(target) < 0) {
+                throw new IOException("truncated data node owner epoch journal frame at "
+                        + offset + " in " + journal);
+            }
+        }
     }
 
     @Override

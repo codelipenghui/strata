@@ -43,6 +43,12 @@ public final class Messages {
         }
     }
 
+    private static void requirePositiveOwnerEpoch(long ownerEpoch) {
+        if (ownerEpoch <= 0) {
+            throw new IllegalArgumentException("ownerEpoch must be positive: " + ownerEpoch);
+        }
+    }
+
     private static void requireNonNegativeRecoveryEpoch(int recoveryEpoch) {
         if (recoveryEpoch < 0) {
             throw new IllegalArgumentException("recoveryEpoch must be non-negative: " + recoveryEpoch);
@@ -1610,6 +1616,30 @@ public final class Messages {
             for (int i = 0; i < n; i++) ids.add(ChunkId.readFrom(b));
             TaggedFields tags = TaggedFields.readFrom(b);
             return new VerifyChunks(ns, verifier, ids, readU64Tag(tags, TAG_OWNER_EPOCH, "ownerEpoch"));
+        }
+    }
+
+    /**
+     * Metadata owner -> data node: durably installs a positive owner-epoch floor for one namespace before
+     * issuing destructive owner RPCs. The data node accepts this request only from a metadata-role SCP
+     * connection; the fixed field is mandatory rather than an optional compatibility tag.
+     */
+    public record InstallOwnerEpoch(StrataNamespace namespace, long ownerEpoch) {
+        public InstallOwnerEpoch {
+            namespace = Objects.requireNonNull(namespace, "namespace");
+            requirePositiveOwnerEpoch(ownerEpoch);
+        }
+
+        public byte[] encode() {
+            BufWriter w = new BufWriter();
+            w.namespace(namespace).u64(ownerEpoch).noTags();
+            return w.toBytes();
+        }
+
+        public static InstallOwnerEpoch decode(ByteBuffer b) {
+            InstallOwnerEpoch m = new InstallOwnerEpoch(StrataNamespace.readFrom(b), b.getLong());
+            TaggedFields.readFrom(b);
+            return m;
         }
     }
 

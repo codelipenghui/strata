@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -69,16 +70,19 @@ class RecordsTest {
         assertEquals(2, record.ackQuorum());
         assertTrue(record.fsyncOnAck());
         assertEquals(5, record.writerEpoch());
+        assertEquals(4, record.nextChunkIndex());
         assertTrue(record.createdBy(11, 22));
         assertFalse(record.createdBy(11, 23));
         assertEquals(FileState.SEALED, record.withState(FileState.SEALED).state());
         assertEquals(0, record.withChunks(List.of()).chunks().size());
         assertEquals(5, record.withChunks(List.of()).writerEpoch());
+        assertEquals(4, record.withChunks(List.of()).nextChunkIndex());
         assertEquals(6, record.withWriterEpoch(6).writerEpoch());
         Records.FileRecord typed = new Records.FileRecord(fileId, StrataNamespace.of("typed"),
                 StrataPath.of("/typed-file"), 3, 2, false,
                 FileState.OPEN, 1234, List.of());
         assertTrue(typed.createdBy(0, 0));
+        assertEquals(0, typed.nextChunkIndex());
         assertEquals(StrataPath.of("/typed-file"), typed.path());
         assertEquals(record, Records.FileRecord.decode(record.encode()));
         assertThrows(IllegalArgumentException.class,
@@ -96,11 +100,56 @@ class RecordsTest {
                         StrataPath.of("/bad-non-intersecting-quorum"),
                         4, 2, false, FileState.OPEN, 1234,
                         List.of()));
+        assertThrows(IllegalArgumentException.class,
+                () -> new Records.FileRecord(fileId, StrataNamespace.of("test"),
+                        StrataPath.of("/bad-chunk-high-water-mark"),
+                        3, 2, false, 5, FileState.OPEN, 1234,
+                        List.of(chunk), 0, 0, 3));
 
         byte[] invalid = record.encode();
         invalid[0] = 99;
         assertThrows(IllegalArgumentException.class, () -> Records.FileRecord.decode(invalid));
         assertThrows(IllegalArgumentException.class, () -> Records.FileRecord.decode(legacyFileRecordBytes(fileId)));
+    }
+
+    @Test
+    void fileRecordNextChunkIndexIsMonotonicAcrossTailRemovalAndRoundtrip() {
+        Records.ChunkRecord chunk3 = new Records.ChunkRecord(
+                3, ChunkState.SEALED, 4096, 0xAA, 5, List.of(7, 8));
+        Records.FileRecord record = new Records.FileRecord(
+                FileId.of(1), "test", "/chunk-high-water", 3, 2, true,
+                FileState.OPEN, 1234, List.of(chunk3));
+        assertEquals(4, record.nextChunkIndex());
+
+        Records.FileRecord afterRemoval = record.withChunks(List.of());
+        assertEquals(4, afterRemoval.nextChunkIndex(), "removing the tail must not lower the high-water mark");
+
+        Records.ChunkRecord chunk7 = new Records.ChunkRecord(
+                7, ChunkState.OPEN, 0, 0, 6, List.of(7, 8));
+        Records.FileRecord afterAddition = afterRemoval.withChunks(List.of(chunk7));
+        assertEquals(8, afterAddition.nextChunkIndex(), "adding a chunk must raise the high-water mark");
+
+        Records.FileRecord removedAgain = afterAddition.withChunks(List.of());
+        assertEquals(8, removedAgain.nextChunkIndex());
+        assertEquals(removedAgain, Records.FileRecord.decode(removedAgain.encode()));
+    }
+
+    @Test
+    void fileRecordV7DecodeMigratesHighWaterMarkFromLiveChunks() {
+        Records.ChunkRecord chunk3 = new Records.ChunkRecord(
+                3, ChunkState.SEALED, 4096, 0xAA, 5, List.of(7, 8), 33, 44);
+        Records.FileRecord source = new Records.FileRecord(
+                FileId.of(1), "test", "/legacy-v7", 3, 2, true,
+                FileState.OPEN, 1234, List.of(chunk3), 11, 22);
+
+        Records.FileRecord migrated = Records.FileRecord.decode(fileRecordV7Bytes(source));
+
+        assertEquals(source, migrated);
+        assertEquals(4, migrated.nextChunkIndex());
+        Records.FileRecord afterRemoval = migrated.withChunks(List.of());
+        assertEquals(4, afterRemoval.nextChunkIndex());
+        assertEquals(8, Byte.toUnsignedInt(afterRemoval.encode()[0]));
+        assertEquals(afterRemoval, Records.FileRecord.decode(afterRemoval.encode()));
     }
 
     @Test
@@ -184,6 +233,58 @@ class RecordsTest {
     }
 
     @Test
+    void namespaceAssignmentV2RoundTripsLeaderIncarnation() {
+        UUID incarnation = UUID.randomUUID();
+        Records.NamespaceAssignment assignment = new Records.NamespaceAssignment(
+                StrataNamespace.of("tenant-a"), 7, List.of("m2:9301", "m3:9301"), incarnation);
+
+        Records.NamespaceAssignment decoded = Records.NamespaceAssignment.decode(assignment.encode());
+
+        assertEquals(assignment, decoded);
+        assertTrue(decoded.hasBoundLeader());
+        assertEquals(incarnation, decoded.leaderIncarnation());
+    }
+
+    @Test
+    void namespaceAssignmentV1MigratesToFailClosedUnboundLeader() {
+        Records.NamespaceAssignment decoded =
+                Records.NamespaceAssignment.decode(namespaceAssignmentV1Bytes(false));
+
+        assertEquals(StrataNamespace.of("legacy-assignment"), decoded.namespace());
+        assertEquals(List.of("m1:9301", "m2:9301"), decoded.replicaSet());
+        assertFalse(decoded.hasBoundLeader());
+        assertEquals(Records.NamespaceAssignment.UNBOUND_LEADER_INCARNATION,
+                decoded.leaderIncarnation());
+    }
+
+    @Test
+    void namespaceAssignmentRejectsMalformedOrTrailingIncarnationBytes() {
+        assertThrows(IllegalArgumentException.class,
+                () -> Records.NamespaceAssignment.decode(namespaceAssignmentV2WithUuidBytes(8)));
+        assertThrows(IllegalArgumentException.class,
+                () -> Records.NamespaceAssignment.decode(namespaceAssignmentV2WithUuidBytes(17)));
+        assertThrows(IllegalArgumentException.class,
+                () -> Records.NamespaceAssignment.decode(namespaceAssignmentV1Bytes(true)));
+    }
+
+    @Test
+    void namespaceAssignmentRejectsTruncationAndInvalidReplicaSets() {
+        assertThrows(IllegalArgumentException.class,
+                () -> Records.NamespaceAssignment.decode(Records.sealRecord(new byte[0])));
+        BufWriter emptyReplicaSet = new BufWriter();
+        emptyReplicaSet.u8(2).string("decoded-empty").i32(0).varint(0).u64(1).u64(2);
+        assertThrows(IllegalArgumentException.class,
+                () -> Records.NamespaceAssignment.decode(
+                        Records.sealRecord(emptyReplicaSet.toBytes())));
+        assertThrows(IllegalArgumentException.class, () -> new Records.NamespaceAssignment(
+                StrataNamespace.of("empty"), 0, List.of(), UUID.randomUUID()));
+        assertThrows(IllegalArgumentException.class, () -> new Records.NamespaceAssignment(
+                StrataNamespace.of("blank"), 0, List.of("m1:9301", " "), UUID.randomUUID()));
+        assertThrows(IllegalArgumentException.class, () -> new Records.NamespaceAssignment(
+                StrataNamespace.of("duplicate"), 0, List.of("m1:9301", "m1:9301"), UUID.randomUUID()));
+    }
+
+    @Test
     void recordEncodingCarriesCrcThatCatchesSilentCorruption() {
         Records.ChunkRecord chunk = new Records.ChunkRecord(3, ChunkState.SEALED, 4096, 0xAA, 5,
                 List.of(7, 8), 33, 44);
@@ -225,11 +326,52 @@ class RecordsTest {
         return Records.sealRecord(w.toBytes());
     }
 
+    private static byte[] fileRecordV7Bytes(Records.FileRecord record) {
+        BufWriter w = new BufWriter();
+        w.u8(7);
+        w.fileId(record.fileId());
+        w.string(record.namespace().toString()).string(record.path().toString());
+        w.u32(record.replicationFactor()).u32(record.ackQuorum()).u8(record.fsyncOnAck() ? 1 : 0);
+        w.i32(record.writerEpoch()).u8(record.state().value).u64(record.createdAtMs());
+        w.u64(record.createOpMsb()).u64(record.createOpLsb());
+        w.varint(record.chunks().size());
+        for (Records.ChunkRecord chunk : record.chunks()) {
+            w.u32(chunk.index()).u8(chunk.state().value).u64(chunk.length()).u32(chunk.crc())
+                    .i32(chunk.writeEpoch());
+            w.u64(chunk.createOpMsb()).u64(chunk.createOpLsb());
+            w.varint(chunk.replicas().size());
+            for (int replica : chunk.replicas()) {
+                w.u32(replica);
+            }
+        }
+        return Records.sealRecord(w.toBytes());
+    }
+
     private static byte[] namespaceManifestV1Bytes() {
         BufWriter w = new BufWriter();
         w.u8(1).string("legacy").u64(4).u64(5).u64(1024).u64(2048);
         writeOptionalFileId(w, Optional.of(FileId.of(21)));
         writeOptionalFileId(w, Optional.of(FileId.of(22)));
+        return Records.sealRecord(w.toBytes());
+    }
+
+    private static byte[] namespaceAssignmentV1Bytes(boolean trailingByte) {
+        BufWriter w = new BufWriter();
+        w.u8(1).string("legacy-assignment").i32(3).varint(2)
+                .string("m1:9301").string("m2:9301");
+        if (trailingByte) {
+            w.u8(1);
+        }
+        return Records.sealRecord(w.toBytes());
+    }
+
+    private static byte[] namespaceAssignmentV2WithUuidBytes(int uuidBytes) {
+        BufWriter w = new BufWriter();
+        w.u8(2).string("bad-assignment").i32(3).varint(2)
+                .string("m1:9301").string("m2:9301");
+        for (int i = 0; i < uuidBytes; i++) {
+            w.u8(i);
+        }
         return Records.sealRecord(w.toBytes());
     }
 

@@ -3,6 +3,9 @@ package io.strata.meta;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+
+import java.util.List;
+
 import org.junit.jupiter.api.Test;
 
 class ControllerConfigDefaultsTest {
@@ -28,6 +31,7 @@ class ControllerConfigDefaultsTest {
     @Test
     void newTuningFieldsDefault() {
         ControllerConfig c = new ControllerConfig("zk:2181", 9100, 3000, 60000, 300000, 5000, 30000);
+        assertEquals(ControllerConfig.DEFAULT_ZK_SESSION_TIMEOUT_MS, c.zkSessionTimeoutMs());
         assertEquals(2_000, c.verifyIntervalMs());
         assertEquals(256, c.verifyBatchSize());
         assertEquals(30_000, c.systemVerifyIntervalMs());
@@ -47,7 +51,9 @@ class ControllerConfigDefaultsTest {
         ControllerConfig c = new ControllerConfig("zk:2181", 9100, 3000, 60000, 300000, 5000, 30000)
                 .withVerifyIntervalMs(500).withVerifyBatchSize(64).withSystemVerifyIntervalMs(10_000)
                 .withDeletedTombstoneTtlMs(120_000).withMaxCommandsPerHeartbeat(64)
-                .withZkRetryBaseMs(50).withZkRetryMaxRetries(9).withNamespaceLogBackend();
+                .withZkRetryBaseMs(50).withZkRetryMaxRetries(9).withZkSessionTimeoutMs(7_500)
+                .withNamespaceLogBackend();
+        assertEquals(7_500, c.zkSessionTimeoutMs());
         assertEquals(500, c.verifyIntervalMs());
         assertEquals(64, c.verifyBatchSize());
         assertEquals(10_000, c.systemVerifyIntervalMs());
@@ -70,6 +76,7 @@ class ControllerConfigDefaultsTest {
         assertThrows(IllegalArgumentException.class, () -> base.withVerifyIntervalMs(0));
         assertThrows(IllegalArgumentException.class, () -> base.withVerifyBatchSize(-1));
         assertThrows(IllegalArgumentException.class, () -> base.withMaxCommandsPerHeartbeat(0));
+        assertThrows(IllegalArgumentException.class, () -> base.withZkSessionTimeoutMs(0));
         assertThrows(IllegalArgumentException.class, () -> base.withZkRetryMaxRetries(-1));
         assertThrows(IllegalArgumentException.class, () -> base.withMetadataBackend(
                 new ControllerConfig.MetadataBackendConfig("namespace-log", 2, 3, false,
@@ -81,6 +88,25 @@ class ControllerConfigDefaultsTest {
         // 0 retries is valid (means no retry)
         assertDoesNotThrow(() -> base.withZkRetryMaxRetries(0));
         assertEquals(0, base.withZkRetryMaxRetries(0).zkRetryMaxRetries());
+    }
+
+    @Test
+    void shardedModeRequiresARealFailoverReplicaSet() {
+        ControllerConfig base =
+                new ControllerConfig("zk:2181", 9100, 3000, 60000, 300000, 5000, 30000);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> base.withControllerEndpoints(List.of("ctrl-a:9100", "ctrl-b:9100"), 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> base.withControllerEndpoints(List.of("ctrl-a:9100", "ctrl-b:9100"), 3));
+        assertThrows(IllegalArgumentException.class,
+                () -> base.withControllerEndpoints(List.of("ctrl-a:9100", "ctrl-a:9100"), 2));
+        assertThrows(IllegalArgumentException.class,
+                () -> base.withControllerEndpoints(List.of("ctrl-a:9100"), 3));
+        assertDoesNotThrow(
+                () -> base.withControllerEndpoints(List.of("ctrl-a:9100"), 1));
+        assertDoesNotThrow(
+                () -> base.withControllerEndpoints(List.of("ctrl-a:9100", "ctrl-b:9100"), 2));
     }
 
     @Test

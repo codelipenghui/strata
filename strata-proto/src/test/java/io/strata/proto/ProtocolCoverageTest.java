@@ -245,6 +245,33 @@ class ProtocolCoverageTest {
     }
 
     @Test
+    void installOwnerEpochRequiresAnExactPositiveEpochAndExtensibleTags() {
+        StrataNamespace namespace = StrataNamespace.of("test");
+        Messages.InstallOwnerEpoch request = new Messages.InstallOwnerEpoch(namespace, 7);
+        byte[] encoded = request.encode();
+
+        assertEquals(request, Messages.InstallOwnerEpoch.decode(ByteBuffer.wrap(encoded)));
+        assertThrows(BufferUnderflowException.class, () -> Messages.InstallOwnerEpoch.decode(
+                ByteBuffer.wrap(Arrays.copyOf(encoded, encoded.length - 1))));
+        assertThrows(NullPointerException.class,
+                () -> new Messages.InstallOwnerEpoch(null, 7));
+        assertThrows(IllegalArgumentException.class,
+                () -> new Messages.InstallOwnerEpoch(namespace, 0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new Messages.InstallOwnerEpoch(namespace, -1));
+
+        BufWriter zeroEpoch = new BufWriter();
+        zeroEpoch.namespace(namespace).u64(0).noTags();
+        assertThrows(IllegalArgumentException.class,
+                () -> Messages.InstallOwnerEpoch.decode(ByteBuffer.wrap(zeroEpoch.toBytes())));
+
+        BufWriter extended = new BufWriter();
+        extended.namespace(namespace).u64(7);
+        TaggedFields.of(Map.of(99, new byte[] {4, 5})).writeTo(extended);
+        assertEquals(request, Messages.InstallOwnerEpoch.decode(ByteBuffer.wrap(extended.toBytes())));
+    }
+
+    @Test
     void sealChunkRejectsMalformedOwnerEpochTag() {
         StrataNamespace namespace = StrataNamespace.of("test");
         ChunkId chunkId = new ChunkId(FileId.of(0x0102030405060708L), 3);

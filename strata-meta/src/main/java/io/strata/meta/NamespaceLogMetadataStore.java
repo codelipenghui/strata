@@ -45,6 +45,11 @@ public final class NamespaceLogMetadataStore implements MetadataStore, Namespace
         backend.setOwnership(ownsNamespace);
     }
 
+    /** Production sharded binding: includes persisted assignment-revision fencing and loss callbacks. */
+    void setOwnership(NamespaceOwnership ownership) {
+        backend.setOwnership(ownership);
+    }
+
     /** Process-wide metadata-log counters (append/compaction/recovery), surfaced as Prometheus metrics. */
     NamespaceLogMetrics metrics() {
         return backend.metrics();
@@ -78,6 +83,11 @@ public final class NamespaceLogMetadataStore implements MetadataStore, Namespace
     @Override
     public long authoritativeOwnerEpoch(StrataNamespace namespace) throws Exception {
         return backend.authoritativeOwnerEpoch(namespace);
+    }
+
+    @Override
+    public boolean requiresDurableOwnerEpochFence(StrataNamespace namespace) {
+        return backend.requiresDurableOwnerEpochFence(namespace);
     }
 
     @Override

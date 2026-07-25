@@ -17,6 +17,7 @@ import io.strata.proto.RequestObserver;
 import io.strata.proto.ScpClient;
 import io.strata.proto.ScpServer;
 import org.apache.curator.framework.recipes.leader.LeaderLatch;
+import org.apache.curator.framework.recipes.leader.LeaderLatchListener;
 import org.apache.zookeeper.KeeperException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,6 +31,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BiFunction;
@@ -37,8 +39,9 @@ import java.util.function.UnaryOperator;
 
 /**
  * Controller (tech design §4): the metadata plane — a ZooKeeper-backed MetadataStore behind the SCP
- * control surface, plus the per-namespace metadata logs. Single active cluster leader (Curator
- * LeaderLatch); a controller that does not own a namespace answers NOT_LEADER with the owner's hint.
+ * control surface, plus the per-namespace metadata logs. A single active cluster coordinator (Curator
+ * LeaderLatch) CAS-promotes dead namespace owners in sharded mode; a controller that does not own a
+ * namespace answers NOT_LEADER with the persisted owner's hint.
  * Placement, leases, repair, and retention orchestration live here.
  */
 public final class Controller implements AutoCloseable {
@@ -56,6 +59,7 @@ public final class Controller implements AutoCloseable {
     private final String advertisedEndpoint;  // this node's reachable host:port — the leader hint clients redirect to
     private final NamespaceOwnership ownership; // resolves each namespace owner (tech design §4.5)
     private final NamespaceLeadership namespaceLeadership; // optional: namespace-log ACTIVE/RECOVERING barrier
+    private final AtomicBoolean initialized = new AtomicBoolean();
     private final AtomicLong lastSystemNamespaceRejectWarnMs = new AtomicLong();
     private final LongAdder metadataStoreNamespaceContractViolations = new LongAdder();
 
@@ -84,6 +88,7 @@ public final class Controller implements AutoCloseable {
         boolean embedded = advertisedEndpoint != null;
         ZkMetadataStore openedStore = null;
         LeaderLatch openedLatch = null;
+        NamespaceOwnership openedOwnership = null;
         RepairCoordinator openedRepair = null;
         ScpServer openedServer = null;
         try {
@@ -110,15 +115,19 @@ public final class Controller implements AutoCloseable {
             MetadataStore backendStore = backendFactory.apply(openedStore, this.advertisedEndpoint);
             NodeRegistry openedRegistry = new NodeRegistry(backendStore, config);
             openedLatch = new LeaderLatch(openedStore.curator(), "/strata/leader", this.advertisedEndpoint);
-            // Static rendezvous ownership over the configured controller endpoints (tech design §4.5). With an
-            // empty/single-endpoint membership this node owns every namespace (no behavior change).
-            NamespaceOwnership openedOwnership = new NamespaceOwnership(this.advertisedEndpoint,
-                    config.controllerEndpoints(), 0, config.controllerReplicaCount());
+            // In sharded mode configured endpoints seed only the first persisted replica order. Serving,
+            // redirects, and failover thereafter use the versioned ZooKeeper assignment exclusively.
+            openedOwnership = config.controllerEndpoints().size() <= 1
+                    ? new NamespaceOwnership(this.advertisedEndpoint,
+                            config.controllerEndpoints(), 0, config.controllerReplicaCount())
+                    : NamespaceOwnership.persistent(openedStore, this.advertisedEndpoint,
+                            config.controllerEndpoints(), 0, config.controllerReplicaCount(),
+                            openedLatch::hasLeadership, config.reconcileIntervalMs());
             NamespaceLeadership openedNamespaceLeadership = null;
             // Eager namespace recovery on the namespace-log backend is scoped to the namespaces this
             // node owns, so it never republishes (and fences) another owner's namespace.
             if (backendStore instanceof NamespaceLogMetadataStore namespaceLog) {
-                namespaceLog.setOwnership(openedOwnership::isOwner);
+                namespaceLog.setOwnership(openedOwnership);
                 openedNamespaceLeadership = namespaceLog;
             }
             // Repair's orphan-deletion is gated on owning every namespace (a sharded controller never
@@ -136,13 +145,27 @@ public final class Controller implements AutoCloseable {
             this.repair = openedRepair;
             this.ownership = openedOwnership;
             this.namespaceLeadership = openedNamespaceLeadership;
+            NamespaceOwnership ownershipForLeadership = openedOwnership;
+            openedLatch.addListener(new LeaderLatchListener() {
+                @Override
+                public void isLeader() {
+                    ownershipForLeadership.requestFullReconcile();
+                }
+
+                @Override
+                public void notLeader() {
+                    // Membership/assignment authority remains readable; only promotion is coordinator-scoped.
+                }
+            });
             // The owner-pull verifier identifies itself by its advertised endpoint (tech design §9.2) so a
-            // node can record which owner attested each chunk; it is also this node's rendezvous identity.
+            // node can record which persisted-assignment owner attested each chunk.
             openedRepair.advertisedEndpoint(this.advertisedEndpoint);
             openedLatch.start();
             openedRepair.start();
+            initialized.set(true);
         } catch (Exception e) {
-            Throwable closeFailure = closeAll(openedRepair, openedServer, openedLatch, openedStore);
+            Throwable closeFailure =
+                    closeAll(openedRepair, openedServer, openedOwnership, openedLatch, openedStore);
             if (closeFailure != null) {
                 e.addSuppressed(closeFailure);
             }
@@ -154,7 +177,8 @@ public final class Controller implements AutoCloseable {
 
     /** Closes whatever subset of the service's resources exists; returns the accumulated failure. */
     private static Throwable closeAll(RepairCoordinator repair, ScpServer server,
-                                      LeaderLatch leaderLatch, MetadataStore store) {
+                                      NamespaceOwnership ownership, LeaderLatch leaderLatch,
+                                      MetadataStore store) {
         Throwable failure = null;
         if (repair != null) {
             try {
@@ -166,6 +190,13 @@ public final class Controller implements AutoCloseable {
         if (server != null) {
             try {
                 server.close();
+            } catch (RuntimeException e) {
+                failure = Closeables.suppress(failure, e);
+            }
+        }
+        if (ownership != null) {
+            try {
+                ownership.close();
             } catch (RuntimeException e) {
                 failure = Closeables.suppress(failure, e);
             }
@@ -265,8 +296,8 @@ public final class Controller implements AutoCloseable {
     }
 
     /**
-     * The configured controller-endpoint membership size — the number of controllers that share the
-     * namespaces (rendezvous-hash owners). Same on every node; {@code max()} across the fleet is the
+     * The configured controller-endpoint membership size — the bootstrap candidate set for persisted
+     * namespace assignments. Same on every node; {@code max()} across the fleet is the
      * controller-server count. Backend-independent (sharding is keyed on endpoint count, not the store kind).
      */
     public int controllerEndpointsConfigured() {
@@ -330,7 +361,7 @@ public final class Controller implements AutoCloseable {
         return metadataStoreNamespaceContractViolations.sum();
     }
 
-    /** This controller's rendezvous endpoint identity — the {@code owner} label for the namespace-owner
+    /** This controller's persisted-assignment endpoint identity — the {@code owner} label for the namespace-owner
      *  gauge ({@code strata_controller_namespace_owner}); same value the latch advertises. */
     public String localControllerEndpoint() {
         return ownership.localEndpoint();
@@ -517,6 +548,10 @@ public final class Controller implements AutoCloseable {
     }
 
     private Frame handle(Frame req) throws Exception {
+        if (!initialized.get()) {
+            throw new ScpException(ErrorCode.METADATA_RECOVERING,
+                    "controller is still initializing; retry");
+        }
         Opcode op = Opcode.fromCode(req.opcode());
         if (op == null) throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "0x" + Integer.toHexString(req.opcode()));
         ByteBuffer h = req.headerSlice();
@@ -801,6 +836,10 @@ public final class Controller implements AutoCloseable {
                             "tail chunk " + tail.index() + " is OPEN — seal or recover it first");
                 }
             }
+            int index = file.nextChunkIndex();
+            if (index == Integer.MAX_VALUE) {
+                throw new ScpException(ErrorCode.PRECONDITION_FAILED, "chunk index exhausted");
+            }
             List<NodeRegistry.LiveNode> nodes = Placement.choose(file.namespace(), registry,
                     file.replicationFactor(), Set.copyOf(m.excludedNodeIds()), Set.of());
             List<Integer> replicaIds = new ArrayList<>(file.replicationFactor());
@@ -809,8 +848,6 @@ public final class Controller implements AutoCloseable {
                 replicaIds.add(n.record.nodeId());
                 replicas.add(new Messages.Replica(n.record.nodeId(), n.record.endpoint()));
             }
-            int index = file.chunks().isEmpty() ? 0
-                    : file.chunks().get(file.chunks().size() - 1).index() + 1;
             List<Records.ChunkRecord> chunks = new ArrayList<>(file.chunks());
             chunks.add(new Records.ChunkRecord(index, ChunkState.OPEN, 0, 0, m.writeEpoch(), replicaIds,
                     m.opIdMsb(), m.opIdLsb()));
@@ -1071,6 +1108,7 @@ public final class Controller implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
-        Closeables.throwIfFailed(closeAll(repair, server, leaderLatch, store));
+        initialized.set(false);
+        Closeables.throwIfFailed(closeAll(repair, server, ownership, leaderLatch, store));
     }
 }

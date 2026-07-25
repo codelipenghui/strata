@@ -49,9 +49,12 @@ public final class ZkMetadataStore implements MetadataStore {
     // and one assignment record per namespace. Distinct from /strata/namespaces (user path/file
     // bindings) so the two never collide.
     private static final String META = "/strata/meta";
-    private static final String META_NAMESPACES = META + "/namespaces";
+    static final String META_NAMESPACES = META + "/namespaces";
     private static final String META_EPOCH = META + "/epoch";
     private static final String META_LIVE_NODES = META + "/live-nodes";
+    static final String META_CONTROLLERS = META + "/controllers";
+    static final String META_CONTROLLER_MEMBERS = META_CONTROLLERS + "/members";
+    static final String META_CONTROLLER_LIVE = META_CONTROLLERS + "/live";
     // Low-volume CAS counter for the system namespace's file ids (a handful of meta-log segments).
     private static final String META_SYS_FILE_ID = META + "/sys-file-id";
     // Global monotonic file-id counter for the ZK backend. File ids are globally unique in ZK
@@ -66,6 +69,18 @@ public final class ZkMetadataStore implements MetadataStore {
     // Per-subtree ZK request/byte counters (read vs write), populated on the I/O path and read back
     // by ServerMetrics as monotonic function-counters — pure accounting, never affects control flow.
     private final Map<String, Counters> zkStats = newStats();
+
+    /**
+     * ZooKeeper identity for one assignment-znode incarnation. A data-version alone is unsafe because
+     * delete/recreate resets it to zero; the creation zxid remains unique, and the modification zxid orders
+     * concurrent authoritative reads.
+     */
+    record NamespaceAssignmentState(
+            Records.NamespaceAssignment value,
+            int version,
+            long creationZxid,
+            long modifiedZxid) {
+    }
 
     public ZkMetadataStore(String zkConnect) {
         this(zkConnect, 60_000, 15_000);
@@ -122,7 +137,8 @@ public final class ZkMetadataStore implements MetadataStore {
 
     private void init() {
         try {
-            for (String path : new String[]{FILES, NAMESPACES, NODES, META, META_NAMESPACES}) {
+            for (String path : new String[]{FILES, NAMESPACES, NODES, META, META_NAMESPACES,
+                    META_CONTROLLERS, META_CONTROLLER_MEMBERS, META_CONTROLLER_LIVE}) {
                 try {
                     if (curator.checkExists().forPath(path) == null) {
                         curator.create().creatingParentsIfNeeded().forPath(path);
@@ -657,13 +673,44 @@ public final class ZkMetadataStore implements MetadataStore {
     @Override
     public Optional<Versioned<Records.NamespaceAssignment>> getNamespaceAssignment(StrataNamespace namespace)
             throws Exception {
+        return getNamespaceAssignmentState(namespace)
+                .map(state -> new Versioned<>(state.value(), state.version()));
+    }
+
+    Optional<NamespaceAssignmentState> getNamespaceAssignmentState(StrataNamespace namespace)
+            throws Exception {
         try {
             Stat stat = new Stat();
             byte[] data = curator.getData().storingStatIn(stat).forPath(assignmentPath(namespace));
-            return Optional.of(new Versioned<>(Records.NamespaceAssignment.decode(data), stat.getVersion()));
+            Records.NamespaceAssignment decoded = Records.NamespaceAssignment.decode(data);
+            if (!namespace.equals(decoded.namespace())) {
+                throw new IllegalArgumentException("namespace assignment path/payload mismatch: path="
+                        + namespace + " payload=" + decoded.namespace());
+            }
+            return Optional.of(new NamespaceAssignmentState(
+                    decoded,
+                    stat.getVersion(),
+                    stat.getCzxid(),
+                    stat.getMzxid()));
         } catch (KeeperException.NoNodeException e) {
             return Optional.empty();
         }
+    }
+
+    /**
+     * Synchronizes this Curator session with ZooKeeper before reading an assignment. Ownership fencing
+     * checks use this instead of a watch/cache value so a reconnect cannot validate a stale local owner.
+     */
+    public Optional<Versioned<Records.NamespaceAssignment>> getNamespaceAssignmentAuthoritative(
+            StrataNamespace namespace) throws Exception {
+        return getNamespaceAssignmentAuthoritativeState(namespace)
+                .map(state -> new Versioned<>(state.value(), state.version()));
+    }
+
+    Optional<NamespaceAssignmentState> getNamespaceAssignmentAuthoritativeState(
+            StrataNamespace namespace) throws Exception {
+        awaitSync(curator.sync(), assignmentPath(namespace), connectionTimeoutMs);
+        return getNamespaceAssignmentState(namespace);
     }
 
     @Override
@@ -698,7 +745,12 @@ public final class ZkMetadataStore implements MetadataStore {
             List<String> children = curator.getChildren().forPath(META_NAMESPACES);
             List<StrataNamespace> out = new ArrayList<>(children.size());
             for (String child : children) {
-                out.add(StrataNamespace.of(child));
+                try {
+                    out.add(StrataNamespace.of(child));
+                } catch (IllegalArgumentException invalidNamespace) {
+                    log.error("ignoring invalid namespace-assignment child under {}: {}",
+                            META_NAMESPACES, child, invalidNamespace);
+                }
             }
             return out;
         } catch (KeeperException.NoNodeException e) {
@@ -706,7 +758,7 @@ public final class ZkMetadataStore implements MetadataStore {
         }
     }
 
-    private static String assignmentPath(StrataNamespace namespace) {
+    static String assignmentPath(StrataNamespace namespace) {
         return META_NAMESPACES + "/" + namespace + "/assignment";
     }
 

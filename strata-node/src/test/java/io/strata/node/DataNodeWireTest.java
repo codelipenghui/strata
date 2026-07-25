@@ -27,6 +27,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -173,6 +174,203 @@ class DataNodeWireTest {
     }
 
     @Test
+    void authoritativeOwnerEpochUsesIncrementalFsyncedJournal() throws Exception {
+        DataNodeConfig config = DataNodeConfig.standalone(dir);
+        Path journal = dir.resolve("owner-epochs.log");
+        try (DataNode node = new DataNode(config)) {
+            node.acceptAuthoritativeOwnerEpoch(TEST_NS, 8);
+            long oneFrame = Files.size(journal);
+            node.acceptAuthoritativeOwnerEpoch(TEST_NS, 9);
+            assertEquals(oneFrame * 2, Files.size(journal),
+                    "raising one namespace appends one fixed-size frame instead of rewriting all floors");
+            assertFalse(Files.exists(dir.resolve("owner-epochs.properties")),
+                    "new volumes use the append journal; properties is migration input only");
+        }
+
+        try (DataNode restarted = new DataNode(config)) {
+            ScpException stale = assertThrows(ScpException.class,
+                    () -> restarted.acceptOwnerEpoch(TEST_NS, 8));
+            assertEquals(ErrorCode.FENCED_EPOCH, stale.code());
+            assertEquals(9, stale.detail());
+        }
+    }
+
+    @Test
+    void legacyOwnerEpochFloorMigratesThroughJournalAndSurvivesRestart() throws Exception {
+        StrataNamespace untouched = StrataNamespace.of("untouched");
+        Path legacy = dir.resolve("owner-epochs.properties");
+        Files.writeString(legacy, "test=8\nuntouched=11\n");
+        DataNodeConfig config = DataNodeConfig.standalone(dir);
+        try (DataNode node = new DataNode(config)) {
+            ScpException stale = assertThrows(ScpException.class,
+                    () -> node.acceptOwnerEpoch(TEST_NS, 7));
+            assertEquals(ErrorCode.FENCED_EPOCH, stale.code());
+            assertEquals(8, stale.detail());
+
+            node.acceptAuthoritativeOwnerEpoch(TEST_NS, 9);
+            assertTrue(Files.size(dir.resolve("owner-epochs.log")) > 0);
+            assertFalse(Files.exists(legacy));
+            assertTrue(Files.exists(dir.resolve("owner-epochs.properties.migrated")));
+        }
+
+        Files.delete(dir.resolve("owner-epochs.properties.migrated"));
+        try (DataNode restarted = new DataNode(config)) {
+            ScpException stale = assertThrows(ScpException.class,
+                    () -> restarted.acceptOwnerEpoch(TEST_NS, 8));
+            assertEquals(ErrorCode.FENCED_EPOCH, stale.code());
+            assertEquals(9, stale.detail(),
+                    "journal replay must override the lower legacy migration floor");
+            restarted.acceptOwnerEpoch(TEST_NS, 9);
+
+            ScpException untouchedStale = assertThrows(ScpException.class,
+                    () -> restarted.acceptOwnerEpoch(untouched, 10));
+            assertEquals(ErrorCode.FENCED_EPOCH, untouchedStale.code());
+            assertEquals(11, untouchedStale.detail(),
+                    "migration must journal floors that were never raised after upgrade");
+        }
+    }
+
+    @Test
+    void repeatedLegacyMigrationRetryKeepsJournalSizeBounded() throws Exception {
+        StrataNamespace untouched = StrataNamespace.of("untouched");
+        Path legacy = dir.resolve("owner-epochs.properties");
+        Path migrated = dir.resolve("owner-epochs.properties.migrated");
+        Path journal = dir.resolve("owner-epochs.log");
+        Files.writeString(legacy, "test=8\nuntouched=11\n");
+        DataNodeConfig config = DataNodeConfig.standalone(dir);
+
+        try (DataNode ignored = new DataNode(config)) {
+            assertTrue(Files.exists(migrated));
+        }
+        long compactSize = Files.size(journal);
+
+        for (int retry = 0; retry < 4; retry++) {
+            // Model a crash after the compact journal was published but before the legacy rename became
+            // durable: both the published journal and legacy input are visible on the next boot.
+            Files.copy(migrated, legacy, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            try (DataNode ignored = new DataNode(config)) {
+                assertEquals(compactSize, Files.size(journal),
+                        "migration retry must rewrite one frame per floor, not duplicate history");
+            }
+        }
+
+        try (DataNode restarted = new DataNode(config)) {
+            ScpException testStale = assertThrows(
+                    ScpException.class, () -> restarted.acceptOwnerEpoch(TEST_NS, 7));
+            assertEquals(8, testStale.detail());
+            ScpException untouchedStale = assertThrows(
+                    ScpException.class, () -> restarted.acceptOwnerEpoch(untouched, 10));
+            assertEquals(11, untouchedStale.detail());
+        }
+    }
+
+    @Test
+    void everyTornOwnerEpochFrameAndCorruptChecksumFailsStartupClosed() throws Exception {
+        Path seed = dir.resolve("seed");
+        DataNodeConfig seedConfig = DataNodeConfig.standalone(seed);
+        try (DataNode node = new DataNode(seedConfig)) {
+            node.acceptAuthoritativeOwnerEpoch(TEST_NS, 8);
+        }
+        byte[] frame = Files.readAllBytes(seed.resolve("owner-epochs.log"));
+
+        for (int cut = 1; cut < frame.length; cut++) {
+            Path firstFrame = dir.resolve("torn-first-" + cut);
+            Files.createDirectory(firstFrame);
+            Files.write(firstFrame.resolve("owner-epochs.log"), Arrays.copyOf(frame, cut));
+            IOException firstFailure = assertThrows(
+                    IOException.class, () -> new DataNode(DataNodeConfig.standalone(firstFrame)));
+            assertTrue(firstFailure.getMessage().contains("owner epoch journal"));
+
+            Path tailFrame = dir.resolve("torn-tail-" + cut);
+            Files.createDirectory(tailFrame);
+            byte[] fullThenTorn = ByteBuffer.allocate(frame.length + cut)
+                    .put(frame)
+                    .put(frame, 0, cut)
+                    .array();
+            Files.write(tailFrame.resolve("owner-epochs.log"), fullThenTorn);
+            IOException tailFailure = assertThrows(
+                    IOException.class, () -> new DataNode(DataNodeConfig.standalone(tailFrame)));
+            assertTrue(tailFailure.getMessage().contains("owner epoch journal"));
+        }
+
+        Path badChecksum = dir.resolve("bad-checksum");
+        Files.createDirectory(badChecksum);
+        byte[] corrupted = frame.clone();
+        corrupted[corrupted.length - 1] ^= 0x01;
+        Files.write(badChecksum.resolve("owner-epochs.log"), corrupted);
+        IOException checksumFailure = assertThrows(
+                IOException.class, () -> new DataNode(DataNodeConfig.standalone(badChecksum)));
+        assertTrue(checksumFailure.getMessage().contains("owner epoch journal"));
+    }
+
+    @Test
+    void regressingOwnerEpochJournalEntryFailsStartupClosed() throws Exception {
+        Path older = dir.resolve("older");
+        try (DataNode node = new DataNode(DataNodeConfig.standalone(older))) {
+            node.acceptAuthoritativeOwnerEpoch(TEST_NS, 8);
+        }
+        byte[] epochEight = Files.readAllBytes(older.resolve("owner-epochs.log"));
+
+        Path regressing = dir.resolve("regressing");
+        DataNodeConfig config = DataNodeConfig.standalone(regressing);
+        try (DataNode node = new DataNode(config)) {
+            node.acceptAuthoritativeOwnerEpoch(TEST_NS, 9);
+        }
+        Files.write(regressing.resolve("owner-epochs.log"), epochEight, StandardOpenOption.APPEND);
+
+        IOException failure = assertThrows(IOException.class, () -> new DataNode(config));
+        assertTrue(failure.getMessage().contains("regressing data node owner epoch"));
+    }
+
+    @Test
+    void installOwnerEpochWireRpcRequiresMetadataRoleAndPersistsFloor() throws Exception {
+        DataNodeConfig config = DataNodeConfig.standalone(dir);
+        try (DataNode node = new DataNode(config)) {
+            for (byte clientKind : new byte[] {
+                    ScpClient.KIND_BROKER, ScpClient.KIND_DATA_NODE, ScpClient.KIND_TOOL}) {
+                try (ScpClient unauthorized = new ScpClient(
+                        "127.0.0.1", node.port(), clientKind, "unauthorized-" + clientKind)) {
+                    ScpException denied = assertThrows(ScpException.class,
+                            () -> unauthorized.call(Opcode.INSTALL_OWNER_EPOCH,
+                                    new Messages.InstallOwnerEpoch(TEST_NS, 9).encode(), null, 5000));
+                    assertEquals(ErrorCode.PRECONDITION_FAILED, denied.code());
+                    assertTrue(denied.getMessage().contains("metadata client kind"));
+                }
+            }
+
+            try (ScpClient metadata = new ScpClient(
+                    "127.0.0.1", node.port(), ScpClient.KIND_METADATA, "metadata-owner")) {
+                metadata.call(Opcode.INSTALL_OWNER_EPOCH,
+                        new Messages.InstallOwnerEpoch(TEST_NS, 8).encode(), null, 5000);
+                metadata.call(Opcode.INSTALL_OWNER_EPOCH,
+                        new Messages.InstallOwnerEpoch(TEST_NS, 8).encode(), null, 5000);
+
+                ScpException staleInstall = assertThrows(ScpException.class,
+                        () -> metadata.call(Opcode.INSTALL_OWNER_EPOCH,
+                                new Messages.InstallOwnerEpoch(TEST_NS, 7).encode(), null, 5000));
+                assertEquals(ErrorCode.FENCED_EPOCH, staleInstall.code());
+                assertEquals(8, staleInstall.detail());
+            }
+        }
+
+        try (DataNode restarted = new DataNode(config);
+             ScpClient staleOwner = new ScpClient(
+                     "127.0.0.1", restarted.port(), ScpClient.KIND_TOOL, "stale-owner");
+             ScpClient metadata = new ScpClient(
+                     "127.0.0.1", restarted.port(), ScpClient.KIND_METADATA, "metadata-successor")) {
+            ScpException staleDelete = assertThrows(ScpException.class,
+                    () -> staleOwner.call(Opcode.DELETE_CHUNKS,
+                            new Messages.DeleteChunks(List.of(id), TEST_NS, 7).encode(), null, 5000));
+            assertEquals(ErrorCode.FENCED_EPOCH, staleDelete.code());
+            assertEquals(8, staleDelete.detail(),
+                    "the wire-installed floor must fence destructive RPCs after restart");
+
+            metadata.call(Opcode.INSTALL_OWNER_EPOCH,
+                    new Messages.InstallOwnerEpoch(TEST_NS, 9).encode(), null, 5000);
+        }
+    }
+
+    @Test
     void finalOrphanDeleteRejectsAConfirmationFencedAfterItReturned() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir));
              ScpClient broker = new ScpClient("127.0.0.1", node.port(), ScpClient.KIND_BROKER, "broker")) {
@@ -293,12 +491,12 @@ class DataNodeWireTest {
     @Test
     void authoritativeOwnerEpochPersistenceFailureFailsClosed() throws Exception {
         try (DataNode node = new DataNode(DataNodeConfig.standalone(dir))) {
-            Files.createDirectory(dir.resolve("owner-epochs.properties.tmp"));
+            Files.createDirectory(dir.resolve("owner-epochs.log"));
 
             ScpException failure = assertThrows(ScpException.class,
                     () -> node.acceptAuthoritativeOwnerEpoch(TEST_NS, 8));
             assertEquals(ErrorCode.INTERNAL, failure.code());
-            assertTrue(failure.getMessage().contains("owner-epochs.properties"));
+            assertTrue(failure.getMessage().contains("owner-epochs.log"));
             assertEquals(1, node.ownerEpochPersistencePoisoned());
 
             ScpException staleSameNamespace = assertThrows(ScpException.class,
