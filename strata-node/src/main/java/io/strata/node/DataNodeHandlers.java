@@ -233,6 +233,14 @@ final class DataNodeHandlers implements ScpServer.Handler {
                 yield ScpServer.ok(req, new Messages.VerifyChunksResp(results).encode(), null);
             }
 
+            case INSTALL_OWNER_EPOCH -> {
+                requireMetadataClient("INSTALL_OWNER_EPOCH");
+                var m = Messages.InstallOwnerEpoch.decode(req.headerReadBuffer());
+                RequestContext.setNamespace(m.namespace().value());
+                node.acceptAuthoritativeOwnerEpoch(m.namespace(), m.ownerEpoch());
+                yield ScpServer.ok(req, Messages.okHeader(), null);
+            }
+
             default -> throw new ScpException(ErrorCode.UNKNOWN_OPCODE, op + " not served by data node");
         };
     }
@@ -362,6 +370,14 @@ final class DataNodeHandlers implements ScpServer.Handler {
         if (recoveryEpoch <= 0) {
             throw new ScpException(ErrorCode.PRECONDITION_FAILED,
                     opcode + " requires a positive recoveryEpoch");
+        }
+    }
+
+    private static void requireMetadataClient(String opcode) {
+        int clientKind = Byte.toUnsignedInt(RequestContext.clientKind());
+        if (RequestContext.clientKind() != ScpClient.KIND_METADATA) {
+            throw new ScpException(ErrorCode.PRECONDITION_FAILED,
+                    opcode + " requires metadata client kind; got " + clientKind);
         }
     }
 

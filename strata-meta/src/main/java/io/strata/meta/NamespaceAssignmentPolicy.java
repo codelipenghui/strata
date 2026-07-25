@@ -10,14 +10,13 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * Static rendezvous-hash (HRW) assignment of a namespace to a small replica set of metadata
- * endpoints (tech design §4.5).
+ * Rendezvous-hash (HRW) bootstrap policy for a namespace's first persisted metadata replica set
+ * (tech design §4.5).
  *
  * <p>{@code score = hash(namespace, membershipGeneration, endpoint)}; the replica set is the top
- * {@code replicaCount} endpoints by score and {@code preferredLeader = replicaSet[0]}. The function
- * is deterministic, so every metadata node computes the same owner for a namespace from the same
- * membership view with no consensus read. Adding an endpoint only moves the namespaces whose new
- * highest score is that endpoint (HRW minimal disruption); existing assignments are otherwise stable.
+ * {@code replicaCount} endpoints by score and {@code preferredLeader = replicaSet[0]}. This result has no
+ * serving authority by itself: sharded controllers persist it once as a versioned namespace assignment,
+ * bind the selected live incarnation, and thereafter route and recover exclusively from that record.
  */
 public final class NamespaceAssignmentPolicy {
     private NamespaceAssignmentPolicy() {}
@@ -28,7 +27,7 @@ public final class NamespaceAssignmentPolicy {
             replicaSet = List.copyOf(replicaSet);
         }
 
-        /** The active controller leader for the namespace = the highest-scoring endpoint. */
+        /** The highest-scoring bootstrap candidate; the persisted assignment decides the active owner. */
         public String preferredLeader() {
             if (replicaSet.isEmpty()) {
                 throw new IllegalStateException("no eligible controller endpoints for namespace " + namespace);

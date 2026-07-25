@@ -393,6 +393,10 @@ class RepairCoordinator implements AutoCloseable {
         if (usesGlobalOwnerEpoch(namespace)) {
             return readyOwnerEpoch(namespace);
         }
+        if (requiresDurableOwnerEpoch(namespace)
+                && !namespaceSettledForVerify(namespace, System.currentTimeMillis())) {
+            return OptionalLong.empty();
+        }
         final long epoch;
         try {
             epoch = namespaceLeadership.authoritativeOwnerEpoch(namespace);
@@ -492,7 +496,8 @@ class RepairCoordinator implements AutoCloseable {
      * {@code deadNodeId} and are now under-replicated. Leader-only (owners are wired in a later task)
      * and settle-gated like the reconcile, so a freshly-elected leader does not repair before nodes
      * re-register. Enumerates the namespaces this leader can authoritatively account for — the ones it
-     * owns (or all, when non-sharded) plus the system meta-log namespace — and reuses the shared
+     * owns when namespace-log metadata is enabled, or every namespace when the global leader writes
+     * directly to ZooKeeper, plus the system meta-log namespace — and reuses the shared
      * per-chunk path, so it dedups against {@code chunksBeingRepaired} with any concurrent reconcile.
      */
     void repairForDeadNode(int deadNodeId) throws Exception {
@@ -504,7 +509,10 @@ class RepairCoordinator implements AutoCloseable {
             return;
         }
         for (StrataNamespace ns : store.listNamespaces()) {
-            if (!ownsAll.getAsBoolean() && !ownsNamespace.test(ns) && !NamespaceLogBackend.isSystem(ns)) {
+            if (namespaceLeadership != null
+                    && !ownsAll.getAsBoolean()
+                    && !ownsNamespace.test(ns)
+                    && !NamespaceLogBackend.isSystem(ns)) {
                 continue;
             }
             if (!namespaceActive(ns)) {
@@ -755,6 +763,12 @@ class RepairCoordinator implements AutoCloseable {
         if (!chunksBeingRepaired.add(new NsChunkId(ns, chunkId))) {
             return;
         }
+        if (!installOwnerEpoch(target.record, chunkId, ns, ownerEpoch)) {
+            chunksBeingRepaired.remove(new NsChunkId(ns, chunkId));
+            log.warn("repair: could not durably fence target {} at owner epoch {} for {}; will retry",
+                    target.record.nodeId(), ownerEpoch, chunkId);
+            return;
+        }
         long cmdId = commandIds.incrementAndGet();
         inflight.put(cmdId, new ReplicateAction(ns, fileId, chunkId, deadNode, target.record.nodeId(),
                 System.currentTimeMillis()));
@@ -959,7 +973,11 @@ class RepairCoordinator implements AutoCloseable {
                     node.endpoint(), node.nodeId(), e.getMessage());
             return List.of();
         }
-        try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(), ScpClient.KIND_TOOL, "owner-verify")) {
+        try (ScpClient client = new ScpClient(
+                endpoint.host(), endpoint.port(), ScpClient.KIND_METADATA, "owner-verify")) {
+            if (requiresDurableOwnerEpoch(ns)) {
+                installOwnerEpoch(client, ns, ownerEpoch, config.repairCommandTimeoutMs());
+            }
             ByteBuffer resp = client.call(Opcode.VERIFY_CHUNKS,
                     new Messages.VerifyChunks(ns, advertisedEndpoint, chunkIds, ownerEpoch).encode(), null,
                     config.repairCommandTimeoutMs());
@@ -1163,7 +1181,7 @@ class RepairCoordinator implements AutoCloseable {
             return false;
         }
         int timeoutMs = Math.max(30_000, config.repairCommandTimeoutMs());
-        try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(), ScpClient.KIND_TOOL, label)) {
+        try (ScpClient client = new ScpClient(endpoint.host(), endpoint.port(), ScpClient.KIND_METADATA, label)) {
             return call.run(client, timeoutMs);
         } catch (ScpException e) {
             if (e.code() == ErrorCode.FENCED_EPOCH || !e.retriable()) {
@@ -1184,6 +1202,9 @@ class RepairCoordinator implements AutoCloseable {
         BufWriter w = new BufWriter();
         Messages.Command.writeRequest(w, cmd);
         return directNodeCall(target.record, cmd.chunkId(), "owner-repair", (client, timeoutMs) -> {
+            if (requiresDurableOwnerEpoch(cmd.namespace())) {
+                installOwnerEpoch(client, cmd.namespace(), cmd.ownerEpoch(), timeoutMs);
+            }
             client.call(Opcode.EXEC_REPLICATE, w.toBytes(), null, timeoutMs);
             return true;
         });
@@ -1197,6 +1218,9 @@ class RepairCoordinator implements AutoCloseable {
     private boolean execReseal(Records.NodeRecord node, ChunkId chunkId, StrataNamespace ns,
                                Records.ChunkRecord exp, long ownerEpoch) {
         return directNodeCall(node, chunkId, "owner-reseal", (client, timeoutMs) -> {
+            if (requiresDurableOwnerEpoch(ns)) {
+                installOwnerEpoch(client, ns, ownerEpoch, timeoutMs);
+            }
             ByteBuffer resp = client.call(Opcode.SEAL_CHUNK,
                     new Messages.SealChunk(chunkId, exp.writeEpoch(), exp.length(), ns, ownerEpoch).encode(),
                     null, timeoutMs);
@@ -1220,6 +1244,9 @@ class RepairCoordinator implements AutoCloseable {
      */
     private boolean execDelete(Records.NodeRecord node, ChunkId chunkId, StrataNamespace ns, long ownerEpoch) {
         return directNodeCall(node, chunkId, "owner-delete", (client, timeoutMs) -> {
+            if (requiresDurableOwnerEpoch(ns)) {
+                installOwnerEpoch(client, ns, ownerEpoch, timeoutMs);
+            }
             ByteBuffer resp = client.call(Opcode.DELETE_CHUNKS,
                     new Messages.DeleteChunks(List.of(chunkId), ns, ownerEpoch).encode(), null, timeoutMs);
             Messages.DeleteChunksResp r = Messages.DeleteChunksResp.decode(resp);
@@ -1230,6 +1257,33 @@ class RepairCoordinator implements AutoCloseable {
             }
             return code == ErrorCode.OK.code || code == ErrorCode.CHUNK_NOT_FOUND.code;
         });
+    }
+
+    /**
+     * Durably raises a data node's namespace owner-epoch floor before an owner command can mutate local
+     * chunk state. This is an upgrade barrier as well as a fence: UNKNOWN_OPCODE from an old node fails the
+     * operation closed instead of silently reverting to the process-local watermark.
+     */
+    private boolean installOwnerEpoch(Records.NodeRecord node, ChunkId chunkId,
+                                      StrataNamespace namespace, long ownerEpoch) {
+        if (!requiresDurableOwnerEpoch(namespace)) {
+            return true;
+        }
+        return directNodeCall(node, chunkId, "owner-epoch-install", (client, timeoutMs) -> {
+            installOwnerEpoch(client, namespace, ownerEpoch, timeoutMs);
+            return true;
+        });
+    }
+
+    private static void installOwnerEpoch(ScpClient client, StrataNamespace namespace,
+                                          long ownerEpoch, int timeoutMs) {
+        client.call(Opcode.INSTALL_OWNER_EPOCH,
+                new Messages.InstallOwnerEpoch(namespace, ownerEpoch).encode(), null, timeoutMs);
+    }
+
+    private boolean requiresDurableOwnerEpoch(StrataNamespace namespace) {
+        return namespaceLeadership != null
+                && namespaceLeadership.requiresDurableOwnerEpochFence(namespace);
     }
 
     /**
@@ -1339,6 +1393,13 @@ class RepairCoordinator implements AutoCloseable {
                                 && d.chunkId().equals(chunkId) && d.nodeId() == nodeId
                                 && d.namespace().equals(ns));
                 if (!alreadyInflight) {
+                    Records.NodeRecord node =
+                            store.getNode(nodeId).map(MetadataStore.Versioned::value).orElse(null);
+                    if (node == null || !installOwnerEpoch(node, chunkId, ns, ownerEpoch)) {
+                        log.warn("delete of {} on node {} deferred: durable owner-epoch fence could not be installed",
+                                chunkId, nodeId);
+                        continue;
+                    }
                     long cmdId = commandIds.incrementAndGet();
                     inflight.put(cmdId, new DeleteAction(ns, file.fileId(), chunkId, nodeId,
                             System.currentTimeMillis()));

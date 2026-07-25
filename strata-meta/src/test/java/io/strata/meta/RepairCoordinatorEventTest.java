@@ -77,6 +77,28 @@ class RepairCoordinatorEventTest {
         assertEquals(new ChunkId(fileId, 0), replicate.chunkId());
     }
 
+    @Test
+    void directZkGlobalLeaderRepairsNamespaceOwnedByAnotherController() throws Exception {
+        FakeStore store = new FakeStore();
+        ControllerConfig config = config();
+        NodeRegistry registry = new NodeRegistry(store, config);
+        Registered source = register(registry, 2260, "source");
+        Registered target = register(registry, 2261, "target");
+        int deadNode = 909_091;
+        FileId fileId = fileId(2250);
+        store.createFile(file(fileId, FileState.SEALED,
+                List.of(sealed(0, 1024, 0xBEE1, List.of(source.nodeId(), deadNode)))));
+
+        RepairCoordinator globalLeader = new RepairCoordinator(
+                store, registry, config, () -> true, () -> false, namespace -> false);
+        globalLeader.becomeLeaderForTest();
+
+        globalLeader.repairForDeadNode(deadNode);
+
+        Messages.ReplicateCmd replicate = onlyReplicate(registry, globalLeader, target);
+        assertEquals(new ChunkId(fileId, 0), replicate.chunkId());
+    }
+
     /**
      * Trigger metrics: an event-lane repair (leader {@code repairForDeadNode}) increments
      * {@code eventRepairs()} and leaves {@code reconcileRepairs()} at zero — the counters distinguish

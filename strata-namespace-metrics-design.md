@@ -1,6 +1,6 @@
 # Strata — per-namespace observability & a namespace dashboard
 
-Design doc · 2026-06-29 · **Implemented** (source-aligned 2026-07-11)
+Design doc · 2026-06-29 · **Implemented** (source-aligned 2026-07-24)
 
 This document preserves the design rationale. Section 2 is the pre-change baseline. Source-level registry
 tests verify selected metric registration and counter behavior; there is no end-to-end Prometheus scrape
@@ -15,8 +15,9 @@ Make namespace the primary axis of Strata's observability. The implemented surfa
 - **Latency** — client data-op latency and controller request latency.
 - **Controller request rate & latency** — by opcode.
 - **Namespace-log activity** — write-log, read-log (replay), compaction, recovery, reacquisition.
-- **Ownership approximation** — which controller currently exposes a loaded namespace repository, plus
-  cold-open/restart counters; automatic owner handoff and authoritative switch timing are not implemented.
+- **Ownership view** — which controller currently exposes a loaded repository under the exact persisted
+  assignment term, plus cold-open/restart counters. Automatic handoff is implemented; the counters remain an
+  approximation of acquisitions rather than a precise end-to-end failover-duration measurement.
 
 …plus a dedicated Grafana dashboard that keys every panel on a `$namespace` selector, and the
 minimal migration of the existing dashboards so nothing regresses.
@@ -135,8 +136,9 @@ Two complementary signals have different lifecycles:
 
 1. **Info gauge** `strata_controller_namespace_owner{namespace,owner}` = `1`, `owner =
    ownership.localEndpoint()`. Emitted via a MultiGauge in the existing 10s `registerPerNamespace`
-   refresh (re-registered each tick, like the files/bytes gauges). It identifies the configured owner
-   of a loaded repository; a future handoff implementation can make its state timeline a switch signal.
+   refresh (re-registered each tick, like the files/bytes gauges). It identifies a loaded repository whose
+   opening term still exactly matches this process's current persisted assignment; automatic handoff makes
+   its state timeline an owner-switch signal.
 2. **Cold-open counter** `strata_controller_namespace_owner_changes_total{namespace}` — registered lazily
    and retained for the process lifetime, so it remains exposed with a frozen value if ownership later leaves
    this process. It is incremented

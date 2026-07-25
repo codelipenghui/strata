@@ -110,8 +110,9 @@ public final class StrataServer {
     /**
      * Co-resident mode: runs a {@link Controller} and a {@link DataNode} in one JVM, so the
      * metadata plane scales with the data fleet and there is no separate {@code strata-meta} to
-     * deploy. Every combined node hosts a controller instance; one is elected leader (the rest are warm
-     * standbys) and serves all metadata RPCs — clients reach it via the {@code NOT_LEADER} redirect.
+     * deploy. Every combined node hosts a controller instance and may serve the namespaces assigned to it;
+     * one is separately elected cluster coordinator for global work and dead-owner assignment rotation.
+     * Clients reach the persisted namespace owner via the {@code NOT_LEADER} redirect.
      * Both planes share one SCP listener on {@code STRATA_LISTEN_PORT} (default 9100): data opcodes go
      * to the data node, metadata opcodes to the co-resident controller. {@code STRATA_CONTROLLER_ENDPOINTS}
      * lists the controller-eligible nodes (including this one) at that port.
@@ -219,15 +220,22 @@ public final class StrataServer {
                         environment, "STRATA_CONTROLLER_DELETED_TOMBSTONE_TTL_MS", 600_000))
                 .withMaxCommandsPerHeartbeat(intEnvFrom(
                         environment, "STRATA_CONTROLLER_MAX_COMMANDS_PER_HEARTBEAT", 16))
+                .withZkSessionTimeoutMs(intEnvFrom(environment, "STRATA_CONTROLLER_ZK_SESSION_TIMEOUT_MS",
+                        ControllerConfig.DEFAULT_ZK_SESSION_TIMEOUT_MS))
                 .withZkRetryBaseMs(intEnvFrom(environment, "STRATA_CONTROLLER_ZK_RETRY_BASE_MS", 100))
                 .withZkRetryMaxRetries(intEnvFrom(environment, "STRATA_CONTROLLER_ZK_RETRY_MAX", 5))
                 .withMetadataBackend(metadataBackendConfig(environment));
-        // Namespace sharding is opt-in. The owner-aware client keeps one connection per owner,
-        // so concurrent namespace traffic does not thrash a single redirected connection.
-        if (boolEnvFrom(environment, "STRATA_CONTROLLER_SHARDING", false)) {
-            config = config.withControllerEndpoints(
-                    endpoints(required(environment, "STRATA_CONTROLLER_ENDPOINTS")),
-                    intEnvFrom(environment, "STRATA_CONTROLLER_REPLICA_COUNT", 3));
+        // A multi-controller bootstrap set always enables persisted namespace ownership. There is no
+        // production-safe static multi-endpoint mode to fall back to. Preserve a single configured endpoint
+        // too: Controller validates that it is this process's advertised endpoint, so a typo cannot silently
+        // degrade several processes into independent global owners.
+        List<String> controllerEndpoints =
+                endpoints(env(environment, "STRATA_CONTROLLER_ENDPOINTS", ""));
+        if (!controllerEndpoints.isEmpty()) {
+            int defaultReplicaCount = controllerEndpoints.size() == 1
+                    ? 1 : Math.min(3, controllerEndpoints.size());
+            config = config.withControllerEndpoints(controllerEndpoints,
+                    intEnvFrom(environment, "STRATA_CONTROLLER_REPLICA_COUNT", defaultReplicaCount));
         }
         return config;
     }

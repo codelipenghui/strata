@@ -724,6 +724,100 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void durableOwnerRepairInstallsEpochBeforeExecReplicateOnSameConnection() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        List<Short> opcodes = new CopyOnWriteArrayList<>();
+        List<Messages.InstallOwnerEpoch> installs = new CopyOnWriteArrayList<>();
+        List<Messages.ReplicateCmd> replicates = new CopyOnWriteArrayList<>();
+        UUID inc = UUID.randomUUID();
+        try (ScpServer targetServer = new ScpServer(0, 999, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    opcodes.add(req.opcode());
+                    if (req.opcode() == Opcode.INSTALL_OWNER_EPOCH.code) {
+                        installs.add(Messages.InstallOwnerEpoch.decode(req.headerSlice()));
+                        return ScpServer.ok(req, Messages.okHeader(), null);
+                    }
+                    if (req.opcode() == Opcode.EXEC_REPLICATE.code) {
+                        replicates.add((Messages.ReplicateCmd) Messages.Command.readRequest(req.headerSlice()));
+                        return ScpServer.ok(req, Messages.okHeader(), null);
+                    }
+                    throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "unexpected opcode");
+                })) {
+            Registered dead = register(registry, 540, "durable-dead");
+            Registered live1 = register(registry, 541, "durable-live-1");
+            Registered live2 = register(registry, 542, "durable-live-2");
+            Registered target = registerAt(
+                    registry, 543, "durable-target", "127.0.0.1:" + targetServer.port());
+            Optional<MetadataStore.Versioned<Records.NodeRecord>> deadRecord = store.getNode(dead.nodeId());
+            store.putNode(deadRecord.orElseThrow().value().withState(Records.NodeState.DEAD),
+                    deadRecord.get().version());
+
+            FileId fileId = fileId(4201);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE,
+                            List.of(dead.nodeId(), live1.nodeId(), live2.nodeId())))));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                    () -> false, () -> false, ns -> true,
+                    activeLeadership(System.currentTimeMillis() - 120_000, new AtomicLong(7), true));
+            owner.ownerRepairPass();
+
+            assertEquals(List.of(Opcode.INSTALL_OWNER_EPOCH.code, Opcode.EXEC_REPLICATE.code), opcodes,
+                    "the durable floor and repair must be serialized on the one owner-repair connection");
+            assertEquals(List.of(new Messages.InstallOwnerEpoch(TEST_NS, 7)), installs);
+            assertEquals(1, replicates.size());
+            assertEquals(TEST_NS, replicates.get(0).namespace());
+            assertEquals(7, replicates.get(0).ownerEpoch());
+            assertTrue(store.files.get(fileId).value().chunks().get(0).replicas().contains(target.nodeId()),
+                    "the descriptor swap lands only after both ordered RPCs succeed");
+        }
+    }
+
+    @Test
+    void failedDurableOwnerEpochInstallSuppressesExecReplicate() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        List<Short> opcodes = new CopyOnWriteArrayList<>();
+        UUID inc = UUID.randomUUID();
+        try (ScpServer targetServer = new ScpServer(0, 999, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    opcodes.add(req.opcode());
+                    if (req.opcode() == Opcode.INSTALL_OWNER_EPOCH.code) {
+                        throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "old data node");
+                    }
+                    return ScpServer.ok(req, Messages.okHeader(), null);
+                })) {
+            Registered dead = register(registry, 550, "old-node-dead");
+            Registered live1 = register(registry, 551, "old-node-live-1");
+            Registered live2 = register(registry, 552, "old-node-live-2");
+            Registered target = registerAt(
+                    registry, 553, "old-node-target", "127.0.0.1:" + targetServer.port());
+            Optional<MetadataStore.Versioned<Records.NodeRecord>> deadRecord = store.getNode(dead.nodeId());
+            store.putNode(deadRecord.orElseThrow().value().withState(Records.NodeState.DEAD),
+                    deadRecord.get().version());
+
+            FileId fileId = fileId(4202);
+            store.createFile(file(fileId, FileState.SEALED,
+                    List.of(sealed(0, 4096, 0xCAFE,
+                            List.of(dead.nodeId(), live1.nodeId(), live2.nodeId())))));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                    () -> false, () -> false, ns -> true,
+                    activeLeadership(System.currentTimeMillis() - 120_000, new AtomicLong(7), true));
+            owner.ownerRepairPass();
+
+            assertEquals(List.of(Opcode.INSTALL_OWNER_EPOCH.code), opcodes,
+                    "UNKNOWN_OPCODE is an upgrade barrier: EXEC_REPLICATE must not follow");
+            List<Integer> replicas = store.files.get(fileId).value().chunks().get(0).replicas();
+            assertTrue(replicas.contains(dead.nodeId()), "failed install must leave the descriptor unchanged");
+            assertFalse(replicas.contains(target.nodeId()), "an unfenced target must not be adopted");
+        }
+    }
+
+    @Test
     void nonLeaderOwnerVerifiesNodeAbsentFromItsFrozenRegistry() throws Exception {
         // A non-leader namespace owner does not receive heartbeats (they are leader-gated), so its in-memory
         // registry is frozen at boot: a data node that (re-)registered AFTER it booted is absent from
@@ -1366,6 +1460,68 @@ class RepairCoordinatorTest {
     }
 
     @Test
+    void failedDurableOwnerEpochInstallSuppressesDelete() throws Exception {
+        FakeStore store = new FakeStore();
+        NodeRegistry registry = new NodeRegistry(store, config());
+
+        List<Short> opcodes = new CopyOnWriteArrayList<>();
+        UUID inc = UUID.randomUUID();
+        try (ScpServer targetServer = new ScpServer(0, 999, inc.getMostSignificantBits(),
+                inc.getLeastSignificantBits(), req -> {
+                    opcodes.add(req.opcode());
+                    if (req.opcode() == Opcode.INSTALL_OWNER_EPOCH.code) {
+                        throw new ScpException(ErrorCode.UNKNOWN_OPCODE, "old data node");
+                    }
+                    return ScpServer.ok(req, Messages.okHeader(), null);
+                })) {
+            Registered target = registerAt(
+                    registry, 701, "old-delete-target", "127.0.0.1:" + targetServer.port());
+            FileId fileId = fileId(4401);
+            store.createFile(file(fileId, FileState.DELETING,
+                    List.of(sealed(0, 4096, 0xCAFE, List.of(target.nodeId())))));
+
+            RepairCoordinator owner = new RepairCoordinator(store, registry, config(),
+                    () -> false, () -> false, ns -> true,
+                    activeLeadership(System.currentTimeMillis() - 120_000, new AtomicLong(7), true));
+            owner.ownerRepairPass();
+
+            assertEquals(List.of(Opcode.INSTALL_OWNER_EPOCH.code), opcodes,
+                    "DELETE_CHUNKS must not follow a failed durable fence install");
+            assertTrue(store.files.containsKey(fileId),
+                    "failed install must leave the deleting descriptor for a later retry");
+        }
+    }
+
+    @Test
+    void freshDynamicOwnershipSettlesDestructiveDeleteButStaticLeadershipDoesNot() throws Exception {
+        FileId dynamicFile = fileId(4402);
+        FakeStore dynamicStore = new FakeStore();
+        dynamicStore.createFile(file(dynamicFile, FileState.DELETING, List.of()));
+        RepairCoordinator dynamicOwner = new RepairCoordinator(
+                dynamicStore, new NodeRegistry(dynamicStore, config()), config(),
+                () -> false, () -> false, ns -> true,
+                activeLeadership(System.currentTimeMillis(), new AtomicLong(7), true));
+
+        dynamicOwner.ownerRepairPass();
+
+        assertTrue(dynamicStore.files.containsKey(dynamicFile),
+                "fresh dynamic ownership must settle before destructive metadata or data-node deletion");
+
+        FileId staticFile = fileId(4403);
+        FakeStore staticStore = new FakeStore();
+        staticStore.createFile(file(staticFile, FileState.DELETING, List.of()));
+        RepairCoordinator staticOwner = new RepairCoordinator(
+                staticStore, new NodeRegistry(staticStore, config()), config(),
+                () -> false, () -> false, ns -> true,
+                activeLeadership(System.currentTimeMillis(), new AtomicLong(7), false));
+
+        staticOwner.ownerRepairPass();
+
+        assertFalse(staticStore.files.containsKey(staticFile),
+                "legacy static leadership must retain its existing prompt-delete behavior");
+    }
+
+    @Test
     void nonControllerOwnerReclaimsDeletedFileWhoseReplicaIsDeadWithoutRpc() throws Exception {
         // A DELETING file whose only replica sits on a DEAD node: the data is already unreachable, so the
         // owner must converge the descriptor (and reclaim the record) without attempting a DELETE_CHUNKS RPC.
@@ -1741,9 +1897,9 @@ class RepairCoordinatorTest {
         coordinator.verifyPass();
 
         assertEquals(1, store.getFileCalls(sysFile),
-                "system verify is keyed to the global owner-epoch authority, not rendezvous ownership");
+                "system verify is keyed to the global owner-epoch authority, not namespace ownership");
         assertEquals(0, store.getFileCalls(userFile),
-                "non-system namespace verify still requires rendezvous ownership");
+                "non-system namespace verify still requires local assignment ownership");
         assertEquals(1, store.allocatedMetadataEpochs());
     }
 
@@ -1808,6 +1964,11 @@ class RepairCoordinatorTest {
     }
 
     private static NamespaceLeadership activeLeadership(long activeSinceMs, AtomicLong ownerEpoch) {
+        return activeLeadership(activeSinceMs, ownerEpoch, false);
+    }
+
+    private static NamespaceLeadership activeLeadership(long activeSinceMs, AtomicLong ownerEpoch,
+                                                        boolean requiresDurableOwnerEpochFence) {
         return new NamespaceLeadership() {
             private final Map<StrataNamespace, ReentrantLock> locks = new ConcurrentHashMap<>();
 
@@ -1834,6 +1995,11 @@ class RepairCoordinatorTest {
             @Override
             public long authoritativeOwnerEpoch(StrataNamespace namespace) {
                 return ownerEpoch.get();
+            }
+
+            @Override
+            public boolean requiresDurableOwnerEpochFence(StrataNamespace namespace) {
+                return requiresDurableOwnerEpochFence;
             }
 
             @Override

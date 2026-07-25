@@ -1,6 +1,6 @@
 # Strata — Technical Design
 
-**Status:** Draft v0.4 (2026-07-11) · **Audience:** engineering · **Companion:** [strata-product-definition.md](strata-product-definition.md) (positioning, competitive landscape, value propositions — not repeated here)
+**Status:** Draft v0.4 (2026-07-24) · **Audience:** engineering · **Companion:** [strata-product-definition.md](strata-product-definition.md) (positioning, competitive landscape, value propositions — not repeated here)
 
 This is the single source of truth for the design. It subsumes the former standalone design notes — metadata scaling (§4), the writer-origin per-record digest and the chunk-file footprint reduction (§11) — which are folded into the sections below; deferred/rejected variants of those are recorded in §17.
 
@@ -75,19 +75,26 @@ The metadata plane is Strata's own — new code, no Kafka. It manages **storage 
 - **A ZooKeeper consensus root** for cluster-wide state — small, slow-changing, globally consistent.
 - **A per-namespace metadata log** for file and chunk state — large, fast-changing, sharded across controllers and owned per namespace.
 
-A single elected cluster leader (Curator `LeaderLatch`) coordinates global maintenance. When current v0 is
-started with `STRATA_CONTROLLER_SHARDING=true`, namespace *ownership* is computed independently by rendezvous
-hashing over the static `STRATA_CONTROLLER_ENDPOINTS` list. Without that opt-in, the configured ownership list
-is empty and each serving controller follows the non-sharded/global-leader path. Persisted membership and
-liveness-aware reassignment remain open (§4.5, §17.17).
+A single elected cluster leader (Curator `LeaderLatch`) coordinates global maintenance and dead-owner
+promotion. Configuring more than one `STRATA_CONTROLLER_ENDPOINTS` entry always enables persisted namespace
+ownership; there is no static multi-controller serving mode or opt-out flag. The endpoint list is only the
+eligible bootstrap set used to create a namespace's first replica set. Once that versioned assignment exists
+in ZooKeeper, it is the **only** serving, routing, and recovery authority; controllers never fall back to
+recomputing an owner from the static endpoint list. Each controller publishes an incarnation-qualified
+ephemeral live-membership record. After the current owner's ZooKeeper session expires, the cluster leader
+CAS-rotates the first live successor to the head of the persisted replica set. Rejoining the old owner does
+not cause automatic failback. An absent list retains the standalone/global-owner path; a configured singleton
+does too only when it exactly matches this process's advertised endpoint (replica count 1). A mismatched
+singleton is a startup error rather than silently creating multiple global owners (§4.5).
 
 ### 4.1 Cluster/system state (ZooKeeper root)
 
 Held directly in ZooKeeper under `/strata`, guarded by version-CAS:
 
 - **Node registry** — `NodeRecord { nodeId, incarnationId, endpoints, topology{zone,rack,host}, capacityBytes, state: REGISTERED|DRAINING|DEAD }`; registration, leases, and incarnation fencing. `SUSPECT` is a derived in-memory lease state inside dead-grace, not a persisted `NodeRecord` value.
-- **Shared cluster-liveness snapshot** — the elected cluster controller periodically publishes `ClusterLiveNodes { publishedAtMs, entries{NodeRecord, freeBytes} }` to the root. A sharded namespace owner, which has no data-node heartbeat channel of its own, merges that snapshot into its local placement and repair view; direct in-memory observations win, and snapshots older than one lease plus two dead-grace windows are ignored. This is placement/repair input, not persisted namespace-owner membership or automatic owner failover.
-- **Namespace ownership schema** — assignment records and generations exist in the SPI/root codec, but current v0 serving uses statically configured controller endpoints and does not persist or fail over those assignments automatically (§4.5, §17.17).
+- **Shared data-node liveness snapshot** — the elected cluster controller periodically publishes `ClusterLiveNodes { publishedAtMs, entries{NodeRecord, freeBytes} }` to the root. A sharded namespace owner, which has no data-node heartbeat channel of its own, merges that snapshot into its local placement and repair view; direct in-memory observations win, and snapshots older than one lease plus two dead-grace windows are ignored. This is placement/repair input, separate from controller membership and namespace assignment.
+- **Controller membership** — each configured controller has durable candidate identity plus an incarnation-qualified ephemeral live record bound to its Curator session. `SUSPENDED`, `READ_ONLY`, and `LOST` clear local serving authority immediately; other controllers do not treat it as dead until ZooKeeper removes the ephemeral record.
+- **Namespace assignments** — `NamespaceAssignment { namespace, generation, replicaSet, leaderIncarnation }` is persisted under version-CAS. The serving term combines the assignment znode's creation zxid, data-version, and bound leader incarnation. `replicaSet[0]` is the preferred owner only because the persisted record says so; the static endpoint list has no serving authority after first bootstrap. Assignment znodes are create-once during online operation and are changed only through versioned `setData`; delete/recreate is supported only as a cluster-wide quiesced disaster restore. The creation zxid prevents a cached pre-restore term from validating after such a restore (§4.5).
 - **Per-namespace manifest** — the version-CAS pointer to a namespace's current metadata snapshot + open log (the linearizable barrier for metadata-log compaction, modeled in `tla/MetadataManifestCAS.tla`).
 - **Metadata epochs and ID allocation**, and the **descriptors of the metadata-log / snapshot system files** (which are themselves replicated Strata files — §4.2).
 
@@ -97,7 +104,14 @@ This state is small (cluster membership plus one manifest/epoch per namespace) a
 
 Each namespace's file and chunk metadata — `FileRecord { fileId, namespace, path, state, … }` and the `ChunkDescriptor`s under it — lives in that namespace's own **metadata log**: an ordered, durable log of metadata mutations plus periodic snapshots, **stored as a replicated Strata file** (chunks on data nodes, the same machinery user data uses), **owned and served by the namespace's owner**. Recovery rebuilds the in-memory derived indexes (`file → chunks`, `node → chunks` for repair, per-node usage for placement) from the published snapshot + log tail. This state scales with retained data (~1M descriptors/PB), not with namespace count — which is exactly why it is sharded out of the global root and onto per-namespace owners. The log is kept bounded by a background compaction sweep (snapshot + roll once the open log passes a size threshold) and a generation-based GC of system files orphaned by a crash between file-create and manifest publish. The intended tombstone truncation condition is both a published snapshot covering the deletion and an elapsed retry-retention floor. Current `sweepOwnedNamespaceTombstones`, however, uses only a `System.currentTimeMillis()` cutoff before appending `TombstoneSwept`; it does not verify snapshot publication. The two-part rule is therefore a target safety condition, not a current guarantee (§17.20). `tla/MetadataTombstoneSweep.tla` models both rules, while `tla/MetadataIdempotency.tla` models the retained idempotency fence.
 
-The namespace's owner assigns each file's id from a monotonic `nextFileId` **high-water carried in the namespace snapshot** (not `max(live files)`, which a swept tombstone would forget and risk reusing). Assignment rides the existing single-writer manifest fence — no global allocator on the hot path. On restart or repository reacquisition, the configured owner loads the snapshot's `nextFileId` and replays the tail; assign-then-append is safe because a crash after assigning N but before `FileCreated(N)` is durable leaves no file at N, so reissuing N is harmless — the "id reuse after recovery" correctness anchor (§4.5, invariant §14.13). Automatic reassignment to a successor controller is not implemented in v0 (§17.17).
+`FileRecord` v8 also persists a monotonic `nextChunkIndex` high-water. `CreateChunk` allocates that value
+and advances it; `withChunks` may raise the mark when adding a higher index but never lowers it when an
+OPEN tail is aborted. Consequently a delayed broker `DELETE_CHUNKS` for the aborted incarnation cannot
+address a later chunk from the same file. The v8 reader accepts a CRC-enveloped v7 record and initializes
+the mark once as `max(live chunk index) + 1` (or zero for an empty file); every subsequent write is v8 and
+preserves the explicit mark.
+
+The namespace's owner assigns each file's id from a monotonic `nextFileId` **high-water carried in the namespace snapshot** (not `max(live files)`, which a swept tombstone would forget and risk reusing). Assignment rides the existing single-writer manifest fence — no global allocator on the hot path. On restart or repository acquisition after a persisted owner rotation, the new preferred owner loads the snapshot's `nextFileId` and replays the tail; assign-then-append is safe because a crash after assigning N but before `FileCreated(N)` is durable leaves no file at N, so reissuing N is harmless — the "id reuse after recovery" correctness anchor (§4.5, invariant §14.13).
 
 The snapshot also carries each file's CAS version so a version token read before restart/reacquisition cannot alias a freshly recovered in-memory counter. Restoring from a snapshot must preserve the file's mutation lineage; otherwise a stale retry could compare against a reset counter and replay an old file update over an intervening owner mutation.
 
@@ -115,7 +129,15 @@ Brokers and data nodes both reach the metadata plane over **SCP control opcodes*
 
 Range-oriented `LookupChunks(namespace, fileId, offsetRange)` and paged `ListFiles(namespace, pageToken)` are target RPCs, not current opcodes. The internal `MetadataStore.listFiles()` method is an unpaged implementation/admin seam and must not be presented as that external contract.
 
-Availability: if a namespace's owner or the consensus root is briefly unavailable, already-open data-path appends and reads can continue from cached descriptors; chunk creates/seals retry or wait. Produce stalls when an open chunk fills without a successor. There is no current ownership-change operation to queue: sharded service waits for its same configured owner to recover (§4.5). Heartbeat grace periods must exceed expected control-plane recovery time so a brief outage never triggers repair.
+Availability: if a namespace's owner or the consensus root is briefly unavailable, already-open data-path
+appends and reads can continue from cached descriptors; chunk creates/seals retry or wait. Produce stalls
+when an open chunk fills without a successor. In sharded mode, owner loss is detected by expiration of the
+incarnation-qualified ZooKeeper ephemeral (10 s default session timeout), followed by a leader-coordinated
+CAS rotation and successor recovery. The successor serves only after recovering under, and revalidating,
+the exact committed assignment term. During `SUSPENDED`/`READ_ONLY`/`LOST`, or while that recovery is
+incomplete, affected metadata operations fail closed rather than using cached/static authority (§4.5).
+Heartbeat grace periods must exceed expected control-plane recovery time so a brief outage never triggers
+repair.
 
 ### 4.4 The `MetadataStore` SPI
 
@@ -125,9 +147,11 @@ Node-registry, namespace-assignment, and manifest logic sits behind a **`Metadat
 
 The two-tier split (§4.1/§4.2) is what lets one Strata cluster hold **100M+ files across many tenants** without one consensus record per file, chunk, replica, or tombstone. The load-bearing specifics:
 
-- **Current v0 configured ownership.** With `STRATA_CONTROLLER_SHARDING=true`, ownership is rendezvous-hashed over the immutable `STRATA_CONTROLLER_ENDPOINTS` configured in each process and `replicaSet[0]` is always selected. Without that flag, v0 retains non-sharded/global-leader behavior. There is no persisted production assignment, liveness-aware reassignment, operator move path, or automatic owner failover yet (§17.17). In sharded mode one namespace is served by exactly one configured owner while that endpoint is available; intra-namespace sharding is deferred (§17.3).
+- **Bootstrap is not authority.** More than one configured `STRATA_CONTROLLER_ENDPOINTS` entry automatically enables persisted ownership. Rendezvous hashing chooses only the first `NamespaceAssignment` replica set; the default replica count is `min(3, endpoint count)`. If the HRW-preferred endpoint is already absent on first touch, creation rotates directly to the first live replica and binds that incarnation at revision 0 instead of persisting an unusable unbound term. From then on, the ZooKeeper record and its complete term are the sole routing/serving/recovery authority. A cold cache synchronously reads or creates that record; failure to establish it returns a retriable metadata-unavailable state and never recomputes a static owner. An absent endpoint list is standalone/global-owner mode; a singleton is accepted only with replica count 1 and only when it names this process's advertised endpoint. Intra-namespace sharding remains deferred (§17.3).
+- **Live membership, leader/CAS rotation, no failback.** Each controller publishes an incarnation-qualified ephemeral tied to its Curator session. The cluster leader authoritatively refreshes membership and assignment state and, only after the preferred owner's exact incarnation is no longer live, CAS-rotates the first live replica to `replicaSet[0]`. Membership and assignment watches are invalidation/wakeup signals; authoritative reads publish the replacement, and the configured reconciliation cadence is a slow full audit (15 s by default in the server). The default ZooKeeper session timeout is 10 s. A recovered former owner remains a non-preferred replica while any successor is live—there is no automatic failback. If every standby is unavailable, the leader may CAS-bind the restarted preferred endpoint's new incarnation as a last-resort recovery; if no assigned endpoint is live, the namespace stays unavailable rather than selecting an unproven endpoint.
+- **Session loss fails closed.** `SUSPENDED`, `READ_ONLY`, and `LOST` immediately clear the local controller's `sessionReady`/`authorityReady` serving gate and emit a term-specific ownership-loss event; the matching repository is fenced even before another controller is allowed to promote it. Membership readiness and assignment readiness are bound to monotonic session-state generations, so a late refresh from an older connection state cannot republish authority. Assignment reads are also bound to the watch-reset and per-namespace invalidation generations, preventing a pre-watch value from resurrecting after a newer CAS. Ownership callbacks are FIFO per namespace and dispatched outside reconciliation locks across striped lanes, so repository fencing cannot deadlock cache publication or let one slow namespace block every other namespace. Reconnection rebuilds assignments from authoritative reads before any namespace can be reacquired. A cache or static endpoint list is never sufficient serving evidence.
 - **Two-layer id generation.** User-file ids come from the owner's in-snapshot `nextFileId` high-water (§4.2) — no consensus round on the create path. The system `strata-meta` namespace cannot host its own counter (its `nextFileId` lives in meta-log files that are themselves `strata-meta` files — it would recurse), so system-file ids come from a small CAS counter in the consensus root scoped to `strata-meta` (low volume).
-- **Per-namespace leader recovery barrier.** On acquiring a namespace, a controller CAS-increments its metadata epoch — fencing prior metadata-log writers at the storage layer, so two controllers that briefly open the same namespace during a membership settle are ordered by epoch (the later, higher-epoch opener wins) — then stays `RECOVERING`: load the manifest, recover/seal the open log tail to its durable end, replay the snapshot + tail, rebuild derived indexes, and re-verify the epoch is still current before serving (`ACTIVE`). Ordinary reads may use the cached `ACTIVE` repository, but destructive orphan confirmation cannot: `CONFIRM_ORPHAN` synchronizes with the consensus root and requires the local manifest value, version, and epoch to match while the repository is locked. A superseded cache, missing manifest, or root-read failure therefore fails closed instead of authorizing deletion or auto-reacquiring a still-higher epoch. (The publication barrier is modeled in `tla/MetadataManifestCAS.tla` and `tla/MetadataTwoLeaderFencing.tla`; the destructive-read schedule is pinned by the two-owner `CONFIRM_ORPHAN` regressions.)
+- **Per-namespace leader recovery barrier.** Acquisition first captures the exact assignment authority term (creation zxid + data-version) whose preferred endpoint and bound incarnation identify this process, then allocates a higher metadata epoch — fencing prior metadata-log writers at the storage layer — and stays `RECOVERING`: load the manifest, recover/seal the open log tail to its durable end, replay the snapshot + tail, and rebuild derived indexes. The repository becomes `ACTIVE` only after a fresh consensus read still matches that exact term, endpoint, incarnation, and session state. A later term fences only the repository bound to the lost term, so a delayed loss callback cannot close a legitimately reacquired handle. Ordinary reads may use the cached `ACTIVE` repository, but destructive orphan confirmation cannot: `CONFIRM_ORPHAN` synchronizes with the consensus root and requires the local manifest value, version, epoch, and assignment authority to match while the repository is locked. A superseded cache, missing manifest, session transition, or root-read failure therefore fails closed instead of authorizing deletion or auto-reacquiring a still-higher epoch. (The publication barrier is modeled in `tla/MetadataManifestCAS.tla` and `tla/MetadataTwoLeaderFencing.tla`; the destructive-read schedule is pinned by the two-owner `CONFIRM_ORPHAN` regressions.)
 - **Stale-epoch re-acquire (converge, don't wedge).** A controller that still owns a namespace but holds a repository cached at a now-stale epoch would otherwise have every metadata-log append fenced (`FENCED_EPOCH`) and retry forever — a permanent wedge with the in-flight file never finalizing. Instead, a fenced append makes the owner evict the stale repository and re-open the namespace (fresh epoch + the barrier above), then replay the mutation once; the retry is bounded to a single attempt, so a genuine ownership disagreement surfaces as the fence rather than an epoch-thrash loop.
 - **Derived indexes, not sources of truth.** `file → chunks`, `(namespace, path) → fileId`, and `node → chunks` are materialized from the metadata log for lookup/listing/repair and rebuilt on recovery; the log is the only authority.
 
@@ -195,7 +219,15 @@ Property: any producer-acked batch existed on at least `ackQuorum` replicas; wit
 
 ### 7.4 Metadata quorum failure
 
-Losing a ZooKeeper member while quorum remains is handled by the ensemble and is invisible to the data path. In non-sharded mode, the global leader latch can move service to another controller. In current sharded v0, however, losing a configured namespace owner makes that namespace's boundary operations unavailable until the same configured endpoint recovers; automatic successor reassignment is not implemented (§17.17). Losing the ZooKeeper quorum still leaves the already-open data path running (§4.3), while chunk-boundary operations wait for ensemble recovery. Control operations are retried idempotently where their opcode carries an operation id.
+Losing a ZooKeeper member while quorum remains is handled by the ensemble and is invisible to the data
+path. In non-sharded mode, the global leader latch can move service to another controller. In sharded mode,
+the failed owner's ephemeral disappears after session expiration; the current global leader CAS-rotates the
+first live assigned replica to the persisted preferred-owner position, and that successor recovers under the
+new assignment revision before serving. The old owner fails closed as soon as its session is suspended/lost
+and does not automatically fail back when it returns. Losing the ZooKeeper quorum still leaves the
+already-open data path running (§4.3), while chunk-boundary operations wait for ensemble recovery and exact
+assignment revalidation. Control operations are retried idempotently where their opcode carries an operation
+id.
 
 ## 8. Placement
 
@@ -207,11 +239,29 @@ Anti-correlation is a first-order p99.9 concern (quorum latency is bounded by th
 
 ### 9.1 Retention
 
-Leader evaluates retention (it owns the policy and the segment timeline) → `DeleteFiles` → metadata marks chunks `DELETING`, then removes records after replica confirmation (or reconciliation timeout). The global leader queues `DELETE` commands via heartbeats; a sharded non-global namespace owner sends direct `DELETE_CHUNKS`. Space reclaim is file unlink: immediate and exact.
+Leader evaluates retention (it owns the policy and the segment timeline) → `DeleteFiles` → metadata marks chunks `DELETING`, then removes records after replica confirmation (or reconciliation timeout). The global leader queues `DELETE` commands via heartbeats; a sharded non-global namespace owner sends direct `DELETE_CHUNKS`. For a persistently assigned sharded namespace, each target data node must first durably acknowledge `INSTALL_OWNER_EPOCH` for the exact, consensus-revalidated owner epoch; failure prevents both command enqueue and direct deletion. Space reclaim is file unlink: immediate and exact.
 
 ### 9.2 Reconciliation (scrub)
 
 Reconciliation runs in both directions, owner-driven rather than as a node push. **Missing/corrupt replicas:** a namespace owner periodically pulls `VERIFY_CHUNKS` from each node holding one of its sealed replicas and diffs the node's report against the descriptor — a replica missing, short, or CRC-mismatched past a grace is dropped and re-repaired (the last live replica is never dropped). **Orphans on disk:** each node runs a local orphan GC — a sealed chunk that no owner has verified within a grace becomes a suspect, and the node walks configured metadata endpoints in order using `CONFIRM_ORPHAN` until one returns an authoritative verdict. The confirmation connection presents the `metadata` HELLO role only for the reserved `strata-meta` namespace; ordinary namespace checks continue to use the `tool` role. Unlike ordinary `LOOKUP_FILE`, this dedicated destructive lane returns no verdict until authority has been synchronized and checked: a namespace-log owner must exactly match the consensus manifest, while a root-backed responder must complete an authoritative root read and still hold global leadership. A stale endpoint is skipped and an unreachable/uncertain owner never triggers deletion. The response distinguishes a referenced chunk (keep), a present file that omits the chunk/node (orphan), and a missing file (which must repeat across GC passes); its positive owner epoch is durably recorded as a volume-bound floor before the verdict is accepted, so restart cannot make an older first response authoritative. A present-file orphan can delete in the same pass after the final confirm, while a missing-file pending key is discarded if the chunk leaves the suspect set. If confirmed-orphan volume crosses the namespace or node rolling-window threshold, or if process-lifetime cumulative confirmed deletes reach the namespace or node cap, orphan GC opens a latching breaker, emits error logs/metrics, and stops deleting in that scope until node restart; small ordinary orphan cleanup below the thresholds still drains. The cumulative caps assume orphan GC is a low-volume backstop while routine retention reclaim flows through owner-direct `DELETE_CHUNKS`. The **commit-before-write invariant** (a chunk exists in metadata before any byte is sent — §4.3) is what makes ordinary orphan deletion safe: an old on-disk chunk absent from the current consensus-validated live descriptor is either state that has since been deleted or data that was never committed as live; it is not part of current live state.
+
+Persisted sharded ownership adds a per-target durable fence to the owner-driven lanes. After validating the
+exact assignment term and active repository, the owner opens a `metadata`-role connection and sends
+`INSTALL_OWNER_EPOCH { namespace, ownerEpoch }` to each target before any verification whose verdict may
+remove a replica, target repair/reseal mutation, queued `DELETE`, or direct `DELETE_CHUNKS`. The data node
+appends and fsyncs the raised namespace floor in its volume-bound `owner-epochs.log` and only then acks.
+Upgrade merges a legacy `owner-epochs.properties` snapshot with any journal entries, writes one compact
+frame per merged floor to a temporary file, fsyncs it, atomically publishes the bounded journal, fsyncs the
+directory, and only then renames the legacy snapshot to `owner-epochs.properties.migrated` and fsyncs the
+directory again. Repeating any pre-rename crash therefore keeps journal size bounded instead of duplicating
+history; new raises append one frame and never rewrite the full namespace map. Replay rejects bad magic,
+checksum, invalid namespace/epoch, regression, and every partial frame (including a torn tail) and refuses
+node startup. A torn append was never acknowledged, but automatic truncation cannot prove that fact after
+crash; repair the volume from a known-good copy rather than deleting the tail and risking rollback of a
+durable owner fence.
+Equal epochs are idempotent; a lower epoch is fenced. Failure on one target—including `UNKNOWN_OPCODE` from
+an old node—skips that target's operation rather than falling back to the process-local watermark. The
+handshake is therefore both the stale-owner barrier and an intentional whole-cluster upgrade barrier.
 
 ### 9.3 Compaction and relocation
 
@@ -259,7 +309,7 @@ u16  headerLength
 - **Connection lifecycle:** current SCP is plaintext, unauthenticated TCP; TLS must be supplied by an external deployment layer or future transport work. First frame MUST be `HELLO`. Pipelining is allowed after handshake and bounded by configured client/server request/byte limits; the server advertises `maxInflightBytes`, but the current client does not consume it as negotiated flow control. All `APPEND`s for a chunk are pinned to one connection generation for ordering. An ambiguous reconnect is not replayed or resynchronized: that replica fails out of the appender and the client seals/rolls according to its quorum policy.
 - **Implementation note (v0 finding):** on virtual-thread runtimes, never hold a monitor (`synchronized`) across blocking I/O or while response handlers may contend for it — blocked virtual threads inside monitors pin their carriers (JDK ≤23), and enough pinned carriers stall every virtual thread in the process. Use `ReentrantLock`, and keep blocking work/response callbacks off transport event-loop threads (a handler blocked on a lock must never stall frame dispatch for the very response its lock-holder is waiting on).
 
-**Handshake.** `HELLO` request: `u16 frameVersionMin, u16 frameVersionMax, u8 clientKind (1 broker | 2 data-node | 3 metadata | 4 tool), u64 featureBits, string clientId`. Response: `u16 chosenFrameVersion, u64 featureBits, u32 nodeId (0 if n/a), uuid incarnationId, u32 maxFrameBytes, u64 maxInflightBytes, array{u16 opcode, u16 maxApiVersion}`. Current v0 accepts frame version 1, emits feature bits `0`, advertises API version 1 for every opcode, and sends every request with API version 1; the client decodes but does not retain/use the opcode map for selection. Per-opcode and feature negotiation are target behavior (§10.6, §17.18). Controller operations addressing the reserved `strata-meta` namespace require the `metadata` HELLO role; every other role is rejected with non-retriable `PRECONDITION_FAILED`. This role is a typed protocol distinction, not authentication on the current unauthenticated SCP transport.
+**Handshake.** `HELLO` request: `u16 frameVersionMin, u16 frameVersionMax, u8 clientKind (1 broker | 2 data-node | 3 metadata | 4 tool), u64 featureBits, string clientId`. Response: `u16 chosenFrameVersion, u64 featureBits, u32 nodeId (0 if n/a), uuid incarnationId, u32 maxFrameBytes, u64 maxInflightBytes, array{u16 opcode, u16 maxApiVersion}`. Current v0 accepts frame version 1, emits feature bits `0`, advertises API version 1 for every opcode, and sends every request with API version 1; the client decodes but does not retain/use the opcode map for selection. Per-opcode and feature negotiation are target behavior (§10.6, §17.18). Controller operations addressing the reserved `strata-meta` namespace, plus `INSTALL_OWNER_EPOCH` for any namespace, require the `metadata` HELLO role; every other role is rejected with non-retriable `PRECONDITION_FAILED`. This role is a typed protocol distinction, not authentication on the current unauthenticated SCP transport.
 
 ### 10.3 Data-plane opcodes
 
@@ -279,6 +329,7 @@ u16  headerLength
 | 0x001A | `READ_RECOVERY` | chunkId, u64 offset, u32 maxBytes, namespace; tag 1: i32 recoveryEpoch (required, >0) | u64 localEndOffset, u64 durableOffset | open-chunk bytes through local end, including the undurable tail |
 | 0x001B | `EXEC_REPLICATE` | `REPLICATE` command{commandId, chunkId, sources, priority, expectedCrc, expectedLength, namespace}; tag 0: u64 ownerEpoch | — | — |
 | 0x001C | `VERIFY_CHUNKS` | namespace, verifierEndpoint, array chunkIds; tag 0: u64 ownerEpoch | array{chunkId, present, state, length, crc} | — |
+| 0x001E | `INSTALL_OWNER_EPOCH` | namespace, u64 ownerEpoch | — | — |
 
 `READ_LEDGER` exposes integrity-ledger entries above an offset: seal recovery (§7.3) needs per-append
 boundaries without parsing the opaque payload. `READ_LEDGER` and `READ_RECOVERY` require a positive
@@ -289,7 +340,7 @@ semantics refined in v0: caller
 footer sections are optional, and the node ALWAYS computes CRC_RANGES + STATS itself — recovery-
 sealed chunks therefore stay byte-identical across replicas with no caller input.
 
-Notes: `FETCH_CHUNK` is distinct from `READ` so it can run in a separate QoS/throttle class (repair must never starve foreground reads) and because it copies the *file* representation (header + footer included) — repaired sealed replicas are byte-identical, their data-region CRCs are comparable, and tests may compare the full image bytes. It carries the namespace owner's epoch and participates in the source node's process-local owner watermark; epoch 0 is accepted only before the node observes a positive owner epoch for that namespace. Separately, only a consensus-validated `CONFIRM_ORPHAN` response may advance the volume-bound owner floor used across restart — persisting an epoch supplied by an arbitrary owner/tool RPC on today's unauthenticated SCP link would turn a process-scoped denial of service into a durable one. The node trusts that its configured endpoint addresses reach real controllers because it initiates those connections; SCP itself is plaintext and unauthenticated, so any transport security belongs to the deployment network. The node-local sidecar and ledger (§11.3) are never copied; the puller starts fresh ones.
+Notes: `FETCH_CHUNK` is distinct from `READ` so it can run in a separate QoS/throttle class (repair must never starve foreground reads) and because it copies the *file* representation (header + footer included) — repaired sealed replicas are byte-identical, their data-region CRCs are comparable, and tests may compare the full image bytes. It carries the namespace owner's epoch and participates in the source node's process-local owner watermark; epoch 0 is accepted only before the node observes a positive owner epoch for that namespace. A volume-bound owner floor may advance through either the node-initiated, consensus-validated `CONFIRM_ORPHAN` path or the controller-initiated `INSTALL_OWNER_EPOCH` handshake. The latter is accepted only on a `metadata`-role connection and is used before per-target sharded-owner work; arbitrary tool/owner mutation RPCs cannot persist the floor. The role is a protocol gate, not cryptographic authentication: the node trusts its configured deployment network to connect it to real controllers because SCP itself is plaintext and unauthenticated. The node-local sidecar and ledger (§11.3) are never copied; the puller starts fresh ones.
 
 ### 10.4 Control-plane opcodes (data node ↔ metadata plane)
 
@@ -299,7 +350,7 @@ Notes: `FETCH_CHUNK` is distinct from `READ` so it can run in a separate QoS/thr
 | 0x0102 | `NODE_HEARTBEAT` | u32 nodeId, uuid incarnationId, u64 sessionEpoch, array{u64 usedBytes, u64 freeBytes}, u32 repairQueueDepth | u64 leaseValidUntilMs, array commands |
 | 0x020B | `CONFIRM_ORPHAN` | namespace, chunkId, u32 nodeId | bool fileExists, bool referencedByNode, u64 ownerEpoch |
 
-Durability reconciliation is the owner pulling `VERIFY_CHUNKS` (0x001C, a data-plane opcode served by the node — §9.2) plus the node's local orphan GC. Orphan GC obtains its destructive verdict through `CONFIRM_ORPHAN` (0x020B); 0x020A remains deliberately unassigned. There is no node-push inventory report.
+Durability reconciliation is the owner pulling `VERIFY_CHUNKS` (0x001C, a data-plane opcode served by the node — §9.2) plus the node's local orphan GC. For persistent sharded ownership, `INSTALL_OWNER_EPOCH` (0x001E; 0x001D is reserved) durably raises one target node's positive namespace floor before the owner continues. It accepts only the `metadata` HELLO role and fails closed on a stale epoch or persistence error. Orphan GC obtains its destructive verdict through `CONFIRM_ORPHAN` (0x020B); 0x020A remains deliberately unassigned. There is no node-push inventory report.
 
 v0 additions: `NODE_HEARTBEAT` requests carry tagged field 0 `completedCommands` (array{u64
 commandId, u16 status}) so the repair coordinator learns command completion on the next heartbeat;
@@ -333,6 +384,18 @@ Current v0's enforceable contract is narrower than the target rolling-upgrade de
 The HELLO opcode map, mutually selected API versions, feature-bit activation, safe handling of unknown
 commands, and an N±1 rolling support window remain target requirements (§17.18); they must not be claimed
 until clients actually consume the negotiation result.
+
+The persisted-assignment/durable-owner-fence release is deliberately **not rolling-compatible** with older
+controllers or data nodes. A new controller can read `FileRecord` v7 but writes v8; an old controller rejects
+v8. An old data node does not implement `INSTALL_OWNER_EPOCH` and returns `UNKNOWN_OPCODE`, which a new
+controller treats as a fail-closed target. Conversely, an old controller cannot establish the durable
+per-target fence required by dynamic owner rotation. Operators must therefore quiesce broker writers and
+metadata mutations, upgrade the entire controller and data-node fleet together, and only then resume
+service. That quiesced cutover is also required because a v7 record can derive a mark only from live chunk
+indices; it cannot reconstruct an index that was already aborted before the upgrade, so no old delayed
+delete may survive into the v8 era. After any new controller has written a v8 record or any new node has
+accepted a durable owner floor, rolling downgrade or reintroduction of an old binary is unsupported. This
+coordinated-upgrade rule remains in force until real wire/record negotiation and an N±1 matrix exist.
 
 ## 11. On-disk formats
 
@@ -492,7 +555,7 @@ attached above individual files; file identity is the immutable `(StrataNamespac
 10. Payload bytes are never re-encoded anywhere between producer and consumer: broker → SCP frame suffix → chunk data region → SCP frame suffix → consumer.
 11. SCP frames and chunk-storage structures use the structure-specific version/integrity checks in §10–§11: frames and chunk/sidecar layouts are versioned and checksummed, while ledger entries carry an entry CRC. Current readers reject unsupported fixed versions; universal feature-mask and prior-format-read rules are targets, not current invariants.
 12. The durable per-record digest is **writer-origin**: the node stores the writer's frame payload CRC verbatim and never originates a competing value; it retains only the right to re-verify (scrub/repair/recovery) and the structural CRCs of its own on-disk layout.
-13. File identity is `(namespace, fileId)` and chunk identity is `(namespace, fileId, index)`. The namespace-log backend allocates user-file ids per namespace; the flat ZooKeeper prototype allocates numeric ids globally. Controller-assigned ids advance monotonically and are not reassigned (high-water/CAS-counter recovery, §4.2).
+13. File identity is `(namespace, fileId)` and chunk identity is `(namespace, fileId, index)`. The namespace-log backend allocates user-file ids per namespace; the flat ZooKeeper prototype allocates numeric ids globally. Controller-assigned file ids advance monotonically and are not reassigned (high-water/CAS-counter recovery). Within a file, v8 `nextChunkIndex` is also monotonic: aborting an OPEN tail removes its descriptor without making that index reusable (§4.2).
 
 ## 15. Observability (v1 minimum)
 
@@ -512,7 +575,7 @@ Produce-path latency decomposed by stage (broker processing / storage append / q
 
 1. **DO staleness bound** — empty-`APPEND` beacons cover idle partitions; the cadence and the maximum staleness a direct reader may observe need a number.
 2. **KIP-392 direct-read** — exact Fetch subset a data node must implement; session/quota handling without broker mediation. v1 ships broker-proxied; this is the v1.x decision.
-3. **Intra-namespace metadata sharding** — sharding is by namespace in the opt-in sharded mode; the partitioning design and the descriptor-count/commit-rate threshold for splitting one hot namespace across controllers are both open.
+3. **Intra-namespace metadata sharding** — multi-controller deployments always shard at namespace granularity; the partitioning design and the descriptor-count/commit-rate threshold for splitting one hot namespace across controllers are both open.
 4. **Segment-roll policy defaults** — balancing chunk-count inflation (metadata sizing) against failover replay bound for low-throughput partition fleets.
 5. **Data-node language/runtime** — RESOLVED in v0: Java 21, Netty NIO transport, and serialized per-connection virtual-thread handler executors. The format and wire contracts remain language-neutral.
 6. **Security baseline** — TLS posture per link (mandatory inter-node?), at-rest encryption (per-chunk envelope vs. volume-level), FIPS story — needs a design pass before the first regulated-industry conversation.
@@ -526,9 +589,9 @@ Produce-path latency decomposed by stage (broker processing / storage append / q
 14. **Open-chunk single-file footprint (header mutable sector)** — sealed chunks are already one file (§11.3); the open `.meta` could be folded into a reserved, separately-CRC'd 512 B sector inside the 4096 B chunk header (in-place atomic single-sector overwrite), making an open chunk `.chunk` + `.j` only. Lower priority than the sealed win: the open `.meta` set is bounded by write concurrency (thousands, not 100M), so the value is create-path churn + footprint uniformity, and it adds fence-epoch atomicity care (the sector must sit *outside* the header CRC and carry its own) that the sealed-`.meta` removal does not.
 15. **Mixed-version on-disk placement** — NOT IMPLEMENTED in v0 (§11.5.3): registration carries format/feature fields, but the controller does not yet persist or filter on them. The current node also reports format 1 while `ChunkFormats.FORMAT_VERSION` is 2. Resolve the advertisement and placement contract before using mixed-format rolling upgrades.
 16. **Metadata-model automation** — the metadata TLA+ specs exist, but `scripts/tlc.sh` currently runs only `ChunkReplication.tla`. Add an explicit per-model matrix before treating the metadata specs as an automated gate; until then they are design models plus manually runnable evidence.
-17. **Namespace-owner failover** — current sharded routing uses immutable configured endpoints and always selects `replicaSet[0]`; production serving does not persist assignments, evaluate owner liveness, or promote another replica. Add a durable assignment/membership lifecycle and an explicit handoff protocol before claiming automatic namespace failover.
-18. **SCP rolling-version negotiation** — HELLO carries feature/opcode fields, but v0 advertises/sends fixed API version 1, feature bits are inactive, clients discard the opcode map, and unknown commands fail decode. Implement and test actual negotiation plus the N±1 matrix before declaring rolling wire compatibility.
-19. **On-disk backward readers and feature masks** — current codecs accept only their current fixed version, and masks are not uniform across sidecars/ledgers. Define structure-by-structure migration and read-old/write-new behavior before mixed-format upgrades (§11.5, §17.15).
+17. **Operator-driven namespace movement** — automatic dead-owner failover is implemented with persisted assignments, ephemeral liveness, and leader/CAS replica rotation (§4.5). Planned live handoff, load-aware replica-set changes, and deliberate failback remain open; recovery of a former owner intentionally does not move authority away from the persisted successor.
+18. **SCP rolling-version negotiation** — HELLO carries feature/opcode fields, but v0 advertises/sends fixed API version 1, feature bits are inactive, clients discard the opcode map, and unknown commands fail decode. Implement and test actual negotiation plus the N±1 matrix before declaring rolling wire compatibility. Until then the assignment/fence/FileRecord-v8 release requires the coordinated, non-rollback upgrade in §10.6.
+19. **On-disk backward readers and feature masks** — `FileRecord` v8 has a deliberate v7 reader, but most current codecs accept only their current fixed version, and masks are not uniform across sidecars/ledgers. Define structure-by-structure migration and read-old/write-new behavior before mixed-format upgrades (§11.5, §17.15).
 20. **Tombstone sweep publication fence** — current namespace-log sweeping uses a wall-clock TTL and appends `TombstoneSwept` without first proving a published snapshot covers the deletion. Add a monotonic retention basis plus a manifest/snapshot publication fence before claiming the two-part truncation rule in §4.2; `tla/MetadataTombstoneSweep.tla` exposes the difference between the current and target guards.
 
 ---

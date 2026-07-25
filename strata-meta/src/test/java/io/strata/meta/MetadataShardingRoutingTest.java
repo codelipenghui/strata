@@ -28,9 +28,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Namespace-sharded routing (design §6): a two-controller cluster where each namespace has exactly one
- * owner (rendezvous). The owner serves its namespaces; a non-owner answers NOT_LEADER carrying the owner
- * endpoint, so the owner-aware client (see {@code ControllerClient}) caches namespace→owner and routes directly,
- * re-resolving only on this redirect. Independent of which controller holds the global cluster latch.
+ * persisted, incarnation-bound owner. The owner serves its namespaces; a non-owner answers NOT_LEADER carrying
+ * the owner endpoint, so the owner-aware client caches namespace→owner and re-resolves on redirect. This is
+ * independent of which controller holds the global cluster latch.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class MetadataShardingRoutingTest {

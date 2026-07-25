@@ -44,7 +44,10 @@ public enum Opcode {
     // data-node orphan GC -> metadata owner: a dedicated destructive confirmation lane. 0x020a stays
     // deliberately unassigned. An older metadata owner rejects this unknown opcode, which the caller
     // treats as no verdict so mixed-version orphan GC fails closed.
-    CONFIRM_ORPHAN(0x020B);
+    CONFIRM_ORPHAN(0x020B),
+    // Metadata owner -> data node: durably raises the namespace owner-epoch floor before any destructive
+    // owner RPC is issued. 0x001D is reserved by the quarantine lane; keep this assignment append-only.
+    INSTALL_OWNER_EPOCH(0x001E);
 
     public final short code;
 

@@ -11,12 +11,14 @@ import io.strata.common.WritePolicyChecks;
 import io.strata.common.Varint;
 import io.strata.proto.BufWriter;
 
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * Metadata records persisted by the MetadataStore backend (tech design §4.2 state, v0 shapes).
@@ -103,7 +105,8 @@ public final class Records {
     public record FileRecord(FileId fileId, StrataNamespace namespace, StrataPath path,
                              int replicationFactor, int ackQuorum, boolean fsyncOnAck,
                              int writerEpoch, FileState state, long createdAtMs,
-                             List<ChunkRecord> chunks, long createOpMsb, long createOpLsb) {
+                             List<ChunkRecord> chunks, long createOpMsb, long createOpLsb,
+                             int nextChunkIndex) {
         public FileRecord {
             fileId = Objects.requireNonNull(fileId, "fileId");
             namespace = Objects.requireNonNull(namespace, "namespace");
@@ -119,6 +122,24 @@ public final class Records {
                 throw new IllegalArgumentException("writerEpoch " + writerEpoch
                         + " is below max chunk epoch " + chunkMaxEpoch);
             }
+            int minimumNextChunkIndex = minimumNextChunkIndex(chunks);
+            if (nextChunkIndex < minimumNextChunkIndex) {
+                throw new IllegalArgumentException("nextChunkIndex " + nextChunkIndex
+                        + " is below live chunk high-water mark " + minimumNextChunkIndex);
+            }
+        }
+
+        /**
+         * Source-compatible constructor for the v7 FileRecord shape. New records infer their initial
+         * high-water mark from the live chunks; once persisted as v8, the mark survives tail removal.
+         */
+        public FileRecord(FileId fileId, StrataNamespace namespace, StrataPath path,
+                          int replicationFactor, int ackQuorum, boolean fsyncOnAck,
+                          int writerEpoch, FileState state, long createdAtMs,
+                          List<ChunkRecord> chunks, long createOpMsb, long createOpLsb) {
+            this(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck,
+                    writerEpoch, state, createdAtMs, chunks, createOpMsb, createOpLsb,
+                    minimumNextChunkIndex(chunks));
         }
 
         public FileRecord(FileId fileId, StrataNamespace namespace, StrataPath path,
@@ -161,6 +182,17 @@ public final class Records {
             return max;
         }
 
+        private static int minimumNextChunkIndex(List<ChunkRecord> chunks) {
+            int next = 0;
+            for (ChunkRecord chunk : chunks) {
+                if (chunk.index() == Integer.MAX_VALUE) {
+                    return Integer.MAX_VALUE;
+                }
+                next = Math.max(next, chunk.index() + 1);
+            }
+            return next;
+        }
+
         public ChunkId chunkId(int index) {
             return new ChunkId(fileId, index);
         }
@@ -168,18 +200,20 @@ public final class Records {
         public FileRecord withState(FileState newState) {
             return new FileRecord(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck, writerEpoch,
                     newState,
-                    createdAtMs, chunks, createOpMsb, createOpLsb);
+                    createdAtMs, chunks, createOpMsb, createOpLsb, nextChunkIndex);
         }
 
         public FileRecord withChunks(List<ChunkRecord> newChunks) {
             return new FileRecord(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck,
                     Math.max(writerEpoch, maxChunkEpoch(newChunks)), state,
-                    createdAtMs, newChunks, createOpMsb, createOpLsb);
+                    createdAtMs, newChunks, createOpMsb, createOpLsb,
+                    Math.max(nextChunkIndex, minimumNextChunkIndex(newChunks)));
         }
 
         public FileRecord withWriterEpoch(int newWriterEpoch) {
             return new FileRecord(fileId, namespace, path, replicationFactor, ackQuorum, fsyncOnAck,
-                    newWriterEpoch, state, createdAtMs, chunks, createOpMsb, createOpLsb);
+                    newWriterEpoch, state, createdAtMs, chunks, createOpMsb, createOpLsb,
+                    nextChunkIndex);
         }
 
         public boolean createdBy(long opMsb, long opLsb) {
@@ -188,7 +222,7 @@ public final class Records {
 
         public byte[] encode() {
             BufWriter w = new BufWriter(256);
-            w.u8(7); // record version
+            w.u8(8); // record version
             w.fileId(fileId);
             w.string(namespace.toString()).string(path.toString())
                     .u32(replicationFactor).u32(ackQuorum).u8(fsyncOnAck ? 1 : 0)
@@ -201,13 +235,16 @@ public final class Records {
                 w.varint(c.replicas().size());
                 for (int n : c.replicas()) w.u32(n);
             }
+            w.u32(nextChunkIndex);
             return sealRecord(w.toBytes());
         }
 
         public static FileRecord decode(byte[] bytes) {
             ByteBuffer b = ByteBuffer.wrap(openRecord(bytes));
             byte version = b.get();
-            if (version != 7) throw new IllegalArgumentException("file record version " + version);
+            if (version != 7 && version != 8) {
+                throw new IllegalArgumentException("file record version " + version);
+            }
             FileId id = FileId.readFrom(b);
             StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
             StrataPath path = StrataPath.of(Varint.readString(b));
@@ -234,8 +271,9 @@ public final class Records {
                 for (int j = 0; j < nr; j++) replicas.add(b.getInt());
                 chunks.add(new ChunkRecord(index, cs, len, crc, epoch, replicas, chunkOpMsb, chunkOpLsb));
             }
+            int nextChunkIndex = version == 8 ? b.getInt() : minimumNextChunkIndex(chunks);
             return new FileRecord(id, namespace, path, replicationFactor, ackQuorum, fsyncOnAck,
-                    writerEpoch, state, created, chunks, fileOpMsb, fileOpLsb);
+                    writerEpoch, state, created, chunks, fileOpMsb, fileOpLsb, nextChunkIndex);
         }
     }
 
@@ -284,11 +322,36 @@ public final class Records {
      * Persisted rendezvous assignment of a namespace to an ordered replica set of controller endpoints
      * (tech design §4.5). {@code preferredLeader} is {@code replicaSet[0]}; {@code generation} pins the
      * membership the assignment was computed against, so it stays stable while nodes are added.
+     *
+     * <p>{@code leaderIncarnation} binds the owner term to one ZooKeeper-backed controller session. An
+     * endpoint that rejoins after session loss receives a different UUID and therefore cannot resume
+     * serving an old assignment while another controller is completing failover. The all-zero value is
+     * the fail-closed migration state decoded from v1 assignments.
      */
-    public record NamespaceAssignment(StrataNamespace namespace, int generation, List<String> replicaSet) {
+    public record NamespaceAssignment(
+            StrataNamespace namespace,
+            int generation,
+            List<String> replicaSet,
+            UUID leaderIncarnation) {
+        public static final UUID UNBOUND_LEADER_INCARNATION = new UUID(0L, 0L);
+
         public NamespaceAssignment {
             namespace = Objects.requireNonNull(namespace, "namespace");
             replicaSet = List.copyOf(replicaSet);
+            leaderIncarnation = Objects.requireNonNull(leaderIncarnation, "leaderIncarnation");
+            if (replicaSet.isEmpty()) {
+                throw new IllegalArgumentException("namespace assignment must contain at least one replica");
+            }
+            if (replicaSet.stream().anyMatch(endpoint -> endpoint == null || endpoint.isBlank())
+                    || replicaSet.stream().distinct().count() != replicaSet.size()) {
+                throw new IllegalArgumentException(
+                        "namespace assignment replicas must be non-blank and distinct");
+            }
+        }
+
+        /** Source-compatible constructor for v1 callers; the resulting assignment cannot authorize serving. */
+        public NamespaceAssignment(StrataNamespace namespace, int generation, List<String> replicaSet) {
+            this(namespace, generation, replicaSet, UNBOUND_LEADER_INCARNATION);
         }
 
         public String preferredLeader() {
@@ -298,24 +361,47 @@ public final class Records {
             return replicaSet.get(0);
         }
 
+        public boolean hasBoundLeader() {
+            return !UNBOUND_LEADER_INCARNATION.equals(leaderIncarnation);
+        }
+
         public byte[] encode() {
-            BufWriter w = new BufWriter(128);
-            w.u8(1); // record version
+            BufWriter w = new BufWriter(144);
+            w.u8(2); // record version
             w.string(namespace.toString()).i32(generation).varint(replicaSet.size());
             for (String e : replicaSet) w.string(e);
+            w.u64(leaderIncarnation.getMostSignificantBits())
+                    .u64(leaderIncarnation.getLeastSignificantBits());
             return sealRecord(w.toBytes());
         }
 
         public static NamespaceAssignment decode(byte[] bytes) {
-            ByteBuffer b = ByteBuffer.wrap(openRecord(bytes));
-            byte version = b.get();
-            if (version != 1) throw new IllegalArgumentException("namespace assignment version " + version);
-            StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
-            int generation = b.getInt();
-            int n = Varint.readCount(b, "replica");
-            List<String> replicaSet = new ArrayList<>(n);
-            for (int i = 0; i < n; i++) replicaSet.add(Varint.readString(b));
-            return new NamespaceAssignment(namespace, generation, replicaSet);
+            try {
+                ByteBuffer b = ByteBuffer.wrap(openRecord(bytes));
+                byte version = b.get();
+                if (version != 1 && version != 2) {
+                    throw new IllegalArgumentException("namespace assignment version " + version);
+                }
+                StrataNamespace namespace = StrataNamespace.of(Varint.readString(b));
+                int generation = b.getInt();
+                int n = Varint.readCount(b, "replica");
+                List<String> replicaSet = new ArrayList<>(n);
+                for (int i = 0; i < n; i++) replicaSet.add(Varint.readString(b));
+                int expectedTail = version == 1 ? 0 : Long.BYTES * 2;
+                if (b.remaining() != expectedTail) {
+                    throw new IllegalArgumentException(
+                            "invalid namespace assignment incarnation bytes: " + b.remaining());
+                }
+                UUID leaderIncarnation = version == 1
+                        ? UNBOUND_LEADER_INCARNATION
+                        : new UUID(b.getLong(), b.getLong());
+                if (b.hasRemaining()) {
+                    throw new IllegalArgumentException("trailing namespace assignment bytes");
+                }
+                return new NamespaceAssignment(namespace, generation, replicaSet, leaderIncarnation);
+            } catch (BufferUnderflowException truncated) {
+                throw new IllegalArgumentException("truncated namespace assignment record", truncated);
+            }
         }
     }
 

@@ -448,7 +448,7 @@ class OrphanGcTest {
             OrphanGc gc = orphanGc(store, List.of("127.0.0.1:" + owner.port()), 0, 60_000, 0, 5_000,
                     (namespace, ownerEpoch) -> {
                         throw new DataNode.OwnerEpochPersistenceException(
-                                "floorFile=/data/owner-epochs.properties", new IOException("disk full"));
+                                "floorFile=/data/owner-epochs.log", new IOException("disk full"));
                     });
 
             gc.gcOnce();

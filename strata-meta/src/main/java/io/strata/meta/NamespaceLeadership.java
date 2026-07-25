@@ -37,6 +37,15 @@ interface NamespaceLeadership {
                 "backend has no authoritative owner read; destructive confirmation unsupported");
     }
 
+    /**
+     * Whether this namespace uses persisted, dynamically failoverable ownership and therefore requires
+     * the append-only durable data-node owner-floor handshake before a target can be reused. Static/global
+     * leadership implementations retain the legacy process-local fence and return false.
+     */
+    default boolean requiresDurableOwnerEpochFence(StrataNamespace namespace) {
+        return false;
+    }
+
     /** Reconcile lock for a locally active user namespace; callers must not request one for inactive namespaces. */
     ReentrantLock namespaceReconcileLock(StrataNamespace namespace);
 }

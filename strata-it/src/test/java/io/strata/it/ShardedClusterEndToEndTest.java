@@ -67,8 +67,8 @@ class ShardedClusterEndToEndTest {
 
     @Test
     void clientWritesAndReadsAcrossNamespacesOwnedByDifferentControllers() throws Exception {
-        // Pick two namespaces that rendezvous-hash to DIFFERENT owners: one served directly by the seed
-        // controller, one reached only by following the NOT_LEADER redirect to the other controller.
+        // Pick two namespaces whose initial persisted replica sets prefer DIFFERENT controllers: one served
+        // directly by the seed, one reached by following the NOT_LEADER redirect to the other controller.
         StrataNamespace nsA = namespaceOwnedBy(endpoints.get(0));
         StrataNamespace nsB = namespaceOwnedBy(endpoints.get(1));
         assertNotEquals(owner(nsA), owner(nsB), "the two namespaces must have distinct owning controllers");
@@ -95,6 +95,8 @@ class ShardedClusterEndToEndTest {
         StrataNamespace namespace = namespaceOwnedBy(endpoints.get(1));
         FileId placeholder = client.create(
                 StrataClient.FileSpec.log(namespace.value(), "/authority-placeholder")).id();
+        long ownerEpoch =
+                ConsistencyVerifier.lookupFile(endpoints, namespace, placeholder).ownerEpoch();
 
         // Stop the old controller processes before planting the orphan. This makes it impossible for a
         // pre-restart GC pass to delete the chunk and pins the reclamation to the replacement-owner path.
@@ -112,7 +114,7 @@ class ShardedClusterEndToEndTest {
                     new Messages.Append(orphan, 1, 0, 0, namespace).encode(),
                     ByteBuffer.wrap("sharded-orphan".getBytes()), 5_000);
             direct.call(Opcode.SEAL_CHUNK,
-                    new Messages.SealChunk(orphan, 1, 14, namespace).encode(), null, 5_000);
+                    new Messages.SealChunk(orphan, 1, 14, namespace, ownerEpoch).encode(), null, 5_000);
         }
         assertTrue(node.store().contains(namespace, orphan));
 
@@ -144,9 +146,9 @@ class ShardedClusterEndToEndTest {
         throw new IllegalStateException("no namespace owned by " + endpoint);
     }
 
-    /** Rendezvous owner of {@code ns} over the cluster's endpoints — must match the controllers' replicaCount=1. */
+    /** Initial persisted owner of {@code ns}; HRW's first endpoint is independent of replica-set width. */
     private String owner(StrataNamespace ns) {
-        return NamespaceAssignmentPolicy.assign(ns, 0, endpoints, 1).preferredLeader();
+        return NamespaceAssignmentPolicy.assign(ns, 0, endpoints, endpoints.size()).preferredLeader();
     }
 
     private void write(StrataNamespace ns, FileId id, byte[] data) throws Exception {

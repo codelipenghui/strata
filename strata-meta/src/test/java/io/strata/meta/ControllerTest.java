@@ -395,6 +395,22 @@ class ControllerTest {
     }
 
     @Test
+    void singletonControllerEndpointMustMatchTheAdvertisedProcess() throws Exception {
+        int port;
+        try (ServerSocket reservation = new ServerSocket(0)) {
+            port = reservation.getLocalPort();
+        }
+        ControllerConfig mismatched = new ControllerConfig(
+                zk.getConnectString(), port, 200, 1_000, 1_500, 300, 3_000)
+                .withAdvertisedHost("127.0.0.1")
+                .withControllerEndpoints(List.of("other-controller:" + port), 1);
+
+        IllegalArgumentException rejected = assertThrows(
+                IllegalArgumentException.class, () -> new Controller(mismatched));
+        assertTrue(rejected.getMessage().contains("single-endpoint membership must name this node"));
+    }
+
+    @Test
     void missingFileOperationsReturnTypedErrorsOrIdempotentSuccess() {
         // Use an id that will never be server-assigned in this test run (server starts at 1, not MaxValue).
         FileId missing = FileId.of(Long.MAX_VALUE);
@@ -1005,7 +1021,8 @@ class ControllerTest {
 
         var replacement = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1).encode(), null, 5000));
-        assertEquals(0, replacement.chunkId().index());
+        assertEquals(1, replacement.chunkId().index());
+        assertNotEquals(chunk.chunkId(), replacement.chunkId());
     }
 
     @Test
@@ -1171,7 +1188,7 @@ class ControllerTest {
     }
 
     @Test
-    void sealChunkMetaFencesStaleSealAfterSameEpochRecreate() {
+    void abortAndSameEpochRecreateNeverReusesChunkId() {
         registerTrio("sealRaceHost");
         var file = Messages.CreateFileResp.decode(client.call(Opcode.CREATE_FILE,
                 new Messages.CreateFile("test", "/seal-incarnation-collision").encode(), null, 5000));
@@ -1179,21 +1196,23 @@ class ControllerTest {
         var a = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1, 0xA1L, 0xA2L).encode(),
                 null, 5000));
-        // abort A, then recreate index 0 as incarnation B at the SAME epoch — the only window the
-        // write-epoch fence cannot separate
+        // Abort A, then recreate at the SAME epoch. A broker may still have A's physical DELETE in
+        // flight, so B must receive a never-before-used ChunkId rather than recycling A's index.
         client.call(Opcode.ABORT_CHUNK_META,
                 new Messages.AbortChunkMeta(StrataNamespace.of("test"), a.chunkId(), 1, 0xA1L, 0xA2L).encode(),
                 null, 5000);
         var b = Messages.CreateChunkResp.decode(client.call(Opcode.CREATE_CHUNK,
                 new Messages.CreateChunk(StrataNamespace.of("test"), file.fileId(), 1, 0xB1L, 0xB2L).encode(),
                 null, 5000));
-        assertEquals(a.chunkId(), b.chunkId()); // same (fileId, index 0), different incarnation
+        assertEquals(0, a.chunkId().index());
+        assertEquals(1, b.chunkId().index());
+        assertNotEquals(a.chunkId(), b.chunkId());
 
-        // a delayed seal from incarnation A must NOT seal incarnation B with A's length/crc
+        // A delayed operation against A now addresses an absent id and cannot mutate B.
         ScpException stale = assertThrows(ScpException.class, () -> client.call(Opcode.SEAL_CHUNK_META,
                 new Messages.SealChunkMeta(StrataNamespace.of("test"), a.chunkId(), 1, 999, 0xDEAD,
                         List.of(), 0xA1L, 0xA2L).encode(), null, 5000));
-        assertEquals(ErrorCode.FENCED_EPOCH, stale.code());
+        assertEquals(ErrorCode.CHUNK_NOT_FOUND, stale.code());
 
         // the live incarnation B seals normally with its own length/crc
         client.call(Opcode.SEAL_CHUNK_META,
